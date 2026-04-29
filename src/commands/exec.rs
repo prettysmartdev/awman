@@ -121,6 +121,7 @@ pub async fn run_prompt(
         Some(effective_agent),
         model_override.as_deref(),
         &*runtime,
+        None,
     )
     .await
 }

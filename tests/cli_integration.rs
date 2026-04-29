@@ -1331,10 +1331,10 @@ fn specs_new_and_new_spec_produce_identical_skeleton_files() {
         String::from_utf8_lossy(&out2.stderr)
     );
 
-    // Both repos start empty, so both commands must produce 0001-equiv-test.md.
+    // Both repos start empty — aspec is downloaded, placing work items in aspec/work-items/.
     let expected_name = "0001-equiv-test.md";
-    let path1 = repo1.path().join("aspec").join(expected_name);
-    let path2 = repo2.path().join("aspec").join(expected_name);
+    let path1 = repo1.path().join("aspec").join("work-items").join(expected_name);
+    let path2 = repo2.path().join("aspec").join("work-items").join(expected_name);
 
     assert!(path1.exists(), "specs new must create {expected_name}; repo: {}", repo1.path().display());
     assert!(path2.exists(), "new spec must create {expected_name}; repo: {}", repo2.path().display());

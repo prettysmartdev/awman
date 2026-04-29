@@ -1749,9 +1749,12 @@ mod tests {
             content.contains("nodesource"),
             "Dockerfile.cline must install Node.js via NodeSource"
         );
+        let installs_cline = content
+            .lines()
+            .any(|line| line.contains("npm install -g") && line.contains("cline"));
         assert!(
-            content.contains("npm install -g cline"),
-            "Dockerfile.cline must install cline via npm install -g"
+            installs_cline,
+            "Dockerfile.cline must install the cline package via npm install -g"
         );
     }
 

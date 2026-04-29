@@ -2590,6 +2590,7 @@ async fn run_agent_with_sink_mount_ssh_emits_warning() {
         None, // agent_override
         None,  // model
         &runtime,
+        None,  // git_root_override
     )
     .await;
 
@@ -2632,6 +2633,7 @@ async fn run_agent_with_sink_no_mount_ssh_no_warning() {
         None, // agent_override
         None,  // model
         &runtime,
+        None,  // git_root_override
     )
     .await;
 
@@ -2675,6 +2677,7 @@ async fn run_agent_with_sink_mount_ssh_display_cmd_includes_ssh_path() {
         None, // agent_override
         None,  // model
         &runtime,
+        None,  // git_root_override
     )
     .await;
 
@@ -2723,6 +2726,7 @@ async fn run_agent_with_sink_no_mount_ssh_display_cmd_excludes_ssh_path() {
         None, // agent_override
         None,  // model
         &runtime,
+        None,  // git_root_override
     )
     .await;
 
@@ -2772,6 +2776,7 @@ async fn run_agent_with_sink_mount_ssh_missing_ssh_dir_errors() {
         None, // agent_override
         None,  // model
         &runtime,
+        None,  // git_root_override
     )
     .await;
 

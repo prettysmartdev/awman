@@ -187,6 +187,7 @@ pub async fn run_new_with_sink(
         None,
         None,
         runtime,
+        None,
     )
     .await?;
 
@@ -244,6 +245,7 @@ pub async fn run_amend(
         None,
         None,
         &*runtime,
+        None,
     )
     .await
 }
@@ -290,6 +292,7 @@ pub async fn run_with_sink_amend(
         None,
         None,
         runtime,
+        None,
     )
     .await
 }

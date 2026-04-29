@@ -6368,7 +6368,9 @@ async fn launch_new_workflow_action(
                 format!("{}/{}", CONTAINER_WORKSPACE, filename),
             )
         } else {
-            (git_root.clone(), dest.to_string_lossy().to_string())
+            let relative = dest.strip_prefix(&git_root).unwrap_or(dest.as_path());
+            let container_path = format!("{}/{}", CONTAINER_WORKSPACE, relative.to_string_lossy());
+            (git_root.clone(), container_path)
         };
 
         let agent_name = load_repo_config(&git_root)
@@ -6420,6 +6422,7 @@ async fn launch_new_workflow_action(
                 None,
                 None,
                 &*runtime,
+                Some(git_root),
             )
             .await
         });
@@ -6498,7 +6501,9 @@ async fn launch_new_skill_action(app: &mut App, state: state::NewSkillDialogStat
             }
             (skill_dir, format!("{}/SKILL.md", CONTAINER_WORKSPACE))
         } else {
-            (git_root.clone(), path.to_string_lossy().to_string())
+            let relative = path.strip_prefix(&git_root).unwrap_or(path.as_path());
+            let container_path = format!("{}/{}", CONTAINER_WORKSPACE, relative.to_string_lossy());
+            (git_root.clone(), container_path)
         };
 
         let agent_name = load_repo_config(&git_root)
@@ -6549,6 +6554,7 @@ async fn launch_new_skill_action(app: &mut App, state: state::NewSkillDialogStat
                 None,
                 None,
                 &*runtime,
+                Some(git_root),
             )
             .await
         });

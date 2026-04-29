@@ -1,22 +1,59 @@
 FROM {{AMUX_BASE_IMAGE}}
 
-# Install Codex CLI from official GitHub releases
-RUN ARCH="$(dpkg --print-architecture)" && \
-    case "${ARCH}" in \
-        amd64) CODEX_ARCH="x86_64-unknown-linux-musl" ;; \
-        arm64) CODEX_ARCH="aarch64-unknown-linux-musl" ;; \
-        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
-    esac && \
-    curl -fsSL \
-        "https://github.com/openai/codex/releases/latest/download/codex-${CODEX_ARCH}.tar.gz" \
-        | tar xz -C /usr/local/bin "codex-${CODEX_ARCH}" && \
-    mv "/usr/local/bin/codex-${CODEX_ARCH}" /usr/local/bin/codex && \
-    chmod +x /usr/local/bin/codex
+# Force root for installation: a base image may have switched to a non-root
+# user, and apt/cp/install need write access to /usr/local, /etc, /root.
+USER root
 
-# Create non-root user for agent operations
-RUN useradd -m -s /bin/bash amux \
-    && mkdir -p /workspace \
-    && chown amux:amux /workspace
+# Reset env vars so installer behavior does not depend on what the base set:
+#   - HOME drives where installers and tools write user-scoped files.
+#   - DEBIAN_FRONTEND avoids interactive apt prompts.
+#   - PATH prepends the agent baseline to whatever the base image set,
+#     so installer-resolved binaries cannot be shadowed by the base while
+#     useful base PATH additions (e.g. /usr/local/cargo/bin from
+#     Dockerfile.dev) stay visible inside the agent container.
+ENV HOME=/root \
+    DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+WORKDIR /root
+
+# Strict shell for every RUN: -e fails fast, -o pipefail catches errors in
+# `curl | bash` pipelines so a partial download cannot silently succeed.
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+# Override any inherited ENTRYPOINT/CMD so `docker run image <command> ...`
+# behaves predictably regardless of how the base evolves.
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+# ── Install agent binary ──────────────────────────────────────────────────────
+# Codex CLI ships prebuilt musl binaries on GitHub releases. Use `uname -m`
+# instead of `dpkg --print-architecture` so this works on non-Debian bases too.
+RUN case "$(uname -m)" in \
+        x86_64|amd64)  CODEX_ARCH=x86_64-unknown-linux-musl ;; \
+        aarch64|arm64) CODEX_ARCH=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
+        "https://github.com/openai/codex/releases/latest/download/codex-${CODEX_ARCH}.tar.gz" \
+        | tar xz -C /tmp "codex-${CODEX_ARCH}" \
+    && install -m 0755 "/tmp/codex-${CODEX_ARCH}" /usr/local/bin/codex \
+    && rm -f "/tmp/codex-${CODEX_ARCH}"
+
+# ── amux user + workspace (idempotent against a base that already created it) ─
+# Outer braces keep the && chain associated with the user-creation block,
+# avoiding the `A || B && C && D` precedence trap that would otherwise skip
+# `mkdir`/`chown` whenever the user already exists.
+RUN { id -u amux >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/amux amux 2>/dev/null \
+       || useradd -s /bin/bash -d /home/amux amux ; } \
+    && mkdir -p /workspace /home/amux \
+    && chown -R amux:amux /workspace /home/amux
 
 USER amux
+ENV HOME=/home/amux \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 WORKDIR /workspace
+
+# ── Smoke test: run as the runtime user so we verify the binary is on PATH and
+# executable from the actual entrypoint context, not just for root. ───────────
+RUN test -x "$(command -v codex)"

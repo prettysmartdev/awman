@@ -1,7 +1,3 @@
 {
-  "agent": "claude",
-  "envPassthrough": [
-    "GH_TOKEN",
-    "OMLX_API_KEY"
-  ]
+  "agent": "claude"
 }

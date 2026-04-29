@@ -1,13 +1,73 @@
 FROM {{AMUX_BASE_IMAGE}}
 
-# Install Claude Code via official standalone installer
-RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && cp /root/.local/bin/claude /usr/local/bin/claude
+# Force root for installation: a base image may have switched to a non-root
+# user, and apt/cp/install need write access to /usr/local, /etc, /root.
+USER root
 
-# Create non-root user for agent operations
-RUN useradd -m -s /bin/bash amux \
-    && mkdir -p /workspace \
-    && chown amux:amux /workspace
+# Reset env vars so installer behavior does not depend on what the base set:
+#   - HOME drives where installers and tools write user-scoped files.
+#   - DEBIAN_FRONTEND avoids interactive apt prompts.
+#   - PATH prepends the agent baseline to whatever the base image set,
+#     so installer-resolved binaries cannot be shadowed by the base while
+#     useful base PATH additions (e.g. /usr/local/cargo/bin from
+#     Dockerfile.dev) stay visible inside the agent container.
+ENV HOME=/root \
+    DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+WORKDIR /root
+
+# Strict shell for every RUN: -e fails fast, -o pipefail catches errors in
+# `curl | bash` pipelines so a partial download cannot silently succeed.
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+# Override any inherited ENTRYPOINT/CMD so `docker run image <command> ...`
+# behaves predictably regardless of how the base evolves.
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+# ── Install agent binary ──────────────────────────────────────────────────────
+# Claude Code's "native" installer drops a launcher *symlink* at
+# $HOME/.local/bin/claude that points to the real binary deep inside
+# $HOME/.local/share/claude/versions/<ver> — past depth 6, and not a regular
+# file. So a `find -maxdepth 6 -type f` search misses both: the launcher
+# (wrong type) and the binary (too deep). We therefore:
+#   1. Save the script to disk first so `--retry` can recover from transient
+#      curl failures without `curl ... | bash` muddling pipefail semantics.
+#   2. Check the well-known launcher path directly before falling back to a
+#      wider find that includes symlinks and goes deep enough to reach the
+#      real binary.
+#   3. Use `install` to copy through the symlink — it dereferences the source
+#      and produces a real binary at /usr/local/bin/claude.
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 \
+        https://claude.ai/install.sh -o /tmp/claude-install.sh \
+    && bash /tmp/claude-install.sh \
+    && rm -f /tmp/claude-install.sh \
+    && BIN="" \
+    && if [ -e "$HOME/.local/bin/claude" ]; then BIN="$HOME/.local/bin/claude"; fi \
+    && if [ -z "$BIN" ]; then BIN="$(command -v claude 2>/dev/null || true)"; fi \
+    && if [ -z "$BIN" ]; then \
+           BIN="$(find / -maxdepth 8 \( -type f -o -type l \) -name claude -print -quit 2>/dev/null || true)"; \
+       fi \
+    && if [ -z "$BIN" ]; then \
+           echo "ERROR: claude binary not found after installation" >&2; exit 1; \
+       fi \
+    && if [ "$BIN" != /usr/local/bin/claude ]; then install -m 0755 "$BIN" /usr/local/bin/claude; fi
+
+# ── amux user + workspace (idempotent against a base that already created it) ─
+# Outer braces keep the && chain associated with the user-creation block,
+# avoiding the `A || B && C && D` precedence trap that would otherwise skip
+# `mkdir`/`chown` whenever the user already exists.
+RUN { id -u amux >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/amux amux 2>/dev/null \
+       || useradd -s /bin/bash -d /home/amux amux ; } \
+    && mkdir -p /workspace /home/amux \
+    && chown -R amux:amux /workspace /home/amux
 
 USER amux
+ENV HOME=/home/amux \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 WORKDIR /workspace
+
+# ── Smoke test: run as the runtime user so we verify the binary is on PATH and
+# executable from the actual entrypoint context, not just for root. ───────────
+RUN test -x "$(command -v claude)"

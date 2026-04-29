@@ -230,6 +230,7 @@ pub async fn run(
         Some(effective_agent),
         model_override.as_deref(),
         &*runtime,
+        None,
     )
     .await;
 
@@ -313,6 +314,7 @@ pub async fn run_with_sink(
         agent_override,
         model,
         runtime,
+        None,
     )
     .await
 }
@@ -817,6 +819,7 @@ pub async fn run_workflow(
             Some(step_agent.to_string()),
             step_model,
             runtime,
+            None,
         )
         .await;
 

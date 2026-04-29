@@ -1,38 +1,45 @@
 FROM debian:bookworm-slim
 
-# ── System packages ───────────────────────────────────────────────────────────
+# Strict shell for every RUN: -e fails fast, -o pipefail propagates errors
+# through `curl | bash`-style pipelines so a partial download cannot silently
+# produce a "successful" build.
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Override any inherited ENTRYPOINT/CMD so `docker run image <command> ...`
+# behaves predictably regardless of how the base evolves.
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+# ── System packages (must run as root — apt-get requires it) ──────────────────
 # build-essential : C compiler + linker required by Rust crates that call `cc`
 #                   (portable-pty, ring, etc.).  Also brings in `make`.
 # pkg-config      : lets Rust build scripts locate system libraries.
 # libxcb*-dev     : X11 clipboard backend compiled into the `arboard` crate.
 # libwayland-dev  : Wayland clipboard backend compiled into the `arboard` crate.
-# gnuplot         : criterion writes HTML benchmark reports with gnuplot
-#                   (cargo bench → target/criterion/).
-# heaptrack       : heap profiler referenced in aspec/devops/localdev.md
-#                   §Heap profiling.
-# linux-perf      : perf(1) required by cargo-flamegraph on Linux
-#                   (aspec/devops/localdev.md §Flamegraph profiling).
 # musl-tools      : musl-gcc cross-compiler; required to build the
 #                   x86_64-unknown-linux-musl target for the statically-linked
 #                   release binary (aspec/architecture/design.md).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    curl \
-    git \
-    gnuplot \
-    heaptrack \
-    libwayland-dev \
-    libxcb1-dev \
-    libxcb-render0-dev \
-    libxcb-shape0-dev \
-    libxcb-xfixes0-dev \
-    linux-perf \
-    musl-tools \
-    pkg-config \
+RUN rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        libwayland-dev \
+        libxcb1-dev \
+        libxcb-render0-dev \
+        libxcb-shape0-dev \
+        libxcb-xfixes0-dev \
+        musl-tools \
+        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# ── GitHub CLI ────────────────────────────────────────────────────────────────
+# ── GitHub CLI (must run as root — writes to /etc/apt) ────────────────────────
 # scripts/release.sh calls `gh auth status`, `gh release create`, etc.
 # Pin the official GitHub apt repository so the version is controlled.
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -43,7 +50,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Rust toolchain ────────────────────────────────────────────────────────────
+# ── Create the amux user (idempotent in case base evolves) ────────────────────
+RUN { id -u amux >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/amux amux 2>/dev/null \
+       || useradd -s /bin/bash -d /home/amux amux ; } \
+    && mkdir -p /home/amux \
+    && chown -R amux:amux /home/amux
+
+# ── Rust toolchain (installed as root, then ownership transferred to amux) ────
 # Pin to the MSRV declared in Cargo.toml (rust-version = "1.94.0").
 # RUSTUP_HOME and CARGO_HOME are placed under /usr/local so the installation
 # is shared across all users without needing per-user ~/.cargo in PATH.
@@ -52,20 +66,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     RUST_VERSION=1.94.0 \
-    PATH=/usr/local/cargo/bin:$PATH
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN curl -sSf https://sh.rustup.rs \
         | sh -s -- --no-modify-path --default-toolchain ${RUST_VERSION} -y \
-    && rustup target add x86_64-unknown-linux-musl
+    && rustup target add x86_64-unknown-linux-musl \
+    && chown -R amux:amux $RUSTUP_HOME $CARGO_HOME
 
-# ── Cargo-installed dev tools ─────────────────────────────────────────────────
-# tokio-console 0.1.12 : live Tokio task inspector used during development
-#   (aspec/devops/localdev.md §tokio-console).
-# flamegraph 0.6.6     : cargo-flamegraph wraps perf to produce CPU flame
-#   graphs (aspec/devops/localdev.md §Flamegraph profiling).
-# --locked ensures the versions recorded in each crate's Cargo.lock are used,
-# making the install reproducible.
-RUN cargo install tokio-console --version 0.1.12 --locked \
-    && cargo install flamegraph --version 0.6.6 --locked
+USER amux
+ENV HOME=/home/amux
 
 WORKDIR /workspace

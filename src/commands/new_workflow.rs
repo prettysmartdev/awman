@@ -385,6 +385,7 @@ pub async fn run_new_workflow_with_sink(
             None,
             None,
             runtime,
+            None,
         )
         .await?;
 

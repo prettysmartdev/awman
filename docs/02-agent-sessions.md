@@ -88,18 +88,20 @@ Both `--model NAME` and `--model=NAME` forms are accepted in both the CLI and th
 
 The model name is passed verbatim to the agent's own model flag — amux does not validate the value. If the name is not recognised by the agent, the agent surfaces its own error. This means any model the agent supports can be used without amux needing updates when providers release new models.
 
-Per-agent translation:
+Per-agent translation and expected `<NAME>` format:
 
-| Agent | Flag appended |
-|-------|--------------|
-| `claude` | `--model <NAME>` |
-| `codex` | `--model <NAME>` |
-| `gemini` | `--model <NAME>` |
-| `opencode` | `--model <NAME>` |
-| `maki` | `--model <NAME>` |
-| `copilot` | *(not supported — a `WARNING:` is printed, flag omitted)* |
-| `crush` | `--model <NAME>` (on the `run` subcommand) |
-| `cline` | `--model <NAME>` (on the `task` subcommand) |
+| Agent | Flag appended | Expected format |
+|-------|--------------|-----------------|
+| `claude` | `--model <NAME>` | bare model ID (e.g. `claude-opus-4-6`) |
+| `codex` | `--model <NAME>` | bare model ID (e.g. `gpt-4o`) |
+| `gemini` | `--model <NAME>` | bare model ID (e.g. `gemini-2.0-flash`) |
+| `opencode` | `--model <NAME>` | **`provider/model` required** (e.g. `anthropic/claude-3-5-sonnet`) |
+| `maki` | `--model <NAME>` | `provider/model-id` (e.g. `anthropic/claude-opus-4-6`) |
+| `crush` | `--model <NAME>` (on the `run` subcommand) | bare model ID *or* `provider/model` to disambiguate when multiple providers expose the same model name |
+| `cline` | `--model <NAME>` (on the `task` subcommand) | bare model ID; the provider is selected separately via `cline auth -p <provider>` and is not switchable per-invocation |
+| `copilot` | *(not supported — a `WARNING:` is printed, flag omitted)* | — |
+
+For agents that support multiple providers (`opencode`, `crush`, `maki`), the `provider/model` slash form lets you target a specific provider when more than one is configured. amux passes the value through verbatim — the agent does the routing.
 
 If an agent does not support `--model`, a `WARNING:` is printed to stderr and the session launches without the flag — it is not aborted. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
 

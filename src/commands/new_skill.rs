@@ -259,6 +259,7 @@ pub async fn run_new_skill_with_sink(
             None,
             None,
             runtime,
+            None,
         )
         .await?;
 

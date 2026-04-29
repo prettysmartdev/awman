@@ -578,8 +578,12 @@ mod tests {
 
     #[test]
     fn effective_agent_stuck_timeout_returns_default_when_no_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
+        let tmp_config = TempDir::new().unwrap();
+        std::env::set_var("AMUX_CONFIG_HOME", tmp_config.path());
         let timeout = effective_agent_stuck_timeout(tmp.path());
+        std::env::remove_var("AMUX_CONFIG_HOME");
         assert_eq!(
             timeout,
             std::time::Duration::from_secs(DEFAULT_STUCK_TIMEOUT_SECS),

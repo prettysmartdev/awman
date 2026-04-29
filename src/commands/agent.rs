@@ -313,8 +313,15 @@ pub async fn run_agent_with_sink(
     agent_override: Option<String>,
     model: Option<&str>,
     runtime: &dyn crate::runtime::AgentRuntime,
+    // Callers that already know the git root (e.g. TUI, where the tab CWD may
+    // differ from the process CWD) should supply it here to avoid a redundant
+    // and potentially wrong `find_git_root()` call.
+    git_root_override: Option<PathBuf>,
 ) -> Result<()> {
-    let git_root = find_git_root().context("Not inside a Git repository")?;
+    let git_root = match git_root_override {
+        Some(gr) => gr,
+        None => find_git_root().context("Not inside a Git repository")?,
+    };
     let config = load_repo_config(&git_root)?;
     let config_agent = config.agent.as_deref().unwrap_or("claude").to_string();
     let agent = agent_override.as_deref().unwrap_or(&config_agent).to_string();
@@ -475,39 +482,28 @@ pub async fn run_agent_with_sink(
 
 /// Append agent-specific model-selection flag to the argument list.
 ///
-/// All currently supported agents use `--model <name>`. For agents where the flag
-/// is unconfirmed (`opencode`, `maki`), a `WARNING:` is emitted to stderr and the
-/// session proceeds without the flag rather than aborting.
+/// All currently supported agents use `--model <name>` as a direct CLI flag.
+/// Per-agent format expectations for `<name>`:
+/// - `claude`, `codex`, `gemini`: bare model ID (e.g. `claude-opus-4-6`, `gpt-4o`).
+/// - `opencode`: `provider/model` is **required** (e.g. `anthropic/claude-3-5-sonnet`).
+/// - `crush`: bare model ID *or* `provider/model` to disambiguate when multiple
+///   providers expose models with the same name. Flag goes on the `run` subcommand.
+/// - `maki`: `provider/model-id` (e.g. `anthropic/claude-opus-4-6`).
+/// - `cline`: bare model ID; the provider is selected separately via `cline auth -p`
+///   and is not switchable per-invocation through `--model`.
+/// - `copilot`: no CLI flag — model selection is via the `/model` interactive
+///   slash command, so `--model` is dropped with a warning.
 pub fn append_model_flag(args: &mut Vec<String>, agent: &str, model: &str) {
     match agent {
-        // These agents support --model <name> as a direct CLI flag.
-        // crush supports --model / -m on its `run` subcommand (same syntax).
-        "claude" | "codex" | "gemini" | "cline" | "crush" => {
+        "claude" | "codex" | "gemini" | "cline" | "crush" | "opencode" | "maki" => {
             args.push("--model".to_string());
             args.push(model.to_string());
         }
-        // copilot uses /model as an interactive slash command, not a CLI flag.
         "copilot" => {
             eprintln!(
                 "WARNING: --model: agent 'copilot' does not support --model as a CLI flag \
                  (model selection is via the /model interactive command); proceeding without the flag."
             );
-        }
-        "opencode" => {
-            eprintln!(
-                "WARNING: --model: agent 'opencode' may not support --model; \
-                 attempting to pass it anyway."
-            );
-            args.push("--model".to_string());
-            args.push(model.to_string());
-        }
-        "maki" => {
-            eprintln!(
-                "WARNING: --model: agent 'maki' may not support --model; \
-                 attempting to pass it anyway."
-            );
-            args.push("--model".to_string());
-            args.push(model.to_string());
         }
         _ => {
             eprintln!(
@@ -1486,32 +1482,37 @@ mod tests {
     }
 
     #[test]
-    fn append_model_flag_opencode_appends_flag_despite_warning() {
-        // opencode may not support --model; a warning is emitted but the flag is still appended.
+    fn append_model_flag_opencode_appends_provider_slash_model() {
+        // opencode requires `provider/model` format; amux passes the value through verbatim.
         let mut args = vec!["opencode".to_string()];
-        append_model_flag(&mut args, "opencode", "some-model");
-        assert!(
-            args.contains(&"--model".to_string()),
-            "--model must still be appended for opencode"
-        );
-        assert!(
-            args.contains(&"some-model".to_string()),
-            "model name must be present for opencode"
+        append_model_flag(&mut args, "opencode", "anthropic/claude-3-5-sonnet");
+        assert_eq!(
+            args,
+            vec!["opencode", "--model", "anthropic/claude-3-5-sonnet"]
         );
     }
 
     #[test]
-    fn append_model_flag_maki_appends_flag_despite_warning() {
-        // maki may not support --model; a warning is emitted but the flag is still appended.
+    fn append_model_flag_maki_appends_provider_slash_model() {
+        // maki accepts `provider/model-id`; amux passes the value through verbatim.
         let mut args = vec!["maki".to_string()];
-        append_model_flag(&mut args, "maki", "some-model");
-        assert!(
-            args.contains(&"--model".to_string()),
-            "--model must still be appended for maki"
-        );
-        assert!(
-            args.contains(&"some-model".to_string()),
-            "model name must be present for maki"
+        append_model_flag(&mut args, "maki", "anthropic/claude-opus-4-6");
+        assert_eq!(args, vec!["maki", "--model", "anthropic/claude-opus-4-6"]);
+    }
+
+    #[test]
+    fn append_model_flag_crush_accepts_provider_slash_model() {
+        // crush accepts either a bare model ID or `provider/model` to disambiguate.
+        let mut args = vec!["crush".to_string(), "run".to_string()];
+        append_model_flag(&mut args, "crush", "openrouter/anthropic/claude-sonnet-4");
+        assert_eq!(
+            args,
+            vec![
+                "crush",
+                "run",
+                "--model",
+                "openrouter/anthropic/claude-sonnet-4"
+            ]
         );
     }
 
@@ -1597,6 +1598,7 @@ mod tests {
             None,
             None,
             &runtime,
+            None,
         )
         .await;
 

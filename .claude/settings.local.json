@@ -130,7 +130,22 @@
       "Bash(sudo chmod *)",
       "Bash(CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/tmp/amux-target cargo check)",
       "Bash(CARGO_TARGET_DIR=/tmp/amux-target cargo check)",
-      "Bash(CARGO_HOME=/tmp/amux-cargo CARGO_TARGET_DIR=/tmp/amux-target cargo check)"
+      "Bash(CARGO_HOME=/tmp/amux-cargo CARGO_TARGET_DIR=/tmp/amux-target cargo check)",
+      "Bash(./target/release/amux agent *)",
+      "Bash(ln -sf /etc/hostname /tmp/test-link)",
+      "Bash(install -m 0755 /tmp/test-link /tmp/test-copy)",
+      "Bash(rm /tmp/test-link /tmp/test-copy)",
+      "WebFetch(domain:opencode.ai)",
+      "WebFetch(domain:docs.cline.bot)",
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(export PATH=\"/root/.cargo/bin:$PATH\")",
+      "Bash(export PATH=\"/usr/local/cargo/bin:$PATH\" CARGO_TARGET_DIR=/tmp/amux-target)",
+      "Bash(CARGO_TARGET_DIR=/home/amux/.cache/amux-target PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin cargo --version)",
+      "Bash(CARGO_TARGET_DIR=/home/amux/.cache/amux-target PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin cargo build -q --offline)",
+      "Bash(rm /tmp/symlink-probe/cargo /tmp/symlink-probe/rustc)",
+      "Bash(rmdir /tmp/symlink-probe)",
+      "Bash(./target/release/amux --version)",
+      "Bash(./target/release/amux --help)"
     ]
   }
 }

@@ -139,6 +139,7 @@ pub async fn run_with_sink(
         agent_override,
         model,
         runtime,
+        None,
     )
     .await
 }
