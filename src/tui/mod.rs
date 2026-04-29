@@ -739,8 +739,8 @@ async fn handle_action(app: &mut App, action: Action) {
             launch_init(app, agent, aspec, replace_aspec, run_audit, work_items).await;
         }
 
-        Action::AgentSetupAccepted { agent } => {
-            handle_agent_setup_accepted(app, agent).await;
+        Action::AgentSetupAccepted { agent, image_only } => {
+            handle_agent_setup_accepted(app, agent, image_only).await;
         }
 
         Action::AgentSetupFallbackAccepted { declined_agent, default_agent } => {
@@ -942,7 +942,7 @@ fn run_git_interactive(app: &mut App, cwd: &std::path::Path, args: &[&str]) -> b
 /// task completes `check_audit_continuation` detects `AuditPhase::AgentSetupBuild` and
 /// re-calls `launch_pending_command`, which re-enters `launch_implement` and finds the
 /// Dockerfile now present.
-async fn handle_agent_setup_accepted(app: &mut App, agent: String) {
+async fn handle_agent_setup_accepted(app: &mut App, agent: String, image_only: bool) {
     let tab_cwd = app.active_tab().cwd.clone();
     let git_root = match find_git_root_from(&tab_cwd) {
         Some(r) => r,
@@ -961,16 +961,30 @@ async fn handle_agent_setup_accepted(app: &mut App, agent: String) {
     let tx = app.active_tab().output_tx.clone();
 
     spawn_text_command(tx, exit_tx, move |sink| async move {
-        let available = crate::commands::agent::ensure_agent_available(
-            &git_root,
-            &agent,
-            &sink,
-            runtime.as_ref(),
-            |_| Ok(true), // user already confirmed via dialog
-        )
-        .await?;
-        if !available {
-            anyhow::bail!("Agent '{}' setup failed.", agent);
+        if image_only {
+            // Dockerfile already exists; just build the agent image.
+            let ok = crate::commands::agent::build_agent_image(
+                &git_root,
+                &agent,
+                &sink,
+                runtime.as_ref(),
+            )?;
+            if !ok {
+                anyhow::bail!("Agent '{}' image build failed.", agent);
+            }
+        } else {
+            // Dockerfile missing — download and build.
+            let available = crate::commands::agent::ensure_agent_available(
+                &git_root,
+                &agent,
+                &sink,
+                runtime.as_ref(),
+                |_| Ok(true), // user already confirmed via dialog
+            )
+            .await?;
+            if !available {
+                anyhow::bail!("Agent '{}' setup failed.", agent);
+            }
         }
         Ok(())
     });
@@ -2618,13 +2632,32 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
                 agent: agent_name.clone(),
                 default_agent: config_default,
                 from_workflow: false,
+                image_only: false,
             };
             return;
         } else if !app.runtime.image_exists(&image_tag) {
-            app.active_tab_mut().push_output(format!(
-                "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-            ));
-            app.active_tab_mut().finish_command(1);
+            // Image missing — prompt to build it, then re-launch.
+            let config_default = agent_name.clone();
+            app.active_tab_mut().pending_command = PendingCommand::Implement {
+                agent: agent_override.clone(),
+                model: model.clone(),
+                work_item,
+                non_interactive,
+                plan,
+                allow_docker,
+                workflow: workflow_path.clone(),
+                worktree,
+                mount_ssh,
+                yolo,
+                auto,
+                overlay: overlay.clone(),
+            };
+            app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+                agent: agent_name.clone(),
+                default_agent: config_default,
+                from_workflow: false,
+                image_only: true,
+            };
             return;
         }
     }
@@ -2730,7 +2763,8 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
                     agent: missing,
                     default_agent: agent_name.clone(),
                     from_workflow: true,
-                };
+                image_only: false,
+            };
                 return;
             }
             map
@@ -2780,17 +2814,48 @@ async fn launch_implement(app: &mut App, work_item: u32, non_interactive: bool, 
         }
         // Validate the step's agent Dockerfile and image.
         if !agent_dockerfile_path.exists() {
-            app.active_tab_mut().push_output(format!(
-                "Error: agent '{}' Dockerfile not found. Run `amux ready` to build it.",
-                step_agent
-            ));
-            app.active_tab_mut().finish_command(1);
+            app.active_tab_mut().pending_command = PendingCommand::Implement {
+                agent: agent_override.clone(),
+                model: model.clone(),
+                work_item,
+                non_interactive,
+                plan,
+                allow_docker,
+                workflow: workflow_path.clone(),
+                worktree,
+                mount_ssh,
+                yolo,
+                auto,
+                overlay: overlay.clone(),
+            };
+            app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+                agent: step_agent.clone(),
+                default_agent: agent_name.clone(),
+                from_workflow: true,
+                image_only: false,
+            };
             return;
         } else if !app.runtime.image_exists(&image_tag) {
-            app.active_tab_mut().push_output(format!(
-                "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-            ));
-            app.active_tab_mut().finish_command(1);
+            app.active_tab_mut().pending_command = PendingCommand::Implement {
+                agent: agent_override.clone(),
+                model: model.clone(),
+                work_item,
+                non_interactive,
+                plan,
+                allow_docker,
+                workflow: workflow_path.clone(),
+                worktree,
+                mount_ssh,
+                yolo,
+                auto,
+                overlay: overlay.clone(),
+            };
+            app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+                agent: step_agent.clone(),
+                default_agent: agent_name.clone(),
+                from_workflow: true,
+                image_only: true,
+            };
             return;
         }
         effective_agent = step_agent.clone();
@@ -3031,13 +3096,28 @@ async fn launch_chat(app: &mut App, non_interactive: bool, plan: bool, allow_doc
             agent: agent_name.clone(),
             default_agent: agent_name.clone(),
             from_workflow: false,
-        };
+                image_only: false,
+            };
         return;
     } else if !app.runtime.image_exists(&image_tag) {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-        ));
-        app.active_tab_mut().finish_command(1);
+        // Image missing — prompt to build it, then re-launch.
+        app.active_tab_mut().pending_command = PendingCommand::Chat {
+            agent: agent_override.clone(),
+            model: model.clone(),
+            non_interactive,
+            plan,
+            allow_docker,
+            mount_ssh,
+            yolo,
+            auto,
+            overlay: overlay.clone(),
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: agent_name.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: false,
+            image_only: true,
+        };
         return;
     }
 
@@ -3291,13 +3371,29 @@ async fn launch_exec_prompt(
             agent: agent_name.clone(),
             default_agent: agent_name.clone(),
             from_workflow: false,
-        };
+                image_only: false,
+            };
         return;
     } else if !app.runtime.image_exists(&image_tag) {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-        ));
-        app.active_tab_mut().finish_command(1);
+        // Image missing — prompt to build it, then re-launch.
+        app.active_tab_mut().pending_command = PendingCommand::ExecPrompt {
+            prompt: prompt.to_string(),
+            agent: agent_override.clone(),
+            model: model.clone(),
+            non_interactive,
+            plan,
+            allow_docker,
+            mount_ssh,
+            yolo,
+            auto,
+            overlay: overlay.clone(),
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: agent_name.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: false,
+            image_only: true,
+        };
         return;
     }
 
@@ -3704,6 +3800,7 @@ async fn launch_exec_workflow(
                 agent: missing,
                 default_agent: agent_name.clone(),
                 from_workflow: true,
+                image_only: false,
             };
             return;
         }
@@ -3751,16 +3848,48 @@ async fn launch_exec_workflow(
     }
 
     if !agent_dockerfile_path.exists() {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent '{}' Dockerfile not found. Run `amux ready` to build it.", step_agent
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().pending_command = PendingCommand::ExecWorkflow {
+            workflow: workflow_path.clone(),
+            work_item,
+            agent: agent_override.clone(),
+            model: model.clone(),
+            non_interactive,
+            plan,
+            allow_docker,
+            worktree,
+            mount_ssh,
+            yolo,
+            auto,
+            overlay: overlay.clone(),
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: step_agent.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: true,
+            image_only: false,
+        };
         return;
     } else if !app.runtime.image_exists(&image_tag) {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().pending_command = PendingCommand::ExecWorkflow {
+            workflow: workflow_path.clone(),
+            work_item,
+            agent: agent_override.clone(),
+            model: model.clone(),
+            non_interactive,
+            plan,
+            allow_docker,
+            worktree,
+            mount_ssh,
+            yolo,
+            auto,
+            overlay: overlay.clone(),
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: step_agent.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: true,
+            image_only: true,
+        };
         return;
     }
     let effective_agent = step_agent.clone();
@@ -5080,17 +5209,28 @@ async fn launch_specs_amend(app: &mut App, work_item: u32, allow_docker: bool) {
     let (image_tag, agent_dockerfile_path) =
         crate::commands::agent::resolve_agent_image_and_dockerfile(&git_root, &agent_name);
     if !agent_dockerfile_path.exists() {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent '{}' Dockerfile not found. Run `amux ready` to build agent images.",
-            agent_name
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().pending_command = PendingCommand::SpecsAmend {
+            work_item,
+            allow_docker,
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: agent_name.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: false,
+            image_only: false,
+        };
         return;
     } else if !app.runtime.image_exists(&image_tag) {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().pending_command = PendingCommand::SpecsAmend {
+            work_item,
+            allow_docker,
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: agent_name.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: false,
+            image_only: true,
+        };
         return;
     }
 
@@ -5219,17 +5359,34 @@ async fn launch_specs_interview_agent(
     let (image_tag, agent_dockerfile_path) =
         crate::commands::agent::resolve_agent_image_and_dockerfile(&git_root, &agent_name);
     if !agent_dockerfile_path.exists() {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent '{}' Dockerfile not found. Run `amux ready` to build agent images.",
-            agent_name
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().pending_command = PendingCommand::SpecsNewInterview {
+            work_item_number,
+            kind: kind.clone(),
+            title: title.clone(),
+            summary: summary.clone(),
+            allow_docker,
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: agent_name.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: false,
+            image_only: false,
+        };
         return;
     } else if !app.runtime.image_exists(&image_tag) {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().pending_command = PendingCommand::SpecsNewInterview {
+            work_item_number,
+            kind: kind.clone(),
+            title: title.clone(),
+            summary: summary.clone(),
+            allow_docker,
+        };
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: agent_name.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: false,
+            image_only: true,
+        };
         return;
     }
 
@@ -5611,17 +5768,20 @@ async fn launch_next_workflow_step(app: &mut App) {
     let (image_tag, agent_dockerfile_path) =
         crate::commands::agent::resolve_agent_image_and_dockerfile(&git_root, &step_agent);
     if !agent_dockerfile_path.exists() {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent '{}' Dockerfile not found. Run `amux ready` to build agent images.",
-            step_agent
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: step_agent.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: true,
+            image_only: false,
+        };
         return;
     } else if !app.runtime.image_exists(&image_tag) {
-        app.active_tab_mut().push_output(format!(
-            "Error: agent image {} not found. Run `amux ready` to build it.", image_tag
-        ));
-        app.active_tab_mut().finish_command(1);
+        app.active_tab_mut().dialog = Dialog::AgentSetupConfirm {
+            agent: step_agent.clone(),
+            default_agent: agent_name.clone(),
+            from_workflow: true,
+            image_only: true,
+        };
         return;
     }
 

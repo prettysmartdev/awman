@@ -307,7 +307,7 @@ pub enum Dialog {
         dir: String,
         input: String,
     },
-    /// Agent setup: agent Dockerfile is missing — ask whether to download and build it.
+    /// Agent setup: agent Dockerfile is missing or image not built — ask whether to set up.
     AgentSetupConfirm {
         /// The agent name that needs setup.
         agent: String,
@@ -316,6 +316,9 @@ pub enum Dialog {
         /// `true` when triggered by a workflow step (`implement --workflow`);
         /// `false` when triggered by `chat` or a non-workflow `implement`.
         from_workflow: bool,
+        /// `true` when the Dockerfile exists but the image is not built;
+        /// `false` when the Dockerfile itself is missing.
+        image_only: bool,
     },
     /// Remote run: show a picker to choose a session from the remote host.
     RemoteSessionPicker {

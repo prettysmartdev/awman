@@ -105,8 +105,9 @@ pub enum Action {
     WorktreePreCommitCommit { message: String },
     /// Copy the current terminal text selection to the system clipboard.
     CopyToClipboard,
-    /// Agent setup dialog: user accepted downloading and building the missing agent Dockerfile.
-    AgentSetupAccepted { agent: String },
+    /// Agent setup dialog: user accepted setting up the agent.
+    /// `image_only` is true when the Dockerfile exists but the image is not built.
+    AgentSetupAccepted { agent: String, image_only: bool },
     /// Agent setup dialog: user declined setup but accepted falling back to the default agent.
     AgentSetupFallbackAccepted { declined_agent: String, default_agent: String },
     /// Agent setup dialog: user declined downloading and building the missing agent Dockerfile.
@@ -230,7 +231,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         Dialog::ClawsReadySudoConfirm { password } => {
             return handle_claws_sudo_confirm(app.active_tab_mut(), key, password)
         }
-        Dialog::AgentSetupConfirm { agent, default_agent, from_workflow: _ } => {
+        Dialog::AgentSetupConfirm { agent, default_agent, from_workflow: _, image_only: _ } => {
             return handle_agent_setup_confirm(app.active_tab_mut(), key, agent, default_agent)
         }
         Dialog::WorkflowStepConfirm { completed_step, next_steps } => {
@@ -1331,8 +1332,9 @@ fn handle_claws_sudo_confirm(tab: &mut TabState, key: KeyEvent, mut password: St
 fn handle_agent_setup_confirm(tab: &mut TabState, key: KeyEvent, agent: String, default_agent: String) -> Action {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            let image_only = matches!(tab.dialog, Dialog::AgentSetupConfirm { image_only: true, .. });
             tab.dialog = Dialog::None;
-            Action::AgentSetupAccepted { agent }
+            Action::AgentSetupAccepted { agent, image_only }
         }
         KeyCode::Char('f') | KeyCode::Char('F') if agent != default_agent => {
             // Offer fallback to the default agent without attempting download.

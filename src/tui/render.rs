@@ -1156,33 +1156,76 @@ or n or 2 (or Esc) to cancel.  ".to_string(),
                 input
             ),
         ),
-        Dialog::AgentSetupConfirm { agent, default_agent, from_workflow } => (
+        Dialog::AgentSetupConfirm { agent, default_agent, from_workflow, image_only } => (
             " Agent Setup Required ",
             if !from_workflow {
-                format!(
-                    "  The '{}' agent is not set up. Its Dockerfile is not present.\n\n  \
-                     Download the Dockerfile template from GitHub and build the agent image?\n\n  \
-                     [y/Enter] Yes, download and build\n  \
-                     [n/Esc]   No, cancel  ",
-                    agent
-                )
+                if *image_only {
+                    format!(
+                        "  The '{}' agent image is not built.
+
+  \n                         Build the agent image now?
+
+  \n                         [y/Enter] Yes, build
+  \n                         [n/Esc]   No, cancel  ",
+                        agent
+                    )
+                } else {
+                    format!(
+                        "  The '{}' agent is not set up. Its Dockerfile is not present.
+
+  \n                         Download the Dockerfile template from GitHub and build the agent image?
+
+  \n                         [y/Enter] Yes, download and build
+  \n                         [n/Esc]   No, cancel  ",
+                        agent
+                    )
+                }
             } else if agent != default_agent {
-                format!(
-                    "  Workflow step requires the '{}' agent, but its Dockerfile is not present.\n\n  \
-                     Download the Dockerfile template from GitHub and build the agent image?\n\n  \
-                     [y/Enter] Yes, download and build\n  \
-                     [f]       Use '{}' instead (default agent)\n  \
-                     [n/Esc]   No, cancel workflow  ",
-                    agent, default_agent
-                )
+                if *image_only {
+                    format!(
+                        "  Workflow step requires the '{}' agent, but its image is not built.
+
+  \n                         Build the agent image now?
+
+  \n                         [y/Enter] Yes, build
+  \n                         [f]       Use '{}' instead (default agent)
+  \n                         [n/Esc]   No, cancel workflow  ",
+                        agent, default_agent
+                    )
+                } else {
+                    format!(
+                        "  Workflow step requires the '{}' agent, but its Dockerfile is not present.
+
+  \n                         Download the Dockerfile template from GitHub and build the agent image?
+
+  \n                         [y/Enter] Yes, download and build
+  \n                         [f]       Use '{}' instead (default agent)
+  \n                         [n/Esc]   No, cancel workflow  ",
+                        agent, default_agent
+                    )
+                }
             } else {
-                format!(
-                    "  Workflow step requires the '{}' agent, but its Dockerfile is not present.\n\n  \
-                     Download the Dockerfile template from GitHub and build the agent image?\n\n  \
-                     [y/Enter] Yes, download and build\n  \
-                     [n/Esc]   No, cancel workflow  ",
-                    agent
-                )
+                if *image_only {
+                    format!(
+                        "  Workflow step requires the '{}' agent, but its image is not built.
+
+  \n                         Build the agent image now?
+
+  \n                         [y/Enter] Yes, build
+  \n                         [n/Esc]   No, cancel workflow  ",
+                        agent
+                    )
+                } else {
+                    format!(
+                        "  Workflow step requires the '{}' agent, but its Dockerfile is not present.
+
+  \n                         Download the Dockerfile template from GitHub and build the agent image?
+
+  \n                         [y/Enter] Yes, download and build
+  \n                         [n/Esc]   No, cancel workflow  ",
+                        agent
+                    )
+                }
             },
         ),
         Dialog::None => return,

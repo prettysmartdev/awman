@@ -169,6 +169,63 @@ where
     }
 }
 
+/// Build an agent image from an existing Dockerfile.
+///
+/// Called from the TUI when the user accepts the `AgentSetupConfirm` dialog
+/// with `image_only: true` — the Dockerfile is already present but the
+/// Docker image has not been built yet.
+///
+/// Returns:
+/// - `Ok(true)`  — the image was built successfully.
+/// - `Ok(false)` — the build failed (error printed via `out`).
+/// - `Err(_)`    — the project base image is not built.
+pub fn build_agent_image(
+    git_root: &std::path::Path,
+    agent_name: &str,
+    out: &OutputSink,
+    runtime: &dyn crate::runtime::AgentRuntime,
+) -> Result<bool> {
+    let agent_dockerfile = git_root.join(".amux").join(format!("Dockerfile.{}", agent_name));
+    if !agent_dockerfile.exists() {
+        anyhow::bail!(
+            "Agent '{}' Dockerfile not found at {}",
+            agent_name,
+            agent_dockerfile.display()
+        );
+    }
+    let agent_tag = agent_image_tag(git_root, agent_name);
+    if runtime.image_exists(&agent_tag) {
+        return Ok(true);
+    }
+    let project_base = project_image_tag(git_root);
+    if !runtime.image_exists(&project_base) {
+        anyhow::bail!(
+            "Project base image {} is not built. Run `amux ready` first.",
+            project_base
+        );
+    }
+    out.println(format!("Agent image {} not found. Building from {}…", agent_tag, agent_dockerfile.display()));
+    let git_root_str = git_root.to_str().unwrap_or(".");
+    let out_clone = out.clone();
+    let build_result = runtime.build_image_streaming(
+        &agent_tag,
+        &agent_dockerfile,
+        std::path::Path::new(git_root_str),
+        false,
+        &mut |line| { out_clone.println(line); },
+    );
+    match build_result {
+        Ok(_) => {
+            out.println(format!("Agent image {} built successfully.", agent_tag));
+            Ok(true)
+        }
+        Err(e) => {
+            out.println(format!("Error: failed to build agent image {}: {}", agent_tag, e));
+            Ok(false)
+        }
+    }
+}
+
 /// CLI mode: ensure the requested agent is available, prompting via stdin.
 ///
 /// If the agent Dockerfile is missing and the user declines to download/build it,
@@ -607,12 +664,14 @@ mod tests {
     /// Minimal `AgentRuntime` stub for `ensure_agent_available` unit tests.
     /// Tracks `build_image_streaming` calls; all container-run methods panic.
     struct MockRuntime {
-        /// Returned by `image_exists` for every tag query.
+        /// Returned by `image_exists` for every tag query (unless overridden by absent_tags).
         project_image_exists: bool,
         /// When `false`, `build_image_streaming` returns an error.
         builds_succeed: bool,
         /// Records every image tag passed to `build_image_streaming`.
         built_tags: std::sync::Mutex<Vec<String>>,
+        /// When set, tags containing any of these substrings report as absent.
+        absent_tags: Option<Vec<String>>,
     }
 
     impl MockRuntime {
@@ -622,6 +681,17 @@ mod tests {
                 project_image_exists: true,
                 builds_succeed: true,
                 built_tags: std::sync::Mutex::new(vec![]),
+                absent_tags: None,
+            }
+        }
+
+        /// Runtime where the project base image exists, but specific agent tags are absent.
+        fn with_absent_agent_tags(tags: Vec<String>) -> Self {
+            Self {
+                project_image_exists: true,
+                builds_succeed: true,
+                built_tags: std::sync::Mutex::new(vec![]),
+                absent_tags: Some(tags),
             }
         }
 
@@ -635,7 +705,16 @@ mod tests {
         fn check_socket(&self) -> anyhow::Result<std::path::PathBuf> {
             Ok(std::path::PathBuf::from("/var/run/mock.sock"))
         }
-        fn image_exists(&self, _tag: &str) -> bool { self.project_image_exists }
+        fn image_exists(&self, tag: &str) -> bool {
+            // If a specific set of absent tags is configured, check against it.
+            // Otherwise fall back to the project_image_exists flag.
+            if let Some(absent) = self.absent_tags.as_ref() {
+                if absent.iter().any(|t| tag.contains(t)) {
+                    return false;
+                }
+            }
+            self.project_image_exists
+        }
         fn name(&self) -> &'static str { "mock" }
         fn cli_binary(&self) -> &'static str { "mock" }
 
@@ -767,6 +846,34 @@ mod tests {
         assert_eq!(result.unwrap(), true, "must return true when Dockerfile already exists");
     }
 
+    #[test]
+    fn build_agent_image_builds_when_dockerfile_exists_but_image_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create .amux/Dockerfile.codex so the agent Dockerfile is already present.
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(amux_dir.join("Dockerfile.codex"), "FROM ubuntu
+").unwrap();
+
+        // Project base image exists, but agent image is absent.
+        let runtime = MockRuntime::with_absent_agent_tags(vec!["codex".to_string()]);
+        let (tx, _rx) = unbounded_channel();
+        let sink = OutputSink::Channel(tx);
+
+        let result = build_agent_image(
+            tmp.path(),
+            "codex",
+            &sink,
+            &runtime,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "must return true after building image from existing Dockerfile");
+        // Verify the agent image was actually built.
+        let tags = runtime.built_tags();
+        assert!(tags.iter().any(|t| t.contains("codex")), "agent image must be built; got built tags: {:?}", tags);
+    }
+
     #[tokio::test]
     async fn ensure_agent_available_returns_false_on_http_connection_failure() {
         // When the HTTP download fails (connection refused), ensure_agent_available must
@@ -830,6 +937,7 @@ mod tests {
             project_image_exists: true,
             builds_succeed: false,
             built_tags: std::sync::Mutex::new(vec![]),
+            absent_tags: None,
         };
         let (tx, _rx) = unbounded_channel();
         let sink = OutputSink::Channel(tx);
