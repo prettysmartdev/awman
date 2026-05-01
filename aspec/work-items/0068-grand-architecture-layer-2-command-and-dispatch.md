@@ -16,8 +16,8 @@ The four tenets are restated for emphasis:
 
 The companion work items are:
 
-- `0066-grand-architecture-foundation-and-layer-0-data.md` (must be merged)
-- `0067-grand-architecture-layer-1-engines.md` (must be merged)
+- `0066-grand-architecture-foundation-and-layer-0-data.md` (already merged)
+- `0067-grand-architecture-layer-1-engines.md` (already merged)
 - `0069-grand-architecture-layer-3-frontends-and-binary.md`
 - `0070-grand-architecture-finalize-and-remove-oldsrc.md`
 
