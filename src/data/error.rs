@@ -54,6 +54,12 @@ pub enum DataError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("workflow step has a missing dependency: step '{step}' depends on '{missing}'")]
+    MissingDependency { step: String, missing: String },
+
+    #[error("workflow contains a cycle involving step '{step}'")]
+    CyclicDependency { step: String },
+
     #[error("workflow state error: {0}")]
     WorkflowState(String),
 

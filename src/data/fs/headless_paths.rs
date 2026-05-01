@@ -87,6 +87,51 @@ impl HeadlessPaths {
         self.root.join(TLS_SUBDIR)
     }
 
+    /// Headless server PID file.
+    pub fn pid_file(&self) -> PathBuf {
+        self.root.join("amux.pid")
+    }
+
+    /// Headless server log file.
+    pub fn log_file(&self) -> PathBuf {
+        self.root.join("amux.log")
+    }
+
+    /// API key hash file (mode 0o600 on Unix).
+    pub fn api_key_hash_file(&self) -> PathBuf {
+        self.root.join("api_key.hash")
+    }
+
+    /// Workflow state file for a single command run.
+    pub fn command_workflow_state_path(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("workflow.state.json")
+    }
+
+    /// Metadata file for a single command run.
+    pub fn command_metadata_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id).join("metadata.json")
+    }
+
+    /// Per-session worktree directory.
+    pub fn session_worktree_dir(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("worktree")
+    }
+
+    /// Per-session agent settings directory.
+    pub fn session_agent_settings_dir(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("agent-settings")
+    }
+
+    /// Alias for `from_root` to match the legacy `at_root` naming.
+    pub fn at_root(root: impl Into<PathBuf>) -> Self {
+        Self::from_root(root)
+    }
+
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
         std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))

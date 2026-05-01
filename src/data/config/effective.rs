@@ -24,6 +24,17 @@ pub struct EffectiveConfig {
     global: GlobalConfig,
 }
 
+impl Default for EffectiveConfig {
+    fn default() -> Self {
+        Self::new(
+            FlagConfig::default(),
+            crate::data::config::env::EnvSnapshot::default(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        )
+    }
+}
+
 impl EffectiveConfig {
     /// Construct a merged view from the four source layers.
     ///

@@ -1,0 +1,111 @@
+//! `NextAction`, `AvailableActions`, `StepFailureChoice`, `YoloTickOutcome`.
+
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextAction {
+    /// Launch a fresh container for the next ready step.
+    LaunchNext,
+    /// Push an additional prompt into the still-running container, keeping it
+    /// alive for the next step. Only valid when the next step targets the
+    /// same agent and the running container supports prompt injection.
+    ContinueInCurrentContainer { prompt: String },
+    /// Re-run the step that just completed.
+    RestartCurrentStep,
+    /// Revert to the immediately-previous step in topological order.
+    CancelToPreviousStep,
+    /// Mark every remaining step as Skipped and the workflow as completed.
+    /// Only valid when the current step is the last in topological order.
+    FinishWorkflow,
+    /// Pause execution after the current step completes.
+    Pause,
+    /// Abort the workflow entirely.
+    Abort,
+}
+
+/// Set of `NextAction` variants the frontend may present to the user. The
+/// engine computes this set; the frontend renders only what it permits.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AvailableActions {
+    pub can_continue_in_current_container: bool,
+    pub can_launch_next: bool,
+    pub can_restart_current_step: bool,
+    pub can_cancel_to_previous_step: bool,
+    pub can_finish_workflow: bool,
+    pub can_pause: bool,
+    pub can_abort: bool,
+    pub continue_unavailable_reason: Option<String>,
+    pub cancel_to_previous_unavailable_reason: Option<String>,
+    pub finish_workflow_unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepFailureChoice {
+    Retry,
+    Pause,
+    Abort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YoloTickOutcome {
+    Continue,
+    Cancel,
+    AdvanceNow,
+}
+
+/// What `step_once` returned: the step that just executed plus its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOutcome {
+    pub step_name: String,
+    pub status: WorkflowStepStatus,
+    pub remaining: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowStepStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed { exit_code: i32 },
+    Cancelled,
+    Skipped,
+}
+
+/// What `run_to_completion` returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowOutcome {
+    Completed,
+    Paused,
+    Aborted,
+    Failed { last_step: String, exit_code: i32 },
+}
+
+/// What the engine produces while a step's container streams output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOutput {
+    pub step_name: String,
+    pub kind: StepOutputKind,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutputKind {
+    Stdout,
+    Stderr,
+}
+
+/// Information that `WorkflowFrontend::confirm_resume` receives when a
+/// persisted workflow's hash differs from the current parsed file's hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeMismatch {
+    pub workflow_name: String,
+    pub saved_hash: String,
+    pub current_hash: String,
+    pub message: String,
+}
+
+/// Yolo-countdown tick metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoloTick {
+    pub remaining: Duration,
+}
