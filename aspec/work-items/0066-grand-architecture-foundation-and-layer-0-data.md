@@ -145,7 +145,9 @@ pub mod frontend;   // empty until 0069
 
 ### 3. Implement Layer 0 (`src/data/`)
 
-The grand architecture explicitly enumerates what belongs in Layer 0. Every item below MUST be implemented in this work item:
+The grand architecture explicitly enumerates what belongs in Layer 0. Every item below MUST be implemented in this work item.
+
+**PARITY MANDATE**: Layer 0 sits at the storage boundary. Anything users have on disk today (config files, sqlite db, workflow state files, api-key hash, PID file) MUST remain readable and writable by the new code without any user-visible migration. The "Compatibility Inventory" subsections below pin the exact schemas, field names, file paths, env-var names, and on-disk formats that MUST be preserved byte-for-byte. **These are NOT design suggestions — they are contracts with existing user data.**
 
 #### 3a. `Session` and `SessionState` (`src/data/session.rs`)
 
@@ -224,23 +226,294 @@ Move every config concern out of `oldsrc/config/mod.rs` (1636 lines) into struct
 - `env.rs` — typed reads of every env var amux honors. Each var is a constant + a typed read method on a `Env` struct or namespace, never a scattered `std::env::var("AMUX_…")` call.
 - `flags.rs` — typed flag values that survive across the layers. Frontends parse user input into these structs and pass them down. (Concrete `clap` definitions still live in Layer 2's Dispatch in 0068; *this* file just defines the typed flag value structs.)
 
-Define a single `EffectiveConfig` type that owns the merged view (repo + global + env + flags) and exposes typed accessors that today exist as scattered free `pub fn` calls in `oldsrc/config/mod.rs` (`effective_env_passthrough`, `effective_yolo_disallowed_tools`, `effective_scrollback_lines`, `effective_agent_stuck_timeout`, `effective_headless_work_dirs`, `effective_always_non_interactive`, `effective_remote_default_addr`, `effective_remote_default_api_key`, `effective_remote_saved_dirs`). Each becomes a method on `EffectiveConfig`.
+Define a single `EffectiveConfig` type that owns the merged view (repo + global + env + flags) and exposes typed accessors that today exist as scattered free `pub fn` calls in `oldsrc/config/mod.rs` (`effective_env_passthrough`, `effective_yolo_disallowed_tools`, `effective_scrollback_lines`, `effective_agent_stuck_timeout`, `effective_headless_work_dirs`, `effective_remote_default_addr`, `effective_remote_default_api_key`, `effective_remote_saved_dirs`). Each becomes a method on `EffectiveConfig`. Note: `effective_always_non_interactive` is dropped — the top-level global config field it read was never used. Non-interactive mode for agent containers is now controlled exclusively by `GlobalConfig::headless.alwaysNonInteractive` (read directly by `Dispatch`) and the `--non-interactive` CLI flag.
 
 `Session` owns an `EffectiveConfig` (or constructs one on demand).
+
+##### Compatibility Inventory — JSON schema (parity-critical)
+
+**Repository config** — `<git_root>/.amux/config.json`. Field-by-field schema; the JSON keys are load-bearing — mixed snake_case + camelCase is the contract:
+
+| Rust field | JSON key | Type | Default | Notes |
+|---|---|---|---|---|
+| `agent` | `agent` (snake) | `Option<String>` | `None` (inherits global `default_agent`) | Validates against canonical agent enum |
+| `auto_agent_auth_accepted` | `auto_agent_auth_accepted` (snake) | `Option<bool>` | `None` | **Read-only via CLI**; set by auto-auth flow only — `EffectiveConfig` exposes a getter, **no setter via `amux config set`** |
+| `terminal_scrollback_lines` | `terminal_scrollback_lines` (snake) | `Option<usize>` | `10_000` | Must be `> 0` |
+| `yolo_disallowed_tools` | `yoloDisallowedTools` (camel) | `Option<Vec<String>>` | `None` | Empty string clears (becomes `Some(vec![])`) |
+| `env_passthrough` | `envPassthrough` (camel) | `Option<Vec<String>>` | `None` | Empty string explicitly clears |
+| `work_items` | `workItems` (camel) | `Option<WorkItemsConfig>` | `None` | Nested |
+| `work_items.dir` | `dir` (snake within nested) | `Option<String>` | `None` | Path-escape validated via `validate_path_within_git_root` |
+| `work_items.template` | `template` (snake within nested) | `Option<String>` | `None` | Same path-escape validation |
+| `overlays` | `overlays` (snake) | `Option<OverlaysConfig>` | `None` | Nested |
+| `overlays.directories[]` | `directories` (snake) | `Option<Vec<DirectoryOverlayConfig>>` | `None` | |
+| `overlays.directories[].host` | `host` | `String` | required | Tilde-expanded, made absolute |
+| `overlays.directories[].container` | `container` | `String` | required | Must be absolute path |
+| `overlays.directories[].permission` | `permission` | `Option<String>` | `"ro"` when absent | Must be `"ro"` or `"rw"` |
+| `agent_stuck_timeout_secs` | `agentStuckTimeout` (camel — note: NO `Secs` suffix in JSON) | `Option<u64>` | `30` | Must be `> 0` |
+
+**Global config** — `$HOME/.amux/config.json`:
+
+| Rust field | JSON key | Type | Default | Notes |
+|---|---|---|---|---|
+| `default_agent` | `default_agent` (snake) | `Option<String>` | `"claude"` | |
+| `terminal_scrollback_lines` | `terminal_scrollback_lines` (snake) | `Option<usize>` | `10_000` | |
+| `runtime` | `runtime` (snake) | `Option<String>` | `"docker"` | Must be `"docker"` or `"apple-containers"`; `apple-containers` falls back to `docker` on non-mac with a warning |
+| `yolo_disallowed_tools` | `yoloDisallowedTools` (camel) | `Option<Vec<String>>` | `None` | |
+| `env_passthrough` | `envPassthrough` (camel) | `Option<Vec<String>>` | `None` | |
+| `headless` | `headless` (snake) | `Option<HeadlessConfig>` | `None` | Nested |
+| `headless.work_dirs` | `workDirs` (camel) | `Option<Vec<String>>` | `None` | Absolute paths, canonicalized at server start |
+| `headless.always_non_interactive` | `alwaysNonInteractive` (camel) | `Option<bool>` | `false` | Drives `--non-interactive` injection for `chat`, `ready`, `exec prompt`, `exec workflow`, `specs amend` |
+| `remote` | `remote` (snake) | `Option<RemoteConfig>` | `None` | Nested |
+| `remote.default_addr` | `defaultAddr` (camel) | `Option<String>` | `None` | URL, e.g. `http://1.2.3.4:9876` |
+| `remote.saved_dirs` | `savedDirs` (camel) | `Option<Vec<String>>` | `None` | Pre-saved working dirs for `remote session start` |
+| `remote.default_api_key` | `defaultAPIKey` (CAMEL — uppercase `API`, NOT `Api`) | `Option<String>` | `None` | Masked on display via `first4…last4` |
+| `overlays` | `overlays` (snake) | `Option<OverlaysConfig>` | `None` | Same shape as repo |
+| `agent_stuck_timeout_secs` | `agentStuckTimeout` (camel) | `Option<u64>` | `30` | |
+
+**Renames are load-bearing.** `serde(rename = "...")` MUST be applied per the table. "Normalizing" `defaultAPIKey` to `defaultApiKey` or `agentStuckTimeout` to `agentStuckTimeoutSecs` will silently drop user data.
+
+**Legacy keys MUST be silently ignored on load (NOT deserialized into the new fields).** The pre-WI-0058 flat keys `headlessWorkDirs` and `remoteDefaultAddr` at the top level of global config MUST remain rejected (preserve the breaking change documented by the older work item). Tests must assert this.
+
+##### Compatibility Inventory — `EffectiveConfig` merge rules (per-field, NOT uniform)
+
+The merge rule differs by field. The 0067-spec phrase "flag > env > repo > global > built-in default" is correct in spirit but the actual rules are:
+
+| Field | Rule |
+|---|---|
+| `terminal_scrollback_lines` | repo > global > 10000 |
+| `yolo_disallowed_tools` | repo > global > empty (**NO additive merge** — repo `[]` wins entirely over global list) |
+| `env_passthrough` | repo > global > empty (**NO additive merge** — repo `[]` wins entirely) |
+| `agent_stuck_timeout_secs` | repo > global > 30 |
+| `agent` (effective) | repo.agent > global.default_agent > "claude" |
+| `runtime` | global only > "docker" |
+| `default_agent` | global only > "claude" |
+| `headless.workDirs` | global only |
+| `headless.alwaysNonInteractive` | global only |
+| `remote.defaultAddr` | env (`AMUX_REMOTE_ADDR`) > global only |
+| `remote.savedDirs` | global only |
+| `remote.defaultAPIKey` | env (`AMUX_API_KEY`) > global only — but `defaultAPIKey` only forwarded when target addr matches `defaultAddr` exactly (after case-insensitive + trailing-slash normalization). **Cross-host forwarding MUST be prevented.** |
+| `work_items.dir/template` | repo only |
+| `auto_agent_auth_accepted` | repo only, read-only |
+| `overlays` | **additive 4-source merge** — see below |
+
+**Vec list scope replacement is critical.** `envPassthrough` and `yoloDisallowedTools` are NOT additively merged. A repo config setting them to `[]` MUST result in `EffectiveConfig::env_passthrough() == &[]`, NOT the global list. Required test: `effective_env_passthrough_repo_empty_array_wins_over_global` (preserve the legacy test by name).
+
+**Overlay merge** — 4 sources, additive, by `conflict_key`:
+- Priority 0: global config `overlays.directories`
+- Priority 1: repo config `overlays.directories`
+- Priority 2: `AMUX_OVERLAYS` env var (parsed)
+- Priority 3: CLI `--overlay` flags
+
+Dedup by `conflict_key()` (canonicalized host path; falls back to raw path string if canonicalize fails). Higher-priority `container_path` wins. **Most restrictive `permission` wins regardless of priority** (`ro` beats `rw`). Missing host paths are non-fatal (`tracing::warn!` + drop). Malformed values are FATAL for both env var and CLI flags. Container-path collisions across distinct host paths emit a warning.
+
+The merge logic MUST live in Layer 0 as a method on `EffectiveConfig` (e.g. `EffectiveConfig::overlays(&Env, &Flags) -> Vec<DirectoryOverlay>`) or in a dedicated `OverlayResolver` data type. **The parsing of `AMUX_OVERLAYS` env-var grammar is also Layer 0.** The mounting (i.e. translating `Vec<DirectoryOverlay>` into container `-v` flags) is Layer 1's `OverlayEngine`.
+
+**`AMUX_OVERLAYS` grammar** (preserved from `oldsrc/overlays/mod.rs`):
+
+```
+overlay-list   := overlay-expr ("," overlay-expr)*
+overlay-expr   := type-tag "(" overlay-args ")"
+type-tag       := "dir"           # currently the only type
+overlay-args   := host-path ":" container-path [ ":" permission ]
+permission     := "ro" | "rw"
+```
+
+Outer commas split via `split_top_level_commas` (parens nest). `~` and `~/...` expand to `$HOME`. Relative paths resolve against `cwd`. Whitespace around tokens trimmed. Spaces in paths permitted literally (no quoting). Unknown type tag → fatal error listing supported tags.
+
+##### Compatibility Inventory — `ConfigFieldDef` master list
+
+`oldsrc/commands/config.rs::ALL_FIELDS` is the canonical metadata source for the `amux config show/get/set` CLI surface. Reproduce it as a Layer 0 typed object (e.g. `pub static CONFIG_FIELDS: &[ConfigFieldDef]`) exposed for Layer 2's CLI to consume. Without this, the new `amux config show/get/set` cannot match. Each entry carries: dotted key, scope (global/repo), Rust type, default, description, settable flag, validation. `auto_agent_auth_accepted` MUST have `settable=false`; expose only a typed marker token method (e.g. `RepoConfig::record_auth_decision(...)`) for the auto-auth flow.
+
+##### Compatibility Inventory — Built-in defaults
+
+Built-in defaults (returned by `EffectiveConfig` accessors when no scope sets them):
+
+- `default_agent = "claude"`
+- `runtime = "docker"`
+- `terminal_scrollback_lines = 10_000` (constant `DEFAULT_SCROLLBACK_LINES`)
+- `agent_stuck_timeout_secs = 30` (constant `DEFAULT_STUCK_TIMEOUT_SECS`)
+- `headless.alwaysNonInteractive = false`
+
+All other fields default to `None` / empty.
+
+##### Compatibility Inventory — Environment variables
+
+Every env var amux honors (each becomes a constant + typed accessor on the `Env` struct, never a scattered `std::env::var(...)`):
+
+| Env var | Effect | Layer 0 home |
+|---|---|---|
+| `AMUX_CONFIG_HOME` | Override `$HOME/.amux/` location (test/CI override; affects `global_config_path`, `global_workflows_dir`, `global_skills_dir`) | `Env::config_home()` |
+| `AMUX_HEADLESS_ROOT` | Override `~/.amux/headless/` (used in tests + power users) | `Env::headless_root()` |
+| `AMUX_OVERLAYS` | Comma-separated overlay spec; priority 2 in overlay merge | `Env::overlays()` |
+| `AMUX_API_KEY` | API key for remote headless; takes precedence over `remote.defaultAPIKey` config | `Env::api_key()` |
+| `AMUX_REMOTE_ADDR` | Remote server addr; takes precedence over `remote.defaultAddr` | `Env::remote_addr()` |
+| `AMUX_REMOTE_SESSION` | Resumable remote session ID for `remote run` | `Env::remote_session()` |
+| `RUST_LOG` | Tracing log filter (consumed by Layer 3 logging init) | `Env::rust_log()` |
+| `TERM_PROGRAM` | VS Code detection for `amux new` UX | `Env::term_program()` |
+| `HOME` | Standard | `Env::home()` |
+
+Plus the dynamic set named in `envPassthrough` config — those are read at agent-launch time from the host process env and forwarded into containers as `-e NAME=value`.
 
 #### 3d. Filesystem (`src/data/fs/`)
 
 Move every direct filesystem and database concern out of the old code into typed objects:
 
 - `headless_db.rs` — `SqliteSessionStore` (replaces the loose helpers in `oldsrc/commands/headless/db.rs`). Owns the sqlite connection pool, schema migrations, CRUD. Consumes `Session` and persists relevant fields.
-- `headless_paths.rs` — `HeadlessPaths` struct: typed accessors for the headless root, log dir, db path, tls dir, etc. Replaces ad-hoc `dirs::data_dir().join("amux/headless/...")` calls scattered through `oldsrc/commands/headless/`.
+- `headless_paths.rs` — `HeadlessPaths` struct: typed accessors for the headless root and its child files/dirs.
 - `workflow_state.rs` — `WorkflowStateStore`: persists `WorkflowInvocation` to disk. Replaces the free `pub fn`s `workflow_state_path`, `save_workflow_state`, `load_workflow_state`, `validate_resume_compatibility` in `oldsrc/workflow/mod.rs`.
-- `skill_dirs.rs` — `SkillDirs`: typed access to global + per-repo skill directories.
-- `workflow_dirs.rs` — `WorkflowDirs`: typed access to global + per-repo workflow directories.
+- `workflow_definition.rs` — parses workflow files (`.md`, `.toml`, `.yml`/`.yaml`) into `Workflow` + `WorkflowStep` structs; provides `substitute_prompt` for template variables. See "Workflow definition format" below.
+- `worktree_paths.rs` — `WorktreePaths`: resolves `~/.amux/worktrees/<repo-name>/<NNNN>/` and `~/.amux/worktrees/<repo-name>/wf-<name>/`. The git operations themselves are Layer 1, but path resolution is Layer 0.
+- `repo_dockerfile_paths.rs` — `RepoDockerfilePaths`: resolves `<git_root>/.amux/Dockerfile.dev` and `<git_root>/.amux/Dockerfile.<agent>` per agent.
+- `skill_dirs.rs` — `SkillDirs`: typed access to global (`$HOME/.amux/skills/`) + per-repo (`<git_root>/.claude/skills/`) skill directories.
+- `workflow_dirs.rs` — `WorkflowDirs`: typed access to global (`$HOME/.amux/workflows/`) + per-repo (`<git_root>/aspec/workflows/`) workflow directories.
 - `overlay_paths.rs` — `OverlayPathResolver`: resolves host paths (canonicalize, expand `~`, dedup keys). The grand architecture explicitly states this filesystem-resolution concern lives in Layer 0; the *mounting* of overlays into containers is Layer 1.
-- `auth_paths.rs` — `AuthPathResolver`: resolves host-side credential file locations for each agent (Claude, Codex, OpenCode, etc.). Same rationale: filepath resolution is Layer 0; the *passthrough into containers* is Layer 1.
+- `auth_paths.rs` — `AuthPathResolver`: resolves host-side credential file locations for each agent. Same rationale: filepath resolution is Layer 0; the *passthrough into containers* is Layer 1. Per-agent paths and exclusion lists are pinned below.
+- `image_tags.rs` — pure helper functions `project_image_tag(git_root) -> "amux-{folder}:latest"` and `agent_image_tag(git_root, agent) -> "amux-{folder}-{agent}:latest"`. Used by both `AgentEngine` and `ContainerRuntime`; Layer 0 to avoid duplication.
 
-Every type above is a struct with methods. No free `pub fn`s except small stateless helpers.
+Every type above is a struct with methods. No free `pub fn`s except small stateless helpers (the image-tag and parse helpers in `image_tags.rs` are the explicit exception).
+
+##### Compatibility Inventory — `HeadlessPaths` exact layout
+
+Resolve the headless root via `Env::headless_root()` (defaults to `$HOME/.amux/headless/`). The new struct MUST expose accessors for these paths verbatim (the legacy code calls these out by name; preserving them is a contract with existing user installs):
+
+```
+<root>                                    # HeadlessPaths::root()
+<root>/amux.db                            # HeadlessPaths::db_path()
+<root>/amux.pid                           # HeadlessPaths::pid_file()
+<root>/amux.log                           # HeadlessPaths::log_file()
+<root>/api_key.hash                       # HeadlessPaths::api_key_hash_file()  -- mode 0o600 on Unix
+<root>/sessions/                          # HeadlessPaths::sessions_dir()
+<root>/sessions/<sid>/                    # HeadlessPaths::session_dir(sid)
+<root>/sessions/<sid>/commands/<cid>/     # HeadlessPaths::command_dir(sid, cid)
+<root>/sessions/<sid>/commands/<cid>/output.log         # HeadlessPaths::command_log_path(sid, cid)
+<root>/sessions/<sid>/commands/<cid>/metadata.json      # HeadlessPaths::command_metadata_path(sid, cid)
+<root>/sessions/<sid>/commands/<cid>/workflow.state.json # HeadlessPaths::command_workflow_state_path(sid, cid)
+<root>/sessions/<sid>/worktree/           # HeadlessPaths::session_worktree_dir(sid)
+<root>/sessions/<sid>/agent-settings/     # HeadlessPaths::session_agent_settings_dir(sid)
+```
+
+There is **no TLS dir today** in legacy. If TLS is added, document it separately (the 0067 `AuthEngine` section introduces self-signed TLS material; coordinate path naming there).
+
+**macOS launchd plist** path: `$HOME/Library/LaunchAgents/io.amux.headless.plist` — Label `io.amux.headless`. Resolution belongs in Layer 0 (`HeadlessPaths::launchd_plist_path()`); writing/loading the plist is a Layer 1 daemonization concern.
+
+##### Compatibility Inventory — sqlite schema (verbatim)
+
+`SqliteSessionStore::open` MUST produce this exact schema on a fresh DB and MUST NOT alter it on an existing DB. The schema is created via `CREATE TABLE IF NOT EXISTS` (no version table, no migration framework). `PRAGMA journal_mode=WAL` MUST be set on every open:
+
+```sql
+PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id         TEXT PRIMARY KEY,             -- uuid v4 string
+    workdir    TEXT NOT NULL,                -- canonicalized absolute path
+    created_at TEXT NOT NULL,                -- RFC3339 string
+    status     TEXT NOT NULL DEFAULT 'active', -- 'active' | 'closed'
+    closed_at  TEXT                          -- RFC3339 or NULL
+);
+
+CREATE TABLE IF NOT EXISTS commands (
+    id          TEXT PRIMARY KEY,            -- uuid v4 string
+    session_id  TEXT NOT NULL REFERENCES sessions(id),  -- NO ON DELETE CASCADE (manual cascade in delete_closed_sessions_older_than)
+    subcommand  TEXT NOT NULL,
+    args        TEXT NOT NULL,               -- JSON-encoded array of strings
+    status      TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'running' | 'done' | 'error'
+    exit_code   INTEGER,                     -- nullable
+    started_at  TEXT,                        -- RFC3339 nullable
+    finished_at TEXT,                        -- RFC3339 nullable
+    log_path    TEXT NOT NULL                -- absolute filesystem path to output.log
+);
+```
+
+**No indexes today** (lookups by `session_id` and `status` are full table scans on small datasets). Adding indexes is safe (sqlite creates them on next open) but removing the `WAL` mode or adding `ON DELETE CASCADE` is a behavior change that breaks user-data assumptions.
+
+**Required `SqliteSessionStore` methods** (legacy CRUD that downstream code depends on):
+
+- `insert_session(session)`, `get_session(id)`, `list_sessions()`, `list_sessions_by_status(Option<status>)`, `close_session(id)`, `count_active_sessions()`
+- `delete_closed_sessions_older_than(hours)` — manual cascade: deletes `commands` rows for matching sessions first, then `sessions` rows. Returns `Vec<(SessionId, command_count)>`. Boundary is exclusive (`closed_at < cutoff`).
+- `insert_command(command)`, `get_command(id)`, `update_command_started(id)`, `update_command_finished(id, exit_code, status)`
+- `count_running_commands()`, `has_running_command_for_session(session_id)` — counts `status IN ('pending','running')`. **Crash-recovery semantics**: catches commands left orphaned by a prior server crash. MUST be preserved.
+
+**Status enum strings are stable.** `sessions.status` ∈ `{'active', 'closed'}`. `commands.status` ∈ `{'pending', 'running', 'done', 'error'}`. Renaming requires migration.
+
+##### Compatibility Inventory — `WorkflowStateStore` filename and JSON shape
+
+Persistence path: `<git_root>/.amux/workflows/<repohash8>-[<NNNN>-]<workflow_name>.json` (per-repo, NOT under `$HOME`).
+
+- `repohash8` = `sha256_hex(git_root.to_string_lossy())[..8]`. The hash function MUST stay byte-stable to preserve in-flight workflow resumption.
+- With work item: `<repohash8>-<NNNN>-<name>.json` (NNNN zero-padded 4-digit).
+- Without: `<repohash8>-<name>.json`.
+
+The JSON shape (every field required for resume):
+
+```json
+{
+  "title": "optional",
+  "steps": [
+    {
+      "name": "step-name",
+      "depends_on": ["other-step"],
+      "prompt_template": "raw template with {{vars}}",
+      "status": "Pending" | "Running" | "Done" | {"Error": "msg"} | {"Failed": {"exit_code": 1, "error_message": "..."}},
+      "container_id": "abc123" | null,
+      "agent": "codex" | null,
+      "model": "claude-..." | null
+    }
+  ],
+  "workflow_hash": "<sha256-hex of source file>",
+  "work_item": 27,
+  "workflow_name": "filename-stem",
+  "schema_version": 1
+}
+```
+
+**`agent`, `model`, `work_item`, `schema_version` MUST use `#[serde(default)]`** so older state files (no `schema_version` field, no per-step `agent`/`model`) load as v0 and migrate-on-load.
+
+**`StepStatus` MUST preserve the legacy human-readable error message.** The legacy `Error(String)` carries a free-form failure description. The new representation MUST keep that string addressable (e.g. `Failed { exit_code: i32, error_message: Option<String> }`) — a bare `exit_code: i32` is insufficient, build/launch/container-side errors do not always come from a process exit.
+
+`WorkflowState` methods that downstream layers depend on:
+
+- `next_ready()`, `completed_set()`, `all_done()`, `set_status(name, status)`, `set_container_id(name, id)`, `get_step(name)`, `interrupted_running_steps()`, `is_terminal()`, `parallel_group_for(step_name)` (returns the set of steps sharing the same `depends_on` set; used by TUI parallel-group rendering).
+
+`WorkflowStateStore::validate_resume_compatibility(saved, new_steps)`: checks step count match + per-step `name` and `depends_on` equality. **`prompt_template` is permitted to differ silently** — preserve the legacy test `resume_compat_same_steps_ok`.
+
+##### Compatibility Inventory — Workflow definition format (`workflow_definition.rs`)
+
+Three formats by extension via `detect_format(path)`: `.md` → Markdown, `.toml` → TOML, `.yml`/`.yaml` → YAML. `.json` is **explicitly rejected**.
+
+- TOML/YAML: `#[serde(deny_unknown_fields)]` everywhere — typos error.
+- TOML uses key `[[step]]` (array-of-table), mapped via `#[serde(rename = "step")]` from the `steps: Vec<RawStep>` Rust field.
+- UTF-8 BOM stripped before parsing TOML/YAML.
+- Markdown grammar: optional `# Title`, then `## Step: <name>` blocks containing `Depends-on:`, `Agent:`, `Model:` directive lines (only before `Prompt:`), and a `Prompt:` body that consumes everything until the next `## ` heading. **`Agent:` / `Model:` lines AFTER `Prompt:` are captured as part of the prompt body, NOT as directives.** Empty file → error "no steps". Comma-separated `Depends-on` parsed and trimmed.
+- Validation: `validate_references` (every `depends_on` names a real step), `detect_cycle` (DFS with self-loop detection), `validate_agent_name`.
+
+**Prompt template substitution** — `substitute_prompt(template, work_item, work_item_content) -> String` MUST support these tokens (legacy `oldsrc/workflow/mod.rs::substitute_prompt`):
+
+- `{{work_item_number}}` → zero-padded 4-digit (`0042`)
+- `{{work_item_content}}` → full work-item file body
+- `{{work_item_section:[name]}}` → case-insensitive section match, optional trailing colon, supports H1 + H2 sections; iterative loop on section tokens
+- `{{work_item}}` → numeric (no padding, e.g. `42`)
+
+Emits a stderr warning (TODO: route through `UserMessageSink::warning` from the engine layer) if work-item vars used without `--work-item`.
+
+##### Compatibility Inventory — `AuthPathResolver` per-agent paths
+
+Per-agent host paths and exclusion lists (preserve verbatim from `oldsrc/passthrough.rs`):
+
+| Agent | Host path | Container target | Exclusions |
+|---|---|---|---|
+| `claude` | `~/.claude.json` (file) + `~/.claude/` (dir) | `<container_home>/.claude.json` + `<container_home>/.claude/` | denylist: `projects, sessions, session-env, debug, file-history, history.jsonl, telemetry, downloads, ide, shell-snapshots, paste-cache` |
+| `claude` | macOS keychain `Claude Code-credentials` → env var `CLAUDE_CODE_OAUTH_TOKEN` | (env var) | JSON path `claudeAiOauth.accessToken` extracted |
+| `codex` | `~/.codex/` | `/root/.codex` (rw) | denylist: `logs` |
+| `gemini` | `~/.gemini/` (or empty dir) | `/root/.gemini` (rw) | denylist: `logs` |
+| `opencode` | `~/.config/opencode/` | `/root/.config/opencode` (rw) | denylist: `logs` |
+| `crush` | `~/.config/crush/` (or empty dir) | `/root/.config/crush` (rw) — remapped if container is non-root | denylist: `logs` |
+| `cline` | `~/.cline/data/` (or empty dir) | `/root/.cline/data` (rw) | denylist: `tasks, workspace` |
+| `copilot` | (none on host) | (none) — env var `COPILOT_OFFLINE=true` injected | n/a |
+| `maki` | (none) | (none) | n/a |
+
+The `<container_home>` placeholder is `/root` by default and remapped to `/home/<user>` when the agent's Dockerfile declares a non-root `USER`. The remap logic (legacy `apply_dockerfile_user`) is Layer 1's responsibility (it parses Dockerfiles); Layer 0 only resolves the host paths.
+
+**`~/.claude.json` sanitization** before mounting: strip `oauthAccount` field, add `/workspace` project trust entry. Legacy lives in `oldsrc/passthrough.rs::ClaudePassthrough`. Layer 0 owns the JSON manipulation; Layer 1 schedules the temp-dir copy + mount.
 
 #### 3e. Errors (`src/data/error.rs`)
 
@@ -267,6 +540,16 @@ To keep the work bounded and to enforce the layering tenets:
 - **Config file partially missing**: `RepoConfig::load` must distinguish "no config file" (return defaults) from "config file present but malformed" (return structured error). Same for `GlobalConfig`.
 - **Env var precedence**: the merge order is flag > env > repo config > global config > built-in default. This precedence MUST be encoded in `EffectiveConfig` and have unit tests covering every combination.
 - **Path canonicalization on non-existent paths**: `OverlayPathResolver` must handle the same edge case `oldsrc/overlays/mod.rs::make_host_path_canonical` handles after work item 0065 — walk up to the nearest existing ancestor. Reuse the algorithm but encapsulated as a method on the resolver.
+- **Vec list scope replacement (CRITICAL)**: when `RepoConfig.envPassthrough` is `Some(vec![])`, `EffectiveConfig::env_passthrough()` MUST return `[]`, NOT the global list. Same for `yoloDisallowedTools`, `headless.workDirs`, `remote.savedDirs`. Tests must include the empty-array-clears-global case (preserve legacy test `effective_env_passthrough_repo_empty_array_wins_over_global`).
+- **Path-escape validation for `work_items.dir/template`**: must be validated against repo-root-escape using path normalization (legacy `validate_path_within_git_root`). Layer 0 owns this validator; Layer 2 calls it before save. Reject paths containing `..` segments that escape `git_root` after canonicalization.
+- **`api_key.hash` file mode**: MUST be created with mode `0o600` on Unix via `OpenOptions::mode(0o600).create(true).truncate(true)` (atomic create-with-mode, NOT `chmod` after create — the latter has a TOCTOU window). Legacy uses this pattern; preserve it.
+- **Sqlite `WAL` journal mode required**: legacy DBs are WAL on disk. Switching to default (delete) journal mode would force-rewrite every user's DB. `SqliteSessionStore::open` MUST `PRAGMA journal_mode=WAL;` on every open.
+- **Sqlite manual cascade**: `commands.session_id REFERENCES sessions(id)` has **no `ON DELETE CASCADE`**. `delete_closed_sessions_older_than(hours)` deletes commands first then sessions, returning per-session `(SessionId, deleted_command_count)`. Cleanup at server-startup is one-shot (24-hour cutoff hard-coded in legacy); preserve the function shape so 0067/0068 can decide on the trigger schedule.
+- **Status string stability**: changing `'active'` → `'open'` or `'pending'` → `'queued'` etc. invalidates user data. Pin the four command statuses and two session statuses verbatim.
+- **Workflow state forward-compat**: load JSON without `schema_version` as v0 via `#[serde(default)]` and migrate on save. `agent`, `model`, `work_item` per-step fields also `#[serde(default)]` for legacy load.
+- **`StepStatus::Failed` error string must round-trip**: a v0 file written as `{"Error": "msg"}` MUST load and re-save losslessly under the new representation that preserves `error_message`.
+- **macOS-only keychain**: `agent_keychain_credentials(agent)` is macOS-only via `security find-generic-password`. On Linux/Windows it returns no credentials; agents auth via env vars in `envPassthrough`. Layer 0 just exposes the path/service name table; Layer 1 invokes the platform tool.
+- **Per-agent denylists are pinned constants**: `CLAUDE_DIR_DENYLIST`, `OPENCODE_DIR_DENYLIST`, `CODEX_DIR_DENYLIST`, `GEMINI_DIR_DENYLIST`, `CRUSH_CONFIG_DENYLIST`, `CLINE_DATA_DENYLIST` move from `oldsrc/passthrough.rs` to Layer 0 as `pub const &[&str]` arrays. Layer 1's `OverlayEngine` reads them when copying credential dirs into temp dirs for mounting.
 
 ## Test Considerations:
 
@@ -306,9 +589,24 @@ This work item produces **only Layer 0 unit tests** (and a small number of Layer
 - **Filesystem stores**:
   - `SqliteSessionStore::open` runs migrations on a fresh DB and is idempotent on a populated DB.
   - `SqliteSessionStore` schema readability against a checked-in fixture DB written by the prior amux release (covers the user-upgrade path; see Edge Case Considerations).
+  - `SqliteSessionStore::open` introspection: `PRAGMA table_info('sessions')` and `PRAGMA table_info('commands')` produce the EXACT column list (name, type, nullability, default) documented in the Compatibility Inventory. Catches accidental column reorder/rename.
+  - `SqliteSessionStore::open` sets `PRAGMA journal_mode=WAL`. Verify via `PRAGMA journal_mode;`.
+  - `delete_closed_sessions_older_than` cascades commands manually and returns `Vec<(SessionId, command_count)>`.
+  - `has_running_command_for_session` returns true when status is `pending` OR `running` (crash-recovery semantics).
   - `WorkflowStateStore::save` then `load` round-trips a representative `WorkflowInvocation`.
+  - `WorkflowStateStore::load` of a legacy fixture (`tests/fixtures/workflow_state/v0_no_schema_version.json`) succeeds and returns `schema_version == 0`. `save` afterwards rewrites with `schema_version == 1`.
+  - `WorkflowStateStore::load` round-trips `StepStatus::Error("legacy message")` losslessly into the new representation that preserves `error_message`.
+  - `WorkflowStateStore::save` filename for `(git_root, work_item=42, name="impl")` matches `<sha256_hex(git_root_lossy)[..8]>-0042-impl.json`. The hash function MUST be byte-stable.
+  - `validate_resume_compatibility(saved, new_steps)` accepts identical step names + `depends_on` even when `prompt_template` differs (preserve legacy `resume_compat_same_steps_ok`).
   - `OverlayPathResolver::canonicalize("/foo/baz/../bar")` returns `/foo/bar` even when the leaf does not exist.
   - `AuthPathResolver` resolves the right host-side credential path per agent on Linux, macOS, and (best-effort, behind `cfg(windows)`) Windows.
+  - `RepoConfig` round-trip preserves the exact JSON keys (`yoloDisallowedTools` camel, `agentStuckTimeout` camel-no-suffix, `workItems` camel, `defaultAPIKey` uppercase API). A "normalize all to camelCase" round-trip MUST FAIL the test.
+  - `GlobalConfig` legacy-key rejection: top-level `headlessWorkDirs` and `remoteDefaultAddr` MUST be silently ignored on load (preserve WI-0058 breaking change).
+  - `ConfigFieldDef` master list (the new `CONFIG_FIELDS` const) covers every entry from `oldsrc/commands/config.rs::ALL_FIELDS` (data-table assertion: `(key, scope, settable, default)` rows).
+  - `auto_agent_auth_accepted` has `settable=false` in `CONFIG_FIELDS`; the `record_auth_decision` typed setter is the only path to mutate it.
+  - `validate_path_within_git_root("/git/root", "../../escape")` returns `Err`; same for `"foo/../../escape"`. `("/git/root", "subdir")` returns `Ok`.
+  - `EffectiveConfig::overlays(env, flags)`: 4-source merge with priority order, container-path-by-priority, permission-by-most-restrictive (`ro` beats `rw`), missing-host-path warn-and-drop, malformed-value fatal.
+  - `Env::overlays()` parses every legal grammar form (`dir(/h:/c)`, `dir(/h:/c:ro)`, `~/h`, `dir(/spaces in path:/c)`, multi-comma) and rejects unknown type tags.
 
 ### Layer-0-internal integration tests (colocated, not in top-level `tests/`)
 

@@ -75,10 +75,14 @@ Files:
 
 - `mod.rs` — entry point; `pub async fn run(matches: clap::ArgMatches, runtime_ctx: RuntimeContext) -> ExitCode`.
 - `command_frontend.rs` — `CliCommandFrontend` implementing `CommandFrontend` over `clap::ArgMatches`.
-- `per_command/` — one file per command implementing the corresponding `*CommandFrontend` (e.g. `implement.rs` implements `ImplementCommandFrontend`).
+- `per_command/` — one file per command implementing the corresponding `*CommandFrontend` (e.g. `exec_workflow.rs` implements `ExecWorkflowCommandFrontend`). `per_command/ready.rs` implements both `ReadyFrontend` and `ReadyCommandFrontend` (supertrait), printing phase transitions and step statuses to stderr, prompting on stdin for Dockerfile and legacy-migration decisions. `per_command/init.rs` implements both `InitFrontend` and `InitCommandFrontend`, prompting for aspec replacement, audit, and work-items config. `per_command/claws.rs` implements both `ClawsFrontend` and `ClawsCommandFrontend`, printing `ClawsPhase` transitions to stderr and prompting on stdin for clone-replacement and audit decisions.
 - `container_frontend.rs` — `CliContainerFrontend` binding `ContainerFrontend` to stdin/stdout/stderr (with PTY allocation when stdin is a TTY).
-- `workflow_frontend.rs` — `CliWorkflowFrontend` rendering workflow status to stderr, prompting on stdin for `user_choose_next_action`, etc.
+- `workflow_frontend.rs` — `CliWorkflowFrontend` rendering workflow status to stderr, prompting on stdin for `user_choose_next_action`. The prompt MUST present only the actions in `AvailableActions` — `LaunchNext`, `ContinueInCurrentContainer`, `RestartCurrentStep`, `CancelToPreviousStep`, `Pause`, `Abort` — each conditionally included based on the corresponding `can_*` flag. Excluded actions MUST NOT appear in the prompt. When an action is excluded, the `*_unavailable_reason` string SHOULD be printed as a parenthetical note so the user understands why.
 - `output.rs` — small helpers for terminal styling (colors, hyperlinks). Pure presentation.
+- `user_message.rs` — `CliUserMessageSink` implementing `UserMessageSink`. Holds a `Vec<UserMessage>` queue and a `pty_active: bool` flag. `write_message` pushes to the queue when `pty_active` is true, or writes immediately to stderr when false. `replay_queued` writes all queued messages to stderr in insertion order and clears the queue. The `CliContainerFrontend` sets `pty_active = true` before handing the terminal to the container and `pty_active = false` after the container exits. The command layer calls `replay_queued` after each `ContainerExecution::wait` and after `WorktreeLifecycle::finalize`.
+- `worktree_lifecycle_frontend.rs` — `CliWorktreeLifecycleFrontend` implementing `WorktreeLifecycleFrontend`. Prompts on stdin for each decision (pre-commit warning: `[c]ommit / [u]se last commit / [a]bort`; existing worktree: `[r]esume / [R]ecreate`; post-workflow action: `[m]erge / [d]iscard / [s]kip`; merge confirm: `[y/n]`; cleanup confirm: `[y/n]`). Reports via stderr. Default commit message pre-populated as `"WIP: pre-worktree commit"`.
+
+The `CliWorktreeLifecycleFrontend` and `CliUserMessageSink` MUST be the same concrete type (or one wraps the other) so that messages written during the `WorktreeLifecycle::prepare` call (e.g. detached-HEAD warning) are queued if a PTY container is active. In practice, the entire `CliExecWorkflowCommandFrontend` type implements all of `ContainerFrontend + WorkflowFrontend + WorktreeLifecycleFrontend + UserMessageSink` and holds the queue state in one place.
 
 The CLI frontend's logic is small:
 
@@ -111,11 +115,23 @@ Files (proposed; ASK THE DEVELOPER if a different split fits better):
 - `command_frontend.rs` — `TuiCommandFrontend` implementing `CommandFrontend`. Pulls flag values from the parsed command-box input.
 - `per_command/` — one file per command implementing the corresponding `*CommandFrontend`. Each is a thin wrapper that bridges command frontend trait calls into TUI dialog rendering and keyboard input.
 - `container_view.rs` — `TuiContainerFrontend` implementing `ContainerFrontend`. Owns the PTY allocation, scrollback buffer, and rendering.
-- `workflow_view.rs` — `TuiWorkflowFrontend` implementing `WorkflowFrontend`. Renders the workflow control dialog, yolo countdowns, etc.
+- `workflow_view.rs` — `TuiWorkflowFrontend` implementing `WorkflowFrontend`. Renders the workflow control dialog and yolo countdowns. The workflow control dialog MUST present only the actions present in `AvailableActions` — this includes `LaunchNext`, `ContinueInCurrentContainer`, `RestartCurrentStep`, `CancelToPreviousStep`, `Pause`, and `Abort`. Actions excluded by the engine (e.g. `ContinueInCurrentContainer` for cross-agent transitions, `CancelToPreviousStep` on the first step) MUST be visually disabled or omitted, with the corresponding `*_unavailable_reason` string shown as a tooltip or inline note.
+- `ready_view.rs` — `TuiReadyFrontend` implementing both `ReadyFrontend` and `ReadyCommandFrontend`. Renders `ReadyPhase` transitions as progress steps in the TUI, opens modal dialogs for Dockerfile and legacy-migration decisions, and hands container build/audit output to a `TuiContainerFrontend`.
+- `init_view.rs` — `TuiInitFrontend` implementing both `InitFrontend` and `InitCommandFrontend`. Renders `InitPhase` transitions, opens modal dialogs for aspec replacement, audit, and work-items configuration.
+- `claws_view.rs` — `TuiClawsFrontend` implementing both `ClawsFrontend` and `ClawsCommandFrontend`. Renders `ClawsPhase` transitions as progress steps, opens modal dialogs for clone-replacement and audit decisions, and hands container build/audit output to a `TuiContainerFrontend`. Reproduces visual and keyboard behavior equivalent to the `claws init` flow in `oldsrc/commands/claws.rs`.
 - `dialogs/` — pure-presentation dialog widgets (selection lists, confirmations, text prompts). Each dialog has a typed input (the data Layer 2 wants the user to choose from) and a typed output (the user's choice). Dialogs do NOT decide what the next step is — they only render and collect.
 - `keymap.rs` — keyboard shortcut definitions. Pure presentation.
 - `render.rs` — pure rendering of UI chrome (tab bar, status bar, hints).
 - `hints.rs` — pulls hint text via `CommandCatalogue::tui_hint_for`.
+- `user_message.rs` — `TuiUserMessageSink` implementing `UserMessageSink`. Appends messages to a per-tab status log that the TUI renders in a scrollable panel. `replay_queued` is a no-op (messages are rendered live). The status log is visible during container execution without interrupting the container view.
+- `worktree_lifecycle_frontend.rs` — `TuiWorktreeLifecycleFrontend` implementing `WorktreeLifecycleFrontend` as modal dialogs:
+  - `ask_pre_worktree_uncommitted_files`: `WorktreePreCommitWarning` dialog (showing file list), transitions to `WorktreePreCommitMessage` dialog on 'c'.
+  - `ask_existing_worktree`: inline prompt in the status area (or a small modal) with `[r]esume / [R]ecreate`.
+  - `ask_post_workflow_action`: `WorktreeMergePrompt` dialog: `[m]erge / [d]iscard / [s]kip-and-keep`.
+  - `ask_worktree_commit_before_merge`: `WorktreeCommitPrompt` dialog with editable text box (default message pre-populated, supports cursor navigation, Ctrl+Enter to submit).
+  - `confirm_squash_merge`: `WorktreeMergeConfirm` dialog: `[y/n]`.
+  - `confirm_worktree_cleanup`: `WorktreeDeleteConfirm` dialog: `[y/n]`.
+  - All dialogs reproduce the exact key bindings and visual layout from `oldsrc/tui/` (see `Dialog` variants in `oldsrc/tui/state.rs` and `oldsrc/tui/input.rs`).
 
 Critical constraints from the grand architecture document:
 
@@ -138,6 +154,11 @@ The TUI must preserve, with zero user-visible drift:
 - All status-bar elements.
 - All keyboard shortcuts documented today.
 - All error rendering (translations of `CommandError`, `EngineError`, `DataError` into user-friendly strings).
+- `amux ready` phase-by-phase progress display (each `ReadyPhase` transition updates the TUI; dialogs for Dockerfile creation and legacy migration fire modally).
+- `amux init` phase-by-phase progress display (each `InitPhase` transition updates the TUI; dialogs for aspec replacement, audit decision, and work-items config fire modally).
+- Worktree pre-creation flow: `WorktreePreCommitWarning` dialog (shows uncommitted file list, `[c]ommit / [u]se last commit / [a]bort` keybindings) and `WorktreePreCommitMessage` dialog (editable text box with default `"WIP: pre-worktree commit"`, cursor navigation, Ctrl+Enter to submit — exact key handling from `oldsrc/tui/input.rs::handle_worktree_pre_commit_message`).
+- Worktree post-completion flow: `WorktreeMergePrompt` dialog (`[m]erge / [d]iscard / [s/Esc]kip-and-keep`), `WorktreeCommitPrompt` dialog (if worktree has uncommitted files, editable text box, Ctrl+Enter/Ctrl+S to submit), `WorktreeMergeConfirm` dialog (`[y/n]`), `WorktreeDeleteConfirm` dialog (`[y/n]`).
+- `UserMessageSink` messages appear in the per-tab status log during container execution and are scrollable independently of the container PTY view.
 
 A line-by-line port from `oldsrc/tui/` is *not* the goal. The goal is to reproduce user-perceptible behavior on top of the new layers. Where the legacy code embedded business logic in the TUI (workflow advance decisions, agent resolution, etc.), that logic lives in Layer 2 now and the TUI only renders the result.
 
@@ -148,9 +169,11 @@ Files:
 - `mod.rs` — entry point: `pub async fn serve(config: HeadlessServeConfig, engines: Engines, session_manager: Arc<RwLock<SessionManager>>) -> Result<(), HeadlessError>`. **Layer 2 cannot call `serve` directly — that would be an upward call.** Instead, `HeadlessStartCommand` (Layer 2) accepts a `HeadlessStartCommandFrontend` trait at instantiation. The trait exposes a method like `serve_until_shutdown(config: HeadlessServeConfig) -> Result<(), CommandError>`. The CLI frontend's `HeadlessStartCommandFrontend` impl calls `crate::frontend::headless::serve(...)` — that is a peer call within Layer 3 and is allowed. The headless frontend never starts itself; it is always launched by an impl living in some other Layer 3 frontend (today, only the CLI's impl exists).
 - `routes.rs` — registers HTTP routes derived from `CommandCatalogue::rest_route_table`. Each route handler is uniform (see below).
 - `command_frontend.rs` — `HeadlessCommandFrontend` implementing `CommandFrontend` over a deserialized request body + query parameters.
-- `per_command/` — one file per command implementing the corresponding `*CommandFrontend`. Where a command needs interactive input, the headless frontend either (a) returns a structured "needs input" response and resumes via a follow-up request, or (b) defaults safely. ASK THE DEVELOPER which model to use for each interactive command.
+- `per_command/` — one file per command implementing the corresponding `*CommandFrontend`. Where a command needs interactive input, the headless frontend either (a) returns a structured "needs input" response and resumes via a follow-up request, or (b) defaults safely. ASK THE DEVELOPER which model to use for each interactive command. For `ready`, `init`, and `claws`, the headless frontend MUST implement `ReadyFrontend`, `InitFrontend`, and `ClawsFrontend` respectively; Q&A decisions (Dockerfile creation, legacy migration, aspec replacement, audit, work-items, clone replacement) should default to sensible non-interactive values (create Dockerfile if missing, skip audit, skip work-items config, skip legacy migration, skip re-clone if clone exists) unless overridden by request parameters. Phase transitions stream as SSE events so clients can track progress.
 - `container_stream.rs` — `HeadlessContainerFrontend` implementing `ContainerFrontend` over an SSE/WebSocket stream of stdin/stdout/stderr chunks.
 - `workflow_stream.rs` — `HeadlessWorkflowFrontend` implementing `WorkflowFrontend` over the same streaming surface.
+- `user_message.rs` — `HeadlessUserMessageSink` implementing `UserMessageSink`. Emits each message as an SSE event of type `amux-message` with `{ "level": "info"|"warning"|"error"|"success", "text": "..." }`. `replay_queued` is a no-op (messages are streamed live).
+- `worktree_lifecycle_frontend.rs` — `HeadlessWorktreeLifecycleFrontend` implementing `WorktreeLifecycleFrontend`. Uses request-parameter defaults for all decisions (create if absent, skip audit, default commit message, etc.) unless the client overrides them via request body fields. Reports (worktree created, discarded, kept, merge conflict) stream as `amux-message` SSE events. ASK THE DEVELOPER whether to expose Q&A decisions as separate API endpoints or as upfront request parameters.
 - `auth.rs` — TLS + API-key middleware. Pure plumbing; the cryptographic logic is in `AuthEngine` (Layer 1).
 - `errors.rs` — translates `CommandError` etc. into HTTP status codes + JSON error bodies.
 
@@ -171,7 +194,7 @@ The grand architecture document explicitly forbids the server from "just calling
 
 - Every route documented in the existing OpenAPI/handler set continues to exist with the same path, method, body schema, and response schema. Use `CommandCatalogue::rest_route_table` to enforce this; the catalogue MUST already match the existing surface as of 0068.
 - TLS, bind-address, and auth-disabled behavior from work item 0065 is preserved. The `AuthEngine` (Layer 1) holds the logic; this frontend is plumbing.
-- SSE/WebSocket streaming endpoints (chat, exec, implement output) preserve their wire format byte-for-byte.
+- SSE/WebSocket streaming endpoints (chat, exec workflow output) preserve their wire format byte-for-byte.
 
 ### 4. `src/main.rs` — Layer 4
 
@@ -183,7 +206,7 @@ The grand architecture document explicitly forbids the server from "just calling
 use anyhow::Result;
 use amux::command::dispatch::CommandCatalogue;
 use amux::data::{Session, SessionManager, GlobalConfig};
-use amux::engine::{ContainerRuntime, GitEngine, OverlayEngine, AuthEngine, WorkflowStateStore};
+use amux::engine::{ContainerRuntime, GitEngine, OverlayEngine, AuthEngine, AgentEngine, WorkflowStateStore};
 use amux::frontend::{cli, tui};
 
 #[tokio::main]
@@ -238,17 +261,302 @@ The `oldsrc/README.md` from 0066 stays. Add a note: "no longer compiled — see 
 - No new commands, new flags, or new user-visible behavior. This work item is *parity only*.
 - No regressions in the `aspec/uxui/cli.md` documented surface.
 
+### 7. Frontend parity addenda — TUI behaviors that MUST be preserved
+
+The legacy TUI (`oldsrc/tui/*.rs`, ~21k lines) carries non-trivial user-perceptible behavior that is easy to lose in a re-implementation. This section enumerates each preserved behavior with the corresponding new-architecture surface. Where a behavior is not yet covered by a Layer 1 / Layer 2 frontend trait, the addendum specifies which trait to extend and where.
+
+#### 7a. Tab management — colors, indicators, focus
+
+Each `TabState` (now wrapped around a `Session`) renders in the tab bar with a color computed from execution state. The legacy color matrix MUST be preserved; the function lives in `src/frontend/tui/tabs.rs::tab_color`:
+
+- Stuck (any phase) → Yellow
+- Remote-bound (any phase) → Magenta
+- Error → Red
+- Running + container PTY → Green
+- Running + no container → Blue
+- Running + claws command → Magenta
+- Idle / Done → Dark Gray
+
+The active tab renders with `➡ project` and TOP+LEFT+RIGHT borders (no bottom). Background yolo countdowns alternate `⚠️  yolo in Ns` and `🤘 yolo in Ns` every 2 seconds in the tab subcommand label (legacy `tab_subcommand_label`). Stuck tabs prepend `⚠️ ` to the command in the label.
+
+`Focus` enum (CommandBox vs ExecutionWindow) governs which keybindings apply. ↑ from CommandBox switches focus to ExecutionWindow when a container is running. Esc from ExecutionWindow returns focus to CommandBox.
+
+ContainerWindow state (Hidden / Minimized / Maximized) — Ctrl+M cycles. Hidden = no window rendered; Minimized = 1-line status bar; Maximized = full window.
+
+#### 7b. Command box and autocomplete
+
+The command box widget MUST honor the legacy keybindings and behaviors:
+
+- Tab / Shift+Tab cycle through autocomplete suggestions (suggestions sourced from `CommandCatalogue::tui_completions`).
+- Suggestion row displays first-match → `> · sugg2 · sugg3 · …` separated by middots.
+- When suggestions are not visible: row shows `CWD: /path` or `Using Worktree: /path`.
+- Backspace deletes char before cursor; Delete deletes char at cursor; Home/End jump.
+- Ctrl+T (always) opens NewTabDirectory dialog regardless of focus.
+- On invalid command typed in the box: `Dispatch::parse_command_box_input` returns a structured error (`UnknownCommand`, `MissingArgument`, etc.) AND a typo-correction suggestion (Levenshtein distance ≤ 4) when applicable. The TUI renders the suggestion as `did you mean: <suggestion>?` in red below the box. The Levenshtein helper lives in `CommandCatalogue::closest_command(input: &str)` (Layer 2 catalogue helper, not TUI logic).
+
+#### 7c. Workflow control board — exact key matrix
+
+`TuiWorkflowFrontend::user_choose_next_action` opens the `WorkflowControlBoard` modal. The modal MUST render with the exact arrow-key matrix from `oldsrc/tui/render.rs`:
+
+```
+         ↑ Restart current
+    ← Prev   Right: Next (new container) →
+         ↓ Next (same container)
+         ^C Cancel workflow
+  [last step only] Ctrl+Enter Finish
+```
+
+Mapping of keys to `NextAction` (per WI 0067 §9a.4):
+
+- ↑ → `RestartCurrentStep`
+- ← → `CancelToPreviousStep`
+- → → `LaunchNext`
+- ↓ → `ContinueInCurrentContainer { prompt }` (with the next step's prompt template substituted; the engine constructs the prompt and the dialog only renders/forwards)
+- Ctrl+Enter → `FinishWorkflow` (only enabled on last step; visually disabled otherwise)
+- Ctrl+C → opens `WorkflowCancelConfirm` modal; on `[y/1]` returns `NextAction::Abort`
+- `d` → `DisableAutoAdvanceForCurrentStep` — sets a per-tab flag in the frontend so the stuck/yolo dialog will not auto-popup again for this step. **The flag is purely a Layer 3 concern** (engine still ticks the timers); the TUI uses the flag to suppress auto-popup. Persist as `TabState::auto_workflow_disabled_steps: HashSet<String>`.
+- Esc → close the dialog without choosing an action; engine continues waiting (this is NOT a `NextAction` — the trait method blocks until a real choice is made; Esc just dismisses the modal so the user can scroll the container, then re-opens via Ctrl+W).
+
+Disabled actions render in dark gray with the `*_unavailable_reason` string as a tooltip below the matrix. The dialog title is `" Workflow Control "` with a yellow rounded border, center-aligned popup (52 cols × 13–15 rows), step name truncated to fit width.
+
+#### 7d. Workflow stuck detection and yolo countdown — TUI rendering
+
+Per WI 0067 §9a.5 the engine fires `report_step_stuck` and `yolo_countdown_tick`. The TUI renders these as:
+
+- `report_step_stuck`: the active tab turns yellow; `⚠️ ` prepends the command in the tab label; status bar shows `agent appears stuck — Ctrl+W to open workflow controls`.
+- `report_step_unstuck`: tab returns to green; status bar resets.
+- `yolo_countdown_tick(remaining)` (only when `--yolo` was set): opens the `WorkflowYoloCountdown` modal (magenta border) with the step name and remaining seconds. The modal is dismissable with Esc, which returns `YoloTickOutcome::Cancel` to the engine. Background-tab indicator alternates `⚠️  yolo in Ns` / `🤘 yolo in Ns` every 2 seconds.
+- The TUI's per-tab `auto_workflow_disabled_steps` flag (§7c) suppresses re-opening of the modal after a manual dismissal — even though the engine still ticks the countdown, the TUI returns `YoloTickOutcome::Cancel` for every tick on a disabled-auto step. The user can manually re-arm by pressing Ctrl+W.
+
+#### 7e. Workflow step error dialog
+
+`WorkflowFrontend::user_choose_after_step_failure` (WI 0067 §9a.4) opens the legacy `WorkflowStepError` modal:
+
+- Title: `" Step failed "` (red border).
+- Body: step name + first-N lines of the failure output (`exit_code` and `signal` fields from `ContainerExitInfo`).
+- Keys: `[r]` or `[1]` → `StepFailureChoice::Retry`; `[q]` / `[2]` / `Esc` → `Pause`; `[a]` → `Abort`.
+
+#### 7f. Agent setup confirmation dialog
+
+`AgentSetupFrontend::ask_agent_setup` (WI 0068 §6.3b) opens the legacy `AgentSetupConfirm` modal:
+
+- Title varies: `" Set up <agent>? "` (Dockerfile missing) or `" Build <agent> image? "` (Dockerfile present, image missing).
+- Body explains the situation and lists the planned actions.
+- Keys: `[y]` / `Enter` → `AgentSetupDecision::Setup`; `[f]` → `FallbackToDefault` (only rendered when `default_available` is true and the requested agent != default); `[n]` / `Esc` → `Abort`.
+- Per-step fallback caching: when the user presses `[f]` during a workflow, the TUI calls `AgentSetupFrontend::record_fallback(requested, default)`; subsequent steps in the same workflow that target `requested` automatically use `default` without re-prompting. Persist the cache in `TabState::workflow_agent_fallbacks: HashMap<AgentName, AgentName>`.
+
+#### 7g. Mount scope dialog
+
+`MountScopeFrontend::ask_mount_scope` (WI 0068 §6.3a) opens the legacy `MountScope` modal:
+
+- Title: `" Mount Scope "`.
+- Body: shows both paths (git_root and cwd) and explains what each option mounts.
+- Keys: `[r]` → `MountGitRoot`; `[c]` → `MountCurrentDirOnly`; `[a]` / `Esc` → `Abort`.
+
+#### 7h. Agent auth consent dialog
+
+`AgentAuthFrontend::ask_agent_auth_consent` (WI 0068 §6.3c) opens a new modal `AgentAuthConsent`:
+
+- Title: `" Agent credentials? "`.
+- Body: lists the env-var names that will be injected (e.g. `ANTHROPIC_API_KEY`) and explains the consent semantics.
+- Keys: `[y]` → `Accept` (persists `auto_agent_auth_accepted = true`); `[n]` → `Decline` (persists `false`); `[o]` (once) → `DeclineOnce` (no persistence). `Esc` → `DeclineOnce`.
+
+#### 7i. Config show dialog
+
+The legacy `Dialog::ConfigShow` (a full-screen interactive table) is preserved verbatim in `src/frontend/tui/config_show_view.rs`:
+
+- Triggered by `config show` command from the command box, OR by Ctrl+, (toggle) anywhere in the TUI.
+- Full-screen table: columns Field | Global | Repo | Effective.
+- Arrow keys navigate rows; Enter enters edit mode on the selected cell.
+- In edit mode: type to modify, Backspace/Delete supported, Ctrl+S saves to the appropriate config file (Global column → global config, Repo column → repo config), Esc cancels edit (reverts cell).
+- Ctrl+, (or close button) closes the dialog. Closing without saving discards uncommitted edits with a confirmation prompt.
+- Read-only fields (`auto_agent_auth_accepted`) render in gray and reject Enter (display tooltip "read-only").
+- Validation errors (e.g. invalid agent name) display inline below the cell in red; the cell stays in edit mode until the user fixes or Esc-cancels.
+
+The dialog calls into Layer 2 via `ConfigCommand::set_field` (which uses `RepoConfig::set_field` / `GlobalConfig::set_field` from Layer 0). The TUI never manipulates config JSON directly.
+
+#### 7j. New-artefact dialogs (`new spec`, `new workflow`, `new skill`, `specs new`)
+
+- `NewKindSelect`: radio modal with [1] Feature / [2] Bug / [3] Task / [4] Enhancement. Keys 1–4 select; Esc cancels. Rendered when `new spec` (or `specs new` alias) is invoked from the command box.
+- `NewTitleInput`: single-line text input. Ctrl+Enter submits; Esc cancels.
+- `NewInterviewSummary`: multiline text editor with cursor navigation (left/right/up/down, home/end, backspace/delete). Ctrl+Enter submits. Used for `--interview` mode summaries.
+- `NewWorkflow` / `NewSkill`: multi-field form (title, format/extension, default agent, etc.). Tab / Shift+Tab cycle fields. Ctrl+Enter submits.
+- All editable text inputs share the legacy `WORKTREE_COMMIT_PROMPT_KEYMAP` for cursor navigation — see `src/frontend/tui/text_edit.rs` (a single shared widget).
+
+#### 7k. Claws dialogs (in addition to those listed in §2)
+
+- `ClawsReadyHasForked`: [1] Yes / [2] No.
+- `ClawsReadyUsernameInput`: GitHub username text input (single line).
+- `ClawsReadySudoConfirm`: sudo password input (display masked as `*` per character).
+- `ClawsReadyDockerSocketWarning`: [1] Accept / [2] Decline mounting Docker socket.
+- `ClawsReadyOfferRestartStopped`: [1] Restart stopped container / [2] No.
+- `ClawsReadyOfferStart`: [1] Start fresh container / [2] No.
+- `ClawsRestartFailedOfferFresh`: [1] Delete and start fresh / [2] No.
+
+These all map to `ClawsFrontend` methods (some new) — extend the trait in WI 0067 §5a.c to cover each. Update the engine state machine to fire each phase appropriately.
+
+#### 7l. Quit and tab-close dialogs
+
+- `QuitConfirm`: [y/Y/1/Enter] quit / [n/N/2/Esc] cancel. Triggered by Ctrl+C with a single tab, or `q` in idle command box.
+- `CloseTabConfirm`: triggered by Ctrl+C with multiple tabs. Choices: Ctrl+C again → quit entire app; Ctrl+T → close just this tab; Esc → cancel.
+
+#### 7m. PTY container view — VT100, scrollback, mouse selection
+
+`TuiContainerFrontend` holds:
+
+- A `vt100::Parser` instance for parsing ANSI escape sequences. Cell grid dimensions follow the rendered window size; on `resize_pty(cols, rows)` the parser is resized AND the engine is informed via `resize_pty` forwarding.
+- A scrollback buffer of `terminal_scrollback_lines` lines (sourced from `EffectiveConfig::terminal_scrollback_lines`, default 10000). Configurable per-repo or globally via the catalogue's `config set terminal_scrollback_lines N`.
+- `pty_pending_cr` flag for handling `\r` / `\r\n` sequences without flickering.
+- A `pty_live_line` flag — true when the last line is incomplete (no trailing newline yet); used to overwrite spinner output in place.
+
+Mouse handling:
+
+- MouseDown in the container window starts a selection anchor (`terminal_selection_start`).
+- MouseDrag extends the selection (`terminal_selection_end`).
+- MouseUp finalizes — captures the vt100 cell snapshot for clipboard.
+- Ctrl+Y copies the selected text to the system clipboard via the `arboard` crate (or equivalent). On wire failure, emits `UserMessage::error("clipboard unavailable")`.
+
+Scrollback navigation (when ExecutionWindow has focus):
+
+- ↑ / ↓ scroll one line.
+- PageUp / PageDown scroll one page.
+- `b` jumps to top of scrollback; `e` jumps to live (offset = 0).
+- Mouse wheel scrolls (preserving selection if active).
+
+Container output streams via `ContainerFrontend::write_stdout` / `write_stderr` chunks. The TUI does NOT distinguish stdout from stderr in rendering (matches legacy behavior); both feed the same vt100 parser.
+
+Kitty keyboard protocol: `App::run` calls `crossterm::execute!(stdout, PushKeyboardEnhancementFlags(...))` best-effort on startup. Failure is non-fatal (legacy behavior). Cleanup on `App::drop` pops the flags.
+
+#### 7n. Tab status log via `UserMessageSink`
+
+`TuiUserMessageSink` writes each `UserMessage` to a per-tab status log rendered in a scrollable panel below the container window (or beside it, depending on layout). The log:
+
+- Renders messages in insertion order with level-colored prefixes (Info: dim gray, Warning: yellow, Error: red, Success: green).
+- Auto-scrolls to bottom on new message unless the user has scrolled up.
+- `replay_queued()` is a no-op (messages are rendered live).
+
+The status log is visible at all times — when a container is running, when the workflow control board is open, etc. Users can press `l` (lowercase L) when the ExecutionWindow has focus to toggle the log between collapsed (1-line summary) and expanded (full panel).
+
+#### 7o. Status command — TUI tab annotations
+
+`TuiStatusCommandFrontend` populates the `StatusCommandTuiContext` (WI 0068 §6.8) before each invocation:
+
+```rust
+fn build_tui_context(&self, session_manager: &SessionManager) -> StatusCommandTuiContext {
+    StatusCommandTuiContext {
+        tabs: session_manager.iter().enumerate().map(|(i, sess)| TuiTabSnapshot {
+            tab_number: i as u32 + 1,
+            container_name: sess.running_container_name(),
+            is_stuck: sess.is_stuck(),
+            command_label: sess.command_label(),
+        }).collect(),
+    }
+}
+```
+
+The status command then renders the standard table with extra columns (Tab #, ⚠️ stuck) only when the context is `Some`.
+
+#### 7p. TUI startup behavior
+
+`tui::run(matches, ctx)` MUST:
+
+1. Capture terminal: raw mode, alternate screen, mouse capture (`EnableMouseCapture`), Kitty keyboard protocol (best-effort).
+2. Construct `App` with one initial tab at `std::env::current_dir()`.
+3. Determine the startup command:
+   - If `git_root_resolver` succeeds (cwd is in a git repo): build `Dispatch` for `["ready"]` with flags from `matches` (`--build`, `--no-cache`, `--refresh`) and run it through the initial tab's `TuiReadyFrontend`.
+   - Otherwise: build `Dispatch` for `["status", "--watch"]` and run it through the initial tab's `TuiStatusCommandFrontend`.
+4. Enter the event loop.
+
+The startup invocation MUST run through the standard `Dispatch` → `*Command` → `*Frontend` chain — no special-casing in `App::new`. Cover with a unit test for both branches (in-repo, not-in-repo).
+
+`StartupReadyFlags` is internal to the TUI's startup path — not a public type. It is just the legacy name for "the flags clap parsed at the top level that are also relevant to startup ready".
+
+#### 7q. Remote session picker dialogs
+
+The legacy TUI exposes per-tab remote session selection through several pickers. Each maps to `RemoteRunCommandFrontend` / `RemoteSessionStartCommandFrontend` / `RemoteSessionKillCommandFrontend` trait methods (added in WI 0068; not previously enumerated). For each picker:
+
+- `RemoteSessionPicker` (selecting a session for `remote run` when `--session` is omitted): arrow-key navigable list of sessions fetched from the remote server. Enter to select; Esc to cancel.
+- `RemoteSavedDirPicker` (selecting a directory for `remote session start` when `<DIR>` is omitted): list comes from `GlobalConfig::remote.saved_dirs`. Enter to select; Esc to cancel.
+- `RemoteSessionKillPicker` (selecting a session for `remote session kill`): similar to `RemoteSessionPicker`.
+- `RemoteSaveDirConfirm` (after `remote session start <DIR>` succeeds with a new directory): asks `[y]/[n]` whether to save the directory in `remote.saved_dirs` for future use. Headless default: false (do NOT save). CLI default: stdin prompt; non-TTY → false.
+
+Each picker fetches data asynchronously via `RemoteClient` — the TUI shows a "loading…" placeholder until results arrive. Cover with a unit test that simulates a slow fetch.
+
+#### 7r. Status command TIPS array and CLEAR_MARKER
+
+`StatusCommand`'s rendered output ends with a random tip from a fixed `TIPS: &[&str]` array (legacy `oldsrc/commands/status.rs`). The selection index is `(unix_seconds % TIPS.len())` — deterministic per second. Preserve the exact array verbatim in `src/command/commands/status_tips.rs`. Cover with a unit test that asserts a frozen tip given a fixed timestamp.
+
+`StatusCommand --watch` writes a CLEAR_MARKER (ANSI `\x1b[2J\x1b[H`) before each re-render. The CLI frontend forwards CLEAR_MARKER to stdout; the TUI swallows it (the TUI re-renders the dialog widget instead). Cover both behaviors.
+
+#### 7s. `amux init --aspec` semantics
+
+The legacy `--aspec` flag forces a fresh download of the aspec template tree from GitHub (`download_aspec_tarball`). The `InitPhase::CreatingAspecFolder` phase uses the bundled (compiled-in) template when `--aspec` is absent. When `--aspec` is present:
+
+1. The `InitEngineOptions::run_aspec_setup` field is true.
+2. The engine downloads the latest aspec tarball during the `CreatingAspecFolder` phase (or a new dedicated `DownloadingAspecTemplates` sub-phase).
+3. If a download fails (network error, 404), fall back to the bundled template AND emit `UserMessage::warning("aspec download failed — using bundled template")`.
+
+Cover all three paths (no `--aspec`: bundled; `--aspec` + success: downloaded; `--aspec` + failure: bundled with warning).
+
+#### 7t. `WorkItemsConfig` structure
+
+The `InitFrontend::ask_work_items_setup` return type:
+
+```rust
+pub struct WorkItemsConfig {
+    pub dir: PathBuf,                   // required (relative to git_root)
+    pub template: Option<PathBuf>,      // optional (relative to git_root)
+}
+```
+
+The TUI's `InitWorkItemsDirInput` dialog prompts for `dir` (Enter to confirm). Then `InitWorkItemsTemplateInput` prompts for `template` (Enter to confirm with empty string → None, or skip via Esc → None). Cover with unit tests for: dir-only, dir+template, both empty (returns `Ok(None)`).
+
+#### 7u. Headless dialog defaults — exhaustive list
+
+The headless frontend implements every per-command frontend trait but defaults all interactive prompts to safe non-interactive values. Capture each default in `src/frontend/headless/defaults.rs` as named constants:
+
+- `ReadyFrontend::ask_create_dockerfile` → `true` (always create when missing).
+- `ReadyFrontend::ask_run_audit_on_template` → `false` (skip audit by default).
+- `ReadyFrontend::ask_migrate_legacy_layout` → `false` (preserve legacy layout).
+- `InitFrontend::ask_replace_aspec` → `false` (preserve existing).
+- `InitFrontend::ask_run_audit` → `false` (skip).
+- `InitFrontend::ask_work_items_setup` → `None` (skip work-items config).
+- `ClawsFrontend::ask_replace_existing_clone` → `false`.
+- `ClawsFrontend::ask_run_audit` → `false`.
+- `WorkflowFrontend::user_choose_next_action` → `LaunchNext` for non-yolo (advance to next ready step), `LaunchNext` (with auto-advance) for yolo.
+- `WorkflowFrontend::user_choose_after_step_failure` → `Pause` (do not auto-retry).
+- `WorktreeLifecycleFrontend::ask_pre_worktree_uncommitted_files` → `UseLastCommit` (don't auto-commit).
+- `WorktreeLifecycleFrontend::ask_existing_worktree` → `Resume`.
+- `WorktreeLifecycleFrontend::ask_post_workflow_action` → `Keep` (don't auto-merge or auto-discard).
+- `WorktreeLifecycleFrontend::ask_worktree_commit_before_merge` → `None`.
+- `WorktreeLifecycleFrontend::confirm_squash_merge` → `false`.
+- `WorktreeLifecycleFrontend::confirm_worktree_cleanup` → `false`.
+- `MountScopeFrontend::ask_mount_scope` → `MountGitRoot`.
+- `AgentSetupFrontend::ask_agent_setup` → `Setup` (proceed with download/build).
+- `AgentAuthFrontend::ask_agent_auth_consent` → `DeclineOnce` (do NOT auto-persist consent over an API).
+
+Each default MAY be overridden by request body parameters; the request schema lives alongside the catalogue's headless projection.
+
 ## Edge Case Considerations:
 
 - **Existing TUI tests**: `oldsrc/tui/state.rs` has substantial tests. They cannot run against the new TUI; reproduce the equivalent assertions against `Session` + `SessionManager` + the TUI's view code. ASK THE DEVELOPER if a particular test reveals a behavior that is not preserved.
-- **`StartupReadyFlags`**: the legacy `main.rs` passes `--build`, `--no-cache`, `--refresh` into the TUI to be applied to a startup `ready` invocation. The new architecture handles this via `Dispatch` calling `ReadyCommand` at TUI startup; the TUI startup path constructs a `Dispatch` for `["ready"]` with the global flags pre-populated. Confirm with developer whether this is the right model.
+- **`StartupReadyFlags`**: the legacy `main.rs` passes `--build`, `--no-cache`, `--refresh` into the TUI to be applied to a startup `ready` invocation. The new architecture handles this via `Dispatch` calling `ReadyCommand` at TUI startup; the TUI startup path constructs a `Dispatch` for `["ready"]` with the global flags pre-populated. The `ReadyCommand` then constructs a `ReadyEngine` with those options and runs it through `TuiReadyFrontend`. Confirm with developer whether this is the right model.
+- **`ReadyEngine` and `InitEngine` non-interactive defaults**: when the TUI or headless frontend runs `ready` or `init` without a user present at the dialog (e.g. startup flags, headless API call), the frontend's Q&A methods MUST return safe defaults rather than blocking. The engine does not care — it calls the trait method and acts on the result. Each frontend is responsible for supplying those defaults; the engine has no `non_interactive` flag of its own (that was a legacy anti-pattern). If a caller wants non-interactive behavior, it implements a frontend that returns `false` / `None` for all decision methods.
 - **Session lifetime in the TUI**: each tab owns one `Session`. Closing a tab removes the session from `SessionManager`. If a session has an in-flight container, `SessionManager::remove` must orchestrate cancellation through `ContainerExecution::cancel`. ASK THE DEVELOPER whether closing a tab forcibly kills running containers (legacy behavior) or prompts the user.
 - **CLI vs TUI Session count**: `SessionManager::in_memory()` works for both single-session (CLI) and multi-session (TUI). Cover this with a unit test asserting both modes.
-- **Headless multi-session concurrency**: each API session is a `Session`; `Dispatch::run_command` borrows the `Session` via the `Arc<RwLock<Session>>` provided to `Dispatch::new`. Long-running commands (chat, implement, exec workflow) hold the read lock across the lifetime of the command. Verify this does not deadlock with concurrent inspection requests.
+- **Headless multi-session concurrency**: each API session is a `Session`; `Dispatch::run_command` borrows the `Session` via the `Arc<RwLock<Session>>` provided to `Dispatch::new`. Long-running commands (chat, exec workflow) hold the read lock across the lifetime of the command. Verify this does not deadlock with concurrent inspection requests.
 - **Error rendering parity**: every error message a user might see today must be reproducible by the new error rendering. Capture the existing user-visible strings (or close paraphrases) in `tests/cli_error_parity.rs` and assert.
 - **Color and TTY detection**: `oldsrc/commands/output.rs` handles color/no-color logic. Move this to `src/frontend/cli/output.rs` (pure presentation).
 - **Help text**: `clap` builds help from the catalogue. Compare `amux help` and `amux <subcommand> --help` output before and after; differences must be limited to noise (whitespace, version string, help-ordering).
 - **TUI keyboard shortcut conflicts**: the new TUI adds no shortcuts; preserve every existing one. ASK THE DEVELOPER if any new shortcut is requested as part of this work item (default: no).
+- **Tab close with running container**: legacy behavior is to **forcibly cancel** the running container without prompting. Preserve this — `SessionManager::remove(session_id)` calls `ContainerExecution::cancel` synchronously and propagates any cancel error as a `UserMessage::warning` rather than blocking the tab close. Cover with a unit test using a mock execution that records `cancel` calls.
+- **Tab switching during yolo countdown**: leaving a tab while a `WorkflowYoloCountdown` modal is open MUST close the modal but keep the engine's countdown running (the engine doesn't know about tab switches). Re-entering the tab re-opens the modal at the engine's current remaining time. The TUI tracks `tab.yolo_countdown_started_at` for this purpose. Cover with a unit test.
+- **Stuck-detection dismissal backoff**: per WI 0067 §9a.5, dismissing the yolo-countdown modal triggers a 60s backoff before the engine can re-fire `report_step_stuck`. The TUI also tracks per-step manual disabling via `auto_workflow_disabled_steps` (§7c). Cover both behaviors with unit tests asserting the correct interaction order.
+- **CLI worktree dialog defaults**: when stdin is not a TTY (piped), the `CliWorktreeLifecycleFrontend` MUST NOT block on stdin reads. Instead, it returns the same safe-defaults as the headless frontend (§7q). Cover with a unit test using a `Cursor`-backed stdin.
+- **Headless server lifecycle hand-off**: WI 0068 §6.4 introduces `HeadlessLifecycle`. The CLI frontend's `HeadlessStartCommandFrontend` impl drives the lifecycle: it calls `lifecycle.write_pid()`, opens the log for append, hands the assembled `HeadlessServeConfig` to `crate::frontend::headless::serve(...)`, and on shutdown calls `lifecycle.clear_pid()`. Cover with a unit test that asserts the PID lifecycle methods are invoked in order.
+- **Mouse selection persistence**: a text selection in the container window persists across re-renders and only clears on (a) MouseDown for a new selection, (b) Esc when ExecutionWindow is focused, or (c) tab switch. Cover with a unit test using synthetic mouse events.
+- **Clipboard fallback**: when the system clipboard is unavailable (no display server, OS support missing), Ctrl+Y emits `UserMessage::error("clipboard unavailable")` rather than panicking. Cover with a unit test using a fake `Clipboard` adapter that returns an error.
+- **Read-only config fields**: the TUI's `ConfigShow` dialog renders `auto_agent_auth_accepted` as a read-only field with gray text and a tooltip on Enter. Cover with a unit test asserting Enter is rejected and the tooltip is rendered.
 
 ## Test Considerations:
 
@@ -280,6 +588,37 @@ This work item produces **only Layer 3 unit tests and pure-presentation snapshot
   - Dialog widgets (selection list, confirmation, text input) snapshot-tested with `insta` against synthetic inputs and key sequences.
   - Hint rendering pulls from `CommandCatalogue::tui_hint_for` — assert the hint text comes from the catalogue, not a hard-coded string in the TUI.
   - Tab close with an in-flight container calls `ContainerExecution::cancel` on the right execution (mock the engine).
+  - `TuiReadyFrontend::report_phase` for each `ReadyPhase` variant updates the expected TUI component state (data-table test over all variants).
+  - `TuiClawsFrontend::report_phase` for each `ClawsPhase` variant updates the expected TUI component state (data-table test over all variants).
+  - `TuiClawsFrontend::ask_replace_existing_clone` opens the correct dialog; key `'y'` returns `true`, `'n'`/Esc returns `false`.
+  - `TuiWorkflowFrontend::user_choose_next_action` with `AvailableActions { can_continue_in_current_container: false, .. }` renders without the continue option and returns only from the available set.
+  - `TuiWorkflowFrontend::user_choose_next_action` with `AvailableActions { can_cancel_to_previous_step: false, cancel_to_previous_unavailable_reason: Some("this is the first step"), .. }` renders the option as disabled with the reason string visible.
+  - Selecting `RestartCurrentStep` from the dialog returns `NextAction::RestartCurrentStep` (data-table test over all available action variants).
+  - `TuiWorktreeLifecycleFrontend::ask_pre_worktree_uncommitted_files` with key `'c'` transitions to `WorktreePreCommitMessage` dialog with default message pre-populated. Ctrl+Enter submits with the typed message. `'a'`/Esc returns `PreWorktreeDecision::Abort`.
+  - `TuiWorktreeLifecycleFrontend::ask_post_workflow_action` with key `'m'` returns `PostWorkflowWorktreeAction::Merge`; `'d'` returns `Discard`; `'s'`/Esc returns `Keep`.
+  - `TuiWorktreeLifecycleFrontend::ask_worktree_commit_before_merge`: editable text box with cursor navigation — left/right/home/end/backspace/delete key handling matches `oldsrc/tui/input.rs::handle_worktree_commit_prompt` (data-table test over cursor movements).
+  - `TuiUserMessageSink::write_message` appends to the per-tab status log; status log renders messages in insertion order; `replay_queued` is confirmed to be a no-op (log is unchanged afterward).
+  - **Tab color matrix** (per §7a): for each `(execution_phase, focus, container_state, is_stuck, is_remote)` tuple the rendered tab color matches the legacy specification. Drive via a data-table test.
+  - **Tab subcommand label**: the alternating yolo indicator (`⚠️  yolo in Ns` / `🤘 yolo in Ns`) renders correctly across two consecutive renders 2 seconds apart (drive with `tokio::time::pause`).
+  - **Container window state cycling** (Ctrl+M): Hidden → Minimized → Maximized → Hidden. Cover with a data-table test.
+  - **Focus transitions**: ↑ from CommandBox with running container moves focus to ExecutionWindow; Esc from ExecutionWindow returns focus to CommandBox.
+  - **`WorkflowControlBoard` arrow-key matrix** (per §7c): every key in the legend maps to the correct `NextAction`. Data-table test.
+  - **`WorkflowControlBoard` Ctrl+Enter** on the last step returns `NextAction::FinishWorkflow`; on a non-last step it is visually disabled and Ctrl+Enter is a no-op.
+  - **`WorkflowControlBoard` 'd' key** sets `tab.auto_workflow_disabled_steps[current_step]`; subsequent `yolo_countdown_tick` calls return `YoloTickOutcome::Cancel` for that step.
+  - **`WorkflowYoloCountdown` modal** dismissed via Esc returns `YoloTickOutcome::Cancel` AND triggers a 60s backoff (`STUCK_DIALOG_BACKOFF`) before the next `report_step_stuck` fires. Drive with `tokio::time::pause`.
+  - **`WorkflowStepError` modal** (per §7e): `[r]` returns `Retry`, `[q]` returns `Pause`, `[a]` returns `Abort`. Data-table test.
+  - **`AgentSetupConfirm` modal** (per §7f): renders the fallback option only when `default_available` is true and `requested != default`; `[f]` records a fallback in `tab.workflow_agent_fallbacks`.
+  - **Workflow agent-fallback caching**: when the cache contains the requested agent, `AgentSetupFrontend::ask_agent_setup` is NOT called for that agent in the same workflow run. (Layer 3 caching — verify by mocking the frontend.)
+  - **`MountScope` modal** (per §7g): `[r]` → MountGitRoot, `[c]` → MountCurrentDirOnly, `[a]`/Esc → Abort.
+  - **`AgentAuthConsent` modal** (per §7h): `[y]` persists `auto_agent_auth_accepted = true`; `[n]` persists false; `[o]`/Esc → DeclineOnce (no persistence).
+  - **`ConfigShow` dialog** (per §7i): edit-mode key sequence `Enter` → typing → `Ctrl+S` saves to the right config file; `Esc` reverts; read-only field rejects Enter.
+  - **`ConfigShow` validation**: setting an invalid `agent` value displays an inline red error message; the cell stays in edit mode.
+  - **TUI startup branching** (per §7p): in-repo path runs `["ready"]`; not-in-repo path runs `["status", "--watch"]`. Verify both with a fake `git_root_resolver`.
+  - **Tab close with in-flight container** calls `ContainerExecution::cancel` synchronously, NOT after a confirmation dialog (legacy behavior).
+  - **Mouse selection** persists across re-renders; clears on MouseDown for a new selection, Esc, or tab switch.
+  - **Clipboard fallback**: Ctrl+Y on a fake clipboard that errors emits `UserMessage::error("clipboard unavailable")` and does NOT panic.
+  - **Levenshtein typo correction**: `Dispatch::parse_command_box_input("imp")` returns an error containing `"did you mean: implement?"`. (Catalogue helper test, but rendered by the TUI.)
+  - **Per-tab `auto_workflow_disabled_steps` reset**: when a step transitions from `Failed`/`Succeeded` back to `Pending` (e.g. via `RestartCurrentStep`), the disabled flag is cleared. Cover with a unit test.
 - **Headless** (`src/frontend/headless/`):
   - For each route in `CommandCatalogue::rest_route_table`, a focused test sends a representative `axum::http::Request` to the handler with a mocked `Dispatch::run_command` and asserts the handler called dispatch with the right command path and a `HeadlessCommandFrontend` populated from the request.
   - Auth middleware: token mode rejects bad tokens with 401, accepts good tokens with the expected response; disabled mode emits `X-Amux-Auth: disabled`; TLS-required mode rejects non-loopback bind without TLS.
@@ -312,7 +651,7 @@ This work item is the last point at which the legacy `oldsrc/` is still in the r
 The PR description MUST include:
 
 - A table listing every command and subcommand documented in `aspec/uxui/cli.md`, each marked PASS / MINOR-DRIFT (with one-sentence justification) / REGRESSION (block).
-- A confirmation that the TUI was launched on a real terminal, every documented keyboard shortcut was exercised, at least 3 tabs were opened, an `implement` workflow was run end-to-end (with at least one user dialog), and rendering was visually identical (or improved with documented justification) to pre-refactor.
+- A confirmation that the TUI was launched on a real terminal, every documented keyboard shortcut was exercised, at least 3 tabs were opened, an `exec workflow` was run end-to-end (with at least one user dialog), and rendering was visually identical (or improved with documented justification) to pre-refactor.
 - A confirmation that the headless server was started, every documented endpoint received a real `curl` invocation, and responses were wire-compatible with pre-refactor.
 
 Any item that is REGRESSION blocks the PR. The implementing agent MUST fix or escalate to the developer. Do not merge with open regressions.

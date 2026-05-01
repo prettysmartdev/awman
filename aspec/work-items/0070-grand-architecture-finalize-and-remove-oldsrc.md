@@ -87,17 +87,23 @@ tests/
   engine/                          # Layer 1 — real-system tests
     container_docker.rs            # real Docker daemon required
     container_apple.rs             # real Apple containers required (cfg(target_os = "macos"))
-    workflow_end_to_end.rs         # real Docker, three-step workflow
+    workflow_end_to_end.rs         # real Docker, three-step workflow; includes ContinueInCurrentContainer and multi-agent advance
+    ready_engine.rs                # real Docker, real git; full ReadyPhase state machine from Preflight to Complete
+    init_engine.rs                 # real Docker, real git; full InitPhase state machine from Preflight to Complete
+    claws_engine.rs                # real Docker, real git; full ClawsPhase state machine; ClawsMode::Init/Ready/Chat entry points
+    agent_engine.rs                # real Docker; ensure_available download+build path; build_options per supported agent
     git_engine.rs                  # real `git init` worktree create/merge/remove cycle
+    worktree_lifecycle.rs          # real git: full prepare→run→finalize cycle; merge conflict path; discard path
     overlay_engine.rs              # real filesystem with canonicalization edge cases
     auth_engine_tls.rs             # real rustls cert generation, fingerprint stability
   command/                         # Layer 2 against real Layers 0+1
-    dispatch_real_engines.rs       # Dispatch::run_command end-to-end for init/ready/status/single-step implement
+    dispatch_real_engines.rs       # Dispatch::run_command end-to-end for init/ready/status/exec-workflow
   cli_parity/                      # Layer 3 CLI parity vs. pre-refactor (or vs. documented behavior)
     help_text.rs                   # golden-file: amux help, amux <sub> --help for every level
-    init.rs
-    ready.rs
-    implement.rs
+    init.rs                        # full phase-by-phase parity: each InitPhase produces expected output/files
+    ready.rs                       # full phase-by-phase parity: each ReadyPhase produces expected output/images
+    exec_workflow_worktree.rs      # full pre/post worktree lifecycle parity: pre-commit dialog, merge/discard/keep
+    user_messages.rs               # verify UserMessageSink messages appear in CLI stderr and TUI status log
     chat.rs
     exec_prompt.rs
     exec_workflow.rs
@@ -172,7 +178,7 @@ With the new test suite in place, produce `aspec/review-notes/0070-parity-valida
 - Additionally, the implementing agent MUST launch the new TUI on a real terminal and walk through the documented user flows:
   - Launch → tab list visible → status bar correct.
   - Open multiple tabs (every tab-open shortcut). Switch between them. Close them.
-  - Run `implement` from the command box; complete a single-step workflow; observe the workflow control dialog; choose advance, pause, abort.
+  - Run `exec workflow` from the command box; complete a single-step workflow; observe the workflow control dialog; choose advance, pause, abort.
   - Run a multi-step workflow with `--yolo` and observe the auto-advance countdown.
   - Trigger an error path (e.g. a missing work item) and confirm the error rendering is identical or improved.
   - Resize the terminal during execution; confirm dynamic tab widths and PTY resize work.
@@ -188,6 +194,100 @@ With the new test suite in place, produce `aspec/review-notes/0070-parity-valida
 #### 2d. Sign-off rule
 
 The work item cannot proceed to step 4 (deletion) until every parity entry is PASS or has an explicit, developer-approved MINOR-DRIFT justification. REGRESSIONs block the PR.
+
+#### 2e. Parity validation matrix — explicit coverage requirements
+
+Beyond the broad CLI/TUI/headless tiers in §2a–c, the following specific behaviors from `oldsrc/` MUST each have at least one targeted test in the new `tests/` tree. The list is derived from work items 0067 §9a, 0068 §6, and 0069 §7. Track each entry as a row in `aspec/review-notes/0070-parity-validation.md` with PASS / MINOR-DRIFT / REGRESSION.
+
+**Command surface parity** (one test per row, against the `amux` binary as a subprocess unless otherwise noted):
+
+1. `amux init --agent <claude|codex|opencode|maki|gemini|copilot|crush|cline> --aspec` runs to completion and produces `.amux/config.json` + `Dockerfile.dev` (data-table over agents).
+2. `amux ready --refresh --build --no-cache --non-interactive --allow-docker --json` produces machine-readable JSON with the documented schema.
+3. `amux ready --json` implies `--non-interactive` (verify by inspecting that no interactive prompts fire even with stdin attached).
+4. `amux implement 0001 [--workflow PATH] [--worktree] [--yolo] [--auto] [--plan] [--agent NAME] [--model NAME] [--non-interactive] [--allow-docker] [--mount-ssh] [--overlay SPEC]…` runs end-to-end. Cover the implication rule (`--yolo + --workflow ⇒ --worktree`).
+5. `amux chat [flags]` runs interactively (PTY); `amux chat -n` runs non-interactively.
+6. `amux specs new --interview` prompts for kind+title and creates a work-item file.
+7. `amux specs amend 0042 [-n] [--allow-docker]` runs end-to-end.
+8. `amux new spec` is an alias for `amux specs new`.
+9. `amux new workflow [--interview] [--global] [--format toml|yaml|md]` creates a workflow file at the right location.
+10. `amux new skill [--interview] [--global]` creates a skill file at the right location.
+11. `amux claws init` / `claws ready` / `claws chat` run their multi-phase flows end-to-end.
+12. `amux status [--watch]` prints the legacy ASCII table; `--watch` re-renders every 3 seconds.
+13. `amux config show` / `config get FIELD` / `config set FIELD VALUE [--global]` for every documented field.
+14. `amux exec prompt "..."` runs non-interactively with a non-empty prompt validator.
+15. `amux exec workflow PATH [--work-item NUM] [--yolo|--auto|--worktree] …` runs end-to-end. The `wf` alias works.
+16. `amux headless start [--port] [--workdirs] [--background] [--refresh-key] [--dangerously-skip-auth]` starts the server with the right config; `--refresh-key` prints exactly the legacy banner once; `--background` daemonizes and exits the foreground process cleanly.
+17. `amux headless kill` / `headless logs` / `headless status` work against a running server.
+18. `amux remote run -- exec prompt "hi" --yolo` forwards trailing args correctly (verify `--yolo` reaches the remote without "unknown flag" errors).
+19. `amux remote session start /path` / `session kill SESSION_ID`.
+
+**Engine behavior parity** (driven from `tests/engine/`):
+
+20. `AgentEngine::ensure_available` for each supported agent: download → build → image_exists → idempotent on second call.
+21. `AgentEngine::build_options` per-agent matrix produces the correct `Vec<ContainerOption>` for each combination of `(yolo, auto, plan, non_interactive, model, allowed_tools)`.
+22. `OverlayEngine::agent_settings_overlays(claude)` strips `oauthAccount`, applies the denylist filter, injects yolo settings when `Yolo::Enabled`, suppresses LSP recommendations, and detects non-root `USER` directives. Each property is a separate test.
+23. `OverlayEngine::agent_settings_overlays` for non-Claude agents produces the correct single-dir overlay.
+24. `AuthEngine::agent_keychain_credentials` returns the right env-var pairs from a fake keychain backend.
+25. `AuthEngine::resolve_agent_auth` honors `auto_agent_auth_accepted`.
+26. `WorkflowEngine` end-to-end: 3-step DAG with `LaunchNext`, `ContinueInCurrentContainer`, `RestartCurrentStep`, `CancelToPreviousStep`, `FinishWorkflow`, `Pause`, `Abort`, and `StepFailureChoice::Retry` paths each.
+27. Workflow stuck detection: agent silent for `agentStuckTimeout` seconds → `report_step_stuck` fires; new output → `report_step_unstuck`; `--yolo` → `yolo_countdown_tick` ticks at 1 Hz.
+28. Workflow file parsing: the same workflow expressed in `.md`, `.toml`, `.yaml` produces identical `Workflow` structs.
+29. Prompt template substitution: `{{work_item_number}}`, `{{work_item_content}}`, `{{work_item_section:[Name]}}` substitute correctly; missing work item produces empty strings + a `UserMessage::warning`.
+30. Workflow state persistence: `save` then `load` round-trips; legacy fallback path migration works (synthesize a state file at `<HOME>/.amux/workflow-state/` and verify it migrates to `<git-root>/.amux/workflows/`).
+31. `ContainerRuntime::detect` selects Docker on Linux, Apple on macOS-with-config, errors on Linux-with-apple-config, defaults to Docker with warning on unknown value.
+32. Image tags: `<repo-hash>:latest` and `<repo-hash>:<agent>:latest` match the legacy fingerprint for a known fixture path.
+33. `GitEngine` worktree path: `~/.amux/worktrees/<repo-name>/0042/` for work items, `~/.amux/worktrees/<repo-name>/wf-<name>/` for named workflows. Branch names: `amux/work-item-0042` and `amux/workflow-<name>`.
+34. `GitEngine::merge_branch` uses `git merge --squash` followed by `git commit -m "Implement <branch>"`.
+
+**TUI behavior parity** (driven from `tests/tui_parity/` against a vt100 harness):
+
+35. Tab management — Ctrl+T opens `NewTabDirectory`, Ctrl+A/D switch, Ctrl+C closes tab (multi-tab) or quits (single-tab).
+36. Tab color matrix: yellow (stuck), magenta (remote), red (error), green (PTY+running), blue (running no PTY), magenta (claws), dark gray (idle/done).
+37. Tab subcommand label: alternating `⚠️  yolo in Ns` / `🤘 yolo in Ns` every 2 seconds when yolo countdown is active in background.
+38. Container window state cycling: Ctrl+M → Hidden → Minimized → Maximized → Hidden.
+39. Focus transitions: ↑ from CommandBox to ExecutionWindow when running; Esc from ExecutionWindow back to CommandBox.
+40. Workflow control board: every arrow-key + Ctrl+Enter + Ctrl+C + 'd' + Esc is exercised at least once across tests.
+41. Workflow yolo countdown: opens after 30s stuck; auto-advances after 60s; Esc dismisses with 60s backoff.
+42. Workflow step error dialog: [r] retry / [q] pause / [a] abort.
+43. Agent setup confirm: [y] setup / [f] fallback / [n] decline; per-tab fallback cache prevents re-prompting.
+44. Mount scope dialog: [r] root / [c] cwd / [a] abort.
+45. Agent auth consent: [y]/[n]/[o] persist correctly.
+46. Config show dialog: edit mode, save (Ctrl+S), cancel (Esc), Ctrl+, toggle, read-only field rejection.
+47. New spec / new workflow / new skill dialogs: kind selection, title input, multiline interview summary, multi-field forms.
+48. Claws dialogs: every variant (HasForked, UsernameInput, SudoConfirm, DockerSocketWarning, OfferRestartStopped, OfferStart, RestartFailedOfferFresh, AuditConfirm).
+49. Worktree dialogs: PreCommitWarning [c/u/a], PreCommitMessage (Ctrl+Enter / Ctrl+S submit), MergePrompt [m/d/s], CommitPrompt (Ctrl+Enter submit), MergeConfirm [y/n], DeleteConfirm [y/n].
+50. Quit confirm and CloseTab confirm: every key path.
+51. PTY: vt100 rendering of ANSI sequences; scrollback navigation (↑/↓/PageUp/PageDown/b/e); mouse selection + Ctrl+Y clipboard copy; carriage-return spinner overwrite.
+52. Kitty keyboard protocol: enabled best-effort on startup; non-fatal on failure.
+53. Tab status log: messages appear with level-colored prefixes; auto-scroll to bottom; `l` toggles collapsed/expanded.
+54. Status command tab annotations appear when invoked from TUI; do not appear from CLI/headless.
+55. TUI startup: in-repo runs `ready`; not-in-repo runs `status --watch`.
+56. Tab close with running container forcibly cancels (no prompt).
+
+**Headless behavior parity** (driven from `tests/headless_parity/`):
+
+57. Every route in `CommandCatalogue::rest_route_table` is reachable; method+path match a frozen fixture.
+58. Auth modes: token (good/bad), disabled (`X-Amux-Auth: disabled` header), TLS-required (rejects non-loopback without TLS).
+59. SSE wire format: container stdout/stderr chunks, `amux-message` events, completion events match a frozen fixture byte-for-byte.
+60. WebSocket wire format (if used): same as SSE.
+61. PID file lifecycle: written on start, removed on clean shutdown, stale-PID detection on second start.
+62. `--background` daemonizes and exits the foreground; PID file points to the daemon.
+63. `--refresh-key` prints exactly the legacy banner; old key hash is replaced.
+64. Workdir allowlist: CLI `--workdirs` merges with config; non-existent paths are rejected with structured errors.
+65. Headless safe-defaults for every interactive frontend method (per WI 0069 §7q).
+66. SQLite session/command persistence: schema is forward-compatible with the legacy schema (open a fixture DB and assert it loads).
+
+**Cross-cutting parity**:
+
+67. `AMUX_OVERLAYS` env validation fires before any command is constructed; malformed → fatal error with structured message.
+68. `--non-interactive` flag and `headless.alwaysNonInteractive` config both translate to `AgentRunOptions::non_interactive = true` AND the agent-specific print flag (e.g. `--print` for Claude).
+69. `auto_agent_auth_accepted` first-run consent flow: None → prompt → persist; Some(true) → silent inject; Some(false) → no inject.
+70. Detached HEAD: warned via `UserMessage::warning`, command continues.
+71. `--api-key` flag > `AMUX_API_KEY` env > `remote.defaultAPIKey` (only when target_addr matches `remote.defaultAddr` after URL canonicalization).
+72. HTTP timeouts: connect=10s, read=600s for `send_command`; read disabled (or large) for `stream_command`.
+73. Error-message parity: every user-visible string from the legacy code is reproducible (or close paraphrase with developer sign-off).
+
+Each row above MUST appear in `aspec/review-notes/0070-parity-validation.md` with its corresponding test file path and PASS/MINOR-DRIFT/REGRESSION verdict. Empty cells are not acceptable.
 
 ### 3. Architectural tenet audit
 
@@ -340,7 +440,7 @@ All colocated `#[cfg(test)] mod tests` blocks added in 0066–0069 remain in pla
 
 ### Manual smoke test
 
-- The implementing agent MUST install the new binary on a real machine and run a representative session: `amux init`, `amux ready`, open the TUI, run an `implement` workflow, exit.
+- The implementing agent MUST install the new binary on a real machine and run a representative session: `amux init`, `amux ready`, open the TUI, run an `exec workflow`, exit.
 - The implementing agent MUST start `amux headless start`, issue real `curl` calls to a representative endpoint set, and stop the server cleanly.
 
 ## Codebase Integration:
