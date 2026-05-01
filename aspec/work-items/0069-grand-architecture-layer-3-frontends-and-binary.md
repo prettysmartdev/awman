@@ -25,7 +25,7 @@ The companion work items are:
 
 - Build `src/frontend/cli/` — implements `CommandFrontend`, every `*CommandFrontend`, and the `ContainerFrontend` and `WorkflowFrontend` adapters needed for stdin/stdout/stderr binding. Builds clap arg matches and projects them through Dispatch. No business logic.
 - Build `src/frontend/tui/` — fully reimplements the existing TUI on top of `SessionManager`, `Dispatch`, and the per-command frontend traits. Tabs become `Session` instances managed by `SessionManager`. Command-box input goes straight to `Dispatch`. Hints come from `CommandCatalogue::tui_hint_for`. Dialogs render data structures returned from per-command frontend trait calls; user choices are returned to lower layers as typed action enums. Every existing TUI behavior, keyboard shortcut, and visual element is preserved.
-- Build `src/frontend/headless/` — fully reimplements the existing headless server on top of `SessionManager` and `Dispatch`. Routes come from `CommandCatalogue::rest_route_table`. Request validation is left to Dispatch. The handler body for each route is uniform: build a `HeadlessCommandFrontend`, hand it to `Dispatch::run_command`, serialize the `*Outcome` to JSON.
+- Build `src/frontend/headless/` — fully reimplements the existing headless server on top of `SessionManager` and `Dispatch`. The route table is preserved verbatim from old-amux (a fixed set of REST endpoints, not derived from `CommandCatalogue`). The single command-execution endpoint (`POST /v1/commands`) accepts `{ subcommand, args }`, constructs a `HeadlessCommandFrontend` that parses the subcommand + args into a `CommandPath` via `Dispatch`, and runs the command — replacing the old child-process spawn. All other handlers (session management, status, log streaming, workflow state) are ported with identical schemas.
 - Implement `src/main.rs` (Layer 4) as a tiny binary that builds clap from the catalogue, parses argv, constructs `SessionManager` + engines, and dispatches to either the CLI or the TUI frontend. The headless server is launched by the `headless start` *command* (Layer 2), not by `main.rs`.
 - Swap the `Cargo.toml` so the user-facing `amux` binary is built from `src/main.rs`. Rename the previous `amux-next` target out of existence. The legacy `oldsrc/` tree remains in place as frozen reference material; it is no longer compiled.
 - Comprehensive parity tests (existing user-visible behavior, no regressions). The next work item, 0070, deletes `oldsrc/` once parity is signed off.
@@ -66,7 +66,10 @@ trust that the entrypoint is not hiding any business logic.
 - Read `aspec/architecture/2026-grand-architecture.md` end-to-end.
 - Read `aspec/uxui/cli.md` for user-visible CLI behavior; nothing in this work item changes that surface.
 - Read the current state of `src/data/`, `src/engine/`, and `src/command/`.
-- For reference only (do not port verbatim): `oldsrc/main.rs`, `oldsrc/cli.rs`, `oldsrc/tui/*.rs` (~21k lines), `oldsrc/commands/headless/*.rs`. Use these to extract user-visible behavior; the implementation MUST be a fresh reimplementation on top of Dispatch.
+- **oldsrc code reuse policy**: The grand architecture tenet (no business logic in Layer 3) applies to *behavior*, not to Ratatui rendering. Two categories of oldsrc code are distinct:
+  - **Must be reimplemented**: anything that calls the old command system, interprets command output semantics, drives workflow state, resolves agents, or makes decisions that belong in Layer 2. Do not lift this code.
+  - **Should be adapted / may be copied**: pure Ratatui rendering (`draw_*` functions, layout calculations, widget construction, color computations, border styles), dialog widget state types, PTY parsing infrastructure, keyboard cursor-movement helpers. This code carries no business logic; copying it and adapting the type references (`TabState` → `Session`, old `Dialog` types → new dialog types) is the expected approach. **Re-implementing the Ratatui layout from scratch increases the risk of visual regressions.** See §8 for the per-file breakdown.
+  - Key files to read: `oldsrc/main.rs`, `oldsrc/cli.rs`, `oldsrc/tui/*.rs` (~21k lines), `oldsrc/commands/headless/*.rs`.
 - When uncertain, ASK THE DEVELOPER.
 
 ### 1. `src/frontend/cli/` — CLI frontend
@@ -119,9 +122,11 @@ Files (proposed; ASK THE DEVELOPER if a different split fits better):
 - `ready_view.rs` — `TuiReadyFrontend` implementing both `ReadyFrontend` and `ReadyCommandFrontend`. Renders `ReadyPhase` transitions as progress steps in the TUI, opens modal dialogs for Dockerfile and legacy-migration decisions, and hands container build/audit output to a `TuiContainerFrontend`.
 - `init_view.rs` — `TuiInitFrontend` implementing both `InitFrontend` and `InitCommandFrontend`. Renders `InitPhase` transitions, opens modal dialogs for aspec replacement, audit, and work-items configuration.
 - `claws_view.rs` — `TuiClawsFrontend` implementing both `ClawsFrontend` and `ClawsCommandFrontend`. Renders `ClawsPhase` transitions as progress steps, opens modal dialogs for clone-replacement and audit decisions, and hands container build/audit output to a `TuiContainerFrontend`. Reproduces visual and keyboard behavior equivalent to the `claws init` flow in `oldsrc/commands/claws.rs`.
-- `dialogs/` — pure-presentation dialog widgets (selection lists, confirmations, text prompts). Each dialog has a typed input (the data Layer 2 wants the user to choose from) and a typed output (the user's choice). Dialogs do NOT decide what the next step is — they only render and collect.
+- `dialogs/` — pure-presentation dialog widgets (selection lists, confirmations, text prompts). Each dialog has a typed input (the data Layer 2 wants the user to choose from) and a typed output (the user's choice). Dialogs do NOT decide what the next step is — they only render and collect. Adapt dialog key-handling code from `oldsrc/tui/input.rs`.
+- `text_edit.rs` — shared single-line and multi-line text edit widget (cursor movement, backspace/delete, home/end, Ctrl+Enter submit). Adapted from `oldsrc/tui/input.rs` cursor-movement helpers. Used by `command_box.rs`, `WorktreePreCommitMessage`, `WorktreeCommitPrompt`, `NewTitleInput`, `NewInterviewSummary`, and all other text-input dialogs.
+- `pty.rs` — PTY session management (vt100 parser, channel bridge, resize handling). **Copy from `oldsrc/tui/pty.rs` with import updates only.**
 - `keymap.rs` — keyboard shortcut definitions. Pure presentation.
-- `render.rs` — pure rendering of UI chrome (tab bar, status bar, hints).
+- `render.rs` — pure rendering of UI chrome (tab bar, status bar, hints). **Adapt from `oldsrc/tui/render.rs`; see §8a.**
 - `hints.rs` — pulls hint text via `CommandCatalogue::tui_hint_for`.
 - `user_message.rs` — `TuiUserMessageSink` implementing `UserMessageSink`. Appends messages to a per-tab status log that the TUI renders in a scrollable panel. `replay_queued` is a no-op (messages are rendered live). The status log is visible during container execution without interrupting the container view.
 - `worktree_lifecycle_frontend.rs` — `TuiWorktreeLifecycleFrontend` implementing `WorktreeLifecycleFrontend` as modal dialogs:
@@ -160,41 +165,64 @@ The TUI must preserve, with zero user-visible drift:
 - Worktree post-completion flow: `WorktreeMergePrompt` dialog (`[m]erge / [d]iscard / [s/Esc]kip-and-keep`), `WorktreeCommitPrompt` dialog (if worktree has uncommitted files, editable text box, Ctrl+Enter/Ctrl+S to submit), `WorktreeMergeConfirm` dialog (`[y/n]`), `WorktreeDeleteConfirm` dialog (`[y/n]`).
 - `UserMessageSink` messages appear in the per-tab status log during container execution and are scrollable independently of the container PTY view.
 
-A line-by-line port from `oldsrc/tui/` is *not* the goal. The goal is to reproduce user-perceptible behavior on top of the new layers. Where the legacy code embedded business logic in the TUI (workflow advance decisions, agent resolution, etc.), that logic lives in Layer 2 now and the TUI only renders the result.
+A line-by-line port of the *business-logic-entangled* parts of `oldsrc/tui/` is not the goal. Where the legacy code embedded business logic in the TUI (workflow advance decisions, agent resolution, etc.), that logic lives in Layer 2 now and the TUI only renders the result. However, **pure Ratatui rendering code — layout calculations, `draw_*` functions, color functions, dialog widget state types, PTY parsing — SHOULD be adapted from `oldsrc/tui/render.rs`, `oldsrc/tui/pty.rs`, `oldsrc/tui/state.rs`, and `oldsrc/tui/input.rs`**. These carry no business logic; rewriting them from scratch is likely to introduce visual regressions. See §8 for the per-file guidance.
 
 ### 3. `src/frontend/headless/` — Headless frontend
+
+**The HTTP API surface MUST NOT change.** Every path, every HTTP method, every request body schema, and every response body schema must be wire-identical to the old-amux headless server (`oldsrc/commands/headless/server.rs`). The only internal change is that `POST /v1/commands` dispatches through `Dispatch` instead of spawning a child `amux` process. If a required Dispatch surface is missing, stop and ask the developer.
+
+The existing API is a **single command-execution endpoint** (`POST /v1/commands`) that accepts `{ subcommand: String, args: Vec<String> }`. `Dispatch` — not the route table — is responsible for parsing `subcommand + args` into a `CommandPath` and routing to the right `Command` implementation. `CommandCatalogue` is **not** used to derive routes; it is used only to validate the incoming subcommand name (replacing the old hardcoded `KNOWN_SUBCOMMANDS` list) and to parse args into typed flag values inside `HeadlessCommandFrontend`.
 
 Files:
 
 - `mod.rs` — entry point: `pub async fn serve(config: HeadlessServeConfig, engines: Engines, session_manager: Arc<RwLock<SessionManager>>) -> Result<(), HeadlessError>`. **Layer 2 cannot call `serve` directly — that would be an upward call.** Instead, `HeadlessStartCommand` (Layer 2) accepts a `HeadlessStartCommandFrontend` trait at instantiation. The trait exposes a method like `serve_until_shutdown(config: HeadlessServeConfig) -> Result<(), CommandError>`. The CLI frontend's `HeadlessStartCommandFrontend` impl calls `crate::frontend::headless::serve(...)` — that is a peer call within Layer 3 and is allowed. The headless frontend never starts itself; it is always launched by an impl living in some other Layer 3 frontend (today, only the CLI's impl exists).
-- `routes.rs` — registers HTTP routes derived from `CommandCatalogue::rest_route_table`. Each route handler is uniform (see below).
-- `command_frontend.rs` — `HeadlessCommandFrontend` implementing `CommandFrontend` over a deserialized request body + query parameters.
-- `per_command/` — one file per command implementing the corresponding `*CommandFrontend`. Where a command needs interactive input, the headless frontend either (a) returns a structured "needs input" response and resumes via a follow-up request, or (b) defaults safely. ASK THE DEVELOPER which model to use for each interactive command. For `ready`, `init`, and `claws`, the headless frontend MUST implement `ReadyFrontend`, `InitFrontend`, and `ClawsFrontend` respectively; Q&A decisions (Dockerfile creation, legacy migration, aspec replacement, audit, work-items, clone replacement) should default to sensible non-interactive values (create Dockerfile if missing, skip audit, skip work-items config, skip legacy migration, skip re-clone if clone exists) unless overridden by request parameters. Phase transitions stream as SSE events so clients can track progress.
-- `container_stream.rs` — `HeadlessContainerFrontend` implementing `ContainerFrontend` over an SSE/WebSocket stream of stdin/stdout/stderr chunks.
-- `workflow_stream.rs` — `HeadlessWorkflowFrontend` implementing `WorkflowFrontend` over the same streaming surface.
+- `routes.rs` — registers the **same HTTP routes as `oldsrc/commands/headless/server.rs::build_router`**, verbatim. The route list is fixed; it is not derived from `CommandCatalogue`:
+  ```
+  GET    /v1/status
+  GET    /v1/workdirs
+  GET    /v1/sessions
+  POST   /v1/sessions
+  GET    /v1/sessions/:id
+  DELETE /v1/sessions/:id
+  POST   /v1/commands                  — accepts { subcommand, args }; dispatches via Dispatch
+  GET    /v1/commands/:id
+  GET    /v1/commands/:id/logs
+  GET    /v1/commands/:id/logs/stream  — SSE stream of the command's output.log file
+  GET    /v1/workflows/:command_id
+  ```
+- `command_frontend.rs` — `HeadlessCommandFrontend` implementing `CommandFrontend`. Constructed from `CreateCommandRequest { subcommand: String, args: Vec<String> }`. Provides `parse_command_path(&self) -> Result<CommandPath, HeadlessError>` — derives the command path from `subcommand` and the leading positional `args` (uses `CommandCatalogue` to know which top-level commands have subcommands). Implements `CommandFrontend::get_flag` by parsing the remaining `args` against the command's known flags. For commands that require interactive input (`ready`, `init`, `claws`, worktree lifecycle decisions, agent setup), the frontend returns the safe non-interactive defaults listed in §7u; each default MAY be overridden by fields in the request body.
+- `container_log.rs` — `HeadlessContainerFrontend` implementing `ContainerFrontend`. Writes container stdout/stderr to the command's `output.log` file — the same path and format as the old-amux `execute_command` function. The `GET /v1/commands/:id/logs/stream` SSE endpoint streams from this file, line-per-`data:` event, terminated by `[amux:done]`. The wire format is byte-identical to old-amux.
+- `workflow_state.rs` — `HeadlessWorkflowFrontend` implementing `WorkflowFrontend`. Writes workflow state to `workflow.state.json` in the command directory — the same path and format as the old-amux `poll_workflow_state` helper. The `GET /v1/workflows/:command_id` endpoint reads from this file; the JSON schema is identical to old-amux.
 - `user_message.rs` — `HeadlessUserMessageSink` implementing `UserMessageSink`. Emits each message as an SSE event of type `amux-message` with `{ "level": "info"|"warning"|"error"|"success", "text": "..." }`. `replay_queued` is a no-op (messages are streamed live).
-- `worktree_lifecycle_frontend.rs` — `HeadlessWorktreeLifecycleFrontend` implementing `WorktreeLifecycleFrontend`. Uses request-parameter defaults for all decisions (create if absent, skip audit, default commit message, etc.) unless the client overrides them via request body fields. Reports (worktree created, discarded, kept, merge conflict) stream as `amux-message` SSE events. ASK THE DEVELOPER whether to expose Q&A decisions as separate API endpoints or as upfront request parameters.
+- `worktree_lifecycle_frontend.rs` — `HeadlessWorktreeLifecycleFrontend` implementing `WorktreeLifecycleFrontend`. Uses request-parameter defaults for all decisions (see §7u). Reports stream as `amux-message` SSE events. ASK THE DEVELOPER whether to expose Q&A decisions as separate API endpoints or as upfront request parameters.
 - `auth.rs` — TLS + API-key middleware. Pure plumbing; the cryptographic logic is in `AuthEngine` (Layer 1).
 - `errors.rs` — translates `CommandError` etc. into HTTP status codes + JSON error bodies.
 
-Each route handler is the same shape:
+The `POST /v1/commands` handler replaces the child-process spawn with a Dispatch call. All surrounding logic (session validation, concurrency guard, `x-amux-session` header, DB inserts, command directory creation, 202 Accepted response) is copied verbatim from `oldsrc/commands/headless/server.rs::handle_create_command` and `execute_command`; only the body of `execute_command` changes:
 
 ```rust
-async fn handle(State(app): State<AppState>, req: Request) -> Result<Response, HeadlessError> {
-    let frontend = HeadlessCommandFrontend::from_request(&req)?;
-    let dispatch = Dispatch::new(frontend, app.session, app.engines);
-    let outcome = dispatch.run_command(&req.command_path()).await?;
-    Ok(serialize_outcome(outcome)?)
-}
+// OLD (oldsrc): spawns child amux process
+let mut cmd = tokio::process::Command::new(&amux_bin);
+cmd.arg(&subcommand).args(&args); /* ... */ cmd.spawn();
+
+// NEW: dispatches through Dispatch
+let frontend = HeadlessCommandFrontend::new(subcommand, args, log_path.clone());
+let command_path = frontend.parse_command_path()?;
+let dispatch = Dispatch::new(frontend, session, engines);
+dispatch.run_command(&command_path).await
 ```
+
+`CreateCommandRequest`, `CreateCommandResponse`, `SessionResponse`, `CommandResponse`, `StatusResponse`, and `ErrorResponse` — all Serde shapes are **identical to `oldsrc/commands/headless/server.rs`**. Do not rename fields, change types, or add/remove fields.
 
 The grand architecture document explicitly forbids the server from "just calling the CLI": the headless frontend talks to `Dispatch` directly, never spawns a child `amux` process.
 
 #### Headless behavioral parity checklist
 
-- Every route documented in the existing OpenAPI/handler set continues to exist with the same path, method, body schema, and response schema. Use `CommandCatalogue::rest_route_table` to enforce this; the catalogue MUST already match the existing surface as of 0068.
+- Every route in `oldsrc/commands/headless/server.rs::build_router` continues to exist with the **same path pattern, same HTTP method, same request body schema, and same response body schema**. No routes may be added, removed, renamed, or have their schemas changed. The only permitted internal difference is that `POST /v1/commands` dispatches through `Dispatch` instead of spawning a child process. **Routes are NOT derived from `CommandCatalogue::rest_route_table`.**
+- **Before writing any handler**, read `oldsrc/commands/headless/server.rs` end-to-end. Preserve the session-validation logic, concurrency guard (`busy_sessions`), DB-update sequence, graceful-shutdown task drain, and all error-response shapes verbatim — replacing only the `execute_command` function body.
 - TLS, bind-address, and auth-disabled behavior from work item 0065 is preserved. The `AuthEngine` (Layer 1) holds the logic; this frontend is plumbing.
-- SSE/WebSocket streaming endpoints (chat, exec workflow output) preserve their wire format byte-for-byte.
+- SSE stream wire format (`GET /v1/commands/:id/logs/stream`): line-per-`data:` event, `[amux:done]` sentinel. Byte-identical to old-amux.
+- Workflow state JSON schema (`GET /v1/workflows/:command_id`): same shape as old-amux `WorkflowState`.
 
 ### 4. `src/main.rs` — Layer 4
 
@@ -260,6 +288,7 @@ The `oldsrc/README.md` from 0066 stays. Add a note: "no longer compiled — see 
 - No edits inside `oldsrc/` other than possibly the `oldsrc/README.md` note.
 - No new commands, new flags, or new user-visible behavior. This work item is *parity only*.
 - No regressions in the `aspec/uxui/cli.md` documented surface.
+- **No changes to the headless HTTP API surface.** No route paths, no HTTP methods, no request body fields, no response body fields. The new headless frontend is a transparent re-plumbing of the existing API through Dispatch — clients talking to the new server must not need to change any request or response handling.
 
 ### 7. Frontend parity addenda — TUI behaviors that MUST be preserved
 
@@ -279,9 +308,47 @@ Each `TabState` (now wrapped around a `Session`) renders in the tab bar with a c
 
 The active tab renders with `➡ project` and TOP+LEFT+RIGHT borders (no bottom). Background yolo countdowns alternate `⚠️  yolo in Ns` and `🤘 yolo in Ns` every 2 seconds in the tab subcommand label (legacy `tab_subcommand_label`). Stuck tabs prepend `⚠️ ` to the command in the label.
 
+Tab name truncates at 14 visible characters with `…` (logic in `tab_project_name`; copy from `oldsrc/tui/state.rs`). For remote-bound tabs, `display_host` is used in place of the local folder name, with the same 14-char cap.
+
+Tab width algorithm (`compute_tab_bar_width`): 1 tab = 1/4 area width; 2 tabs = 1/2; 3 tabs = 3/4; 4+ tabs = full area / n. Each tab gets `min(natural_content_width + 2 borders, budget)`. Copy `compute_tab_bar_width` and `draw_tab_bar` verbatim from `oldsrc/tui/render.rs`, adapting type references.
+
 `Focus` enum (CommandBox vs ExecutionWindow) governs which keybindings apply. ↑ from CommandBox switches focus to ExecutionWindow when a container is running. Esc from ExecutionWindow returns focus to CommandBox.
 
 ContainerWindow state (Hidden / Minimized / Maximized) — Ctrl+M cycles. Hidden = no window rendered; Minimized = 1-line status bar; Maximized = full window.
+
+**Execution window border color** (`window_border_color` — copy from `oldsrc/tui/state.rs`):
+
+- Running + ExecutionWindow focused → Blue
+- Running + CommandBox focused → Gray
+- Done + ExecutionWindow focused → Green
+- Done + CommandBox focused → Gray
+- Error (any focus) → Red
+- Idle → DarkGray
+
+**Execution window phase label** (preserve verbatim):
+
+- Idle: ` amux `
+- Running: ` ● running: {command} `
+- Done: ` ✓ done: {command} `
+- Error: ` ✗ error: {command} (exit {exit_code}) `
+
+**Welcome message** (shown in exec window body when Idle and no output): two lines of `Color::DarkGray` text — `"  Welcome to amux."` and `"  Running \`amux ready\` to check your environment..."`.
+
+**Full frame layout** (copy `draw()` structure from `oldsrc/tui/render.rs`):
+
+```
+Vertical: tab bar (3 rows) | main area (Min 5)
+Main area vertical:
+  exec window (Min 5)
+  [optional] minimized container bar OR last-container summary (3 rows each, mutually exclusive)
+  [optional] workflow strip (variable height)
+  status bar (1 row)
+  command box (3 rows)
+  suggestion row (1 row)
+Container overlay (Maximized): 95% of exec area width × 95% height, centered. Inner area = outer − 2 borders.
+```
+
+Copy `calculate_container_inner_size` verbatim from `oldsrc/tui/render.rs`. This function is used to size the PTY/vt100 parser to match the rendered window.
 
 #### 7b. Command box and autocomplete
 
@@ -537,6 +604,50 @@ The headless frontend implements every per-command frontend trait but defaults a
 
 Each default MAY be overridden by request body parameters; the request schema lives alongside the catalogue's headless projection.
 
+### 8. Code Reuse Policy — per-file breakdown
+
+This section is the authoritative guide for deciding whether to adapt oldsrc code or reimplement from scratch. The rule: **business logic → reimplement on top of Dispatch; pure presentation → adapt from oldsrc**.
+
+#### 8a. Files to copy and adapt (pure presentation — no business logic)
+
+| oldsrc source | New destination | Notes |
+|---|---|---|
+| `oldsrc/tui/render.rs` | `src/frontend/tui/render.rs` | Copy all `draw_*` functions, `compute_tab_bar_width`, `calculate_container_inner_size`. Update type references: `TabState` → view-layer tab struct, `App` → new `App`, `WorkflowState` → data passed in from `WorkflowFrontend`. Remove any calls to the old command or workflow state machines. |
+| `oldsrc/tui/pty.rs` | `src/frontend/tui/pty.rs` | Copy verbatim; update imports. This is pure PTY infrastructure (vt100 parser, channel bridge to the TUI event loop) with no business logic. |
+| `oldsrc/tui/state.rs` — pure presentation types | `src/frontend/tui/` (split by concern) | Copy: `Focus`, `ContainerWindowState`, `ConfigDialogState`, `NewWorkflowDialogState`, `NewSkillDialogState`, `WorkflowField`, `RemoteTabBinding`, `STUCK_TIMEOUT`, `STUCK_DIALOG_BACKOFF`, `YOLO_COUNTDOWN_DURATION`. These are data-only types or pure constants. Do NOT copy the `App`/`TabState` struct definitions (replace with `Session`-backed types) or `PendingCommand` (replaced by Dispatch). |
+| `oldsrc/tui/state.rs` — pure presentation methods | `src/frontend/tui/tabs.rs` | Copy `tab_color`, `tab_project_name`, `tab_subcommand_label`, `tab_display_name`, `background_yolo_color`, `background_yolo_label`, `window_border_color` as methods on the new per-tab view struct. Copy associated unit tests. |
+| `oldsrc/tui/state.rs` — stuck / yolo timer logic | `src/frontend/tui/tabs.rs` | Copy `is_stuck`, `acknowledge_stuck`, `record_user_activity`, `dismiss_stuck_dialog` as methods on the new per-tab view struct. These are pure timer comparisons with no command semantics. |
+| `oldsrc/tui/input.rs` — cursor movement helpers | `src/frontend/tui/text_edit.rs` | Copy all `handle_*_cursor` / `handle_worktree_commit_prompt` / `handle_worktree_pre_commit_message` key-handling functions verbatim into the shared `TextEditWidget`. These are pure text-buffer manipulations; adapt only the `Dialog` → typed dialog parameter. |
+| `oldsrc/tui/input.rs` — dialog key handlers | `src/frontend/tui/dialogs/` | Copy individual dialog key-handling blocks (e.g. `handle_worktree_merge_prompt`, `handle_workflow_control_board`, `handle_agent_setup_confirm`) as methods on the corresponding dialog widget types. Adapt the `Action` return type to the new typed output enum for each dialog. |
+| `oldsrc/tui/state.rs` — `Dialog` enum variants | `src/frontend/tui/dialogs/mod.rs` | Use as the exhaustive reference list of all dialogs that must exist in the new TUI. Each variant maps 1:1 to a dialog widget in `src/frontend/tui/dialogs/`. **Do not copy the enum itself** — the new dialogs use typed structs, not one fat enum. |
+
+#### 8b. Files to reimplement from scratch (business logic entangled)
+
+| oldsrc source | Replacement | Reason |
+|---|---|---|
+| `oldsrc/tui/mod.rs` — event loop body | `src/frontend/tui/app.rs` + `src/frontend/tui/mod.rs` | The old event loop calls into the old command handlers directly. New event loop dispatches all commands through `Dispatch`. Copy only the terminal setup/teardown boilerplate (raw mode, alternate screen, mouse capture, Kitty protocol). |
+| `oldsrc/tui/mod.rs` — command submission | `src/frontend/tui/command_box.rs` | Old code parsed the command box string inline. New code hands the raw string to `Dispatch::parse_command_box_input`. |
+| `oldsrc/tui/state.rs` — `App` / `TabState` | `src/frontend/tui/app.rs`, `src/frontend/tui/tabs.rs` | `TabState` mixes rendering state (presentational) with command-handling state (business logic). The new `App` owns `Terminal` + `SessionManager`; per-tab view state is a thin struct wrapping `Session`. |
+| `oldsrc/tui/state.rs` — `PendingCommand` | Replaced by Dispatch | Business logic. |
+| `oldsrc/tui/input.rs` — `Action` enum and top-level dispatch | `src/frontend/tui/per_command/` | The `Action` enum is the old command-dispatch surface. Each `Action` variant maps to a Layer 2 command invoked through `Dispatch`. Do not port the enum; instead implement each `*CommandFrontend` trait. |
+| `oldsrc/tui/flag_parser.rs` | `src/frontend/tui/command_frontend.rs` | Old flag parser is a bespoke mini-parser. New code uses `Dispatch::parse_command_box_input` (Layer 2). |
+
+#### 8c. Terminal setup / teardown — copy verbatim
+
+The crossterm terminal initialization block in `oldsrc/tui/mod.rs` (raw mode, `EnterAlternateScreen`, `EnableMouseCapture`, Kitty `PushKeyboardEnhancementFlags` best-effort, and the corresponding cleanup on drop) MUST be copied verbatim into `src/frontend/tui/app.rs`. This is infrastructure, not business logic, and any deviation risks leaving the terminal in a broken state on panic or early exit.
+
+#### 8d. Copy-then-prune workflow
+
+The recommended workflow for TUI rendering files:
+
+1. Copy the target oldsrc file into the new location.
+2. Update `use` statements and type references (old → new).
+3. Delete any function that calls into the old command system (these will not compile after step 2 anyway).
+4. Implement the deleted functions fresh against the Dispatch/frontend-trait surface.
+5. Run `cargo clippy` and fix warnings.
+
+This ensures no visual element is accidentally dropped during the port.
+
 ## Edge Case Considerations:
 
 - **Existing TUI tests**: `oldsrc/tui/state.rs` has substantial tests. They cannot run against the new TUI; reproduce the equivalent assertions against `Session` + `SessionManager` + the TUI's view code. ASK THE DEVELOPER if a particular test reveals a behavior that is not preserved.
@@ -564,13 +675,17 @@ Each default MAY be overridden by request body parameters; the request schema li
 
 Tests for Layer 3 + Layer 4 are **designed and written from scratch** alongside the new frontends. **Do not port tests from `oldsrc/tui/**/#[cfg(test)] mod tests`, `oldsrc/commands/headless/**/#[cfg(test)]`, or `oldsrc/cli.rs` test blocks.** The old TUI tests assume `TabState` plus business-logic-in-the-frontend; the old headless tests assume the legacy ad-hoc routing; the old CLI tests assume a parameter-style command surface. All of these are explicitly designed away.
 
-The narrow exception is a test that satisfies **all** of the following:
+There are two narrow exceptions:
+
+**Exception A — presentation-layer tests** (same rule as §8a for code): tests that exercise pure-presentation functions (e.g. `tab_color`, `tab_subcommand_label`, `compute_tab_bar_width`, `window_border_color`, cursor-movement helpers) SHOULD be adapted from `oldsrc/tui/state.rs` if they satisfy all of: (1) the tested function is being copied per §8a, (2) the test compiles with only mechanical type-reference updates, (3) no legacy command or engine types appear. These tests are the fastest way to verify that visual parity is maintained; bring them forward by default.
+
+**Exception B — other tests** must satisfy **all** of the following:
 
 1. Asserts a user-visible behavior the new frontend MUST preserve (e.g. exact help-text format, exact SSE wire format, exact keyboard-shortcut set, exact prompt text in a confirmation dialog).
 2. Compiles unchanged or with mechanical edits against the new frontend types.
 3. Exercises only Layer 0 + 1 + 2 + 3 (and Layer 4 for binary-level tests). No legacy types.
 
-If any old test is brought forward under this exception, the PR description MUST list it with a one-sentence justification. The default answer is "rewrite from scratch."
+If any old test is brought forward under Exception B, the PR description MUST list it with a one-sentence justification. The default answer for Exception B is "rewrite from scratch."
 
 This work item produces **only Layer 3 unit tests and pure-presentation snapshot tests** plus a **manual sign-off checklist** that gates 0070. The full parity test suite, the real-Docker / real-network end-to-end tests, and the freshly rebuilt top-level `tests/` directory are 0070's responsibility. **Do not create any file under `tests/` in this work item.**
 
@@ -620,7 +735,9 @@ This work item produces **only Layer 3 unit tests and pure-presentation snapshot
   - **Levenshtein typo correction**: `Dispatch::parse_command_box_input("imp")` returns an error containing `"did you mean: implement?"`. (Catalogue helper test, but rendered by the TUI.)
   - **Per-tab `auto_workflow_disabled_steps` reset**: when a step transitions from `Failed`/`Succeeded` back to `Pending` (e.g. via `RestartCurrentStep`), the disabled flag is cleared. Cover with a unit test.
 - **Headless** (`src/frontend/headless/`):
-  - For each route in `CommandCatalogue::rest_route_table`, a focused test sends a representative `axum::http::Request` to the handler with a mocked `Dispatch::run_command` and asserts the handler called dispatch with the right command path and a `HeadlessCommandFrontend` populated from the request.
+    - Route-parity assertion: define a `const EXPECTED_ROUTES: &[(&str, &str)]` table of `(method, path)` pairs copied verbatim from `oldsrc/commands/headless/server.rs::build_router`'s route registrations, and assert that the new `build_router` registers every entry. This test fails if a route is missing — it is the mechanical guard that the HTTP API surface has not changed.
+  - `POST /v1/commands` handler: send a `CreateCommandRequest { subcommand: "implement", args: vec!["--chat", "hello"] }` with a valid `x-amux-session` header to a test `AppState` with a mocked `Dispatch::run_command`, and assert (a) the handler returned 202 Accepted with a `command_id`, (b) `Dispatch::run_command` was called with the command path `["implement"]` and a `HeadlessCommandFrontend` that returns `"hello"` for the `--chat` flag.
+  - `HeadlessCommandFrontend::parse_command_path` correctly derives the path for each known top-level command and nested command (e.g. `"exec" + ["workflow", ...]` → `["exec", "workflow"]`). Data-table test.
   - Auth middleware: token mode rejects bad tokens with 401, accepts good tokens with the expected response; disabled mode emits `X-Amux-Auth: disabled`; TLS-required mode rejects non-loopback bind without TLS.
   - SSE/WebSocket adapter (`HeadlessContainerFrontend`) writes stdout chunks in the expected wire format against a mocked stream sink — pure unit test, no real container.
   - Error translation: each `CommandError` variant maps to the documented HTTP status code and JSON error body.
