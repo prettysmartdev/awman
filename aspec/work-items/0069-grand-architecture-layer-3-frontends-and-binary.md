@@ -16,16 +16,16 @@ The four tenets, again:
 
 The companion work items are:
 
-- `0066-grand-architecture-foundation-and-layer-0-data.md` (must be merged)
-- `0067-grand-architecture-layer-1-engines.md` (must be merged)
-- `0068-grand-architecture-layer-2-command-and-dispatch.md` (must be merged)
+- `0066-grand-architecture-foundation-and-layer-0-data.md` (already merged)
+- `0067-grand-architecture-layer-1-engines.md` (already merged)
+- `0068-grand-architecture-layer-2-command-and-dispatch.md` (already merged)
 - `0070-grand-architecture-finalize-and-remove-oldsrc.md`
 
 ## Summary:
 
 - Build `src/frontend/cli/` — implements `CommandFrontend`, every `*CommandFrontend`, and the `ContainerFrontend` and `WorkflowFrontend` adapters needed for stdin/stdout/stderr binding. Builds clap arg matches and projects them through Dispatch. No business logic.
 - Build `src/frontend/tui/` — fully reimplements the existing TUI on top of `SessionManager`, `Dispatch`, and the per-command frontend traits. Tabs become `Session` instances managed by `SessionManager`. Command-box input goes straight to `Dispatch`. Hints come from `CommandCatalogue::tui_hint_for`. Dialogs render data structures returned from per-command frontend trait calls; user choices are returned to lower layers as typed action enums. Every existing TUI behavior, keyboard shortcut, and visual element is preserved.
-- Build `src/frontend/headless/` — fully reimplements the existing headless server on top of `SessionManager` and `Dispatch`. The route table is preserved verbatim from old-amux (a fixed set of REST endpoints, not derived from `CommandCatalogue`). The single command-execution endpoint (`POST /v1/commands`) accepts `{ subcommand, args }`, constructs a `HeadlessCommandFrontend` that parses the subcommand + args into a `CommandPath` via `Dispatch`, and runs the command — replacing the old child-process spawn. All other handlers (session management, status, log streaming, workflow state) are ported with identical schemas.
+- Build `src/frontend/headless/` — fully reimplements the existing headless server on top of `SessionManager` and `Dispatch`. The route table is preserved verbatim from old-amux (a fixed set of REST endpoints, not derived from `CommandCatalogue`). The single command-execution endpoint (`POST /v1/commands`) accepts `{ subcommand, args }`, constructs a `HeadlessCommandFrontend` that parses the subcommand + args into a `CommandPath` via `Dispatch`, and runs the command — replacing the old child-process spawn. All other handlers (session management, status, log streaming, workflow state) are ported to the new layered architecture with identical schemas.
 - Implement `src/main.rs` (Layer 4) as a tiny binary that builds clap from the catalogue, parses argv, constructs `SessionManager` + engines, and dispatches to either the CLI or the TUI frontend. The headless server is launched by the `headless start` *command* (Layer 2), not by `main.rs`.
 - Swap the `Cargo.toml` so the user-facing `amux` binary is built from `src/main.rs`. Rename the previous `amux-next` target out of existence. The legacy `oldsrc/` tree remains in place as frozen reference material; it is no longer compiled.
 - Comprehensive parity tests (existing user-visible behavior, no regressions). The next work item, 0070, deletes `oldsrc/` once parity is signed off.
@@ -36,7 +36,7 @@ The companion work items are:
 As a: existing amux user
 
 I want to:
-upgrade to the new amux binary and have every CLI command, every TUI keystroke, every headless API endpoint behave identically to before
+upgrade to the new amux binary and have every CLI command, every TUI keystroke, every headless API endpoint be compatible with my existing workflows, but with improved quality and parity between frontends
 
 So I can:
 benefit from the new architecture without learning anything new or losing any feature.
