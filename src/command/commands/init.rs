@@ -8,6 +8,7 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
 use crate::engine::init::{InitEngine, InitEngineOptions, InitFrontend, InitSummary};
+use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone)]
 pub struct InitCommandFlags {
@@ -24,23 +25,23 @@ pub struct InitOutcome {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SerializableInitSummary {
-    pub aspec_folder: String,
-    pub dockerfile: String,
-    pub config: String,
-    pub audit: String,
-    pub image_build: String,
-    pub work_items_setup: String,
+    pub aspec_folder: StepStatus,
+    pub dockerfile: StepStatus,
+    pub config: StepStatus,
+    pub audit: StepStatus,
+    pub image_build: StepStatus,
+    pub work_items_setup: StepStatus,
 }
 
 impl From<InitSummary> for SerializableInitSummary {
     fn from(s: InitSummary) -> Self {
         Self {
-            aspec_folder: format!("{:?}", s.aspec_folder),
-            dockerfile: format!("{:?}", s.dockerfile),
-            config: format!("{:?}", s.config),
-            audit: format!("{:?}", s.audit),
-            image_build: format!("{:?}", s.image_build),
-            work_items_setup: format!("{:?}", s.work_items_setup),
+            aspec_folder: s.aspec_folder,
+            dockerfile: s.dockerfile,
+            config: s.config,
+            audit: s.audit,
+            image_build: s.image_build,
+            work_items_setup: s.work_items_setup,
         }
     }
 }

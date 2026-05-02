@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::AgentEngine;
 use crate::engine::container::ContainerRuntime;
@@ -75,7 +76,22 @@ impl ReadyEngine {
     ) -> Result<ReadyPhase, EngineError> {
         frontend.report_phase(&self.phase);
         let next = match &self.phase {
-            ReadyPhase::Preflight => ReadyPhase::AwaitingDockerfileDecision,
+            ReadyPhase::Preflight => {
+                // If Dockerfile.dev already exists in the git root, skip both the
+                // "create?" prompt and the create step — the user does not need
+                // to be asked about a file that's already there. Only prompt when
+                // it's actually missing.
+                let dockerfile_path = self.session.git_root().join("Dockerfile.dev");
+                if dockerfile_path.exists() {
+                    frontend.report_step_status(
+                        "Check Dockerfile.dev",
+                        StepStatus::Done,
+                    );
+                    self.next_phase_after_dockerfile_present()
+                } else {
+                    ReadyPhase::AwaitingDockerfileDecision
+                }
+            }
             ReadyPhase::AwaitingDockerfileDecision => {
                 if frontend.ask_create_dockerfile()? {
                     ReadyPhase::CreatingDockerfile
@@ -88,6 +104,9 @@ impl ReadyEngine {
             }
             ReadyPhase::CreatingDockerfile => {
                 frontend.report_step_status("Create Dockerfile.dev", StepStatus::Done);
+                // Just-created Dockerfile.dev means no per-agent file can exist
+                // yet (we just wrote the project base from a template), so the
+                // legacy-migration question is meaningful here.
                 ReadyPhase::AwaitingLegacyMigrationDecision
             }
             ReadyPhase::AwaitingLegacyMigrationDecision => {
@@ -131,6 +150,24 @@ impl ReadyEngine {
             frontend.report_summary(&self.summary);
         }
         Ok(next)
+    }
+
+    /// Decide which phase to enter when `Dockerfile.dev` is already on disk.
+    ///
+    /// Matches old-amux `is_legacy_layout` semantics: the "migrate to modular
+    /// layout?" question is only meaningful when `Dockerfile.dev` exists AND
+    /// no per-agent `.amux/Dockerfile.<agent>` file has been written yet. If
+    /// the per-agent file is already present, the project is on the modular
+    /// layout — skip the migration phases entirely.
+    fn next_phase_after_dockerfile_present(&mut self) -> ReadyPhase {
+        let paths = RepoDockerfilePaths::new(self.session.git_root());
+        let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
+        if agent_dockerfile.exists() {
+            self.summary.legacy_migration = StepStatus::Skipped;
+            ReadyPhase::BuildingBaseImage
+        } else {
+            ReadyPhase::AwaitingLegacyMigrationDecision
+        }
     }
 
     /// Drive to completion: advance phases in a loop until terminal.
@@ -374,5 +411,179 @@ mod tests {
         assert_eq!(engine.phase(), &ReadyPhase::AwaitingDockerfileDecision);
         engine.step(&mut frontend).await.unwrap();
         assert_eq!(engine.phase(), &ReadyPhase::CreatingDockerfile);
+    }
+
+    #[tokio::test]
+    async fn preflight_skips_dockerfile_decision_when_file_exists() {
+        // When Dockerfile.dev already exists in the git root, the engine must
+        // not ask the user "Dockerfile.dev not found; create one?" — it should
+        // skip straight past the decision and the create step.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Arc::new(
+            crate::data::session::Session::open(
+                tmp.path().to_path_buf(),
+                &resolver,
+                SessionOpenOptions::default(),
+            )
+            .unwrap(),
+        );
+        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
+        ));
+        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            overlay.clone(),
+            runtime.clone(),
+        ));
+        let options = ReadyEngineOptions {
+            agent: AgentName::new("claude").unwrap(),
+            refresh: false,
+            build: true,
+            no_cache: false,
+            allow_docker: false,
+        };
+        let mut engine = ReadyEngine::new(
+            session,
+            Arc::new(GitEngine::new()),
+            overlay,
+            runtime,
+            agent_engine,
+            options,
+        );
+        // create_dockerfile=false would normally cause AwaitingDockerfileDecision
+        // to abort the run. But because the file exists, that decision must be
+        // skipped entirely and the engine must reach Complete.
+        let mut frontend = FakeReadyFrontend {
+            create_dockerfile: false,
+            run_audit: false,
+            migrate_legacy: true,
+            phases: Vec::new(),
+            statuses: Vec::new(),
+        };
+        let _summary = engine.run_to_completion(&mut frontend).await.unwrap();
+        assert_eq!(engine.phase(), &ReadyPhase::Complete);
+        assert!(
+            !frontend.phases.contains(&ReadyPhase::AwaitingDockerfileDecision),
+            "AwaitingDockerfileDecision must be skipped when Dockerfile.dev exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_prompt_for_legacy_migration_when_per_agent_dockerfile_exists() {
+        // Repository is already on the modular layout: both Dockerfile.dev
+        // and .amux/Dockerfile.<agent> are present. Old amux's
+        // is_legacy_layout() returns false here, so the engine MUST NOT ask
+        // the user "Migrate to the modular layout?" — there's nothing to
+        // migrate. legacy_migration must be reported as Skipped.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".amux")).unwrap();
+        std::fs::write(
+            tmp.path().join(".amux").join("Dockerfile.claude"),
+            "FROM project-base\n",
+        )
+        .unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Arc::new(
+            crate::data::session::Session::open(
+                tmp.path().to_path_buf(),
+                &resolver,
+                SessionOpenOptions::default(),
+            )
+            .unwrap(),
+        );
+        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
+        ));
+        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            overlay.clone(),
+            runtime.clone(),
+        ));
+        let options = ReadyEngineOptions {
+            agent: AgentName::new("claude").unwrap(),
+            refresh: false,
+            build: true,
+            no_cache: false,
+            allow_docker: false,
+        };
+        let mut engine = ReadyEngine::new(
+            session,
+            Arc::new(GitEngine::new()),
+            overlay,
+            runtime,
+            agent_engine,
+            options,
+        );
+
+        // `LegacyAskTracker` records whether `ask_migrate_legacy_layout` was
+        // called. The frontend MUST NOT be asked because the per-agent
+        // Dockerfile already exists.
+        struct LegacyAskTracker {
+            inner: FakeReadyFrontend,
+            asked: bool,
+        }
+        impl UserMessageSink for LegacyAskTracker {
+            fn write_message(&mut self, _: UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        impl ReadyFrontend for LegacyAskTracker {
+            fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
+                self.inner.ask_create_dockerfile()
+            }
+            fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
+                self.inner.ask_run_audit_on_template()
+            }
+            fn ask_migrate_legacy_layout(
+                &mut self,
+                agent: &AgentName,
+            ) -> Result<bool, EngineError> {
+                self.asked = true;
+                self.inner.ask_migrate_legacy_layout(agent)
+            }
+            fn report_phase(&mut self, p: &ReadyPhase) {
+                self.inner.report_phase(p)
+            }
+            fn report_step_status(&mut self, s: &str, st: StepStatus) {
+                self.inner.report_step_status(s, st)
+            }
+            fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+                self.inner.container_frontend()
+            }
+            fn report_summary(&mut self, s: &ReadySummary) {
+                self.inner.report_summary(s)
+            }
+        }
+
+        let mut frontend = LegacyAskTracker {
+            inner: FakeReadyFrontend {
+                create_dockerfile: false,
+                run_audit: false,
+                migrate_legacy: false,
+                phases: Vec::new(),
+                statuses: Vec::new(),
+            },
+            asked: false,
+        };
+        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+        assert_eq!(engine.phase(), &ReadyPhase::Complete);
+        assert!(
+            !frontend.asked,
+            "ask_migrate_legacy_layout MUST NOT be called when .amux/Dockerfile.<agent> already exists"
+        );
+        assert!(
+            !frontend
+                .inner
+                .phases
+                .contains(&ReadyPhase::AwaitingLegacyMigrationDecision),
+            "AwaitingLegacyMigrationDecision must be skipped when on the modular layout"
+        );
+        assert!(
+            matches!(summary.legacy_migration, StepStatus::Skipped),
+            "legacy_migration must be Skipped when nothing to migrate, got {:?}",
+            summary.legacy_migration
+        );
     }
 }

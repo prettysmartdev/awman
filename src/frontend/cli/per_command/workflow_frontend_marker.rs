@@ -100,9 +100,13 @@ impl WorkflowFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(StepFailureChoice::Pause);
         }
+        let signal_str = exit
+            .signal
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "—".to_string());
         eprintln!(
-            "amux: step '{}' failed (exit {:?}, signal {:?}). [r]etry / [p]ause / [a]bort?",
-            step.name, exit.exit_code, exit.signal,
+            "amux: step '{}' failed (exit {}, signal {signal_str}). [r]etry / [p]ause / [a]bort?",
+            step.name, exit.exit_code,
         );
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {

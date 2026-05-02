@@ -14,22 +14,28 @@ use crate::engine::step_status::StepStatus;
 use crate::frontend::cli::command_frontend::CliFrontend;
 use crate::frontend::cli::output::stdin_is_tty;
 
-use super::helpers::yes_no;
+use super::helpers::{render_summary_box, step_status_label, yes_no};
 
 impl InitFrontend for CliFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
-        Ok(yes_no("aspec/ already exists; replace?", false))
+        Ok(yes_no(
+            "An aspec/ folder already exists. Replace it with fresh templates?",
+            false,
+        ))
     }
 
     fn ask_run_audit(&mut self) -> Result<bool, EngineError> {
-        Ok(yes_no("run dockerfile audit now?", false))
+        Ok(yes_no(
+            "Run the agent audit container to scan and customise the Dockerfile?",
+            false,
+        ))
     }
 
     fn ask_work_items_setup(&mut self) -> Result<Option<WorkItemsConfig>, EngineError> {
         if !stdin_is_tty() {
             return Ok(None);
         }
-        eprintln!("amux: configure work-items directory? (empty = skip)");
+        eprintln!("amux: Configure a work items directory? (path relative to repo root, empty to skip)");
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return Ok(None);
@@ -38,7 +44,7 @@ impl InitFrontend for CliFrontend {
         if dir.is_empty() {
             return Ok(None);
         }
-        eprintln!("amux: work-items template path (empty = none)");
+        eprintln!("amux: Work item template path (empty for none):");
         let mut buf2 = String::new();
         let _ = std::io::stdin().read_line(&mut buf2);
         let template_str = buf2.trim();
@@ -53,17 +59,19 @@ impl InitFrontend for CliFrontend {
         }))
     }
 
-    fn report_phase(&mut self, phase: &InitPhase) {
-        self.messages.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("init phase: {phase:?}"),
-        });
+    fn report_phase(&mut self, _phase: &InitPhase) {
+        // InitPhase is an internal state-machine token; users see progress
+        // through `report_step_status` and the final summary box.
     }
 
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
+        let level = match status {
+            StepStatus::Failed(_) => MessageLevel::Error,
+            _ => MessageLevel::Info,
+        };
         self.messages.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("init step {step}: {status:?}"),
+            level,
+            text: format!("{step}: {}", step_status_label(&status)),
         });
     }
 
@@ -71,5 +79,21 @@ impl InitFrontend for CliFrontend {
         Box::new(super::container_frontend_marker::CliContainerProxy)
     }
 
-    fn report_summary(&mut self, _summary: &InitSummary) {}
+    fn report_summary(&mut self, summary: &InitSummary) {
+        let rows: Vec<(&str, &StepStatus)> = vec![
+            ("Config", &summary.config),
+            ("aspec folder", &summary.aspec_folder),
+            ("Dockerfile.dev", &summary.dockerfile),
+            ("Agent audit", &summary.audit),
+            ("Docker image", &summary.image_build),
+            ("Work items", &summary.work_items_setup),
+        ];
+        let box_str = render_summary_box("Init Summary", &rows);
+        let footer = "\nWhat's Next?\n  Run `amux` to launch the interactive TUI.\n\n  Available commands:\n    amux chat        — Start a freeform chat session with the agent\n    amux new spec    — Create a new work item from the aspec template\n    amux implement   — Implement a work item inside a container\n";
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!("\n{box_str}{footer}").as_bytes(),
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
 }

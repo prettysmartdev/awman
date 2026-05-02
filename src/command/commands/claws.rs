@@ -9,12 +9,23 @@ use crate::command::error::CommandError;
 use crate::engine::claws::{
     ClawsEngine, ClawsEngineOptions, ClawsFrontend, ClawsMode, ClawsSummary,
 };
+use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClawsCommandMode {
     Init,
     Ready,
     Chat,
+}
+
+impl ClawsCommandMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClawsCommandMode::Init => "init",
+            ClawsCommandMode::Ready => "ready",
+            ClawsCommandMode::Chat => "chat",
+        }
+    }
 }
 
 impl From<ClawsCommandMode> for ClawsMode {
@@ -35,24 +46,24 @@ pub struct ClawsCommandFlags {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClawsOutcome {
     pub mode: String,
-    pub clone: String,
-    pub permissions_check: String,
-    pub image_build: String,
-    pub audit: String,
-    pub configure: String,
-    pub controller: String,
+    pub clone: StepStatus,
+    pub permissions_check: StepStatus,
+    pub image_build: StepStatus,
+    pub audit: StepStatus,
+    pub configure: StepStatus,
+    pub controller: StepStatus,
 }
 
 impl From<(ClawsCommandMode, ClawsSummary)> for ClawsOutcome {
     fn from((mode, s): (ClawsCommandMode, ClawsSummary)) -> Self {
         Self {
-            mode: format!("{mode:?}"),
-            clone: format!("{:?}", s.clone),
-            permissions_check: format!("{:?}", s.permissions_check),
-            image_build: format!("{:?}", s.image_build),
-            audit: format!("{:?}", s.audit),
-            configure: format!("{:?}", s.configure),
-            controller: format!("{:?}", s.controller),
+            mode: mode.as_str().to_string(),
+            clone: s.clone,
+            permissions_check: s.permissions_check,
+            image_build: s.image_build,
+            audit: s.audit,
+            configure: s.configure,
+            controller: s.controller,
         }
     }
 }

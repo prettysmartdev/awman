@@ -20,9 +20,13 @@ impl AgentAuthFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(AgentAuthDecision::DeclineOnce);
         }
+        let vars = if env_var_names.is_empty() {
+            "no environment variables".to_string()
+        } else {
+            env_var_names.join(", ")
+        };
         eprintln!(
-            "amux: inject host credentials ({:?}) into the {} container? [y]es / [n]o / [o]nce",
-            env_var_names,
+            "amux: Inject host credentials ({vars}) into the {} container? [y]es / [n]o / [o]nce",
             agent.as_str()
         );
         let mut buf = String::new();

@@ -8,6 +8,7 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
+use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone)]
 pub struct ReadyCommandFlags {
@@ -22,22 +23,22 @@ pub struct ReadyCommandFlags {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadyOutcome {
     pub runtime: String,
-    pub base_image: String,
-    pub agent_image: String,
-    pub local_agent: String,
-    pub audit: String,
-    pub legacy_migration: String,
+    pub base_image: StepStatus,
+    pub agent_image: StepStatus,
+    pub local_agent: StepStatus,
+    pub audit: StepStatus,
+    pub legacy_migration: StepStatus,
 }
 
 impl From<ReadySummary> for ReadyOutcome {
     fn from(s: ReadySummary) -> Self {
         Self {
             runtime: s.runtime_name,
-            base_image: format!("{:?}", s.base_image),
-            agent_image: format!("{:?}", s.agent_image),
-            local_agent: format!("{:?}", s.local_agent),
-            audit: format!("{:?}", s.audit),
-            legacy_migration: format!("{:?}", s.legacy_migration),
+            base_image: s.base_image,
+            agent_image: s.agent_image,
+            local_agent: s.local_agent,
+            audit: s.audit,
+            legacy_migration: s.legacy_migration,
         }
     }
 }

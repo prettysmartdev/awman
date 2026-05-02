@@ -68,14 +68,16 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
     }
 }
 
-/// Format a successful [`CommandOutcome`] to a string, or `None` for
-/// `Empty`. Per-variant pretty rendering is deferred to WI 0072; the
-/// scaffold serializes to JSON so downstream tooling can inspect output.
+/// Format a successful [`CommandOutcome`] to user-facing stdout text.
+/// Returns `None` when the outcome carries nothing additional to print
+/// beyond what the engine already streamed via `report_*` to stderr.
+///
+/// The previous implementation fell back to `serde_json::to_string_pretty`
+/// for every non-Empty variant, which surfaced raw JSON as the primary
+/// user output for `chat`, `status`, `config`, etc. Per-variant rendering
+/// now lives in [`per_command::render`].
 pub(crate) fn format_outcome(outcome: &CommandOutcome) -> Option<String> {
-    match outcome {
-        CommandOutcome::Empty => None,
-        other => serde_json::to_string_pretty(other).ok(),
-    }
+    per_command::render::render(outcome)
 }
 
 /// Format a [`CommandError`] to the user-visible stderr string.
@@ -217,18 +219,27 @@ mod tests {
     }
 
     #[test]
-    fn format_outcome_non_empty_returns_some_json() {
-        // Any serializable variant produces Some(json_string).
-        // StatusOutcome is a representative non-Empty variant.
+    fn format_outcome_status_renders_dashboard_not_json() {
+        use crate::command::commands::status::StatusOutcome;
         use crate::command::CommandOutcome;
-        // Construct a trivially serializable outcome.
-        let outcome = CommandOutcome::Empty; // use Empty as baseline
+        let outcome = CommandOutcome::Status(StatusOutcome {
+            containers: vec![],
+            watched: false,
+        });
+        let s = format_outcome(&outcome).expect("status must render text");
+        assert!(s.contains("AMUX STATUS DASHBOARD"));
+        assert!(!s.contains('{'), "status must not be rendered as JSON");
+    }
+
+    #[test]
+    fn format_outcome_chat_clean_exit_returns_none() {
+        use crate::command::commands::chat::ChatOutcome;
+        use crate::command::CommandOutcome;
+        let outcome = CommandOutcome::Chat(ChatOutcome {
+            agent: Some("claude".into()),
+            exit_code: Some(0),
+        });
         assert!(format_outcome(&outcome).is_none());
-        // Verify the JSON path is exercised by round-tripping through
-        // serde_json directly (non-Empty serializable variant test).
-        let json = serde_json::to_string_pretty(&CommandOutcome::Empty).unwrap();
-        // Empty variant serializes to "\"Empty\"".
-        assert!(json.contains("Empty"), "Empty must round-trip: got {json}");
     }
 
     // ─── format_error — per-variant rendering assertions ─────────────────────

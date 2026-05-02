@@ -11,6 +11,7 @@
 //! Q&A, reporting, or container-frontend hooks.
 
 mod helpers;
+pub(crate) mod render;
 
 mod chat;
 mod claws;
