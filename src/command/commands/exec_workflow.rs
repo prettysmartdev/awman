@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
-use crate::command::commands::parse_overlay_spec;
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
@@ -263,7 +263,7 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
-            env_passthrough: None,
+            env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays: self.directory_overlays.clone(),
         };
         let options = self
@@ -347,8 +347,8 @@ impl Command for ExecWorkflowCommand {
             None
         };
 
-        // 4. Parse overlay specs early so errors surface before PTY is activated.
-        let directory_overlays = self
+        // 4. Parse CLI overlay specs early so errors surface before PTY is activated.
+        let cli_overlays = self
             .flags
             .overlay
             .iter()
@@ -380,6 +380,9 @@ impl Command for ExecWorkflowCommand {
             crate::data::session::SessionOpenOptions::default(),
         )
         .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
+
+        // Merge CLI overlays with config/env sources now that session is available.
+        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
         // 8. Run the engine. The engine block is scoped so proxy + factory are
         //    dropped before we reclaim the frontend via Arc::try_unwrap.

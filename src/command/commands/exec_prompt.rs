@@ -7,7 +7,7 @@ use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::chat::{open_session_for_cwd, resolve_agent};
 use crate::command::commands::mount_scope::MountScopeFrontend;
-use crate::command::commands::parse_overlay_spec;
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -103,7 +103,7 @@ impl Command for ExecPromptCommand {
         let session = open_session_for_cwd(&self.engines)?;
         let agent = resolve_agent(&self.flags.agent, &session)?;
 
-        let directory_overlays = self
+        let cli_overlays = self
             .flags
             .overlay
             .iter()
@@ -114,6 +114,7 @@ impl Command for ExecPromptCommand {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
         // Ensure the agent is available (downloads + builds when missing).
         ensure_exec_prompt_agent_setup(
@@ -142,6 +143,7 @@ impl Command for ExecPromptCommand {
             non_interactive: true,
             model: self.flags.model.clone(),
             initial_prompt: Some(self.flags.prompt.clone()),
+            env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays,
             ..Default::default()
         };

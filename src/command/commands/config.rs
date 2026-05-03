@@ -222,6 +222,21 @@ fn config_field_kind(name: &str) -> ConfigFieldKind {
 /// user via `amux config set`. Surfaced with `(read-only)` in the table.
 const READ_ONLY_FIELDS: &[&str] = &["auto_agent_auth_accepted"];
 
+const SENSITIVE_FIELDS: &[&str] = &["remote.defaultAPIKey"];
+
+fn mask_sensitive(field: &str, value: Option<String>) -> Option<String> {
+    if !SENSITIVE_FIELDS.contains(&field) {
+        return value;
+    }
+    value.map(|v| {
+        if v.len() > 12 {
+            format!("{}…{}", &v[..4], &v[v.len() - 4..])
+        } else {
+            "(set)".to_string()
+        }
+    })
+}
+
 fn collect_config_rows(
     global: &serde_json::Value,
     repo: &serde_json::Value,
@@ -231,11 +246,12 @@ fn collect_config_rows(
         .map(|(name, _scope)| {
             let g = config_field_value(global, name);
             let r = config_field_value(repo, name);
+            let effective = r.clone().or_else(|| g.clone());
             ConfigFieldRow {
                 field: (*name).to_string(),
-                global_value: g.clone(),
-                repo_value: r.clone(),
-                effective_value: r.or(g),
+                global_value: mask_sensitive(name, g),
+                repo_value: mask_sensitive(name, r),
+                effective_value: mask_sensitive(name, effective),
                 kind: config_field_kind(name),
                 read_only: READ_ONLY_FIELDS.contains(name),
             }

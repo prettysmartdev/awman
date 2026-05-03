@@ -19,7 +19,10 @@ pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepState {
     Pending,
-    Running,
+    Running {
+        #[serde(default)]
+        container_id: Option<String>,
+    },
     Succeeded,
     Failed {
         exit_code: i32,
@@ -84,6 +87,16 @@ impl WorkflowState {
                     | StepState::Cancelled
             )
         })
+    }
+
+    /// Steps that were in `Running` state when persisted, indicating an
+    /// interrupted/crashed run.
+    pub fn interrupted_running_steps(&self) -> Vec<String> {
+        self.step_states
+            .iter()
+            .filter(|(_, s)| matches!(s, StepState::Running { .. }))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Steps ready to run given current `completed_steps`.

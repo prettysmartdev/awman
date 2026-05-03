@@ -260,9 +260,10 @@ fn raw_to_steps(raw: Vec<RawStep>) -> Result<Vec<WorkflowStep>, DataError> {
         let name = r.name.ok_or_else(|| {
             DataError::WorkflowState(format!("step {idx}: missing required field 'name'"))
         })?;
-        let prompt_template = r.prompt.ok_or_else(|| {
+        let prompt_raw = r.prompt.ok_or_else(|| {
             DataError::WorkflowState(format!("step {idx} ('{name}'): missing required 'prompt'"))
         })?;
+        let prompt_template = prompt_raw.trim().to_string();
         steps.push(WorkflowStep {
             name,
             depends_on: r.depends_on,

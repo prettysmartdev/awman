@@ -7,6 +7,7 @@
 
 mod apple;
 mod backend;
+pub mod display;
 mod docker;
 pub mod frontend;
 pub mod instance;

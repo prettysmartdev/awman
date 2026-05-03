@@ -112,7 +112,7 @@ impl WorkflowEngine {
         let saved = store.load(&workflow_name)?;
 
         let workflow_hash = compute_workflow_hash(&workflow);
-        let state = match saved {
+        let mut state = match saved {
             Some(saved) => {
                 if saved.schema_version > WORKFLOW_STATE_SCHEMA_VERSION {
                     return Err(EngineError::UnsupportedWorkflowSchemaVersion {
@@ -137,6 +137,20 @@ impl WorkflowEngine {
             }
             None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash),
         };
+
+        let interrupted = state.interrupted_running_steps();
+        if !interrupted.is_empty() {
+            frontend.write_message(crate::engine::message::UserMessage {
+                level: crate::engine::message::MessageLevel::Warning,
+                text: format!(
+                    "Interrupted steps detected (prior crash?): {}. Resetting to Pending.",
+                    interrupted.join(", "),
+                ),
+            });
+            for name in &interrupted {
+                state.set_status(name, StepState::Pending);
+            }
+        }
 
         let effective_config = session.effective_config();
         Ok(Self {
@@ -328,7 +342,12 @@ impl WorkflowEngine {
         };
 
         // Mark running and launch.
-        self.state.set_status(&step.name, StepState::Running);
+        self.state.set_status(
+            &step.name,
+            StepState::Running {
+                container_id: None,
+            },
+        );
         self.frontend
             .report_step_status(&step, WorkflowStepStatus::Running);
         self.persist()?;
@@ -336,6 +355,16 @@ impl WorkflowEngine {
         let execution = self
             .container_factory
             .execution_for_step(&step, &self.session, &runtime)?;
+
+        // Persist the container ID now that we know it.
+        self.state.set_status(
+            &step.name,
+            StepState::Running {
+                container_id: Some(execution.handle().id.clone()),
+            },
+        );
+        self.persist()?;
+
         // Store before waiting so the execution is available for
         // ContinueInCurrentContainer prompt injection after this step completes.
         self.current_execution = Some(execution);
@@ -421,6 +450,17 @@ impl WorkflowEngine {
                 Some("FinishWorkflow is only valid on the last step".into());
         }
         Ok(a)
+    }
+
+    /// All steps that are currently ready to execute (dependencies satisfied,
+    /// not yet started). Callers that only need one step can use
+    /// `next_ready_steps().first()`.
+    pub fn next_ready_steps(&self) -> Result<Vec<WorkflowStep>, EngineError> {
+        self.state
+            .next_ready(&self.dag)
+            .into_iter()
+            .map(|name| self.find_step(&name))
+            .collect()
     }
 
     fn next_ready_step(&self) -> Result<Option<WorkflowStep>, EngineError> {

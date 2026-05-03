@@ -22,12 +22,28 @@ pub use summary::ClawsSummary;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Issue 22: Audit prompt seeded into the nanoclaw audit container.
-const CLAWS_AUDIT_PROMPT: &str = r#"You are auditing a nanoclaw (container-based sub-agent) environment. Check:
-1. The Dockerfile is well-formed and installs the required tooling
-2. Network connectivity to required services is available
-3. The agent CLI is installed and accessible
-Report any issues found."#;
+/// Audit prompt seeded into the nanoclaw audit container.
+const CLAWS_AUDIT_PROMPT: &str = "\
+You have two jobs that can be performed in parallel: \n\
+\n\
+First, evaluate the nanoclaw source code to determine how containers communicate with each other \
+over the network. Modify the codebase so that all network traffic gets configured to be \
+container-to-container rather than container-to-host. The `host.docker.internal` route should \
+never be used, since nanoclaw, onecli, and all workers will be running within containers, and so \
+communication with the host machine will never be needed. The nanoclaw controller should \
+communicate with onecli over a container-to-container connection. When worker containers are \
+launched, they should be configured to communicate with onecli and the nanoclaw controller over \
+a container-to-container connection. Nanoclaw should use the Docker CLI and container ports to determine how to \
+perform all network communication. Modify the codebase comprehensively, looking for any place \
+where network traffic is configured, including addresses and ports for the controller onecli, \
+and workers. Think hard to ensure no container-to-host communication will happen after your \
+changes are complete. Do not attempt to use Docker yourself, as you do not have access. \n\
+\n\
+Second, change the nanoclaw codebase to detect `/tmp/onecli-*` volume mounts that the OneCLI SDK adds, \
+and automatically copy those cert files to `data/certs/` (which is on the actual host filesystem via mount) \
+Also rewrite the container mount args to use those host-accessible paths. Ensure the agent container gets the \
+CA cert correctly so Node.js can trust the OneCLI proxy's certificate.\
+";
 
 /// Issue 21: URL for the nanoclaw-specific Dockerfile template.
 const NANOCLAW_DOCKERFILE_URL: &str =
@@ -55,6 +71,7 @@ pub struct ClawsEngine {
     git_engine: Arc<GitEngine>,
     overlay_engine: Arc<OverlayEngine>,
     container_runtime: Arc<ContainerRuntime>,
+    auth_engine: Arc<crate::engine::auth::AuthEngine>,
     options: ClawsEngineOptions,
     phase: ClawsPhase,
     summary: ClawsSummary,
@@ -66,6 +83,7 @@ impl ClawsEngine {
         git_engine: Arc<GitEngine>,
         overlay_engine: Arc<OverlayEngine>,
         container_runtime: Arc<ContainerRuntime>,
+        auth_engine: Arc<crate::engine::auth::AuthEngine>,
         options: ClawsEngineOptions,
     ) -> Self {
         Self {
@@ -73,6 +91,7 @@ impl ClawsEngine {
             git_engine,
             overlay_engine,
             container_runtime,
+            auth_engine,
             options,
             phase: ClawsPhase::Preflight,
             summary: ClawsSummary::default(),
@@ -360,7 +379,13 @@ impl ClawsEngine {
             }
             (ClawsPhase::BuildingImage, _) => {
                 use crate::data::claws_paths::claws_image_tag;
-                let dockerfile = self.options.clone_dir.join("Dockerfile");
+                let dockerfile_dev = self.options.clone_dir.join("Dockerfile.dev");
+                let dockerfile_plain = self.options.clone_dir.join("Dockerfile");
+                let dockerfile = if dockerfile_dev.exists() {
+                    dockerfile_dev
+                } else {
+                    dockerfile_plain
+                };
                 let tag = claws_image_tag(self.session.git_root());
                 if dockerfile.exists() {
                     let mut sink = |line: &str| {
@@ -631,8 +656,8 @@ impl ClawsEngine {
             }
             (ClawsPhase::AttachingChat, ClawsMode::Chat) => {
                 use crate::data::claws_paths::claws_controller_name;
+                use crate::data::session::AgentName;
                 let controller_name = claws_controller_name(self.session.git_root());
-                // Issue 24: dynamic chat entrypoint based on configured agent.
                 let agent_name = self
                     .session
                     .effective_config()
@@ -642,8 +667,17 @@ impl ClawsEngine {
                 let mut exec_args = vec![
                     "exec".to_string(),
                     "-it".to_string(),
-                    controller_name.clone(),
                 ];
+                // Forward agent credentials into the exec session.
+                if let Ok(agent) = AgentName::new(&agent_name) {
+                    if let Ok(creds) = self.auth_engine.agent_keychain_credentials(&agent) {
+                        for (k, v) in &creds.env_vars {
+                            exec_args.push("-e".to_string());
+                            exec_args.push(format!("{k}={v}"));
+                        }
+                    }
+                }
+                exec_args.push(controller_name.clone());
                 exec_args.extend(entrypoint);
                 let status = std::process::Command::new("docker")
                     .args(&exec_args)
@@ -953,11 +987,15 @@ mod tests {
             crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
         ));
         let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let auth_paths = crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path());
+        let headless_paths = crate::data::fs::headless_paths::HeadlessPaths::at_home(tmp.path());
+        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(auth_paths, headless_paths));
         ClawsEngine::new(
             session,
             Arc::new(GitEngine::new()),
             overlay,
             runtime,
+            auth_engine,
             ClawsEngineOptions {
                 mode,
                 nanoclaw_url: None,

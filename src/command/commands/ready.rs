@@ -75,6 +75,7 @@ impl ReadyOutcome {
                 StepStatus::Running => serde_json::json!({"status": "running", "message": ""}),
                 StepStatus::Done => serde_json::json!({"status": "ok", "message": ""}),
                 StepStatus::Skipped => serde_json::json!({"status": "skipped", "message": ""}),
+                StepStatus::Warn(msg) => serde_json::json!({"status": "warn", "message": msg}),
                 StepStatus::Failed(msg) => {
                     serde_json::json!({"status": "failed", "message": msg})
                 }

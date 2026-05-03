@@ -115,6 +115,50 @@ impl RemoteClient {
         Ok(RemoteResponse { status, body })
     }
 
+    pub async fn get(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
+        let url = format!("{}/v1/{}", self.base_url, path.join("/"));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        if status >= 400 {
+            return Err(CommandError::RemoteHttpStatus {
+                status,
+                body: body.to_string(),
+            });
+        }
+        Ok(RemoteResponse { status, body })
+    }
+
+    pub async fn delete(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
+        let url = format!("{}/v1/{}", self.base_url, path.join("/"));
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::json!({}));
+        if status >= 400 {
+            return Err(CommandError::RemoteHttpStatus {
+                status,
+                body: body.to_string(),
+            });
+        }
+        Ok(RemoteResponse { status, body })
+    }
+
     /// Stream SSE events from the remote server. Disables the read timeout
     /// so long-running commands don't hit the 600s ceiling.
     pub async fn stream_command(

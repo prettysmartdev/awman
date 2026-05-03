@@ -103,6 +103,7 @@ impl Command for ClawsCommand {
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),
             self.engines.runtime.clone(),
+            self.engines.auth_engine.clone(),
             ClawsEngineOptions {
                 mode: mode.into(),
                 nanoclaw_url: None,

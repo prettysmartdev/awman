@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
-use crate::command::commands::parse_overlay_spec;
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -80,7 +80,7 @@ impl Command for ChatCommand {
         let _mount_path = MountScope::resolve(&cwd, session.git_root(), frontend.as_mut())?;
 
         // 2. Parse overlay specs before PTY is activated so errors surface early.
-        let directory_overlays = self
+        let cli_overlays = self
             .flags
             .overlay
             .iter()
@@ -91,6 +91,7 @@ impl Command for ChatCommand {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
         // 3. Ensure the agent is available (Dockerfile + image present, build
         //    if missing). Runs before PTY activation so any download/build
@@ -121,6 +122,7 @@ impl Command for ChatCommand {
             mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
+            env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays,
             ..Default::default()
         };

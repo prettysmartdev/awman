@@ -32,3 +32,10 @@ pub fn agent_dockerfile_for(agent: &str) -> Option<&'static str> {
 pub fn nanoclaw_dockerfile() -> &'static str {
     include_str!("../../../templates/Dockerfile.nanoclaw")
 }
+
+/// Returns `true` when the given content matches the bundled project base
+/// template (ignoring leading/trailing whitespace). Used by the ready engine
+/// to decide whether an audit should be offered.
+pub fn dockerfile_matches_template(content: &str) -> bool {
+    content.trim() == project_dockerfile_dev().trim()
+}

@@ -163,6 +163,24 @@ impl ContainerBackend for DockerBackend {
         Ok(())
     }
 
+    fn exec_args(
+        &self,
+        container_id: &str,
+        working_dir: &str,
+        entrypoint: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> Vec<String> {
+        let mut args = vec!["exec".to_string(), "-it".to_string()];
+        args.extend(["-w".to_string(), working_dir.to_string()]);
+        for (k, v) in env_vars {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        args.push(container_id.to_string());
+        args.extend(entrypoint.iter().map(|s| s.to_string()));
+        args
+    }
+
     fn name(&self) -> &'static str {
         "docker"
     }

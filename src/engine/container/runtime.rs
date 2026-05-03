@@ -179,15 +179,36 @@ impl ContainerRuntime {
         self.backend.stop(handle)
     }
 
+    /// Build CLI arguments for `docker exec -it` (or equivalent) into a running
+    /// container. Returns args suitable for `Command::new(cli_binary).args(...)`.
+    pub fn exec_args(
+        &self,
+        container_id: &str,
+        working_dir: &str,
+        entrypoint: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> Vec<String> {
+        self.backend
+            .exec_args(container_id, working_dir, entrypoint, env_vars)
+    }
+
+    /// The CLI binary name for this runtime (`"docker"` or `"container"`).
+    pub fn cli_binary(&self) -> &'static str {
+        match self.backend.name() {
+            "apple-containers" => "container",
+            _ => "docker",
+        }
+    }
+
     /// Best-effort check whether the container runtime daemon is reachable.
     /// Returns `false` when `docker info` (or equivalent) fails.
     pub fn is_available(&self) -> bool {
-        let cli_bin = match self.backend.name() {
-            "apple-containers" => "container",
-            _ => "docker",
+        let (cli_bin, args): (&str, &[&str]) = match self.backend.name() {
+            "apple-containers" => ("container", &["system", "status"]),
+            _ => ("docker", &["info", "--format", "{{.ServerVersion}}"]),
         };
         std::process::Command::new(cli_bin)
-            .args(["info", "--format", "{{.ServerVersion}}"])
+            .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

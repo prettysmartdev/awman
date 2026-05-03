@@ -13,6 +13,12 @@ pub struct StatusCommandFlags {
     pub watch: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ContainerKind {
+    Agent,
+    Claws,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusOutcome {
     pub containers: Vec<StatusContainerRow>,
@@ -27,6 +33,7 @@ pub struct StatusContainerRow {
     pub name: String,
     pub image: String,
     pub started_at: String,
+    pub kind: ContainerKind,
     pub tab_number: Option<u32>,
     pub stuck: bool,
     pub command_label: Option<String>,
@@ -36,6 +43,14 @@ pub struct StatusContainerRow {
     pub cpu_percent: Option<f64>,
     /// Live memory usage in MB.
     pub memory_mb: Option<f64>,
+}
+
+fn classify_container(name: &str) -> ContainerKind {
+    if name.starts_with("amux-claws-") || name.contains("nanoclaw") {
+        ContainerKind::Claws
+    } else {
+        ContainerKind::Agent
+    }
 }
 
 /// Optional context supplied by the TUI; CLI / headless leave this `None`.
@@ -114,6 +129,7 @@ impl Command for StatusCommand {
                         name: h.name.clone(),
                         image: h.image_tag.clone(),
                         started_at: h.started_at.to_rfc3339(),
+                        kind: classify_container(&h.name),
                         tab_number: None,
                         stuck: false,
                         command_label: None,
@@ -223,6 +239,7 @@ mod tests {
             started_at: "2025-01-01T00:00:00Z".into(),
             tab_number: None,
             stuck: false,
+            kind: ContainerKind::Agent,
             command_label: None, cpu_percent: None, memory_mb: None,
         };
         // Apply the same matching logic used in run_with_frontend.
@@ -245,6 +262,7 @@ mod tests {
             name: "amux-x".into(),
             image: "img".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
+            kind: ContainerKind::Agent,
             tab_number: None,
             stuck: false,
             command_label: None, cpu_percent: None, memory_mb: None,
@@ -269,6 +287,7 @@ mod tests {
             name: "amux-mine".into(),
             image: "img".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
+            kind: ContainerKind::Agent,
             tab_number: None,
             stuck: false,
             command_label: None, cpu_percent: None, memory_mb: None,
@@ -280,5 +299,19 @@ mod tests {
             row.command_label = Some(t.command_label.clone());
         }
         assert_eq!(row.tab_number, None, "no match must leave tab_number None");
+    }
+
+    #[test]
+    fn classify_agent_containers() {
+        assert_eq!(classify_container("amux-123-456"), ContainerKind::Agent);
+        assert_eq!(classify_container("amux-abc"), ContainerKind::Agent);
+    }
+
+    #[test]
+    fn classify_claws_containers() {
+        assert_eq!(classify_container("amux-claws-controller"), ContainerKind::Claws);
+        assert_eq!(classify_container("amux-claws-abc123"), ContainerKind::Claws);
+        assert_eq!(classify_container("nanoclaw-worker-1"), ContainerKind::Claws);
+        assert_eq!(classify_container("something-nanoclaw-x"), ContainerKind::Claws);
     }
 }

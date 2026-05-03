@@ -30,7 +30,7 @@ use crate::command::commands::remote::{
     RemoteOutcome, RemoteRunOutcome, RemoteSessionKillOutcome, RemoteSessionStartOutcome,
 };
 use crate::command::commands::specs::{SpecsAmendOutcome, SpecsNewOutcome, SpecsOutcome};
-use crate::command::commands::status::{StatusContainerRow, StatusOutcome};
+use crate::command::commands::status::{ContainerKind, StatusContainerRow, StatusOutcome};
 use crate::command::CommandOutcome;
 
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
@@ -62,18 +62,44 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
 // ─── status ──────────────────────────────────────────────────────────────────
 
 pub fn render_status(o: &StatusOutcome) -> String {
+    let agents: Vec<&StatusContainerRow> = o
+        .containers
+        .iter()
+        .filter(|c| c.kind == ContainerKind::Agent)
+        .collect();
+    let claws: Vec<&StatusContainerRow> = o
+        .containers
+        .iter()
+        .filter(|c| c.kind == ContainerKind::Claws)
+        .collect();
+
     let mut out = String::new();
     out.push_str("AMUX STATUS DASHBOARD\n\n");
+
     out.push_str("CODE AGENTS\n");
-    if o.containers.is_empty() {
+    if agents.is_empty() {
         out.push_str("  No code agents running.\n");
         out.push_str("  To start one: amux implement <work-item>  or  amux chat\n");
     } else {
         let headers = ["●", "Container", "ID", "Image", "CPU%", "Mem MB", "Started"];
-        let rows: Vec<Vec<String>> = o
-            .containers
+        let rows: Vec<Vec<String>> = agents
             .iter()
-            .map(|c: &StatusContainerRow| {
+            .map(|c| render_container_row(c))
+            .collect();
+        out.push_str(&format_table(&headers, &rows));
+    }
+
+    out.push('\n');
+
+    out.push_str("NANOCLAW\n");
+    if claws.is_empty() {
+        out.push_str("  Nanoclaw is not running.\n");
+        out.push_str("  To start it: amux claws init\n");
+    } else {
+        let headers = ["●", "Container", "ID", "CPU%", "Mem MB"];
+        let rows: Vec<Vec<String>> = claws
+            .iter()
+            .map(|c| {
                 let indicator = if c.stuck { "🟡" } else { "🟢" };
                 let cpu = c
                     .cpu_percent
@@ -87,17 +113,37 @@ pub fn render_status(o: &StatusOutcome) -> String {
                     indicator.to_string(),
                     c.name.clone(),
                     c.id.chars().take(12).collect(),
-                    c.image.clone(),
                     cpu,
                     mem,
-                    c.started_at.clone(),
                 ]
             })
             .collect();
         out.push_str(&format_table(&headers, &rows));
     }
+
     out.push_str(&format!("\nTip: {}\n", o.tip));
     out
+}
+
+fn render_container_row(c: &StatusContainerRow) -> Vec<String> {
+    let indicator = if c.stuck { "🟡" } else { "🟢" };
+    let cpu = c
+        .cpu_percent
+        .map(|v| format!("{v:>5.1}"))
+        .unwrap_or_else(|| "  -  ".to_string());
+    let mem = c
+        .memory_mb
+        .map(|v| format!("{v:>6.1}"))
+        .unwrap_or_else(|| "   -  ".to_string());
+    vec![
+        indicator.to_string(),
+        c.name.clone(),
+        c.id.chars().take(12).collect(),
+        c.image.clone(),
+        cpu,
+        mem,
+        c.started_at.clone(),
+    ]
 }
 
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -329,32 +375,26 @@ fn render_remote(o: &RemoteOutcome) -> Option<String> {
 
 fn render_remote_run(o: &RemoteRunOutcome) -> String {
     let cmd = o.command.join(" ");
-    let session = o
-        .session
+    let status_part = o
+        .status
         .as_deref()
-        .map(|s| format!(" (session {s})"))
+        .map(|s| format!(" [{s}]"))
         .unwrap_or_default();
-    let addr = o
-        .remote_addr
-        .as_deref()
-        .map(|a| format!(" via {a}"))
-        .unwrap_or_default();
-    format!("Submitted remote command: {cmd}{session}{addr}")
+    format!(
+        "Command {}: {cmd} (session {}) via {}{status_part}",
+        o.command_id, o.session, o.remote_addr,
+    )
 }
 
 fn render_remote_session_start(o: &RemoteSessionStartOutcome) -> String {
-    let dir = o.dir.as_deref().unwrap_or("<cwd>");
-    let addr = o
-        .remote_addr
-        .as_deref()
-        .map(|a| format!(" via {a}"))
-        .unwrap_or_default();
-    format!("Remote session started for {dir}{addr}.")
+    format!(
+        "Session {} created for {} via {}.",
+        o.session_id, o.dir, o.remote_addr,
+    )
 }
 
 fn render_remote_session_kill(o: &RemoteSessionKillOutcome) -> String {
-    let id = o.session_id.as_deref().unwrap_or("<latest>");
-    format!("Remote session {id} killed.")
+    format!("Session {} killed via {}.", o.session_id, o.remote_addr)
 }
 
 // ─── new ─────────────────────────────────────────────────────────────────────
@@ -455,17 +495,19 @@ mod tests {
         let s = render_status(&o);
         assert!(s.contains("AMUX STATUS DASHBOARD"));
         assert!(s.contains("No code agents running"));
+        assert!(s.contains("Nanoclaw is not running"));
         assert!(s.contains("Tip: test tip"));
     }
 
     #[test]
-    fn render_status_with_one_container_emits_table_and_no_json() {
+    fn render_status_with_one_agent_container() {
         let o = StatusOutcome {
             containers: vec![StatusContainerRow {
                 id: "abc1234567890".into(),
                 name: "amux-1".into(),
                 image: "amux/dev:latest".into(),
                 started_at: "2025-01-01T00:00:00Z".into(),
+                kind: ContainerKind::Agent,
                 tab_number: None,
                 stuck: false,
                 command_label: None, cpu_percent: None, memory_mb: None,
@@ -474,10 +516,66 @@ mod tests {
             tip: "test tip".into(),
         };
         let s = render_status(&o);
+        assert!(s.contains("CODE AGENTS"), "{s}");
         assert!(s.contains("amux-1"), "{s}");
-        // No JSON braces in the rendered string.
-        assert!(!s.contains("\"name\""), "should not contain JSON: {s}");
-        assert!(!s.contains("{"), "should not contain braces: {s}");
+        assert!(s.contains("Nanoclaw is not running"), "empty nanoclaw section: {s}");
+    }
+
+    #[test]
+    fn render_status_with_claws_container() {
+        let o = StatusOutcome {
+            containers: vec![StatusContainerRow {
+                id: "claws123456789".into(),
+                name: "amux-claws-controller".into(),
+                image: "amux-claws:latest".into(),
+                started_at: "2025-01-01T00:00:00Z".into(),
+                kind: ContainerKind::Claws,
+                tab_number: None,
+                stuck: false,
+                command_label: None, cpu_percent: None, memory_mb: None,
+            }],
+            watched: false,
+            tip: "test tip".into(),
+        };
+        let s = render_status(&o);
+        assert!(s.contains("NANOCLAW"), "{s}");
+        assert!(s.contains("amux-claws-controller"), "{s}");
+        assert!(s.contains("No code agents running"), "empty agents section: {s}");
+    }
+
+    #[test]
+    fn render_status_both_sections() {
+        let o = StatusOutcome {
+            containers: vec![
+                StatusContainerRow {
+                    id: "agent123456789".into(),
+                    name: "amux-1".into(),
+                    image: "amux/dev:latest".into(),
+                    started_at: "2025-01-01T00:00:00Z".into(),
+                    kind: ContainerKind::Agent,
+                    tab_number: None,
+                    stuck: false,
+                    command_label: None, cpu_percent: None, memory_mb: None,
+                },
+                StatusContainerRow {
+                    id: "claws123456789".into(),
+                    name: "amux-claws-abc".into(),
+                    image: "amux-claws:latest".into(),
+                    started_at: "2025-01-01T00:00:00Z".into(),
+                    kind: ContainerKind::Claws,
+                    tab_number: None,
+                    stuck: false,
+                    command_label: None, cpu_percent: None, memory_mb: None,
+                },
+            ],
+            watched: false,
+            tip: "test tip".into(),
+        };
+        let s = render_status(&o);
+        assert!(s.contains("amux-1"), "agent row: {s}");
+        assert!(s.contains("amux-claws-abc"), "claws row: {s}");
+        assert!(!s.contains("No code agents running"), "agents section not empty: {s}");
+        assert!(!s.contains("Nanoclaw is not running"), "nanoclaw section not empty: {s}");
     }
 
     #[test]

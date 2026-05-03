@@ -171,20 +171,42 @@ impl OverlayEngine {
 
         match agent.as_str() {
             "claude" => {
-                if let Some(cfg) = paths.config_file.as_ref() {
-                    if cfg.exists() {
-                        // Produce a sanitized copy of `.claude.json` (oauthAccount
-                        // stripped, trust dialog accepted for /workspace) under a
-                        // tempdir; mount that instead of the raw host file. The
-                        // tempdir is retained on the engine so RAII cleanup runs
-                        // when the engine drops (process exit).
-                        let host_path = match sanitize_claude_config(cfg) {
-                            Ok((dir, path)) => {
-                                let _retained = self.retain_tempdir(dir);
-                                path
-                            }
-                            Err(_) => cfg.clone(),
-                        };
+                let has_config = paths
+                    .config_file
+                    .as_ref()
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                if has_config {
+                    let cfg = paths.config_file.as_ref().unwrap();
+                    let host_path = match sanitize_claude_config(cfg) {
+                        Ok((dir, path)) => {
+                            let _retained = self.retain_tempdir(dir);
+                            path
+                        }
+                        Err(_) => cfg.clone(),
+                    };
+                    out.push(OverlaySpec {
+                        host_path,
+                        container_path: PathBuf::from(format!(
+                            "{container_home}/.claude.json"
+                        )),
+                        permission: OverlayPermission::ReadWrite,
+                    });
+                } else {
+                    // First-time user: no ~/.claude.json on host. Synthesize a
+                    // minimal config with the /workspace trust dialog accepted
+                    // so the agent doesn't prompt inside the container.
+                    let host_path = match synthesize_minimal_claude_config() {
+                        Ok((dir, path)) => {
+                            let _retained = self.retain_tempdir(dir);
+                            path
+                        }
+                        Err(_) => {
+                            // Can't create temp file — skip this overlay.
+                            PathBuf::new()
+                        }
+                    };
+                    if host_path.exists() {
                         out.push(OverlaySpec {
                             host_path,
                             container_path: PathBuf::from(format!(
@@ -194,20 +216,35 @@ impl OverlayEngine {
                         });
                     }
                 }
-                if let Some(dir) = paths.settings_dir.as_ref() {
-                    if dir.exists() {
-                        // Sanitize the settings dir: filter denylisted entries
-                        // and optionally inject yolo + LSP-banner suppression.
-                        let host_path = match sanitize_claude_settings_dir(dir, yolo) {
-                            Ok((tmp, path)) => {
-                                let _retained = self.retain_tempdir(tmp);
-                                path
-                            }
-                            Err(_) => dir.clone(),
-                        };
+                let has_settings_dir = paths
+                    .settings_dir
+                    .as_ref()
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                if has_settings_dir {
+                    let dir = paths.settings_dir.as_ref().unwrap();
+                    let host_path = match sanitize_claude_settings_dir(dir, yolo) {
+                        Ok((tmp, path)) => {
+                            let _retained = self.retain_tempdir(tmp);
+                            path
+                        }
+                        Err(_) => dir.clone(),
+                    };
+                    out.push(OverlaySpec {
+                        host_path,
+                        container_path: PathBuf::from(format!("{container_home}/.claude")),
+                        permission: OverlayPermission::ReadWrite,
+                    });
+                } else {
+                    // First-time user: no ~/.claude/ on host. Synthesize a
+                    // minimal settings dir with LSP suppression.
+                    if let Ok((tmp, path)) = synthesize_minimal_claude_settings_dir(yolo) {
+                        let _retained = self.retain_tempdir(tmp);
                         out.push(OverlaySpec {
-                            host_path,
-                            container_path: PathBuf::from(format!("{container_home}/.claude")),
+                            host_path: path,
+                            container_path: PathBuf::from(format!(
+                                "{container_home}/.claude"
+                            )),
                             permission: OverlayPermission::ReadWrite,
                         });
                     }
@@ -357,8 +394,10 @@ fn sanitize_claude_settings_dir(
         serde_json::json!({})
     };
     if let serde_json::Value::Object(obj) = &mut settings {
+        // Set both LSP suppression keys for compatibility with different
+        // Claude Code versions.
         obj.insert(
-            "skipDangerousModePermissionPrompt".into(),
+            "hasShownLspRecommendation".into(),
             serde_json::Value::Bool(true),
         );
         obj.insert(
@@ -367,6 +406,10 @@ fn sanitize_claude_settings_dir(
         );
         if yolo {
             obj.insert(
+                "skipDangerousModePermissionPrompt".into(),
+                serde_json::Value::Bool(true),
+            );
+            obj.insert(
                 "permissionMode".into(),
                 serde_json::Value::String("bypassPermissions".into()),
             );
@@ -374,6 +417,60 @@ fn sanitize_claude_settings_dir(
     }
     let body = serde_json::to_string_pretty(&settings).unwrap_or_default();
     let _ = std::fs::write(&settings_path, body);
+    Ok((tmp, tmp_root))
+}
+
+/// Synthesize a minimal `.claude.json` for first-time users: trust dialog
+/// accepted for `/workspace`, no oauthAccount.
+fn synthesize_minimal_claude_config() -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let value = serde_json::json!({
+        "projects": {
+            "/workspace": {
+                "hasTrustDialogAccepted": true
+            }
+        }
+    });
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("amux-claude-minimal-")
+        .tempdir()?;
+    let dest = tmp_dir.path().join("claude.json");
+    let body = serde_json::to_string_pretty(&value).unwrap_or_default();
+    std::fs::write(&dest, body)?;
+    Ok((tmp_dir, dest))
+}
+
+/// Synthesize a minimal `~/.claude/` directory for first-time users with
+/// LSP suppression and (optionally) yolo bypass.
+fn synthesize_minimal_claude_settings_dir(
+    yolo: bool,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let tmp = tempfile::Builder::new()
+        .prefix("amux-claude-dir-minimal-")
+        .tempdir()?;
+    let tmp_root = tmp.path().to_path_buf();
+    let mut settings = serde_json::json!({});
+    if let serde_json::Value::Object(obj) = &mut settings {
+        obj.insert(
+            "hasShownLspRecommendation".into(),
+            serde_json::Value::Bool(true),
+        );
+        obj.insert(
+            "lspRecommendationDismissed".into(),
+            serde_json::Value::Bool(true),
+        );
+        if yolo {
+            obj.insert(
+                "skipDangerousModePermissionPrompt".into(),
+                serde_json::Value::Bool(true),
+            );
+            obj.insert(
+                "permissionMode".into(),
+                serde_json::Value::String("bypassPermissions".into()),
+            );
+        }
+    }
+    let body = serde_json::to_string_pretty(&settings).unwrap_or_default();
+    std::fs::write(tmp_root.join("settings.json"), body)?;
     Ok((tmp, tmp_root))
 }
 

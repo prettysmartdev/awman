@@ -46,19 +46,22 @@ pub fn step_status_label(status: &StepStatus) -> String {
         StepStatus::Running => "running".to_string(),
         StepStatus::Done => "done".to_string(),
         StepStatus::Skipped => "skipped".to_string(),
+        StepStatus::Warn(msg) if msg.is_empty() => "warn".to_string(),
+        StepStatus::Warn(msg) => format!("warn: {msg}"),
         StepStatus::Failed(reason) if reason.is_empty() => "failed".to_string(),
         StepStatus::Failed(reason) => format!("failed: {reason}"),
     }
 }
 
 /// Render a [`StepStatus`] as a single glyph for summary tables.
-/// `-` Pending, `…` Running, `✓` Done, `–` Skipped, `✗` Failed.
+/// `-` Pending, `…` Running, `✓` Done, `–` Skipped, `⚠` Warn, `✗` Failed.
 pub fn step_status_glyph(status: &StepStatus) -> &'static str {
     match status {
         StepStatus::Pending => "-",
         StepStatus::Running => "…",
         StepStatus::Done => "✓",
         StepStatus::Skipped => "–",
+        StepStatus::Warn(_) => "⚠",
         StepStatus::Failed(_) => "✗",
     }
 }

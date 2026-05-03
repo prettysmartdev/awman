@@ -96,7 +96,7 @@ impl ReadyEngine {
                 if aspec_dir.exists() {
                     self.summary.aspec_folder = StepStatus::Done;
                 } else {
-                    self.summary.aspec_folder = StepStatus::Failed("aspec/ folder not found".into());
+                    self.summary.aspec_folder = StepStatus::Warn("aspec/ folder not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
                         text: "aspec/ folder not found in git root; run `amux init` to create it.".to_string(),
@@ -106,7 +106,7 @@ impl ReadyEngine {
                 if config_path.exists() {
                     self.summary.work_items_config = StepStatus::Done;
                 } else {
-                    self.summary.work_items_config = StepStatus::Failed("aspec/.amux.json not found".into());
+                    self.summary.work_items_config = StepStatus::Warn("aspec/.amux.json not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
                         text: "aspec/.amux.json not found; run `amux init` to create it.".to_string(),
@@ -295,6 +295,19 @@ impl ReadyEngine {
                     self.summary.audit = StepStatus::Skipped;
                     self.phase = ReadyPhase::RebuildingAfterAudit;
                     return Ok(self.phase.clone());
+                }
+                // Inform the frontend whether the Dockerfile.dev still matches
+                // the bundled template — the UI can show a hint that the audit
+                // may overwrite customisations.
+                let dockerfile_path = git_root.join("Dockerfile.dev");
+                if dockerfile_path.exists() {
+                    let content = std::fs::read_to_string(&dockerfile_path).unwrap_or_default();
+                    if !templates::dockerfile_matches_template(&content) {
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Warning,
+                            text: "Dockerfile.dev has been customised; audit may overwrite changes.".into(),
+                        });
+                    }
                 }
                 if frontend.ask_run_audit_on_template()? {
                     use crate::data::templates::ready_audit_prompt;

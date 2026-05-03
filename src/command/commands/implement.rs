@@ -16,7 +16,7 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::exec_workflow::WorkflowSummary;
 use crate::command::commands::implement_prompts::render_default_prompt;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
-use crate::command::commands::parse_overlay_spec;
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
@@ -239,7 +239,7 @@ impl ContainerExecutionFactory for ImplementCommandLayerFactory {
             mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
-            env_passthrough: None,
+            env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays: self.directory_overlays.clone(),
         };
         let options = self
@@ -334,8 +334,8 @@ impl Command for ImplementCommand {
             None
         };
 
-        // Parse overlay specs before any async work so errors surface early.
-        let directory_overlays = self
+        // Parse CLI overlay specs before any async work so errors surface early.
+        let cli_overlays = self
             .flags
             .overlay
             .iter()
@@ -363,6 +363,9 @@ impl Command for ImplementCommand {
             crate::data::session::SessionOpenOptions::default(),
         )
         .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
+
+        // Merge CLI overlays with config/env sources now that session is available.
+        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
         let (engine_result, step_counts) = {
             let proxy = ImplementWorkflowProxy(Arc::clone(&shared));

@@ -64,10 +64,12 @@ impl<F: ?Sized + HasContainerFrontend> crate::engine::agent::AgentFrontend
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
         let level = match &status {
             StepStatus::Failed(_) => crate::engine::message::MessageLevel::Error,
+            StepStatus::Warn(_) => crate::engine::message::MessageLevel::Warning,
             _ => crate::engine::message::MessageLevel::Info,
         };
         let text = match status {
             StepStatus::Failed(msg) => format!("{step}: failed — {msg}"),
+            StepStatus::Warn(msg) => format!("{step}: {msg}"),
             StepStatus::Done => format!("{step}: done"),
             StepStatus::Running => format!("{step}: running"),
             StepStatus::Skipped => format!("{step}: skipped"),

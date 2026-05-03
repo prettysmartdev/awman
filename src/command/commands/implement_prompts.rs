@@ -4,8 +4,10 @@
 
 /// Default single-step prompt used when `--workflow` is omitted.
 /// `{{work_item_number}}` is substituted at command-build time.
-pub const DEFAULT_IMPLEMENT_PROMPT: &str =
-    "Implement work item {{work_item_number}}. Iterate until build/tests/docs succeed.";
+pub const DEFAULT_IMPLEMENT_PROMPT: &str = "Implement work item {{work_item_number}}. Iterate \
+    until the build succeeds. Implement tests as described in the work item and the project \
+    aspec. Iterate until tests are comprehensive and pass. Write documentation as described \
+    in the project aspec. Ensure final build and test success.";
 
 /// Substitute the canonical placeholder.
 pub fn render_default_prompt(work_item: &str) -> String {
