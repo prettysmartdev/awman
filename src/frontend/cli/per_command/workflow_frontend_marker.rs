@@ -14,7 +14,7 @@ use crate::engine::container::instance::ContainerExitInfo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput,
-    WorkflowOutcome, WorkflowStepStatus, YoloTickOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
@@ -119,9 +119,7 @@ impl WorkflowFrontend for CliFrontend {
         })
     }
 
-    fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
-        let _ = (step, status);
-    }
+    fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
 
@@ -195,5 +193,90 @@ impl WorkflowFrontend for CliFrontend {
         Ok(YoloTickOutcome::Continue)
     }
 
-    fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
+    fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
+        let msg = match outcome {
+            WorkflowOutcome::Completed => "workflow completed successfully.",
+            WorkflowOutcome::Paused   => "workflow paused.",
+            WorkflowOutcome::Aborted  => "workflow aborted.",
+            WorkflowOutcome::Failed { last_step, exit_code } => {
+                eprintln!("amux: workflow failed at step '{}' (exit {}).", last_step, exit_code);
+                return;
+            }
+        };
+        eprintln!("amux: {}", msg);
+    }
+
+    fn report_workflow_progress(&mut self, steps: &[WorkflowStepProgressInfo]) {
+        if steps.is_empty() {
+            return;
+        }
+        // Column widths.
+        let name_w = steps.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
+        let agent_w = steps.iter().map(|s| s.agent.len()).max().unwrap_or(5).max(5);
+        let model_w = steps
+            .iter()
+            .map(|s| s.model.as_deref().unwrap_or("default").len())
+            .max()
+            .unwrap_or(5)
+            .max(5);
+
+        let div = format!(
+            "  {bar}  {bar2}  {bar3}  {bar4}",
+            bar  = "─".repeat(2),
+            bar2 = "─".repeat(name_w),
+            bar3 = "─".repeat(agent_w),
+            bar4 = "─".repeat(model_w),
+        );
+        eprintln!();
+        eprintln!(
+            "  {:>2}  {:<name_w$}  {:<agent_w$}  {:<model_w$}  Status",
+            "#", "Step", "Agent", "Model",
+            name_w = name_w, agent_w = agent_w, model_w = model_w,
+        );
+        eprintln!("{}", div);
+        for (i, step) in steps.iter().enumerate() {
+            let model_str = step.model.as_deref().unwrap_or("default");
+            let status_str = match &step.status {
+                WorkflowStepStatus::Pending   => "· Pending".to_string(),
+                WorkflowStepStatus::Running   => "▶ Running".to_string(),
+                WorkflowStepStatus::Succeeded => "✓ Done".to_string(),
+                WorkflowStepStatus::Failed { exit_code } => format!("✗ Failed ({})", exit_code),
+                WorkflowStepStatus::Cancelled => "○ Cancelled".to_string(),
+                WorkflowStepStatus::Skipped   => "⊘ Skipped".to_string(),
+            };
+            eprintln!(
+                "  {:>2}  {:<name_w$}  {:<agent_w$}  {:<model_w$}  {}",
+                i + 1, step.name, step.agent, model_str, status_str,
+                name_w = name_w, agent_w = agent_w, model_w = model_w,
+            );
+        }
+        eprintln!("{}", div);
+        eprintln!();
+    }
+
+    fn report_step_interactive_launch(
+        &mut self,
+        _step: &WorkflowStep,
+        agent: &str,
+        _model: Option<&str>,
+    ) {
+        if !stdin_is_tty() {
+            return;
+        }
+        eprintln!();
+        eprintln!("╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║                                                              ║");
+        eprintln!("║     ╦╔╗╔╔╦╗╔═╗╦═╗╔═╗╔═╗╔╦╗╦╦  ╦╔═╗  ╔╦╗╔═╗╔╦╗╔═╗        ║");
+        eprintln!("║     ║║║║ ║ ║╣ ╠╦╝╠═╣║   ║ ║╚╗╔╝║╣   ║║║║ ║ ║║║╣         ║");
+        eprintln!("║     ╩╝╚╝ ╩ ╚═╝╩╚═╩ ╩╚═╝ ╩ ╩ ╚╝ ╚═╝  ╩ ╩╚═╝═╩╝╚═╝       ║");
+        eprintln!("║                                                              ║");
+        let label = format!("║  Agent '{}' is launching in INTERACTIVE mode.", agent);
+        let pad = 64usize.saturating_sub(label.chars().count() + 1);
+        eprintln!("{}{}║", label, " ".repeat(pad));
+        eprintln!("║  You will need to quit the agent (Ctrl+C or exit)            ║");
+        eprintln!("║  when its work is complete.                                  ║");
+        eprintln!("║                                                              ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝");
+        eprintln!();
+    }
 }

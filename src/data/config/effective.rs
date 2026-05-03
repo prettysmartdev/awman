@@ -69,6 +69,11 @@ impl EffectiveConfig {
         &self.global
     }
 
+    /// Resolve the model override (flag only; no repo/global level for model).
+    pub fn model(&self) -> Option<String> {
+        self.flags.model.clone()
+    }
+
     /// Resolve the agent name (flag > repo.agent > global.default_agent).
     pub fn agent(&self) -> Option<String> {
         if let Some(a) = self.flags.agent.as_deref() {

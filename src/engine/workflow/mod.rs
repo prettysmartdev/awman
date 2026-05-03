@@ -21,7 +21,7 @@ use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome,
-    WorkflowOutcome, WorkflowStepStatus, YoloTickOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -191,12 +191,16 @@ impl WorkflowEngine {
     pub async fn run_to_completion(&mut self) -> Result<WorkflowOutcome, EngineError> {
         loop {
             if self.state.is_complete() {
+                let progress = self.workflow_progress_info();
+                self.frontend.report_workflow_progress(&progress);
                 let outcome = WorkflowOutcome::Completed;
                 self.frontend.report_workflow_completed(&outcome);
                 return Ok(outcome);
             }
             let outcome = self.step_once().await?;
             if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
+                let progress = self.workflow_progress_info();
+                self.frontend.report_workflow_progress(&progress);
                 let final_outcome = WorkflowOutcome::Failed {
                     last_step: outcome.step_name,
                     exit_code,
@@ -206,6 +210,10 @@ impl WorkflowEngine {
             }
             // Ask the user what to do next when there are remaining steps.
             if !self.state.is_complete() {
+                // Emit the progress table before yolo countdown or user prompt.
+                let progress = self.workflow_progress_info();
+                self.frontend.report_workflow_progress(&progress);
+
                 // In yolo mode, replace the interactive prompt with a 60-second
                 // countdown that auto-advances unless the user cancels.
                 if self.yolo {
@@ -365,6 +373,17 @@ impl WorkflowEngine {
             git_root: self.session.git_root().to_path_buf(),
             session_id: self.session.id(),
         };
+
+        // Emit the workflow progress table (step still Pending) so the user
+        // sees the full picture before the container launches.
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        // Emit the interactive-launch notice so the CLI can print the banner.
+        self.frontend.report_step_interactive_launch(
+            &step,
+            resolved_agent.as_str(),
+            resolved_model.as_deref(),
+        );
 
         // Mark running and launch.
         self.state.set_status(
@@ -564,6 +583,28 @@ impl WorkflowEngine {
             })
     }
 
+    /// Build a per-step progress snapshot for `report_workflow_progress`.
+    fn workflow_progress_info(&self) -> Vec<WorkflowStepProgressInfo> {
+        use crate::data::workflow_state::StepState;
+        self.workflow.steps.iter().map(|step| {
+            let agent = self.resolve_agent(step)
+                .map(|a| a.as_str().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            let model = self.resolve_model(step);
+            let status = match self.state.status_of(&step.name) {
+                None | Some(StepState::Pending) => WorkflowStepStatus::Pending,
+                Some(StepState::Running { .. }) => WorkflowStepStatus::Running,
+                Some(StepState::Succeeded) => WorkflowStepStatus::Succeeded,
+                Some(StepState::Failed { exit_code, .. }) => {
+                    WorkflowStepStatus::Failed { exit_code: *exit_code }
+                }
+                Some(StepState::Cancelled) => WorkflowStepStatus::Cancelled,
+                Some(StepState::Skipped) => WorkflowStepStatus::Skipped,
+            };
+            WorkflowStepProgressInfo { name: step.name.clone(), agent, model, status }
+        }).collect()
+    }
+
     fn resolve_agent(&self, step: &WorkflowStep) -> Result<AgentName, EngineError> {
         if let Some(name) = step.agent.as_deref() {
             return AgentName::new(name).map_err(EngineError::Data);
@@ -583,7 +624,10 @@ impl WorkflowEngine {
         if let Some(m) = step.model.as_deref() {
             return Some(m.to_string());
         }
-        self.workflow.model.clone()
+        if let Some(m) = self.workflow.model.as_ref() {
+            return Some(m.clone());
+        }
+        self.effective_config.model()
     }
 
     fn persist(&self) -> Result<(), EngineError> {

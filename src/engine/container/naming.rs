@@ -4,12 +4,12 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Generate an ephemeral container name: `amux-<pid>-<unix-nanos>`.
+/// Generate an ephemeral container name: `amux-<pid>-<subsec-nanos>`.
 pub fn generate_container_name() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     format!("amux-{pid}-{nanos}")
 }

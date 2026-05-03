@@ -81,12 +81,26 @@ impl ContainerBackend for AppleBackend {
                 .or_else(|| row.get("labels"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let row_name = row
-                .get("Names")
-                .or_else(|| row.get("Name"))
-                .or_else(|| row.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            // Apple `container list` outputs Names as a JSON array ["name"],
+            // not a string. Handle both array and string forms.
+            let row_name = {
+                let val = row.get("Names")
+                    .or_else(|| row.get("Name"))
+                    .or_else(|| row.get("name"));
+                match val {
+                    Some(v) if v.is_array() => v.as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.trim_start_matches('/'))
+                        .unwrap_or_default()
+                        .to_string(),
+                    Some(v) => v.as_str()
+                        .map(|s| s.trim_start_matches('/'))
+                        .unwrap_or_default()
+                        .to_string(),
+                    None => String::new(),
+                }
+            };
             if !labels.contains("amux")
                 && !row_name.starts_with("amux-")
                 && !row_name.contains("nanoclaw")
@@ -98,10 +112,11 @@ impl ContainerBackend for AppleBackend {
                 .get("ID")
                 .or_else(|| row.get("Id"))
                 .or_else(|| row.get("id"))
+                .or_else(|| row.get("ContainerID"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let name = row_name.to_string();
+            let name = row_name;
             let image_tag = row
                 .get("Image")
                 .or_else(|| row.get("image"))

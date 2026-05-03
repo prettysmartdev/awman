@@ -9,7 +9,7 @@ use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput,
-    WorkflowOutcome, WorkflowStepStatus, YoloTickOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 
 /// Per-workflow frontend the engine uses for every Q&A and status report.
@@ -50,4 +50,20 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError>;
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome);
+
+    /// Called by the engine before each step runs and before any yolo countdown
+    /// or user-input prompt. The engine controls the call ordering; the frontend
+    /// renders the table. Default implementation is a no-op (e.g. for tests).
+    fn report_workflow_progress(&mut self, _steps: &[WorkflowStepProgressInfo]) {}
+
+    /// Called by the engine after resolving the step's agent/model but before
+    /// the container launches. When stdin is a TTY the CLI frontend prints the
+    /// interactive-mode ASCII banner. Default implementation is a no-op.
+    fn report_step_interactive_launch(
+        &mut self,
+        _step: &WorkflowStep,
+        _agent: &str,
+        _model: Option<&str>,
+    ) {
+    }
 }

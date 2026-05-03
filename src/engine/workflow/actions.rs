@@ -113,3 +113,15 @@ pub struct ResumeMismatch {
 pub struct YoloTick {
     pub remaining: Duration,
 }
+
+/// Per-step snapshot used by `WorkflowFrontend::report_workflow_progress`.
+/// The engine pre-resolves agent/model so the frontend doesn't need to.
+#[derive(Debug, Clone)]
+pub struct WorkflowStepProgressInfo {
+    pub name: String,
+    /// Resolved agent name (step > workflow > config fallback, or "?" on error).
+    pub agent: String,
+    /// Resolved model, if any.
+    pub model: Option<String>,
+    pub status: WorkflowStepStatus,
+}

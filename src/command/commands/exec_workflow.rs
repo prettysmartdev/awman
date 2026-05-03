@@ -26,7 +26,7 @@ use crate::engine::error::EngineError;
 use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
-    WorkflowStepStatus, YoloTickOutcome,
+    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -160,6 +160,19 @@ impl WorkflowFrontend for WorkflowProxy {
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         self.0.lock().unwrap().report_workflow_completed(outcome);
     }
+
+    fn report_workflow_progress(&mut self, steps: &[WorkflowStepProgressInfo]) {
+        self.0.lock().unwrap().report_workflow_progress(steps);
+    }
+
+    fn report_step_interactive_launch(
+        &mut self,
+        step: &WorkflowStep,
+        agent: &str,
+        model: Option<&str>,
+    ) {
+        self.0.lock().unwrap().report_step_interactive_launch(step, agent, model);
+    }
 }
 
 // ─── ContainerFrontendProxy ──────────────────────────────────────────────────
@@ -266,7 +279,15 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allowed_tools: vec![],
             disallowed_tools: vec![],
-            initial_prompt: Some(substitution.rendered),
+            // In interactive mode the agent runs with a PTY; the user
+            // supervises and interacts directly. The step prompt is shown in
+            // the progress table and interactive banner so the user knows
+            // the task. Only pipe the prompt in non-interactive mode.
+            initial_prompt: if self.flags.non_interactive {
+                Some(substitution.rendered)
+            } else {
+                None
+            },
             allow_docker: self.flags.allow_docker,
             mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
