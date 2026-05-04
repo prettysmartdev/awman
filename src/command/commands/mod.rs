@@ -182,17 +182,9 @@ fn parse_dir_overlay_args(
         Some("ro") => OverlayPermission::ReadOnly,
         _ => OverlayPermission::ReadWrite,
     };
-    // Expand ~ in host path.
-    let host_expanded = if host.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            let rest = host.strip_prefix("~/").unwrap_or(&host[1..]);
-            home.join(rest).to_string_lossy().to_string()
-        } else {
-            host.to_string()
-        }
-    } else {
-        host.to_string()
-    };
+    let host_expanded = crate::data::fs::OverlayPathResolver::expand_tilde(host)
+        .to_string_lossy()
+        .into_owned();
     Ok(DirectorySpec {
         host: host_expanded,
         container: container.to_string(),

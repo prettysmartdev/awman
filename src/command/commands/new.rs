@@ -10,6 +10,7 @@ use crate::command::commands::implement_prompts::{
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::fs::{SkillDirs, WorkflowDirs};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::ContainerOption;
 use crate::engine::message::UserMessageSink;
@@ -161,13 +162,12 @@ impl Command for NewCommand {
                 } else {
                     None
                 };
+                let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
+                let workflow_dirs = WorkflowDirs::from_process_env(git_root)?;
                 let dir = if f.global {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".amux")
-                        .join("workflows")
+                    workflow_dirs.global_dir()
                 } else {
-                    session.as_ref().unwrap().git_root().join("aspec").join("workflows")
+                    workflow_dirs.repo_dir().unwrap()
                 };
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join(format!("{name}.{extension}"));
@@ -239,14 +239,12 @@ impl Command for NewCommand {
                 } else {
                     None
                 };
+                let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
+                let skill_dirs = SkillDirs::from_process_env(git_root)?;
                 let dir = if f.global {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".amux")
-                        .join("skills")
-                        .join(&name)
+                    skill_dirs.global_dir().join(&name)
                 } else {
-                    session.as_ref().unwrap().git_root().join("aspec").join("skills").join(&name)
+                    skill_dirs.repo_dir().unwrap().join(&name)
                 };
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join("SKILL.md");

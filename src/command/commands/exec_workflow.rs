@@ -572,9 +572,7 @@ fn parse_work_item_number(s: &str) -> Option<u32> {
 /// config's `workItems.dir` setting; falls back to `<git_root>/aspec/work-items/`.
 fn find_work_item_file(git_root: &std::path::Path, number: u32) -> Option<std::path::PathBuf> {
     let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root).unwrap_or_default();
-    let dir = repo_cfg
-        .work_items_dir(git_root)
-        .unwrap_or_else(|| git_root.join("aspec").join("work-items"));
+    let dir = repo_cfg.work_items_dir_or_default(git_root);
     let prefix = format!("{:04}-", number);
     std::fs::read_dir(&dir)
         .ok()?

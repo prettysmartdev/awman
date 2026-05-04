@@ -180,6 +180,18 @@ impl RepoConfig {
         }
     }
 
+    /// Resolve the work items directory, falling back to `<git_root>/aspec/work-items/`.
+    pub fn work_items_dir_or_default(&self, git_root: &Path) -> PathBuf {
+        self.work_items_dir(git_root)
+            .unwrap_or_else(|| git_root.join("aspec").join("work-items"))
+    }
+
+    /// Resolve the work item template path, falling back to `<work_items_dir>/0000-template.md`.
+    pub fn work_items_template_or_default(&self, git_root: &Path) -> PathBuf {
+        self.work_items_template(git_root)
+            .unwrap_or_else(|| self.work_items_dir_or_default(git_root).join("0000-template.md"))
+    }
+
     /// Replace the `workItems` config block. The chained `save(git_root)` call
     /// persists the change. Pass `None` to clear the block entirely.
     pub fn set_work_items_config(&mut self, cfg: Option<WorkItemsConfig>) {

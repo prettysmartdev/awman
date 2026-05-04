@@ -281,7 +281,25 @@ impl ContainerInstance for AppleContainerInstance {
 
         let mut cmd = Command::new("container");
         cmd.args(&argv);
-        if interactive && seeded.is_none() {
+        if interactive {
+            // Interactive: open /dev/tty directly so Apple Containers gets a
+            // fresh terminal fd for PTY setup. After CLI prompts have consumed
+            // buffered reads on fd 0, inheriting stdin can fail with ENOTTY
+            // (NSPOSIXErrorDomain Code=25 "Inappropriate ioctl for device")
+            // because Apple Containers calls ioctl(TIOCGWINSZ) on the fd.
+            // /dev/tty always refers to the controlling terminal and satisfies
+            // all PTY-related ioctls.
+            #[cfg(unix)]
+            {
+                let tty_stdin = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/tty")
+                    .map(std::process::Stdio::from)
+                    .unwrap_or_else(|_| Stdio::inherit());
+                cmd.stdin(tty_stdin);
+            }
+            #[cfg(not(unix))]
             cmd.stdin(Stdio::inherit());
             cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::inherit());

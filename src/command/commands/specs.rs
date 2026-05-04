@@ -183,8 +183,7 @@ impl Command for SpecsCommand {
                 let git_root = session.git_root().to_path_buf();
                 let work_items_dir = session
                     .repo_config()
-                    .work_items_dir(&git_root)
-                    .unwrap_or_else(|| git_root.join("aspec").join("work-items"));
+                    .work_items_dir_or_default(&git_root);
                 // Look up the file for the requested work-item number.
                 let n: u32 = f.work_item.trim_start_matches('0').parse().unwrap_or(0);
                 let prefix = format!("{:04}-", n);
@@ -259,12 +258,10 @@ pub(crate) async fn create_new_spec(
     let git_root = session.git_root().to_path_buf();
     let work_items_dir = session
         .repo_config()
-        .work_items_dir(&git_root)
-        .unwrap_or_else(|| git_root.join("aspec").join("work-items"));
+        .work_items_dir_or_default(&git_root);
     let template_path = session
         .repo_config()
-        .work_items_template(&git_root)
-        .unwrap_or_else(|| work_items_dir.join("0000-template.md"));
+        .work_items_template_or_default(&git_root);
 
     if !template_path.exists() {
         return Err(CommandError::SpecTemplateMissing {

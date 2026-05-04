@@ -8,6 +8,7 @@ use crate::command::commands::chat::open_session_for_cwd;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::engine::message::UserMessageSink;
 
 /// Typed enum of every asset the `download` command knows how to fetch.
@@ -87,7 +88,7 @@ impl Command for DownloadCommand {
         let outcome = match parsed {
             DownloadAsset::AspecTarball => {
                 let session = open_session_for_cwd(&self.engines)?;
-                let dest = session.git_root().join("aspec");
+                let dest = RepoDockerfilePaths::new(session.git_root()).aspec_root();
                 let bytes = crate::data::network::download_aspec_tarball()
                     .await
                     .map_err(|e| CommandError::Other(e.to_string()))?;
@@ -102,10 +103,7 @@ impl Command for DownloadCommand {
             }
             DownloadAsset::AgentDockerfile { agent } => {
                 let session = open_session_for_cwd(&self.engines)?;
-                let dest = session
-                    .git_root()
-                    .join(".amux")
-                    .join(format!("Dockerfile.{agent}"));
+                let dest = RepoDockerfilePaths::new(session.git_root()).agent_dockerfile(&agent);
                 let project_tag = crate::data::image_tags::project_image_tag(session.git_root());
                 crate::engine::agent::download::download_agent_dockerfile(&agent, &dest, &project_tag)
                     .await

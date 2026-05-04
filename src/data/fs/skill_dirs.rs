@@ -9,7 +9,7 @@ use crate::data::error::DataError;
 /// Directory name for global skills under the global home.
 pub const GLOBAL_SKILLS_SUBDIR: &str = "skills";
 
-/// Directory name for per-repo skills under `<git_root>/.amux/`.
+/// Directory name for per-repo skills under `<git_root>/.claude/`.
 pub const REPO_SKILLS_SUBDIR: &str = "skills";
 
 /// Resolves global and per-repo skill directories.
@@ -44,12 +44,12 @@ impl SkillDirs {
     pub fn repo_dir(&self) -> Option<PathBuf> {
         self.git_root
             .as_ref()
-            .map(|r| r.join(".amux").join(REPO_SKILLS_SUBDIR))
+            .map(|r| r.join(".claude").join(REPO_SKILLS_SUBDIR))
     }
 
     /// Path to the per-repo skills directory, given an explicit git root.
     pub fn repo_dir_for(git_root: &Path) -> PathBuf {
-        git_root.join(".amux").join(REPO_SKILLS_SUBDIR)
+        git_root.join(".claude").join(REPO_SKILLS_SUBDIR)
     }
 
     /// Create the global skills directory on disk, if missing.

@@ -30,6 +30,11 @@ impl RepoDockerfilePaths {
         self.git_root.join(".amux").join(format!("Dockerfile.{agent}"))
     }
 
+    /// `<git_root>/aspec/` — spec and work-items directory.
+    pub fn aspec_root(&self) -> PathBuf {
+        self.git_root.join("aspec")
+    }
+
     /// `<git_root>/.amux/` — directory holding agent dockerfiles and engine state.
     pub fn amux_dir(&self) -> PathBuf {
         self.git_root.join(".amux")
