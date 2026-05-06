@@ -24,7 +24,7 @@ use crate::data::session::Session;
 
 mod command_frontend;
 mod output;
-mod per_command;
+pub(crate) mod per_command;
 mod user_message;
 
 pub use command_frontend::{command_path_from_matches, CliFrontend};

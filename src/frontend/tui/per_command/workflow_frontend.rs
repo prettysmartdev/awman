@@ -112,6 +112,22 @@ impl WorkflowFrontend for TuiCommandFrontend {
         })
     }
 
+    fn report_step_interactive_launch(
+        &mut self,
+        _step: &WorkflowStep,
+        agent: &str,
+        _model: Option<&str>,
+    ) {
+        // Signal the TUI event loop to reset the vt100 parser for the new step.
+        self.pty_reset_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Update container agent display name for the new step.
+        self.messages.info(format!(
+            "Launching agent '{}' in new container...",
+            agent
+        ));
+    }
+
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
         self.messages
             .info(format!("workflow step '{}': {:?}", step.name, status));
@@ -297,6 +313,9 @@ mod tests {
         };
         let workflow_view = std::sync::Arc::new(std::sync::Mutex::new(None));
         let yolo_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let pty_reset_flag = std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        );
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -305,6 +324,7 @@ mod tests {
             container_io,
             workflow_view,
             yolo_state,
+            pty_reset_flag,
         );
         (frontend, req_rx, resp_tx)
     }

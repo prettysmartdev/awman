@@ -79,9 +79,15 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     render_command_box(app, chunks[5], frame);
     render_suggestion_row(app, chunks[6], frame);
 
-    // Container maximized overlay (rendered on top of all chrome).
+    // Container maximized overlay (rendered on top of execution window only,
+    // not over the workflow strip or bottom chrome).
     if container_state == ContainerWindowState::Maximized {
-        container_view::render_container_maximized(app.active_tab_mut(), area, frame);
+        container_view::render_container_maximized(
+            app.active_tab_mut(),
+            area,
+            workflow_height,
+            frame,
+        );
     }
 
     // Active dialog (rendered on top of everything).
@@ -487,8 +493,12 @@ fn render_command_box(app: &App, area: Rect, frame: &mut Frame) {
     let line = Line::from(vec![prefix, Span::raw(display_text)]);
     frame.render_widget(Paragraph::new(line), inner);
 
-    if focused {
-        let cursor_x = area.x + 1 + 2 + app.command_input.cursor as u16;
+    if focused && app.active_dialog.is_none() {
+        let text_before_cursor = &app.command_input.text[..app.command_input.cursor];
+        let display_before = unicode_width::UnicodeWidthStr::width(
+            text_before_cursor.replace('\n', "\u{21b5}").as_str(),
+        );
+        let cursor_x = area.x + 1 + 2 + display_before as u16;
         let cursor_y = area.y + 1;
         if cursor_x < area.x + area.width.saturating_sub(1) {
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
@@ -543,7 +553,7 @@ fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
 fn status_level_color(level: &crate::engine::message::MessageLevel) -> Color {
     use crate::engine::message::MessageLevel;
     match level {
-        MessageLevel::Info => Color::DarkGray,
+        MessageLevel::Info => Color::White,
         MessageLevel::Warning => Color::Yellow,
         MessageLevel::Error => Color::Red,
         MessageLevel::Success => Color::Green,
@@ -583,8 +593,16 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             let dialog_area = dialogs::centered_fixed(60, 7, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
-            let text = format!("{prompt}\n> {}", editor.text);
+            let display_text: String = editor.text.chars().take(inner.width.saturating_sub(3) as usize).collect();
+            let text = format!("{prompt}\n> {}", display_text);
             frame.render_widget(Paragraph::new(text), inner);
+            let text_before_cursor = &editor.text[..editor.cursor];
+            let cursor_display_w = unicode_width::UnicodeWidthStr::width(text_before_cursor) as u16;
+            let cursor_x = inner.x + 2 + cursor_display_w.min(inner.width.saturating_sub(3));
+            let cursor_y = inner.y + 1;
+            if cursor_x < inner.x + inner.width {
+                frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+            }
         }
         dialogs::Dialog::MultilineInput {
             title,
@@ -599,6 +617,15 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 Paragraph::new(text).wrap(Wrap { trim: false }),
                 inner,
             );
+            let lines_before: Vec<&str> = editor.text[..editor.cursor].split('\n').collect();
+            let last_line = lines_before.last().unwrap_or(&"");
+            let cursor_display_w = unicode_width::UnicodeWidthStr::width(*last_line) as u16;
+            let prompt_lines = prompt.lines().count() as u16 + 1;
+            let cursor_x = inner.x + cursor_display_w.min(inner.width.saturating_sub(1));
+            let cursor_y = inner.y + prompt_lines + (lines_before.len() as u16).saturating_sub(1);
+            if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
+                frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+            }
         }
         dialogs::Dialog::ListPicker {
             title,
@@ -639,8 +666,6 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             frame.render_widget(Paragraph::new(lines), inner);
         }
         dialogs::Dialog::WorkflowControlBoard(state) => {
-            // Auto-grow the dialog to fit the optional unavailable-reason
-            // strings (each takes one extra row when present).
             let extra_reasons = [
                 state.continue_unavailable_reason.is_some(),
                 state.cancel_to_previous_unavailable_reason.is_some(),
@@ -649,59 +674,94 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             .iter()
             .filter(|x| **x)
             .count() as u16;
-            let dialog_area = dialogs::centered_fixed(58, 14 + extra_reasons, area);
+            let base_height: u16 = if state.can_finish { 15 } else { 13 };
+            let dialog_area =
+                dialogs::centered_fixed(52, base_height + extra_reasons, area);
             let inner = dialogs::render_dialog_frame(
                 "Workflow Control",
                 Color::Yellow,
                 dialog_area,
                 frame,
             );
-            let mut lines = vec![
-                Line::from(format!("  Step: {}", state.step_name)),
+
+            let arrow_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+            let label_style = Style::default().fg(Color::White);
+            let dimmed_style = Style::default().fg(Color::DarkGray);
+            let step_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+            let cancel_style = Style::default().fg(Color::Red);
+
+            let (right_arrow_style, right_label_style) = if state.can_launch_next {
+                (arrow_style, label_style)
+            } else {
+                (dimmed_style, dimmed_style)
+            };
+            let (down_arrow_style, down_label_style) = if state.can_continue_current {
+                (arrow_style, label_style)
+            } else {
+                (dimmed_style, dimmed_style)
+            };
+            let (left_arrow_style, left_label_style) = if state.can_go_back {
+                (arrow_style, label_style)
+            } else {
+                (dimmed_style, dimmed_style)
+            };
+
+            let mut lines: Vec<Line> = vec![
+                Line::from(vec![
+                    Span::raw(" Step: "),
+                    Span::styled(&state.step_name, step_style),
+                ]),
                 Line::from(""),
+                // ↑ Restart (top of diamond)
+                Line::from(vec![
+                    Span::raw("         "),
+                    Span::styled("\u{2191}", arrow_style),
+                    Span::styled(" Restart current step", label_style),
+                ]),
+                Line::from(""),
+                // ← Cancel to prev    → Next: new container
+                Line::from(vec![
+                    Span::styled("\u{2190}", left_arrow_style),
+                    Span::styled(" Cancel to prev", left_label_style),
+                    Span::raw("   "),
+                    Span::styled("\u{2192}", right_arrow_style),
+                    Span::styled(" Next: new container", right_label_style),
+                ]),
+                Line::from(""),
+                // ↓ Next: same container (bottom of diamond)
+                Line::from(vec![
+                    Span::raw("         "),
+                    Span::styled("\u{2193}", down_arrow_style),
+                    Span::styled(" Next: same container", down_label_style),
+                ]),
             ];
-            let action_line = |key: &str, label: &str, enabled: bool| -> Line {
-                let style = if enabled {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                Line::from(Span::styled(format!("  [{key}] {label}"), style))
-            };
-            let reason_line = |reason: &Option<String>| -> Option<Line> {
-                reason.as_ref().map(|r| {
-                    Line::from(Span::styled(
-                        format!("        \u{2937} {r}"),
-                        Style::default().fg(Color::DarkGray),
-                    ))
-                })
-            };
-            lines.push(action_line("\u{2192}", "Advance to next step", state.can_launch_next));
-            lines.push(action_line(
-                "\u{2193}",
-                "Continue in current container",
-                state.can_continue_current,
-            ));
-            if let Some(r) = reason_line(&state.continue_unavailable_reason) {
-                lines.push(r);
+            if let Some(ref reason) = state.continue_unavailable_reason {
+                lines.push(Line::from(Span::styled(
+                    format!("           {reason}"),
+                    dimmed_style,
+                )));
+            } else {
+                lines.push(Line::from(""));
             }
-            lines.push(action_line("\u{2191}", "Restart current step", state.can_restart));
-            lines.push(action_line(
-                "\u{2190}",
-                "Go back to previous step",
-                state.can_go_back,
-            ));
-            if let Some(r) = reason_line(&state.cancel_to_previous_unavailable_reason) {
-                lines.push(r);
-            }
-            lines.push(action_line("Ctrl+Enter", "Finish workflow", state.can_finish));
-            if let Some(r) = reason_line(&state.finish_workflow_unavailable_reason) {
-                lines.push(r);
+            lines.push(Line::from(vec![
+                Span::raw("         "),
+                Span::styled("^C", cancel_style),
+                Span::styled(" Cancel workflow execution", cancel_style),
+            ]));
+            if state.can_finish {
+                lines.push(Line::from(""));
+                let finish_style =
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Ctrl+Enter", finish_style),
+                    Span::styled(" Finish workflow", finish_style),
+                ]));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  [d] Disable auto-advance   [a] Abort   [Esc] Pause",
-                Style::default().fg(Color::DarkGray),
+                dimmed_style,
             )));
             frame.render_widget(Paragraph::new(lines), inner);
         }

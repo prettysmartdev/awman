@@ -62,15 +62,30 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
         session_arc,
     );
 
-    // Auto-spawn `ready` at startup to check the environment.
-    app.spawn_command(
-        "ready",
-        ParsedCommandBoxInput {
-            path: vec!["ready".into()],
-            flags: Default::default(),
-            arguments: Default::default(),
-        },
-    );
+    // Auto-spawn startup command: `ready` for git repos, `status --watch`
+    // for non-git directories.
+    let is_git = app.active_tab().session.git_root().join(".git").exists();
+    if is_git {
+        app.spawn_command(
+            "ready",
+            ParsedCommandBoxInput {
+                path: vec!["ready".into()],
+                flags: Default::default(),
+                arguments: Default::default(),
+            },
+        );
+    } else {
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("watch".to_string(), crate::command::dispatch::parsed_input::FlagValue::Bool(true));
+        app.spawn_command(
+            "status --watch",
+            ParsedCommandBoxInput {
+                path: vec!["status".into()],
+                flags,
+                arguments: Default::default(),
+            },
+        );
+    }
 
     match run_event_loop(&mut app) {
         Ok(()) => ExitCode::from(0),
@@ -184,6 +199,12 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     match action {
         // ── Global actions ────────────────────────────────────────────
         Action::OpenNewTabDialog => {
+            // Ctrl-T while CloseTabConfirm is open closes just this tab.
+            if matches!(app.active_dialog, Some(Dialog::CloseTabConfirm)) {
+                app.active_dialog = None;
+                app.close_active_tab();
+                return;
+            }
             let cwd = app
                 .active_tab()
                 .session
@@ -204,6 +225,18 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         Action::PreviousTab => app.switch_to_prev_tab(),
         Action::NextTab => app.switch_to_next_tab(),
         Action::CloseTabOrQuit => {
+            // Second Ctrl-C while QuitConfirm or CloseTabConfirm is open
+            // confirms the quit action immediately.
+            if matches!(app.active_dialog, Some(Dialog::QuitConfirm)) {
+                app.active_dialog = None;
+                app.should_quit = true;
+                return;
+            }
+            if matches!(app.active_dialog, Some(Dialog::CloseTabConfirm)) {
+                app.active_dialog = None;
+                app.should_quit = true;
+                return;
+            }
             if app.active_dialog.is_some() {
                 return;
             }
@@ -434,13 +467,15 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::ScrollUp => {
             let tab = app.active_tab_mut();
             if tab.container_window_state == ContainerWindowState::Maximized {
-                // Probe the actual scrollback depth so we don't run past it.
+                // vt100's visible_rows() overflows when scrollback_offset >
+                // screen rows, so cap to min(scrollback_depth, rows).
                 let max_scroll = {
                     let parser = &mut tab.vt100_parser;
+                    let rows = parser.screen().size().0 as usize;
                     parser.set_scrollback(usize::MAX);
-                    let m = parser.screen().scrollback();
+                    let depth = parser.screen().scrollback();
                     parser.set_scrollback(0);
-                    m
+                    depth.min(rows)
                 };
                 tab.container_scroll_offset =
                     (tab.container_scroll_offset + 5).min(max_scroll);
@@ -533,8 +568,10 @@ fn capture_vt100_snapshot(
     parser: &mut vt100::Parser,
     scroll_offset: usize,
 ) -> Vec<Vec<String>> {
-    if scroll_offset > 0 {
-        parser.set_scrollback(scroll_offset);
+    // Cap to screen rows: vt100's visible_rows() panics if offset > rows.
+    let capped = scroll_offset.min(parser.screen().size().0 as usize);
+    if capped > 0 {
+        parser.set_scrollback(capped);
     }
     let snapshot = {
         let screen = parser.screen();
@@ -555,7 +592,7 @@ fn capture_vt100_snapshot(
             })
             .collect()
     };
-    if scroll_offset > 0 {
+    if capped > 0 {
         parser.set_scrollback(0);
     }
     snapshot
@@ -625,11 +662,14 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
 }
 
 /// Compute the vt100 grid size that fits inside the container overlay,
-/// accounting for the 95% sizing and the 2-cell border subtraction. Mirrors
-/// `oldsrc/tui/render.rs::calculate_container_inner_size`.
+/// accounting for the 95% sizing within the execution window area and the
+/// 2-cell border subtraction. The container window lives between the tab
+/// bar (3 rows) and the bottom chrome (5 rows: status bar + command box +
+/// suggestion row).
 pub fn compute_container_inner_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
+    let exec_height = term_rows.saturating_sub(8); // 3 top + 5 bottom
     let outer_cols = ((term_cols as u32 * 95 / 100) as u16).max(10);
-    let outer_rows = ((term_rows as u32 * 95 / 100) as u16).max(5);
+    let outer_rows = ((exec_height as u32 * 95 / 100) as u16).max(5);
     (outer_cols.saturating_sub(2), outer_rows.saturating_sub(2))
 }
 
@@ -893,30 +933,14 @@ fn handle_dialog_char(app: &mut App, c: char) {
 
     match app.active_dialog.as_ref() {
         // ── Always UI-originated ─────────────────────────────────────
-        Some(Dialog::QuitConfirm) => match c {
-            'y' => {
-                app.active_dialog = None;
-                app.should_quit = true;
-            }
-            'n' => {
-                app.active_dialog = None;
-            }
-            _ => {}
-        },
-        Some(Dialog::CloseTabConfirm) => match c {
-            'q' => {
-                app.active_dialog = None;
-                app.should_quit = true;
-            }
-            'c' => {
-                app.active_dialog = None;
-                app.close_active_tab();
-            }
-            'n' => {
-                app.active_dialog = None;
-            }
-            _ => {}
-        },
+        Some(Dialog::QuitConfirm) => {
+            // Only Ctrl-C (handled via Action::CloseTabOrQuit) or Esc
+            // (handled via Action::DismissDialog) are valid here. Ignore
+            // all regular char keys.
+        }
+        Some(Dialog::CloseTabConfirm) => {
+            // Only Ctrl-C, Ctrl-T, or Esc are valid. Ignore regular chars.
+        }
         Some(Dialog::WorkflowCancelConfirm) => match c {
             'y' | 'Y' => {
                 // Tell the engine to abort: the workflow_frontend's
@@ -1044,19 +1068,55 @@ fn handle_new_tab_path(app: &mut App, path: &str) {
         return;
     }
 
-    let resolver = crate::data::session::StaticGitRootResolver::new(&dir);
-    match crate::data::session::Session::open(
-        dir,
-        &resolver,
-        crate::data::session::SessionOpenOptions::default(),
-    ) {
-        Ok(session) => {
-            let idx = app.add_tab(session);
-            app.active_tab = idx;
+    let session = {
+        let resolver = crate::data::session::StaticGitRootResolver::new(&dir);
+        match crate::data::session::Session::open(
+            dir.clone(),
+            &resolver,
+            crate::data::session::SessionOpenOptions::default(),
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                // Fallback for non-git directories: use dir as git root.
+                match crate::data::session::Session::open_at_git_root(
+                    dir.clone(),
+                    dir.clone(),
+                    crate::data::session::SessionOpenOptions::default(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        app.status_bar.text = format!("Failed to open session: {e}");
+                        return;
+                    }
+                }
+            }
         }
-        Err(e) => {
-            app.status_bar.text = format!("Failed to open session: {e}");
-        }
+    };
+
+    let is_git = session.git_root().join(".git").exists();
+    let idx = app.add_tab(session);
+    app.active_tab = idx;
+
+    if is_git {
+        app.spawn_command(
+            "ready",
+            crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
+                path: vec!["ready".into()],
+                flags: Default::default(),
+                arguments: Default::default(),
+            },
+        );
+    } else {
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("watch".to_string(), crate::command::dispatch::parsed_input::FlagValue::Bool(true));
+        app.spawn_command(
+            "status --watch",
+            crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
+                path: vec!["status".into()],
+                flags,
+                arguments: Default::default(),
+            },
+        );
     }
 }
 
@@ -1183,7 +1243,8 @@ mod tests {
     fn quit_confirm_y_sets_should_quit() {
         let mut app = make_app();
         app.active_dialog = Some(Dialog::QuitConfirm);
-        press_char(&mut app, 'y');
+        // Second Ctrl-C while QuitConfirm is open quits
+        press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
         assert!(app.active_dialog.is_none());
     }
@@ -1192,7 +1253,8 @@ mod tests {
     fn quit_confirm_n_dismisses_without_quitting() {
         let mut app = make_app();
         app.active_dialog = Some(Dialog::QuitConfirm);
-        press_char(&mut app, 'n');
+        // Esc dismisses the dialog
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.should_quit);
         assert!(app.active_dialog.is_none());
     }
@@ -1212,7 +1274,8 @@ mod tests {
     fn close_tab_confirm_q_quits_entire_app() {
         let mut app = make_app();
         app.active_dialog = Some(Dialog::CloseTabConfirm);
-        press_char(&mut app, 'q');
+        // Second Ctrl-C while CloseTabConfirm is open quits
+        press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
     }
 
@@ -1221,7 +1284,8 @@ mod tests {
         let mut app = make_app();
         app.tabs.push(Tab::new(make_session()));
         app.active_dialog = Some(Dialog::CloseTabConfirm);
-        press_char(&mut app, 'c');
+        // Ctrl-T closes the tab
+        press_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(app.tabs.len(), 1);
         assert!(!app.should_quit);
     }
@@ -1232,7 +1296,8 @@ mod tests {
         app.tabs.push(Tab::new(make_session()));
         let initial_len = app.tabs.len();
         app.active_dialog = Some(Dialog::CloseTabConfirm);
-        press_char(&mut app, 'n');
+        // Esc cancels the dialog
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.active_dialog.is_none());
         assert_eq!(app.tabs.len(), initial_len);
     }

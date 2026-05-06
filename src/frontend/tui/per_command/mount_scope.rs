@@ -56,6 +56,9 @@ mod tests {
         };
         let workflow_view = std::sync::Arc::new(std::sync::Mutex::new(None));
         let yolo_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let pty_reset_flag = std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        );
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -64,6 +67,7 @@ mod tests {
             container_io,
             workflow_view,
             yolo_state,
+            pty_reset_flag,
         );
         (frontend, req_rx, resp_tx)
     }

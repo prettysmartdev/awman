@@ -16,7 +16,7 @@ use crate::command::error::CommandError;
 use crate::engine::container::frontend::ContainerIo;
 use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
-use crate::frontend::tui::tabs::{SharedWorkflowViewState, SharedYoloState};
+use crate::frontend::tui::tabs::{SharedPtyResetFlag, SharedWorkflowViewState, SharedYoloState};
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
 /// TUI frontend struct. Implements every per-command frontend trait.
@@ -47,6 +47,9 @@ pub struct TuiCommandFrontend {
     /// indicator (avoids the dialog-spam that a per-tick `ask_dialog` would
     /// cause).
     pub(crate) yolo_state: SharedYoloState,
+    /// Shared flag: set to `true` to signal the TUI event loop to reset the
+    /// vt100 parser between workflow steps.
+    pub(crate) pty_reset_flag: SharedPtyResetFlag,
 }
 
 impl TuiCommandFrontend {
@@ -58,6 +61,7 @@ impl TuiCommandFrontend {
         container_io: ContainerIo,
         workflow_view: SharedWorkflowViewState,
         yolo_state: SharedYoloState,
+        pty_reset_flag: SharedPtyResetFlag,
     ) -> Self {
         Self {
             parsed,
@@ -69,6 +73,7 @@ impl TuiCommandFrontend {
             status_log,
             workflow_view,
             yolo_state,
+            pty_reset_flag,
         }
     }
 

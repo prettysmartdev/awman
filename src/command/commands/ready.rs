@@ -7,6 +7,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
+use crate::engine::message::{MessageLevel, UserMessage};
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
 use crate::engine::step_status::StepStatus;
 
@@ -30,6 +31,8 @@ pub struct ReadyOutcome {
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
     pub legacy_migration: StepStatus,
+    /// Per non-default agent image status.
+    pub non_default_agent_images: Vec<(String, StepStatus)>,
     /// `true` when `--json` was passed; controls how the CLI renders the outcome.
     #[serde(skip)]
     pub json_requested: bool,
@@ -49,6 +52,7 @@ impl From<ReadySummary> for ReadyOutcome {
             audit: s.audit,
             image_rebuild: s.image_rebuild,
             legacy_migration: s.legacy_migration,
+            non_default_agent_images: s.non_default_agent_images,
             json_requested: false,
             refresh_requested: false,
         }
@@ -149,8 +153,32 @@ impl Command for ReadyCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let agent = AgentName::new("claude").map_err(CommandError::from)?;
-        let session = open_session()?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "ready: checking environment…".into(),
+        });
+
+        let agent = match AgentName::new("claude") {
+            Ok(a) => a,
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("ready: failed to resolve agent name: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        };
+        let session = match open_session() {
+            Ok(s) => s,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("ready: failed to open session: {e}"),
+                });
+                return Err(e);
+            }
+        };
         let options = ReadyEngineOptions {
             agent,
             refresh: self.flags.refresh,
@@ -160,6 +188,22 @@ impl Command for ReadyCommand {
             non_interactive: self.flags.non_interactive,
             env_passthrough: None,
         };
+
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Checking Docker availability…".into(),
+        });
+
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Checking container runtime…".into(),
+        });
+
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Checking agent image…".into(),
+        });
+
         let mut engine = ReadyEngine::new(
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
@@ -168,14 +212,34 @@ impl Command for ReadyCommand {
             self.engines.agent_engine.clone(),
             options,
         );
-        let summary = engine
-            .run_to_completion(frontend.as_mut())
-            .await
-            .map_err(CommandError::from)?;
+        let summary = match engine.run_to_completion(frontend.as_mut()).await {
+            Ok(s) => s,
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("ready: engine run failed: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        };
         frontend.replay_queued();
         let mut outcome: ReadyOutcome = summary.into();
         outcome.json_requested = self.flags.json;
         outcome.refresh_requested = self.flags.refresh;
+
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "ready: complete — runtime={}, dockerfile={:?}, base_image={:?}, agent_image={:?}, local_agent={:?}",
+                outcome.runtime,
+                outcome.dockerfile,
+                outcome.base_image,
+                outcome.agent_image,
+                outcome.local_agent,
+            ),
+        });
+
         Ok(outcome)
     }
 }

@@ -1,33 +1,17 @@
 # new-amux observed issues
 
-### ISSUE-1
+### TUI
 
-1.1: Calling `new spec` does not ask what kind of work item it should be, and therefore does not replace the type placeholder in the resulting file. Ensure it behaves just like old-amux.
+TUI-1: For the THIRD time now, container stats in the top-right title bar of the container window are not showing any data, only `...`. This is unacceptable, it has been "fixed" several times and still does not work. Think hard, do not take shortcuts, look at the codepaths end-to-end to ensure that container stats in the container window title bar work for every container backend in every scenario and update at a regular interval. Review old-amux and make it work EXACTLY THE SAME WAY. No more fake fixes.
 
-1.2 Passing `--interview` to `new spec` does not ask for the work item's interview prompt. Ensure this works for all the `new *` commands
+TUI-2: The `status --watch` command run in a new tab that is launched in a non-git directory only outputs two lines of status text, does not show the entire status output, and does not continuously update. Look at how this behaved in old-amux and replicate it EXACTLY using the new grand architecture patterns.
 
-1.3 Passing `--interview` to `new spec` results in an agent container with no settings or auth passthrough. Ensure it launches correctly with auth, settings, and interview prompt for all of the `new *` commands
+TUI-3: The `config show` dialog window only shows some titles but no content, no controls, no anything. Port it over identically from old-amux and ensure it's wired correctly into the new grand architecture.
 
-### ISSUE-2
+### Engines
 
-2.1: `exec workflow` does not need to print the workflow status table before AND after the yolo countdown between steps. Just once, before yolo countdown.
+ENG-1: When producing the status table during `ready`, all of the non-default agents can be reported on in a single table row, like `Other agents: done` instead of having a table row per other-agent. If all non-default agents have valid images, just include one row for all of them. If any of the non-default agents have missing images, each agent with a missing image can get a row in the table, like `Maki: missing`. Non-default agents with missing images are NEVER a fatal error and should only produce warnings and a row in the status table. Ensure this is all handled in the ready engine and that both frontend traits render the output correctly.
 
-2.2 the workflow status table isn't very nice looking, make it nicer (proper table formatting):
+### Commands
 
-```
-yolo: auto-advancing to next step...
-
-   #  Step       Agent   Model             Status
-  ──  ─────────  ──────  ────────────────
-   1  implement  claude  claude-opus-4-7   ✓ Done
-   2  tests      claude  default           · Pending
-   3  docs       claude  claude-haiku-4-5  · Pending
-   4  review     claude  claude-opus-4-7   · Pending
-  ──  ─────────  ──────  ────────────────
-  ```
-
-  2.3 when `exec workflow` runs an interactive agent container (i.e. when --non-interactive is NOT passed), no prompt is passed to the agent. It should be authed, set up, interactive, and prompted with the correct prompt for the given workflow step (including work-item template substitutions if applicable.) Ensure workflow step agent containers are properly prompted for both interactive and non-interactive.
-
-  2.4 The user input during the yolo countdown doesn't work, typing n, a, or p and pressing enter just causes the yolo countdown to start printing on a new line and nothing happens. Ensure user input and the "pretty" single-line countdown timer both work
-
-  2.5 Triple check to ensure that all workflow agent containers that are supposed to run in a worktree get mounted correctly to the worktree and not the main repo path. This applies to both --worktree and --yolo when a workflow is run
+COM-1: Whenever a git/worktree pre/post workflow detects a dirty worktree and/or requires a commit message, ensure the engine and/or command code produces BOTH the list of dirty files AND a suggested commit message to the frontend and that the frontends render these correctly so that the user knows which files are dirty and can choose to accept the suggested commit message or delete it anwrite their own. Ensure all the git logic is at the engine/command layers and the frontends are rendering and returning chosen commit messages only via their frontend trait implementations.

@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::message::UserMessageSink;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct StatusCommandFlags {
@@ -107,16 +107,39 @@ impl Command for StatusCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let session = open_session()?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "status: gathering session info…".into(),
+        });
+        let session = match open_session() {
+            Ok(s) => s,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("status: failed to open session: {e}"),
+                });
+                return Err(e);
+            }
+        };
         let mut last_containers: Vec<StatusContainerRow>;
         let mut tick: u32 = 0;
 
         loop {
-            let handles = self
+            let handles = match self
                 .engines
                 .runtime
                 .list_running(&session)
-                .map_err(CommandError::from)?;
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    let err = CommandError::from(e);
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("status: failed to list running containers: {err}"),
+                    });
+                    return Err(err);
+                }
+            };
             let context = frontend.tui_context().cloned();
             let containers: Vec<StatusContainerRow> = handles
                 .into_iter()
@@ -166,6 +189,10 @@ impl Command for StatusCommand {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("status: found {} running container(s)", last_containers.len()),
+        });
         frontend.replay_queued();
         Ok(StatusOutcome {
             containers: last_containers,

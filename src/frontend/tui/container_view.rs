@@ -24,12 +24,27 @@ use crate::frontend::tui::tabs::{format_duration, LastContainerSummary, Tab, Tex
 /// `tab.container_inner_area` so `handle_mouse_event` can translate raw
 /// terminal coords into vt100 cell coords; and temporarily mutates the
 /// vt100 scrollback offset to render the user's chosen scrollback view.
-pub fn render_container_maximized(tab: &mut Tab, outer_area: Rect, frame: &mut Frame) {
-    // 95% of outer area, centered. Same formula as oldsrc.
-    let container_height = (outer_area.height * 95 / 100).max(5);
-    let container_width = (outer_area.width * 95 / 100).max(10);
-    let offset_x = (outer_area.width.saturating_sub(container_width)) / 2;
-    let offset_y = (outer_area.height.saturating_sub(container_height)) / 2;
+///
+/// `workflow_strip_height` is the number of rows occupied by the workflow
+/// strip below the execution window — the container overlay must not
+/// cover it.
+pub fn render_container_maximized(
+    tab: &mut Tab,
+    outer_area: Rect,
+    workflow_strip_height: u16,
+    frame: &mut Frame,
+) {
+    // 95% of the execution window area (between tab bar and command box).
+    // Tab bar = 3 rows at top, status bar + command box + suggestion = 5 rows at bottom.
+    let top_reserved: u16 = 3;
+    let bottom_reserved: u16 = 5 + workflow_strip_height;
+    let exec_height = outer_area.height.saturating_sub(top_reserved + bottom_reserved);
+    let exec_width = outer_area.width;
+
+    let container_height = ((exec_height as u32 * 95 / 100) as u16).max(5);
+    let container_width = ((exec_width as u32 * 95 / 100) as u16).max(10);
+    let offset_x = (exec_width.saturating_sub(container_width)) / 2;
+    let offset_y = top_reserved + (exec_height.saturating_sub(container_height)) / 2;
     let container_area = Rect {
         x: outer_area.x + offset_x,
         y: outer_area.y + offset_y,
@@ -55,15 +70,16 @@ pub fn render_container_maximized(tab: &mut Tab, outer_area: Rect, frame: &mut F
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Green));
 
-    // Scrollback indicator. The vt100 parser caps `set_scrollback` against
-    // the actual scrollback depth; probe the maximum, then restore.
+    // Probe scrollback depth, capping to screen rows to avoid a subtraction
+    // overflow inside vt100's `visible_rows()`.
     let (effective_scroll_offset, max_scrollback) = if tab.container_scroll_offset > 0 {
         let parser = &mut tab.vt100_parser;
-        parser.set_scrollback(tab.container_scroll_offset);
-        let eff = parser.screen().scrollback();
+        let rows = parser.screen().size().0 as usize;
         parser.set_scrollback(usize::MAX);
-        let max = parser.screen().scrollback();
+        let depth = parser.screen().scrollback();
         parser.set_scrollback(0);
+        let max = depth.min(rows);
+        let eff = tab.container_scroll_offset.min(max);
         (eff, max)
     } else {
         (0, 0)

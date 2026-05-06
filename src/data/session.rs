@@ -307,6 +307,22 @@ impl Session {
         Self::open_at_git_root(working_dir, git_root, opts)
     }
 
+    /// Open a session, falling back to using the working directory as the git
+    /// root when git resolution fails. Valid for non-git directories.
+    pub fn open_or_workdir_fallback(
+        working_dir: PathBuf,
+        resolver: &dyn GitRootResolver,
+        opts: SessionOpenOptions,
+    ) -> Result<Self, DataError> {
+        match Self::open(working_dir.clone(), resolver, opts.clone()) {
+            Ok(session) => Ok(session),
+            Err(DataError::GitRootNotFound { .. }) => {
+                Self::open_at_git_root(working_dir.clone(), working_dir, opts)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Open a session with an explicit, pre-resolved git root.
     pub fn open_at_git_root(
         working_dir: PathBuf,

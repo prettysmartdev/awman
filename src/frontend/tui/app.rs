@@ -19,14 +19,14 @@ use crate::frontend::tui::tabs::{ExecutionPhase, Tab};
 use crate::frontend::tui::text_edit::TextEdit;
 
 /// Pull the `--agent` value out of a parsed command box input, falling back
-/// to the command path itself (`chat`, `claws`, `workflow run X`) when the
-/// flag is absent. Used to seed `ContainerInfo.agent_display_name`.
+/// to "Claude" (the default agent) when the flag is absent.
+/// Used to seed `ContainerInfo.agent_display_name`.
 fn agent_name_from_parsed(parsed: &ParsedCommandBoxInput) -> String {
     use crate::command::dispatch::parsed_input::FlagValue;
     if let Some(FlagValue::String(s)) = parsed.flags.get("agent") {
         return s.clone();
     }
-    parsed.path.join(" ")
+    "Claude".to_string()
 }
 
 /// UI focus target.
@@ -60,6 +60,12 @@ pub struct App {
     pub command_dialog_active: bool,
     pub runtime_handle: tokio::runtime::Handle,
     pub session: Arc<RwLock<Session>>,
+    /// Receiver for asynchronous container stats results.
+    pub stats_rx: Option<std::sync::mpsc::Receiver<(usize, crate::engine::container::instance::ContainerStats)>>,
+    /// Sender cloned per stats query — kept alive so the channel stays open.
+    pub stats_tx: std::sync::mpsc::Sender<(usize, crate::engine::container::instance::ContainerStats)>,
+    /// Tracks when the last stats query was dispatched so we don't spam.
+    pub last_stats_poll: std::time::Instant,
 }
 
 impl App {
@@ -71,6 +77,7 @@ impl App {
         runtime_handle: tokio::runtime::Handle,
         session: Arc<RwLock<Session>>,
     ) -> Self {
+        let (stats_tx, stats_rx) = std::sync::mpsc::channel();
         Self {
             tabs: vec![initial_tab],
             active_tab: 0,
@@ -88,6 +95,9 @@ impl App {
             command_dialog_active: false,
             runtime_handle,
             session,
+            stats_rx: Some(stats_rx),
+            stats_tx,
+            last_stats_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
         }
     }
 
@@ -141,6 +151,13 @@ impl App {
         }
         tab.scroll_offset = 0;
 
+        // Reset the vt100 parser so the previous container's output is gone.
+        let (rows, cols) = tab.vt100_parser.screen().size();
+        tab.vt100_parser = vt100::Parser::new(rows, cols, 10000);
+        tab.container_scroll_offset = 0;
+        tab.mouse_selection = None;
+        tab.last_container_summary = None;
+
         // Dialog channels (std::sync::mpsc — command thread blocks on recv).
         let (dialog_req_tx, dialog_req_rx) = std::sync::mpsc::channel::<DialogRequest>();
         let (dialog_resp_tx, dialog_resp_rx) = std::sync::mpsc::channel::<DialogResponse>();
@@ -186,6 +203,7 @@ impl App {
             container_io,
             tab.workflow_state.clone(),
             tab.yolo_state.clone(),
+            tab.pty_reset_flag.clone(),
         );
 
         // Store the receiving/sending ends in the tab.
@@ -197,25 +215,54 @@ impl App {
         tab.dialog_response_tx = Some(dialog_resp_tx);
 
         let command_name = parsed.path.join(" ");
+        let agent_display = agent_name_from_parsed(&parsed);
 
         // Pre-populate ContainerInfo so the overlay title bar can show the
         // command name and elapsed time even before the engine reports the
         // actual container's name. The engine may overwrite the container
         // name later via `report_status`.
         tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: agent_name_from_parsed(&parsed),
+            agent_display_name: agent_display.clone(),
             container_name: String::new(),
             start_time: std::time::Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
         });
 
+        // Show the "Interactive Mode" banner for containerized commands.
+        let is_containerized = matches!(
+            parsed.path.first().map(|s| s.as_str()),
+            Some("chat" | "implement" | "exec")
+        );
+        if is_containerized {
+            use crate::frontend::tui::user_message::TuiUserMessageSink;
+            use crate::engine::message::UserMessageSink;
+            let mut sink = TuiUserMessageSink::new(tab.status_log.clone());
+            sink.info("╔══════════════════════════════════════════════════════════════╗".to_string());
+            sink.info("║                                                              ║".to_string());
+            sink.info("║     ╦╔╗╔╔╦╗╔═╗╦═╗╔═╗╔═╗╔╦╗╦╦  ╦╔═╗  ╔╦╗╔═╗╔╦╗╔═╗        ║".to_string());
+            sink.info("║     ║║║║ ║ ║╣ ╠╦╝╠═╣║   ║ ║╚╗╔╝║╣   ║║║║ ║ ║║║╣         ║".to_string());
+            sink.info("║     ╩╝╚╝ ╩ ╚═╝╩╚═╩ ╩╚═╝ ╩ ╩ ╚╝ ╚═╝  ╩ ╩╚═╝═╩╝╚═╝       ║".to_string());
+            sink.info("║                                                              ║".to_string());
+            sink.info(format!(
+                "║  Agent '{}' is launching in INTERACTIVE mode.{}║",
+                agent_display,
+                " ".repeat(46usize.saturating_sub(agent_display.len() + 43))
+            ));
+            sink.info("║  You will need to quit the agent (Ctrl+C or exit)            ║".to_string());
+            sink.info("║  when its work is complete.                                  ║".to_string());
+            sink.info("║                                                              ║".to_string());
+            sink.info("╚══════════════════════════════════════════════════════════════╝".to_string());
+        }
+
         tab.execution_phase = ExecutionPhase::Running {
             command: command_name,
         };
 
-        // Build the dispatch and spawn the command.
-        let session = Arc::clone(&self.session);
+        // Build the dispatch and spawn the command using the tab's session
+        // so commands execute in the correct working directory.
+        let tab_session = self.active_tab().session.clone();
+        let session = Arc::new(RwLock::new(tab_session));
         let engines = self.engines.clone();
         let path_owned: Vec<String> = parsed.path.clone();
 
@@ -236,13 +283,65 @@ impl App {
     }
 
     /// Tick all tabs: drain container output, poll for command completion,
-    /// and recompute the per-tab stuck flag.
+    /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
         let active = self.active_tab;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             tab.drain_container_output();
             tab.poll_command_completion();
             tab.recompute_stuck(i == active);
+        }
+
+        // Drain any completed stats results.
+        if let Some(ref rx) = self.stats_rx {
+            while let Ok((tab_idx, stats)) = rx.try_recv() {
+                if tab_idx < self.tabs.len() {
+                    if let Some(ref mut info) = self.tabs[tab_idx].container_info {
+                        info.stats_history.push((stats.cpu_percent, stats.memory_mb));
+                        if info.container_name.is_empty() {
+                            info.container_name = stats.name.clone();
+                        }
+                        info.latest_stats = Some(stats);
+                    }
+                }
+            }
+        }
+
+        // Dispatch a new stats poll every ~3 seconds for tabs with active containers.
+        if self.last_stats_poll.elapsed() >= std::time::Duration::from_secs(3) {
+            self.last_stats_poll = std::time::Instant::now();
+            for (i, tab) in self.tabs.iter().enumerate() {
+                if !matches!(tab.execution_phase, crate::frontend::tui::tabs::ExecutionPhase::Running { .. }) {
+                    continue;
+                }
+                if tab.container_window_state == crate::frontend::tui::tabs::ContainerWindowState::Hidden {
+                    continue;
+                }
+                let container_name = tab.container_info.as_ref()
+                    .map(|info| info.container_name.clone())
+                    .unwrap_or_default();
+                let runtime = self.engines.runtime.clone();
+                let tx = self.stats_tx.clone();
+                let tab_idx = i;
+                self.runtime_handle.spawn(async move {
+                    let handles = match runtime.list_running_sync() {
+                        Ok(h) => h,
+                        Err(_) => return,
+                    };
+                    // Find the right container: match by name if known,
+                    // otherwise use the first amux container.
+                    let target = if !container_name.is_empty() {
+                        handles.iter().find(|h| h.name == container_name)
+                    } else {
+                        handles.first()
+                    };
+                    if let Some(handle) = target {
+                        if let Ok(stats) = runtime.stats(handle) {
+                            let _ = tx.send((tab_idx, stats));
+                        }
+                    }
+                });
+            }
         }
     }
 

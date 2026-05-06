@@ -1,6 +1,7 @@
 //! Per-tab state.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -38,9 +39,9 @@ pub enum ContainerWindowState {
 impl ContainerWindowState {
     pub fn cycle(self) -> Self {
         match self {
-            Self::Hidden => Self::Minimized,
+            Self::Hidden => Self::Maximized,
             Self::Minimized => Self::Maximized,
-            Self::Maximized => Self::Hidden,
+            Self::Maximized => Self::Minimized,
         }
     }
 }
@@ -79,6 +80,10 @@ pub type SharedWorkflowViewState = Arc<Mutex<Option<WorkflowViewState>>>;
 /// while a yolo countdown is active; the renderer reads it to display the
 /// "Auto-advancing in Ns" non-modal overlay.
 pub type SharedYoloState = Arc<Mutex<Option<YoloState>>>;
+
+/// Shared flag set by the workflow frontend to signal the TUI event loop
+/// to reset the vt100 parser before the next step's PTY output arrives.
+pub type SharedPtyResetFlag = Arc<AtomicBool>;
 
 #[derive(Debug, Clone)]
 pub struct YoloState {
@@ -186,6 +191,9 @@ pub struct Tab {
     pub dialog_request_rx: Option<std::sync::mpsc::Receiver<DialogRequest>>,
     /// Event loop sends dialog responses back to the command thread.
     pub dialog_response_tx: Option<std::sync::mpsc::Sender<DialogResponse>>,
+    /// Shared flag: workflow frontend sets this to signal the TUI to reset the
+    /// vt100 parser between workflow steps.
+    pub pty_reset_flag: SharedPtyResetFlag,
 }
 
 impl Tab {
@@ -220,6 +228,7 @@ impl Tab {
             command_result_rx: None,
             dialog_request_rx: None,
             dialog_response_tx: None,
+            pty_reset_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -342,9 +351,23 @@ impl Tab {
     ///
     /// Auto-opens the container overlay to Maximized the first time bytes
     /// arrive so the user sees the PTY output immediately without having to
-    /// manually cycle with Ctrl+M.
+    /// manually cycle with Ctrl+M. Also ensures the parser is sized to match
+    /// the current terminal dimensions (prevents the PTY rendering at 80x24
+    /// until the first resize event).
+    ///
+    /// Between workflow steps the engine sets `pty_reset_flag`, which causes
+    /// this method to reinitialize the vt100 parser (clearing the old step's
+    /// terminal content) before processing the new step's output.
     pub fn drain_container_output(&mut self) {
         if let Some(ref mut rx) = self.container_stdout_rx {
+            // Check if the engine signalled a PTY reset (workflow step transition).
+            if self.pty_reset_flag.swap(false, Ordering::Relaxed) {
+                let (rows, cols) = self.vt100_parser.screen().size();
+                self.vt100_parser = vt100::Parser::new(rows, cols, 10000);
+                self.container_scroll_offset = 0;
+                self.mouse_selection = None;
+            }
+
             let mut received_any = false;
             while let Ok(bytes) = rx.try_recv() {
                 self.vt100_parser.process(&bytes);
@@ -352,6 +375,14 @@ impl Tab {
                 received_any = true;
             }
             if received_any && self.container_window_state == ContainerWindowState::Hidden {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    let (inner_cols, inner_rows) =
+                        crate::frontend::tui::compute_container_inner_size(cols, rows);
+                    self.vt100_parser.set_size(inner_rows, inner_cols);
+                    if let Some(ref tx) = self.container_resize_tx {
+                        let _ = tx.send((inner_cols, inner_rows));
+                    }
+                }
                 self.container_window_state = ContainerWindowState::Maximized;
             }
         }
@@ -408,6 +439,12 @@ impl Tab {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
+                    if let Ok(mut log) = self.status_log.lock() {
+                        log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                            level: crate::engine::message::MessageLevel::Success,
+                            text: format!("Command '{}' completed successfully.", cmd_name),
+                        });
+                    }
                     self.execution_phase =
                         ExecutionPhase::Done { command: cmd_name, exit_code: 0 };
                     self.close_container_overlay(0);
@@ -421,9 +458,16 @@ impl Tab {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
+                    let err_msg = format!("{err}");
+                    if let Ok(mut log) = self.status_log.lock() {
+                        log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                            level: crate::engine::message::MessageLevel::Error,
+                            text: format!("Command '{}' failed: {}", cmd_name, err_msg),
+                        });
+                    }
                     self.execution_phase = ExecutionPhase::Error {
                         command: cmd_name,
-                        message: format!("{err}"),
+                        message: err_msg,
                     };
                     self.close_container_overlay(-1);
                     self.command_result_rx = None;
@@ -440,9 +484,16 @@ impl Tab {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
+                    let err_msg = "command task dropped unexpectedly".to_string();
+                    if let Ok(mut log) = self.status_log.lock() {
+                        log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                            level: crate::engine::message::MessageLevel::Error,
+                            text: format!("Command '{}' failed: {}", cmd_name, err_msg),
+                        });
+                    }
                     self.execution_phase = ExecutionPhase::Error {
                         command: cmd_name,
-                        message: "command task dropped unexpectedly".to_string(),
+                        message: err_msg,
                     };
                     self.close_container_overlay(-1);
                     self.command_result_rx = None;
@@ -555,14 +606,16 @@ pub fn phase_label(phase: &ExecutionPhase) -> String {
 
 /// Compute the width of each tab in the tab bar.
 ///
-/// Two-stage formula matching old amux:
-/// - **Budget** (cap): 1 tab → ¼ of area, 2 → ½, 3 → ¾, n≥4 → 1/n. Caps how
-///   wide a single tab can grow.
+/// Dynamic sizing:
 /// - **Natural**: the widest "untruncated content" across all tabs (project
-///   name title vs. subcommand body) plus 2 cells for the borders. Tabs only
-///   grow as wide as needed to fit their content.
+///   name title vs. subcommand body) plus 2 cells for the borders, with a
+///   minimum of 20 (double the old minimum). Tabs grow as wide as needed
+///   to fit their content.
+/// - **Budget**: when all tabs fit within the area width at their natural
+///   size, use the natural size. When they don't fit, shrink to share the
+///   full width equally (`area_width / n`).
 ///
-/// The actual tab width is `min(natural, budget)`.
+/// Tabs never shrink below 12 cells (enough for a truncated label + ellipsis).
 pub fn compute_tab_bar_width(
     num_tabs: usize,
     area_width: u16,
@@ -572,14 +625,14 @@ pub fn compute_tab_bar_width(
         return 0;
     }
     let n = num_tabs as u16;
-    let natural = max_natural_content + 2;
-    let budget = match num_tabs {
-        1 => area_width / 4,
-        2 => area_width / 2,
-        3 => (area_width * 3) / 4,
-        _ => area_width / n,
-    };
-    natural.min(budget)
+    let min_tab_width: u16 = 20;
+    let natural = (max_natural_content + 2).max(min_tab_width);
+    let total_natural = natural.saturating_mul(n);
+    if total_natural <= area_width {
+        natural
+    } else {
+        (area_width / n).max(12)
+    }
 }
 
 #[cfg(test)]
@@ -604,9 +657,9 @@ mod tests {
 
     #[test]
     fn container_window_cycles() {
-        assert_eq!(ContainerWindowState::Hidden.cycle(), ContainerWindowState::Minimized);
+        assert_eq!(ContainerWindowState::Hidden.cycle(), ContainerWindowState::Maximized);
         assert_eq!(ContainerWindowState::Minimized.cycle(), ContainerWindowState::Maximized);
-        assert_eq!(ContainerWindowState::Maximized.cycle(), ContainerWindowState::Hidden);
+        assert_eq!(ContainerWindowState::Maximized.cycle(), ContainerWindowState::Minimized);
     }
 
     // ── truncate_with_ellipsis ─────────────────────────────────────────────────
@@ -660,31 +713,33 @@ mod tests {
     // ── compute_tab_bar_width ──────────────────────────────────────────────────
 
     #[test]
-    fn tab_bar_width_single_tab_uses_natural_when_tiny() {
-        // 1 tab, content 5 → natural = 7, budget = 50; min = 7.
-        assert_eq!(compute_tab_bar_width(1, 200, 5), 7);
+    fn tab_bar_width_single_tab_uses_min_when_content_small() {
+        // 1 tab, content 5 → natural = max(7, 20) = 20, fits in 200.
+        assert_eq!(compute_tab_bar_width(1, 200, 5), 20);
     }
 
     #[test]
-    fn tab_bar_width_single_tab_caps_at_quarter() {
-        // 1 tab, large content → capped at area/4.
-        assert_eq!(compute_tab_bar_width(1, 100, 80), 25);
+    fn tab_bar_width_single_tab_uses_natural_when_fits() {
+        // 1 tab, content 80 → natural = 82, fits in 100.
+        assert_eq!(compute_tab_bar_width(1, 100, 80), 82);
     }
 
     #[test]
-    fn tab_bar_width_two_tabs_caps_at_half() {
+    fn tab_bar_width_two_tabs_shrinks_when_overflow() {
+        // 2 tabs, content 90 → natural = 92, total = 184 > 100. Shrink: 100/2 = 50.
         assert_eq!(compute_tab_bar_width(2, 100, 90), 50);
     }
 
     #[test]
-    fn tab_bar_width_three_tabs_caps_at_three_quarters() {
-        assert_eq!(compute_tab_bar_width(3, 100, 90), 75);
+    fn tab_bar_width_three_tabs_shrinks_when_overflow() {
+        // 3 tabs, content 90 → natural = 92, total = 276 > 100. Shrink: 100/3 = 33.
+        assert_eq!(compute_tab_bar_width(3, 100, 90), 33);
     }
 
     #[test]
-    fn tab_bar_width_four_tabs_uses_natural_when_small() {
-        // 4 tabs, content 10 → natural = 12, budget = 25; min = 12.
-        assert_eq!(compute_tab_bar_width(4, 100, 10), 12);
+    fn tab_bar_width_four_tabs_uses_min_when_content_small() {
+        // 4 tabs, content 10 → natural = max(12, 20) = 20, total = 80 ≤ 100.
+        assert_eq!(compute_tab_bar_width(4, 100, 10), 20);
     }
 
     #[test]

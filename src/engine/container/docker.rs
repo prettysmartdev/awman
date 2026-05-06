@@ -140,6 +140,55 @@ impl ContainerBackend for DockerBackend {
         Ok(handles)
     }
 
+    fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
+        let queries: &[&[&str]] = &[
+            &["ps", "--filter", "label=amux=true", "--format", format],
+            &["ps", "--filter", "name=amux-",      "--format", format],
+        ];
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut handles: Vec<ContainerHandle> = Vec::new();
+
+        for args in queries {
+            let output = Command::new("docker")
+                .args(*args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output();
+            let output = match output {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.splitn(4, '\t').collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+                let id = parts[0].to_string();
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let name = parts[1].to_string();
+                let image_tag = parts[2].to_string();
+                let created = parts[3];
+                let started_at =
+                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                handles.push(ContainerHandle {
+                    id,
+                    image_tag,
+                    name,
+                    started_at,
+                });
+            }
+        }
+
+        Ok(handles)
+    }
+
     fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
         let output = Command::new("docker")
             .args([

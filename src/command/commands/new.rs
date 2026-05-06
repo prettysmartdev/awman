@@ -13,7 +13,7 @@ use crate::command::error::CommandError;
 use crate::data::fs::{SkillDirs, WorkflowDirs};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::ContainerOption;
-use crate::engine::message::UserMessageSink;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct NewSpecFlags {
@@ -130,24 +130,37 @@ impl Command for NewCommand {
     ) -> Result<Self::Outcome, CommandError> {
         let outcome = match self.sub {
             NewSubcommand::Spec(f) => {
-                // Delegate to the shared `create_new_spec` helper. Dispatch
-                // canonicalizes `specs new` to `new spec`, so this branch is
-                // the implementation for both invocations — Q&A, template
-                // substitution, and the optional --interview agent run all
-                // happen here.
-                let new_outcome = crate::command::commands::specs::create_new_spec(
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "new spec: starting work item creation".into(),
+                });
+                let new_outcome = match crate::command::commands::specs::create_new_spec(
                     &self.engines,
                     f.interview,
                     f.non_interactive,
                     frontend.as_mut(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("new spec: failed to create spec: {e}"),
+                        });
+                        return Err(e);
+                    }
+                };
                 NewOutcome::Spec(NewSpecOutcome {
                     interview: new_outcome.interview,
                     path: new_outcome.created_path,
                 })
             }
             NewSubcommand::Workflow(f) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "new workflow: starting workflow creation".into(),
+                });
                 let name = frontend
                     .ask_workflow_name()
                     .unwrap_or_else(|_| "workflow".into());
@@ -158,12 +171,30 @@ impl Command for NewCommand {
                     _ => "toml",
                 };
                 let session = if !f.global || f.interview {
-                    Some(open_session_for_cwd(&self.engines)?)
+                    Some(match open_session_for_cwd(&self.engines) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to open session: {e}"),
+                            });
+                            return Err(e);
+                        }
+                    })
                 } else {
                     None
                 };
                 let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
-                let workflow_dirs = WorkflowDirs::from_process_env(git_root)?;
+                let workflow_dirs = match WorkflowDirs::from_process_env(git_root) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("new workflow: failed to resolve workflow dirs: {e}"),
+                        });
+                        return Err(CommandError::from(e));
+                    }
+                };
                 let dir = if f.global {
                     workflow_dirs.global_dir()
                 } else {
@@ -174,18 +205,40 @@ impl Command for NewCommand {
                 let body = match extension {
                     "yaml" | "yml" => format!("name: {name}\nsteps: []\n"),
                     "md" => format!("# Workflow: {name}\n\n## Steps\n"),
-                    _ => "[[steps]]\nname = \"step-1\"\nagent = \"claude\"\nprompt = \"do something\"\n".to_string(),
+                    _ => "[[step]]\nname = \"step-1\"\nagent = \"claude\"\nprompt = \"do something\"\n".to_string(),
                 };
                 let _ = std::fs::write(&path, body);
 
                 if f.interview {
                     let session = session.as_ref().unwrap();
-                    let agent = resolve_agent(&None, session)?;
-                    let credentials = self
+                    let agent = match resolve_agent(&None, session) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to resolve agent: {e}"),
+                            });
+                            return Err(e);
+                        }
+                    };
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!("new workflow: launching interview agent '{}'", agent.as_str()),
+                    });
+                    let credentials = match self
                         .engines
                         .auth_engine
                         .resolve_agent_auth(session, &agent)
-                        .map_err(CommandError::from)?;
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to resolve agent auth: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                     let summary = frontend.ask_workflow_summary().unwrap_or_default();
                     let filename = path
                         .file_name()
@@ -200,23 +253,50 @@ impl Command for NewCommand {
                         env_passthrough: Some(session.effective_config().env_passthrough()),
                         ..Default::default()
                     };
-                    let mut options = self
+                    let mut options = match self
                         .engines
                         .agent_engine
-                        .build_options(session, &agent, &run_opts)?;
+                        .build_options(session, &agent, &run_opts)
+                    {
+                        Ok(o) => o,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to build agent options: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                     if !credentials.env_vars.is_empty() {
                         options.push(ContainerOption::AgentCredentials {
                             env_vars: credentials.env_vars,
                         });
                     }
-                    let instance = self.engines.runtime.build(options)?;
+                    let instance = match self.engines.runtime.build(options) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to build container: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: "Launching agent container…".into(),
+                    });
                     frontend.set_pty_active(true);
-                    let cf = frontend.container_frontend();
+                    let cf = frontend.container_frontend_for_pty();
                     let mut execution = match instance.run_with_frontend(cf) {
                         Ok(e) => e,
                         Err(e) => {
                             frontend.set_pty_active(false);
                             frontend.replay_queued();
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to run container: {e}"),
+                            });
                             return Err(CommandError::from(e));
                         }
                     };
@@ -233,14 +313,36 @@ impl Command for NewCommand {
                 })
             }
             NewSubcommand::Skill(f) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "new skill: starting skill creation".into(),
+                });
                 let name = frontend.ask_skill_name().unwrap_or_else(|_| "skill".into());
                 let session = if !f.global || f.interview {
-                    Some(open_session_for_cwd(&self.engines)?)
+                    Some(match open_session_for_cwd(&self.engines) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new skill: failed to open session: {e}"),
+                            });
+                            return Err(e);
+                        }
+                    })
                 } else {
                     None
                 };
                 let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
-                let skill_dirs = SkillDirs::from_process_env(git_root)?;
+                let skill_dirs = match SkillDirs::from_process_env(git_root) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("new skill: failed to resolve skill dirs: {e}"),
+                        });
+                        return Err(CommandError::from(e));
+                    }
+                };
                 let dir = if f.global {
                     skill_dirs.global_dir().join(&name)
                 } else {
@@ -250,18 +352,39 @@ impl Command for NewCommand {
                 let path = dir.join("SKILL.md");
 
                 if f.interview {
-                    // Interview mode: write skeleton and let agent fill it in.
                     let skeleton = format!(
                         "# Skill: {name}\n\n## Description\n\n## Body\n"
                     );
                     let _ = std::fs::write(&path, skeleton);
                     let session = session.as_ref().unwrap();
-                    let agent = resolve_agent(&None, session)?;
-                    let credentials = self
+                    let agent = match resolve_agent(&None, session) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new skill: failed to resolve agent: {e}"),
+                            });
+                            return Err(e);
+                        }
+                    };
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!("new skill: launching interview agent '{}'", agent.as_str()),
+                    });
+                    let credentials = match self
                         .engines
                         .auth_engine
                         .resolve_agent_auth(session, &agent)
-                        .map_err(CommandError::from)?;
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new skill: failed to resolve agent auth: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                     let summary = frontend.ask_skill_summary().unwrap_or_default();
                     let path_str = path.display().to_string();
                     let prompt = render_skill_interview_prompt(&path_str, &summary);
@@ -271,23 +394,46 @@ impl Command for NewCommand {
                         env_passthrough: Some(session.effective_config().env_passthrough()),
                         ..Default::default()
                     };
-                    let mut options = self
+                    let mut options = match self
                         .engines
                         .agent_engine
-                        .build_options(session, &agent, &run_opts)?;
+                        .build_options(session, &agent, &run_opts)
+                    {
+                        Ok(o) => o,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new skill: failed to build agent options: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                     if !credentials.env_vars.is_empty() {
                         options.push(ContainerOption::AgentCredentials {
                             env_vars: credentials.env_vars,
                         });
                     }
-                    let instance = self.engines.runtime.build(options)?;
+                    let instance = match self.engines.runtime.build(options) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new skill: failed to build container: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                     frontend.set_pty_active(true);
-                    let cf = frontend.container_frontend();
+                    let cf = frontend.container_frontend_for_pty();
                     let mut execution = match instance.run_with_frontend(cf) {
                         Ok(e) => e,
                         Err(e) => {
                             frontend.set_pty_active(false);
                             frontend.replay_queued();
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new skill: failed to run container: {e}"),
+                            });
                             return Err(CommandError::from(e));
                         }
                     };
@@ -489,7 +635,7 @@ mod tests {
             let path = std::path::Path::new(&path_str);
             assert!(path.exists(), "workflow file must exist: {path_str}");
             let content = std::fs::read_to_string(path).unwrap();
-            assert!(content.contains("[[steps]]"), "TOML workflow must contain [[steps]]");
+            assert!(content.contains("[[step]]"), "TOML workflow must contain [[step]]");
         } else {
             panic!("unexpected outcome variant");
         }

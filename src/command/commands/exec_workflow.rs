@@ -23,7 +23,7 @@ use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::container::instance::ContainerExitInfo;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 use crate::engine::error::EngineError;
-use crate::engine::message::{UserMessage, UserMessageSink};
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
@@ -234,6 +234,12 @@ impl ContainerFrontend for ContainerFrontendProxy {
     fn resize_pty(&mut self, cols: u16, rows: u16) {
         self.0.lock().unwrap().resize_pty(cols, rows);
     }
+
+    fn take_container_io(
+        &mut self,
+    ) -> Option<crate::engine::container::frontend::ContainerIo> {
+        self.0.lock().unwrap().take_container_io()
+    }
 }
 
 impl UserMessageSink for ContainerFrontendProxy {
@@ -258,6 +264,9 @@ struct CommandLayerFactory {
     flags: Arc<ExecWorkflowCommandFlags>,
     directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
     work_item_context: Option<WorkItemContext>,
+    /// The original repository git root (not the worktree). Used for image tag
+    /// derivation so worktree-based runs use the correct project image.
+    image_git_root: PathBuf,
 }
 
 impl ContainerExecutionFactory for CommandLayerFactory {
@@ -291,6 +300,20 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             .engines
             .agent_engine
             .build_options(session, &runtime.step_agent, &run_opts)?;
+
+        // Override the image tag to use the original repo root, not a worktree path.
+        let correct_tag = crate::data::image_tags::agent_image_tag(
+            &self.image_git_root,
+            runtime.step_agent.as_str(),
+        );
+        for opt in options.iter_mut() {
+            if matches!(opt, crate::engine::container::options::ContainerOption::Image(_)) {
+                *opt = crate::engine::container::options::ContainerOption::Image(
+                    crate::engine::container::options::ImageRef::new(correct_tag.clone()),
+                );
+                break;
+            }
+        }
 
         // Inject keychain credentials so the agent can reach its backend.
         // Mirrors the same step in `chat` and `exec_prompt`.
@@ -349,12 +372,26 @@ impl Command for ExecWorkflowCommand {
 
         // 1. Load the workflow file.
         if !self.flags.workflow.exists() {
-            return Err(CommandError::WorkflowFileNotFound {
+            let err = CommandError::WorkflowFileNotFound {
                 path: self.flags.workflow.clone(),
+            };
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: workflow file not found: {}", self.flags.workflow.display()),
             });
+            return Err(err);
         }
-        let workflow = Workflow::load(&self.flags.workflow)
-            .map_err(|e| CommandError::Other(format!("loading workflow: {e}")))?;
+        let workflow = match Workflow::load(&self.flags.workflow) {
+            Ok(w) => w,
+            Err(e) => {
+                let err = CommandError::Other(format!("loading workflow: {e}"));
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: failed to load workflow: {e}"),
+                });
+                return Err(err);
+            }
+        };
 
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = std::env::current_dir()
@@ -364,7 +401,16 @@ impl Command for ExecWorkflowCommand {
             .git_engine
             .resolve_root(&cwd)
             .unwrap_or_else(|_| cwd.clone());
-        let _mount_path = MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut())?;
+        let _mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
+            Ok(p) => p,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: mount scope resolution failed: {e}"),
+                });
+                return Err(e);
+            }
+        };
 
         // 3. Load work item context when --work-item is supplied.
         let work_item_context = if let Some(wi_str) = &self.flags.work_item {
@@ -407,19 +453,38 @@ impl Command for ExecWorkflowCommand {
         // rooted at the worktree checkout rather than the main repo.
         let mut worktree_path: Option<PathBuf> = None;
         let worktree_lifecycle = if self.flags.worktree {
-            let git_root = self
+            let git_root = match self
                 .engines
                 .git_engine
                 .resolve_root(&cwd)
-                .map_err(CommandError::from)?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = CommandError::from(e);
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec workflow: failed to resolve git root: {err}"),
+                    });
+                    return Err(err);
+                }
+            };
             // When --work-item is supplied, name the worktree/branch after the
             // work item number rather than the workflow filename.
             let lifecycle = if let Some(ctx) = &work_item_context {
-                WorktreeLifecycle::for_work_item(
+                match WorktreeLifecycle::for_work_item(
                     Arc::clone(&self.engines.git_engine),
                     git_root,
                     ctx.number,
-                )?
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec workflow: failed to create worktree for work item: {e}"),
+                        });
+                        return Err(e);
+                    }
+                }
             } else {
                 let name = self
                     .flags
@@ -428,13 +493,31 @@ impl Command for ExecWorkflowCommand {
                     .and_then(|s| s.to_str())
                     .unwrap_or("workflow")
                     .to_string();
-                WorktreeLifecycle::for_workflow(
+                match WorktreeLifecycle::for_workflow(
                     Arc::clone(&self.engines.git_engine),
                     git_root,
                     &name,
-                )?
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec workflow: failed to create worktree for workflow: {e}"),
+                        });
+                        return Err(e);
+                    }
+                }
             };
-            let wt_path = lifecycle.prepare(&mut *frontend).await?;
+            let wt_path = match lifecycle.prepare(&mut *frontend).await {
+                Ok(p) => p,
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec workflow: worktree prepare failed: {e}"),
+                    });
+                    return Err(e);
+                }
+            };
             worktree_path = Some(wt_path);
             Some(lifecycle)
         } else {
@@ -442,7 +525,7 @@ impl Command for ExecWorkflowCommand {
         };
 
         // 5. Parse CLI overlay specs early so errors surface before PTY is activated.
-        let cli_overlays = self
+        let cli_overlays = match self
             .flags
             .overlay
             .iter()
@@ -452,7 +535,17 @@ impl Command for ExecWorkflowCommand {
                     reason,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: invalid overlay spec: {e}"),
+                });
+                return Err(e);
+            }
+        };
 
         // 6. Set PTY active — queues user messages during the engine run.
         frontend.set_pty_active(true);
@@ -468,15 +561,34 @@ impl Command for ExecWorkflowCommand {
         // When a worktree is active, root the session at the worktree so that
         // `build_options` mounts the worktree checkout, not the main repo.
         let session_root = worktree_path.as_deref().unwrap_or(&cwd);
-        let git_root_for_session = Arc::clone(&self.engines.git_engine)
+        let git_root_for_session = match Arc::clone(&self.engines.git_engine)
             .resolve_root(session_root)
-            .map_err(CommandError::from)?;
-        let session = Session::open_at_git_root(
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let err = CommandError::from(e);
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: failed to resolve git root for session: {err}"),
+                });
+                return Err(err);
+            }
+        };
+        let session = match Session::open_at_git_root(
             session_root.to_path_buf(),
             git_root_for_session,
             crate::data::session::SessionOpenOptions::default(),
-        )
-        .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = CommandError::Other(format!("opening session: {e}"));
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: failed to open session: {e}"),
+                });
+                return Err(err);
+            }
+        };
 
         // Merge CLI overlays with config/env sources now that session is available.
         let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
@@ -492,16 +604,26 @@ impl Command for ExecWorkflowCommand {
                 flags: Arc::clone(&flags_arc),
                 directory_overlays,
                 work_item_context,
+                image_git_root: git_root_for_scope.clone(),
             };
-            let mut engine = WorkflowEngine::new(
+            let mut engine = match WorkflowEngine::new(
                 &session,
                 workflow,
                 Box::new(proxy),
                 Box::new(factory),
                 Arc::clone(&self.engines.git_engine),
                 Arc::clone(&self.engines.overlay_engine),
-            )
-            .map_err(CommandError::from)?;
+            ) {
+                Ok(eng) => eng,
+                Err(e) => {
+                    let err = CommandError::from(e);
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec workflow: failed to initialize workflow engine: {err}"),
+                    });
+                    return Err(err);
+                }
+            };
             engine.set_yolo(yolo);
             let result = engine.run_to_completion().await;
             let mut completed = 0usize;
@@ -545,12 +667,25 @@ impl Command for ExecWorkflowCommand {
 
         // 12. Worktree finalize.
         if let Some(lifecycle) = worktree_lifecycle {
-            lifecycle.finalize(&mut *frontend, had_error).await?;
+            if let Err(e) = lifecycle.finalize(&mut *frontend, had_error).await {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: worktree finalize failed: {e}"),
+                });
+                return Err(e);
+            }
             frontend.replay_queued();
         }
 
         // 13. Surface engine errors after lifecycle cleanup.
-        engine_result.map_err(CommandError::from)?;
+        if let Err(e) = engine_result {
+            let err = CommandError::from(e);
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: workflow engine error: {err}"),
+            });
+            return Err(err);
+        }
 
         Ok(ExecWorkflowOutcome {
             workflow: workflow_path,

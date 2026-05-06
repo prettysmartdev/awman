@@ -43,6 +43,26 @@ impl RepoDockerfilePaths {
     pub fn git_root(&self) -> &Path {
         &self.git_root
     }
+
+    /// Discover all per-agent Dockerfiles in `.amux/`.
+    /// Returns `(agent_name, path)` for each `Dockerfile.<agent>` found.
+    pub fn discover_agent_dockerfiles(&self) -> Vec<(String, PathBuf)> {
+        let amux_dir = self.amux_dir();
+        let mut result = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&amux_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_string();
+                if let Some(agent) = name_str.strip_prefix("Dockerfile.") {
+                    if !agent.is_empty() {
+                        result.push((agent.to_string(), entry.path()));
+                    }
+                }
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
 }
 
 #[cfg(test)]

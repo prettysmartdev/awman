@@ -9,7 +9,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
-use crate::engine::message::UserMessageSink;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 /// Typed enum of every asset the `download` command knows how to fetch.
 /// Catalogue parsing maps the user-supplied string into this enum so unknown
@@ -79,22 +79,61 @@ impl Command for DownloadCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let parsed = DownloadAsset::parse(&self.asset).ok_or_else(|| {
-            CommandError::Other(format!(
-                "unknown download asset '{}'; expected 'aspec' or 'dockerfile-<agent>'",
-                self.asset
-            ))
-        })?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("download: fetching asset '{}'…", self.asset),
+        });
+        let parsed = match DownloadAsset::parse(&self.asset) {
+            Some(p) => p,
+            None => {
+                let err = CommandError::Other(format!(
+                    "unknown download asset '{}'; expected 'aspec' or 'dockerfile-<agent>'",
+                    self.asset
+                ));
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("download: unknown asset '{}': {err}", self.asset),
+                });
+                return Err(err);
+            }
+        };
         let outcome = match parsed {
             DownloadAsset::AspecTarball => {
-                let session = open_session_for_cwd(&self.engines)?;
+                let session = match open_session_for_cwd(&self.engines) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("download: failed to open session: {e}"),
+                        });
+                        return Err(e);
+                    }
+                };
                 let dest = RepoDockerfilePaths::new(session.git_root()).aspec_root();
-                let bytes = crate::data::network::download_aspec_tarball()
-                    .await
-                    .map_err(|e| CommandError::Other(e.to_string()))?;
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "download: fetching aspec tarball…".into(),
+                });
+                let bytes = match crate::data::network::download_aspec_tarball().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let err = CommandError::Other(e.to_string());
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("download: failed to fetch aspec tarball: {e}"),
+                        });
+                        return Err(err);
+                    }
+                };
                 let bytes_written = bytes.len();
-                crate::data::network::extract_aspec_tarball(&bytes, &dest)
-                    .map_err(|e| CommandError::Other(e.to_string()))?;
+                if let Err(e) = crate::data::network::extract_aspec_tarball(&bytes, &dest) {
+                    let err = CommandError::Other(e.to_string());
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("download: failed to extract aspec tarball: {e}"),
+                    });
+                    return Err(err);
+                }
                 DownloadOutcome {
                     asset: self.asset,
                     bytes_written,
@@ -102,12 +141,32 @@ impl Command for DownloadCommand {
                 }
             }
             DownloadAsset::AgentDockerfile { agent } => {
-                let session = open_session_for_cwd(&self.engines)?;
+                let session = match open_session_for_cwd(&self.engines) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("download: failed to open session: {e}"),
+                        });
+                        return Err(e);
+                    }
+                };
                 let dest = RepoDockerfilePaths::new(session.git_root()).agent_dockerfile(&agent);
                 let project_tag = crate::data::image_tags::project_image_tag(session.git_root());
-                crate::engine::agent::download::download_agent_dockerfile(&agent, &dest, &project_tag)
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!("download: fetching agent image for '{agent}'…"),
+                });
+                if let Err(e) = crate::engine::agent::download::download_agent_dockerfile(&agent, &dest, &project_tag)
                     .await
-                    .map_err(|e| CommandError::Other(e.to_string()))?;
+                {
+                    let err = CommandError::Other(e.to_string());
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("download: failed to download agent dockerfile: {e}"),
+                    });
+                    return Err(err);
+                }
                 let bytes_written =
                     std::fs::metadata(&dest).map(|m| m.len() as usize).unwrap_or(0);
                 DownloadOutcome {
@@ -117,6 +176,10 @@ impl Command for DownloadCommand {
                 }
             }
         };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "download: complete".into(),
+        });
         frontend.replay_queued();
         Ok(outcome)
     }

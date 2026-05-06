@@ -13,7 +13,7 @@ use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
-use crate::engine::message::UserMessageSink;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct ChatCommandFlags {
@@ -71,16 +71,48 @@ impl Command for ChatCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
-        let session = open_session_for_cwd(&self.engines)?;
-        let agent = resolve_agent(&self.flags.agent, &session)?;
+        let session = match open_session_for_cwd(&self.engines) {
+            Ok(s) => s,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: failed to open session: {e}"),
+                });
+                return Err(e);
+            }
+        };
+        let agent = match resolve_agent(&self.flags.agent, &session) {
+            Ok(a) => a,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: failed to resolve agent: {e}"),
+                });
+                return Err(e);
+            }
+        };
+
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("chat: using agent '{}'", agent.as_str()),
+        });
 
         // 1b. Confirm mount scope when cwd differs from git root.
         let cwd = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let _mount_path = MountScope::resolve(&cwd, session.git_root(), frontend.as_mut())?;
+        let _mount_path = match MountScope::resolve(&cwd, session.git_root(), frontend.as_mut()) {
+            Ok(p) => p,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: mount scope resolution failed: {e}"),
+                });
+                return Err(e);
+            }
+        };
 
         // 2. Parse overlay specs before PTY is activated so errors surface early.
-        let cli_overlays = self
+        let cli_overlays = match self
             .flags
             .overlay
             .iter()
@@ -90,28 +122,65 @@ impl Command for ChatCommand {
                     reason,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: invalid overlay spec: {e}"),
+                });
+                return Err(e);
+            }
+        };
         let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
         // 3. Ensure the agent is available (Dockerfile + image present, build
         //    if missing). Runs before PTY activation so any download/build
         //    progress streams to the user terminal directly.
-        ensure_agent_setup(
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Checking agent availability…".into(),
+        });
+        match ensure_agent_setup(
             self.engines.agent_engine.as_ref(),
             &session,
             &agent,
             &mut frontend,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: agent setup failed: {e}"),
+                });
+                return Err(e);
+            }
+        }
 
         // 4. Resolve agent authentication (keychain credentials) and inject
         //    them as container env-vars so the running agent can reach its
         //    backend.
-        let credentials = self
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Resolving agent credentials…".into(),
+        });
+        let credentials = match self
             .engines
             .auth_engine
             .resolve_agent_auth(&session, &agent)
-            .map_err(CommandError::from)?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: credential resolution failed: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
 
         // 5. Build the run options from flags + credentials.
         let mut run_opts = AgentRunOptions {
@@ -129,10 +198,20 @@ impl Command for ChatCommand {
         let env_overrides = credentials.env_vars.clone();
 
         // 6. Build the container options through AgentEngine.
-        let mut options = self
+        let mut options = match self
             .engines
             .agent_engine
-            .build_options(&session, &agent, &run_opts)?;
+            .build_options(&session, &agent, &run_opts)
+        {
+            Ok(o) => o,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: failed to build container options: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
         if !env_overrides.is_empty() {
             options.push(crate::engine::container::options::ContainerOption::AgentCredentials {
                 env_vars: env_overrides,
@@ -141,9 +220,22 @@ impl Command for ChatCommand {
         let _ = &mut run_opts; // silence unused-mut lint when no fields mutate later
 
         // 7. Build the container instance.
-        let instance = self.engines.runtime.build(options)?;
+        let instance = match self.engines.runtime.build(options) {
+            Ok(i) => i,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: failed to build container instance: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
 
         // 8. Run with PTY-active gating.
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Launching agent container…".into(),
+        });
         frontend.set_pty_active(true);
         let container_frontend = frontend.container_frontend_for_pty();
         let mut execution = match instance.run_with_frontend(container_frontend) {
@@ -151,12 +243,21 @@ impl Command for ChatCommand {
             Err(e) => {
                 frontend.set_pty_active(false);
                 frontend.replay_queued();
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("chat: failed to launch container: {e}"),
+                });
                 return Err(CommandError::from(e));
             }
         };
         let exit = execution.wait().await;
         frontend.set_pty_active(false);
         frontend.replay_queued();
+
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Agent session ended".into(),
+        });
 
         let exit_code = exit.map(|e| e.exit_code).ok();
         Ok(ChatOutcome {

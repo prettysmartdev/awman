@@ -164,14 +164,23 @@ impl ReadyEngine {
                         text: "aspec/ folder not found in git root; run `amux init` to create it.".to_string(),
                     });
                 }
-                let config_path = git_root.join("aspec").join(".amux.json");
-                if config_path.exists() {
+                // Modern repo config: .amux/config.json
+                let modern_config = git_root.join(".amux").join("config.json");
+                // Legacy path: only warn if it EXISTS (user should migrate)
+                let legacy_config = git_root.join("aspec").join(".amux.json");
+                if modern_config.exists() {
                     self.summary.work_items_config = StepStatus::Done;
+                    if legacy_config.exists() {
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Warning,
+                            text: "Legacy aspec/.amux.json found alongside .amux/config.json; consider removing the legacy file.".to_string(),
+                        });
+                    }
                 } else {
-                    self.summary.work_items_config = StepStatus::Warn("aspec/.amux.json not found".into());
+                    self.summary.work_items_config = StepStatus::Warn(".amux/config.json not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
-                        text: "aspec/.amux.json not found; run `amux init` to create it.".to_string(),
+                        text: ".amux/config.json not found; run `amux init` to create it.".to_string(),
                     });
                 }
 
@@ -296,7 +305,7 @@ impl ReadyEngine {
                     self.summary.agent_image = StepStatus::Done;
                     frontend.report_step_status("Build agent image", StepStatus::Done);
                     return Ok({
-                        self.phase = ReadyPhase::CheckingLocalAgent;
+                        self.phase = ReadyPhase::CheckingNonDefaultAgents;
                         self.phase.clone()
                     });
                 }
@@ -319,7 +328,7 @@ impl ReadyEngine {
                         );
                         // Continue but mark agent image not built.
                         return Ok({
-                            self.phase = ReadyPhase::CheckingLocalAgent;
+                            self.phase = ReadyPhase::CheckingNonDefaultAgents;
                             self.phase.clone()
                         });
                     }
@@ -347,6 +356,84 @@ impl ReadyEngine {
                         );
                     }
                 }
+
+                // ENG-1: When --build is set, also build all other agent images.
+                if self.options.build {
+                    let all_agents = paths.discover_agent_dockerfiles();
+                    let default_agent = self.options.agent.as_str();
+                    for (agent_name, agent_path) in &all_agents {
+                        if agent_name == default_agent {
+                            continue;
+                        }
+                        let other_tag = agent_image_tag(&git_root, agent_name);
+                        frontend.report_step_status(
+                            &format!("Build agent image: {agent_name}"),
+                            StepStatus::Running,
+                        );
+                        let mut agent_sink = |line: &str| {
+                            frontend.report_step_status(line, StepStatus::Running);
+                        };
+                        let agent_result = self.container_runtime.build_image(
+                            &other_tag,
+                            agent_path,
+                            &git_root,
+                            self.options.no_cache,
+                            &mut agent_sink,
+                        );
+                        match agent_result {
+                            Ok(()) => {
+                                frontend.report_step_status(
+                                    &format!("Build agent image: {agent_name}"),
+                                    StepStatus::Done,
+                                );
+                            }
+                            Err(e) => {
+                                frontend.report_step_status(
+                                    &format!("Build agent image: {agent_name}"),
+                                    StepStatus::Failed(e.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                ReadyPhase::CheckingNonDefaultAgents
+            }
+            ReadyPhase::CheckingNonDefaultAgents => {
+                // ENG-2: Check non-default agent images and report their status.
+                let paths = RepoDockerfilePaths::new(&git_root);
+                let all_agents = paths.discover_agent_dockerfiles();
+                let default_agent = self.options.agent.as_str();
+
+                let mut missing_agents: Vec<String> = Vec::new();
+                for (agent_name, _agent_path) in &all_agents {
+                    if agent_name == default_agent {
+                        continue;
+                    }
+                    let other_tag = agent_image_tag(&git_root, agent_name);
+                    let status = if self.container_runtime.image_exists(&other_tag) {
+                        StepStatus::Done
+                    } else {
+                        missing_agents.push(agent_name.clone());
+                        StepStatus::Warn(format!("image not built: {other_tag}"))
+                    };
+                    frontend.report_step_status(
+                        &format!("Agent: {agent_name}"),
+                        status.clone(),
+                    );
+                    self.summary.non_default_agent_images.push((agent_name.clone(), status));
+                }
+
+                if !missing_agents.is_empty() {
+                    frontend.write_message(crate::engine::message::UserMessage {
+                        level: crate::engine::message::MessageLevel::Warning,
+                        text: format!(
+                            "Missing agent images: {}",
+                            missing_agents.join(", ")
+                        ),
+                    });
+                }
+
                 ReadyPhase::CheckingLocalAgent
             }
             ReadyPhase::CheckingLocalAgent => {

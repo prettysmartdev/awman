@@ -38,7 +38,7 @@ async fn main() -> Result<ExitCode> {
     let git_engine = Arc::new(GitEngine::new());
 
     let working_dir = std::env::current_dir().context("could not read current directory")?;
-    let session = Session::open(
+    let session = Session::open_or_workdir_fallback(
         working_dir.clone(),
         git_engine.as_ref(),
         SessionOpenOptions::default(),

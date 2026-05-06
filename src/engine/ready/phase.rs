@@ -11,6 +11,7 @@ pub enum ReadyPhase {
     MigratingLegacyLayout,
     BuildingBaseImage,
     BuildingAgentImage,
+    CheckingNonDefaultAgents,
     CheckingLocalAgent,
     RunningAudit,
     RebuildingAfterAudit,

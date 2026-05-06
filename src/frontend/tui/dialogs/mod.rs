@@ -158,6 +158,8 @@ pub fn centered_fixed(cols: u16, rows: u16, area: Rect) -> Rect {
 }
 
 /// Render a dialog frame with the given title and border color.
+/// Returns the padded inner area (1-cell horizontal padding, 1-row vertical
+/// padding inside the border) so dialog content doesn't touch the frame.
 pub fn render_dialog_frame(
     title: &str,
     color: Color,
@@ -172,7 +174,13 @@ pub fn render_dialog_frame(
         .border_type(ratatui::widgets::BorderType::Rounded);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    inner
+    // Add padding: 1 col each side, 1 row top/bottom
+    Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y.saturating_add(1),
+        width: inner.width.saturating_sub(2),
+        height: inner.height.saturating_sub(2),
+    }
 }
 
 /// Render the YesNo dialog.
@@ -191,16 +199,19 @@ pub fn render_yes_no(
     );
 }
 
-/// Render the quit confirmation dialog.
+/// Render the quit confirmation dialog (single tab).
 pub fn render_quit_confirm(area: Rect, frame: &mut Frame) {
-    render_yes_no("Quit?", "Are you sure you want to quit amux?", area, frame);
+    let dialog_area = centered_fixed(55, 8, area);
+    let inner = render_dialog_frame("Quit amux?", Color::Yellow, dialog_area, frame);
+    let text = "\n  Press Ctrl-C again to quit amux\n\n  Press Esc to cancel";
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
-/// Render the close-tab confirmation dialog.
+/// Render the close-tab confirmation dialog (multiple tabs).
 pub fn render_close_tab_confirm(area: Rect, frame: &mut Frame) {
-    let dialog_area = centered_fixed(55, 9, area);
+    let dialog_area = centered_fixed(55, 10, area);
     let inner = render_dialog_frame("Close tab?", Color::Yellow, dialog_area, frame);
-    let text = "  [q] Quit entire app\n  [c] Close this tab\n  [n] Cancel";
+    let text = "\n  Press Ctrl-C again to quit amux\n  Press Ctrl-T to close this tab\n\n  Press Esc to cancel";
     frame.render_widget(Paragraph::new(text), inner);
 }
 
@@ -322,8 +333,8 @@ mod tests {
         let output = render_to_string(80, 24, |area, frame| {
             render_close_tab_confirm(area, frame);
         });
-        assert!(output.contains("[q]"), "expected '[q]' in output:\n{output}");
-        assert!(output.contains("[c]"), "expected '[c]' in output:\n{output}");
-        assert!(output.contains("[n]"), "expected '[n]' in output:\n{output}");
+        assert!(output.contains("Ctrl-C"), "expected 'Ctrl-C' in output:\n{output}");
+        assert!(output.contains("Ctrl-T"), "expected 'Ctrl-T' in output:\n{output}");
+        assert!(output.contains("Esc"), "expected 'Esc' in output:\n{output}");
     }
 }

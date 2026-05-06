@@ -70,7 +70,7 @@ impl ReadyFrontend for CliFrontend {
         if self.is_json_mode() {
             return;
         }
-        let rows: Vec<(&str, &StepStatus)> = vec![
+        let mut rows: Vec<(&str, &StepStatus)> = vec![
             ("Dockerfile", &summary.dockerfile),
             ("Base image", &summary.base_image),
             ("Agent image", &summary.agent_image),
@@ -78,6 +78,16 @@ impl ReadyFrontend for CliFrontend {
             ("Audit", &summary.audit),
             ("Legacy migration", &summary.legacy_migration),
         ];
+
+        let agent_labels: Vec<String> = summary
+            .non_default_agent_images
+            .iter()
+            .map(|(name, _)| format!("Agent: {name}"))
+            .collect();
+        for (i, (_, status)) in summary.non_default_agent_images.iter().enumerate() {
+            rows.push((&agent_labels[i], status));
+        }
+
         let box_str = render_summary_box(
             &format!("Ready Summary ({})", summary.runtime_name),
             &rows,
@@ -89,6 +99,16 @@ impl ReadyFrontend for CliFrontend {
             &mut std::io::stderr(),
             format!("\n{box_str}amux is ready.\n").as_bytes(),
         );
+
+        let has_missing = summary.non_default_agent_images.iter().any(|(_, s)| {
+            matches!(s, StepStatus::Warn(_))
+        });
+        if has_missing {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"Tip: run \"ready --build\" to build all available agent images.\n",
+            );
+        }
         let _ = std::io::Write::flush(&mut std::io::stderr());
     }
 }

@@ -9,6 +9,7 @@ use crate::command::error::CommandError;
 use crate::engine::claws::{
     ClawsEngine, ClawsEngineOptions, ClawsFrontend, ClawsMode, ClawsSummary,
 };
+use crate::engine::message::{MessageLevel, UserMessage};
 use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +96,20 @@ impl Command for ClawsCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let session = open_session()?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "claws: opening shell in container…".into(),
+        });
+        let session = match open_session() {
+            Ok(s) => s,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("claws: failed to open session: {e}"),
+                });
+                return Err(e);
+            }
+        };
         let clone_dir = std::env::temp_dir().join("nanoclaw");
         let mode = self.flags.mode;
         let mut engine = ClawsEngine::new(
@@ -112,10 +126,21 @@ impl Command for ClawsCommand {
                 clone_dir,
             },
         );
-        let summary = engine
-            .run_to_completion(frontend.as_mut())
-            .await
-            .map_err(CommandError::from)?;
+        let summary = match engine.run_to_completion(frontend.as_mut()).await {
+            Ok(s) => s,
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("claws: run_to_completion failed: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "claws: container session ended".into(),
+        });
         frontend.replay_queued();
         Ok((mode, summary).into())
     }

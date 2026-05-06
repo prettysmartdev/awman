@@ -632,6 +632,7 @@ mod tests {
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
             legacy_migration: StepStatus::Skipped,
+            non_default_agent_images: Vec::new(),
             json_requested: false,
             refresh_requested: false,
         };
@@ -708,6 +709,7 @@ mod tests {
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
             legacy_migration: StepStatus::Skipped,
+            non_default_agent_images: Vec::new(),
             json_requested: true,
             refresh_requested: false,
         };
@@ -755,6 +757,7 @@ mod tests {
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
             legacy_migration: StepStatus::Skipped,
+            non_default_agent_images: Vec::new(),
             json_requested: true,
             refresh_requested: true,
         };

@@ -14,7 +14,7 @@ use crate::command::error::CommandError;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::container::options::ContainerOption;
-use crate::engine::message::UserMessageSink;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct SpecsNewFlags {
@@ -102,6 +102,14 @@ pub trait SpecsCommandFrontend:
         Box::new(NoopContainerFrontend)
     }
 
+    /// Like `container_frontend`, but yields a frontend that surrenders its
+    /// PTY I/O channels for direct bridging. Interactive container launches
+    /// call this so the PTY is wired to the TUI renderer.
+    /// Default falls back to `container_frontend`.
+    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+        self.container_frontend()
+    }
+
     /// PTY lifecycle gating around the agent run. Default: no-op.
     fn set_pty_active(&mut self, _active: bool) {}
 }
@@ -169,17 +177,36 @@ impl Command for SpecsCommand {
     ) -> Result<Self::Outcome, CommandError> {
         let outcome = match self.sub {
             SpecsSubcommand::New(f) => {
-                let new_outcome = create_new_spec(
+                let new_outcome = match create_new_spec(
                     &self.engines,
                     f.interview,
                     f.non_interactive,
                     frontend.as_mut(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("specs: failed to create new spec: {e}"),
+                        });
+                        return Err(e);
+                    }
+                };
                 SpecsOutcome::New(new_outcome)
             }
             SpecsSubcommand::Amend(f) => {
-                let session = open_session_for_cwd(&self.engines)?;
+                let session = match open_session_for_cwd(&self.engines) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("specs amend: failed to open session: {e}"),
+                        });
+                        return Err(e);
+                    }
+                };
                 let git_root = session.git_root().to_path_buf();
                 let work_items_dir = session
                     .repo_config()
@@ -199,12 +226,30 @@ impl Command for SpecsCommand {
                     }
                 }
                 if found.is_none() {
-                    return Err(CommandError::WorkItemNotFound { number: n });
+                    let err = CommandError::WorkItemNotFound { number: n };
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("specs amend: work item {:04} not found", n),
+                    });
+                    return Err(err);
                 }
 
                 // Run the amend agent to review the file against the
                 // implementation. Honors --non-interactive and --allow-docker.
-                let agent = resolve_agent(&None, &session)?;
+                let agent = match resolve_agent(&None, &session) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("specs amend: failed to resolve agent: {e}"),
+                        });
+                        return Err(e);
+                    }
+                };
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!("specs amend: reviewing work item {:04} with agent '{}'", n, agent.as_str()),
+                });
                 let prompt = render_amend_prompt(n);
                 let run_opts = AgentRunOptions {
                     initial_prompt: Some(prompt),
@@ -212,18 +257,45 @@ impl Command for SpecsCommand {
                     allow_docker: f.allow_docker,
                     ..Default::default()
                 };
-                let options = self
+                let options = match self
                     .engines
                     .agent_engine
-                    .build_options(&session, &agent, &run_opts)?;
-                let instance = self.engines.runtime.build(options)?;
+                    .build_options(&session, &agent, &run_opts)
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("specs amend: failed to build agent options: {e}"),
+                        });
+                        return Err(CommandError::from(e));
+                    }
+                };
+                let instance = match self.engines.runtime.build(options) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("specs amend: failed to build container instance: {e}"),
+                        });
+                        return Err(CommandError::from(e));
+                    }
+                };
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "Launching agent container…".into(),
+                });
                 frontend.set_pty_active(true);
-                let cf = frontend.container_frontend();
+                let cf = frontend.container_frontend_for_pty();
                 let mut execution = match instance.run_with_frontend(cf) {
                     Ok(e) => e,
                     Err(e) => {
                         frontend.set_pty_active(false);
                         frontend.replay_queued();
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("specs amend: failed to run container: {e}"),
+                        });
                         return Err(CommandError::from(e));
                     }
                 };
@@ -254,7 +326,16 @@ pub(crate) async fn create_new_spec(
     non_interactive: bool,
     frontend: &mut dyn SpecsCommandFrontend,
 ) -> Result<SpecsNewOutcome, CommandError> {
-    let session = open_session_for_cwd(engines)?;
+    let session = match open_session_for_cwd(engines) {
+        Ok(s) => s,
+        Err(e) => {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("specs new: failed to open session: {e}"),
+            });
+            return Err(e);
+        }
+    };
     let git_root = session.git_root().to_path_buf();
     let work_items_dir = session
         .repo_config()
@@ -264,18 +345,35 @@ pub(crate) async fn create_new_spec(
         .work_items_template_or_default(&git_root);
 
     if !template_path.exists() {
-        return Err(CommandError::SpecTemplateMissing {
+        let err = CommandError::SpecTemplateMissing {
             path: template_path.clone(),
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Error,
+            text: format!("specs new: spec template missing at {}", template_path.display()),
         });
+        return Err(err);
     }
-    let template = std::fs::read_to_string(&template_path).map_err(|e| {
-        CommandError::Other(format!(
-            "reading spec template {}: {e}",
-            template_path.display()
-        ))
-    })?;
+    let template = match std::fs::read_to_string(&template_path) {
+        Ok(t) => t,
+        Err(e) => {
+            let err = CommandError::Other(format!(
+                "reading spec template {}: {e}",
+                template_path.display()
+            ));
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("specs new: failed to read spec template {}: {e}", template_path.display()),
+            });
+            return Err(err);
+        }
+    };
 
     let next_n = next_work_item_number(&work_items_dir);
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!("specs new: creating work item {:04}", next_n),
+    });
     let kind = frontend.ask_spec_kind().unwrap_or(WorkItemKind::Task);
     let title = frontend.ask_spec_title().unwrap_or_else(|_| "Untitled".into());
     let summary = frontend.ask_spec_summary().unwrap_or_default();
@@ -283,24 +381,59 @@ pub(crate) async fn create_new_spec(
     let filename = format!("{:04}-{slug}.md", next_n);
     let dest = work_items_dir.join(&filename);
 
-    std::fs::create_dir_all(&work_items_dir).map_err(|e| {
-        CommandError::Other(format!(
-            "creating work-items dir {}: {e}",
-            work_items_dir.display()
-        ))
-    })?;
+    match std::fs::create_dir_all(&work_items_dir) {
+        Ok(()) => {}
+        Err(e) => {
+            let err = CommandError::Other(format!(
+                "creating work-items dir {}: {e}",
+                work_items_dir.display()
+            ));
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("specs new: failed to create work-items dir {}: {e}", work_items_dir.display()),
+            });
+            return Err(err);
+        }
+    }
 
     let number_str = format!("{next_n:04}");
     let body = apply_work_item_template(&template, kind, &title, &summary, &number_str);
-    std::fs::write(&dest, body)
-        .map_err(|e| CommandError::Other(format!("writing work item {}: {e}", dest.display())))?;
+    match std::fs::write(&dest, body) {
+        Ok(()) => {}
+        Err(e) => {
+            let err = CommandError::Other(format!("writing work item {}: {e}", dest.display()));
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("specs new: failed to write work item {}: {e}", dest.display()),
+            });
+            return Err(err);
+        }
+    }
 
     if interview {
-        let agent = resolve_agent(&None, &session)?;
-        let credentials = engines
+        let agent = match resolve_agent(&None, &session) {
+            Ok(a) => a,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("specs new: failed to resolve agent: {e}"),
+                });
+                return Err(e);
+            }
+        };
+        let credentials = match engines
             .auth_engine
             .resolve_agent_auth(&session, &agent)
-            .map_err(CommandError::from)?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("specs new: failed to resolve agent auth: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
         let prompt = render_interview_prompt(next_n, kind.as_str(), &title, &summary);
         let run_opts = AgentRunOptions {
             initial_prompt: Some(prompt),
@@ -308,22 +441,49 @@ pub(crate) async fn create_new_spec(
             env_passthrough: Some(session.effective_config().env_passthrough()),
             ..Default::default()
         };
-        let mut options = engines
+        let mut options = match engines
             .agent_engine
-            .build_options(&session, &agent, &run_opts)?;
+            .build_options(&session, &agent, &run_opts)
+        {
+            Ok(o) => o,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("specs new: failed to build agent options: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
         if !credentials.env_vars.is_empty() {
             options.push(ContainerOption::AgentCredentials {
                 env_vars: credentials.env_vars,
             });
         }
-        let instance = engines.runtime.build(options)?;
+        let instance = match engines.runtime.build(options) {
+            Ok(i) => i,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("specs new: failed to build container instance: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Launching interview agent…".into(),
+        });
         frontend.set_pty_active(true);
-        let cf = frontend.container_frontend();
+        let cf = frontend.container_frontend_for_pty();
         let mut execution = match instance.run_with_frontend(cf) {
             Ok(e) => e,
             Err(e) => {
                 frontend.set_pty_active(false);
                 frontend.replay_queued();
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("specs new: failed to run container: {e}"),
+                });
                 return Err(CommandError::from(e));
             }
         };

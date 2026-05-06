@@ -68,21 +68,28 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // Global shortcuts (available in all contexts except maximized container).
-    if ctx != FocusContext::ContainerMaximized {
-        if ctrl {
-            match key.code {
-                KeyCode::Char('t') => return Action::OpenNewTabDialog,
-                KeyCode::Char('a') => return Action::PreviousTab,
-                KeyCode::Char('d') => return Action::NextTab,
-                KeyCode::Char('c') => return Action::CloseTabOrQuit,
-                KeyCode::Char('m') => return Action::CycleContainerWindow,
-                _ => {}
-            }
+    // Global shortcuts — available in ALL contexts including maximized container.
+    if ctrl {
+        match key.code {
+            KeyCode::Char('t') => return Action::OpenNewTabDialog,
+            KeyCode::Char('a') => return Action::PreviousTab,
+            KeyCode::Char('d') => return Action::NextTab,
+            KeyCode::Char('m') => return Action::CycleContainerWindow,
+            _ => {}
         }
-        if key.code == KeyCode::Char(',') && ctrl {
-            return Action::OpenConfigShow;
+    }
+
+    // Ctrl-C: forward to PTY when the container is maximized (so the
+    // signal reaches the process inside the container); otherwise
+    // trigger the close-tab / quit dialog.
+    if ctrl && key.code == KeyCode::Char('c') {
+        if ctx == FocusContext::ContainerMaximized {
+            return Action::ForwardToPty(key);
         }
+        return Action::CloseTabOrQuit;
+    }
+    if key.code == KeyCode::Char(',') && ctrl {
+        return Action::OpenConfigShow;
     }
 
     match ctx {
@@ -92,8 +99,6 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
         FocusContext::ContainerMaximized => {
             if ctrl && key.code == KeyCode::Char('y') {
                 Action::CopySelection
-            } else if ctrl && key.code == KeyCode::Char('m') {
-                Action::CycleContainerWindow
             } else {
                 Action::ForwardToPty(key)
             }
@@ -218,11 +223,24 @@ mod tests {
 
     #[test]
     fn ctrl_c_closes_tab_or_quits() {
-        let action = map_key(
-            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        for ctx in [
             FocusContext::CommandBox,
-        );
-        assert_eq!(action, Action::CloseTabOrQuit);
+            FocusContext::ExecutionWindow,
+            FocusContext::Dialog,
+        ] {
+            let action = map_key(
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                ctx,
+            );
+            assert_eq!(action, Action::CloseTabOrQuit);
+        }
+    }
+
+    #[test]
+    fn ctrl_c_in_maximized_container_forwards_to_pty() {
+        let k = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let action = map_key(k.clone(), FocusContext::ContainerMaximized);
+        assert_eq!(action, Action::ForwardToPty(k));
     }
 
     #[test]
@@ -522,10 +540,9 @@ mod tests {
     }
 
     #[test]
-    fn global_ctrl_t_not_available_in_maximized_container() {
-        // Global shortcuts are suppressed in ContainerMaximized — key goes to PTY.
+    fn global_ctrl_t_available_in_maximized_container() {
         let k = key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        let action = map_key(k.clone(), FocusContext::ContainerMaximized);
-        assert_eq!(action, Action::ForwardToPty(k));
+        let action = map_key(k, FocusContext::ContainerMaximized);
+        assert_eq!(action, Action::OpenNewTabDialog);
     }
 }

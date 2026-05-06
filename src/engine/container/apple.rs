@@ -146,6 +146,92 @@ impl ContainerBackend for AppleBackend {
         Ok(handles)
     }
 
+    fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+        let output = Command::new("container")
+            .args(["list", "--format", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            _ => return Ok(Vec::new()),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut handles = Vec::new();
+        let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&stdout);
+        let rows: Vec<serde_json::Value> = match arr {
+            Ok(v) => v,
+            Err(_) => stdout
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect(),
+        };
+        for row in rows {
+            let labels = row
+                .get("Labels")
+                .or_else(|| row.get("labels"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let row_name = {
+                let val = row.get("Names")
+                    .or_else(|| row.get("Name"))
+                    .or_else(|| row.get("name"));
+                match val {
+                    Some(v) if v.is_array() => v.as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.trim_start_matches('/'))
+                        .unwrap_or_default()
+                        .to_string(),
+                    Some(v) => v.as_str()
+                        .map(|s| s.trim_start_matches('/'))
+                        .unwrap_or_default()
+                        .to_string(),
+                    None => String::new(),
+                }
+            };
+            if !labels.contains("amux")
+                && !row_name.starts_with("amux-")
+                && !row_name.contains("nanoclaw")
+            {
+                continue;
+            }
+            let id = row
+                .get("ID")
+                .or_else(|| row.get("Id"))
+                .or_else(|| row.get("id"))
+                .or_else(|| row.get("ContainerID"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let name = row_name;
+            let image_tag = row
+                .get("Image")
+                .or_else(|| row.get("image"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let started_at = row
+                .get("CreatedAt")
+                .or_else(|| row.get("Created"))
+                .or_else(|| row.get("created"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            if id.is_empty() && name.is_empty() {
+                continue;
+            }
+            handles.push(ContainerHandle {
+                id,
+                image_tag,
+                name,
+                started_at,
+            });
+        }
+        Ok(handles)
+    }
+
     fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
         let output = Command::new("container")
             .args([

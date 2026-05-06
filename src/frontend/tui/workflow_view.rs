@@ -14,8 +14,6 @@
 //! - When more parallel steps exist than rows fit, the last visible row
 //!   becomes a `+ N more…` overflow box.
 
-use std::collections::BTreeMap;
-
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
@@ -145,26 +143,54 @@ pub fn render_workflow_strip(
     }
 }
 
-/// Group steps into columns by sorted `depends_on` signature. Steps with the
-/// same dependency set sit in the same column (parallel group). Columns are
-/// emitted in insertion order so the resulting layout reflects topological
-/// order.
+/// Group steps into columns by topological depth. Steps at the same depth
+/// form a parallel group (same column). Depth is the longest path from any
+/// root (step with no dependencies) to this step. Steps that share the exact
+/// same set of dependencies at the same depth are grouped together — steps
+/// that depend on members of the previous parallel group all land in the next
+/// column regardless of which specific member they depend on.
 fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepView>> {
-    let mut by_signature: BTreeMap<String, Vec<&WorkflowStepView>> = BTreeMap::new();
-    let mut order: Vec<String> = Vec::new();
-    for step in &state.steps {
-        let mut deps = step.depends_on.clone();
-        deps.sort();
-        let signature = deps.join("|");
-        if !by_signature.contains_key(&signature) {
-            order.push(signature.clone());
+    use std::collections::HashMap;
+
+    let step_names: HashMap<&str, usize> = state
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+
+    let mut depths: Vec<usize> = vec![0; state.steps.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (i, step) in state.steps.iter().enumerate() {
+            for dep in &step.depends_on {
+                if let Some(&dep_idx) = step_names.get(dep.as_str()) {
+                    let new_depth = depths[dep_idx] + 1;
+                    if new_depth > depths[i] {
+                        depths[i] = new_depth;
+                        changed = true;
+                    }
+                }
+            }
         }
-        by_signature.entry(signature).or_default().push(step);
     }
-    order
-        .into_iter()
-        .filter_map(|sig| by_signature.remove(&sig))
-        .collect()
+
+    let max_depth = depths.iter().copied().max().unwrap_or(0);
+    let mut columns: Vec<Vec<&WorkflowStepView>> = Vec::with_capacity(max_depth + 1);
+    for d in 0..=max_depth {
+        let col: Vec<&WorkflowStepView> = state
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| depths[*i] == d)
+            .map(|(_, s)| s)
+            .collect();
+        if !col.is_empty() {
+            columns.push(col);
+        }
+    }
+    columns
 }
 
 /// Compute the label text + style for a step box.
@@ -243,18 +269,36 @@ mod tests {
     }
 
     #[test]
-    fn build_workflow_columns_groups_by_dependency_signature() {
+    fn build_workflow_columns_groups_by_topological_depth() {
         let v = view(vec![
             step("a", "done", vec![]),
             step("b", "done", vec![]),
             step("c", "running", vec!["a", "b"]),
         ]);
         let cols = build_workflow_columns(&v);
-        // a + b both depend on nothing → same column. c depends on a,b → next column.
+        // a + b at depth 0 → same column. c at depth 1 → next column.
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].len(), 2);
         assert_eq!(cols[1].len(), 1);
         assert_eq!(cols[1][0].name, "c");
+    }
+
+    #[test]
+    fn build_workflow_columns_parallel_deps_land_same_column() {
+        // D depends on B, E depends on C. Both B and C are at depth 1,
+        // so D and E should both be at depth 2 (same column).
+        let v = view(vec![
+            step("a", "done", vec![]),
+            step("b", "done", vec!["a"]),
+            step("c", "done", vec!["a"]),
+            step("d", "running", vec!["b"]),
+            step("e", "running", vec!["c"]),
+        ]);
+        let cols = build_workflow_columns(&v);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].len(), 1); // a
+        assert_eq!(cols[1].len(), 2); // b, c
+        assert_eq!(cols[2].len(), 2); // d, e
     }
 
     #[test]

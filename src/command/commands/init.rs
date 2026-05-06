@@ -8,6 +8,7 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
 use crate::engine::init::{InitEngine, InitEngineOptions, InitFrontend, InitSummary};
+use crate::engine::message::{MessageLevel, UserMessage};
 use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone)]
@@ -74,13 +75,44 @@ impl Command for InitCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let agent_name = AgentName::new(self.flags.agent.clone()).map_err(CommandError::from)?;
-        let session = build_throwaway_session()?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "init: initializing amux for this repository".into(),
+        });
+        let agent_name = match AgentName::new(self.flags.agent.clone()) {
+            Ok(n) => n,
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("init: invalid agent name: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        };
+        let session = match build_throwaway_session() {
+            Ok(s) => s,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("init: failed to create session: {e}"),
+                });
+                return Err(e);
+            }
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("init: resolved git root at {:?}", session.git_root()),
+        });
         let options = InitEngineOptions {
             agent: agent_name,
             run_aspec_setup: self.flags.aspec,
             git_root: session.git_root().to_path_buf(),
         };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("init: configuring agent '{}'", &self.flags.agent),
+        });
         let mut engine = InitEngine::new(
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
@@ -89,10 +121,25 @@ impl Command for InitCommand {
             self.engines.agent_engine.clone(),
             options,
         );
-        let summary = engine
-            .run_to_completion(frontend.as_mut())
-            .await
-            .map_err(CommandError::from)?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "init: running initialization steps (directories, config, image build)".into(),
+        });
+        let summary = match engine.run_to_completion(frontend.as_mut()).await {
+            Ok(s) => s,
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("init: engine run_to_completion failed: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "init: configuration written successfully".into(),
+        });
         frontend.replay_queued();
         Ok(InitOutcome {
             agent: self.flags.agent,

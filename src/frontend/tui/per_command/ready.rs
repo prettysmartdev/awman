@@ -69,8 +69,48 @@ impl ReadyFrontend for TuiCommandFrontend {
         Box::new(super::TuiContainerProxy::new(self.status_log.clone()))
     }
 
-    fn report_summary(&mut self, _summary: &ReadySummary) {
-        self.messages.success("ready completed");
+    fn report_summary(&mut self, summary: &ReadySummary) {
+        use crate::frontend::cli::per_command::helpers::render_summary_box;
+        let mut rows: Vec<(&str, &crate::engine::step_status::StepStatus)> = vec![
+            ("Dockerfile", &summary.dockerfile),
+            ("Base image", &summary.base_image),
+            ("Agent image", &summary.agent_image),
+            ("Local agent", &summary.local_agent),
+            ("Audit", &summary.audit),
+            ("Legacy migration", &summary.legacy_migration),
+            ("aspec folder", &summary.aspec_folder),
+            ("Config", &summary.work_items_config),
+        ];
+
+        // Owned strings for non-default agent labels.
+        let agent_labels: Vec<String> = summary
+            .non_default_agent_images
+            .iter()
+            .map(|(name, _)| format!("Agent: {name}"))
+            .collect();
+        for (i, (_, status)) in summary.non_default_agent_images.iter().enumerate() {
+            rows.push((&agent_labels[i], status));
+        }
+
+        let box_str = render_summary_box(
+            &format!("Ready Summary ({})", summary.runtime_name),
+            &rows,
+        );
+        for line in box_str.lines() {
+            let s: String = line.to_string();
+            self.messages.info(s);
+        }
+
+        let has_missing = summary.non_default_agent_images.iter().any(|(_, s)| {
+            matches!(s, crate::engine::step_status::StepStatus::Warn(_))
+        });
+        if has_missing {
+            self.messages.info(
+                "Tip: run \"ready --build\" to build all available agent images.".to_string()
+            );
+        }
+
+        self.messages.success("amux is ready.".to_string());
     }
 }
 
@@ -106,6 +146,9 @@ mod tests {
         };
         let workflow_view = std::sync::Arc::new(std::sync::Mutex::new(None));
         let yolo_state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let pty_reset_flag = std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        );
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -114,6 +157,7 @@ mod tests {
             container_io,
             workflow_view,
             yolo_state,
+            pty_reset_flag,
         );
         (frontend, req_rx, resp_tx)
     }

@@ -28,7 +28,7 @@ use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::container::instance::ContainerExitInfo;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 use crate::engine::error::EngineError;
-use crate::engine::message::{UserMessage, UserMessageSink};
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
     WorkflowStepStatus, YoloTickOutcome,
@@ -210,6 +210,9 @@ impl ContainerFrontend for ImplementContainerFrontendProxy {
     fn resize_pty(&mut self, cols: u16, rows: u16) {
         self.0.lock().unwrap().resize_pty(cols, rows);
     }
+    fn take_container_io(&mut self) -> Option<crate::engine::container::frontend::ContainerIo> {
+        self.0.lock().unwrap().take_container_io()
+    }
 }
 
 // ─── CommandLayerFactory ─────────────────────────────────────────────────────
@@ -281,6 +284,10 @@ impl Command for ImplementCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("implement: resolving work item {}", self.flags.work_item),
+        });
         let synthetic_prompt = if self.flags.workflow.is_none() {
             Some(render_default_prompt(&self.flags.work_item))
         } else {
@@ -289,19 +296,44 @@ impl Command for ImplementCommand {
         let workflow_used = self.flags.workflow.as_ref().map(|p| p.display().to_string());
 
         // Load or construct workflow.
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: match &self.flags.workflow {
+                Some(path) => format!("implement: loading workflow from {}", path.display()),
+                None => "implement: constructing single-step workflow".into(),
+            },
+        });
         let workflow: Workflow = match &self.flags.workflow {
-            Some(path) => Workflow::load(path)
-                .map_err(|e| CommandError::Other(format!("loading workflow: {e}")))?,
+            Some(path) => match Workflow::load(path) {
+                Ok(w) => w,
+                Err(e) => {
+                    let cmd_err = CommandError::Other(format!("loading workflow: {e}"));
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("implement: failed to load workflow: {e}"),
+                    });
+                    return Err(cmd_err);
+                }
+            },
             None => {
                 let prompt = render_default_prompt(&self.flags.work_item);
-                Workflow::parse(
+                match Workflow::parse(
                     &format!(
                         "[[steps]]\nname = \"implement\"\nagent = \"claude\"\nprompt_template = {:?}\n",
                         prompt
                     ),
                     WorkflowFormat::Toml,
-                )
-                .map_err(|e| CommandError::Other(format!("building synthetic workflow: {e}")))?
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let cmd_err = CommandError::Other(format!("building synthetic workflow: {e}"));
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("implement: failed to build synthetic workflow: {e}"),
+                        });
+                        return Err(cmd_err);
+                    }
+                }
             }
         };
 
@@ -313,29 +345,62 @@ impl Command for ImplementCommand {
             .git_engine
             .resolve_root(&cwd)
             .unwrap_or_else(|_| cwd.clone());
-        let _mount_path = MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut())?;
+        let _mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
+            Ok(p) => p,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("implement: mount scope resolution failed: {e}"),
+                });
+                return Err(e);
+            }
+        };
 
         // Worktree prepare.
 
         let worktree_lifecycle = if self.flags.worktree {
-            let git_root = self
-                .engines
-                .git_engine
-                .resolve_root(&cwd)
-                .map_err(CommandError::from)?;
-            let lifecycle = WorktreeLifecycle::for_work_item(
+            let git_root = match self.engines.git_engine.resolve_root(&cwd) {
+                Ok(r) => r,
+                Err(e) => {
+                    let cmd_err = CommandError::from(e);
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("implement: failed to resolve git root for worktree: {cmd_err}"),
+                    });
+                    return Err(cmd_err);
+                }
+            };
+            let lifecycle = match WorktreeLifecycle::for_work_item(
                 Arc::clone(&self.engines.git_engine),
                 git_root,
                 parse_work_item_number(&self.flags.work_item),
-            )?;
-            lifecycle.prepare(&mut *frontend).await?;
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("implement: worktree lifecycle creation failed: {e}"),
+                    });
+                    return Err(e);
+                }
+            };
+            match lifecycle.prepare(&mut *frontend).await {
+                Ok(_) => {}
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("implement: worktree prepare failed: {e}"),
+                    });
+                    return Err(e);
+                }
+            }
             Some(lifecycle)
         } else {
             None
         };
 
         // Parse CLI overlay specs before any async work so errors surface early.
-        let cli_overlays = self
+        let cli_overlays = match self
             .flags
             .overlay
             .iter()
@@ -345,7 +410,17 @@ impl Command for ImplementCommand {
                     reason,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("implement: invalid overlay spec: {e}"),
+                });
+                return Err(e);
+            }
+        };
 
         frontend.set_pty_active(true);
 
@@ -354,18 +429,40 @@ impl Command for ImplementCommand {
 
         let flags_arc = Arc::new(self.flags.clone());
 
-        let git_root_for_session = Arc::clone(&self.engines.git_engine)
-            .resolve_root(&cwd)
-            .map_err(CommandError::from)?;
-        let session = Session::open_at_git_root(
+        let git_root_for_session = match Arc::clone(&self.engines.git_engine).resolve_root(&cwd) {
+            Ok(r) => r,
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("implement: failed to resolve git root for session: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        };
+        let session = match Session::open_at_git_root(
             cwd,
             git_root_for_session,
             crate::data::session::SessionOpenOptions::default(),
-        )
-        .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let cmd_err = CommandError::Other(format!("opening session: {e}"));
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("implement: failed to open session: {e}"),
+                });
+                return Err(cmd_err);
+            }
+        };
 
         // Merge CLI overlays with config/env sources now that session is available.
         let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
+
+        shared.lock().unwrap().write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "implement: launching agent container…".into(),
+        });
 
         let (engine_result, step_counts) = {
             let proxy = ImplementWorkflowProxy(Arc::clone(&shared));
@@ -375,15 +472,24 @@ impl Command for ImplementCommand {
                 flags: Arc::clone(&flags_arc),
                 directory_overlays,
             };
-            let mut engine = WorkflowEngine::new(
+            let mut engine = match WorkflowEngine::new(
                 &session,
                 workflow,
                 Box::new(proxy),
                 Box::new(factory),
                 Arc::clone(&self.engines.git_engine),
                 Arc::clone(&self.engines.overlay_engine),
-            )
-            .map_err(CommandError::from)?;
+            ) {
+                Ok(eng) => eng,
+                Err(e) => {
+                    let cmd_err = CommandError::from(e);
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("implement: workflow engine creation failed: {cmd_err}"),
+                    });
+                    return Err(cmd_err);
+                }
+            };
             let result = engine.run_to_completion().await;
             let mut completed = 0usize;
             let mut failed = 0usize;
@@ -405,6 +511,22 @@ impl Command for ImplementCommand {
             .unwrap();
 
         frontend.set_pty_active(false);
+
+        if matches!(
+            &engine_result,
+            Err(_) | Ok(WorkflowOutcome::Failed { .. }) | Ok(WorkflowOutcome::Aborted)
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "implement: step failed".into(),
+            });
+        } else {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "implement: step completed successfully".into(),
+            });
+        }
+
         frontend.replay_queued();
 
         let had_error = matches!(
@@ -421,11 +543,30 @@ impl Command for ImplementCommand {
         });
 
         if let Some(lifecycle) = worktree_lifecycle {
-            lifecycle.finalize(&mut *frontend, had_error).await?;
+            match lifecycle.finalize(&mut *frontend, had_error).await {
+                Ok(()) => {}
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("implement: worktree finalize failed: {e}"),
+                    });
+                    return Err(e);
+                }
+            }
             frontend.replay_queued();
         }
 
-        engine_result.map_err(CommandError::from)?;
+        match engine_result {
+            Ok(_) => {}
+            Err(e) => {
+                let cmd_err = CommandError::from(e);
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("implement: workflow engine failed: {cmd_err}"),
+                });
+                return Err(cmd_err);
+            }
+        }
 
         Ok(ImplementOutcome {
             work_item: self.flags.work_item,

@@ -2,7 +2,7 @@ title = "Implement Hard Feature Workflow"
 
 [[step]]
 name = "implement"
-model = "claude-opus-4-7"
+model = "claude-opus-4-6"
 prompt = """
 Implement work item {{work_item_number}}, adhering strongly to its implementation plan. Iterate until the work item is comprehensively implemented, the build succeeds, and all existing tests pass. DO NOT write any new tests yet, just fix any you break. New tests will be implemented in the next step. Do not write or change any docs yet, that will happen in a future step.
 

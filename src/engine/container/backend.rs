@@ -20,6 +20,12 @@ pub(super) trait ContainerBackend: Send + Sync {
 
     fn list_running(&self, session: &Session) -> Result<Vec<ContainerHandle>, EngineError>;
 
+    /// List all running amux containers without requiring a session.
+    /// Default falls back to an empty list.
+    fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+
     fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError>;
 
     fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError>;

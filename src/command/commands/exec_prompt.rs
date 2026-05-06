@@ -14,7 +14,7 @@ use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
-use crate::engine::message::UserMessageSink;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct ExecPromptCommandFlags {
@@ -100,10 +100,32 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let session = open_session_for_cwd(&self.engines)?;
-        let agent = resolve_agent(&self.flags.agent, &session)?;
+        let session = match open_session_for_cwd(&self.engines) {
+            Ok(s) => s,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: failed to open session: {e}"),
+                });
+                return Err(e);
+            }
+        };
+        let agent = match resolve_agent(&self.flags.agent, &session) {
+            Ok(a) => a,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: failed to resolve agent: {e}"),
+                });
+                return Err(e);
+            }
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("exec prompt: using agent '{}'", agent.as_str()),
+        });
 
-        let cli_overlays = self
+        let cli_overlays = match self
             .flags
             .overlay
             .iter()
@@ -113,25 +135,56 @@ impl Command for ExecPromptCommand {
                     reason,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: invalid overlay spec: {e}"),
+                });
+                return Err(e);
+            }
+        };
         let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
-        // Ensure the agent is available (downloads + builds when missing).
-        ensure_exec_prompt_agent_setup(
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Checking agent availability…".into(),
+        });
+        if let Err(e) = ensure_exec_prompt_agent_setup(
             self.engines.agent_engine.as_ref(),
             &session,
             &agent,
             &mut frontend,
         )
-        .await?;
+        .await
+        {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec prompt: agent setup failed: {e}"),
+            });
+            return Err(e);
+        }
 
-        // Resolve agent credentials so the running container can reach its
-        // backend.
-        let credentials = self
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Resolving agent credentials…".into(),
+        });
+        let credentials = match self
             .engines
             .auth_engine
             .resolve_agent_auth(&session, &agent)
-            .map_err(CommandError::from)?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: credential resolution failed: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
 
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
@@ -147,24 +200,51 @@ impl Command for ExecPromptCommand {
             ..Default::default()
         };
 
-        let mut options = self
+        let mut options = match self
             .engines
             .agent_engine
-            .build_options(&session, &agent, &run_opts)?;
+            .build_options(&session, &agent, &run_opts)
+        {
+            Ok(o) => o,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: failed to build container options: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
         if !credentials.env_vars.is_empty() {
             options.push(crate::engine::container::options::ContainerOption::AgentCredentials {
                 env_vars: credentials.env_vars,
             });
         }
 
-        let instance = self.engines.runtime.build(options)?;
+        let instance = match self.engines.runtime.build(options) {
+            Ok(i) => i,
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: failed to build container: {e}"),
+                });
+                return Err(CommandError::from(e));
+            }
+        };
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Launching agent container…".into(),
+        });
         frontend.set_pty_active(true);
-        let container_frontend = frontend.container_frontend();
+        let container_frontend = frontend.container_frontend_for_pty();
         let mut execution = match instance.run_with_frontend(container_frontend) {
             Ok(e) => e,
             Err(e) => {
                 frontend.set_pty_active(false);
                 frontend.replay_queued();
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: container launch failed: {e}"),
+                });
                 return Err(CommandError::from(e));
             }
         };
@@ -173,6 +253,10 @@ impl Command for ExecPromptCommand {
         frontend.replay_queued();
 
         let exit_code = exit.map(|e| e.exit_code).ok();
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "Agent session ended".into(),
+        });
         Ok(ExecPromptOutcome {
             agent: Some(agent.as_str().to_string()),
             exit_code,
