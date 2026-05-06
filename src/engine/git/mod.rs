@@ -13,6 +13,40 @@ use crate::data::worktree_paths::{
     worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
 };
 use crate::engine::error::EngineError;
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+
+/// Run a git command and log both the command line and output to the sink.
+fn run_git_logged(
+    args: &[&str],
+    cwd: &Path,
+    sink: &mut dyn UserMessageSink,
+) -> Result<std::process::Output, EngineError> {
+    let cmd_str = format!("git {}", args.join(" "));
+    sink.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!("$ {cmd_str}"),
+    });
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| EngineError::Git(format!("invoke `{cmd_str}`: {e}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().chain(stderr.lines()) {
+        if !line.trim().is_empty() {
+            sink.write_message(UserMessage {
+                level: if output.status.success() {
+                    MessageLevel::Info
+                } else {
+                    MessageLevel::Warning
+                },
+                text: line.to_string(),
+            });
+        }
+    }
+    Ok(output)
+}
 
 /// Parsed `git --version` result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +309,151 @@ impl GitEngine {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    // ─── Logged variants ──────────────────────────────────────────────
+    //
+    // These methods mirror the unlogged methods above but push every git
+    // command and its output to a `UserMessageSink`. Used from the
+    // `WorktreeLifecycle` command layer so the user can see exactly what
+    // amux is doing.
+
+    pub fn uncommitted_files_logged(
+        &self,
+        path: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<Vec<String>, EngineError> {
+        let output = run_git_logged(&["status", "--porcelain"], path, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git status failed: {}",
+                stderr.trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect())
+    }
+
+    pub fn commit_all_logged(
+        &self,
+        path: &Path,
+        message: &str,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        let add = run_git_logged(&["add", "-A"], path, sink)?;
+        if !add.status.success() {
+            let stderr = String::from_utf8_lossy(&add.stderr);
+            return Err(EngineError::Git(format!("git add -A failed: {}", stderr.trim())));
+        }
+        let commit = run_git_logged(&["commit", "-m", message], path, sink)?;
+        if !commit.status.success() {
+            let stderr = String::from_utf8_lossy(&commit.stderr);
+            return Err(EngineError::Git(format!(
+                "git commit failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn create_worktree_logged(
+        &self,
+        git_root: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        std::fs::create_dir_all(worktree_path.parent().unwrap_or(worktree_path))
+            .map_err(|e| EngineError::io(worktree_path, e))?;
+        let wt_str = worktree_path
+            .to_str()
+            .ok_or_else(|| EngineError::Git("worktree path not UTF-8".into()))?;
+        let args: Vec<&str> = if self.branch_exists(git_root, branch) {
+            vec!["worktree", "add", wt_str, branch]
+        } else {
+            vec!["worktree", "add", wt_str, "-b", branch]
+        };
+        let output = run_git_logged(&args, git_root, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git worktree add failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn remove_worktree_logged(
+        &self,
+        git_root: &Path,
+        worktree_path: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        let wt_str = worktree_path
+            .to_str()
+            .ok_or_else(|| EngineError::Git("worktree path not UTF-8".into()))?;
+        let output = run_git_logged(
+            &["worktree", "remove", "--force", wt_str],
+            git_root,
+            sink,
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git worktree remove failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn merge_branch_logged(
+        &self,
+        git_root: &Path,
+        branch: &str,
+        worktree_path: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        let output = run_git_logged(&["merge", "--squash", branch], git_root, sink)?;
+        if !output.status.success() {
+            return Err(EngineError::MergeConflict {
+                branch: branch.to_string(),
+                worktree_path: worktree_path.to_path_buf(),
+            });
+        }
+        let message = format!("Implement {branch}");
+        let output = run_git_logged(&["commit", "-m", &message], git_root, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git commit failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn delete_branch_logged(
+        &self,
+        git_root: &Path,
+        branch: &str,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        let output = run_git_logged(&["branch", "-D", branch], git_root, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git branch -D failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
     }
 }
 

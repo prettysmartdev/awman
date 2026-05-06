@@ -121,7 +121,19 @@ impl WorkflowFrontend for TuiCommandFrontend {
         // Signal the TUI event loop to reset the vt100 parser for the new step.
         self.pty_reset_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        // Update container agent display name for the new step.
+
+        // Recreate container I/O channels so the new step's container gets
+        // fresh stdin/resize channels (stdout reuses the same TUI receiver).
+        // The new senders are published via shared slots so the TUI event loop
+        // picks them up on the next tick.
+        self.recreate_container_io();
+
+        // Clear the container name so the TUI picks up the new container's
+        // name when the engine reports it.
+        if let Ok(mut name) = self.container_name_shared.lock() {
+            *name = None;
+        }
+
         self.messages.info(format!(
             "Launching agent '{}' in new container...",
             agent
@@ -254,7 +266,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
                     status: workflow_status_str(&s.status).to_string(),
                     agent: Some(s.agent.clone()),
                     model: s.model.clone(),
-                    depends_on: Vec::new(), // Engine doesn't expose this here yet
+                    depends_on: s.depends_on.clone(),
                 })
                 .collect();
             view.current_step = steps
@@ -316,6 +328,8 @@ mod tests {
         let pty_reset_flag = std::sync::Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         );
+        let stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -325,6 +339,9 @@ mod tests {
             workflow_view,
             yolo_state,
             pty_reset_flag,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stdin_tx_shared,
+            resize_tx_shared,
         );
         (frontend, req_rx, resp_tx)
     }

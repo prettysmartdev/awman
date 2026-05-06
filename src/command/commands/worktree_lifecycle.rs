@@ -38,6 +38,7 @@ pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
     fn ask_pre_worktree_uncommitted_files(
         &mut self,
         files: &[String],
+        suggested_message: &str,
     ) -> Result<PreWorktreeDecision, CommandError>;
 
     fn ask_existing_worktree(
@@ -58,6 +59,7 @@ pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
         &mut self,
         branch: &str,
         files: &[String],
+        suggested_message: &str,
     ) -> Result<Option<String>, CommandError>;
 
     fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError>;
@@ -147,15 +149,16 @@ impl WorktreeLifecycle {
                 }
                 ExistingWorktreeDecision::Recreate => {
                     self.git_engine
-                        .remove_worktree(&self.git_root, &self.worktree_path)?;
+                        .remove_worktree_logged(&self.git_root, &self.worktree_path, frontend)?;
                 }
             }
         } else {
-            let files = self.git_engine.uncommitted_files(&self.git_root)?;
+            let files = self.git_engine.uncommitted_files_logged(&self.git_root, frontend)?;
             if !files.is_empty() {
-                match frontend.ask_pre_worktree_uncommitted_files(&files)? {
+                let suggested = format!("WIP: pre-worktree commit for {}", self.branch);
+                match frontend.ask_pre_worktree_uncommitted_files(&files, &suggested)? {
                     PreWorktreeDecision::Commit { message } => {
-                        self.git_engine.commit_all(&self.git_root, &message)?;
+                        self.git_engine.commit_all_logged(&self.git_root, &message, frontend)?;
                     }
                     PreWorktreeDecision::UseLastCommit => {}
                     PreWorktreeDecision::Abort => return Err(CommandError::Aborted),
@@ -163,7 +166,7 @@ impl WorktreeLifecycle {
             }
         }
         self.git_engine
-            .create_worktree(&self.git_root, &self.worktree_path, &self.branch)?;
+            .create_worktree_logged(&self.git_root, &self.worktree_path, &self.branch, frontend)?;
         frontend.report_worktree_created(&self.worktree_path, &self.branch);
         Ok(self.worktree_path.clone())
     }
@@ -176,12 +179,13 @@ impl WorktreeLifecycle {
         let action = frontend.ask_post_workflow_action(&self.branch, had_error)?;
         match action {
             PostWorkflowWorktreeAction::Merge => {
-                let files = self.git_engine.uncommitted_files(&self.worktree_path)?;
+                let files = self.git_engine.uncommitted_files_logged(&self.worktree_path, frontend)?;
                 if !files.is_empty() {
+                    let suggested = format!("Implement {}", self.branch);
                     if let Some(msg) = frontend
-                        .ask_worktree_commit_before_merge(&self.branch, &files)?
+                        .ask_worktree_commit_before_merge(&self.branch, &files, &suggested)?
                     {
-                        self.git_engine.commit_all(&self.worktree_path, &msg)?;
+                        self.git_engine.commit_all_logged(&self.worktree_path, &msg, frontend)?;
                     }
                 }
                 if !frontend.confirm_squash_merge(&self.branch)? {
@@ -190,16 +194,16 @@ impl WorktreeLifecycle {
                 }
                 match self
                     .git_engine
-                    .merge_branch(&self.git_root, &self.branch, &self.worktree_path)
+                    .merge_branch_logged(&self.git_root, &self.branch, &self.worktree_path, frontend)
                 {
                     Ok(()) => {
                         if frontend
                             .confirm_worktree_cleanup(&self.branch, &self.worktree_path)?
                         {
                             self.git_engine
-                                .remove_worktree(&self.git_root, &self.worktree_path)?;
+                                .remove_worktree_logged(&self.git_root, &self.worktree_path, frontend)?;
                             self.git_engine
-                                .delete_branch(&self.git_root, &self.branch)?;
+                                .delete_branch_logged(&self.git_root, &self.branch, frontend)?;
                             frontend.report_worktree_discarded(&self.branch);
                         } else {
                             frontend.report_worktree_kept(&self.worktree_path, &self.branch);
@@ -217,9 +221,9 @@ impl WorktreeLifecycle {
             }
             PostWorkflowWorktreeAction::Discard => {
                 self.git_engine
-                    .remove_worktree(&self.git_root, &self.worktree_path)?;
+                    .remove_worktree_logged(&self.git_root, &self.worktree_path, frontend)?;
                 self.git_engine
-                    .delete_branch(&self.git_root, &self.branch)?;
+                    .delete_branch_logged(&self.git_root, &self.branch, frontend)?;
                 frontend.report_worktree_discarded(&self.branch);
             }
             PostWorkflowWorktreeAction::Keep => {
@@ -302,6 +306,7 @@ mod tests {
         fn ask_pre_worktree_uncommitted_files(
             &mut self,
             _files: &[String],
+            _suggested_message: &str,
         ) -> Result<PreWorktreeDecision, CommandError> {
             Ok(self.pre_uncommitted_response.clone())
         }
@@ -331,6 +336,7 @@ mod tests {
             &mut self,
             _branch: &str,
             _files: &[String],
+            _suggested_message: &str,
         ) -> Result<Option<String>, CommandError> {
             Ok(self.commit_before_merge_response.clone())
         }
@@ -765,9 +771,9 @@ mod tests {
         }
         impl WorktreeLifecycleFrontend for ErrorRecordingFrontend {
             fn ask_pre_worktree_uncommitted_files(
-                &mut self, files: &[String],
+                &mut self, files: &[String], suggested_message: &str,
             ) -> Result<PreWorktreeDecision, CommandError> {
-                self.inner.ask_pre_worktree_uncommitted_files(files)
+                self.inner.ask_pre_worktree_uncommitted_files(files, suggested_message)
             }
             fn ask_existing_worktree(
                 &mut self, path: &Path, branch: &str,
@@ -784,9 +790,9 @@ mod tests {
                 self.inner.ask_post_workflow_action(branch, had_error)
             }
             fn ask_worktree_commit_before_merge(
-                &mut self, branch: &str, files: &[String],
+                &mut self, branch: &str, files: &[String], suggested_message: &str,
             ) -> Result<Option<String>, CommandError> {
-                self.inner.ask_worktree_commit_before_merge(branch, files)
+                self.inner.ask_worktree_commit_before_merge(branch, files, suggested_message)
             }
             fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError> {
                 self.inner.confirm_squash_merge(branch)

@@ -28,6 +28,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
     fn ask_pre_worktree_uncommitted_files(
         &mut self,
         files: &[String],
+        suggested_message: &str,
     ) -> Result<PreWorktreeDecision, CommandError> {
         if !stdin_is_tty() {
             return Ok(PreWorktreeDecision::UseLastCommit);
@@ -45,13 +46,12 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         eprintln!("  [c]ommit / [u]se last commit / [a]bort");
         match read_line_or_default('u') {
             'c' | 'C' => {
-                let default_msg = "WIP: pre-worktree commit";
-                eprintln!("amux: commit message (default \"{default_msg}\"):");
+                eprintln!("amux: commit message (default \"{suggested_message}\"):");
                 let mut buf = String::new();
                 let _ = std::io::stdin().read_line(&mut buf);
                 let trimmed = buf.trim();
                 let message = if trimmed.is_empty() {
-                    default_msg.to_string()
+                    suggested_message.to_string()
                 } else {
                     trimmed.to_string()
                 };
@@ -112,21 +112,29 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         &mut self,
         branch: &str,
         files: &[String],
+        suggested_message: &str,
     ) -> Result<Option<String>, CommandError> {
         if !stdin_is_tty() {
             return Ok(None);
         }
         eprintln!(
-            "amux: {} uncommitted file(s) in worktree {branch}; commit message (empty to skip):",
+            "amux: {} uncommitted file(s) in worktree {branch}:",
             files.len()
         );
+        for f in files.iter().take(10) {
+            eprintln!("  {f}");
+        }
+        if files.len() > 10 {
+            eprintln!("  ... and {} more", files.len() - 10);
+        }
+        eprintln!("amux: commit message (default \"{suggested_message}\", empty to skip):");
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return Ok(None);
         }
         let trimmed = buf.trim();
         Ok(if trimmed.is_empty() {
-            None
+            Some(suggested_message.to_string())
         } else {
             Some(trimmed.to_string())
         })

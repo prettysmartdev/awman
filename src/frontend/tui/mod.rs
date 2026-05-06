@@ -51,7 +51,6 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
     let session = ctx.session.read().await.clone();
     let initial_tab = Tab::new(session);
     let runtime_handle = tokio::runtime::Handle::current();
-    let session_arc = Arc::clone(&ctx.session);
 
     let mut app = App::new(
         catalogue,
@@ -59,7 +58,6 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
         session_manager,
         initial_tab,
         runtime_handle,
-        session_arc,
     );
 
     // Auto-spawn startup command: `ready` for git repos, `status --watch`
@@ -268,14 +266,14 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             tab.container_window_state = tab.container_window_state.cycle();
         }
         Action::OpenConfigShow => {
-            app.active_dialog = Some(Dialog::ConfigShow(dialogs::ConfigShowState {
-                rows: Vec::new(),
-                selected: 0,
-                editing: false,
-                edit_column: 0,
-                editor: text_edit::TextEdit::new(false),
-            }));
-            app.command_dialog_active = false;
+            // Run `config show` through dispatch so the command layer
+            // computes the rows and the frontend trait presents the dialog.
+            let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
+                path: vec!["config".into(), "show".into()],
+                flags: Default::default(),
+                arguments: Default::default(),
+            };
+            app.spawn_command("config show", parsed);
         }
 
         // ── Command box actions ───────────────────────────────────────
@@ -349,6 +347,22 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 
         // ── Dialog actions ────────────────────────────────────────────
         Action::DismissDialog => {
+            // In ConfigShow editing mode, Esc cancels the edit (back to browse).
+            if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+                if state.editing {
+                    state.editing = false;
+                    return;
+                }
+            }
+            // Yolo countdown cancel: clear shared state so the engine stops
+            // the countdown and pauses the workflow.
+            if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
+                if let Ok(mut guard) = app.active_tab().yolo_state.lock() {
+                    *guard = None;
+                }
+                app.active_dialog = None;
+                return;
+            }
             dismiss_dialog(app);
         }
 
@@ -855,6 +869,37 @@ fn handle_dialog_submit(app: &mut App) {
             app.command_dialog_active = false;
         }
 
+        Some(Dialog::ConfigShow(state)) if is_command => {
+            if state.editing {
+                // Save the edited value: send "field\tvalue\tscope"
+                let row = &state.rows[state.selected];
+                let field = row.field.clone();
+                let value = state.editor.text.clone();
+                let scope = if state.edit_column == 0 { "global" } else { "repo" };
+                let edit_str = format!("{}\t{}\t{}", field, value, scope);
+                app.send_dialog_response(DialogResponse::Text(edit_str));
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            } else {
+                // Start editing: Enter opens the inline editor on the
+                // selected row. edit_column 0 = global, 1 = repo.
+                let row = &state.rows[state.selected];
+                if row.read_only {
+                    return;
+                }
+                let initial_value = if state.edit_column == 0 {
+                    row.global.clone()
+                } else {
+                    row.repo.clone()
+                };
+                if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+                    state.editing = true;
+                    state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                    state.editor.set_text(&initial_value);
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -876,6 +921,21 @@ fn handle_dialog_cursor(app: &mut App, dir: CursorDir) {
                 CursorDir::End => editor.move_end(),
             }
         }
+        Some(Dialog::ConfigShow(state)) => {
+            if state.editing {
+                match dir {
+                    CursorDir::Left => state.editor.move_left(),
+                    CursorDir::Right => state.editor.move_right(),
+                    CursorDir::Home => state.editor.move_home(),
+                    CursorDir::End => state.editor.move_end(),
+                }
+            } else {
+                match dir {
+                    CursorDir::Left | CursorDir::Home => state.edit_column = 0,
+                    CursorDir::Right | CursorDir::End => state.edit_column = 1,
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -885,6 +945,9 @@ fn handle_dialog_backspace(app: &mut App) {
         Some(Dialog::TextInput { editor, .. }) | Some(Dialog::MultilineInput { editor, .. }) => {
             editor.backspace();
         }
+        Some(Dialog::ConfigShow(state)) if state.editing => {
+            state.editor.backspace();
+        }
         _ => {}
     }
 }
@@ -893,6 +956,9 @@ fn handle_dialog_delete(app: &mut App) {
     match &mut app.active_dialog {
         Some(Dialog::TextInput { editor, .. }) | Some(Dialog::MultilineInput { editor, .. }) => {
             editor.delete();
+        }
+        Some(Dialog::ConfigShow(state)) if state.editing => {
+            state.editor.delete();
         }
         _ => {}
     }
@@ -1044,9 +1110,17 @@ fn handle_dialog_char(app: &mut App, c: char) {
             }
         }
 
+        Some(Dialog::ConfigShow(state)) if state.editing => {
+            if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+                state.editor.insert_char(c);
+            }
+        }
+        Some(Dialog::ConfigShow(_)) => {
+            // When not editing, ignore char keys (navigate with arrows, Enter to edit)
+        }
+
         // ── Non-interactive / fallback dialogs ─────────────────────
         Some(Dialog::Loading { .. })
-        | Some(Dialog::ConfigShow(_))
         | Some(Dialog::ListPicker { .. })
         | Some(Dialog::KindSelect { .. })
         | Some(Dialog::YesNo { .. })
@@ -1177,9 +1251,8 @@ mod tests {
         let engines = make_engines();
         let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
         let session = make_session();
-        let session_arc = Arc::new(RwLock::new(session.clone()));
         let tab = Tab::new(session);
-        App::new(catalogue, engines, session_manager, tab, rt.handle().clone(), session_arc)
+        App::new(catalogue, engines, session_manager, tab, rt.handle().clone())
     }
 
     fn press_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {

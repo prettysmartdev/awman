@@ -85,6 +85,20 @@ pub type SharedYoloState = Arc<Mutex<Option<YoloState>>>;
 /// to reset the vt100 parser before the next step's PTY output arrives.
 pub type SharedPtyResetFlag = Arc<AtomicBool>;
 
+/// Shared container name. Set by the container frontend when the engine
+/// reports `ContainerStatus::Running { container_name }`. The TUI event
+/// loop reads this to populate `ContainerInfo.container_name` for stats
+/// polling.
+pub type SharedContainerName = Arc<Mutex<Option<String>>>;
+
+/// Shared stdin sender slot. When a workflow step transition creates fresh
+/// stdin channels, the new sender is published here so the TUI event loop
+/// can swap `tab.container_stdin_tx` to the new one.
+pub type SharedStdinTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
+
+/// Shared resize sender slot, same pattern as `SharedStdinTx`.
+pub type SharedResizeTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>>>;
+
 #[derive(Debug, Clone)]
 pub struct YoloState {
     pub step_name: String,
@@ -194,6 +208,13 @@ pub struct Tab {
     /// Shared flag: workflow frontend sets this to signal the TUI to reset the
     /// vt100 parser between workflow steps.
     pub pty_reset_flag: SharedPtyResetFlag,
+    /// Shared container name: set by the container frontend when the engine
+    /// reports the running container's name.
+    pub container_name_shared: SharedContainerName,
+    /// Shared stdin sender slot for workflow step transitions.
+    pub stdin_tx_shared: SharedStdinTx,
+    /// Shared resize sender slot for workflow step transitions.
+    pub resize_tx_shared: SharedResizeTx,
 }
 
 impl Tab {
@@ -229,6 +250,9 @@ impl Tab {
             dialog_request_rx: None,
             dialog_response_tx: None,
             pty_reset_flag: Arc::new(AtomicBool::new(false)),
+            container_name_shared: Arc::new(Mutex::new(None)),
+            stdin_tx_shared: Arc::new(Mutex::new(None)),
+            resize_tx_shared: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -543,6 +567,17 @@ pub fn format_duration(secs: u64) -> String {
 /// Tab color based on execution state.
 pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     use ratatui::style::Color;
+    // Yolo countdown in progress: alternate yellow/magenta each second so
+    // background tabs flash visibly, matching old-amux behavior.
+    if let Ok(guard) = tab.yolo_state.lock() {
+        if let Some(ref state) = *guard {
+            return if state.remaining_secs % 2 == 0 {
+                Color::Yellow
+            } else {
+                Color::Magenta
+            };
+        }
+    }
     if tab.stuck {
         return Color::Yellow;
     }

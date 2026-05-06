@@ -297,6 +297,10 @@ impl ContainerInstance for DockerContainerInstance {
         // - Otherwise we keep the existing inherit-stdio path (correct for
         //   the bare CLI, for non-interactive runs, and for build/pull
         //   probes that should stream into the user's terminal).
+        frontend.report_status(crate::engine::container::frontend::ContainerStatus::Running {
+            container_name: self.name.0.clone(),
+        });
+
         let pty_io = if interactive { frontend.take_container_io() } else { None };
 
         if let Some(io) = pty_io {

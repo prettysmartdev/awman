@@ -370,6 +370,13 @@ impl Command for ExecWorkflowCommand {
     ) -> Result<Self::Outcome, CommandError> {
         let workflow_path = self.flags.workflow.display().to_string();
 
+        if self.flags.yolo && self.flags.worktree {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "--yolo implies --worktree. Running in isolated worktree.".into(),
+            });
+        }
+
         // 1. Load the workflow file.
         if !self.flags.workflow.exists() {
             let err = CommandError::WorkflowFileNotFound {
@@ -869,6 +876,7 @@ mod tests {
         fn ask_pre_worktree_uncommitted_files(
             &mut self,
             _files: &[String],
+            _suggested_message: &str,
         ) -> Result<PreWorktreeDecision, CommandError> {
             Ok(PreWorktreeDecision::UseLastCommit)
         }
@@ -891,6 +899,7 @@ mod tests {
             &mut self,
             _branch: &str,
             _files: &[String],
+            _suggested_message: &str,
         ) -> Result<Option<String>, CommandError> {
             Ok(None)
         }

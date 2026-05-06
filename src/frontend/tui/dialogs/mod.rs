@@ -30,7 +30,7 @@ pub enum DialogRequest {
     /// workflow is running. `y` aborts the workflow (kills the container,
     /// returns the current step to Pending), `n`/`Esc` keeps it running.
     WorkflowCancelConfirm,
-    ConfigShow,
+    ConfigShow { rows: Vec<ConfigShowRow> },
     Loading { title: String },
     Custom { title: String, body: String, keys: Vec<(char, String)> },
 }
@@ -126,6 +126,7 @@ pub struct ConfigShowState {
     pub editor: TextEdit,
 }
 
+#[derive(Debug)]
 pub struct ConfigShowRow {
     pub field: String,
     pub global: String,

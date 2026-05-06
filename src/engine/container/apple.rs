@@ -368,6 +368,10 @@ impl ContainerInstance for AppleContainerInstance {
         // PTY-bridged path: the TUI frontend exposes a `ContainerIo`. We
         // spawn the Apple `container run -it` binary via portable-pty so the
         // PTY master is bridged into the frontend's vt100 parser.
+        frontend.report_status(crate::engine::container::frontend::ContainerStatus::Running {
+            container_name: self.name.0.clone(),
+        });
+
         let pty_io = if interactive { frontend.take_container_io() } else { None };
         if let Some(io) = pty_io {
             return spawn_pty_bridged_apple(self, frontend, io, argv, started_at, handle);

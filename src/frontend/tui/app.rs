@@ -59,7 +59,6 @@ pub struct App {
     pub needs_redraw: bool,
     pub command_dialog_active: bool,
     pub runtime_handle: tokio::runtime::Handle,
-    pub session: Arc<RwLock<Session>>,
     /// Receiver for asynchronous container stats results.
     pub stats_rx: Option<std::sync::mpsc::Receiver<(usize, crate::engine::container::instance::ContainerStats)>>,
     /// Sender cloned per stats query — kept alive so the channel stays open.
@@ -75,7 +74,6 @@ impl App {
         session_manager: Arc<RwLock<SessionManager>>,
         initial_tab: Tab,
         runtime_handle: tokio::runtime::Handle,
-        session: Arc<RwLock<Session>>,
     ) -> Self {
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();
         Self {
@@ -94,7 +92,6 @@ impl App {
             needs_redraw: true,
             command_dialog_active: false,
             runtime_handle,
-            session,
             stats_rx: Some(stats_rx),
             stats_tx,
             last_stats_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
@@ -195,6 +192,9 @@ impl App {
         // Build the TUI frontend. Workflow + yolo overlays share the same
         // `Arc<Mutex<...>>` between the engine-side frontend impl and the
         // renderer.
+        tab.container_name_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        tab.stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        tab.resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let frontend = TuiCommandFrontend::new(
             parsed.clone(),
             tab.status_log.clone(),
@@ -204,6 +204,9 @@ impl App {
             tab.workflow_state.clone(),
             tab.yolo_state.clone(),
             tab.pty_reset_flag.clone(),
+            tab.container_name_shared.clone(),
+            tab.stdin_tx_shared.clone(),
+            tab.resize_tx_shared.clone(),
         );
 
         // Store the receiving/sending ends in the tab.
@@ -290,6 +293,34 @@ impl App {
             tab.drain_container_output();
             tab.poll_command_completion();
             tab.recompute_stuck(i == active);
+
+            // Pick up the container name from the engine (set via
+            // `report_status(Running { container_name })`).
+            if let Some(ref mut info) = tab.container_info {
+                if info.container_name.is_empty() {
+                    if let Ok(mut name_guard) = tab.container_name_shared.lock() {
+                        if let Some(name) = name_guard.take() {
+                            info.container_name = name;
+                        }
+                    }
+                }
+            }
+
+            // Pick up new stdin/resize senders from workflow step transitions.
+            // When `recreate_container_io()` runs on the engine thread, it
+            // publishes new senders via the shared slots. We swap the tab's
+            // senders here so keystrokes and resize events reach the new
+            // container.
+            if let Ok(mut guard) = tab.stdin_tx_shared.lock() {
+                if let Some(new_tx) = guard.take() {
+                    tab.container_stdin_tx = Some(new_tx);
+                }
+            }
+            if let Ok(mut guard) = tab.resize_tx_shared.lock() {
+                if let Some(new_tx) = guard.take() {
+                    tab.container_resize_tx = Some(new_tx);
+                }
+            }
         }
 
         // Drain any completed stats results.
@@ -342,6 +373,37 @@ impl App {
                     }
                 });
             }
+        }
+
+        // Sync yolo countdown overlay from shared state. The engine thread
+        // updates `yolo_state` every 100ms during the countdown; we reflect
+        // that into `active_dialog` for the active tab. Background tabs auto-
+        // advance via their own engine thread — the TUI just renders the tab
+        // label differently (handled in the tab-bar renderer).
+        let active = self.active_tab;
+        let yolo_snapshot = self.tabs[active]
+            .yolo_state
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        if let Some(state) = yolo_snapshot {
+            // Only overwrite when no command dialog is blocking. The yolo
+            // overlay is non-modal; command dialogs (step error, control
+            // board) take precedence.
+            if !self.command_dialog_active {
+                self.active_dialog =
+                    Some(Dialog::WorkflowYoloCountdown(
+                        crate::frontend::tui::dialogs::WorkflowYoloCountdownState {
+                            step_name: state.step_name.clone(),
+                            remaining_secs: state.remaining_secs,
+                        },
+                    ));
+            }
+        } else if matches!(
+            self.active_dialog,
+            Some(Dialog::WorkflowYoloCountdown(_))
+        ) {
+            self.active_dialog = None;
         }
     }
 
@@ -408,11 +470,9 @@ impl App {
                 DialogRequest::QuitConfirm => Dialog::QuitConfirm,
                 DialogRequest::CloseTabConfirm => Dialog::CloseTabConfirm,
                 DialogRequest::WorkflowCancelConfirm => Dialog::WorkflowCancelConfirm,
-                DialogRequest::ConfigShow => {
-                    // ConfigShow dialog needs rows populated by the caller;
-                    // open with empty state for now.
+                DialogRequest::ConfigShow { rows } => {
                     Dialog::ConfigShow(crate::frontend::tui::dialogs::ConfigShowState {
-                        rows: Vec::new(),
+                        rows,
                         selected: 0,
                         editing: false,
                         edit_column: 0,
@@ -507,9 +567,8 @@ mod tests {
         let engines = make_engines();
         let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
         let session = make_test_session();
-        let session_arc = Arc::new(RwLock::new(session.clone()));
         let tab = Tab::new(session);
-        App::new(catalogue, engines, session_manager, tab, rt.handle().clone(), session_arc)
+        App::new(catalogue, engines, session_manager, tab, rt.handle().clone())
     }
 
     // ── update_suggestions ────────────────────────────────────────────────────

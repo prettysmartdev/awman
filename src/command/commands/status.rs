@@ -180,6 +180,11 @@ impl Command for StatusCommand {
                 frontend.write_clear_marker();
             }
             tick = tick.saturating_add(1);
+
+            // Write the status table on every tick so the user sees live data.
+            let tip = crate::command::commands::status_tips::select_random_tip();
+            write_status_table(&mut *frontend, &containers, tip);
+
             last_containers = containers;
 
             if !self.flags.watch || !frontend.should_continue_watching() {
@@ -188,12 +193,6 @@ impl Command for StatusCommand {
 
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
-
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("status: found {} running container(s)", last_containers.len()),
-        });
-        frontend.replay_queued();
         Ok(StatusOutcome {
             containers: last_containers,
             watched: self.flags.watch,
@@ -206,6 +205,88 @@ impl StatusCommandTuiContext {
     pub fn new(tabs: Vec<TuiTabSnapshot>) -> Self {
         Self { tabs }
     }
+}
+
+fn write_status_table(
+    frontend: &mut dyn StatusCommandFrontend,
+    containers: &[StatusContainerRow],
+    tip: &str,
+) {
+    let agents: Vec<&StatusContainerRow> = containers
+        .iter()
+        .filter(|c| c.kind == ContainerKind::Agent)
+        .collect();
+    let claws: Vec<&StatusContainerRow> = containers
+        .iter()
+        .filter(|c| c.kind == ContainerKind::Claws)
+        .collect();
+
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: "AMUX STATUS DASHBOARD".into(),
+    });
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: String::new(),
+    });
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: "CODE AGENTS".into(),
+    });
+    if agents.is_empty() {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "  No code agents running.".into(),
+        });
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "  To start one: amux implement <work-item>  or  amux chat".into(),
+        });
+    } else {
+        for c in &agents {
+            let indicator = if c.stuck { "Y" } else { "G" };
+            let cpu = c.cpu_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".into());
+            let mem = c.memory_mb.map(|v| format!("{v:.0}MB")).unwrap_or_else(|| "-".into());
+            let tab = c.tab_number.map(|t| format!(" [tab {t}]")).unwrap_or_default();
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!(
+                    "  {indicator} {name}  {cpu}  {mem}  {img}{tab}",
+                    name = c.name,
+                    img = c.image,
+                ),
+            });
+        }
+    }
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: String::new(),
+    });
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: "NANOCLAW".into(),
+    });
+    if claws.is_empty() {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "  Nanoclaw is not running.".into(),
+        });
+    } else {
+        for c in &claws {
+            let indicator = if c.stuck { "Y" } else { "G" };
+            let cpu = c.cpu_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "-".into());
+            let mem = c.memory_mb.map(|v| format!("{v:.0}MB")).unwrap_or_else(|| "-".into());
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!("  {indicator} {name}  {cpu}  {mem}", name = c.name),
+            });
+        }
+    }
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!("\nTip: {tip}"),
+    });
+    frontend.replay_queued();
 }
 
 fn open_session() -> Result<crate::data::session::Session, CommandError> {

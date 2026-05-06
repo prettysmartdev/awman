@@ -11,7 +11,7 @@ pub enum ContainerStatus {
     Building,
     Pulling,
     Starting,
-    Running,
+    Running { container_name: String },
     Stopping,
     Exited(i32),
     Failed(String),

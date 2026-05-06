@@ -68,6 +68,9 @@ mod tests {
             workflow_view,
             yolo_state,
             pty_reset_flag,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
         );
         (frontend, req_rx, resp_tx)
     }

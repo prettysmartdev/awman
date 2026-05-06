@@ -9,13 +9,12 @@
 use std::sync::Arc;
 
 use crate::data::config::effective::EffectiveConfig;
-use crate::data::error::DataError;
 use crate::data::session::{AgentName, Session};
 use crate::data::workflow_dag::WorkflowDag;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
-use crate::engine::container::instance::ContainerExecution;
+use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -60,6 +59,9 @@ pub struct WorkflowEngine {
     /// When true, skip the inter-step user prompt and auto-advance after a
     /// 60-second countdown (giving the user a chance to intervene).
     yolo: bool,
+    /// Exit info from the most recent step execution, used by the step-failure
+    /// dialog so it can display timing and signal information.
+    last_exit_info: Option<ContainerExitInfo>,
 }
 
 impl WorkflowEngine {
@@ -96,6 +98,7 @@ impl WorkflowEngine {
             current_step_agent: None,
             current_step_model: None,
             yolo: false,
+            last_exit_info: None,
         })
     }
 
@@ -179,6 +182,7 @@ impl WorkflowEngine {
             current_step_agent: None,
             current_step_model: None,
             yolo: false,
+            last_exit_info: None,
         })
     }
 
@@ -201,12 +205,49 @@ impl WorkflowEngine {
             if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
                 let progress = self.workflow_progress_info();
                 self.frontend.report_workflow_progress(&progress);
-                let final_outcome = WorkflowOutcome::Failed {
-                    last_step: outcome.step_name,
-                    exit_code,
-                };
-                self.frontend.report_workflow_completed(&final_outcome);
-                return Ok(final_outcome);
+
+                let step = self.find_step(&outcome.step_name)?;
+                let exit_info = self.last_exit_info.clone().unwrap_or_else(|| {
+                    ContainerExitInfo {
+                        exit_code,
+                        signal: None,
+                        started_at: chrono::Utc::now(),
+                        ended_at: chrono::Utc::now(),
+                    }
+                });
+                let choice = self.frontend.user_choose_after_step_failure(
+                    &step, &exit_info,
+                )?;
+                match choice {
+                    StepFailureChoice::Retry => {
+                        self.state.set_status(
+                            &outcome.step_name,
+                            StepState::Pending,
+                        );
+                        self.persist()?;
+                        continue;
+                    }
+                    StepFailureChoice::Pause => {
+                        self.persist()?;
+                        let paused = WorkflowOutcome::Paused;
+                        self.frontend.report_workflow_completed(&paused);
+                        return Ok(paused);
+                    }
+                    StepFailureChoice::Abort => {
+                        for s in &self.workflow.steps {
+                            if !self.state.completed_steps.contains(&s.name) {
+                                self.state.set_status(
+                                    &s.name,
+                                    StepState::Cancelled,
+                                );
+                            }
+                        }
+                        self.persist()?;
+                        let aborted = WorkflowOutcome::Aborted;
+                        self.frontend.report_workflow_completed(&aborted);
+                        return Ok(aborted);
+                    }
+                }
             }
             // Ask the user what to do next when there are remaining steps.
             if !self.state.is_complete() {
@@ -413,6 +454,9 @@ impl WorkflowEngine {
             exec.wait().await?
         };
 
+        // Store exit info for the step-failure dialog.
+        self.last_exit_info = Some(exit.clone());
+
         // Persist new step state based on exit code.
         let (status, step_state) = if exit.exit_code == 0 {
             (WorkflowStepStatus::Succeeded, StepState::Succeeded)
@@ -597,7 +641,13 @@ impl WorkflowEngine {
                 Some(StepState::Cancelled) => WorkflowStepStatus::Cancelled,
                 Some(StepState::Skipped) => WorkflowStepStatus::Skipped,
             };
-            WorkflowStepProgressInfo { name: step.name.clone(), agent, model, status }
+            WorkflowStepProgressInfo {
+                name: step.name.clone(),
+                agent,
+                model,
+                status,
+                depends_on: step.depends_on.clone(),
+            }
         }).collect()
     }
 
@@ -654,11 +704,6 @@ fn workflow_name_for(workflow: &Workflow) -> String {
         .unwrap_or("workflow")
         .to_string()
 }
-
-// Suppress unused-import warnings for symbols re-exported but not yet used by
-// upstream code at this point in the refactor.
-#[allow(dead_code)]
-fn _suppress(_: StepFailureChoice, _: DataError) {}
 
 #[cfg(test)]
 mod tests {
@@ -891,13 +936,22 @@ mod tests {
         factory: FakeContainerExecutionFactory,
         actions: impl IntoIterator<Item = NextAction>,
     ) -> WorkflowEngine {
+        make_engine_with_frontend(session, workflow, factory, FakeWorkflowFrontend::new(actions))
+    }
+
+    fn make_engine_with_frontend(
+        session: &Session,
+        workflow: Workflow,
+        factory: FakeContainerExecutionFactory,
+        frontend: FakeWorkflowFrontend,
+    ) -> WorkflowEngine {
         let overlay = OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
         );
         WorkflowEngine::new(
             session,
             workflow,
-            Box::new(FakeWorkflowFrontend::new(actions)),
+            Box::new(frontend),
             Box::new(factory),
             Arc::new(GitEngine::new()),
             Arc::new(overlay),
@@ -992,22 +1046,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_to_completion_returns_failed_on_nonzero_exit() {
+    async fn step_failure_abort_returns_aborted() {
         let tmp = tempfile::tempdir().unwrap();
         let session = make_session(&tmp);
         let workflow = make_workflow(
-            Some("wf-fail2"),
+            Some("wf-fail-abort"),
             Some("claude"),
             vec![make_step("a", &[], None)],
         );
         let factory = FakeContainerExecutionFactory::new([2]);
-        let mut engine = make_engine(&session, workflow, factory, []);
+        let frontend = FakeWorkflowFrontend::new([]);
+        // default failure_choice = Abort
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
-        assert!(matches!(
-            result,
-            WorkflowOutcome::Failed { exit_code: 2, .. }
-        ));
+        assert!(
+            matches!(result, WorkflowOutcome::Aborted),
+            "step failure + Abort choice should return Aborted, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn step_failure_retry_reruns_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-retry"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        // First run: exit 1 (fail), second run: exit 0 (success).
+        let factory = FakeContainerExecutionFactory::new([1, 0]);
+        let mut frontend = FakeWorkflowFrontend::new([]);
+        frontend.failure_choice = StepFailureChoice::Retry;
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert!(
+            matches!(result, WorkflowOutcome::Completed),
+            "step failure + Retry should re-run and complete, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn step_failure_pause_returns_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-pause"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeContainerExecutionFactory::new([1]);
+        let mut frontend = FakeWorkflowFrontend::new([]);
+        frontend.failure_choice = StepFailureChoice::Pause;
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert!(
+            matches!(result, WorkflowOutcome::Paused),
+            "step failure + Pause should return Paused, got: {:?}",
+            result
+        );
     }
 
     #[tokio::test]

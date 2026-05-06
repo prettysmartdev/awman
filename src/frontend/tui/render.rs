@@ -913,5 +913,11 @@ fn render_config_show(
         lines.push(Line::from(Span::styled(text, style)));
     }
 
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ navigate  |  Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     frame.render_widget(Paragraph::new(lines), inner);
 }

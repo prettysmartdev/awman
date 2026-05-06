@@ -822,15 +822,17 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
         .flag_path(p, "workflow")?
         .or_else(|| f.argument(p, "workflow").ok().flatten().map(PathBuf::from))
         .ok_or_else(|| CommandError::missing_required_argument(p, "workflow"))?;
+    let yolo = f.flag_bool(p, "yolo")?.unwrap_or(false);
+    let worktree = f.flag_bool(p, "worktree")?.unwrap_or(false) || yolo;
     Ok(ExecWorkflowCommandFlags {
         workflow,
         work_item: f.flag_string(p, "work-item")?,
         non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
         plan: f.flag_bool(p, "plan")?.unwrap_or(false),
         allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
-        worktree: f.flag_bool(p, "worktree")?.unwrap_or(false),
+        worktree,
         mount_ssh: f.flag_bool(p, "mount-ssh")?.unwrap_or(false),
-        yolo: f.flag_bool(p, "yolo")?.unwrap_or(false),
+        yolo,
         auto: f.flag_bool(p, "auto")?.unwrap_or(false),
         agent: f.flag_string(p, "agent")?,
         model: f.flag_string(p, "model")?,

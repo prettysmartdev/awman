@@ -16,7 +16,7 @@ use crate::command::error::CommandError;
 use crate::engine::container::frontend::ContainerIo;
 use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
-use crate::frontend::tui::tabs::{SharedPtyResetFlag, SharedWorkflowViewState, SharedYoloState};
+use crate::frontend::tui::tabs::{SharedContainerName, SharedPtyResetFlag, SharedResizeTx, SharedStdinTx, SharedWorkflowViewState, SharedYoloState};
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
 /// TUI frontend struct. Implements every per-command frontend trait.
@@ -38,18 +38,19 @@ pub struct TuiCommandFrontend {
     pub(crate) dialog_rx: Mutex<std::sync::mpsc::Receiver<DialogResponse>>,
     pub(crate) container_io: Option<ContainerIo>,
     pub(crate) status_log: SharedStatusLog,
-    /// Workflow strip state — workflow_frontend.rs writes to it on
-    /// `report_workflow_progress` / `report_step_status`. The renderer reads
-    /// it under the same lock.
     pub(crate) workflow_view: SharedWorkflowViewState,
-    /// Yolo countdown overlay state — `yolo_countdown_tick` updates it
-    /// every 100ms. The renderer reads it for the non-modal countdown
-    /// indicator (avoids the dialog-spam that a per-tick `ask_dialog` would
-    /// cause).
     pub(crate) yolo_state: SharedYoloState,
-    /// Shared flag: set to `true` to signal the TUI event loop to reset the
-    /// vt100 parser between workflow steps.
     pub(crate) pty_reset_flag: SharedPtyResetFlag,
+    pub(crate) container_name_shared: SharedContainerName,
+    /// Persistent stdout sender — kept alive across workflow steps so each
+    /// new `ContainerIo` can send output to the same TUI event loop receiver.
+    pub(crate) stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Shared slot for the stdin sender. When a new workflow step creates
+    /// fresh stdin channels, the new sender is placed here so the TUI event
+    /// loop can pick it up and forward keystrokes to the new container.
+    pub(crate) stdin_tx_shared: std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Shared slot for the resize sender, same pattern as stdin_tx_shared.
+    pub(crate) resize_tx_shared: std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>>>,
 }
 
 impl TuiCommandFrontend {
@@ -62,7 +63,11 @@ impl TuiCommandFrontend {
         workflow_view: SharedWorkflowViewState,
         yolo_state: SharedYoloState,
         pty_reset_flag: SharedPtyResetFlag,
+        container_name_shared: SharedContainerName,
+        stdin_tx_shared: SharedStdinTx,
+        resize_tx_shared: SharedResizeTx,
     ) -> Self {
+        let stdout_tx = container_io.stdout.clone();
         Self {
             parsed,
             messages: TuiUserMessageSink::new(status_log.clone()),
@@ -74,7 +79,42 @@ impl TuiCommandFrontend {
             workflow_view,
             yolo_state,
             pty_reset_flag,
+            container_name_shared,
+            stdout_tx,
+            stdin_tx_shared,
+            resize_tx_shared,
         }
+    }
+
+    /// Recreate `ContainerIo` channels for a new workflow step. The stdout
+    /// sender is reused (same TUI event loop receiver), but stdin and resize
+    /// get fresh channels. The new senders are published via shared slots so
+    /// the TUI event loop can swap to them.
+    pub(crate) fn recreate_container_io(&mut self) {
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let stdin_tx_for_engine = stdin_tx.clone();
+        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+
+        let initial_size = match crossterm::terminal::size() {
+            Ok((cols, rows)) => crate::frontend::tui::compute_container_inner_size(cols, rows),
+            Err(_) => (80u16, 24u16),
+        };
+
+        // Publish new senders so the TUI event loop picks them up.
+        if let Ok(mut guard) = self.stdin_tx_shared.lock() {
+            *guard = Some(stdin_tx);
+        }
+        if let Ok(mut guard) = self.resize_tx_shared.lock() {
+            *guard = Some(resize_tx);
+        }
+
+        self.container_io = Some(ContainerIo {
+            stdout: self.stdout_tx.clone(),
+            stdin_tx: stdin_tx_for_engine,
+            stdin_rx,
+            resize: resize_rx,
+            initial_size,
+        });
     }
 
     /// Send a dialog request and block waiting for the response.

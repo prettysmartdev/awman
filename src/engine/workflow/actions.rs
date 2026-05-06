@@ -124,4 +124,7 @@ pub struct WorkflowStepProgressInfo {
     /// Resolved model, if any.
     pub model: Option<String>,
     pub status: WorkflowStepStatus,
+    /// Steps this one depends on. Drives the topological column grouping in
+    /// the workflow strip renderer.
+    pub depends_on: Vec<String>,
 }

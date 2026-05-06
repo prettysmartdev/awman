@@ -237,7 +237,7 @@ fn mask_sensitive(field: &str, value: Option<String>) -> Option<String> {
     })
 }
 
-fn collect_config_rows(
+pub fn collect_config_rows(
     global: &serde_json::Value,
     repo: &serde_json::Value,
 ) -> Vec<ConfigFieldRow> {
@@ -274,7 +274,23 @@ pub struct ConfigSetOutcome {
     pub scope: String,
 }
 
-pub trait ConfigCommandFrontend: UserMessageSink + Send + Sync {}
+/// A user edit returned from the config show dialog.
+#[derive(Debug, Clone)]
+pub struct ConfigEditRequest {
+    pub field: String,
+    pub value: String,
+    pub global: bool,
+}
+
+pub trait ConfigCommandFrontend: UserMessageSink + Send + Sync {
+    /// Present the config table to the user and block until they either
+    /// dismiss the dialog or edit a value. Returns `Ok(None)` on dismiss,
+    /// `Ok(Some(edit))` when the user changes a field.
+    fn present_config_table(
+        &mut self,
+        rows: &[ConfigFieldRow],
+    ) -> Result<Option<ConfigEditRequest>, CommandError>;
+}
 
 pub struct ConfigCommand {
     sub: ConfigSubcommand,
@@ -314,12 +330,55 @@ impl Command for ConfigCommand {
         let names = valid_field_names();
         let outcome = match self.sub {
             ConfigSubcommand::Show(_) => {
-                let global =
-                    serde_json::to_value(session.global_config()).unwrap_or(serde_json::Value::Null);
-                let repo =
-                    serde_json::to_value(session.repo_config()).unwrap_or(serde_json::Value::Null);
-                let rows = collect_config_rows(&global, &repo);
-                ConfigOutcome::Show(ConfigShowOutcome { global, repo, rows })
+                let mut session = session;
+                loop {
+                    let global = serde_json::to_value(session.global_config())
+                        .unwrap_or(serde_json::Value::Null);
+                    let repo = serde_json::to_value(session.repo_config())
+                        .unwrap_or(serde_json::Value::Null);
+                    let rows = collect_config_rows(&global, &repo);
+
+                    match frontend.present_config_table(&rows)? {
+                        None => {
+                            let global = serde_json::to_value(session.global_config())
+                                .unwrap_or(serde_json::Value::Null);
+                            let repo = serde_json::to_value(session.repo_config())
+                                .unwrap_or(serde_json::Value::Null);
+                            let rows = collect_config_rows(&global, &repo);
+                            break ConfigOutcome::Show(ConfigShowOutcome { global, repo, rows });
+                        }
+                        Some(edit) => {
+                            let coerced = match validate_and_coerce(&edit.field, &edit.value) {
+                                Ok(v) => v,
+                                Err(reason) => {
+                                    frontend.write_message(crate::engine::message::UserMessage {
+                                        level: crate::engine::message::MessageLevel::Warning,
+                                        text: format!("Invalid value: {reason}"),
+                                    });
+                                    continue;
+                                }
+                            };
+                            if edit.global {
+                                let mut cfg = session.global_config().clone();
+                                let mut json = serde_json::to_value(&cfg).unwrap_or_default();
+                                set_config_field(&mut json, &edit.field, coerced);
+                                if let Ok(updated) = serde_json::from_value(json) {
+                                    cfg = updated;
+                                    let _ = cfg.save();
+                                }
+                            } else {
+                                let mut cfg = session.repo_config().clone();
+                                let mut json = serde_json::to_value(&cfg).unwrap_or_default();
+                                set_config_field(&mut json, &edit.field, coerced);
+                                if let Ok(updated) = serde_json::from_value(json) {
+                                    cfg = updated;
+                                    let _ = cfg.save(session.git_root());
+                                }
+                            }
+                            session = open_session()?;
+                        }
+                    }
+                }
             }
             ConfigSubcommand::Get(f) => {
                 // Validate field name.

@@ -39,6 +39,11 @@ impl ContainerFrontend for TuiCommandFrontend {
     }
 
     fn report_status(&mut self, status: ContainerStatus) {
+        if let ContainerStatus::Running { ref container_name } = status {
+            if let Ok(mut name) = self.container_name_shared.lock() {
+                *name = Some(container_name.clone());
+            }
+        }
         self.messages.info(format!("Container: {status:?}"));
     }
 

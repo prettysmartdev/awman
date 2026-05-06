@@ -11,19 +11,26 @@ use crate::engine::message::UserMessageSink;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
+fn format_file_list(files: &[String]) -> String {
+    let shown: Vec<&str> = files.iter().take(10).map(|s| s.as_str()).collect();
+    let mut body = shown.join("\n");
+    if files.len() > 10 {
+        body.push_str(&format!("\n... and {} more", files.len() - 10));
+    }
+    body
+}
+
 impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     fn ask_pre_worktree_uncommitted_files(
         &mut self,
         files: &[String],
+        suggested_message: &str,
     ) -> Result<PreWorktreeDecision, CommandError> {
+        let file_list = format_file_list(files);
         let body = format!(
-            "Uncommitted files:\n{}\n\nCommit them first, use last commit, or abort?",
-            files
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
+            "{} uncommitted file(s):\n{}\n\nCommit them first, use last commit, or abort?",
+            files.len(),
+            file_list
         );
         let response = self.ask_dialog(DialogRequest::Custom {
             title: "Uncommitted files".into(),
@@ -36,16 +43,17 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         })?;
         Ok(match response {
             DialogResponse::Char('c') => {
-                // Ask for commit message
                 let msg_response = self.ask_dialog(DialogRequest::TextInput {
                     title: "Commit message".into(),
-                    prompt: "Enter commit message:".into(),
+                    prompt: format!("Suggested: {suggested_message}\n\nEnter commit message (or press Enter to accept):"),
                 })?;
                 match msg_response {
                     DialogResponse::Text(msg) if !msg.is_empty() => {
                         PreWorktreeDecision::Commit { message: msg }
                     }
-                    _ => PreWorktreeDecision::UseLastCommit,
+                    _ => PreWorktreeDecision::Commit {
+                        message: suggested_message.to_string(),
+                    },
                 }
             }
             DialogResponse::Char('u') => PreWorktreeDecision::UseLastCommit,
@@ -84,12 +92,17 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     fn ask_post_workflow_action(
         &mut self,
         branch: &str,
-        _had_error: bool,
+        had_error: bool,
     ) -> Result<PostWorkflowWorktreeAction, CommandError> {
+        let status = if had_error {
+            "ended with errors"
+        } else {
+            "completed"
+        };
         let response = self.ask_dialog(DialogRequest::Custom {
             title: "Worktree action".into(),
             body: format!(
-                "Workflow complete on branch '{branch}'.\n\nWhat would you like to do?"
+                "Workflow {status} on branch '{branch}'.\n\nWhat would you like to do?"
             ),
             keys: vec![
                 ('m', "Merge into main branch".into()),
@@ -108,15 +121,13 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         &mut self,
         _branch: &str,
         files: &[String],
+        suggested_message: &str,
     ) -> Result<Option<String>, CommandError> {
+        let file_list = format_file_list(files);
         let body = format!(
-            "Uncommitted changes on worktree:\n{}\n\nCommit before merge?",
-            files
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
+            "{} uncommitted file(s) on worktree:\n{}\n\nCommit before merge?",
+            files.len(),
+            file_list
         );
         let response = self.ask_dialog(DialogRequest::YesNo {
             title: "Commit before merge?".into(),
@@ -128,11 +139,11 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         ) {
             let msg_response = self.ask_dialog(DialogRequest::TextInput {
                 title: "Commit message".into(),
-                prompt: "Enter commit message:".into(),
+                prompt: format!("Suggested: {suggested_message}\n\nEnter commit message (or press Enter to accept):"),
             })?;
             match msg_response {
                 DialogResponse::Text(msg) if !msg.is_empty() => Ok(Some(msg)),
-                _ => Ok(None),
+                _ => Ok(Some(suggested_message.to_string())),
             }
         } else {
             Ok(None)

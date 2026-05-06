@@ -289,7 +289,14 @@ impl AuthCommandFrontend for CliFrontend {
         })
     }
 }
-impl ConfigCommandFrontend for CliFrontend {}
+impl ConfigCommandFrontend for CliFrontend {
+    fn present_config_table(
+        &mut self,
+        _rows: &[crate::command::commands::config::ConfigFieldRow],
+    ) -> Result<Option<crate::command::commands::config::ConfigEditRequest>, crate::command::error::CommandError> {
+        Ok(None)
+    }
+}
 impl DownloadCommandFrontend for CliFrontend {}
 impl NewCommandFrontend for CliFrontend {
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {

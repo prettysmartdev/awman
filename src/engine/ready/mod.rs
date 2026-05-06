@@ -400,38 +400,51 @@ impl ReadyEngine {
                 ReadyPhase::CheckingNonDefaultAgents
             }
             ReadyPhase::CheckingNonDefaultAgents => {
-                // ENG-2: Check non-default agent images and report their status.
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let all_agents = paths.discover_agent_dockerfiles();
                 let default_agent = self.options.agent.as_str();
 
-                let mut missing_agents: Vec<String> = Vec::new();
+                let mut missing_agents: Vec<(String, String)> = Vec::new();
+                let mut all_ok = true;
+                let mut count = 0usize;
                 for (agent_name, _agent_path) in &all_agents {
                     if agent_name == default_agent {
                         continue;
                     }
+                    count += 1;
                     let other_tag = agent_image_tag(&git_root, agent_name);
-                    let status = if self.container_runtime.image_exists(&other_tag) {
-                        StepStatus::Done
-                    } else {
-                        missing_agents.push(agent_name.clone());
-                        StepStatus::Warn(format!("image not built: {other_tag}"))
-                    };
-                    frontend.report_step_status(
-                        &format!("Agent: {agent_name}"),
-                        status.clone(),
-                    );
-                    self.summary.non_default_agent_images.push((agent_name.clone(), status));
+                    if !self.container_runtime.image_exists(&other_tag) {
+                        all_ok = false;
+                        missing_agents.push((agent_name.clone(), other_tag));
+                    }
                 }
 
-                if !missing_agents.is_empty() {
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Warning,
-                        text: format!(
-                            "Missing agent images: {}",
-                            missing_agents.join(", ")
-                        ),
-                    });
+                if count > 0 {
+                    if all_ok {
+                        // All non-default agents have valid images → single consolidated row.
+                        frontend.report_step_status("Other agents", StepStatus::Done);
+                        self.summary.non_default_agent_images.push((
+                            "Other agents".to_string(),
+                            StepStatus::Done,
+                        ));
+                    } else {
+                        // Report only the missing agents individually as warnings.
+                        for (name, tag) in &missing_agents {
+                            let status = StepStatus::Warn(format!("image missing: {tag}"));
+                            frontend.report_step_status(
+                                &format!("Agent: {name}"),
+                                status.clone(),
+                            );
+                            self.summary.non_default_agent_images.push((name.clone(), status));
+                        }
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Warning,
+                            text: format!(
+                                "Missing agent images: {}",
+                                missing_agents.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                            ),
+                        });
+                    }
                 }
 
                 ReadyPhase::CheckingLocalAgent
