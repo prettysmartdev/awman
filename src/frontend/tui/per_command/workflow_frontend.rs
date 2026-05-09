@@ -283,6 +283,17 @@ impl WorkflowFrontend for TuiCommandFrontend {
         }
     }
 
+    fn reset_yolo_initialized(&mut self) {
+        self.yolo_initialized = false;
+    }
+
+    fn clear_yolo_state(&mut self) {
+        if let Ok(mut guard) = self.yolo_state.lock() {
+            *guard = None;
+        }
+        self.yolo_initialized = false;
+    }
+
     fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError> {
         let step_name = self
             .workflow_view

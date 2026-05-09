@@ -688,7 +688,22 @@ impl WorkflowEngine {
                                         }
                                     }
                                     MidStepYoloResult::Cancelled => continue,
-                                    MidStepYoloResult::Advanced => continue,
+                                    MidStepYoloResult::Advanced => {
+                                        if let Some(ch) = &cancel_handle {
+                                            let _ = ch.cancel();
+                                        }
+                                        self.state.set_status(&step_name, StepState::Succeeded);
+                                        self.persist()?;
+                                        let step = self.find_step(&step_name)?;
+                                        self.frontend.report_step_status(
+                                            &step,
+                                            WorkflowStepStatus::Succeeded,
+                                        );
+                                        self.frontend.report_step_unstuck(&step);
+                                        let progress = self.workflow_progress_info();
+                                        self.frontend.report_workflow_progress(&progress);
+                                        return Ok(InterruptibleStepResult::LoopContinue);
+                                    }
                                 }
                             } else {
                                 let mid_step_outcome = self.handle_mid_step_control_board(
@@ -859,6 +874,7 @@ impl WorkflowEngine {
     /// Run the 60-second yolo countdown, ticking through the frontend every
     /// 100 ms. Returns the next action to take.
     async fn run_yolo_countdown(&mut self) -> Result<YoloCountdownResult, EngineError> {
+        self.frontend.reset_yolo_initialized();
         let total = std::time::Duration::from_secs(60);
         let start = std::time::Instant::now();
         loop {
@@ -869,11 +885,18 @@ impl WorkflowEngine {
                 total - elapsed
             };
             match self.frontend.yolo_countdown_tick(remaining)? {
-                YoloTickOutcome::AdvanceNow => return Ok(YoloCountdownResult::Advance),
-                YoloTickOutcome::Cancel => return Ok(YoloCountdownResult::Pause),
+                YoloTickOutcome::AdvanceNow => {
+                    self.frontend.clear_yolo_state();
+                    return Ok(YoloCountdownResult::Advance);
+                }
+                YoloTickOutcome::Cancel => {
+                    self.frontend.clear_yolo_state();
+                    return Ok(YoloCountdownResult::Pause);
+                }
                 YoloTickOutcome::Continue => {}
             }
             if remaining.is_zero() {
+                self.frontend.clear_yolo_state();
                 return Ok(YoloCountdownResult::Advance);
             }
             tokio::select! {
@@ -881,6 +904,7 @@ impl WorkflowEngine {
                 Some(req) = Self::recv_control_board(&mut self.control_board_rx) => {
                     match req {
                         ControlBoardRequest::OpenControlBoard => {
+                            self.frontend.clear_yolo_state();
                             return Ok(YoloCountdownResult::ShowControlBoard);
                         }
                         ControlBoardRequest::StepStuck => {
@@ -902,6 +926,7 @@ impl WorkflowEngine {
         _cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
         wait_rx: &mut tokio::sync::oneshot::Receiver<(ContainerExecution, Result<ContainerExitInfo, EngineError>)>,
     ) -> Result<MidStepYoloResult, EngineError> {
+        self.frontend.reset_yolo_initialized();
         let total = timing::YOLO_COUNTDOWN_DURATION;
         let start = std::time::Instant::now();
 
@@ -915,15 +940,18 @@ impl WorkflowEngine {
 
             match self.frontend.yolo_countdown_tick(remaining)? {
                 YoloTickOutcome::AdvanceNow => {
+                    self.frontend.clear_yolo_state();
                     return Ok(MidStepYoloResult::Advanced);
                 }
                 YoloTickOutcome::Cancel => {
+                    self.frontend.clear_yolo_state();
                     return Ok(MidStepYoloResult::Cancelled);
                 }
                 YoloTickOutcome::Continue => {}
             }
 
             if remaining.is_zero() {
+                self.frontend.clear_yolo_state();
                 return Ok(MidStepYoloResult::Advanced);
             }
 
@@ -933,6 +961,7 @@ impl WorkflowEngine {
                     let (exec_back, exit_result) = result
                         .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
                     self.current_execution = Some(exec_back);
+                    self.frontend.clear_yolo_state();
                     return Ok(MidStepYoloResult::StepCompleted(
                         self.finalize_step(step_name, exit_result?)?
                     ));
@@ -940,6 +969,7 @@ impl WorkflowEngine {
                 Some(req) = Self::recv_control_board(&mut self.control_board_rx) => {
                     match req {
                         ControlBoardRequest::OpenControlBoard => {
+                            self.frontend.clear_yolo_state();
                             return Ok(MidStepYoloResult::ShowControlBoard);
                         }
                         ControlBoardRequest::StepStuck => {
@@ -960,7 +990,7 @@ impl WorkflowEngine {
             can_pause: true,
             can_abort: true,
             can_finish_workflow: self.is_last_step(),
-            can_dismiss: self.current_execution.is_some(),
+            can_dismiss: self.current_execution.is_some() || self.current_step_name.is_some(),
             ..Default::default()
         };
         // Continue-in-current-container: requires same agent + same model

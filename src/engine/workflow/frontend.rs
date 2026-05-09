@@ -49,6 +49,15 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// Called repeatedly while a yolo countdown is ticking down.
     fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError>;
 
+    /// Reset the yolo-initialized flag so a new countdown starts fresh.
+    /// Called at the beginning of each mid-step yolo countdown.
+    fn reset_yolo_initialized(&mut self) {}
+
+    /// Clear the shared yolo state after a countdown finishes (advanced,
+    /// cancelled, or step completed). Prevents stale state from being
+    /// rendered.
+    fn clear_yolo_state(&mut self) {}
+
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome);
 
     /// Called by the engine before each step runs and before any yolo countdown

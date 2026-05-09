@@ -224,19 +224,21 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     }
 
     // TUI-2: Yolo countdown dialog allows tab switching — dismiss the dialog
-    // (countdown continues in the tab label) and switch tabs.
+    // (countdown continues in the tab label) and switch tabs. With only 1 tab,
+    // swallow the key so the generic char handler doesn't close the dialog.
     if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_)))
         && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         match key.code {
-            KeyCode::Char('a') => {
-                app.active_dialog = None;
-                app.switch_to_prev_tab();
-                return;
-            }
-            KeyCode::Char('d') => {
-                app.active_dialog = None;
-                app.switch_to_next_tab();
+            KeyCode::Char('a') | KeyCode::Char('d') => {
+                if app.tabs.len() > 1 {
+                    app.active_dialog = None;
+                    if key.code == KeyCode::Char('a') {
+                        app.switch_to_prev_tab();
+                    } else {
+                        app.switch_to_next_tab();
+                    }
+                }
                 return;
             }
             _ => {}
@@ -1258,10 +1260,12 @@ fn handle_dialog_char(app: &mut App, c: char) {
             app.active_dialog = None;
             app.command_dialog_active = false;
         }
-        Some(Dialog::Custom { .. }) => {
-            app.send_dialog_response(DialogResponse::Char(c));
-            app.active_dialog = None;
-            app.command_dialog_active = false;
+        Some(Dialog::Custom { ref keys, .. }) => {
+            if keys.iter().any(|(ch, _)| *ch == c) {
+                app.send_dialog_response(DialogResponse::Char(c));
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
         }
 
         Some(Dialog::WorkflowControlBoard { .. }) => {
@@ -1683,6 +1687,73 @@ mod tests {
         press_char(&mut app, 'a');
         let response = rx.try_recv().unwrap();
         assert!(matches!(response, DialogResponse::Char('a')));
+    }
+
+    // ─── Custom dialog key filtering ────────────────────────────────────────
+
+    #[test]
+    fn custom_dialog_accepts_listed_key() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::Custom {
+                title: "Choose".into(),
+                body: "Pick one".into(),
+                keys: vec![
+                    ('m', "Merge".into()),
+                    ('d', "Discard".into()),
+                    ('k', "Keep".into()),
+                ],
+            },
+        );
+        press_char(&mut app, 'm');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Char('m')));
+        assert!(app.active_dialog.is_none());
+    }
+
+    #[test]
+    fn custom_dialog_ignores_unlisted_key() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::Custom {
+                title: "Choose".into(),
+                body: "Pick one".into(),
+                keys: vec![
+                    ('m', "Merge".into()),
+                    ('d', "Discard".into()),
+                    ('k', "Keep".into()),
+                ],
+            },
+        );
+        press_char(&mut app, 'x');
+        assert!(
+            rx.try_recv().is_err(),
+            "unlisted key must not send a dialog response"
+        );
+        assert!(
+            app.active_dialog.is_some(),
+            "dialog must stay open after unlisted key"
+        );
+    }
+
+    #[test]
+    fn ctrl_m_in_dialog_does_not_cycle_container() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            Dialog::YesNo {
+                title: "Test".into(),
+                body: "Test body".into(),
+            },
+        );
+        let before = app.active_tab().container_window_state;
+        press_key(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.active_tab().container_window_state, before,
+            "Ctrl+M must not cycle container window while a dialog is open"
+        );
     }
 
     // ─── KindSelect command dialog ────────────────────────────────────────────

@@ -175,6 +175,14 @@ impl WorkflowFrontend for WorkflowProxy {
         self.0.lock().unwrap().yolo_countdown_tick(remaining)
     }
 
+    fn reset_yolo_initialized(&mut self) {
+        self.0.lock().unwrap().reset_yolo_initialized();
+    }
+
+    fn clear_yolo_state(&mut self) {
+        self.0.lock().unwrap().clear_yolo_state();
+    }
+
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         self.0.lock().unwrap().report_workflow_completed(outcome);
     }

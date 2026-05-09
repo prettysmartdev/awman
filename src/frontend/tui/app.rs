@@ -464,7 +464,7 @@ impl App {
             }
         }
 
-        // ENG-1: Stuck-container → notify the engine.
+        // ENG-1: Stuck-container → notify the engine (ALL tabs).
         //
         // The TUI detects stuck (no PTY output for STUCK_TIMEOUT) and sends
         // `ControlBoardRequest::StepStuck` to the engine. The ENGINE decides
@@ -473,8 +473,8 @@ impl App {
         // `user_choose_next_action`. The TUI only renders; it never drives
         // yolo countdowns.
         let active = self.active_tab;
-        {
-            let tab = &self.tabs[active];
+        for tab_idx in 0..self.tabs.len() {
+            let tab = &self.tabs[tab_idx];
             let has_workflow_step = tab
                 .workflow_state
                 .lock()
@@ -491,35 +491,20 @@ impl App {
                 .yolo_dismissed_at
                 .map(|t| t.elapsed() < crate::engine::workflow::timing::STUCK_DIALOG_BACKOFF)
                 .unwrap_or(false);
-            let _auto_disabled = tab
-                .workflow_state
-                .lock()
-                .ok()
-                .and_then(|g| {
-                    g.as_ref().map(|ws| {
-                        ws.current_step
-                            .as_ref()
-                            .map(|s| ws.auto_disabled.contains(s))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
+            let is_active = tab_idx == active;
 
             if tab.stuck
                 && has_workflow_step
                 && !engine_yolo_active
-                && !self.command_dialog_active
                 && !backoff_active
+                && (!is_active || !self.command_dialog_active)
             {
-                // ENG-1: Notify the engine. In yolo mode the engine starts a
-                // mid-step countdown; in non-yolo mode it opens the WCB.
                 if let Ok(guard) = tab.control_board_tx_shared.lock() {
                     if let Some(tx) = guard.as_ref() {
                         let _ = tx.send(crate::engine::workflow::ControlBoardRequest::StepStuck);
                     }
                 }
-            } else if !tab.stuck && !has_workflow_step {
-                // Clear stuck-triggered countdown when unstuck.
+            } else if is_active && !tab.stuck && !has_workflow_step {
                 if matches!(self.active_dialog, Some(Dialog::WorkflowYoloCountdown(_)))
                     && !engine_yolo_active
                 {

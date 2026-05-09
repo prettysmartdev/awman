@@ -78,7 +78,7 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
             KeyCode::Char('t') => return Action::OpenNewTabDialog,
             KeyCode::Char('a') if ctx != FocusContext::Dialog => return Action::PreviousTab,
             KeyCode::Char('d') if ctx != FocusContext::Dialog => return Action::NextTab,
-            KeyCode::Char('m') => return Action::CycleContainerWindow,
+            KeyCode::Char('m') if ctx != FocusContext::Dialog => return Action::CycleContainerWindow,
             KeyCode::Char('w') => return Action::WorkflowControl,
             _ => {}
         }
@@ -310,6 +310,15 @@ mod tests {
             FocusContext::Dialog,
         );
         assert_ne!(action, Action::PreviousTab, "Ctrl-A must not switch tabs while a dialog is open");
+    }
+
+    #[test]
+    fn ctrl_m_suppressed_in_dialog() {
+        let action = map_key(
+            key(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_ne!(action, Action::CycleContainerWindow, "Ctrl-M must not cycle container window while a dialog is open");
     }
 
     // ── Command box ───────────────────────────────────────────────────────────
