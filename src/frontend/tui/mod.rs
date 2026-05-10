@@ -232,6 +232,9 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('d') => {
                 if app.tabs.len() > 1 {
+                    // Clear user-activity so the departing tab stays "stuck"
+                    // and doesn't send a false StepUnstuck on switch-back.
+                    app.active_tab_mut().last_user_activity_time = None;
                     app.active_dialog = None;
                     if key.code == KeyCode::Char('a') {
                         app.switch_to_prev_tab();

@@ -358,16 +358,24 @@ impl WorkflowEngine {
             }
 
             // Step succeeded. Decide what to do next.
-            if !self.state.is_complete() {
+            let workflow_just_completed = self.state.is_complete();
+
+            if !workflow_just_completed {
                 let progress = self.workflow_progress_info();
                 self.frontend.report_workflow_progress(&progress);
 
                 if self.yolo {
-                    // Yolo mode: auto-advance to the next step without prompting.
-                    // Yolo countdowns only happen mid-step when a container is stuck.
                     continue;
                 }
+            } else if self.yolo {
+                // Last step in yolo mode: always require explicit user
+                // confirmation before ending the workflow so the user can
+                // review the final step's output.
+                let progress = self.workflow_progress_info();
+                self.frontend.report_workflow_progress(&progress);
+            }
 
+            if !workflow_just_completed || self.yolo {
                 let available = self.compute_available_actions()?;
                 let action = self
                     .frontend
@@ -573,7 +581,7 @@ impl WorkflowEngine {
                                 "Step '{}' appears stuck (no output)",
                                 step_name,
                             ));
-                            if self.yolo {
+                            if self.yolo && !self.is_last_step() {
                                 let yolo_result = self.run_mid_step_yolo_countdown(
                                     &step_name,
                                     &cancel_handle,
@@ -2265,15 +2273,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn step_stuck_in_yolo_mode_starts_countdown() {
+        // Uses a 2-step workflow so that step "a" is NOT the last step.
+        // The last step never runs a yolo countdown (it shows the WCB
+        // instead), so this test exercises the countdown on step "a".
         let tmp = tempfile::tempdir().unwrap();
         let session = make_session(&tmp);
         let workflow = make_workflow(
             Some("wf-stuck-yolo"),
             Some("claude"),
-            vec![make_step("a", &[], None)],
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
 
-        let (cancel_flag, completion) = make_blocking_entry();
+        let (cancel_flag_a, completion_a) = make_blocking_entry();
+        let (_cancel_flag_b, completion_b) = make_blocking_entry();
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
 
         // Frontend that tracks yolo lifecycle calls.
@@ -2328,13 +2340,17 @@ mod tests {
         }
 
         let frontend = YoloTrackingFrontend {
-            actions: Mutex::new(VecDeque::new()),
+            // WCB is shown after last step completes in yolo mode.
+            actions: Mutex::new(VecDeque::from([NextAction::FinishWorkflow])),
             engine_tx: engine_tx.clone(),
             yolo_started: AtomicBool::new(false),
             yolo_finished: AtomicBool::new(false),
         };
 
-        let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+        let factory = BlockingFactory::new([
+            (cancel_flag_a.clone(), completion_a.clone()),
+            (_cancel_flag_b.clone(), completion_b.clone()),
+        ]);
         let overlay = OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
         );
@@ -2359,8 +2375,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Countdown was cancelled by the frontend (YoloTickOutcome::Cancel),
-        // so the step keeps running. Complete it normally.
-        signal_completion(&completion, 0);
+        // so step "a" keeps running. Complete it normally.
+        signal_completion(&completion_a, 0);
+
+        // Yolo auto-advances to step "b". Complete it.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        signal_completion(&completion_b, 0);
 
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
