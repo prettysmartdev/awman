@@ -143,26 +143,33 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 
 ### `--overlay <SPEC>`
 
-Mount additional host directories into the agent container. Accepts a typed overlay expression in the format `dir(host_path:container_path[:ro|rw])`. May be repeated or combined with a comma-separated list.
+Mount additional host directories or skills into the agent container. Accepts typed overlay expressions:
+
+- `skill()` — mount your global amux skills directory (`~/.amux/skills/`) as slash commands (no arguments)
+- `dir(host_path:container_path[:ro|rw])` — mount a host directory
+
+May be repeated or combined with a comma-separated list. Permission defaults to `:ro` when omitted. `:rw` grants read-write access.
 
 ```sh
-# CLI
-amux implement 0030 --overlay "dir(/data/reference:/mnt/reference:ro)"
+# Mount skills
+amux implement 0030 --overlay "skill()"
+
+# Mount a directory
+amux chat --overlay "dir(/data/reference:/mnt/reference:ro)"
 amux chat --overlay "dir(~/prompts:/mnt/prompts:rw)"
 
-# Two overlays — flag repeated or comma-separated (both produce identical results)
-amux implement 0030 --overlay "dir(/a:/mnt/a:ro)" --overlay "dir(/b:/mnt/b:rw)"
-amux implement 0030 --overlay "dir(/a:/mnt/a:ro),dir(/b:/mnt/b:rw)"
+# Skills + directories (repeated flag or comma-separated)
+amux implement 0030 --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
+amux implement 0030 --overlay "skill(),dir(/data:/mnt/data:ro)"
 
 # TUI command box (use comma-separated syntax — repeated --overlay in TUI keeps only the last value)
-implement 0030 --overlay "dir(/data/reference:/mnt/reference:ro),dir(~/prompts:/mnt/prompts)"
+implement 0030 --overlay "skill(),dir(/data/reference:/mnt/reference:ro),dir(~/prompts:/mnt/prompts)"
 ```
-
-Permission defaults to `:ro` when omitted. `:rw` grants read-write access.
 
 Available on all four agent-launching commands: `implement`, `chat`, `exec prompt`, and `exec workflow`.
 
-See [Security & Isolation](03-security-and-isolation.md#overlay-mounts) for the full overlay reference including the `AMUX_OVERLAYS` env var, config-based overlays, and conflict resolution rules.
+See [Configuration → Overlays](07-configuration.md#overlays) for the full overlay reference including config-based overlays, the `AMUX_OVERLAYS` env var, and conflict resolution rules.
+See [Security & Isolation](03-security-and-isolation.md#overlay-mounts) for security considerations.
 
 ### `--allow-docker`
 
@@ -312,6 +319,20 @@ amux new skill --global
 ```
 
 Writes to `~/.amux/skills/<name>/SKILL.md` instead of the current repo. Use this to maintain a personal library of skills that travel with you across projects.
+
+To make global skills available inside agent containers, enable the skills overlay via config:
+
+```json
+{ "overlays": { "skills": true } }
+```
+
+Or pass it at the command line:
+
+```sh
+amux implement 0030 --overlay "skill()"
+```
+
+Once enabled, your global skills appear as slash commands. See [Configuration → Overlays](07-configuration.md#overlays) for details.
 
 `--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.amux/skills/<name>/` directory — not the whole repo or home directory. This still requires being inside a git repository (for agent image lookup).
 

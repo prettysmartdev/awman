@@ -32,6 +32,13 @@ pub mod worktree_lifecycle;
 
 pub use command_trait::Command;
 
+/// A parsed overlay expression: either a directory mount or a skills overlay.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedOverlay {
+    Directory(crate::engine::overlay::DirectorySpec),
+    Skill,
+}
+
 /// Parse a user-supplied overlay spec string in the form
 /// `host:container` or `host:container:perm` (where perm is `ro` or `rw`).
 ///
@@ -76,11 +83,11 @@ pub fn parse_overlay_spec(spec: &str) -> Result<crate::engine::overlay::Director
 /// Parse a comma-separated list of typed overlay expressions from the
 /// `AMUX_OVERLAYS` env var or config arrays.
 ///
-/// Grammar: `dir(host:container[:perm])` expressions separated by commas.
-/// Commas inside parentheses are ignored (paren-aware splitting).
-pub fn parse_overlay_list(
-    input: &str,
-) -> Result<Vec<crate::engine::overlay::DirectorySpec>, String> {
+/// Grammar: `dir(host:container[:perm])` or `skill()` expressions separated
+/// by commas. Bare `host:container[:perm]` strings (no type tag) are accepted
+/// as legacy shorthand for `dir(...)`. Commas inside parentheses are ignored
+/// (paren-aware splitting).
+pub fn parse_overlay_list(input: &str) -> Result<Vec<TypedOverlay>, String> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(vec![]);
@@ -116,8 +123,13 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
     results
 }
 
-/// Parse a single typed overlay expression like `dir(/host:/container:ro)`.
-fn parse_single_typed_overlay(expr: &str) -> Result<crate::engine::overlay::DirectorySpec, String> {
+/// Parse a single typed overlay expression like `dir(/host:/container:ro)`
+/// or `skill()`. If the input has no parentheses, it is treated as a legacy
+/// bare path spec (`host:container[:perm]`).
+fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
+    if !expr.contains('(') {
+        return parse_overlay_spec(expr).map(TypedOverlay::Directory);
+    }
     let open = expr
         .find('(')
         .ok_or_else(|| format!("malformed overlay expression (missing '('): '{expr}'"))?;
@@ -132,9 +144,17 @@ fn parse_single_typed_overlay(expr: &str) -> Result<crate::engine::overlay::Dire
     let tag = expr[..open].trim();
     let args = expr[open + 1..close].trim();
     match tag {
-        "dir" => parse_dir_overlay_args(args, expr),
+        "dir" => parse_dir_overlay_args(args, expr).map(TypedOverlay::Directory),
+        "skill" => {
+            if !args.is_empty() {
+                return Err(format!(
+                    "'skill()' takes no arguments, got '{args}' in '{expr}'"
+                ));
+            }
+            Ok(TypedOverlay::Skill)
+        }
         _ => Err(format!(
-            "unknown overlay type '{tag}' in '{expr}'; supported types: dir"
+            "unknown overlay type '{tag}' in '{expr}'; supported types: dir, skill"
         )),
     }
 }
@@ -210,12 +230,16 @@ pub fn config_overlay_to_spec(
 
 /// Collect all directory overlays from effective config sources (global config,
 /// repo config, AMUX_OVERLAYS env var) and merge with CLI flag overlays.
+///
+/// Returns `(directory_specs, skills_enabled)` where `skills_enabled` is true
+/// when any source (config, env var, or CLI) requests the skills overlay.
 pub fn collect_all_overlay_specs(
     session: &crate::data::session::Session,
-    cli_overlays: Vec<crate::engine::overlay::DirectorySpec>,
-) -> Vec<crate::engine::overlay::DirectorySpec> {
+    cli_typed_overlays: Vec<TypedOverlay>,
+) -> (Vec<crate::engine::overlay::DirectorySpec>, bool) {
     let ec = session.effective_config();
     let mut specs = Vec::new();
+    let mut skills_enabled = false;
 
     // 1. Global config overlays (lowest priority).
     if let Some(overlays) = ec.global().overlays.as_ref() {
@@ -223,6 +247,9 @@ pub fn collect_all_overlay_specs(
             for d in dirs {
                 specs.push(config_overlay_to_spec(d));
             }
+        }
+        if overlays.skills == Some(true) {
+            skills_enabled = true;
         }
     }
 
@@ -233,19 +260,205 @@ pub fn collect_all_overlay_specs(
                 specs.push(config_overlay_to_spec(d));
             }
         }
+        if overlays.skills == Some(true) {
+            skills_enabled = true;
+        }
     }
 
     // 3. AMUX_OVERLAYS env var.
     if let Some(env_str) = ec.env().overlays() {
         if let Ok(parsed) = parse_overlay_list(env_str) {
-            specs.extend(parsed);
+            for typed in parsed {
+                match typed {
+                    TypedOverlay::Directory(spec) => specs.push(spec),
+                    TypedOverlay::Skill => skills_enabled = true,
+                }
+            }
         }
     }
 
     // 4. CLI flag overlays (highest priority).
-    specs.extend(cli_overlays);
+    for typed in cli_typed_overlays {
+        match typed {
+            TypedOverlay::Directory(spec) => specs.push(spec),
+            TypedOverlay::Skill => skills_enabled = true,
+        }
+    }
 
-    specs
+    (specs, skills_enabled)
+}
+
+#[cfg(test)]
+mod skill_parser_tests {
+    use super::*;
+
+    #[test]
+    fn skill_empty_parses_to_skill_variant() {
+        let result = parse_overlay_list("skill()").unwrap();
+        assert_eq!(result, vec![TypedOverlay::Skill]);
+    }
+
+    #[test]
+    fn skill_with_args_returns_error_takes_no_arguments() {
+        let err = parse_overlay_list("skill(anything)").unwrap_err();
+        assert!(
+            err.contains("takes no arguments"),
+            "error must mention 'takes no arguments'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn skill_and_dir_in_comma_list_produces_both_variants() {
+        let result = parse_overlay_list("skill(),dir(/host:/container:ro)").unwrap();
+        assert_eq!(result.len(), 2, "expected 2 overlays; got {result:?}");
+        assert!(
+            matches!(result[0], TypedOverlay::Skill),
+            "first entry must be Skill; got {result:?}"
+        );
+        assert!(
+            matches!(result[1], TypedOverlay::Directory(_)),
+            "second entry must be Directory; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_tag_error_lists_dir_and_skill_as_valid_types() {
+        let err = parse_overlay_list("foobar(/x:/y)").unwrap_err();
+        assert!(
+            err.contains("dir"),
+            "error must mention 'dir' as a supported type; got: {err}"
+        );
+        assert!(
+            err.contains("skill"),
+            "error must mention 'skill' as a supported type; got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod collect_overlay_specs_tests {
+    use super::*;
+    use crate::data::config::env::{EnvSnapshot, AMUX_CONFIG_HOME, AMUX_OVERLAYS};
+    use crate::data::config::global::GlobalConfig;
+    use crate::data::config::repo::{OverlaysConfig, RepoConfig};
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+
+    fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
+        let resolver = StaticGitRootResolver::new(git_root);
+        let opts = SessionOpenOptions {
+            flags: Default::default(),
+            env: Some(env),
+            available_agents: None,
+        };
+        Session::open(git_root.to_path_buf(), &resolver, opts).unwrap()
+    }
+
+    #[test]
+    fn skills_enabled_when_repo_config_has_skills_true() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let repo_config = RepoConfig {
+            overlays: Some(OverlaysConfig {
+                skills: Some(true),
+                directories: None,
+            }),
+            ..Default::default()
+        };
+        repo_config.save(git_tmp.path()).unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        assert!(skills_enabled, "skills must be enabled from repo config");
+    }
+
+    #[test]
+    fn skills_enabled_when_global_config_has_skills_true() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let global_config = GlobalConfig {
+            overlays: Some(OverlaysConfig {
+                skills: Some(true),
+                directories: None,
+            }),
+            ..Default::default()
+        };
+        let env =
+            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_with(&env).unwrap();
+        let session = open_session(git_tmp.path(), env);
+
+        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        assert!(skills_enabled, "skills must be enabled from global config");
+    }
+
+    #[test]
+    fn skills_enabled_when_amux_overlays_env_contains_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([
+            (AMUX_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AMUX_OVERLAYS, "skill()"),
+        ]);
+        let session = open_session(tmp.path(), env);
+
+        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        assert!(
+            skills_enabled,
+            "skills must be enabled when AMUX_OVERLAYS contains skill()"
+        );
+    }
+
+    #[test]
+    fn skills_enabled_when_cli_typed_overlays_contains_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![TypedOverlay::Skill]);
+        assert!(
+            skills_enabled,
+            "skills must be enabled from CLI TypedOverlay::Skill"
+        );
+    }
+
+    #[test]
+    fn skills_disabled_when_no_source_enables_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        assert!(!skills_enabled, "skills must be disabled when no source sets it");
+    }
+
+    #[test]
+    fn skills_enabled_is_additive_or_single_source_sufficient() {
+        // Only global config has skills=true; repo config and CLI do not.
+        // skills_enabled must still be true — OR semantics, not AND.
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let global_config = GlobalConfig {
+            overlays: Some(OverlaysConfig {
+                skills: Some(true),
+                directories: None,
+            }),
+            ..Default::default()
+        };
+        let env =
+            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_with(&env).unwrap();
+        // Repo config has no overlays; no CLI TypedOverlay::Skill.
+        let session = open_session(git_tmp.path(), env);
+
+        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        assert!(
+            skills_enabled,
+            "a single source (global config) must be sufficient to enable skills (additive OR)"
+        );
+    }
 }
 
 #[cfg(test)]

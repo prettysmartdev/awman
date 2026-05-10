@@ -48,6 +48,9 @@ pub struct AgentRunOptions {
     pub env_passthrough: Option<Vec<String>>,
     /// User-supplied directory overlays.
     pub directory_overlays: Vec<DirectorySpec>,
+    /// When true, mount the global amux skills directory into the agent's
+    /// native skills path inside the container.
+    pub include_skills: bool,
 }
 
 #[derive(Clone)]
@@ -298,9 +301,10 @@ impl AgentEngine {
             },
         ));
 
-        // Overlays — agent settings + user-supplied dirs.
+        // Overlays — agent settings + user-supplied dirs + skills.
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
+            include_skills: run.include_skills,
             agent: Some(agent.clone()),
             yolo: matches!(run.yolo, Some(YoloMode::Enabled)),
             container_home: None,

@@ -317,6 +317,7 @@ impl InitEngine {
                     model: None,
                     env_passthrough: None,
                     directory_overlays: vec![],
+                    include_skills: false,
                 };
                 match self
                     .agent_engine

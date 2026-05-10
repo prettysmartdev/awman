@@ -35,6 +35,9 @@ pub const CLAUDE_DENYLIST: &[&str] = &[
 pub struct OverlayRequest {
     /// Inline directory specs (host:container[:perm]).
     pub directories: Vec<DirectorySpec>,
+    /// When true, mount the global amux skills directory into the agent's
+    /// native skills/commands path inside the container.
+    pub include_skills: bool,
     /// Whether to include agent-settings overlays for `agent`. When `Some`
     /// the engine prepares per-agent host configs (e.g. `~/.claude.json`).
     pub agent: Option<AgentName>,
@@ -119,6 +122,16 @@ impl OverlayEngine {
             for spec in self.agent_settings_overlays_with(agent, request.yolo)? {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
                 insert_or_merge(&mut by_key, key, spec);
+            }
+        }
+
+        // 3. Skills overlay (mount ~/.amux/skills/ read-only into agent's native path).
+        if request.include_skills {
+            if let Some(agent) = &request.agent {
+                for spec in self.skill_overlays(agent, &request.container_home)? {
+                    let key = OverlayPathResolver::conflict_key(&spec.host_path);
+                    insert_or_merge(&mut by_key, key, spec);
+                }
             }
         }
 
@@ -301,6 +314,63 @@ impl OverlayEngine {
         }
 
         Ok(out)
+    }
+
+    /// Build overlay specs for the global skills directory, mapping it to the
+    /// agent's native skills/commands path inside the container (read-only).
+    pub fn skill_overlays(
+        &self,
+        agent: &AgentName,
+        container_home_override: &Option<String>,
+    ) -> Result<Vec<OverlaySpec>, EngineError> {
+        let skill_dirs =
+            crate::data::fs::skill_dirs::SkillDirs::from_process_env(None).map_err(EngineError::Data)?;
+        let host_skills_dir = skill_dirs.global_dir();
+        if !host_skills_dir.exists() {
+            tracing::debug!(
+                path = %host_skills_dir.display(),
+                "global skills directory does not exist; skipping skills overlay"
+            );
+            return Ok(vec![]);
+        }
+
+        let home = self.auth_resolver.home();
+        let container_home = container_home_override
+            .clone()
+            .unwrap_or_else(|| {
+                detect_container_home(home, agent.as_str())
+                    .unwrap_or_else(|| "/root".to_string())
+            });
+
+        let container_path = match agent.as_str() {
+            "claude" => format!("{container_home}/.claude/commands"),
+            "codex" => format!("{container_home}/.codex/skills"),
+            "opencode" => format!("{container_home}/.config/opencode/commands"),
+            "gemini" => format!("{container_home}/.gemini/commands"),
+            "copilot" => format!("{container_home}/.copilot/instructions"),
+            "crush" => format!("{container_home}/.config/crush/commands"),
+            "cline" => format!("{container_home}/.cline/skills"),
+            "maki" => {
+                tracing::warn!(
+                    agent = "maki",
+                    "skills overlay is not supported for maki; no known skills directory"
+                );
+                return Ok(vec![]);
+            }
+            other => {
+                tracing::warn!(
+                    agent = other,
+                    "skills overlay: unknown agent, skipping"
+                );
+                return Ok(vec![]);
+            }
+        };
+
+        Ok(vec![OverlaySpec {
+            host_path: OverlayPathResolver::canonicalize_lossy(&host_skills_dir),
+            container_path: PathBuf::from(container_path),
+            permission: OverlayPermission::ReadOnly,
+        }])
     }
 }
 
@@ -539,8 +609,258 @@ mod tests {
     use super::*;
     use crate::data::session::AgentName;
 
+    /// Serialises tests that write to `AMUX_CONFIG_HOME` (a process-global env var).
+    static AMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `AMUX_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
+    fn with_amux_config_home<F, R>(home: &Path, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _g = AMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AMUX_CONFIG_HOME").ok();
+        std::env::set_var("AMUX_CONFIG_HOME", home.to_str().unwrap());
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var("AMUX_CONFIG_HOME", v),
+            None => std::env::remove_var("AMUX_CONFIG_HOME"),
+        }
+        result
+    }
+
     fn make_engine(home: &Path) -> OverlayEngine {
         OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+    }
+
+    // ─── skill_overlays ───────────────────────────────────────────────────────
+
+    /// Create a temp dir, make `<dir>/skills/` exist, and return both.
+    fn make_home_with_skills() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let skills_canon = std::fs::canonicalize(&skills).unwrap_or(skills);
+        (tmp, skills_canon)
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_claude() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1, "expected 1 OverlaySpec; got {specs:?}");
+        assert_eq!(specs[0].host_path, skills_canon, "host path must be global skills dir");
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly, "must be :ro");
+        assert!(
+            specs[0].container_path.to_string_lossy().contains("/.claude/commands"),
+            "claude container path must contain /.claude/commands; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_codex() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("codex").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0].container_path.to_string_lossy().contains("/.codex/skills"),
+            "codex container path must contain /.codex/skills; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_gemini() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("gemini").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0].container_path.to_string_lossy().contains("/.gemini/commands"),
+            "gemini container path must contain /.gemini/commands; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_opencode() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("opencode").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.config/opencode/commands"),
+            "opencode container path must contain /.config/opencode/commands; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_copilot() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("copilot").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.copilot/instructions"),
+            "copilot container path must contain /.copilot/instructions; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_crush() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("crush").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.config/crush/commands"),
+            "crush container path must contain /.config/crush/commands; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_cline() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("cline").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0].container_path.to_string_lossy().contains("/.cline/skills"),
+            "cline container path must contain /.cline/skills; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_empty_when_skills_dir_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately do NOT create <tmp>/skills/.
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert!(
+            specs.is_empty(),
+            "must return empty vec when skills dir is absent; got {specs:?}"
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_empty_for_maki_no_error() {
+        let (tmp, _) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("maki").unwrap();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        assert!(
+            specs.is_empty(),
+            "maki must produce no skills mount; got {specs:?}"
+        );
+    }
+
+    #[test]
+    fn skill_overlays_uses_container_home_override_when_set() {
+        let (tmp, _) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let override_home = Some("/home/appuser".to_string());
+
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine.skill_overlays(&agent, &override_home).unwrap()
+        });
+
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .starts_with("/home/appuser/"),
+            "container path must use the override home '/home/appuser'; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_defaults_to_root_when_no_dockerfile_present() {
+        let (tmp, _) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+
+        // Ensure no Dockerfile.claude in cwd or home.
+        let prev_cwd = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).ok();
+
+        let specs =
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+
+        if let Some(p) = prev_cwd {
+            let _ = std::env::set_current_dir(p);
+        }
+
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].container_path.to_string_lossy().starts_with("/root/"),
+            "container path must default to /root/ when detect_container_home returns None; got {:?}",
+            specs[0].container_path
+        );
     }
 
     #[test]
@@ -623,6 +943,7 @@ mod tests {
                     permission: OverlayPermission::ReadOnly,
                 },
             ],
+            include_skills: false,
             agent: None,
             yolo: false,
             container_home: None,

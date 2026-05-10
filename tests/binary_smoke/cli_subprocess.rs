@@ -103,6 +103,90 @@ fn amux_remote_help_exits_zero() {
     assert!(out.status.success());
 }
 
+// ─── skill() overlay flag behaviour (WI 0075) ────────────────────────────────
+
+fn make_git_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("TempDir::new");
+    std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repo.path())
+        .status()
+        .expect("git init");
+    repo
+}
+
+/// `skill(anything)` as --overlay value must exit non-zero with a descriptive
+/// error; the flag itself must be recognised (not "unknown flag").
+#[test]
+fn skill_with_args_flag_exits_nonzero_with_descriptive_error() {
+    let repo = make_git_repo();
+    // Use `chat --non-interactive` which accepts --overlay without a required positional arg.
+    let out = Command::new(amux_bin())
+        .current_dir(repo.path())
+        .args([
+            "chat",
+            "--non-interactive",
+            "--overlay",
+            "skill(something)",
+        ])
+        .output()
+        .expect("failed to run amux");
+
+    assert!(
+        !out.status.success(),
+        "skill(something) must cause a non-zero exit; got: {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Must NOT complain that --overlay is unrecognised.
+    assert!(
+        !stderr.contains("unexpected argument '--overlay'")
+            && !stderr.contains("unrecognized argument --overlay"),
+        "--overlay must be a recognised flag; got: {stderr}"
+    );
+    // Must report a parse-level error mentioning the invalid use of arguments.
+    assert!(
+        stderr.contains("takes no arguments") || stderr.contains("skill"),
+        "error must describe the invalid skill() usage; got: {stderr}"
+    );
+}
+
+/// `skill()` (valid) as --overlay value must be recognised — clap must not
+/// reject the flag. The command may still fail (no Docker/agent), but the
+/// --overlay flag itself must be accepted as syntactically valid.
+#[test]
+fn skill_empty_overlay_flag_is_recognized_by_cli() {
+    let repo = make_git_repo();
+    let out = Command::new(amux_bin())
+        .current_dir(repo.path())
+        .args(["implement", "--help"])
+        .output()
+        .expect("failed to run amux implement --help");
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--overlay"),
+        "implement --help must mention --overlay so skill() can be passed; got: {stdout}"
+    );
+}
+
+/// `AMUX_OVERLAYS="skill()"` env var: help still works (env var not parsed at help time).
+#[test]
+fn skill_in_amux_overlays_env_does_not_break_help() {
+    let out = Command::new(amux_bin())
+        .env("AMUX_OVERLAYS", "skill()")
+        .args(["implement", "--help"])
+        .output()
+        .expect("failed to run amux implement --help");
+
+    assert!(
+        out.status.success(),
+        "amux implement --help must succeed even when AMUX_OVERLAYS=skill(); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ─── Unknown command error handling ──────────────────────────────────────────
 
 #[test]

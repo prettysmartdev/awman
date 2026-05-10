@@ -19,6 +19,7 @@ This file is created by `amux init` and should be committed to source control. I
   "yoloDisallowedTools": ["Bash", "computer"],
   "envPassthrough": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
   "overlays": {
+    "skills": true,
     "directories": [
       { "host": "/data/fixtures", "container": "/mnt/fixtures", "permission": "ro" }
     ]
@@ -36,6 +37,7 @@ This file is created by `amux init` and should be committed to source control. I
 | `terminal_scrollback_lines` | integer | `10000` | Number of scrollback lines in the container terminal emulator. Overrides the global value |
 | `yoloDisallowedTools` | string array | `[]` | Tools the agent cannot use when `--yolo` is active. Overrides the global list entirely |
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. Overrides the global list entirely. See [`envPassthrough`](#envpassthrough) |
+| `overlays.skills` | boolean | false | When `true`, mount your global amux skills directory (`~/.amux/skills/`) into the agent container as its native slash commands. **Additive** with the global config; either scope setting it to `true` enables the mount. See [`overlays`](#overlays) |
 | `overlays.directories` | object array | `[]` | Host directories to mount into agent containers automatically. **Additive** with the global list — entries from both scopes are merged, not replaced. See [`overlays`](#overlays) |
 | `workItems.dir` | string | (not set) | Path to the work items directory, relative to repo root. See [Work item paths](#work-item-paths) |
 | `workItems.template` | string | (not set) | Path to the work item template file, relative to repo root. See [Work item paths](#work-item-paths) |
@@ -56,6 +58,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
   "yoloDisallowedTools": ["Bash"],
   "envPassthrough": ["ANTHROPIC_API_KEY"],
   "overlays": {
+    "skills": true,
     "directories": [
       { "host": "~/personal-prompts", "container": "/mnt/prompts", "permission": "ro" }
     ]
@@ -79,6 +82,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `runtime` | string | `"docker"` | Container runtime: `"docker"` or `"apple-containers"` (macOS 26+ only) |
 | `yoloDisallowedTools` | string array | `[]` | Global fallback list of tools forbidden when `--yolo` is active |
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. See [`envPassthrough`](#envpassthrough) |
+| `overlays.skills` | boolean | false | When `true`, mount your global amux skills directory (`~/.amux/skills/`) into every agent container as its native slash commands. **Additive** — enable it here, per-repo config, `AMUX_OVERLAYS`, or `--overlay` flags. See [`overlays`](#overlays) |
 | `overlays.directories` | object array | `[]` | Host directories to mount into agent containers automatically across all projects. **Additive** with per-repo overlays — both lists are merged. See [`overlays`](#overlays) |
 | `headless.workDirs` | string array | `[]` | Working directories pre-approved for headless mode session creation. Merged with `--workdirs` flags at server startup. See [Headless Mode](08-headless-mode.md#working-directory-allowlist) |
 | `headless.alwaysNonInteractive` | boolean | `false` | When `true`, all dispatched commands automatically run in non-interactive mode. Useful for headless servers where no TTY is available. See [Headless Mode](08-headless-mode.md#alwaysnoninteractive) |
@@ -98,6 +102,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `terminal_scrollback_lines` | Per-repo → Global → Built-in default (10,000) |
 | `yoloDisallowedTools` | Per-repo → Global → Empty list (no restriction) |
 | `envPassthrough` | Per-repo → Global → Empty list (no passthrough) |
+| `overlays.skills` | **Additive OR**: if true in global, per-repo, `AMUX_OVERLAYS`, or `--overlay` flags, the mount is enabled |
 | `overlays.directories` | **Additive**: global + per-repo + `AMUX_OVERLAYS` env var + `--overlay` flags, merged with conflict resolution |
 | `runtime` | Global only |
 | `workItems.dir` / `workItems.template` | Per-repo only |
@@ -109,7 +114,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 
 For `yoloDisallowedTools` and `envPassthrough`, if a per-repo list is set it **replaces** the global list entirely — lists are not merged. To inherit the global list for a repo, omit the field from the repo config.
 
-`overlays.directories` behaves differently: all sources are **additive**. Entries from global config, per-repo config, the `AMUX_OVERLAYS` env var, and `--overlay` CLI flags are all merged into a single list. When the same host path appears in multiple sources, conflict resolution applies (higher-priority source wins for the container path; more restrictive permission always wins). See [`overlays`](#overlays) for the full resolution rules.
+`overlays.skills` and `overlays.directories` behave differently: all sources are **additive**. Entries from global config, per-repo config, the `AMUX_OVERLAYS` env var, and `--overlay` CLI flags are all merged into the final configuration. For `overlays.skills`, if any source sets it to `true`, the skills mount is enabled — there is no hierarchy; it's an OR operation. For `overlays.directories`, entries with different host paths are kept independent; when the same host path appears in multiple sources, conflict resolution applies (higher-priority source wins for the container path; more restrictive permission always wins). See [`overlays`](#overlays) for the full resolution rules.
 
 A 10,000-line scrollback buffer at 80 columns uses approximately 3 MB per tab. Increase for long-running build or test sessions; decrease when running many simultaneous tabs.
 
@@ -131,6 +136,7 @@ runtime                          docker (built-in)   N/A               docker   
 terminal_scrollback_lines        10000 (built-in)    5000              5000               yes
 yolo_disallowed_tools            (empty)             (not set)         (empty)            —
 env_passthrough                  HOME, PATH          (not set)         HOME, PATH         —
+overlays.skills                  true                (not set)         true (enabled)     —
 overlays.directories             1 entry             1 entry           2 entries (merged) —
 agent                            N/A                 codex             codex              yes
 auto_agent_auth_accepted         N/A                 true (read-only)  true               —
@@ -174,7 +180,7 @@ When neither scope has the field set, the built-in default is shown for both Glo
 Passing an unknown field name prints a helpful error listing all valid names:
 
 ```
-error: Unknown config field 'scrollback'. Valid fields: default_agent, runtime, terminal_scrollback_lines, yolo_disallowed_tools, env_passthrough, overlays.directories, agent, auto_agent_auth_accepted, headless.workDirs, headless.alwaysNonInteractive, remote.defaultAddr, remote.defaultAPIKey, remote.savedDirs
+error: Unknown config field 'scrollback'. Valid fields: default_agent, runtime, terminal_scrollback_lines, yolo_disallowed_tools, env_passthrough, overlays.skills, overlays.directories, agent, auto_agent_auth_accepted, headless.workDirs, headless.alwaysNonInteractive, remote.defaultAddr, remote.defaultAPIKey, remote.savedDirs
 ```
 
 ### `amux config set [--global] <field> <value>`
@@ -202,6 +208,12 @@ amux config set work_items.dir docs/work-items
 
 # Set work item template for this repo
 amux config set work_items.template docs/work-items/0000-template.md
+
+# Enable skills overlay for this repo
+amux config set overlays.skills true
+
+# Enable skills overlay globally
+amux config set --global overlays.skills true
 
 # Configure headless working directories globally
 amux config set --global headless.workDirs "/home/user/my-project,/home/user/other-project"
@@ -517,7 +529,7 @@ If a variable name appears in both `envPassthrough` and the agent's keychain cre
 
 ## Overlays
 
-Overlays let you mount additional host directories into agent containers. Unlike `envPassthrough`, overlay sources from all scopes are **additive** — entries from global config, per-repo config, the `AMUX_OVERLAYS` env var, and `--overlay` CLI flags are all merged into the final mount list.
+Overlays let you mount additional host directories into agent containers, and optionally inject your personal amux skills library. Unlike `envPassthrough`, overlay sources from all scopes are **additive** — entries from global config, per-repo config, the `AMUX_OVERLAYS` env var, and `--overlay` CLI flags are all merged into the final mount list.
 
 ### Configuration
 
@@ -525,6 +537,7 @@ Overlays let you mount additional host directories into agent containers. Unlike
 ```json
 {
   "overlays": {
+    "skills": true,
     "directories": [
       { "host": "/data/fixtures", "container": "/mnt/fixtures", "permission": "ro" },
       { "host": "~/shared-prompts", "container": "/mnt/prompts" }
@@ -537,12 +550,34 @@ Overlays let you mount additional host directories into agent containers. Unlike
 ```json
 {
   "overlays": {
+    "skills": true,
     "directories": [
       { "host": "~/personal-prompts", "container": "/mnt/prompts", "permission": "ro" }
     ]
   }
 }
 ```
+
+#### Skills overlay
+
+The `skills` overlay (boolean, default `false`) mounts your global amux skills directory (`~/.amux/skills/`) into the agent container at its native skills location. This makes any custom skills you've created with `amux new skill` available as slash commands inside the container, without manually wiring up paths.
+
+When `skills` is set to `true` in any config source or via `--overlay "skill()"`, the mount is applied automatically. The container path is determined by the agent type:
+
+| Agent | Container path | Notes |
+|-------|---|---|
+| `claude` | `~/.claude/commands` | Claude Code traverses subdirectories; each `<skill-name>/SKILL.md` appears as a namespaced command |
+| `codex` | `~/.codex/skills` | Codex recognizes subdirectories containing `SKILL.md` files |
+| `opencode` | `~/.config/opencode/commands` | OpenCode scans its `commands/` directory for `.md` files |
+| `gemini` | `~/.gemini/commands` | Gemini CLI custom commands directory |
+| `copilot` | `~/.copilot/instructions` | Copilot reads instruction files from this directory |
+| `crush` | `~/.config/crush/commands` | Custom commands directory |
+| `cline` | `~/.cline/skills` | Cline's skills format matches amux format exactly |
+| `maki` | *(not supported)* | maki has no known skills directory; mount is skipped |
+
+If the skills directory doesn't exist on the host (you haven't created any skills yet), the mount is skipped silently with a debug-level log — it's not an error.
+
+#### Directory entries
 
 Each directory entry accepts:
 
@@ -554,18 +589,21 @@ Each directory entry accepts:
 
 ### The `AMUX_OVERLAYS` environment variable
 
-Set `AMUX_OVERLAYS` in your shell profile to inject personal overlays into every session without touching any config file. It uses the same `dir(...)` syntax as the `--overlay` CLI flag — a comma-separated list of typed overlay expressions:
+Set `AMUX_OVERLAYS` in your shell profile to inject personal overlays into every session without touching any config file. It uses typed overlay expressions separated by commas. Supported types:
+
+- `skill()` — mount your global amux skills directory (no arguments)
+- `dir(host:container[:permission])` — mount a host directory
 
 ```sh
 # In ~/.bashrc, ~/.zshrc, etc.
-export AMUX_OVERLAYS="dir(~/personal-prompts:/mnt/prompts),dir(/data/shared-fixtures:/mnt/fixtures:ro)"
+export AMUX_OVERLAYS="skill(),dir(~/personal-prompts:/mnt/prompts),dir(/data/shared-fixtures:/mnt/fixtures:ro)"
 ```
 
 `AMUX_OVERLAYS` has higher priority than config file entries but lower priority than `--overlay` flags.
 
 ### Priority order
 
-Overlays are resolved from all sources, then merged. Priority order from lowest to highest:
+Overlays are resolved from all sources, then merged. For **directory** overlays, priority order from lowest to highest:
 
 | Priority | Source |
 |----------|--------|
@@ -575,6 +613,8 @@ Overlays are resolved from all sources, then merged. Priority order from lowest 
 | 3 (highest) | `--overlay` CLI flags |
 
 All entries from all sources are combined into one list. Entries with different host paths are kept as independent mounts — they do not replace each other.
+
+**Skills overlay** (`overlays.skills`) works differently — it is **additive OR**. If *any* source sets `"skills": true` or includes `skill()` in `--overlay` flags, the mount is enabled. There is no priority hierarchy; only a boolean check: is skills enabled anywhere?
 
 ### Conflict resolution
 
@@ -597,24 +637,30 @@ WARN overlay host path '/data/reference' does not exist; skipping
 
 ### CLI flag
 
-The `--overlay` flag is available on all four agent-launching commands: `implement`, `chat`, `exec prompt`, and `exec workflow`.
+The `--overlay` flag is available on all four agent-launching commands: `implement`, `chat`, `exec prompt`, and `exec workflow`. It accepts both `skill()` and `dir(...)` entries.
 
 ```sh
-# Single overlay
-amux implement 0042 --overlay "dir(/data/reference:/mnt/reference:ro)"
+# Skills overlay alone
+amux implement 0042 --overlay "skill()"
 
-# Multiple overlays (repeated flag or comma-separated — equivalent on CLI)
+# Skills overlay with directory overlays (repeated flag or comma-separated)
+amux chat --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
+amux chat --overlay "skill(),dir(/data:/mnt/data:ro)"
+
+# Directory overlays (tilde expansion supported)
+amux implement 0042 --overlay "dir(~/prompts:/mnt/prompts)"
+
+# Multiple directory overlays
 amux chat --overlay "dir(/a:/mnt/a:ro)" --overlay "dir(/b:/mnt/b:rw)"
 amux chat --overlay "dir(/a:/mnt/a:ro),dir(/b:/mnt/b:rw)"
-
-# Tilde expansion
-amux implement 0042 --overlay "dir(~/prompts:/mnt/prompts)"
 ```
 
 Malformed `--overlay` values are a fatal error — the command exits immediately with a descriptive message rather than silently skipping the bad entry:
 
 ```
 error: malformed overlay expression (missing opening parenthesis): "notvalid"
+
+error: 'skill()' takes no arguments, got 'arg' in 'skill(arg)'
 ```
 
 ### Paths with spaces
@@ -625,9 +671,58 @@ Spaces in host or container paths are supported natively — the parser splits o
 amux chat --overlay "dir(/path with spaces:/mnt/ref:ro)"
 ```
 
+### Common use cases
+
+#### Personal skills library (skills overlay)
+
+If you've built custom skills with `amux new skill` and stored them in `~/.amux/skills/`, enable the skills overlay to make them available in every agent session:
+
+```json
+{ "overlays": { "skills": true } }
+```
+
+Once enabled, your skills appear as slash commands inside the agent. This is useful for:
+- Sharing a personal library of prompt templates and utilities across all projects
+- Making team-wide skills available to all developers in a repo (set in `aspec/.amux.json`)
+- Avoiding the need to manually copy or link skill files into containers
+
+#### Shared project assets (directory overlay)
+
+Mount fixture files, reference data, or shared prompts into containers:
+
+```json
+{
+  "overlays": {
+    "directories": [
+      { "host": "/var/data/fixtures", "container": "/mnt/fixtures", "permission": "ro" },
+      { "host": "~/team-prompts", "container": "/mnt/prompts", "permission": "ro" }
+    ]
+  }
+}
+```
+
+#### Combining both
+
+Enable your personal skills library AND mount shared team assets:
+
+```sh
+# In ~/.amux/config.json (global)
+export AMUX_OVERLAYS="skill(),dir(~/team-shared:/mnt/shared:ro)"
+
+# Or in aspec/.amux.json (per-repo)
+{
+  "overlays": {
+    "skills": true,
+    "directories": [
+      { "host": "~/team-shared", "container": "/mnt/shared", "permission": "ro" }
+    ]
+  }
+}
+```
+
 ### Security
 
-Overlay mounts are printed in the full Docker command before each session, so you always see exactly what is mounted. `:ro` prevents the agent from modifying the overlaid directory. Only use `:rw` when the task genuinely requires write access to that directory.
+Overlay mounts are printed in the full Docker command before each session, so you always see exactly what is mounted. `:ro` prevents the agent from modifying the overlaid directory. Skills are always mounted read-only and cannot be modified by the agent. Only use `:rw` for directory overlays when the task genuinely requires write access to that directory.
 
 See [Security & Isolation](03-security-and-isolation.md#overlay-mounts) for a complete reference.
 

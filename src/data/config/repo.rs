@@ -53,6 +53,9 @@ pub struct HeadlessConfig {
 pub struct OverlaysConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directories: Option<Vec<DirectoryOverlayConfig>>,
+    /// When true, mount the global amux skills dir into the agent container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<bool>,
 }
 
 /// A single directory overlay entry as stored in JSON config.
@@ -352,5 +355,57 @@ mod tests {
         let tmp = make_git_root();
         let p = RepoConfig::legacy_path(tmp.path());
         assert_eq!(p, tmp.path().join("aspec").join(".amux.json"));
+    }
+
+    // ─── OverlaysConfig / skills deserialization ──────────────────────────────
+
+    #[test]
+    fn overlays_config_skills_true_deserializes() {
+        let json = r#"{"overlays": {"skills": true}}"#;
+        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
+        let overlays = cfg.overlays.expect("overlays must be present");
+        assert_eq!(
+            overlays.skills,
+            Some(true),
+            "skills: true must deserialize to Some(true)"
+        );
+        assert!(overlays.directories.is_none(), "directories must be None");
+    }
+
+    #[test]
+    fn overlays_config_skills_false_deserializes() {
+        let json = r#"{"overlays": {"skills": false}}"#;
+        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
+        let overlays = cfg.overlays.expect("overlays must be present");
+        assert_eq!(
+            overlays.skills,
+            Some(false),
+            "skills: false must deserialize to Some(false)"
+        );
+    }
+
+    #[test]
+    fn overlays_config_missing_skills_key_deserializes_to_none() {
+        let json = r#"{"overlays": {}}"#;
+        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
+        let overlays = cfg.overlays.expect("overlays must be present");
+        assert!(
+            overlays.skills.is_none(),
+            "missing 'skills' key must deserialize to None; got {:?}",
+            overlays.skills
+        );
+    }
+
+    #[test]
+    fn overlays_config_only_directories_deserializes_without_error() {
+        let json = r#"{"overlays": {"directories": [{"host": "/h", "container": "/c", "permission": "ro"}]}}"#;
+        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
+        let overlays = cfg.overlays.expect("overlays must be present");
+        assert!(overlays.skills.is_none(), "skills must be None when not in JSON");
+        assert_eq!(
+            overlays.directories.as_ref().map(|d| d.len()),
+            Some(1),
+            "directories must have 1 entry"
+        );
     }
 }

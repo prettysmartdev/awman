@@ -12,7 +12,7 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
@@ -291,6 +291,7 @@ struct CommandLayerFactory {
     engines: Engines,
     flags: Arc<ExecWorkflowCommandFlags>,
     directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
+    include_skills: bool,
     work_item_context: Option<WorkItemContext>,
     /// The original repository git root (not the worktree). Used for image tag
     /// derivation so worktree-based runs use the correct project image.
@@ -321,6 +322,7 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             model: runtime.step_model.clone(),
             env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays: self.directory_overlays.clone(),
+            include_skills: self.include_skills,
         };
         let mut options =
             self.engines
@@ -559,26 +561,25 @@ impl Command for ExecWorkflowCommand {
         };
 
         // 5. Parse CLI overlay specs early so errors surface before PTY is activated.
-        let cli_overlays = match self
-            .flags
-            .overlay
-            .iter()
-            .map(|s| {
-                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
-                    spec: s.clone(),
-                    reason,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec workflow: invalid overlay spec: {e}"),
-                });
-                return Err(e);
+        let cli_typed = {
+            let mut all = Vec::new();
+            for s in &self.flags.overlay {
+                match parse_overlay_list(s) {
+                    Ok(parsed) => all.extend(parsed),
+                    Err(reason) => {
+                        let e = CommandError::InvalidOverlaySpec {
+                            spec: s.clone(),
+                            reason,
+                        };
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec workflow: invalid overlay spec: {e}"),
+                        });
+                        return Err(e);
+                    }
+                }
             }
+            all
         };
 
         // 5b. Detect a persisted workflow-state file and ask the user whether
@@ -689,7 +690,7 @@ impl Command for ExecWorkflowCommand {
         };
 
         // Merge CLI overlays with config/env sources now that session is available.
-        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
+        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
 
         // 9. Run the engine. The engine block is scoped so proxy + factory are
         //    dropped before we reclaim the frontend via Arc::try_unwrap.
@@ -702,6 +703,7 @@ impl Command for ExecWorkflowCommand {
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
                 directory_overlays,
+                include_skills: skills_enabled,
                 work_item_context,
                 image_git_root: git_root_for_scope.clone(),
             };

@@ -7,7 +7,7 @@ use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};
@@ -103,28 +103,27 @@ impl Command for ChatCommand {
         };
 
         // 2. Parse overlay specs before PTY is activated so errors surface early.
-        let cli_overlays = match self
-            .flags
-            .overlay
-            .iter()
-            .map(|s| {
-                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
-                    spec: s.clone(),
-                    reason,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("chat: invalid overlay spec: {e}"),
-                });
-                return Err(e);
+        let cli_typed = {
+            let mut all = Vec::new();
+            for s in &self.flags.overlay {
+                match parse_overlay_list(s) {
+                    Ok(parsed) => all.extend(parsed),
+                    Err(reason) => {
+                        let e = CommandError::InvalidOverlaySpec {
+                            spec: s.clone(),
+                            reason,
+                        };
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("chat: invalid overlay spec: {e}"),
+                        });
+                        return Err(e);
+                    }
+                }
             }
+            all
         };
-        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
+        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
 
         // 3. Ensure the agent is available (Dockerfile + image present, build
         //    if missing). Runs before PTY activation so any download/build
@@ -184,6 +183,7 @@ impl Command for ChatCommand {
             model: self.flags.model.clone(),
             env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays,
+            include_skills: skills_enabled,
             ..Default::default()
         };
         let env_overrides = credentials.env_vars.clone();

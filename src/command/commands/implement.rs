@@ -18,7 +18,7 @@ use crate::command::commands::implement_prompts::render_default_prompt;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
@@ -248,6 +248,7 @@ struct ImplementCommandLayerFactory {
     engines: Engines,
     flags: Arc<ImplementCommandFlags>,
     directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
+    include_skills: bool,
 }
 
 impl ContainerExecutionFactory for ImplementCommandLayerFactory {
@@ -270,6 +271,7 @@ impl ContainerExecutionFactory for ImplementCommandLayerFactory {
             model: runtime.step_model.clone(),
             env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays: self.directory_overlays.clone(),
+            include_skills: self.include_skills,
         };
         let options =
             self.engines
@@ -427,26 +429,25 @@ impl Command for ImplementCommand {
         };
 
         // Parse CLI overlay specs before any async work so errors surface early.
-        let cli_overlays = match self
-            .flags
-            .overlay
-            .iter()
-            .map(|s| {
-                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
-                    spec: s.clone(),
-                    reason,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("implement: invalid overlay spec: {e}"),
-                });
-                return Err(e);
+        let cli_typed = {
+            let mut all = Vec::new();
+            for s in &self.flags.overlay {
+                match parse_overlay_list(s) {
+                    Ok(parsed) => all.extend(parsed),
+                    Err(reason) => {
+                        let e = CommandError::InvalidOverlaySpec {
+                            spec: s.clone(),
+                            reason,
+                        };
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("implement: invalid overlay spec: {e}"),
+                        });
+                        return Err(e);
+                    }
+                }
             }
+            all
         };
 
         frontend.set_pty_active(true);
@@ -458,7 +459,7 @@ impl Command for ImplementCommand {
         let session = self.session;
 
         // Merge CLI overlays with config/env sources now that session is available.
-        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
+        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
 
         shared.lock().unwrap().write_message(UserMessage {
             level: MessageLevel::Info,
@@ -472,6 +473,7 @@ impl Command for ImplementCommand {
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
                 directory_overlays,
+                include_skills: skills_enabled,
             };
             let wi_num = parse_work_item_number(&self.flags.work_item);
             let work_item = if wi_num > 0 { Some(wi_num) } else { None };

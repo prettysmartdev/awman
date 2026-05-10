@@ -8,7 +8,7 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::mount_scope::MountScopeFrontend;
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};
@@ -113,28 +113,27 @@ impl Command for ExecPromptCommand {
             text: format!("exec prompt: using agent '{}'", agent.as_str()),
         });
 
-        let cli_overlays = match self
-            .flags
-            .overlay
-            .iter()
-            .map(|s| {
-                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
-                    spec: s.clone(),
-                    reason,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: invalid overlay spec: {e}"),
-                });
-                return Err(e);
+        let cli_typed = {
+            let mut all = Vec::new();
+            for s in &self.flags.overlay {
+                match parse_overlay_list(s) {
+                    Ok(parsed) => all.extend(parsed),
+                    Err(reason) => {
+                        let e = CommandError::InvalidOverlaySpec {
+                            spec: s.clone(),
+                            reason,
+                        };
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec prompt: invalid overlay spec: {e}"),
+                        });
+                        return Err(e);
+                    }
+                }
             }
+            all
         };
-        let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
+        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
 
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
@@ -185,6 +184,7 @@ impl Command for ExecPromptCommand {
             initial_prompt: Some(self.flags.prompt.clone()),
             env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays,
+            include_skills: skills_enabled,
             ..Default::default()
         };
 
