@@ -220,6 +220,17 @@ fn render_execution_window(app: &App, area: Rect, frame: &mut Frame) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Status dashboard takes priority when populated by the status command.
+    let has_dashboard = tab
+        .status_dashboard
+        .lock()
+        .map(|d| d.is_some())
+        .unwrap_or(false);
+    if has_dashboard {
+        render_status_dashboard(tab, inner, frame);
+        return;
+    }
+
     let log_empty = tab
         .status_log
         .lock()
@@ -308,6 +319,135 @@ fn render_output_content(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_y as u16, 0));
     frame.render_widget(para, area);
+}
+
+/// Render the status dashboard as a proper ratatui `Table` widget.
+fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
+    let dash = match tab.status_dashboard.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let data = match dash.as_ref() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let header_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    // Title + empty line above the table.
+    let title_height: u16 = 2;
+    let tip_height: u16 = 2;
+    let table_area_height = area.height.saturating_sub(title_height + tip_height);
+
+    // Split: title row, table, tip row.
+    let chunks = Layout::vertical([
+        Constraint::Length(title_height),
+        Constraint::Length(table_area_height),
+        Constraint::Length(tip_height),
+    ])
+    .split(area);
+
+    // Title.
+    let title = Paragraph::new(vec![
+        Line::from(Span::styled(
+            " AMUX STATUS DASHBOARD",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ]);
+    frame.render_widget(title, chunks[0]);
+
+    if data.containers.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::from(Span::styled(
+                " No code agents running.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " To start one:  amux exec workflow <file>  or  amux chat",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+        frame.render_widget(empty, chunks[1]);
+    } else {
+        let header = Row::new(vec![
+            Cell::from(" "),
+            Cell::from("NAME").style(header_style),
+            Cell::from("CPU").style(header_style),
+            Cell::from("MEM").style(header_style),
+            Cell::from("IMAGE").style(header_style),
+            Cell::from("TAB").style(header_style),
+        ])
+        .bottom_margin(0);
+
+        let rows: Vec<Row> = data
+            .containers
+            .iter()
+            .map(|c| {
+                let indicator_style = if c.stuck {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                };
+                let indicator = if c.stuck { "\u{25cf}" } else { "\u{25cf}" };
+
+                let cpu = c
+                    .cpu_percent
+                    .map(|v| format!("{v:.1}%"))
+                    .unwrap_or_else(|| "-".into());
+                let mem = c
+                    .memory_mb
+                    .map(|v| format!("{v:.0}MB"))
+                    .unwrap_or_else(|| "-".into());
+                let tab_label = c
+                    .tab_number
+                    .map(|t| format!("{t}"))
+                    .unwrap_or_else(|| "-".into());
+
+                Row::new(vec![
+                    Cell::from(indicator).style(indicator_style),
+                    Cell::from(c.name.as_str()),
+                    Cell::from(cpu),
+                    Cell::from(mem),
+                    Cell::from(c.image.as_str()),
+                    Cell::from(tab_label),
+                ])
+            })
+            .collect();
+
+        let widths = [
+            Constraint::Length(2),
+            Constraint::Min(16),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(4),
+        ];
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(Style::default());
+        frame.render_widget(table, chunks[1]);
+    }
+
+    // Tip.
+    let tip = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" Tip: {}", data.tip),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    frame.render_widget(tip, chunks[2]);
 }
 
 /// Render the 1-row status hint bar above the command box.

@@ -76,6 +76,63 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
     /// Emit a clear-screen marker so the CLI can redraw the status table in
     /// place. No-op for TUI / headless frontends.
     fn write_clear_marker(&mut self) {}
+
+    /// Render the status dashboard. Default writes plain text via
+    /// `write_message`; the TUI overrides this to store structured data for
+    /// a proper `Table` widget.
+    fn write_status_dashboard(&mut self, containers: &[StatusContainerRow], tip: &str) {
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "AMUX STATUS DASHBOARD".into(),
+        });
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: String::new(),
+        });
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "CODE AGENTS".into(),
+        });
+        if containers.is_empty() {
+            self.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "  No code agents running.".into(),
+            });
+            self.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "  To start one: amux exec workflow <file>  or  amux chat".into(),
+            });
+        } else {
+            for c in containers {
+                let indicator = if c.stuck { "Y" } else { "G" };
+                let cpu = c
+                    .cpu_percent
+                    .map(|v| format!("{v:.1}%"))
+                    .unwrap_or_else(|| "-".into());
+                let mem = c
+                    .memory_mb
+                    .map(|v| format!("{v:.0}MB"))
+                    .unwrap_or_else(|| "-".into());
+                let tab_col = c
+                    .tab_number
+                    .map(|t| format!(" [tab {t}]"))
+                    .unwrap_or_default();
+                self.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!(
+                        "  {indicator} {name}  {cpu}  {mem}  {img}{tab_col}",
+                        name = c.name,
+                        img = c.image,
+                    ),
+                });
+            }
+        }
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("\nTip: {tip}"),
+        });
+        self.replay_queued();
+    }
 }
 
 pub struct StatusCommand {
@@ -151,20 +208,17 @@ impl Command for StatusCommand {
                 })
                 .collect();
 
-            // Only emit the clear-screen marker on watch ticks 2+ (the first
-            // paint should not blow away whatever the user had above).
-            if self.flags.watch && tick > 0 {
+            if tick > 0 {
                 frontend.write_clear_marker();
             }
             tick = tick.saturating_add(1);
 
-            // Write the status table on every tick so the user sees live data.
             let tip = crate::command::commands::status_tips::select_random_tip();
-            write_status_table(&mut *frontend, &containers, tip);
+            frontend.write_status_dashboard(&containers, tip);
 
             last_containers = containers;
 
-            if !self.flags.watch || !frontend.should_continue_watching() {
+            if !self.flags.watch && !frontend.should_continue_watching() {
                 break;
             }
 
@@ -182,64 +236,6 @@ impl StatusCommandTuiContext {
     pub fn new(tabs: Vec<TuiTabSnapshot>) -> Self {
         Self { tabs }
     }
-}
-
-fn write_status_table(
-    frontend: &mut dyn StatusCommandFrontend,
-    containers: &[StatusContainerRow],
-    tip: &str,
-) {
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: "AMUX STATUS DASHBOARD".into(),
-    });
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: String::new(),
-    });
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: "CODE AGENTS".into(),
-    });
-    if containers.is_empty() {
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "  No code agents running.".into(),
-        });
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "  To start one: amux exec workflow <file>  or  amux chat".into(),
-        });
-    } else {
-        for c in containers {
-            let indicator = if c.stuck { "Y" } else { "G" };
-            let cpu = c
-                .cpu_percent
-                .map(|v| format!("{v:.1}%"))
-                .unwrap_or_else(|| "-".into());
-            let mem = c
-                .memory_mb
-                .map(|v| format!("{v:.0}MB"))
-                .unwrap_or_else(|| "-".into());
-            let tab = c
-                .tab_number
-                .map(|t| format!(" [tab {t}]"))
-                .unwrap_or_default();
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!(
-                    "  {indicator} {name}  {cpu}  {mem}  {img}{tab}",
-                    name = c.name,
-                    img = c.image,
-                ),
-            });
-        }
-    }
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: format!("\nTip: {tip}"),
-    });
-    frontend.replay_queued();
 }
 
 #[cfg(test)]

@@ -59,6 +59,12 @@ fn extract_apple_image(row: &serde_json::Value) -> String {
         if let Some(s) = img_obj.as_str() {
             return s.to_string();
         }
+        if let Some(repo) = img_obj.get("repository").and_then(|v| v.as_str()) {
+            return match img_obj.get("tag").and_then(|v| v.as_str()) {
+                Some(tag) if !tag.is_empty() => format!("{repo}:{tag}"),
+                _ => repo.to_string(),
+            };
+        }
         return serde_json::to_string(img_obj).unwrap_or_default();
     }
     row.get("Image")
@@ -737,6 +743,48 @@ mod apple_tests {
         }]"#;
         let handles = parse_apple_list_output(json);
         assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn extract_apple_image_formats_repo_and_tag() {
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{"configuration": {"image": {"repository": "amux/dev", "tag": "latest"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_apple_image(&row), "amux/dev:latest");
+    }
+
+    #[test]
+    fn extract_apple_image_repo_only_without_tag() {
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{"configuration": {"image": {"repository": "amux/dev"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_apple_image(&row), "amux/dev");
+    }
+
+    #[test]
+    fn extract_apple_image_plain_string() {
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{"configuration": {"image": "amux/dev:latest"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_apple_image(&row), "amux/dev:latest");
+    }
+
+    #[test]
+    fn parse_apple_list_formats_image_correctly() {
+        let json = r#"[{
+            "status": "running",
+            "configuration": {
+                "id": "amux-test",
+                "image": {"repository": "amux/dev", "tag": "latest"}
+            },
+            "startedDate": 1715000000.0
+        }]"#;
+        let handles = parse_apple_list_output(json);
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].image_tag, "amux/dev:latest");
     }
 
     #[test]

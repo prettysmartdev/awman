@@ -158,6 +158,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
         );
         (frontend, req_rx, resp_tx)
     }

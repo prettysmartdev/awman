@@ -73,6 +73,15 @@ pub enum NewOutcome {
     Skill(NewSkillOutcome),
 }
 
+/// A single step collected from the user during `new workflow`.
+#[derive(Debug, Clone)]
+pub struct WorkflowStepInput {
+    pub name: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub prompt: String,
+}
+
 /// `NewCommandFrontend` extends `SpecsCommandFrontend` so the `Spec`
 /// subcommand can drive the same Q&A (kind / title / summary).
 pub trait NewCommandFrontend:
@@ -82,9 +91,33 @@ pub trait NewCommandFrontend:
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
         Ok("workflow".to_string())
     }
+    /// Prompt for a human-readable workflow title.
+    fn ask_workflow_title(&mut self) -> Result<String, CommandError> {
+        Ok(String::new())
+    }
     /// Prompt for a one-line summary for the new workflow (used in interview mode).
     fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
         Ok(String::new())
+    }
+    /// Prompt for a step name.
+    fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
+        Ok(String::new())
+    }
+    /// Prompt for the optional agent override for the current step.
+    fn ask_workflow_step_agent(&mut self) -> Result<Option<String>, CommandError> {
+        Ok(None)
+    }
+    /// Prompt for the optional model override for the current step.
+    fn ask_workflow_step_model(&mut self) -> Result<Option<String>, CommandError> {
+        Ok(None)
+    }
+    /// Prompt for the step prompt text.
+    fn ask_workflow_step_prompt(&mut self) -> Result<String, CommandError> {
+        Ok(String::new())
+    }
+    /// Ask whether to add another workflow step.
+    fn ask_add_another_step(&mut self) -> Result<bool, CommandError> {
+        Ok(false)
     }
     /// Prompt for a skill name.
     fn ask_skill_name(&mut self) -> Result<String, CommandError> {
@@ -99,6 +132,77 @@ pub trait NewCommandFrontend:
         Ok(String::new())
     }
 }
+
+// ─── Serde structs for workflow serialization ────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct WorkflowFileToml<'a> {
+    title: &'a str,
+    #[serde(rename = "step", skip_serializing_if = "Vec::is_empty")]
+    steps_toml: Vec<WorkflowStepSerde<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowFileYaml<'a> {
+    title: &'a str,
+    steps: Vec<WorkflowStepSerde<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowStepSerde<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    prompt: &'a str,
+}
+
+fn serialize_steps(steps: &[WorkflowStepInput]) -> Vec<WorkflowStepSerde<'_>> {
+    steps
+        .iter()
+        .map(|s| WorkflowStepSerde {
+            name: &s.name,
+            agent: s.agent.as_deref(),
+            model: s.model.as_deref(),
+            prompt: &s.prompt,
+        })
+        .collect()
+}
+
+fn serialize_workflow_toml(title: &str, steps: &[WorkflowStepInput]) -> String {
+    let file = WorkflowFileToml {
+        title,
+        steps_toml: serialize_steps(steps),
+    };
+    toml::to_string_pretty(&file).unwrap_or_else(|_| format!("title = \"{title}\"\n"))
+}
+
+fn serialize_workflow_yaml(title: &str, steps: &[WorkflowStepInput]) -> String {
+    let file = WorkflowFileYaml {
+        title,
+        steps: serialize_steps(steps),
+    };
+    serde_yaml::to_string(&file).unwrap_or_else(|_| format!("title: \"{title}\"\nsteps: []\n"))
+}
+
+fn serialize_workflow_md(title: &str, steps: &[WorkflowStepInput]) -> String {
+    let mut out = format!("# {title}\n");
+    for step in steps {
+        out.push_str(&format!("\n## Step: {}\n", step.name));
+        if let Some(agent) = &step.agent {
+            out.push_str(&format!("Agent: {agent}\n"));
+        }
+        if let Some(model) = &step.model {
+            out.push_str(&format!("Model: {model}\n"));
+        }
+        out.push_str(&format!("Prompt: {}\n", step.prompt));
+    }
+    out
+}
+
+/// Subdirectory under the git root for user-authored workflow definitions.
+const REPO_WORKFLOW_DEFINITIONS_DIR: &str = "aspec/workflows";
 
 pub struct NewCommand {
     sub: NewSubcommand,
@@ -173,32 +277,43 @@ impl Command for NewCommand {
                 } else {
                     None
                 };
-                let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
-                let workflow_dirs = match WorkflowDirs::from_process_env(git_root) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("new workflow: failed to resolve workflow dirs: {e}"),
-                        });
-                        return Err(CommandError::from(e));
-                    }
-                };
+
+                // Resolve destination directory. Non-global workflows go
+                // under <git_root>/aspec/workflows/ (the user-facing
+                // definitions directory), matching old-amux behaviour.
                 let dir = if f.global {
+                    let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
+                    let workflow_dirs = match WorkflowDirs::from_process_env(git_root) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("new workflow: failed to resolve workflow dirs: {e}"),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                     workflow_dirs.global_dir()
                 } else {
-                    workflow_dirs.repo_dir().unwrap()
+                    let git_root = session
+                        .as_ref()
+                        .expect("session required for non-global workflow")
+                        .git_root();
+                    git_root.join(REPO_WORKFLOW_DEFINITIONS_DIR)
                 };
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join(format!("{name}.{extension}"));
-                let body = match extension {
-                    "yaml" | "yml" => format!("name: {name}\nsteps: []\n"),
-                    "md" => format!("# Workflow: {name}\n\n## Steps\n"),
-                    _ => "[[step]]\nname = \"step-1\"\nagent = \"claude\"\nprompt = \"do something\"\n".to_string(),
-                };
-                let _ = std::fs::write(&path, body);
 
                 if f.interview {
+                    // Interview mode: write a skeleton, then launch an agent
+                    // to fill it in.
+                    let skeleton = match extension {
+                        "yaml" | "yml" => format!("title: \"{name}\"\nsteps: []\n"),
+                        "md" => format!("# {name}\n"),
+                        _ => format!("title = \"{name}\"\n"),
+                    };
+                    let _ = std::fs::write(&path, skeleton);
+
                     let session = session.as_ref().unwrap();
                     let agent = match resolve_agent(&None, session) {
                         Ok(a) => a,
@@ -294,7 +409,57 @@ impl Command for NewCommand {
                     let _ = execution.wait().await;
                     frontend.set_pty_active(false);
                     frontend.replay_queued();
+                } else {
+                    // Non-interview: collect title and steps from the user,
+                    // then serialize the complete workflow to disk.
+                    let title = frontend.ask_workflow_title().unwrap_or_else(|_| name.clone());
+                    let title = if title.is_empty() { name.clone() } else { title };
+
+                    let mut steps: Vec<WorkflowStepInput> = Vec::new();
+                    loop {
+                        let step_name = frontend.ask_workflow_step_name()?;
+                        if step_name.is_empty() {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: "Step name cannot be empty.".into(),
+                            });
+                            continue;
+                        }
+                        let agent = frontend.ask_workflow_step_agent()?;
+                        let model = frontend.ask_workflow_step_model()?;
+                        let prompt = frontend.ask_workflow_step_prompt()?;
+                        steps.push(WorkflowStepInput {
+                            name: step_name,
+                            agent,
+                            model,
+                            prompt,
+                        });
+                        match frontend.ask_add_another_step() {
+                            Ok(true) => continue,
+                            _ => break,
+                        }
+                    }
+
+                    if steps.is_empty() {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: "At least one step is required.".into(),
+                        });
+                        return Err(CommandError::Aborted);
+                    }
+
+                    let body = match extension {
+                        "yaml" | "yml" => serialize_workflow_yaml(&title, &steps),
+                        "md" => serialize_workflow_md(&title, &steps),
+                        _ => serialize_workflow_toml(&title, &steps),
+                    };
+                    let _ = std::fs::write(&path, body);
                 }
+
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!("Created workflow: {}", path.display()),
+                });
 
                 NewOutcome::Workflow(NewWorkflowOutcome {
                     interview: f.interview,
@@ -478,6 +643,9 @@ mod tests {
 
     struct FakeNewFrontend {
         workflow_name: String,
+        workflow_title: String,
+        steps: Vec<WorkflowStepInput>,
+        step_index: std::sync::atomic::AtomicUsize,
         skill_name: String,
         skill_body: String,
     }
@@ -485,9 +653,22 @@ mod tests {
         fn new(workflow: &str, skill: &str, body: &str) -> Self {
             Self {
                 workflow_name: workflow.into(),
+                workflow_title: workflow.into(),
+                steps: vec![WorkflowStepInput {
+                    name: "step-1".into(),
+                    agent: None,
+                    model: None,
+                    prompt: "do something".into(),
+                }],
+                step_index: std::sync::atomic::AtomicUsize::new(0),
                 skill_name: skill.into(),
                 skill_body: body.into(),
             }
+        }
+        fn with_steps(mut self, title: &str, steps: Vec<WorkflowStepInput>) -> Self {
+            self.workflow_title = title.into();
+            self.steps = steps;
+            self
         }
     }
     impl crate::engine::message::UserMessageSink for FakeNewFrontend {
@@ -542,6 +723,51 @@ mod tests {
     impl NewCommandFrontend for FakeNewFrontend {
         fn ask_workflow_name(&mut self) -> Result<String, crate::command::error::CommandError> {
             Ok(self.workflow_name.clone())
+        }
+        fn ask_workflow_title(&mut self) -> Result<String, crate::command::error::CommandError> {
+            Ok(self.workflow_title.clone())
+        }
+        fn ask_workflow_step_name(&mut self) -> Result<String, crate::command::error::CommandError> {
+            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
+            if idx < self.steps.len() {
+                Ok(self.steps[idx].name.clone())
+            } else {
+                Ok(String::new())
+            }
+        }
+        fn ask_workflow_step_agent(
+            &mut self,
+        ) -> Result<Option<String>, crate::command::error::CommandError> {
+            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
+            if idx < self.steps.len() {
+                Ok(self.steps[idx].agent.clone())
+            } else {
+                Ok(None)
+            }
+        }
+        fn ask_workflow_step_model(
+            &mut self,
+        ) -> Result<Option<String>, crate::command::error::CommandError> {
+            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
+            if idx < self.steps.len() {
+                Ok(self.steps[idx].model.clone())
+            } else {
+                Ok(None)
+            }
+        }
+        fn ask_workflow_step_prompt(
+            &mut self,
+        ) -> Result<String, crate::command::error::CommandError> {
+            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
+            if idx < self.steps.len() {
+                Ok(self.steps[idx].prompt.clone())
+            } else {
+                Ok(String::new())
+            }
+        }
+        fn ask_add_another_step(&mut self) -> Result<bool, crate::command::error::CommandError> {
+            let idx = self.step_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            Ok(idx < self.steps.len())
         }
         fn ask_skill_name(&mut self) -> Result<String, crate::command::error::CommandError> {
             Ok(self.skill_name.clone())
@@ -606,17 +832,41 @@ mod tests {
             engines,
             session,
         );
-        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
-            .await
-            .unwrap();
+        let fe = FakeNewFrontend::new("my-wf", "skill", "").with_steps(
+            "My Workflow",
+            vec![
+                WorkflowStepInput {
+                    name: "plan".into(),
+                    agent: None,
+                    model: None,
+                    prompt: "Plan the work.".into(),
+                },
+                WorkflowStepInput {
+                    name: "implement".into(),
+                    agent: Some("codex".into()),
+                    model: Some("claude-opus-4-7".into()),
+                    prompt: "Do the work.".into(),
+                },
+            ],
+        );
+        let outcome = cmd.run_with_frontend(Box::new(fe)).await.unwrap();
         if let NewOutcome::Workflow(w) = outcome {
             let path_str = w.path.expect("path must be Some");
             let path = std::path::Path::new(&path_str);
+            assert!(
+                path_str.contains("aspec/workflows/"),
+                "path must be under aspec/workflows/: {path_str}"
+            );
             assert!(path.exists(), "workflow file must exist: {path_str}");
             let content = std::fs::read_to_string(path).unwrap();
             assert!(
                 content.contains("[[step]]"),
-                "TOML workflow must contain [[step]]"
+                "TOML workflow must contain [[step]]: {content}"
+            );
+            assert!(content.contains("plan"), "must contain step name 'plan'");
+            assert!(
+                content.contains("codex"),
+                "must contain agent 'codex': {content}"
             );
         } else {
             panic!("unexpected outcome variant");
@@ -647,10 +897,18 @@ mod tests {
                 path_str.ends_with(".yaml"),
                 "path must have .yaml extension: {path_str}"
             );
+            assert!(
+                path_str.contains("aspec/workflows/"),
+                "path must be under aspec/workflows/: {path_str}"
+            );
             let content = std::fs::read_to_string(&path_str).unwrap();
             assert!(
                 content.contains("steps:"),
-                "YAML workflow must contain steps key"
+                "YAML workflow must contain steps key: {content}"
+            );
+            assert!(
+                content.contains("step-1"),
+                "must contain default step name: {content}"
             );
         } else {
             panic!("unexpected outcome variant");
@@ -681,10 +939,14 @@ mod tests {
                 path_str.ends_with(".md"),
                 "path must have .md extension: {path_str}"
             );
+            assert!(
+                path_str.contains("aspec/workflows/"),
+                "path must be under aspec/workflows/: {path_str}"
+            );
             let content = std::fs::read_to_string(&path_str).unwrap();
             assert!(
-                content.contains("## Steps"),
-                "Markdown workflow must contain ## Steps"
+                content.contains("## Step:"),
+                "Markdown workflow must contain ## Step: heading: {content}"
             );
         } else {
             panic!("unexpected outcome variant");

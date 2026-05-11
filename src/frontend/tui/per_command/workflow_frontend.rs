@@ -380,6 +380,7 @@ mod tests {
             resize_tx_shared,
             engine_tx_shared,
             std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
         );
         (frontend, req_rx, resp_tx)
     }

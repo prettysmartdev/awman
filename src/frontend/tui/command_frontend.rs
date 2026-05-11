@@ -18,7 +18,8 @@ use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
     SharedActiveWorktreePath, SharedContainerName, SharedEngineTx, SharedPtyResetFlag,
-    SharedResizeTx, SharedStdinTx, SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
+    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedWorkflowViewState,
+    SharedYoloCancelFlag, SharedYoloState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
@@ -66,6 +67,10 @@ pub struct TuiCommandFrontend {
     /// this when a worktree is created/resumed and clears it on cleanup;
     /// the renderer reads it for the bottom-bar context line.
     pub(crate) active_worktree_path: SharedActiveWorktreePath,
+    /// Shared status dashboard data. The status command writes structured
+    /// container data here; the TUI renderer reads it to display a proper
+    /// `Table` widget.
+    pub(crate) status_dashboard: SharedStatusDashboard,
 }
 
 impl TuiCommandFrontend {
@@ -85,6 +90,7 @@ impl TuiCommandFrontend {
         resize_tx_shared: SharedResizeTx,
         engine_tx_shared: SharedEngineTx,
         active_worktree_path: SharedActiveWorktreePath,
+        status_dashboard: SharedStatusDashboard,
     ) -> Self {
         let stdout_tx = container_io.stdout.clone();
         Self {
@@ -105,6 +111,7 @@ impl TuiCommandFrontend {
             resize_tx_shared,
             engine_tx_shared,
             active_worktree_path,
+            status_dashboard,
         }
     }
 

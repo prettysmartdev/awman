@@ -280,8 +280,37 @@ impl NewCommandFrontend for CliFrontend {
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
         require_named_input("workflow name?")
     }
+    fn ask_workflow_title(&mut self) -> Result<String, CommandError> {
+        require_named_input("workflow title (human-readable)?")
+    }
     fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
         require_multiline_input("workflow description?")
+    }
+    fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
+        require_named_input("step name?")
+    }
+    fn ask_workflow_step_agent(&mut self) -> Result<Option<String>, CommandError> {
+        match require_optional_input("agent (optional, Enter to skip)?") {
+            Ok(s) if s.is_empty() => Ok(None),
+            Ok(s) => Ok(Some(s)),
+            Err(_) => Ok(None),
+        }
+    }
+    fn ask_workflow_step_model(&mut self) -> Result<Option<String>, CommandError> {
+        match require_optional_input("model (optional, Enter to skip)?") {
+            Ok(s) if s.is_empty() => Ok(None),
+            Ok(s) => Ok(Some(s)),
+            Err(_) => Ok(None),
+        }
+    }
+    fn ask_workflow_step_prompt(&mut self) -> Result<String, CommandError> {
+        require_multiline_input("step prompt?")
+    }
+    fn ask_add_another_step(&mut self) -> Result<bool, CommandError> {
+        match require_optional_input("add another step? [y/N]") {
+            Ok(s) => Ok(matches!(s.trim().to_lowercase().as_str(), "y" | "yes")),
+            Err(_) => Ok(false),
+        }
     }
     fn ask_skill_name(&mut self) -> Result<String, CommandError> {
         require_named_input("skill name?")
@@ -290,9 +319,6 @@ impl NewCommandFrontend for CliFrontend {
         require_multiline_input("skill description?")
     }
     fn ask_skill_body(&mut self) -> Result<String, CommandError> {
-        // Body may be empty, but the read itself must succeed; non-TTY must
-        // surface the structured "no input available" error rather than block
-        // or invent text.
         require_optional_input("skill body (one line)?")
     }
 }

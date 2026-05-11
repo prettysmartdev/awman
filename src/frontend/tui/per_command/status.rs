@@ -1,7 +1,8 @@
 //! `StatusCommandFrontend` impl for the TUI.
 
-use crate::command::commands::status::StatusCommandFrontend;
+use crate::command::commands::status::{StatusCommandFrontend, StatusContainerRow};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
+use crate::frontend::tui::tabs::StatusDashboardData;
 
 impl StatusCommandFrontend for TuiCommandFrontend {
     fn should_continue_watching(&mut self) -> bool {
@@ -9,8 +10,17 @@ impl StatusCommandFrontend for TuiCommandFrontend {
     }
 
     fn write_clear_marker(&mut self) {
-        if let Ok(mut log) = self.status_log.lock() {
-            log.clear();
+        if let Ok(mut dash) = self.status_dashboard.lock() {
+            *dash = None;
+        }
+    }
+
+    fn write_status_dashboard(&mut self, containers: &[StatusContainerRow], tip: &str) {
+        if let Ok(mut dash) = self.status_dashboard.lock() {
+            *dash = Some(StatusDashboardData {
+                containers: containers.to_vec(),
+                tip: tip.to_string(),
+            });
         }
     }
 }

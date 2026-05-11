@@ -145,6 +145,9 @@ impl App {
         if let Ok(mut log) = tab.status_log.lock() {
             log.clear();
         }
+        if let Ok(mut dash) = tab.status_dashboard.lock() {
+            *dash = None;
+        }
         tab.scroll_offset = 0;
 
         // Reset the vt100 parser so the previous container's output is gone.
@@ -222,6 +225,7 @@ impl App {
             tab.resize_tx_shared.clone(),
             tab.engine_tx_shared.clone(),
             tab.active_worktree_path.clone(),
+            tab.status_dashboard.clone(),
         );
 
         // Store the receiving/sending ends in the tab.

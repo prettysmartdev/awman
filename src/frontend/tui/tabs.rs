@@ -73,6 +73,17 @@ pub struct WorkflowStepView {
 /// renderer reads from it. Mirrors the pattern used by `SharedStatusLog`.
 pub type SharedWorkflowViewState = Arc<Mutex<Option<WorkflowViewState>>>;
 
+/// Snapshot of the status dashboard for TUI table rendering.
+#[derive(Debug, Clone)]
+pub struct StatusDashboardData {
+    pub containers: Vec<crate::command::commands::status::StatusContainerRow>,
+    pub tip: String,
+}
+
+/// Cross-thread shared status dashboard data. The status command writes here;
+/// the TUI renderer reads it to display a proper `Table` widget.
+pub type SharedStatusDashboard = Arc<Mutex<Option<StatusDashboardData>>>;
+
 /// Cross-thread shared yolo-countdown state. The engine ticks it every 100ms
 /// while a yolo countdown is active; the renderer reads it to display the
 /// "Auto-advancing in Ns" non-modal overlay.
@@ -195,6 +206,7 @@ pub struct Tab {
     pub yolo_cancel_flag: SharedYoloCancelFlag,
     pub status_log: SharedStatusLog,
     pub status_log_collapsed: bool,
+    pub status_dashboard: SharedStatusDashboard,
     pub scroll_offset: usize,
     pub workflow_strip_scroll_offset: usize,
     pub last_strip_rect: Option<Rect>,
@@ -258,6 +270,7 @@ impl Tab {
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
             status_log: Arc::new(Mutex::new(Vec::new())),
             status_log_collapsed: false,
+            status_dashboard: Arc::new(Mutex::new(None)),
             scroll_offset: 0,
             workflow_strip_scroll_offset: 0,
             last_strip_rect: None,
