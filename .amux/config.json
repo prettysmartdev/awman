@@ -1,6 +1,4 @@
 {
   "agent": "claude",
-  "envPassthrough": [
-    "OMLX_API_KEY"
-  ]
+  "terminal_scrollback_lines": 7500
 }

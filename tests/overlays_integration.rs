@@ -28,20 +28,6 @@ fn make_git_repo() -> TempDir {
 // ─── --overlay flag presence in help text ────────────────────────────────────
 
 #[test]
-fn implement_help_shows_overlay_flag() {
-    let output = amux()
-        .args(["implement", "--help"])
-        .output()
-        .expect("failed to run amux implement --help");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("--overlay"),
-        "implement --help must mention --overlay flag; got: {stdout}"
-    );
-}
-
-#[test]
 fn chat_help_shows_overlay_flag() {
     let output = amux()
         .args(["chat", "--help"])
@@ -219,12 +205,12 @@ fn valid_amux_overlays_env_var_does_not_prevent_help() {
     // A well-formed AMUX_OVERLAYS also must not interfere with help.
     let output = amux()
         .env("AMUX_OVERLAYS", "dir(/tmp:/mnt/tmp:ro)")
-        .args(["implement", "--help"])
+        .args(["chat", "--help"])
         .output()
-        .expect("failed to run amux implement --help");
+        .expect("failed to run amux chat --help");
     assert!(
         output.status.success(),
-        "amux implement --help must exit 0 with a valid AMUX_OVERLAYS; stderr: {}",
+        "amux chat --help must exit 0 with a valid AMUX_OVERLAYS; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

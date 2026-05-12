@@ -11,7 +11,7 @@ A typical setup has one machine running `amux headless start` (the _remote host_
 ```
 Local machine                          Remote host
 ──────────────                         ──────────────────────────
-amux remote run implement 0059 -f ───► POST /v1/commands
+amux remote run exec workflow my.md -f ─► POST /v1/commands
                                        ◄─── SSE stream: log output
                                        ◄─── [amux:done] sentinel
 ```
@@ -25,6 +25,8 @@ Three subcommands cover the full lifecycle:
 | `amux remote session kill [session-id]` | Close a session on the remote host |
 
 All three subcommands work from the terminal (CLI mode) and from inside the TUI (where interactive pickers are also available). A headless server can also delegate `remote` subcommands to itself as subprocesses when triggered via the HTTP API.
+
+`<command>` can be any amux command — for example `exec workflow path/to/workflow.md`, `chat`, `exec prompt "Fix the tests" --yolo`, or `ready`.
 
 ---
 
@@ -83,7 +85,7 @@ For CI pipelines, use the environment variable:
 export AMUX_REMOTE_ADDR=http://build-server.internal:9876
 export AMUX_API_KEY=<your-api-key>
 
-amux remote run implement 0059 --follow
+amux remote run exec workflow aspec/workflows/implement-feature.md --follow
 ```
 
 ### Security note
@@ -100,19 +102,19 @@ Dispatches an amux subcommand to a session on the remote host.
 amux remote run <command> [--session <ID>] [--follow] [--remote-addr <URL>]
 ```
 
-`<command>` is any amux subcommand that the remote host can execute — for example `implement 0059`, `exec prompt "Fix the tests" --yolo`, or `chat`. Everything after `remote run` (except the `--session`, `--follow`, and `--remote-addr` flags) is forwarded to the remote host verbatim.
+`<command>` is any amux subcommand that the remote host can execute — for example `exec workflow path/to/workflow.md`, `exec prompt "Fix the tests" --yolo`, or `chat`. Everything after `remote run` (except the `--session`, `--follow`, and `--remote-addr` flags) is forwarded to the remote host verbatim.
 
 ### Basic usage
 
 ```sh
-# Dispatch implement 0059 to a session; return a command ID immediately
-amux remote run implement 0059 --session abc123
+# Dispatch a workflow to a session; return a command ID immediately
+amux remote run exec workflow path/to/workflow.md --session abc123
 
 # Wait for the command to complete and stream its output to your terminal
-amux remote run implement 0059 --session abc123 --follow
+amux remote run exec workflow path/to/workflow.md --session abc123 --follow
 
 # Short form for --follow
-amux remote run implement 0059 --session abc123 -f
+amux remote run exec workflow path/to/workflow.md --session abc123 -f
 
 # Pass inner-command flags through unchanged; amux does not consume them
 amux remote run exec prompt "Fix the tests" --yolo --non-interactive --session abc123 -f
@@ -157,7 +159,7 @@ Command dispatched: e5f6a7b8-...
 With `--follow`, amux connects to the SSE log-streaming endpoint and relays the command's output to your terminal in real time, as if the session were local:
 
 ```sh
-amux remote run implement 0059 --session abc123 --follow
+amux remote run exec workflow path/to/workflow.md --session abc123 --follow
 ```
 
 ```
@@ -176,7 +178,7 @@ Once the command completes, amux prints a summary table and exits:
 ├──────────────┼────────────────────────────────────────┤
 │ Command ID   │ e5f6a7b8-…                             │
 │ Session ID   │ abc123                                 │
-│ Subcommand   │ implement 0059                         │
+│ Subcommand   │ exec workflow path/to/workflow.md     │
 │ Status       │ done                                   │
 │ Exit Code    │ 0                                      │
 │ Started      │ 2026-04-22T10:00:00Z                   │
@@ -389,7 +391,7 @@ Remote-bound tabs are **purple** in the tab bar. The tab label shows the `host:p
 
 ```
 ┌─ Tab 1: myproject ──────────┬─ 1.2.3.4:9876 ─────────────┐
-│  implement 0001              │  implement 0059             │
+│  exec workflow plan.md       │  exec workflow build.md     │
 └──────────────────────────────┴─────────────────────────────┘
 ```
 
@@ -411,7 +413,7 @@ Closing a remote-bound tab (with **Ctrl+C** when multiple tabs are open) cancels
 
 ### Workflow state strip for remote-bound tabs
 
-When a workflow command is dispatched from a remote-bound tab (`exec workflow`, `implement --workflow`), the workflow state strip appears automatically — exactly as it does for local workflow runs.
+When a workflow command is dispatched from a remote-bound tab (`exec workflow`), the workflow state strip appears automatically — exactly as it does for local workflow runs.
 
 Starting 5 seconds after the command is dispatched, amux polls `GET /v1/workflows/:command_id` on the remote headless server every 5 seconds. As soon as a workflow state is found, the strip renders and continues updating until the workflow reaches a terminal state (`complete` or `error`).
 
@@ -500,10 +502,10 @@ SESSION=$(amux remote session start /home/user/my-project | grep 'Session starte
 echo "Session: $SESSION"
 
 # Dispatch a command and stream its output
-amux remote run implement 0059 --session "$SESSION" --follow
+amux remote run exec workflow path/to/workflow.md --session "$SESSION" --follow
 
 # Or pipe into a log file (no ANSI decoration)
-amux remote run implement 0059 --session "$SESSION" --follow > implement-0059.log
+amux remote run exec workflow path/to/workflow.md --session "$SESSION" --follow > workflow.log
 
 # Kill the session when you are done
 amux remote session kill "$SESSION"
@@ -518,8 +520,8 @@ export AMUX_REMOTE_ADDR=http://build-server.internal:9876
 export AMUX_API_KEY=<your-api-key>
 export AMUX_REMOTE_SESSION=<pre-provisioned-session-id>
 
-# Dispatch the work item; exit code reflects the command's exit code
-amux remote run implement 0059 --follow
+# Dispatch the workflow; exit code reflects the command's exit code
+amux remote run exec workflow path/to/workflow.md --follow
 ```
 
 For CI contexts where a session is long-lived and pre-provisioned, setting `AMUX_REMOTE_SESSION` and `AMUX_API_KEY` in the pipeline environment avoids per-command flags entirely.
@@ -540,7 +542,7 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-amux-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"implement","args":["0059"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec","args":["workflow","path/to/workflow.md"]}' | jq -r .command_id)
 
 # Stream live output via SSE (prints each log line as it arrives)
 curl -s "$SERVER/v1/commands/$CMD/logs/stream" \

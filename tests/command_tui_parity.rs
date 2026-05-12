@@ -9,10 +9,6 @@ use amux::commands::auth::{
 use amux::commands::chat::{
     chat_entrypoint, chat_entrypoint_non_interactive,
 };
-use amux::commands::implement::{
-    agent_entrypoint, agent_entrypoint_non_interactive, find_work_item, implement_prompt,
-    parse_work_item,
-};
 use amux::commands::new::{
     apply_template, find_template, next_work_item_number, slugify, WorkItemKind,
 };
@@ -271,7 +267,6 @@ fn init_via_sink_includes_whats_next() {
     // Should include summary table and what's next section.
     assert!(all.contains("Init Summary"), "Missing init summary table");
     assert!(all.contains("chat"), "Missing chat command in what's next");
-    assert!(all.contains("implement"), "Missing implement in what's next");
 }
 
 // ---------------------------------------------------------------------------
@@ -334,31 +329,11 @@ fn interactive_notice_contains_agent_info() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. find_work_item is shared — same function used in command and TUI mode
-// ---------------------------------------------------------------------------
-
-#[test]
-fn find_work_item_used_in_both_modes() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().to_path_buf();
-    let work_items_dir = root.join("aspec/work-items");
-    std::fs::create_dir_all(&work_items_dir).unwrap();
-    std::fs::write(work_items_dir.join("0002-some-feature.md"), "# test").unwrap();
-
-    let path = find_work_item(&root, 2).unwrap();
-    assert!(path.ends_with("0002-some-feature.md"));
-
-    let err = find_work_item(&root, 99).unwrap_err();
-    assert!(err.to_string().contains("99"));
-}
-
-// ---------------------------------------------------------------------------
 // 4. Unknown command -> closest suggestion (TUI input logic)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn unknown_command_suggests_closest_subcommand() {
-    assert_eq!(closest_subcommand("implemnt"), Some("implement".into()));
     assert_eq!(closest_subcommand("redy"), Some("ready".into()));
     assert_eq!(closest_subcommand("int"), Some("init".into()));
     assert_eq!(closest_subcommand("ready"), None);
@@ -366,9 +341,6 @@ fn unknown_command_suggests_closest_subcommand() {
 
 #[test]
 fn autocomplete_returns_matching_subcommands() {
-    let sug = autocomplete_suggestions("im");
-    assert_eq!(sug, vec!["implement"]);
-
     let sug = autocomplete_suggestions("r");
     assert!(sug.contains(&"ready".to_string()), "expected 'ready' in suggestions for 'r'");
     assert!(sug.contains(&"remote".to_string()), "expected 'remote' in suggestions for 'r'");
@@ -384,12 +356,6 @@ fn autocomplete_ready_shows_all_flags() {
     assert!(sug.iter().any(|s| s.contains("--build")), "Missing --build");
     assert!(sug.iter().any(|s| s.contains("--no-cache")), "Missing --no-cache");
     assert!(sug.iter().any(|s| s.contains("--non-interactive")), "Missing --non-interactive");
-}
-
-#[test]
-fn autocomplete_implement_shows_non_interactive_flag() {
-    let sug = autocomplete_suggestions("implement ");
-    assert!(sug.iter().any(|s| s.contains("--non-interactive")));
 }
 
 // ---------------------------------------------------------------------------
@@ -436,104 +402,6 @@ fn auth_apply_decision_saves_config() {
     apply_auth_decision(tmp.path(), "claude", false).unwrap();
     let config = amux::config::load_repo_config(tmp.path()).unwrap();
     assert_eq!(config.auto_agent_auth_accepted, Some(false));
-}
-
-// ---------------------------------------------------------------------------
-// 7. Implement entrypoint and prompt (shared between CLI and TUI)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn implement_entrypoint_for_each_agent() {
-    let claude = agent_entrypoint("claude", 1, false);
-    assert_eq!(claude.len(), 2);
-    assert_eq!(claude[0], "claude");
-    assert!(claude[1].contains("work item 0001"));
-    assert!(claude[1].contains("Iterate until the build succeeds"));
-
-    let codex = agent_entrypoint("codex", 2, false);
-    assert_eq!(codex[0], "codex");
-    assert!(codex[1].contains("work item 0002"));
-
-    let opencode = agent_entrypoint("opencode", 3, false);
-    assert_eq!(opencode[0], "opencode");
-    assert_eq!(opencode[1], "run");
-    assert!(opencode[2].contains("work item 0003"));
-
-    let maki = agent_entrypoint("maki", 4, false);
-    assert_eq!(maki[0], "maki");
-    assert!(maki[1].contains("work item 0004"));
-
-    let gemini = agent_entrypoint("gemini", 5, false);
-    assert_eq!(gemini[0], "gemini");
-    assert!(gemini[1].contains("work item 0005"));
-}
-
-#[test]
-fn implement_entrypoint_non_interactive_for_each_agent() {
-    let claude = agent_entrypoint_non_interactive("claude", 1, false);
-    assert_eq!(claude[0], "claude");
-    assert_eq!(claude[1], "-p");
-    assert!(claude[2].contains("work item 0001"));
-
-    let codex = agent_entrypoint_non_interactive("codex", 2, false);
-    assert_eq!(codex[0], "codex");
-    assert_eq!(codex[1], "exec");
-    assert!(codex[2].contains("work item 0002"));
-
-    let opencode = agent_entrypoint_non_interactive("opencode", 3, false);
-    assert_eq!(opencode[0], "opencode");
-    assert_eq!(opencode[1], "run");
-    assert!(opencode[2].contains("work item 0003"));
-
-    let maki = agent_entrypoint_non_interactive("maki", 4, false);
-    assert_eq!(maki[0], "maki");
-    assert_eq!(maki[1], "--print");
-    assert!(maki[2].contains("work item 0004"));
-
-    let gemini = agent_entrypoint_non_interactive("gemini", 5, false);
-    assert_eq!(gemini[0], "gemini");
-    assert_eq!(gemini[1], "-p");
-    assert!(gemini[2].contains("work item 0005"));
-}
-
-#[test]
-fn implement_prompt_contains_required_elements() {
-    let prompt = implement_prompt(42);
-    assert!(
-        prompt.contains("Implement work item 0042"),
-        "prompt: {}",
-        prompt
-    );
-    assert!(
-        prompt.contains("Iterate until the build succeeds"),
-        "prompt: {}",
-        prompt
-    );
-    assert!(
-        prompt.contains("tests are comprehensive and pass"),
-        "prompt: {}",
-        prompt
-    );
-    assert!(
-        prompt.contains("Write documentation"),
-        "prompt: {}",
-        prompt
-    );
-    assert!(
-        prompt.contains("Ensure final build and test success"),
-        "prompt: {}",
-        prompt
-    );
-}
-
-#[test]
-fn parse_work_item_accepts_various_formats() {
-    assert_eq!(parse_work_item("0001").unwrap(), 1);
-    assert_eq!(parse_work_item("1").unwrap(), 1);
-    assert_eq!(parse_work_item("42").unwrap(), 42);
-    assert_eq!(parse_work_item("0042").unwrap(), 42);
-    assert!(parse_work_item("abc").is_err());
-    assert!(parse_work_item("").is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +613,7 @@ async fn new_via_sink_creates_work_item() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. New command: autocomplete includes "specs new"
+// 16. New command: autocomplete includes specs subcommand
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -758,11 +626,11 @@ fn autocomplete_includes_new_subcommand() {
 }
 
 #[test]
-fn autocomplete_new_shows_hint() {
+fn autocomplete_specs_shows_amend_hint() {
     let sug = autocomplete_suggestions("specs ");
     assert!(
-        sug.iter().any(|s| s.contains("new")),
-        "Expected hint for 'specs new' command, got: {:?}",
+        sug.iter().any(|s| s.contains("amend")),
+        "Expected hint for 'specs amend' command, got: {:?}",
         sug
     );
 }
@@ -1104,74 +972,6 @@ fn chat_entrypoint_non_interactive_for_each_agent() {
 }
 
 // ---------------------------------------------------------------------------
-// 33. Chat entrypoint has no prompt (unlike implement)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn chat_entrypoint_has_no_prompt() {
-    for agent in &["claude", "codex", "opencode"] {
-        let chat_args = chat_entrypoint(agent, false);
-        let impl_args = agent_entrypoint(agent, 1, false);
-
-        // Chat should have fewer args than implement (no prompt).
-        assert!(
-            chat_args.len() < impl_args.len(),
-            "Chat entrypoint for {} should be shorter than implement entrypoint ({} vs {})",
-            agent,
-            chat_args.len(),
-            impl_args.len()
-        );
-
-        // Chat should not contain any prompt-like text.
-        for arg in &chat_args {
-            assert!(
-                !arg.contains("Implement"),
-                "Chat entrypoint for {} should not contain implement prompt",
-                agent
-            );
-            assert!(
-                !arg.contains("work item"),
-                "Chat entrypoint for {} should not reference a work item",
-                agent
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 34. Chat and implement share docker run arg construction
-// ---------------------------------------------------------------------------
-
-#[test]
-fn chat_and_implement_share_docker_args() {
-    let chat_ep = chat_entrypoint("claude", false);
-    let impl_ep = agent_entrypoint("claude", 1, false);
-
-    let chat_ep_refs: Vec<&str> = chat_ep.iter().map(String::as_str).collect();
-    let impl_ep_refs: Vec<&str> = impl_ep.iter().map(String::as_str).collect();
-
-    use amux::runtime::AgentRuntime;
-    let rt = amux::runtime::docker::DockerRuntime::new();
-    let chat_args = rt.build_run_args_pty("img", "/repo", &chat_ep_refs, &[], None, false, None, None);
-    let impl_args = rt.build_run_args_pty("img", "/repo", &impl_ep_refs, &[], None, false, None, None);
-
-    // Both should start with the same Docker flags.
-    assert_eq!(chat_args[0], impl_args[0]); // "run"
-    assert_eq!(chat_args[1], impl_args[1]); // "--rm"
-    assert_eq!(chat_args[2], impl_args[2]); // "-it"
-
-    // Both should use the same image.
-    assert!(chat_args.contains(&"img".to_string()));
-    assert!(impl_args.contains(&"img".to_string()));
-
-    // Chat should have "claude" only; implement should have "claude" + prompt.
-    let chat_post_image: Vec<&String> = chat_args.iter().skip_while(|a| *a != "img").skip(1).collect();
-    let impl_post_image: Vec<&String> = impl_args.iter().skip_while(|a| *a != "img").skip(1).collect();
-    assert_eq!(chat_post_image.len(), 1, "Chat: just the agent command");
-    assert_eq!(impl_post_image.len(), 2, "Implement: agent + prompt");
-}
-
-// ---------------------------------------------------------------------------
 // 35. Autocomplete includes chat subcommand
 // ---------------------------------------------------------------------------
 
@@ -1223,7 +1023,6 @@ fn pending_command_chat_variant() {
 fn chat_entrypoint_non_interactive_has_no_prompt() {
     for agent in &["claude", "codex", "opencode"] {
         let chat_args = chat_entrypoint_non_interactive(agent, false);
-        let impl_args = agent_entrypoint_non_interactive(agent, 1, false);
 
         // Chat non-interactive should not contain prompt text.
         for arg in &chat_args {
@@ -1234,15 +1033,6 @@ fn chat_entrypoint_non_interactive_has_no_prompt() {
                 arg
             );
         }
-
-        // Chat should have fewer or equal args than implement.
-        assert!(
-            chat_args.len() <= impl_args.len(),
-            "Chat non-interactive for {} should not be longer than implement ({} vs {})",
-            agent,
-            chat_args.len(),
-            impl_args.len()
-        );
     }
 }
 
@@ -1443,22 +1233,6 @@ fn cli_chat_plan_flag() {
 }
 
 #[test]
-fn cli_implement_plan_flag() {
-    use amux::cli::{Cli, Command};
-    use clap::Parser;
-
-    let cli = Cli::parse_from(&["amux", "implement", "0001", "--plan"]);
-    match cli.command.unwrap() {
-        Command::Implement { plan, work_item, non_interactive, .. } => {
-            assert!(plan);
-            assert_eq!(work_item, "0001");
-            assert!(!non_interactive);
-        }
-        _ => panic!("expected implement"),
-    }
-}
-
-#[test]
 fn cli_chat_plan_and_non_interactive() {
     use amux::cli::{Cli, Command};
     use clap::Parser;
@@ -1473,22 +1247,6 @@ fn cli_chat_plan_and_non_interactive() {
     }
 }
 
-#[test]
-fn cli_implement_plan_and_non_interactive() {
-    use amux::cli::{Cli, Command};
-    use clap::Parser;
-
-    let cli = Cli::parse_from(&["amux", "implement", "42", "--plan", "--non-interactive"]);
-    match cli.command.unwrap() {
-        Command::Implement { plan, non_interactive, work_item, .. } => {
-            assert!(plan);
-            assert!(non_interactive);
-            assert_eq!(work_item, "42");
-        }
-        _ => panic!("expected implement"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Plan flag: agent entrypoint configuration per agent
 // ---------------------------------------------------------------------------
@@ -1500,17 +1258,9 @@ fn plan_flag_configures_claude_correctly() {
     assert!(chat.contains(&"--permission-mode".to_string()), "Claude chat should include --permission-mode");
     assert!(chat.contains(&"plan".to_string()), "Claude chat should include plan");
 
-    let imp = agent_entrypoint("claude", 1, true);
-    assert!(imp.contains(&"--permission-mode".to_string()), "Claude implement should include --permission-mode");
-    assert!(imp.contains(&"plan".to_string()), "Claude implement should include plan");
-
     let chat_ni = chat_entrypoint_non_interactive("claude", true);
     assert!(chat_ni.contains(&"--permission-mode".to_string()), "Claude chat non-interactive should include --permission-mode");
     assert!(chat_ni.contains(&"plan".to_string()), "Claude chat non-interactive should include plan");
-
-    let imp_ni = agent_entrypoint_non_interactive("claude", 1, true);
-    assert!(imp_ni.contains(&"--permission-mode".to_string()), "Claude implement non-interactive should include --permission-mode");
-    assert!(imp_ni.contains(&"plan".to_string()), "Claude implement non-interactive should include plan");
 }
 
 #[test]
@@ -1519,10 +1269,6 @@ fn plan_flag_configures_codex_correctly() {
     let chat = chat_entrypoint("codex", true);
     assert!(chat.contains(&"--approval-mode".to_string()), "Codex chat should include --approval-mode");
     assert!(chat.contains(&"plan".to_string()), "Codex chat should include plan");
-
-    let imp = agent_entrypoint("codex", 2, true);
-    assert!(imp.contains(&"--approval-mode".to_string()), "Codex implement should include --approval-mode");
-    assert!(imp.contains(&"plan".to_string()), "Codex implement should include plan");
 }
 
 #[test]
@@ -1531,10 +1277,6 @@ fn plan_flag_ignored_for_opencode() {
     let chat_no_plan = chat_entrypoint("opencode", false);
     let chat_plan = chat_entrypoint("opencode", true);
     assert_eq!(chat_no_plan, chat_plan, "Opencode chat should be unchanged with --plan");
-
-    let imp_no_plan = agent_entrypoint("opencode", 3, false);
-    let imp_plan = agent_entrypoint("opencode", 3, true);
-    assert_eq!(imp_no_plan, imp_plan, "Opencode implement should be unchanged with --plan");
 }
 
 #[test]
@@ -1544,10 +1286,6 @@ fn plan_false_does_not_add_flags() {
         let chat = chat_entrypoint(agent, false);
         assert!(!chat.contains(&"--permission-mode".to_string()), "No --permission-mode for {} with plan=false", agent);
         assert!(!chat.contains(&"--approval-mode".to_string()), "No --approval-mode for {} with plan=false", agent);
-
-        let imp = agent_entrypoint(agent, 1, false);
-        assert!(!imp.contains(&"--permission-mode".to_string()), "No --permission-mode for {} implement with plan=false", agent);
-        assert!(!imp.contains(&"--approval-mode".to_string()), "No --approval-mode for {} implement with plan=false", agent);
     }
 }
 
@@ -1564,15 +1302,6 @@ fn pending_command_chat_plan_field() {
     assert_ne!(cmd, PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: false, allow_docker: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
 }
 
-#[test]
-fn pending_command_implement_plan_field() {
-    use amux::tui::state::PendingCommand;
-
-    let cmd = PendingCommand::Implement { agent: None, model: None, work_item: 1, non_interactive: false, plan: true, allow_docker: false, workflow: None, worktree: false, mount_ssh: false, yolo: false, auto: false, overlay: None };
-    assert_eq!(cmd, PendingCommand::Implement { agent: None, model: None, work_item: 1, non_interactive: false, plan: true, allow_docker: false, workflow: None, worktree: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
-    assert_ne!(cmd, PendingCommand::Implement { agent: None, model: None, work_item: 1, non_interactive: false, plan: false, allow_docker: false, workflow: None, worktree: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
-}
-
 // ---------------------------------------------------------------------------
 // Plan flag: autocomplete hints include --plan
 // ---------------------------------------------------------------------------
@@ -1587,48 +1316,9 @@ fn autocomplete_chat_shows_plan_hint() {
     );
 }
 
-#[test]
-fn autocomplete_implement_shows_plan_hint() {
-    let sug = autocomplete_suggestions("implement ");
-    assert!(
-        sug.iter().any(|s| s.contains("--plan")),
-        "Expected --plan hint for 'implement' command, got: {:?}",
-        sug
-    );
-}
-
 // ---------------------------------------------------------------------------
 // allow-docker flag: CLI parsing
 // ---------------------------------------------------------------------------
-
-#[test]
-fn cli_implement_allow_docker_flag() {
-    use amux::cli::{Cli, Command};
-    use clap::Parser;
-
-    let cli = Cli::try_parse_from(["amux", "implement", "0001", "--allow-docker"]).unwrap();
-    match cli.command.unwrap() {
-        Command::Implement { allow_docker, work_item, .. } => {
-            assert!(allow_docker, "Expected allow_docker=true");
-            assert_eq!(work_item, "0001");
-        }
-        _ => panic!("Expected Implement command"),
-    }
-}
-
-#[test]
-fn cli_implement_no_allow_docker_by_default() {
-    use amux::cli::{Cli, Command};
-    use clap::Parser;
-
-    let cli = Cli::try_parse_from(["amux", "implement", "0001"]).unwrap();
-    match cli.command.unwrap() {
-        Command::Implement { allow_docker, .. } => {
-            assert!(!allow_docker, "Expected allow_docker=false by default");
-        }
-        _ => panic!("Expected Implement command"),
-    }
-}
 
 #[test]
 fn cli_chat_allow_docker_flag() {
@@ -1687,22 +1377,6 @@ fn cli_ready_no_allow_docker_by_default() {
 }
 
 #[test]
-fn cli_implement_allow_docker_with_plan() {
-    use amux::cli::{Cli, Command};
-    use clap::Parser;
-
-    let cli = Cli::try_parse_from(["amux", "implement", "0042", "--allow-docker", "--plan"]).unwrap();
-    match cli.command.unwrap() {
-        Command::Implement { allow_docker, plan, work_item, .. } => {
-            assert!(allow_docker);
-            assert!(plan);
-            assert_eq!(work_item, "0042");
-        }
-        _ => panic!("Expected Implement command"),
-    }
-}
-
-#[test]
 fn cli_chat_allow_docker_with_plan() {
     use amux::cli::{Cli, Command};
     use clap::Parser;
@@ -1746,15 +1420,6 @@ fn pending_command_chat_allow_docker_field() {
 }
 
 #[test]
-fn pending_command_implement_allow_docker_field() {
-    use amux::tui::state::PendingCommand;
-
-    let cmd = PendingCommand::Implement { agent: None, model: None, work_item: 1, non_interactive: false, plan: false, allow_docker: true, workflow: None, worktree: false, mount_ssh: false, yolo: false, auto: false, overlay: None };
-    assert_eq!(cmd, PendingCommand::Implement { agent: None, model: None, work_item: 1, non_interactive: false, plan: false, allow_docker: true, workflow: None, worktree: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
-    assert_ne!(cmd, PendingCommand::Implement { agent: None, model: None, work_item: 1, non_interactive: false, plan: false, allow_docker: false, workflow: None, worktree: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
-}
-
-#[test]
 fn pending_command_ready_allow_docker_field() {
     use amux::tui::state::PendingCommand;
 
@@ -1768,7 +1433,7 @@ fn pending_command_ready_allow_docker_field() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn allow_docker_adds_socket_mount_to_implement_run_args() {
+fn allow_docker_adds_socket_mount_to_run_args() {
     use amux::runtime::AgentRuntime;
 
     let socket_path = amux::runtime::docker::docker_socket_path();
@@ -1798,7 +1463,7 @@ fn allow_docker_adds_socket_mount_to_implement_run_args() {
 }
 
 #[test]
-fn no_allow_docker_omits_socket_mount_from_implement_run_args() {
+fn no_allow_docker_omits_socket_mount_from_run_args() {
     use amux::runtime::AgentRuntime;
 
     let socket_path = amux::runtime::docker::docker_socket_path();
@@ -1834,16 +1499,6 @@ fn autocomplete_chat_shows_allow_docker_hint() {
     assert!(
         sug.iter().any(|s| s.contains("--allow-docker")),
         "Expected --allow-docker hint for 'chat' command, got: {:?}",
-        sug
-    );
-}
-
-#[test]
-fn autocomplete_implement_shows_allow_docker_hint() {
-    let sug = autocomplete_suggestions("implement ");
-    assert!(
-        sug.iter().any(|s| s.contains("--allow-docker")),
-        "Expected --allow-docker hint for 'implement' command, got: {:?}",
         sug
     );
 }
@@ -2006,432 +1661,6 @@ async fn new_fails_when_explicit_cwd_has_no_git_repo() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 45. Claws command expansion: CLI parsing for init, ready, chat
-// ---------------------------------------------------------------------------
-
-#[test]
-fn cli_claws_init_parsed() {
-    use amux::cli::{Cli, ClawsAction, Command};
-    use clap::Parser;
-
-    let cli = Cli::try_parse_from(["amux", "claws", "init"]).unwrap();
-    match cli.command.unwrap() {
-        Command::Claws { action } => assert!(matches!(action, ClawsAction::Init)),
-        _ => panic!("Expected Claws command"),
-    }
-}
-
-#[test]
-fn cli_claws_ready_parity() {
-    use amux::cli::{Cli, ClawsAction, Command};
-    use clap::Parser;
-
-    let cli = Cli::try_parse_from(["amux", "claws", "ready"]).unwrap();
-    match cli.command.unwrap() {
-        Command::Claws { action } => assert!(matches!(action, ClawsAction::Ready)),
-        _ => panic!("Expected Claws command"),
-    }
-}
-
-#[test]
-fn cli_claws_chat_parsed() {
-    use amux::cli::{Cli, ClawsAction, Command};
-    use clap::Parser;
-
-    let cli = Cli::try_parse_from(["amux", "claws", "chat"]).unwrap();
-    match cli.command.unwrap() {
-        Command::Claws { action } => assert!(matches!(action, ClawsAction::Chat)),
-        _ => panic!("Expected Claws command"),
-    }
-}
-
-#[test]
-fn cli_claws_init_ready_chat_are_distinct_actions() {
-    use amux::cli::{Cli, ClawsAction, Command};
-    use clap::Parser;
-
-    let extract = |args: &[&str]| {
-        let cli = Cli::try_parse_from(args).unwrap();
-        match cli.command.unwrap() {
-            Command::Claws { action } => action,
-            _ => panic!("expected Claws"),
-        }
-    };
-
-    assert!(matches!(extract(&["amux", "claws", "init"]), ClawsAction::Init));
-    assert!(matches!(extract(&["amux", "claws", "ready"]), ClawsAction::Ready));
-    assert!(matches!(extract(&["amux", "claws", "chat"]), ClawsAction::Chat));
-}
-
-// ---------------------------------------------------------------------------
-// 46. Claws: run_claws_ready returns Ok with message when nanoclaw not installed
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn claws_ready_not_installed_suggests_init() {
-    use amux::commands::claws;
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let sink = amux::commands::output::OutputSink::Channel(tx);
-
-    let tmp = TempDir::new().unwrap();
-    let _guard = HOME_MUTEX.lock().unwrap();
-    std::env::set_var("HOME", tmp.path());
-
-    let runtime = DockerRuntime::new();
-    let result = claws::run_claws_ready(&sink, &runtime).await;
-
-    std::env::remove_var("HOME");
-
-    assert!(result.is_ok(), "run_claws_ready should not error when not installed");
-    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert!(
-        messages.iter().any(|m| m.contains("claws init")),
-        "Expected message suggesting 'claws init', got: {:?}",
-        messages
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 47. Claws: run_claws_chat errors with informative message when not installed
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn claws_chat_not_installed_returns_error() {
-    use amux::commands::claws;
-
-    let tmp = TempDir::new().unwrap();
-    let _guard = HOME_MUTEX.lock().unwrap();
-    std::env::set_var("HOME", tmp.path());
-
-    let runtime = DockerRuntime::new();
-    let result = claws::run_claws_chat(&runtime).await;
-
-    std::env::remove_var("HOME");
-
-    assert!(result.is_err(), "run_claws_chat should error when nanoclaw not installed");
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("claws init"),
-        "Error should mention 'claws init', got: {}",
-        msg
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 48. Claws: run_claws_chat errors when container is not running
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn claws_chat_container_not_running_returns_error() {
-    use amux::commands::claws;
-
-    let tmp = TempDir::new().unwrap();
-    let nanoclaw_dir = tmp.path().join(".nanoclaw");
-    std::fs::create_dir_all(&nanoclaw_dir).unwrap();
-    std::fs::write(
-        nanoclaw_dir.join(".amux.json"),
-        r#"{"nanoclawContainerID": "definitely-not-a-real-container-id"}"#,
-    ).unwrap();
-
-    let _guard = HOME_MUTEX.lock().unwrap();
-    std::env::set_var("HOME", tmp.path());
-
-    let runtime = DockerRuntime::new();
-    let result = claws::run_claws_chat(&runtime).await;
-
-    std::env::remove_var("HOME");
-
-    assert!(result.is_err(), "run_claws_chat should error when container is not running");
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("claws ready"),
-        "Error should suggest 'claws ready', got: {}",
-        msg
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 49. Claws: NanoclawConfig serializes and deserializes correctly
-// ---------------------------------------------------------------------------
-
-#[test]
-fn nanoclaw_config_roundtrip() {
-    use amux::commands::claws::NanoclawConfig;
-
-    let config = NanoclawConfig {
-        nanoclaw_container_id: Some("abc123def456".to_string()),
-    };
-    let json = serde_json::to_string(&config).unwrap();
-    assert!(json.contains("nanoclawContainerID"), "JSON key should be camelCase");
-    assert!(json.contains("abc123def456"));
-
-    let parsed: NanoclawConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.nanoclaw_container_id, Some("abc123def456".to_string()));
-}
-
-#[test]
-fn nanoclaw_config_default_has_no_container_id() {
-    use amux::commands::claws::NanoclawConfig;
-
-    let config = NanoclawConfig::default();
-    assert!(config.nanoclaw_container_id.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// 50. Claws: autocomplete suggests init, ready, and chat
-// ---------------------------------------------------------------------------
-
-#[test]
-fn autocomplete_claws_space_shows_all_three_subcommands() {
-    let sug = autocomplete_suggestions("claws ");
-    assert!(
-        sug.iter().any(|s| s.contains("init")),
-        "Expected 'init' in claws suggestions, got: {:?}",
-        sug
-    );
-    assert!(
-        sug.iter().any(|s| s.contains("ready")),
-        "Expected 'ready' in claws suggestions, got: {:?}",
-        sug
-    );
-    assert!(
-        sug.iter().any(|s| s.contains("chat")),
-        "Expected 'chat' in claws suggestions, got: {:?}",
-        sug
-    );
-}
-
-#[test]
-fn autocomplete_claws_init_hint_describes_setup() {
-    let sug = autocomplete_suggestions("claws ");
-    let init_hint = sug.iter().find(|s| s.starts_with("claws init"));
-    assert!(init_hint.is_some(), "Expected 'claws init' hint, got: {:?}", sug);
-    let hint = init_hint.unwrap();
-    assert!(
-        hint.contains("setup") || hint.contains("clone") || hint.contains("first"),
-        "Init hint should describe setup purpose, got: {}",
-        hint
-    );
-}
-
-#[test]
-fn autocomplete_claws_chat_hint_describes_attach() {
-    let sug = autocomplete_suggestions("claws ");
-    let chat_hint = sug.iter().find(|s| s.starts_with("claws chat"));
-    assert!(chat_hint.is_some(), "Expected 'claws chat' hint, got: {:?}", sug);
-    let hint = chat_hint.unwrap();
-    assert!(
-        hint.contains("attach") || hint.contains("chat") || hint.contains("container"),
-        "Chat hint should describe attach purpose, got: {}",
-        hint
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 51. Claws: tab color is purple for claws init, ready, and chat commands
-// ---------------------------------------------------------------------------
-
-#[test]
-fn tab_color_claws_init_command_is_magenta() {
-    use amux::tui::state::{App, ExecutionPhase, STUCK_TIMEOUT};
-    use ratatui::style::Color;
-
-    let mut app = App::new(std::path::PathBuf::new());
-    app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws init".to_string() };
-    assert_eq!(
-        app.active_tab().tab_color(true, STUCK_TIMEOUT),
-        Color::Magenta,
-        "claws init command should show magenta tab"
-    );
-}
-
-#[test]
-fn tab_color_claws_chat_command_is_magenta() {
-    use amux::tui::state::{App, ExecutionPhase, STUCK_TIMEOUT};
-    use ratatui::style::Color;
-
-    let mut app = App::new(std::path::PathBuf::new());
-    app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws chat".to_string() };
-    assert_eq!(
-        app.active_tab().tab_color(true, STUCK_TIMEOUT),
-        Color::Magenta,
-        "claws chat command should show magenta tab"
-    );
-}
-
-#[test]
-fn tab_color_claws_ready_still_magenta() {
-    use amux::tui::state::{App, ExecutionPhase, STUCK_TIMEOUT};
-    use ratatui::style::Color;
-
-    let mut app = App::new(std::path::PathBuf::new());
-    app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws ready".to_string() };
-    assert_eq!(
-        app.active_tab().tab_color(true, STUCK_TIMEOUT),
-        Color::Magenta,
-        "claws ready command should show magenta tab"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 52. Claws: nanoclaw path and utility functions
-// ---------------------------------------------------------------------------
-
-#[test]
-fn nanoclaw_path_uses_home_directory() {
-    use amux::commands::claws::nanoclaw_path;
-
-    let path = nanoclaw_path();
-    assert!(
-        path.ends_with(".nanoclaw"),
-        "nanoclaw_path should end with .nanoclaw, got: {:?}",
-        path
-    );
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    assert!(
-        path.starts_with(&home),
-        "nanoclaw_path should be under HOME ({}), got: {:?}",
-        home,
-        path
-    );
-}
-
-#[test]
-fn nanoclaw_path_str_matches_path() {
-    use amux::commands::claws::{nanoclaw_path, nanoclaw_path_str};
-
-    let path = nanoclaw_path();
-    let path_str = nanoclaw_path_str();
-    assert_eq!(
-        path.to_string_lossy().as_ref(),
-        path_str.as_str(),
-        "nanoclaw_path_str should match nanoclaw_path"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 53. Claws: print_claws_summary output contains all status rows
-// ---------------------------------------------------------------------------
-
-#[test]
-fn print_claws_summary_outputs_all_rows() {
-    use amux::commands::claws::{ClawsSummary, print_claws_summary};
-    use amux::commands::ready::StepStatus;
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let sink = amux::commands::output::OutputSink::Channel(tx);
-
-    let summary = ClawsSummary {
-        nanoclaw_cloned: StepStatus::Ok("exists".into()),
-        docker_daemon: StepStatus::Ok("running".into()),
-        nanoclaw_image: StepStatus::Ok("built".into()),
-        nanoclaw_container: StepStatus::Ok("running".into()),
-    };
-
-    print_claws_summary(&sink, &summary);
-
-    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    let joined = messages.join("\n");
-    assert!(joined.contains("Nanoclaw"), "Summary should include Nanoclaw row");
-    assert!(joined.contains("Docker"), "Summary should include Docker daemon row");
-    assert!(joined.contains("Container"), "Summary should include Container row");
-}
-
-// ---------------------------------------------------------------------------
-// 54. Claws: audit container has amux- container name and carries audit prompt
-// ---------------------------------------------------------------------------
-
-#[test]
-fn audit_container_name_has_amux_prefix() {
-    // The audit container must have an amux- name so it is identifiable in docker ps.
-    let name = amux::runtime::generate_container_name();
-    assert!(
-        name.starts_with("amux-"),
-        "Audit container name must have amux- prefix, got: {}",
-        name
-    );
-}
-
-#[test]
-fn build_run_args_pty_at_path_includes_name_and_prompt() {
-    use amux::commands::ready::audit_entrypoint;
-    use amux::runtime::AgentRuntime;
-
-    let nanoclaw_str = "/home/user/.nanoclaw";
-    let agent_name = "claude";
-    let container_name = amux::runtime::generate_container_name();
-    let entrypoint = audit_entrypoint(agent_name);
-    let entrypoint_refs: Vec<&str> = entrypoint.iter().map(String::as_str).collect();
-
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_pty_at_path(
-        amux::commands::claws::NANOCLAW_IMAGE_TAG,
-        nanoclaw_str,
-        nanoclaw_str,
-        nanoclaw_str,
-        &entrypoint_refs,
-        &[],
-        None,
-        false,
-        Some(&container_name),
-    );
-
-    // Container name must appear.
-    assert!(
-        args.contains(&container_name),
-        "Args must include container name; args: {:?}",
-        args
-    );
-    assert!(
-        args.iter().any(|a| a == "--name"),
-        "Args must include --name flag; args: {:?}",
-        args
-    );
-
-    // Audit prompt must be in the entrypoint args.
-    assert!(
-        args.iter().any(|a| a.contains("scan this project")),
-        "Audit entrypoint must carry the audit prompt; args: {:?}",
-        args
-    );
-
-    // Mount must use nanoclaw path on both sides (not /workspace).
-    let mount_arg = format!("{}:{}", nanoclaw_str, nanoclaw_str);
-    assert!(
-        args.contains(&mount_arg),
-        "Mount must use identical host and container paths; args: {:?}",
-        args
-    );
-
-    // Must be foreground (--rm -it), not detached (-d).
-    assert!(args.contains(&"--rm".to_string()), "Must include --rm");
-    assert!(args.contains(&"-it".to_string()), "Must include -it (interactive+tty)");
-    assert!(!args.contains(&"-d".to_string()), "Must NOT include -d (detached)");
-}
-
-#[test]
-fn claws_audit_ctx_carries_prompt_via_audit_entrypoint() {
-    use amux::commands::ready::{audit_entrypoint, AUDIT_PROMPT};
-
-    // Verify that audit_entrypoint includes the audit prompt for every supported agent.
-    for agent in &["claude", "codex", "opencode"] {
-        let args = audit_entrypoint(agent);
-        assert!(
-            args.iter().any(|a| a.contains("scan this project")),
-            "audit_entrypoint({}) must carry audit prompt: {:?}",
-            agent,
-            args
-        );
-        // The prompt should match the canonical AUDIT_PROMPT constant.
-        assert!(
-            args.iter().any(|a| a == AUDIT_PROMPT),
-            "audit_entrypoint({}) must include the full AUDIT_PROMPT; args: {:?}",
-            agent,
-            args
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Workflow state tests
@@ -2826,67 +2055,9 @@ fn worktree_branch_name_format() {
 }
 
 // ---------------------------------------------------------------------------
-// 30. End-to-end: SSH warning in implement/chat output (work item 0030)
+// 30. End-to-end: SSH warning in chat output (work item 0030)
 //     These tests require docker and a real git repo; run with `--ignored`.
 // ---------------------------------------------------------------------------
-
-/// E2E: `amux implement 0001 --mount-ssh` displays the SSH warning and includes
-/// the SSH mount in the Docker command shown to the user.
-///
-/// Requires: git repo, Docker daemon, and a Dockerfile.dev image.
-#[tokio::test]
-#[ignore]
-async fn e2e_implement_mount_ssh_displays_warning_and_docker_mount() {
-    let _lock = HOME_MUTEX.lock().unwrap();
-    let original_home = std::env::var("HOME").ok();
-
-    let fake_home = TempDir::new().unwrap();
-    let ssh_dir = fake_home.path().join(".ssh");
-    std::fs::create_dir_all(&ssh_dir).unwrap();
-    std::env::set_var("HOME", fake_home.path());
-
-    let (tx, mut rx) = unbounded_channel::<String>();
-    let sink = OutputSink::Channel(tx);
-
-    let cwd = std::env::current_dir().unwrap();
-    let runtime = DockerRuntime::new();
-    let _ = amux::commands::implement::run_with_sink(
-        1,
-        &sink,
-        Some(cwd.clone()),
-        vec![],
-        false,
-        false,
-        None,
-        false,
-        false, // worktree
-        true,  // mount_ssh
-        false, // yolo
-        false, // auto
-        None,  // agent_override
-        None,  // model
-        &runtime,
-    )
-    .await;
-
-    match original_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
-    }
-
-    let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert!(
-        messages.iter().any(|m| m.contains("--mount-ssh")),
-        "Expected SSH warning in implement output: {:?}",
-        messages
-    );
-    let docker_line = messages.iter().find(|m| m.starts_with("$ docker run"));
-    assert!(
-        docker_line.map(|l| l.contains("/.ssh")).unwrap_or(false),
-        "Expected /.ssh in docker command: {:?}",
-        messages
-    );
-}
 
 /// E2E: `amux chat --mount-ssh` displays the SSH warning and includes
 /// the SSH mount in the Docker command shown to the user.

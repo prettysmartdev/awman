@@ -8,7 +8,7 @@ Workflows are files you write and commit to your repo — in Markdown, TOML, or 
 
 ## When to use workflows
 
-Single-step `implement` works well for focused, well-specified tasks. Workflows are better when:
+Workflows are useful when:
 
 - The task is complex enough that you want the agent to plan before coding
 - You want multiple review checkpoints (e.g. review the plan before implementation starts)
@@ -20,17 +20,17 @@ Single-step `implement` works well for focused, well-specified tasks. Workflows 
 ## Quick start
 
 ```sh
-# Run the bundled example workflow against work item 0027
-amux implement 0027 --workflow aspec/workflows/implement-feature.md
-
-# Run a workflow without a work item (exec workflow)
-amux exec workflow aspec/workflows/review.md
+# Run a workflow file
+amux exec workflow aspec/workflows/implement-feature.md
 
 # Run a workflow and associate a work item for template variable substitution
 amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
+
+# Run a workflow without a work item
+amux exec workflow aspec/workflows/review.md
 ```
 
-`exec workflow` and `implement --workflow` behave identically, except the work item is optional with `exec workflow`. Use `exec workflow` when you want to run a workflow file independently of any specific work item — for example, a standing code review or documentation workflow. See [Headless Mode](08-headless-mode.md#amux-exec-workflow-path--amux-exec-wf-path) for usage in CI and scripting contexts.
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [Headless Mode](08-headless-mode.md#amux-exec-workflow-path--amux-exec-wf-path) for usage in CI and scripting contexts.
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -85,7 +85,7 @@ amux new workflow --format md     # writes aspec/workflows/<name>.md
 amux new workflow --interview
 ```
 
-Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `specs new --interview` writes a work item.
+Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `new spec --interview` writes a work item.
 
 In the TUI, the dialog switches to a two-field layout: workflow name and summary. Press **Ctrl-Enter** to start the interview agent.
 
@@ -383,7 +383,7 @@ Per-step model values from `Model:` fields are persisted in the workflow state f
 ### In the TUI
 
 ```
-implement 0027 --workflow=aspec/workflows/implement-feature.md
+exec workflow aspec/workflows/implement-feature.md --work-item 0027
 ```
 
 A **workflow status strip** appears, showing each step as a coloured box:
@@ -401,7 +401,7 @@ When a step completes, a confirmation dialog appears. Press **Enter** or **y** t
 ### In command mode
 
 ```sh
-amux implement 0027 --workflow aspec/workflows/implement-feature.md
+amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
 ```
 
 Between steps, amux prints the step summary and prompts:
@@ -421,7 +421,7 @@ Press [r] to retry, or any other key to abort:
 
 ### Flags
 
-All flags available on `implement` work with `--workflow`:
+`exec workflow` accepts the following flags:
 
 | Flag | Description |
 |------|-------------|
@@ -438,32 +438,67 @@ All flags available on `implement` work with `--workflow`:
 
 ## Workflow control board (TUI only)
 
-While a workflow step is **running**, press **Ctrl+W** to open the **workflow control board** — a popup that lets you redirect execution without waiting for the current step to finish. Ctrl+W works regardless of whether the container window is maximized or minimized.
+Press **Ctrl+W** at any time to open the **workflow control board** — a popup that lets you redirect execution without waiting for the current step to finish. Ctrl+W works regardless of whether the container window is maximized or minimized.
+
+There are two variants of the control board:
+
+### Lightweight step confirmation (between steps)
+
+When a step completes and the next step is ready, amux shows a compact confirmation dialog:
 
 ```
-╭──────── Workflow Control ────────╮
-│ Step: implement                  │
-│                                  │
-│         ↑ Restart current step   │
-│                                  │
-│ ← Cancel to prev   → Next: new   │
-│                                  │
-│         ↓ Next: same container   │
-│                                  │
-│  [Arrow] select  [d]isable  [Esc] dismiss  │
-╰──────────────────────────────────╯
+╭─ Step 'implement' done. Advance to 'test'? ─╮
+│                                             │
+│  [Enter] yes  [Esc] pause  [Ctrl+W] details │
+╰─────────────────────────────────────────────╯
 ```
 
 | Key | Action |
 |-----|--------|
-| **↑** | Restart current step — reset to Pending and relaunch in a fresh container |
-| **←** | Cancel to previous step — mark current step Pending and re-run the most recently completed step |
-| **→** | Next step: new container — mark current step Done and advance to the next step in a new container |
-| **↓** | Next step: same container — mark current step Done and send the next step's prompt to the existing container via PTY |
-| **d** | Disable auto-popup for this step — dismiss and suppress auto-open for the remainder of this step |
-| **Esc** | Dismiss without changing anything |
+| **Enter** | Advance to the next step |
+| **Esc** | Pause and wait for your input |
+| **Ctrl+W** | Open the full workflow control board for more options |
 
-Each action persists workflow state before launching any new execution, so an unexpected exit leaves state consistent.
+### Full workflow control board (between or during steps)
+
+The full control board appears when you have multiple options or want fine-grained control. It can be opened mid-step without disrupting the running container:
+
+```
+╭───── Workflow Control ──────╮
+│ Step: implement             │
+│                             │
+│    ↑ Restart current step   │
+│                             │
+│ ← Prev   → Next (new cont.) │
+│                             │
+│    ↓ Next (same container)  │
+│                             │
+│ [Arrow] select  [Esc] done  │
+╰─────────────────────────────╯
+```
+
+#### Between-step actions
+
+| Key | Effect | Container killed? |
+|-----|--------|-------------------|
+| **↑** | Restart current step — reset to Pending and relaunch in a fresh container | ✓ Yes |
+| **←** | Cancel to previous step — mark current step Pending and re-run the most recently completed step | ✓ Yes |
+| **→** | Next step: new container — mark current step Done and advance in a new container | ✓ Yes |
+| **↓** | Next step: same container — mark current step Done and send the next step's prompt to the existing container via PTY | ✗ No |
+| **Esc** | Dismiss and continue waiting | ✗ No |
+
+#### Mid-step actions (when step is running)
+
+When you open the control board **while a step is actively running**, the same actions are available, but with different implications:
+
+| Key | Effect | Container killed? | Step status |
+|-----|--------|-------------------|-------------|
+| **→** | Force advance — mark current step Done regardless of completion and launch the next step | ✓ Yes | Treated as succeeded |
+| **↓** | Continue in current container — queue a message for the running agent to process | ✗ No | Continues running |
+| **Esc** | Dismiss — let the step continue running undisturbed | ✗ No | Continues running |
+| **↑**, **←** | (same as between-step) | ✓ Yes | (same as between-step) |
+
+The dialog title shows `Workflow Control (step running)` when opened mid-step. Actions that kill the container display a sub-note in gray: `↳ kills running container`. The dismiss action shows: `↳ step keeps running`.
 
 ### Next step: same container
 
@@ -479,28 +514,78 @@ In command mode, the "same container" prompt is skipped entirely and the explana
 
 ### Manual vs. automatic opening
 
-Ctrl+W requires:
-- A workflow active in the current tab
-- A step currently running
-- No other dialog open
+Ctrl+W works:
+- Between steps (always available)
+- **During a running step** (new) — does not kill the container unless you select a destructive action
+- When no other dialog is open
 
 ---
 
-## Auto-advance when stuck
+### Next step: same container
 
-If a running workflow step produces no output for **10 seconds**, amux automatically opens the workflow control board so you can decide what to do without having to notice the yellow indicator yourself.
+The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, amux falls back to a new container and shows a status message.
 
-The auto-open fires only when:
-- The stuck tab is the currently active tab (background tabs are deferred until you switch to them)
-- No other dialog is already open
-- Auto-open has not been disabled for this step via the **d** key
-- The user has also been idle for 10 seconds on the active tab (see below)
+If the next step requires a **different agent** than the current step, the **↓** option is unavailable. In the TUI it renders greyed out with the message:
 
-**Active-tab suppression:** If you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even if the container is silent. The control board will not open while you are engaged with the output. The timer starts only once both the container and the user have been idle for 10 seconds. Background tabs are always checked using output time alone.
+```
+Next step uses agent 'codex'; cannot reuse current 'claude' container.
+```
 
-After you dismiss with **Esc**, the stuck timer resets. If the container stays silent for another 10 seconds, the dialog re-opens. The auto-open works even when the container window is maximized — the dialog appears over the full-screen terminal view.
+In command mode, the "same container" prompt is skipped entirely and the explanation is printed instead. Use **→** (new container) to advance, which always works regardless of agent.
 
-In **yolo mode**, the behavior differs for background tabs: instead of deferring the control board until you switch, a live countdown runs directly in the tab bar. See [Yolo Mode — Background yolo countdown](05-yolo-mode.md#background-yolo-countdown).
+### Manual vs. automatic opening
+
+Ctrl+W works at any time when a workflow is active in the current tab — there are no other preconditions. It works mid-step, between steps, during a yolo countdown, or while another dialog is open (the existing dialog is dismissed first).
+
+---
+
+## Workflow strip and step status
+
+The **workflow status strip** shows the state of every step in the workflow:
+
+```
+Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
+```
+
+| Visual | Meaning |
+|--------|---------|
+| **●** (Blue, bold) | Step is currently running |
+| **✓** (Green) | Step completed successfully |
+| **⚠️** (Yellow, bold) | Step is stuck (no output for >30 seconds) |
+| **●** (Gray, dim) | Step is pending |
+| **✗** (Red, bold) | Step encountered an error |
+
+### Stuck steps
+
+When a step produces no output for more than 30 seconds, it is marked as stuck in the strip. Stuck steps show a warning indicator (⚠️) both in the strip box and in the tab label.
+
+Stuck steps trigger automatic behavior depending on the mode:
+- In **yolo mode**: the engine starts a 60-second countdown. When it expires, the step is auto-advanced. If the user cancels (Esc) and the step re-stucks, the countdown restarts from 60 seconds with no backoff.
+- In **non-yolo mode**: the workflow control board opens automatically so you can decide what to do.
+- In either mode, new PTY output immediately clears the stuck state and cancels any active countdown.
+
+You can always open the control board manually via **Ctrl+W** regardless of stuck status.
+
+### Parallel step groups
+
+Steps that share the same dependencies form a **parallel group** and execute sequentially in file order. In the workflow strip, they are stacked vertically with slight indentation. If a group has more than two steps, the additional steps are shown as `+ N more…`. Use **mouse wheel** to scroll within the strip and view hidden parallel steps.
+
+### Viewing the full control board
+
+When a step completes, amux shows the lightweight confirmation dialog. To see all available actions and options, press **Ctrl+W** to open the full control board. Pressing **Esc** on the lightweight dialog pauses the workflow for manual input.
+
+---
+
+## Auto-advance when stuck (yolo mode)
+
+When a running workflow step produces no output for **30 seconds**, the engine is notified that the step is stuck:
+
+- In **yolo mode**: the engine starts a 60-second countdown. If the countdown expires, the step is automatically advanced. Pressing Esc cancels the countdown; if the step re-stucks, the countdown restarts from 60 seconds with no backoff.
+- In **non-yolo mode**: the workflow control board opens automatically so you can decide what to do.
+
+Stuck detection fires independently per tab — background tabs detect and report stuck state to their own engine. In yolo mode, background tabs show a live countdown in the tab bar. See [Yolo Mode — Background yolo countdown](05-yolo-mode.md#background-yolo-countdown).
+
+**Active-tab suppression:** If you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even if the container is silent. The timer starts only once both the container and the user have been idle for 30 seconds. Background tabs are always checked using output time alone.
 
 ---
 
@@ -516,7 +601,7 @@ The file records the status of every step, the container ID used for each step, 
 
 ### Resuming
 
-If a saved state file exists when you run `implement --workflow`, amux offers to resume:
+If a saved state file exists when you run `exec workflow`, amux offers to resume:
 
 ```
 Found a saved workflow state for 'implement-feature' (work item 0027).
@@ -586,7 +671,6 @@ All three files define the same four steps (`implement`, `tests`, `docs`, `revie
 | `Model:` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
 | `Model:` appearing after `Prompt:` | Treated as prompt text, not a directive |
 | Invalid model name in `Model:` field | Passed verbatim to the agent; the agent surfaces its own error |
-| `--model` flag on single-step `implement` (no workflow) | Behaves identically to `chat --model` |
 | Resume with a different `--model` flag | Persisted per-step model values take precedence; `--model` applies only to steps with no persisted model |
 | All steps specify non-default agents | Pre-flight still runs for each; default fallback offered only if setup is declined |
 | Parallel steps with different agents | Each step runs in its own container — no cross-step sharing |

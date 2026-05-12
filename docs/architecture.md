@@ -1,6 +1,2504 @@
 # amux Architecture
 
-## High-level Overview
+## Overview
+
+**Status**: The grand architecture refactor is complete as of work item 0073 (May 2026).
+
+amux is now built from a single, unified four-layer architecture:
+
+- **`src/`** — the production source tree organized as a four-layer architecture. The `amux` binary is built from `src/main.rs`.
+- **`oldsrc/`** (if present) — the frozen pre-refactor source, preserved temporarily for reference only.
+
+For the best introduction to the new architecture, see the [Architecture Overview](10-architecture-overview.md) guide. The detailed specification is in [`aspec/architecture/2026-grand-architecture.md`](../aspec/architecture/2026-grand-architecture.md).
+
+---
+
+## Grand Architecture Refactor (Completed in WI 0073)
+
+### Purpose
+
+amux initially grew into three execution modes (CLI, TUI, headless) that share the same core functionality but implement it separately, producing subtle behavioural drift and making parity across modes impossible to guarantee. The grand architecture refactor (completed May 2026) reorganized the codebase into a strict four-layer system where every frontend is a thin presentation shell over a shared, tested core.
+
+### Tenets
+
+1. **No upward calls.** Lower layers never call functions or use types from higher layers. If a lower layer needs to delegate upward, it defines a trait that a higher layer implements.
+2. **Frontends are dumb.** No frontend (CLI, TUI, headless) may implement business logic. All logic lives in Layer 2 (`command`) or below.
+3. **Typed objects over free functions.** Every significant abstraction is a struct with methods. Free `pub fn` is acceptable only for stateless helpers, constructors, and one-off utilities.
+
+### Layers
+
+```
+Layer 4: binary    main.rs — sets up frontends, delegates everything
+Layer 3: frontend  CLI, TUI, Headless — input/output only
+Layer 2: command   Dispatch, per-command business logic
+Layer 1: engine    ContainerRuntime, WorkflowEngine, GitEngine, OverlayEngine, AuthEngine
+Layer 0: data      Session, config, filesystem, database, typed data
+```
+
+**Layer 0 (data)** owns every data definition, config concern, filesystem access, and database interaction. No business logic, no container calls, no git operations, no workflow execution. See [Layer 0 reference](#layer-0-data-srcdata) below.
+
+**Layer 1 (engine)** owns core runtime primitives: container lifecycle, workflow execution, git operations, overlay construction, authentication, agent management, and the multi-phase `ready`/`init` engines. See [Layer 1 reference](#layer-1-engine-srcengine) below.
+
+**Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
+
+**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. All three frontends are fully functional. See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
+
+**Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, constructs engines, opens a `Session`, and routes to the CLI or TUI frontend. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
+
+### Implementation Timeline
+
+| Phase | Work Items | Status | Completion Date |
+|-------|-----------|--------|---|
+| Layer 0 (data) | WI 0066 | ✓ Complete | Apr 2026 |
+| Layer 1 (engine) | WI 0067 | ✓ Complete | Apr 2026 |
+| Layer 2 (command) | WI 0068 | ✓ Complete | Apr 2026 |
+| Layer 3 (frontend) | WI 0069, 0070, 0071 | ✓ Complete | Apr 2026 |
+| Layer 4 (binary) | WI 0069 | ✓ Complete | Apr 2026 |
+| Validation & Audit | WI 0073 | ✓ Complete | May 2026 |
+
+**Summary**: All layers fully implemented and validated. Full parity across CLI, TUI, and Headless frontends. Architecture lint passes. Test suite (>100 tests) covers all layers.
+
+---
+
+## New Source Tree (`src/`)
+
+```
+src/
+  main.rs                 Layer 4 entry point (the `amux` binary)
+  lib.rs                  Re-exports the four layers
+  data/                   Layer 0 — fully implemented
+    mod.rs
+    session.rs            Session, SessionState, SessionId, AgentName, …
+    session_manager.rs    SessionManager, SessionStore, InMemorySessionStore
+    error.rs              DataError
+    workflow_dag.rs       WorkflowDag, validate_references, detect_cycle
+    workflow_definition.rs  Workflow, WorkflowStep, format detection
+    workflow_state.rs     WorkflowState, StepState, WORKFLOW_STATE_SCHEMA_VERSION
+    workflow_state_store.rs WorkflowStateStore (git-root-scoped persistence)
+    workflow_prompt_template.rs  Prompt-template substitution
+    worktree_paths.rs     WorktreePaths, worktree_branch_name helpers
+    config/
+      mod.rs
+      repo.rs             RepoConfig and related types
+      global.rs           GlobalConfig
+      env.rs              EnvSnapshot, Env, env var constants
+      flags.rs            FlagConfig
+      effective.rs        EffectiveConfig (merged view)
+    fs/
+      mod.rs
+      headless_db.rs      SqliteSessionStore, SessionRecord, CommandRecord
+      headless_paths.rs   HeadlessPaths
+      workflow_state.rs   WorkflowStateStore (legacy alias kept for compat)
+      skill_dirs.rs       SkillDirs
+      workflow_dirs.rs    WorkflowDirs
+      overlay_paths.rs    OverlayPathResolver
+      auth_paths.rs       AuthPathResolver, AgentAuthPaths
+  engine/                 Layer 1 — fully implemented
+    mod.rs                Re-exports: EngineError, UserMessage*, StepStatus
+    error.rs              EngineError
+    message.rs            UserMessage, MessageLevel, UserMessageSink, RecordingMessageSink
+    step_status.rs        StepStatus (shared by ReadyEngine, InitEngine)
+    container/
+      mod.rs              Re-exports: ContainerRuntime, ContainerOption*, ContainerFrontend, …
+      runtime.rs          ContainerRuntime::detect / build / list_running / stats / stop
+      options.rs          ContainerOption enum + surrounding types (ImageRef, Entrypoint, …)
+      instance.rs         ContainerInstance trait, ContainerExecution, ContainerExitInfo
+      frontend.rs         ContainerFrontend trait (defined by Layer 1, implemented by Layer 3)
+      backend.rs          ContainerBackend trait (pub(super) — opaque to callers)
+      docker.rs           DockerBackend (pub(super))
+      apple.rs            AppleBackend (pub(super); macOS only)
+      naming.rs           generate_container_name()
+    workflow/
+      mod.rs              WorkflowEngine struct + all public methods
+      actions.rs          NextAction, AvailableActions, WorkflowOutcome, StepOutcome, …
+      factory.rs          ContainerExecutionFactory trait, WorkflowRuntimeContext
+      frontend.rs         WorkflowFrontend trait
+      timing.rs           YOLO_COUNTDOWN_DURATION, STUCK_DIALOG_BACKOFF constants
+    git/
+      mod.rs              GitEngine; impl GitRootResolver for GitEngine
+    overlay/
+      mod.rs              OverlayEngine, OverlayRequest, DirectorySpec, CLAUDE_DENYLIST
+    auth/
+      mod.rs              AuthEngine (headless API keys, TLS, keychain credentials)
+      keychain.rs         Per-OS keychain backend (keyring crate)
+    agent/
+      mod.rs              AgentEngine, AgentRunOptions
+      agent_matrix.rs     Per-agent entrypoint/flag translation table
+      frontend.rs         AgentFrontend trait
+      download.rs         Dockerfile download URL constants
+    ready/
+      mod.rs              ReadyEngine, ReadyEngineOptions
+      phase.rs            ReadyPhase state machine, ReadyFailure
+      frontend.rs         ReadyFrontend trait
+      summary.rs          ReadySummary
+    init/
+      mod.rs              InitEngine, InitEngineOptions
+      phase.rs            InitPhase state machine, InitFailure
+      frontend.rs         InitFrontend trait
+      summary.rs          InitSummary
+  command/
+    mod.rs                Re-exports: CommandCatalogue, Dispatch, CommandFrontend, CommandOutcome, CommandError
+    error.rs              CommandError (wraps EngineError and DataError)
+    dispatch/
+      mod.rs              Dispatch<F>, Engines, CommandFrontend, CommandOutcome, BuiltCommand
+      catalogue.rs        CommandCatalogue, CommandSpec, FlagSpec, ArgumentSpec, FlagKind, FlagDefault, ArgumentKind, FrontendVisibility
+      parsed_input.rs     ParsedCommandBoxInput (TUI command-box tokenized result)
+      projections/
+        mod.rs            Re-exports
+        clap.rs           CommandCatalogue::build_clap_command()
+        tui_hints.rs      CommandCatalogue::tui_hint_for(), tui_completions()
+        headless_schema.rs CommandCatalogue::openapi_schema(), rest_route_table()
+    commands/
+      mod.rs              Re-exports all *Command types
+      command_trait.rs    Command trait (run_with_frontend)
+      agent_auth.rs       AgentAuthFrontend trait, AgentAuthDecision
+      agent_setup.rs      AgentSetupFrontend trait, AgentSetupDecision
+      auth.rs             AuthCommand, AuthCommandFrontend, AuthOutcome
+      chat.rs             ChatCommand, ChatCommandFrontend, ChatCommandFlags, ChatOutcome
+      config.rs           ConfigCommand, ConfigSubcommand, ConfigShowFlags, ConfigGetFlags, ConfigSetFlags, ConfigOutcome
+      download.rs         DownloadCommand, DownloadOutcome
+      exec_prompt.rs      ExecPromptCommand, ExecPromptCommandFrontend, ExecPromptCommandFlags, ExecPromptOutcome
+      exec_workflow.rs    ExecWorkflowCommand, ExecWorkflowCommandFrontend, ExecWorkflowCommandFlags, ExecWorkflowOutcome, WorkflowSummary
+      headless.rs         HeadlessCommand, HeadlessSubcommand, HeadlessStartFlags, HeadlessKillFlags, HeadlessLogsFlags, HeadlessStatusFlags, HeadlessOutcome
+      headless/
+        banner.rs         Legacy headless banner format constants
+      prompt_templates.rs Interview/amend prompt builders for `specs amend` and `new {spec,workflow,skill}`
+      init.rs             InitCommand, InitCommandFrontend, InitCommandFlags, InitOutcome
+      mount_scope.rs      MountScope, MountScopeFrontend, MountScopeDecision
+      new.rs              NewCommand, NewSubcommand, NewSkillFlags, NewSpecFlags, NewWorkflowFlags, NewOutcome
+      ready.rs            ReadyCommand, ReadyCommandFrontend, ReadyCommandFlags, ReadyOutcome
+      remote.rs           RemoteCommand, RemoteSubcommand, RemoteRunFlags, RemoteSessionStartFlags, RemoteSessionKillFlags, RemoteOutcome
+      remote_client.rs    RemoteClient, RemoteResponse, RemoteEventSink
+      specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsOutcome
+      status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
+      worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
+  frontend/
+    mod.rs                Declares cli, tui, headless sub-modules
+    cli/
+      mod.rs              RuntimeContext; run() entry point; render_outcome/render_error; error_exit_code
+      command_frontend.rs CliFrontend (implements CommandFrontend + all *CommandFrontend marker traits); command_path_from_matches
+      output.rs           stderr_is_tty(), stdin_is_tty() — pure TTY detection helpers
+      user_message.rs     CliUserMessageQueue — UserMessageSink with PTY-active queueing
+      per_command/
+        mod.rs
+        chat.rs           ChatCommandFrontend impl
+        exec_prompt.rs    ExecPromptCommandFrontend impl
+        exec_workflow.rs  ExecWorkflowCommandFrontend + ContainerFrontend + WorkflowFrontend impls
+        headless.rs       HeadlessStartCommandFrontend impl (calls frontend::headless::serve)
+        init.rs           InitCommandFrontend + InitFrontend impls
+        ready.rs          ReadyCommandFrontend + ReadyFrontend impls
+        agent_auth.rs     AgentAuthFrontend impl
+        agent_setup.rs    AgentSetupFrontend impl
+        container_frontend_marker.rs  ContainerFrontend marker impl
+        mount_scope.rs    MountScopeFrontend impl
+        workflow_frontend_marker.rs   WorkflowFrontend marker impl
+        worktree_lifecycle_marker.rs  WorktreeLifecycleFrontend marker impl
+    tui/
+      mod.rs              run() — TUI entry point; run_event_loop(); main_loop()
+      app.rs              App — central TUI state; Focus, StatusBar
+      tabs.rs             Tab — per-tab state; ExecutionPhase, ContainerWindowState; tab_color, compute_tab_bar_width, window_border_color, phase_label
+      command_box.rs      parse_input(), format_parse_error() — command-box tokenization and error formatting
+      command_frontend.rs TuiCommandFrontend — implements CommandFrontend + all *CommandFrontend traits
+      container_view.rs   render_container_maximized/minimized() — vt100 overlay rendering
+      dialogs/
+        mod.rs            Dialog enum, DialogRequest/Response, all dialog state types and rendering helpers
+      hints.rs            hint_for_input(), format_suggestion_row() — catalogue-driven hint text
+      keymap.rs           Action enum, FocusContext, map_key() — complete keyboard shortcut map
+      per_command/        TUI per-command *CommandFrontend trait implementations (one file per command)
+        mod.rs
+        agent_auth.rs     AgentAuthFrontend impl
+        agent_setup.rs    AgentSetupFrontend impl
+        auth.rs           AuthCommandFrontend impl
+        chat.rs           ChatCommandFrontend impl
+        config.rs         ConfigCommandFrontend impl
+        container_frontend.rs  ContainerFrontend impl
+        download.rs       DownloadCommandFrontend impl
+        exec_prompt.rs    ExecPromptCommandFrontend impl
+        exec_workflow.rs  ExecWorkflowCommandFrontend impl
+        headless.rs       HeadlessCommandFrontend impl
+        init.rs           InitCommandFrontend impl
+        mount_scope.rs    MountScopeFrontend impl
+        new.rs            NewCommandFrontend impl
+        ready.rs          ReadyCommandFrontend impl
+        remote.rs         RemoteCommandFrontend impl
+        specs.rs          SpecsCommandFrontend impl
+        status.rs         StatusCommandFrontend impl
+        workflow_frontend.rs   WorkflowFrontend impl
+        worktree_lifecycle.rs  WorktreeLifecycleFrontend impl
+      pty.rs              PtySession — portable-pty wrapper; PtyEvent; spawn_text_command()
+      render.rs           render_frame() — full frame layout; tab bar, execution window, status bar, command box, dialogs
+      tabs.rs             (also see above)
+      text_edit.rs        TextEdit — single-line/multiline text editing with cursor and word movement
+      user_message.rs     TuiUserMessageSink, SharedStatusLog, StatusLogEntry
+      workflow_view.rs    render_workflow_strip() — per-step status strip
+    headless/
+      mod.rs              HeadlessServeConfig; placeholder serve() — ships in 0072
+  main.rs                 Layer 4 binary entrypoint
+```
+
+---
+
+## Layer 0: Data (`src/data/`)
+
+Layer 0 is the foundation every other layer builds on. It owns:
+
+- The `Session` ruling type and its runtime state
+- The `SessionManager` collection and persistence interface
+- All configuration loading, saving, and merging
+- All filesystem and database interactions
+- The typed `DataError` error enum
+
+Nothing in `src/data/` ever spawns a process, opens a network socket, calls `git`, or manages a container. Those are Layer 1 concerns.
+
+---
+
+### Session (`src/data/session.rs`)
+
+`Session` is the ruling type for every amux operation. It ties together a working directory, a resolved git root, loaded configurations, and the in-flight runtime state. Every command and workflow invocation starts with a `Session`.
+
+- The **CLI** creates one `Session` per invocation.
+- The **TUI** creates one `Session` per tab.
+- The **headless server** creates one `Session` per API session.
+
+#### `SessionId`
+
+```rust
+pub struct SessionId(Uuid);
+```
+
+Newtype over `uuid::Uuid`. Implements `Display` (UUID string format), `Hash`, and `Eq`. `SessionId::new()` generates a random v4 UUID; `SessionId::from_uuid(uuid)` wraps an existing one for persistence round-trips.
+
+#### `AgentName`
+
+```rust
+pub struct AgentName(String);
+```
+
+Newtype over `String` with validation: ASCII alphanumerics, hyphens, and underscores; 1–64 characters. `AgentName::new("claude")` returns `Result<AgentName, DataError>`. `as_str()` and `Display` give the inner string.
+
+#### `ContainerHandle`
+
+```rust
+pub struct ContainerHandle {
+    pub id: String,
+    pub image_tag: String,
+    pub name: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+```
+
+The persistable identity of a running container. Layer 0 holds only the identity; the runtime object that controls a container (start/stop/wait) is Layer 1.
+
+#### `SessionState`
+
+```rust
+pub struct SessionState {
+    pub current_command: Option<CommandInvocation>,
+    pub current_workflow: Option<WorkflowInvocation>,
+    pub current_container: Option<ContainerHandle>,
+    pub errors: Vec<SessionLogEntry>,
+    pub notes: Vec<SessionLogEntry>,
+}
+```
+
+Mutable runtime state owned by a `Session`. `record_error(msg)` and `record_note(kind, msg)` append to the respective logs. `SessionLogEntry` carries a UTC timestamp, a `SessionLogKind` (Info / Warning / Error / Diagnostic), and a message string.
+
+#### `CommandInvocation` and `WorkflowInvocation`
+
+`CommandInvocation` is the persistable record of a single in-flight command (subcommand name, args, status, exit code, timestamps). `WorkflowInvocation` is the persistable record of a running workflow (workflow name and hash, work item, step records, paused/yolo/auto flags, current step index).
+
+Both are serializable via serde and stored in `SessionState` for persistence by the headless server.
+
+#### `GitRootResolver` trait
+
+```rust
+pub trait GitRootResolver: Send + Sync {
+    fn resolve(&self, working_dir: &Path) -> Result<PathBuf, DataError>;
+}
+```
+
+Layer 0 never calls `git rev-parse` directly. Instead, `Session::open` accepts a `&dyn GitRootResolver` and delegates resolution to Layer 1's `GitEngine` (wired in work item 0067). `StaticGitRootResolver` is the test-only implementation that returns a fixed path.
+
+#### `Session` constructors and accessors
+
+```rust
+impl Session {
+    pub fn open(
+        working_dir: PathBuf,
+        resolver: &dyn GitRootResolver,
+        opts: SessionOpenOptions,
+    ) -> Result<Self, DataError>;
+
+    pub fn open_at_git_root(
+        working_dir: PathBuf,
+        git_root: PathBuf,
+        opts: SessionOpenOptions,
+    ) -> Result<Self, DataError>;
+
+    // Read accessors
+    pub fn id(&self) -> SessionId;
+    pub fn working_dir(&self) -> &Path;
+    pub fn git_root(&self) -> &Path;
+    pub fn repo_config(&self) -> &RepoConfig;
+    pub fn global_config(&self) -> &GlobalConfig;
+    pub fn env(&self) -> &EnvSnapshot;
+    pub fn flags(&self) -> &FlagConfig;
+    pub fn default_agent(&self) -> Option<&AgentName>;
+    pub fn available_agents(&self) -> &[AgentName];
+    pub fn state(&self) -> &SessionState;
+    pub fn created_at(&self) -> SystemTime;
+    pub fn last_active_at(&self) -> SystemTime;
+    pub fn uptime(&self) -> Duration;
+
+    // Mutation
+    pub fn state_mut(&mut self) -> &mut SessionState;
+    pub fn touch(&mut self);
+    pub fn set_flags(&mut self, flags: FlagConfig);
+    pub fn set_env(&mut self, env: EnvSnapshot);
+    pub fn set_available_agents(&mut self, agents: Vec<AgentName>);
+
+    // Merged config view
+    pub fn effective_config(&self) -> EffectiveConfig;
+}
+```
+
+`Session::open` resolves the git root via the resolver, loads `RepoConfig` and `GlobalConfig` from disk, resolves the default agent using the precedence order (flags > repo config > global config), and records creation timestamps. It returns `DataError::GitRootNotFound` if the resolver fails.
+
+`SessionOpenOptions` carries optional `FlagConfig`, an optional `EnvSnapshot`, and an optional `Vec<AgentName>` for available agents.
+
+---
+
+### SessionManager (`src/data/session_manager.rs`)
+
+```rust
+pub struct SessionManager { … }
+```
+
+A concurrency-safe collection of `Session` values backed by a `tokio::sync::RwLock`. All methods are `async`.
+
+```rust
+impl SessionManager {
+    pub fn in_memory() -> Self;
+    pub fn with_persistence(store: Arc<dyn SessionStore>) -> Self;
+
+    pub async fn create(&self, session: Session) -> Result<SessionId, DataError>;
+    pub async fn get(&self, id: SessionId) -> Result<Session, DataError>;
+    pub async fn update<F, T>(&self, id: SessionId, f: F) -> Result<T, DataError>
+    where F: FnOnce(&mut Session) -> T;
+    pub async fn list(&self) -> Vec<Session>;
+    pub async fn len(&self) -> usize;
+    pub async fn is_empty(&self) -> bool;
+    pub async fn remove(&self, id: SessionId) -> Result<(), DataError>;
+    pub fn has_persistence(&self) -> bool;
+}
+```
+
+`SessionManager::in_memory()` creates a manager with no persistence backend (used by the CLI for its single session and by the TUI for per-tab sessions). `SessionManager::with_persistence(store)` attaches a `SessionStore` backend that receives an `upsert` call on every `create` or `update` and a `remove` call on every `remove`. The headless server uses this variant with `SqliteSessionStore`.
+
+`update` takes a closure instead of returning `&mut Session` to avoid exposing an unguarded mutable reference across an `await` point.
+
+`create` returns `DataError::SessionIdCollision` (instead of panicking) in the astronomically unlikely event of a UUID v4 collision.
+
+#### `SessionStore` trait
+
+```rust
+pub trait SessionStore: Send + Sync {
+    fn upsert(&self, session: &Session) -> Result<(), DataError>;
+    fn remove(&self, id: SessionId) -> Result<(), DataError>;
+}
+```
+
+The persistence interface implemented by Layer 0's `SqliteSessionStore` (and by `InMemorySessionStore` for tests).
+
+---
+
+### Configuration (`src/data/config/`)
+
+All configuration concerns live in `src/data/config/`. Four source layers are merged in a fixed priority order:
+
+```
+flags  >  env  >  repo config  >  global config  >  built-in default
+```
+
+The merge is enforced by `EffectiveConfig` and is never duplicated elsewhere.
+
+#### `RepoConfig` (`config/repo.rs`)
+
+Per-repository configuration stored at `<git_root>/.amux/config.json`.
+
+```rust
+pub struct RepoConfig {
+    pub agent: Option<String>,
+    pub auto_agent_auth_accepted: Option<bool>,
+    pub terminal_scrollback_lines: Option<usize>,
+    pub yolo_disallowed_tools: Option<Vec<String>>,  // "yoloDisallowedTools" in JSON
+    pub env_passthrough: Option<Vec<String>>,          // "envPassthrough" in JSON
+    pub work_items: Option<WorkItemsConfig>,           // "workItems" in JSON
+    pub overlays: Option<OverlaysConfig>,
+    pub agent_stuck_timeout_secs: Option<u64>,        // "agentStuckTimeout" in JSON
+}
+```
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `RepoConfig::path(git_root)` | Returns `<git_root>/.amux/config.json` |
+| `RepoConfig::legacy_path(git_root)` | Returns `<git_root>/aspec/.amux.json` (pre-migration path) |
+| `RepoConfig::load(git_root)` | Loads from disk; returns `default()` when absent, `DataError::ConfigParse` on malformed JSON |
+| `RepoConfig::save(&self, git_root)` | Persists to disk, creating parent dirs as needed |
+| `RepoConfig::migrate_legacy(git_root)` | Moves `aspec/.amux.json` → `.amux/config.json` if and only if legacy exists and new path does not; returns `true` when migration occurred |
+| `RepoConfig::work_items_dir(git_root)` | Resolves configured work items directory |
+| `RepoConfig::work_items_template(git_root)` | Resolves configured work item template path |
+
+Nested types: `WorkItemsConfig` (dir, template), `OverlaysConfig` (directories list), `DirectoryOverlayConfig` (host, container, permission), `HeadlessConfig` (workDirs, alwaysNonInteractive), `RemoteConfig` (defaultAddr, savedDirs, defaultAPIKey).
+
+#### `GlobalConfig` (`config/global.rs`)
+
+Global configuration stored at `$HOME/.amux/config.json`. The path is overridden by the `AMUX_CONFIG_HOME` environment variable (used by tests to isolate state).
+
+```rust
+pub struct GlobalConfig {
+    pub default_agent: Option<String>,
+    pub terminal_scrollback_lines: Option<usize>,
+    pub runtime: Option<String>,
+    pub yolo_disallowed_tools: Option<Vec<String>>,
+    pub env_passthrough: Option<Vec<String>>,
+    pub headless: Option<HeadlessConfig>,
+    pub remote: Option<RemoteConfig>,
+    pub overlays: Option<OverlaysConfig>,
+    pub agent_stuck_timeout_secs: Option<u64>,
+}
+```
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `GlobalConfig::home_dir()` | Resolves `$AMUX_CONFIG_HOME` or `$HOME/.amux` |
+| `GlobalConfig::home_dir_with(env)` | Same, reading from an `EnvSnapshot` |
+| `GlobalConfig::path()` / `path_with(env)` | Resolves the full config file path |
+| `GlobalConfig::load()` / `load_with(env)` | Loads from disk; returns `default()` when absent |
+| `GlobalConfig::save()` / `save_with(env)` | Persists to disk |
+
+#### `EnvSnapshot` and `Env` (`config/env.rs`)
+
+`EnvSnapshot` is a frozen snapshot of every environment variable amux reads. No scattered `std::env::var()` calls appear elsewhere in Layer 0.
+
+```rust
+pub struct EnvSnapshot { … }
+
+impl EnvSnapshot {
+    pub fn empty() -> Self;
+    pub fn with_overrides<I, K, V>(entries: I) -> Self;
+    pub fn get(&self, key: &str) -> Option<&str>;
+
+    // Typed accessors for known vars
+    pub fn config_home(&self) -> Option<PathBuf>;    // AMUX_CONFIG_HOME
+    pub fn headless_root(&self) -> Option<PathBuf>;  // AMUX_HEADLESS_ROOT
+    pub fn overlays(&self) -> Option<&str>;          // AMUX_OVERLAYS
+    pub fn remote_addr(&self) -> Option<&str>;       // AMUX_REMOTE_ADDR
+    pub fn remote_session(&self) -> Option<&str>;    // AMUX_REMOTE_SESSION
+    pub fn api_key(&self) -> Option<&str>;           // AMUX_API_KEY
+}
+```
+
+`Env` is a stateless namespace used to read from the real process environment at startup. Tests use `EnvSnapshot::with_overrides([("AMUX_CONFIG_HOME", tmp_path)])` to avoid touching the filesystem.
+
+Defined constants for every env var amux reads:
+
+| Constant | Variable | Purpose |
+|----------|----------|---------|
+| `AMUX_CONFIG_HOME` | `AMUX_CONFIG_HOME` | Override global config home dir |
+| `AMUX_HEADLESS_ROOT` | `AMUX_HEADLESS_ROOT` | Override headless storage root |
+| `AMUX_OVERLAYS` | `AMUX_OVERLAYS` | Comma-separated overlay specs |
+| `AMUX_REMOTE_ADDR` | `AMUX_REMOTE_ADDR` | Override remote server address |
+| `AMUX_REMOTE_SESSION` | `AMUX_REMOTE_SESSION` | Sticky session id for remote ops |
+| `AMUX_API_KEY` | `AMUX_API_KEY` | API key for headless server |
+
+#### `FlagConfig` (`config/flags.rs`)
+
+Typed struct carrying the flag values parsed by a frontend. Frontends (CLI via clap, TUI via the flag parser) populate a `FlagConfig` and pass it into `SessionOpenOptions`. The config layer itself never parses command-line strings.
+
+Key fields: `agent`, `terminal_scrollback_lines`, `agent_stuck_timeout`, `non_interactive`, `env_passthrough`, `yolo_disallowed_tools`, `remote_addr`, `remote_session`, `api_key`.
+
+#### `EffectiveConfig` (`config/effective.rs`)
+
+The merged view of all four config sources. `Session::effective_config()` returns a fresh `EffectiveConfig` on demand; it is not cached on the session because flags can be updated via `Session::set_flags`.
+
+```rust
+pub struct EffectiveConfig {
+    flags: FlagConfig,
+    env: EnvSnapshot,
+    repo: RepoConfig,
+    global: GlobalConfig,
+}
+
+impl EffectiveConfig {
+    pub fn new(flags, env, repo, global) -> Self;
+
+    // Raw source access
+    pub fn flags(&self) -> &FlagConfig;
+    pub fn env(&self) -> &EnvSnapshot;
+    pub fn repo(&self) -> &RepoConfig;
+    pub fn global(&self) -> &GlobalConfig;
+
+    // Merged accessors (precedence enforced internally)
+    pub fn agent(&self) -> Option<String>;           // flag > repo > global
+    pub fn env_passthrough(&self) -> Vec<String>;    // flag > repo > global > []
+    pub fn yolo_disallowed_tools(&self) -> Vec<String>; // flag > repo > global > []
+    pub fn scrollback_lines(&self) -> usize;         // flag > repo > global > 10_000
+    pub fn agent_stuck_timeout(&self) -> Duration;   // flag > repo > global > 30s
+    pub fn headless_work_dirs(&self) -> Vec<String>; // global only
+    pub fn always_non_interactive(&self) -> bool;    // flag > global > false
+    pub fn remote_default_addr(&self) -> Option<String>;  // flag > env > global
+    pub fn remote_default_api_key(&self) -> Option<String>; // flag > env > global
+    pub fn remote_saved_dirs(&self) -> Vec<String>;  // global only
+    pub fn remote_session(&self) -> Option<String>;  // flag > env
+    pub fn runtime(&self) -> Option<String>;         // global only
+}
+```
+
+Built-in defaults: `scrollback_lines` = 10,000 lines; `agent_stuck_timeout` = 30 seconds.
+
+---
+
+### Filesystem Stores (`src/data/fs/`)
+
+Every direct filesystem or database interaction in Layer 0 is encapsulated in a typed object in this module. Higher layers consume these objects; they never call `std::fs::*` or `rusqlite::*` directly.
+
+#### `SqliteSessionStore` (`fs/headless_db.rs`)
+
+Sqlite-backed persistence for headless-mode session and command metadata. Schema is compatible with `oldsrc/commands/headless/db.rs` so that existing on-disk databases written by earlier amux releases remain readable.
+
+```rust
+pub struct SqliteSessionStore { conn: Mutex<Connection> }
+
+impl SqliteSessionStore {
+    pub fn open(root: &Path) -> Result<Self, DataError>;
+    pub fn open_from_paths(paths: &HeadlessPaths) -> Result<Self, DataError>;
+
+    pub fn insert_session(&self, id, workdir, created_at) -> Result<(), DataError>;
+    pub fn close_session(&self, id, closed_at) -> Result<(), DataError>;
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>, DataError>;
+    pub fn get_session(&self, id) -> Result<Option<SessionRecord>, DataError>;
+
+    pub fn insert_command(&self, id, session_id, subcommand, args, log_path) -> Result<(), DataError>;
+    pub fn update_command_status(&self, id, status, exit_code, finished_at) -> Result<(), DataError>;
+    pub fn list_commands(&self, session_id) -> Result<Vec<CommandRecord>, DataError>;
+    pub fn get_command(&self, id) -> Result<Option<CommandRecord>, DataError>;
+}
+```
+
+`SqliteSessionStore::open(root)` creates the database at `<root>/amux.db`, enables WAL mode, and runs schema migrations idempotently. The schema has two tables: `sessions` and `commands`.
+
+`SessionRecord` and `CommandRecord` are plain structs (no Arc, no async) that carry the persisted metadata fields.
+
+#### `HeadlessPaths` (`fs/headless_paths.rs`)
+
+Typed accessors for every path used by the headless server. Replaces ad-hoc `dirs::data_dir().join("amux/headless/…")` calls scattered through the legacy code.
+
+```rust
+pub struct HeadlessPaths { root: PathBuf }
+
+impl HeadlessPaths {
+    pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError>;
+    pub fn root(&self) -> &Path;
+    pub fn db_path(&self) -> PathBuf;          // <root>/amux.db
+    pub fn log_path(&self) -> PathBuf;         // <root>/amux.log
+    pub fn pid_path(&self) -> PathBuf;         // <root>/amux.pid
+    pub fn tls_dir(&self) -> PathBuf;          // <root>/tls/
+    pub fn sessions_dir(&self) -> PathBuf;     // <root>/sessions/
+    pub fn session_dir(&self, id) -> PathBuf;  // <root>/sessions/<id>/
+    pub fn command_dir(&self, session_id, command_id) -> PathBuf;
+    pub fn stdout_log(&self, session_id, command_id) -> PathBuf;
+    pub fn stderr_log(&self, session_id, command_id) -> PathBuf;
+}
+```
+
+`HeadlessPaths::from_env` reads `AMUX_HEADLESS_ROOT` from the snapshot; if unset, uses `$HOME/.amux/headless`.
+
+#### `WorkflowStateStore` (`fs/workflow_state.rs`)
+
+Persists and retrieves `WorkflowInvocation` to/from disk. Replaces the free `pub fn` helpers `workflow_state_path`, `save_workflow_state`, `load_workflow_state`, and `validate_resume_compatibility` in the legacy code.
+
+```rust
+pub struct WorkflowStateStore { base_dir: PathBuf }
+
+impl WorkflowStateStore {
+    pub fn new(base_dir: PathBuf) -> Self;
+    pub fn for_session(session: &Session) -> Self;
+
+    pub fn state_path(&self, workflow_name: &str) -> PathBuf;
+    pub fn save(&self, invocation: &WorkflowInvocation) -> Result<(), DataError>;
+    pub fn load(&self, workflow_name: &str) -> Result<Option<WorkflowInvocation>, DataError>;
+    pub fn validate_resume(&self, invocation: &WorkflowInvocation) -> Result<(), DataError>;
+    pub fn remove(&self, workflow_name: &str) -> Result<(), DataError>;
+}
+```
+
+Workflow state is stored as JSON at `<base_dir>/workflow-state/<workflow_name>.json`. `validate_resume` checks that the workflow hash in the stored invocation matches the hash of the workflow file on disk, returning `DataError::WorkflowResumeIncompatible` if they differ.
+
+#### `SkillDirs` (`fs/skill_dirs.rs`)
+
+Typed access to global and per-repo skill directories.
+
+```rust
+pub struct SkillDirs {
+    global_dir: Option<PathBuf>,
+    repo_dir: Option<PathBuf>,
+}
+
+impl SkillDirs {
+    pub fn resolve(session: &Session) -> Self;
+    pub fn global_dir(&self) -> Option<&Path>;
+    pub fn repo_dir(&self) -> Option<&Path>;
+    pub fn all_dirs(&self) -> Vec<&Path>;
+}
+```
+
+Global skills live at `$HOME/.amux/skills/` (or `$AMUX_CONFIG_HOME/skills/`). Per-repo skills live at `<git_root>/.amux/skills/`.
+
+#### `WorkflowDirs` (`fs/workflow_dirs.rs`)
+
+Typed access to global and per-repo workflow directories. Same structure as `SkillDirs`: global at `$HOME/.amux/workflows/`, per-repo at `<git_root>/.amux/workflows/`.
+
+#### `OverlayPathResolver` (`fs/overlay_paths.rs`)
+
+Resolves overlay host paths from raw user input. Path *mounting* into containers is Layer 1; path *resolution* is Layer 0.
+
+```rust
+pub struct OverlayPathResolver;
+
+impl OverlayPathResolver {
+    pub fn new() -> Self;
+    pub fn expand_tilde(path: &str) -> PathBuf;
+    pub fn make_absolute_with_cwd(path: &str, cwd: &Path) -> PathBuf;
+    pub fn make_absolute(path: &str) -> PathBuf;
+    pub fn canonicalize_lossy(path: &Path) -> PathBuf;
+}
+```
+
+`canonicalize_lossy` handles the common case of overlay paths that don't exist yet: it walks up to the nearest existing ancestor, canonicalises that, and re-appends the missing trailing components. This mirrors the behaviour of `oldsrc/overlays/make_host_path_canonical` from work item 0065.
+
+#### `AuthPathResolver` (`fs/auth_paths.rs`)
+
+Resolves host-side credential and settings paths for each supported agent. The *passthrough* of those paths into containers (file copying, scrubbing, bind-mount construction) is a Layer 1 concern.
+
+```rust
+pub struct AuthPathResolver { home: PathBuf }
+
+impl AuthPathResolver {
+    pub fn at_home(home: impl Into<PathBuf>) -> Self;
+    pub fn from_process_env() -> Result<Self, DataError>;
+    pub fn home(&self) -> &Path;
+    pub fn resolve(&self, agent: &str) -> AgentAuthPaths;
+}
+
+pub struct AgentAuthPaths {
+    pub agent: String,
+    pub config_file: Option<PathBuf>,
+    pub settings_dir: Option<PathBuf>,
+}
+```
+
+`resolve("claude")` returns `config_file = Some(~/.claude.json)`, `settings_dir = Some(~/.claude)`. Each supported agent maps to its own file locations.
+
+---
+
+### Error Types (`src/data/error.rs`)
+
+All Layer 0 errors are variants of `DataError`. Higher layers wrap `DataError` in their own error enums.
+
+```rust
+#[derive(Debug, Error)]
+pub enum DataError {
+    GitRootNotFound { working_dir: PathBuf },
+    GitRootResolution { working_dir: PathBuf, message: String },
+    SessionNotFound { id: Uuid },
+    SessionIdCollision { id: Uuid },
+    InvalidAgentName { name: String, reason: String },
+    ConfigParse { path: PathBuf, source: serde_json::Error },
+    ConfigSerialize { source: serde_json::Error },
+    Io { path: PathBuf, source: std::io::Error },
+    HomeNotFound,
+    Sqlite(rusqlite::Error),
+    WorkflowState(String),
+    WorkflowResumeIncompatible(String),
+    InvalidPath { path: PathBuf, reason: String },
+}
+```
+
+`DataError::io(path, err)` and `DataError::config_parse(path, err)` are convenience constructors. `DataError` uses `thiserror` for `Display` and `Error::source` implementations.
+
+---
+
+## Layer 1: Engine (`src/engine/`)
+
+Layer 1 is the engine layer: typed objects that own every runtime concern Layer 2 commands need to compose. It is built on top of Layer 0 and never calls into Layer 2, 3, or 4. When an engine needs user input or output it accepts a **frontend trait** defined by Layer 1 — higher layers implement that trait and pass it in at construction.
+
+Three rules govern every engine in this layer:
+
+1. **No direct I/O.** No `println!`, `eprintln!`, `tracing::info!` to user-facing output. All user-visible output flows through `UserMessageSink::write_message` or the appropriate frontend trait.
+2. **No PTY, no `clap`, no `crossterm`, no `ratatui`.** Those are Layer 3 concerns.
+3. **Typed objects over free functions.** Every significant abstraction is a struct with methods.
+
+---
+
+### `UserMessageSink` and `UserMessage` (`src/engine/message.rs`)
+
+`UserMessageSink` is a supertrait of every frontend trait in Layer 1. Any type that implements `ContainerFrontend`, `WorkflowFrontend`, `ReadyFrontend`, `InitFrontend`, or `AgentFrontend` also implements `UserMessageSink`, so engine code can call `frontend.info(…)`, `frontend.warning(…)`, etc. anywhere a frontend reference is held.
+
+```rust
+pub struct UserMessage {
+    pub level: MessageLevel,   // Info | Warning | Error | Success
+    pub text: String,
+}
+
+pub trait UserMessageSink: Send + Sync {
+    fn write_message(&mut self, msg: UserMessage);
+    fn replay_queued(&mut self);
+
+    // Convenience defaults:
+    fn info(&mut self, text: impl Into<String>);
+    fn warning(&mut self, text: impl Into<String>);
+    fn error_msg(&mut self, text: impl Into<String>);
+    fn success(&mut self, text: impl Into<String>);
+}
+```
+
+**CLI queueing contract**: when a PTY-bound container owns the terminal, `write_message` queues the message instead of writing. `replay_queued` drains the queue after the container releases the terminal. TUI and headless implementations render live and treat `replay_queued` as a no-op.
+
+`RecordingMessageSink` (also in `message.rs`) records every message passed to it and is used by all engine unit tests.
+
+---
+
+### `EngineError` (`src/engine/error.rs`)
+
+All Layer 1 failures are variants of `EngineError`. It wraps `DataError` for failures from Layer 0; higher layers wrap `EngineError` in their own error types.
+
+Key variants:
+
+| Variant | Meaning |
+|---------|---------|
+| `Data(DataError)` | Propagated from Layer 0 |
+| `Git(String)` | Git subprocess failure |
+| `Container(String)` | Backend container operation failure |
+| `ConflictingOptions(String)` | Mutually exclusive `ContainerOption`s |
+| `OptionNotSupportedByBackend { option, backend }` | Option irrelevant to chosen backend |
+| `BackendUnsupportedOnPlatform { backend, platform }` | e.g. Apple Containers on Linux |
+| `InvalidAdvanceAction(String)` | `NextAction` rejected by `WorkflowEngine` |
+| `UnsupportedWorkflowSchemaVersion { found, supported }` | Persisted state is too new |
+| `WorkflowResumeIncompatible(String)` | User declined drift-resume |
+| `PlanModeUnsupported { agent }` | Agent does not support `--plan` |
+| `AgentRequiresProjectImage { tag }` | Base image not built yet |
+
+---
+
+### `StepStatus` (`src/engine/step_status.rs`)
+
+Shared across `ReadyEngine` and `InitEngine` for their summary structs.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StepStatus {
+    Pending,
+    Skipped,
+    Running,
+    Done,
+    Failed(String),   // human-readable reason
+}
+```
+
+---
+
+### Container Engine (`src/engine/container/`)
+
+The container engine provides a single typed factory for building and running containers. The concrete backend (Docker or Apple Containers) is selected once at construction and never exposed to callers outside the module.
+
+#### `ContainerRuntime`
+
+```rust
+pub struct ContainerRuntime { /* holds Box<dyn ContainerBackend> — opaque */ }
+
+impl ContainerRuntime {
+    /// Inspect global_config to pick Docker (default) or Apple Containers.
+    /// Returns BackendUnsupportedOnPlatform if Apple Containers is requested on non-macOS.
+    /// Unknown runtime values default to Docker and emit a warning.
+    pub fn detect(global_config: &GlobalConfig) -> Result<Self, EngineError>;
+
+    /// Name of the chosen backend ("docker" or "apple-containers"). Safe for display.
+    pub fn runtime_name(&self) -> &'static str;
+
+    /// Build a fully-configured ContainerInstance from the given options.
+    pub fn build(&self, options: impl IntoIterator<Item = ContainerOption>)
+        -> Result<Box<dyn ContainerInstance>, EngineError>;
+
+    pub fn list_running(&self, session: &Session) -> Result<Vec<ContainerHandle>, EngineError>;
+    pub fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError>;
+    pub fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError>;
+}
+```
+
+Backend selection rules: `"docker"` or absent → Docker; `"apple-containers"` on macOS → Apple; `"apple-containers"` on non-macOS → `EngineError::BackendUnsupportedOnPlatform`; unknown value → warn + Docker.
+
+#### `ContainerOption`
+
+Every knob a container invocation accepts. Adding a new option is one new variant plus one branch in `ResolvedContainerOptions::ingest` — no changes to call sites needed.
+
+```rust
+pub enum ContainerOption {
+    Image(ImageRef),
+    Entrypoint(Entrypoint),
+    Overlay(OverlaySpec),
+    EnvPassthrough(EnvVar),
+    EnvLiteral(EnvLiteral),
+    SeededPrompt(String),
+    Interactive(bool),
+    AllowDocker(bool),
+    MountSsh { source: PathBuf },
+    Yolo(YoloMode),
+    Auto(AutoMode),
+    Plan(PlanMode),
+    WorkingDir(PathBuf),
+    Name(ContainerName),
+    Cpu(CpuLimit),
+    Memory(MemoryLimit),
+    AgentSettingsPassthrough(AgentSettings),
+    AgentCredentials { env_vars: Vec<(String, String)> },
+    DisallowedTools(Vec<String>),
+    AllowedTools(Vec<String>),
+    Model { flag: ModelFlagForm },
+    NonInteractivePrintFlag(String),
+    DockerfileUser(String),
+}
+```
+
+`ModelFlagForm` distinguishes `--model NAME` (Argument) from standalone shorthands like `--model-claude-opus-4-6` (Shorthand).
+
+#### `ContainerInstance` and `ContainerExecution`
+
+```rust
+pub trait ContainerInstance: Send + Sync {
+    fn id(&self) -> &ContainerId;
+    fn name(&self) -> &ContainerName;
+    fn image(&self) -> &ImageRef;
+    fn run_with_frontend(self: Box<Self>, frontend: Box<dyn ContainerFrontend>)
+        -> Result<ContainerExecution, EngineError>;
+}
+
+pub struct ContainerExecution { /* owns running handle + exit futures */ }
+
+impl ContainerExecution {
+    pub async fn wait(self) -> Result<ContainerExitInfo, EngineError>;
+    pub fn handle(&self) -> &ContainerHandle;
+    pub fn cancel(&self) -> Result<(), EngineError>;
+    /// Hand ownership of the running container back to the caller without joining.
+    pub fn detach(self) -> ContainerHandle;
+}
+```
+
+`ContainerExitInfo` carries `exit_code`, `signal` (if applicable), `started_at`, and `ended_at`.
+
+#### `ContainerFrontend` trait
+
+Defined by Layer 1, implemented by Layer 3. Governs all I/O the container runtime needs from the outside world.
+
+```rust
+pub trait ContainerFrontend: UserMessageSink + Send + Sync {
+    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError>;
+    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError>;
+    fn read_stdin(&mut self, buf: &mut [u8]) -> Result<usize, EngineError>;
+    fn report_status(&mut self, status: ContainerStatus);
+    fn report_progress(&mut self, progress: ContainerProgress);
+    fn resize_pty(&mut self, cols: u16, rows: u16);
+}
+```
+
+PTY allocation is a Layer 3 concern. Layer 1 passes raw bytes to the frontend and lets it decide whether they route through a PTY (TUI), straight to fds (CLI), or over a socket (headless).
+
+#### What is forbidden in `src/engine/container/`
+
+- No `pub fn run_container_with_*` style APIs.
+- `docker.rs` and `apple.rs` are `pub(super)` — no caller outside the module can name the backend type.
+- No direct PTY allocation or `crossterm` use.
+- No `println!` / `eprintln!`. All output goes through `ContainerFrontend`.
+
+---
+
+### Workflow Engine (`src/engine/workflow/`)
+
+`WorkflowEngine` owns every workflow execution concern: step ordering, state advancement, yolo/auto countdowns, stuck detection, per-step agent and model resolution, exit-code interpretation, step persistence, and container lifecycle management per step.
+
+```rust
+pub struct WorkflowEngine {
+    session: Session,
+    workflow: Workflow,                    // parsed definition (Layer 0)
+    dag: WorkflowDag,                      // Layer 0 — cycle-free adjacency
+    state: WorkflowState,                  // Layer 0 — serializable snapshot
+    state_store: WorkflowStateStore,       // Layer 0 — git-root-scoped I/O
+    effective_config: EffectiveConfig,     // Layer 0 — for agent/model fallbacks
+    frontend: Box<dyn WorkflowFrontend>,
+    container_factory: Box<dyn ContainerExecutionFactory>,
+    git_engine: Arc<GitEngine>,
+    overlay_engine: Arc<OverlayEngine>,
+    // … current_execution, current_step tracking fields …
+}
+
+impl WorkflowEngine {
+    pub fn new(session, workflow, frontend, factory, git_engine, overlay_engine)
+        -> Result<Self, EngineError>;
+    pub async fn resume(session, workflow, frontend, factory, git_engine, overlay_engine)
+        -> Result<Self, EngineError>;
+
+    pub async fn run_to_completion(&mut self) -> Result<WorkflowOutcome, EngineError>;
+    pub async fn step_once(&mut self) -> Result<StepOutcome, EngineError>;
+    pub fn compute_available_actions(&self) -> Result<AvailableActions, EngineError>;
+    pub fn state(&self) -> &WorkflowState;
+}
+```
+
+#### Per-step agent and model resolution
+
+Resolution order (each level overrides the previous):
+1. Step-level `agent`/`model` fields.
+2. Workflow-level `agent`/`model` defaults.
+3. `EffectiveConfig` fallback (flags > env > repo > global).
+
+The resolved pair is logged via `tracing` and passed to the factory via `WorkflowRuntimeContext { step_agent, step_model, git_root, session_id }`.
+
+#### `NextAction` and `AvailableActions`
+
+After each step completes, `WorkflowEngine` asks the frontend which action to take:
+
+```rust
+pub enum NextAction {
+    LaunchNext,
+    ContinueInCurrentContainer { prompt: String },
+    RestartCurrentStep,
+    CancelToPreviousStep,
+    FinishWorkflow,    // mark remaining steps Skipped; only valid on last step
+    Pause,
+    Abort,
+}
+```
+
+The engine computes `AvailableActions` before calling `user_choose_next_action`, encoding which actions are legal given the current step configuration. The frontend renders only the available set.
+
+`ContinueInCurrentContainer` is unavailable when: the next step targets a different agent or model; the running container has already exited; or the factory's `inject_prompt` returns `None`. `CancelToPreviousStep` is unavailable on the first step.
+
+#### `ContainerExecutionFactory` trait
+
+Layer 2 builds a factory that `WorkflowEngine` calls per step. The engine never sees raw `ContainerOption` lists or frontend implementations.
+
+```rust
+pub trait ContainerExecutionFactory: Send + Sync {
+    fn execution_for_step(&self, step, session, runtime) -> Result<ContainerExecution, EngineError>;
+    fn inject_prompt(&self, execution, prompt) -> Result<Option<()>, EngineError>;
+}
+```
+
+#### `WorkflowFrontend` trait
+
+```rust
+pub trait WorkflowFrontend: UserMessageSink + Send + Sync {
+    fn user_choose_next_action(&mut self, state, available) -> Result<NextAction, EngineError>;
+    fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;
+    fn user_choose_after_step_failure(&mut self, step, exit) -> Result<StepFailureChoice, EngineError>;
+    fn report_step_status(&mut self, step, status: WorkflowStepStatus);
+    fn report_step_output(&mut self, step, output: StepOutput);
+    fn report_step_stuck(&mut self, step);
+    fn report_step_unstuck(&mut self, step);
+    fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError>;
+    fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome);
+}
+```
+
+#### Stuck detection and yolo countdown
+
+`WorkflowEngine` owns two timers:
+
+1. **Stuck timer** — fires when the agent produces no PTY output for `EffectiveConfig::agent_stuck_timeout` (default 30 s). Triggers `report_step_stuck`.
+2. **Yolo countdown** — only when `--yolo` is set and the stuck timer has fired. Counts down `YOLO_COUNTDOWN_DURATION` (60 s, defined in `timing.rs`) before auto-advancing via `NextAction::LaunchNext`. Backoff: `STUCK_DIALOG_BACKOFF` (60 s) prevents re-firing immediately after a dismissed countdown.
+
+#### Workflow state persistence
+
+State is persisted to `<git-root>/.amux/workflows/<hash8>-<name>.json` after every step transition. On resume, the engine checks `schema_version`; if the persisted version is newer than `WORKFLOW_STATE_SCHEMA_VERSION`, it returns `EngineError::UnsupportedWorkflowSchemaVersion`. If the workflow hash has drifted, it calls `confirm_resume`; if declined, it returns `WorkflowResumeIncompatible`.
+
+#### What is forbidden in `WorkflowEngine`
+
+- No direct container construction. Containers arrive pre-built via `ContainerExecutionFactory`.
+- No rendering, no `eprintln!`, no user-console `tracing`. Status flows through the frontend.
+- No worktree lifecycle management. The engine operates on a given `git_root` and is unaware of whether it is a worktree. Worktree creation/removal is a Layer 2 concern.
+- No `clap`, no `crossterm`, no `ratatui`.
+- No DAG logic or state persistence code — those live in `src/data/`.
+
+---
+
+### Git Engine (`src/engine/git/`)
+
+`GitEngine` consolidates every git operation amux performs. It is a stateless struct whose methods are the only public surface. It implements Layer 0's `GitRootResolver` trait so `Session::open` can use it.
+
+```rust
+pub struct GitEngine;
+
+impl GitEngine {
+    pub fn new() -> Self;
+    pub fn version_check(&self) -> Result<GitVersion, EngineError>;
+    pub fn resolve_root(&self, working_dir: &Path) -> Result<PathBuf, EngineError>;
+    pub fn is_clean(&self, path: &Path) -> Result<bool, EngineError>;
+    pub fn uncommitted_files(&self, path: &Path) -> Result<Vec<String>, EngineError>;
+
+    // Worktree paths (convention: ~/.amux/worktrees/<repo>/<NNNN>/ or wf-<name>/)
+    pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError>;
+    pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError>;
+    pub fn branch_name_for_work_item(&self, work_item: u32) -> String;  // amux/work-item-NNNN
+    pub fn branch_name_for_workflow(&self, name: &str) -> String;       // amux/workflow-<name>
+
+    pub fn create_worktree(&self, git_root, worktree_path, branch) -> Result<(), EngineError>;
+    pub fn remove_worktree(&self, git_root, worktree_path) -> Result<(), EngineError>;
+
+    // Merge strategy: git merge --squash <branch> + git commit -m "Implement <branch>"
+    pub fn merge_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError>;
+    pub fn commit_all(&self, path: &Path, message: &str) -> Result<(), EngineError>;
+    pub fn delete_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError>;
+    pub fn branch_exists(&self, git_root: &Path, branch: &str) -> bool;
+    pub fn is_detached_head(&self, git_root: &Path) -> bool;
+}
+```
+
+Naming conventions enforced by `GitEngine`:
+- Worktree path (work-item): `$HOME/.amux/worktrees/<repo-name>/<NNNN>/`
+- Worktree path (workflow): `$HOME/.amux/worktrees/<repo-name>/wf-<workflow-name>/`
+- Branch (work-item): `amux/work-item-<NNNN>` (zero-padded 4 digits)
+- Branch (workflow): `amux/workflow-<workflow-name>`
+- Merge commit: `"Implement <branch>"` (verbatim format preserved)
+
+---
+
+### Overlay Engine (`src/engine/overlay/`)
+
+`OverlayEngine` consolidates overlay construction and management. Layer 0 resolves host paths; Layer 1 builds `OverlaySpec` values that `ContainerOption::Overlay` accepts.
+
+```rust
+pub struct OverlayEngine {
+    path_resolver: OverlayPathResolver,
+    auth_resolver: AuthPathResolver,
+}
+
+impl OverlayEngine {
+    pub fn new(session: &Session) -> Result<Self, EngineError>;
+
+    pub fn build_overlays(
+        &self,
+        session: &Session,
+        request: &OverlayRequest,
+    ) -> Result<Vec<OverlaySpec>, EngineError>;
+
+    pub fn resolve_user_overlay(&self, spec: &str) -> Result<DirectoryOverlay, EngineError>;
+    pub fn agent_settings_overlays(&self, agent: &AgentName) -> Result<Vec<OverlaySpec>, EngineError>;
+}
+```
+
+`OverlayRequest` describes the desired overlays for a given invocation. `build_overlays` returns the resolved, deduplicated, canonicalized set; callers pass each item as `ContainerOption::Overlay`.
+
+Per-agent settings handling (`agent_settings_overlays`) replicates the legacy `HostSettings` machinery:
+
+- **Claude**: mounts `~/.claude.json` (with `oauthAccount` field stripped), mounts `~/.claude/` (applying `CLAUDE_DENYLIST` to exclude telemetry/history entries), sets `skipDangerousModePermissionPrompt: true` in `settings.json` when yolo mode is active, and always sets `hasShownLspRecommendation: true`.
+- **Minimal fallback**: when `~/.claude.json` is absent, produces a synthesized overlay with `/workspace` project trust and LSP suppression.
+- **Non-Claude agents**: each maps to a single agent-config-dir overlay (host path + container path per the agent matrix).
+
+`CLAUDE_DENYLIST` is a named constant — adding a new excluded entry is a one-line change.
+
+---
+
+### Auth Engine (`src/engine/auth/`)
+
+`AuthEngine` consolidates two previously-separate concerns:
+
+1. **Host-side agent credential discovery** — resolving credentials from the OS keychain to inject into agent containers.
+2. **Headless server authentication** — API key generation, hashing, comparison, persistence, and TLS material.
+
+```rust
+pub struct AuthEngine {
+    auth_paths: AuthPathResolver,
+    headless_paths: HeadlessPaths,
+}
+
+impl AuthEngine {
+    pub fn new(session: &Session) -> Self;
+
+    // Keychain credentials
+    pub fn agent_keychain_credentials(&self, agent: &AgentName) -> Result<AgentCredentials, EngineError>;
+    pub fn resolve_agent_auth(&self, session: &Session, agent: &AgentName)
+        -> Result<AgentCredentials, EngineError>;
+
+    // Headless API-key lifecycle
+    pub fn generate_api_key(&self) -> Result<ApiKey, EngineError>;
+    pub fn write_api_key_hash(&self, hash: &ApiKeyHash) -> Result<(), EngineError>;
+    pub fn read_api_key_hash(&self) -> Result<Option<ApiKeyHash>, EngineError>;
+    pub fn verify_api_key(&self, presented: &ApiKey) -> Result<AuthOutcome, EngineError>;
+    pub fn refresh_api_key(&self) -> Result<ApiKey, EngineError>;
+
+    // TLS material
+    pub fn ensure_self_signed_tls(&self, bind_ip: IpAddr) -> Result<TlsMaterial, EngineError>;
+    pub fn load_tls_from_paths(&self, cert: &Path, key: &Path) -> Result<TlsMaterial, EngineError>;
+}
+```
+
+All cryptographic comparisons in `verify_api_key` use `subtle::ConstantTimeEq`, including the case where no hash file exists (compared against a fixed-length sentinel to prevent timing-based "is auth disabled?" leaks).
+
+`keychain.rs` provides the per-OS keychain backend (macOS Keychain, Linux libsecret, Windows credential manager) via the `keyring` crate. The per-agent env-var name set (e.g. `ANTHROPIC_API_KEY` for Claude) is co-located with the agent matrix.
+
+`AuthEngine` only resolves credentials; the "offer to use keychain credentials silently vs. prompt every time" decision is a Layer 2 concern driven by `EffectiveConfig::auto_agent_auth_accepted`.
+
+---
+
+### Agent Engine (`src/engine/agent/`)
+
+`AgentEngine` centralises the cross-cutting agent concerns called from multiple commands (`chat`, `exec`, `ready`, `specs amend`): ensuring the agent is available (Dockerfile + image), and building the `ContainerOption` list for a given invocation. Centralising here ensures adding a new agent type or changing model-flag injection is a single-file edit.
+
+```rust
+pub struct AgentEngine {
+    overlay_engine: Arc<OverlayEngine>,
+    container_runtime: Arc<ContainerRuntime>,
+}
+
+pub struct AgentRunOptions {
+    pub yolo: Option<YoloMode>,
+    pub auto: Option<AutoMode>,
+    pub plan: Option<PlanMode>,
+    pub allowed_tools: Vec<String>,
+    pub initial_prompt: Option<String>,
+    pub allow_docker: bool,
+    pub non_interactive: bool,
+}
+
+impl AgentEngine {
+    pub fn new(overlay_engine, container_runtime) -> Self;
+
+    /// Ensure the agent Dockerfile and image exist; download/build if absent.
+    /// Idempotent: no steps fire and no container_frontend is requested when
+    /// both already exist.
+    pub async fn ensure_available(
+        &self, agent, config, frontend: &mut dyn AgentFrontend,
+    ) -> Result<(), EngineError>;
+
+    /// Build the ContainerOption list for running an agent container.
+    /// Resolves overlays, injects model flags, autonomous flags, and all
+    /// agent-specific entrypoint options. Pass the result to ContainerRuntime::build.
+    pub fn build_options(
+        &self, agent, model, run_options, session,
+    ) -> Result<Vec<ContainerOption>, EngineError>;
+}
+```
+
+`ensure_available` steps:
+1. Check for `<git-root>/.amux/Dockerfile.<agent>`; download if absent.
+2. Check for `<repo-hash>:<agent>:latest` locally; build if absent.
+3. If the project base image (`<repo-hash>:latest`) is missing, fail with `EngineError::AgentRequiresProjectImage` — `AgentEngine` does not build the project image (`ReadyEngine`'s job).
+
+#### Agent matrix (`agent_matrix.rs`)
+
+All per-agent branching — entrypoints, non-interactive flags, plan-mode flags, yolo flags, model flags, image tags, Dockerfile paths, and download URLs — lives exclusively in `agent_matrix.rs`. Adding a new agent is a single-file edit.
+
+Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`.
+
+Key per-agent distinctions:
+
+| Agent | Interactive entrypoint | Non-interactive flag | Plan-mode flag |
+|-------|------------------------|----------------------|----------------|
+| `claude` | `claude` | `--print` / `-p` | `--permission-mode plan` |
+| `codex` | `codex` | `exec`/`run` subcommand | `--approval-mode plan` |
+| `opencode` | `opencode` | `run` subcommand | (unsupported — error) |
+| `gemini` | `gemini` | varies | `--approval-mode=plan` |
+| `copilot` | `copilot -i` | varies | `--plan` |
+| `cline` | `cline` | `task` subcommand | `--plan` |
+| `crush` | `crush` | `run` subcommand | (unsupported — error) |
+| `maki` | `maki` | varies | (unsupported — error) |
+
+`AgentEngine::build_options` with `PlanMode::Enabled` for an agent that does not support plan returns `EngineError::PlanModeUnsupported { agent }`.
+
+#### `AgentFrontend` trait
+
+```rust
+pub trait AgentFrontend: UserMessageSink + Send + Sync {
+    fn report_step_status(&mut self, step: &str, status: StepStatus);
+    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+}
+```
+
+#### Canonical usage pattern
+
+```rust
+// The only sanctioned way to prepare and run an agent container:
+agent_engine.ensure_available(&agent, &config, &mut frontend).await?;
+let opts = agent_engine.build_options(&agent, &model, &run_options, &session)?;
+let instance = container_runtime.build(opts)?;
+let execution = instance.run_with_frontend(Box::new(container_frontend))?;
+let exit = execution.wait().await?;
+```
+
+Duplicating `ensure_available` or `build_options` logic in any other module is a violation.
+
+---
+
+### Ready Engine (`src/engine/ready/`)
+
+`ReadyEngine` owns all multi-phase logic for `amux ready`: preflight checks, legacy-layout detection and migration, Dockerfile.dev creation, Docker image builds, local agent check, audit container run, and post-audit rebuild. The legacy code (`oldsrc/commands/ready.rs`: 2239 lines, `oldsrc/commands/ready_flow.rs`: 726 lines) is replaced entirely.
+
+#### Phase state machine
+
+```rust
+pub enum ReadyPhase {
+    Preflight,                    // runtime detection, git root, config, env vars, legacy detection
+    AwaitingDockerfileDecision,   // Dockerfile.dev absent or unmodified template
+    CreatingDockerfile,           // write Dockerfile.dev from project template
+    AwaitingLegacyMigrationDecision,  // legacy single-file layout detected
+    MigratingLegacyLayout,        // migrate to modular layout
+    BuildingBaseImage,            // build/rebuild project Docker image
+    BuildingAgentImage,           // build/rebuild agent Docker image
+    CheckingLocalAgent,           // send random greeting to local agent
+    RunningAudit,                 // audit container scans/updates Dockerfile.dev
+    RebuildingAfterAudit,         // rebuild after audit modifies Dockerfile.dev
+    Complete,
+    Failed(ReadyFailure),
+}
+```
+
+The state machine is forward-only. If the process is interrupted the user re-runs `amux ready` from the beginning; no partial checkpoint is written.
+
+#### `ReadyEngine` API
+
+```rust
+pub struct ReadyEngine { /* session, engines, options, phase */ }
+
+pub struct ReadyEngineOptions {
+    pub agent: AgentName,
+    pub refresh: bool,
+    pub build: bool,
+    pub no_cache: bool,
+    pub allow_docker: bool,
+}
+
+impl ReadyEngine {
+    pub fn new(session, git_engine, overlay_engine, container_runtime, agent_engine, options) -> Self;
+    pub fn phase(&self) -> &ReadyPhase;
+
+    /// Advance exactly one phase, calling appropriate ReadyFrontend methods. Returns new phase.
+    pub async fn step(&mut self, frontend: &mut dyn ReadyFrontend) -> Result<ReadyPhase, EngineError>;
+
+    /// Drive to completion (calls step in a loop). Returns ReadySummary.
+    pub async fn run_to_completion(&mut self, frontend: &mut dyn ReadyFrontend) -> Result<ReadySummary, EngineError>;
+
+    pub fn summary(&self) -> ReadySummary;
+}
+```
+
+#### `ReadyFrontend` trait
+
+```rust
+pub trait ReadyFrontend: UserMessageSink + Send + Sync {
+    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError>;
+    fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError>;
+    fn ask_migrate_legacy_layout(&mut self, agent_name: &AgentName) -> Result<bool, EngineError>;
+    fn report_phase(&mut self, phase: &ReadyPhase);
+    fn report_step_status(&mut self, step: &str, status: StepStatus);
+    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+    fn report_summary(&mut self, summary: &ReadySummary);
+}
+```
+
+#### `ReadySummary`
+
+```rust
+pub struct ReadySummary {
+    pub runtime_name: String,
+    pub base_image: StepStatus,
+    pub agent_image: StepStatus,
+    pub local_agent: StepStatus,
+    pub audit: StepStatus,
+    pub legacy_migration: StepStatus,
+}
+```
+
+---
+
+### Init Engine (`src/engine/init/`)
+
+`InitEngine` owns all multi-phase logic for `amux init`: git root resolution, aspec folder creation, Dockerfile.dev setup, `.amux.json` config write, optional audit container, image build, and work-items configuration. Replaces `oldsrc/commands/init.rs` + `oldsrc/commands/init_flow.rs` (2702 lines combined).
+
+#### Phase state machine
+
+```rust
+pub enum InitPhase {
+    Preflight,                  // resolve git root, validate environment
+    AwaitingAspecDecision,      // existing aspec folder found
+    CreatingAspecFolder,        // write aspec template into repo
+    SettingUpDockerfile,        // create/confirm Dockerfile.dev
+    WritingConfig,              // write or update .amux.json
+    AwaitingAuditDecision,      // ask whether to run audit
+    BuildingImage,              // build base Docker image
+    RunningAudit,               // agent scans and updates Dockerfile.dev
+    AwaitingWorkItemsDecision,  // ask whether to configure work items
+    WritingWorkItemsConfig,     // write work-items config into .amux.json
+    Complete,
+    Failed(InitFailure),
+}
+```
+
+Forward-only. If the user declines `AwaitingAspecDecision`, `aspec_folder` is `StepStatus::Skipped` and remaining phases continue.
+
+#### `InitEngine` API
+
+```rust
+pub struct InitEngineOptions {
+    pub agent: AgentName,
+    pub run_aspec_setup: bool,
+    pub git_root: PathBuf,
+}
+
+impl InitEngine {
+    pub fn new(session, git_engine, overlay_engine, container_runtime, options) -> Self;
+    pub fn phase(&self) -> &InitPhase;
+    pub async fn step(&mut self, frontend: &mut dyn InitFrontend) -> Result<InitPhase, EngineError>;
+    pub async fn run_to_completion(&mut self, frontend: &mut dyn InitFrontend) -> Result<InitSummary, EngineError>;
+    pub fn summary(&self) -> &InitSummary;
+}
+```
+
+#### `InitFrontend` trait
+
+```rust
+pub trait InitFrontend: UserMessageSink + Send + Sync {
+    fn ask_replace_aspec(&mut self) -> Result<bool, EngineError>;
+    fn ask_run_audit(&mut self) -> Result<bool, EngineError>;
+    fn ask_work_items_setup(&mut self) -> Result<Option<WorkItemsConfig>, EngineError>;
+    fn report_phase(&mut self, phase: &InitPhase);
+    fn report_step_status(&mut self, step: &str, status: StepStatus);
+    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+    fn report_summary(&mut self, summary: &InitSummary);
+}
+```
+
+#### `InitSummary`
+
+```rust
+pub struct InitSummary {
+    pub config: StepStatus,
+    pub aspec_folder: StepStatus,
+    pub dockerfile: StepStatus,
+    pub audit: StepStatus,
+    pub image_build: StepStatus,
+    pub work_items_setup: StepStatus,
+}
+```
+
+---
+
+### Layer 0 additions required by Layer 1 (`src/data/`)
+
+Three modules were added to Layer 0 as part of work item 0067 because they are stateless functions over serializable types — not engine logic.
+
+#### `WorkflowDag` (`src/data/workflow_dag.rs`)
+
+```rust
+pub struct WorkflowDag { /* adjacency; constructed via WorkflowDag::build */ }
+
+impl WorkflowDag {
+    pub fn build(steps: &[WorkflowStep]) -> Result<Self, DataError>;
+    pub fn ready_steps(&self, completed: &HashSet<String>) -> Vec<String>;
+    pub fn topological_order(&self) -> Vec<String>;
+}
+
+pub fn validate_references(steps: &[WorkflowStep]) -> Result<(), DataError>;
+pub fn detect_cycle(steps: &[WorkflowStep]) -> Result<(), DataError>;
+```
+
+`build` returns `DataError::MissingDependency` for unknown `depends_on` entries and `DataError::CyclicDependency` for cycles. `topological_order` is deterministic across calls.
+
+#### `WorkflowState` and `StepState` (`src/data/workflow_state.rs`)
+
+Fully serializable snapshot of workflow execution state. Stored per-workflow at `<git-root>/.amux/workflows/`.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowState {
+    pub schema_version: u32,
+    pub workflow_name: String,
+    pub workflow_hash: String,
+    pub step_states: HashMap<String, StepState>,
+    pub completed_steps: HashSet<String>,
+    pub current_step_index: Option<usize>,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub enum StepState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed { exit_code: i32, error_message: Option<String> },
+    Skipped,
+    Cancelled,
+}
+```
+
+`WorkflowEngine` rejects state whose `schema_version` exceeds `WORKFLOW_STATE_SCHEMA_VERSION` with `EngineError::UnsupportedWorkflowSchemaVersion`.
+
+#### `WorkflowStateStore` (`src/data/workflow_state_store.rs`)
+
+```rust
+pub struct WorkflowStateStore { base_dir: PathBuf }
+
+impl WorkflowStateStore {
+    pub fn new(session: &Session) -> Self;       // base_dir = <git-root>/.amux/workflows/
+    pub fn at_git_root(git_root: &Path) -> Self; // convenience for tests
+    pub fn load(&self, workflow_name: &str) -> Result<Option<WorkflowState>, DataError>;
+    pub fn save(&self, state: &WorkflowState) -> Result<(), DataError>;
+    pub fn delete(&self, workflow_name: &str) -> Result<(), DataError>;
+}
+```
+
+---
+
+## Layer 2: Command (`src/command/`)
+
+Layer 2 is the command layer: typed objects that own every piece of business logic a frontend needs to express. It is built on top of Layer 0 (data) and Layer 1 (engine) and never calls into Layer 3 (frontends) or Layer 4 (the binary). When a command needs user input or output it accepts a **frontend trait defined by Layer 2** — Layer 3 implements that trait and passes it in at invocation time.
+
+Four rules govern this layer:
+
+1. **Layer 2 consumes Layer 0 and Layer 1 only.** No upward calls into frontends or the binary.
+2. **Frontends contain no business logic.** Every command knob — every flag, every prompt, every dialog — flows through Layer 2's `Dispatch` system or a per-command frontend trait.
+3. **Typed objects over `pub fn`.** Each command is a `*Command` struct that implements `Command` and exposes `run_with_frontend(frontend) -> Result<Outcome, CommandError>`.
+4. **The full list of available commands and flags lives only in `CommandCatalogue`.** Frontends never hard-code command names, flag names, or defaults; they ask the catalogue (or its projections) for what's available. This is the single most important guarantee against mode drift across CLI, TUI, and headless.
+
+---
+
+### `Command` trait (`src/command/commands/command_trait.rs`)
+
+Every `*Command` struct implements this trait:
+
+```rust
+#[async_trait]
+pub trait Command {
+    type Frontend: Send;
+    type Outcome;
+
+    async fn run_with_frontend(
+        self,
+        frontend: Self::Frontend,
+    ) -> Result<Self::Outcome, CommandError>;
+}
+```
+
+`Frontend` is the per-command associated type — e.g. `Box<dyn ExecWorkflowCommandFrontend>`. `Outcome` is the typed value the command returns on success, always `Serialize`-able for `--json` callers.
+
+---
+
+### `CommandError` (`src/command/error.rs`)
+
+All Layer 2 failures are variants of `CommandError`. It wraps `EngineError` (Layer 1) and `DataError` (Layer 0) for failures from below. Layer 3 wraps `CommandError` in its own user-facing presentation.
+
+Key variants:
+
+| Variant | Meaning |
+|---------|---------|
+| `Engine(EngineError)` | Propagated from Layer 1 |
+| `Data(DataError)` | Propagated from Layer 0 |
+| `UnknownCommand { path }` | `Dispatch::run_command` received an unrecognised path |
+| `UnknownFlag { command, flag }` | Frontend supplied a flag not in the catalogue |
+| `MissingRequiredFlag { command, flag }` | Required flag was absent |
+| `MissingRequiredArgument { command, argument }` | Required positional argument was absent |
+| `MutuallyExclusive { command, a, b }` | Two conflicting flags were both supplied |
+| `InvalidFlagValue { command, flag, reason }` | Flag value failed type/enum validation |
+| `InvalidArgumentValue { command, argument, reason }` | Positional argument failed validation |
+| `CommandBoxParse(String)` | TUI command-box input could not be tokenised |
+| `Aborted` | User chose to abort in an interactive prompt |
+| `MergeConflict { branch, worktree_path }` | `WorktreeLifecycle::finalize` encountered a git merge conflict |
+| `MissingRemoteAddress` | No `--remote-addr` / `AMUX_REMOTE_ADDR` supplied |
+| `MissingApiKey` | API key could not be resolved from any source |
+| `RemoteTimeout` | HTTP request to remote server timed out |
+| `RemoteConnectionRefused(String)` | Connection to remote server was refused |
+| `RemoteHttpStatus { status, body }` | Remote returned a non-2xx HTTP status |
+| `MalformedSseEvent(String)` | SSE stream contained an unparseable event |
+| `RemoteTransport(String)` | Underlying HTTP transport error |
+| `HeadlessWorkdirNotFound { path }` | A workdir path supplied to `headless start` does not exist |
+| `HeadlessAlreadyRunning { pid }` | Headless server is already running on the given PID |
+
+Convenience constructors: `CommandError::unknown_command`, `missing_required_flag`, `missing_required_argument`, `unknown_flag`, `mutually_exclusive`.
+
+---
+
+### `CommandCatalogue` (`src/command/dispatch/catalogue.rs`)
+
+`CommandCatalogue` is a single static (via `OnceLock`) data structure that enumerates every command, subcommand, argument, and flag exactly once. It is the sole source of truth for the command surface; no frontend or projection may hard-code names, defaults, or types independently.
+
+#### Supporting types
+
+```rust
+pub enum FrontendVisibility {
+    All,          // CLI, TUI, and headless
+    CliOnly,
+    TuiOnly,
+    CliAndTui,
+    Hidden,
+}
+
+pub enum FlagKind {
+    Bool,
+    String,
+    OptionalString,
+    Enum(&'static [&'static str]),
+    VecString,    // repeatable: --foo a --foo b
+    Path,
+    OptionalPath,
+    U16,
+}
+
+pub enum FlagDefault { None, Bool(bool), Str(&'static str), U16(u16), EmptyVec }
+
+pub struct FlagSpec {
+    pub long: &'static str,
+    pub short: Option<char>,
+    pub help: &'static str,
+    pub kind: FlagKind,
+    pub default: FlagDefault,
+    pub frontends: FrontendVisibility,
+    pub conflicts_with: &'static [&'static str],
+    pub implies: &'static [&'static str],
+    pub optional: bool,
+}
+
+pub enum ArgumentKind {
+    String,
+    OptionalString,
+    Path,
+    OptionalPath,
+    TrailingVarArgs,  // <COMMAND>... style; triggers trailing_var_arg + allow_hyphen_values
+}
+
+pub struct ArgumentSpec {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub kind: ArgumentKind,
+    pub optional: bool,
+}
+
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],    // string aliases ("wf" for "exec workflow")
+    pub path_aliases: &'static [&'static [&'static str]],  // path aliases (["specs","new"] → ["new","spec"])
+    pub help: &'static str,
+    pub long_help: Option<&'static str>,
+    pub arguments: &'static [ArgumentSpec],
+    pub flags: &'static [FlagSpec],
+    pub subcommands: &'static [&'static CommandSpec],
+}
+```
+
+#### Catalogue API
+
+```rust
+impl CommandCatalogue {
+    pub fn get() -> &'static CommandCatalogue;
+    pub fn root() -> &'static CommandSpec;
+    pub fn lookup(path: &[&str]) -> Option<&'static CommandSpec>;
+    pub fn lookup_with_aliases(path: &[&str]) -> Option<&'static CommandSpec>;
+}
+```
+
+`lookup_with_aliases` resolves string aliases (e.g. `"wf"` → `["exec", "workflow"]`) so frontends get the canonical spec regardless of invocation form.
+
+#### Commands enumerated
+
+The catalogue covers:
+
+`init`, `ready`, `chat`, `specs` (with `amend`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `headless` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
+
+---
+
+### Catalogue Projections (`src/command/dispatch/projections/`)
+
+Frontends never build their own argument parsers or schema documents. Instead they call projection methods on `CommandCatalogue` that derive the frontend-specific structure from the single catalogue definition. Adding a flag is a one-line edit in the catalogue; every projection updates automatically.
+
+#### `clap.rs`
+
+```rust
+impl CommandCatalogue {
+    pub fn build_clap_command(&self) -> clap::Command;
+}
+```
+
+Walks the catalogue tree and produces a `clap::Command` with all subcommands, flags, arguments, aliases, help text, `conflicts_with` constraints, and `requires` chains. `ArgumentSpec::TrailingVarArgs` sets `trailing_var_arg(true)` and `allow_hyphen_values(true)` (used by `remote run <COMMAND>...`). The CLI frontend calls this once and passes the resulting `ArgMatches` to a `CliCommandFrontend`.
+
+#### `tui_hints.rs`
+
+```rust
+impl CommandCatalogue {
+    pub fn tui_hint_for(&self, path: &[&str]) -> Option<TuiHint>;
+    pub fn tui_completions(&self, partial: &str) -> Vec<TuiCompletion>;
+}
+```
+
+Generates the hint string shown above the TUI command box for the currently typed command path, and the autocomplete entries shown as the user types. The TUI frontend never maintains its own hint or completion lists.
+
+#### `headless_schema.rs`
+
+```rust
+impl CommandCatalogue {
+    pub fn openapi_schema(&self) -> serde_json::Value;
+    pub fn rest_route_table(&self) -> Vec<RestRoute>;
+}
+```
+
+Generates the OpenAPI JSON schema and the REST route table used by the headless server. The headless frontend derives its API surface entirely from these projections.
+
+#### Projection consistency guarantee
+
+A suite of catalogue unit tests (`catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_headless_consistency`) walks every `Arg` in the clap output, every hint entry, and every route in the REST table and asserts each is present in the catalogue with a matching kind, default, and help string. If a flag exists in a projection but not the catalogue (or vice versa), the test fails.
+
+---
+
+### `Dispatch` (`src/command/dispatch/mod.rs`)
+
+`Dispatch` is the gateway through which frontends invoke commands. It reads flag values from the frontend, applies catalogue-driven validation, enforces implication rules, and constructs a typed `*Command` struct populated with all the engines and flag values it needs.
+
+#### `Engines` bundle
+
+```rust
+#[derive(Clone)]
+pub struct Engines {
+    pub runtime: Arc<ContainerRuntime>,
+    pub git_engine: Arc<GitEngine>,
+    pub overlay_engine: Arc<OverlayEngine>,
+    pub auth_engine: Arc<AuthEngine>,
+    pub agent_engine: Arc<AgentEngine>,
+    pub workflow_state_store: Arc<WorkflowStateStore>,
+}
+```
+
+`ReadyEngine` and `InitEngine` are **not** pre-constructed on `Dispatch` — their constructors accept per-invocation flag values. The corresponding commands construct them fresh from the `Engines` references above.
+
+#### `CommandFrontend` trait
+
+Implemented by Layer 3 (CLI, TUI, headless). Supplies flag values and positional arguments to Dispatch, and extends `UserMessageSink` so commands can write status messages through the same frontend object.
+
+```rust
+pub trait CommandFrontend: UserMessageSink + Send + Sync {
+    fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError>;
+    fn flag_string(&self, command_path: &[&str], flag: &str) -> Result<Option<String>, CommandError>;
+    fn flag_strings(&self, command_path: &[&str], flag: &str) -> Result<Vec<String>, CommandError>;
+    fn flag_path(&self, command_path: &[&str], flag: &str) -> Result<Option<PathBuf>, CommandError>;
+    fn flag_enum(&self, command_path: &[&str], flag: &str) -> Result<Option<String>, CommandError>;
+    fn flag_u16(&self, command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError>;
+    fn argument(&self, command_path: &[&str], name: &str) -> Result<Option<String>, CommandError>;
+    fn arguments(&self, command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError>;
+}
+```
+
+Validation (type checking, required vs. optional, mutual exclusion, implication) lives entirely in Dispatch — Layer 3 never validates user input.
+
+#### `Dispatch` struct
+
+```rust
+pub struct Dispatch<F: CommandFrontend> {
+    catalogue: &'static CommandCatalogue,
+    frontend: F,
+    session: Arc<RwLock<Session>>,
+    engines: Engines,
+}
+
+impl<F: CommandFrontend> Dispatch<F> {
+    pub fn new(frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self;
+    pub fn catalogue(&self) -> &'static CommandCatalogue;
+    pub fn frontend(&self) -> &F;
+    pub async fn run_command(self, path: &[&str]) -> Result<CommandOutcome, CommandError>;
+    pub fn build_command(self, path: &[&str]) -> Result<BuiltCommand, CommandError>;
+    pub fn parse_command_box_input(raw: &str) -> Result<ParsedCommandBoxInput, CommandError>;
+}
+```
+
+`build_command` resolves aliases, reads flag values, applies implication rules (e.g. `--yolo` implies `--worktree` for `exec workflow`; `--json` implies `--non-interactive` for `ready`), and constructs the typed `BuiltCommand`. `run_command` calls `build_command` then dispatches to the command's `run_with_frontend`.
+
+`parse_command_box_input` tokenises a raw TUI command-box string against the catalogue and returns a `ParsedCommandBoxInput { path, flags, arguments }`. All command-string interpretation lives here, never in the TUI.
+
+#### `CommandOutcome` and `BuiltCommand`
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", content = "payload")]
+pub enum CommandOutcome {
+    Init(InitOutcome),
+    Ready(ReadyOutcome),
+    Chat(ChatOutcome),
+    Status(StatusOutcome),
+    Config(ConfigOutcome),
+    ExecPrompt(ExecPromptOutcome),
+    ExecWorkflow(ExecWorkflowOutcome),
+    Headless(HeadlessOutcome),
+    Remote(RemoteOutcome),
+    New(NewOutcome),
+    Specs(SpecsOutcome),
+    Auth(AuthOutcome),
+    Download(DownloadOutcome),
+    Empty,
+}
+
+pub enum BuiltCommand {
+    Init(InitCommand),
+    Ready(ReadyCommand),
+    Chat(ChatCommand),
+    /* … one variant per command … */
+}
+```
+
+Every `*Outcome` derives `Serialize`. JSON serialisation is a frontend concern (Layer 3 renders the outcome as JSON when `--json` is active); the command itself is unaware of the output format.
+
+---
+
+### Per-Command Structs (`src/command/commands/`)
+
+Each amux command is one module under `src/command/commands/` containing:
+
+- A `*Command` struct that owns every flag value and engine reference it needs.
+- A `*CommandFlags` struct carrying the typed flag values.
+- A `*CommandFrontend` trait listing the per-command user-input and reporting methods.
+- An `impl Command for *Command` block.
+- Colocated unit tests using fake engines and a recording frontend.
+
+#### Command roster
+
+| Module | Command(s) | Notes |
+|--------|-----------|-------|
+| `init.rs` | `amux init` | Thin wrapper over `InitEngine`; `InitCommandFrontend: InitFrontend + Send` |
+| `ready.rs` | `amux ready` | Thin wrapper over `ReadyEngine`; `ReadyCommandFrontend: ReadyFrontend + Send`; `--json` implies `--non-interactive` |
+| `chat.rs` | `amux chat` | Agent-launching command |
+| `exec_prompt.rs` | `amux exec prompt` | Agent-launching command with inline prompt |
+| `exec_workflow.rs` | `amux exec workflow` | Agent-launching command with full workflow file; `--yolo`/`--auto` imply `--worktree` |
+| `status.rs` | `amux status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
+| `specs.rs` | `amux specs amend` | Review/amend agent runs; shares `create_new_spec` with `new spec` |
+| `config.rs` | `amux config {show,get,set}` | Config read/write; `config set --global` writes to global config |
+| `headless.rs` | `amux headless {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
+| `remote.rs` | `amux remote {run, session start, session kill}` | Uses `RemoteClient` for HTTP + SSE |
+| `new.rs` | `amux new {spec,workflow,skill}` | Work-item and artefact creation |
+| `auth.rs` | `amux auth` | Keychain credential accept/decline per-repo |
+| `download.rs` | `amux download` | Internal helper for Dockerfile downloads |
+
+#### Agent-launching command canonical order
+
+Every command that launches an agent (`chat`, `exec prompt`, `exec workflow`, `specs amend`, `new spec --interview`, `init` audit, `ready` audit) follows this sequence in `run_with_frontend`:
+
+1. Resolve mount path via `MountScope::resolve`.
+2. Resolve effective agent + model (flags > repo config > global config).
+3. If agent is not available: call `AgentSetupFrontend::ask_agent_setup`. On `Setup` → `AgentEngine::ensure_available`. On `FallbackToDefault` → swap agent. On `Abort` → `CommandError::Aborted`.
+4. Check `EffectiveConfig::auto_agent_auth_accepted`: if `None`, call `AgentAuthFrontend::ask_agent_auth_consent`; persist the result.
+5. If `--worktree`: call `WorktreeLifecycle::prepare(frontend)` → use the returned worktree path as the mount root.
+6. Build `ContainerOption` list via `AgentEngine::build_options`; run via `WorkflowEngine` or `ContainerRuntime`.
+7. If worktree was used: call `WorktreeLifecycle::finalize(frontend, had_error)`.
+8. Map exit info to `*Outcome`.
+
+---
+
+### `WorktreeLifecycle` (`src/command/commands/worktree_lifecycle.rs`)
+
+Worktree lifecycle is a command-layer concern, not a `WorkflowEngine` concern. `WorkflowEngine` operates on a given directory and is unaware of whether it is a worktree.
+
+#### Decision types
+
+```rust
+pub enum PreWorktreeDecision {
+    Commit { message: String },
+    UseLastCommit,
+    Abort,
+}
+
+pub enum ExistingWorktreeDecision { Resume, Recreate }
+
+pub enum PostWorkflowWorktreeAction { Merge, Discard, Keep }
+```
+
+#### `WorktreeLifecycleFrontend` trait
+
+Defined by Layer 2, implemented by Layer 3:
+
+```rust
+pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
+    fn ask_pre_worktree_uncommitted_files(&mut self, files: &[String]) -> Result<PreWorktreeDecision, CommandError>;
+    fn ask_existing_worktree(&mut self, path: &Path, branch: &str) -> Result<ExistingWorktreeDecision, CommandError>;
+    fn report_worktree_created(&mut self, path: &Path, branch: &str);
+    fn ask_post_workflow_action(&mut self, branch: &str, had_error: bool) -> Result<PostWorkflowWorktreeAction, CommandError>;
+    fn ask_worktree_commit_before_merge(&mut self, branch: &str, files: &[String]) -> Result<Option<String>, CommandError>;
+    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError>;
+    fn confirm_worktree_cleanup(&mut self, branch: &str, path: &Path) -> Result<bool, CommandError>;
+    fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, git_root: &Path);
+    fn report_worktree_discarded(&mut self, branch: &str);
+    fn report_worktree_kept(&mut self, path: &Path, branch: &str);
+}
+```
+
+#### `WorktreeLifecycle` struct
+
+```rust
+pub struct WorktreeLifecycle {
+    git_engine: Arc<GitEngine>,
+    git_root: PathBuf,
+    worktree_path: PathBuf,
+    branch: String,
+}
+
+impl WorktreeLifecycle {
+    /// Branch name: `amux/workflow-<name>`; path: `~/.amux/worktrees/<repo>/wf-<name>/`
+    pub fn for_workflow(git_engine: Arc<GitEngine>, git_root: PathBuf, workflow_name: &str) -> Self;
+
+    pub fn worktree_path(&self) -> &Path;
+    pub fn branch(&self) -> &str;
+
+    /// Pre-creation checks and worktree setup. Returns the worktree path (= mount root).
+    pub async fn prepare(&self, frontend: &mut dyn WorktreeLifecycleFrontend) -> Result<PathBuf, CommandError>;
+
+    /// Post-completion merge / discard / keep flow.
+    pub async fn finalize(&self, frontend: &mut dyn WorktreeLifecycleFrontend, had_error: bool) -> Result<(), CommandError>;
+}
+```
+
+`prepare` steps: check for existing worktree → if exists call `ask_existing_worktree` (Resume or Recreate); check for uncommitted files → if present call `ask_pre_worktree_uncommitted_files`; create worktree; report.
+
+`finalize` steps: call `ask_post_workflow_action`; on Merge → optional commit → squash-merge → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
+
+Merge conflicts are non-fatal: `finalize` catches `EngineError::MergeConflict`, calls `report_merge_conflict`, and returns `Ok(())`. The user resolves the conflict manually.
+
+This module is `pub(super)` within `src/command/commands/` — not re-exported from `src/command/mod.rs`.
+
+---
+
+### `MountScope` (`src/command/commands/mount_scope.rs`)
+
+When the process `cwd` differs from the git root, every agent-launching command must ask the user which directory to mount into the container.
+
+```rust
+pub enum MountScopeDecision { MountGitRoot, MountCurrentDirOnly, Abort }
+
+pub trait MountScopeFrontend: UserMessageSink + Send + Sync {
+    fn ask_mount_scope(&mut self, git_root: &Path, cwd: &Path) -> Result<MountScopeDecision, CommandError>;
+}
+
+pub struct MountScope;
+
+impl MountScope {
+    /// Returns `git_root` when `cwd == git_root`; otherwise calls `ask_mount_scope`.
+    pub fn resolve(cwd: &Path, git_root: &Path, frontend: &mut dyn MountScopeFrontend) -> Result<PathBuf, CommandError>;
+}
+```
+
+Default behaviors per frontend (implemented by Layer 3): CLI prompts with `[r]oot / [c]urrent dir / [a]bort`; TUI shows the `MountScope` modal dialog; headless returns `MountGitRoot` unless the request body specifies `mount_scope: "cwd"`.
+
+Every agent-launching command frontend trait adds `MountScopeFrontend` as a supertrait bound.
+
+---
+
+### `AgentSetupFrontend` (`src/command/commands/agent_setup.rs`)
+
+When `AgentEngine::ensure_available` would download or build (the agent is not yet ready), Layer 2 commands interpose a user decision before calling the engine. `AgentEngine` reports state; the choice belongs to the command layer.
+
+```rust
+pub enum AgentSetupDecision { Setup, FallbackToDefault, Abort }
+
+pub trait AgentSetupFrontend: UserMessageSink + Send + Sync {
+    fn ask_agent_setup(
+        &mut self,
+        requested: &AgentName,
+        default: &AgentName,
+        default_available: bool,
+        image_only: bool,  // true = Dockerfile exists, only image build needed
+    ) -> Result<AgentSetupDecision, CommandError>;
+
+    fn record_fallback(&mut self, requested: &AgentName, fallback: &AgentName);
+}
+```
+
+Per-step / per-tab caching of fallback decisions (`workflow_agent_fallbacks`) lives in the `ExecWorkflowCommand` body, not in the engine. The command consults its own cache before calling `ask_agent_setup`.
+
+Added as a supertrait bound on every agent-launching command frontend trait.
+
+---
+
+### `AgentAuthFrontend` (`src/command/commands/agent_auth.rs`)
+
+On first run (`auto_agent_auth_accepted: None` in repo config), Layer 2 commands prompt the user before silently injecting keychain credentials into containers.
+
+```rust
+pub enum AgentAuthDecision { Accept, Decline, DeclineOnce }
+
+pub trait AgentAuthFrontend: UserMessageSink + Send + Sync {
+    fn ask_agent_auth_consent(
+        &mut self,
+        agent: &AgentName,
+        env_var_names: &[&str],
+    ) -> Result<AgentAuthDecision, CommandError>;
+}
+```
+
+Decision handling by commands:
+- `Some(true)` → silently inject credentials via `AgentEngine::resolve_agent_auth`.
+- `Some(false)` → do not inject (no prompt).
+- `None` → call `ask_agent_auth_consent`. On `Accept`/`Decline`, persist via `RepoConfig::update` **before** the agent container launches. `DeclineOnce` does not persist.
+
+---
+
+### `RemoteClient` (`src/command/commands/remote_client.rs`)
+
+A typed HTTP client for communicating with a remote amux headless server. Constructed fresh per `RemoteCommand` invocation; not exported beyond `src/command/commands/`.
+
+```rust
+pub struct RemoteClient {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+pub struct RemoteResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+pub trait RemoteEventSink: Send + Sync {
+    fn on_event(&mut self, event_type: &str, data: &str);
+    fn on_done(&mut self);
+}
+
+impl RemoteClient {
+    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+    pub fn new(base_url: &str, api_key: Option<&ApiKey>) -> Result<Self, CommandError>;
+
+    /// Resolution order: explicit arg > AMUX_API_KEY env > GlobalConfig::remote.default_api_key
+    /// (only when target_addr matches GlobalConfig::remote.default_addr after URL canonicalization).
+    /// Returns None when no key is available (server may have --dangerously-skip-auth).
+    pub fn resolve_api_key(session: &Session, target_addr: &str, explicit: Option<&str>) -> Result<Option<ApiKey>, CommandError>;
+
+    pub async fn send_command(&self, path: &[&str], flags: &[(&str, serde_json::Value)]) -> Result<RemoteResponse, CommandError>;
+    pub async fn stream_command(&self, path: &[&str], flags: &[(&str, serde_json::Value)], sink: &mut dyn RemoteEventSink) -> Result<(), CommandError>;
+}
+```
+
+The API key sent as `Authorization: Bearer <key>` on every request. `stream_command` disables the read timeout (or uses a generous value) so SSE streams don't hit the 600 s ceiling. URL canonicalization for the `resolve_api_key` config match normalises scheme case, hostname case, default-port elision, and trailing slash.
+
+All HTTP error variants map to specific `CommandError` variants: timeout → `RemoteTimeout`; connection refused → `RemoteConnectionRefused`; non-2xx → `RemoteHttpStatus`; malformed SSE → `MalformedSseEvent`; transport error → `RemoteTransport`.
+
+---
+
+### `StatusCommand` — TUI tab annotations
+
+`StatusCommand` accepts an optional `StatusCommandTuiContext` populated by the TUI before invocation:
+
+```rust
+pub struct StatusCommandTuiContext {
+    pub tabs: Vec<TuiTabSnapshot>,
+}
+
+pub struct TuiTabSnapshot {
+    pub tab_number: u32,
+    pub container_name: Option<String>,
+    pub is_stuck: bool,
+    pub command_label: String,
+}
+```
+
+In CLI and headless mode the context is `None` and the status output contains no tab annotation columns. In TUI mode the frontend provides the context via `StatusCommandFrontend::tui_context()`.
+
+---
+
+### `HeadlessLifecycle` — server process management
+
+The headless server process lifecycle (PID files, daemonization, log rotation, SIGTERM) is encapsulated in `HeadlessLifecycle` in `src/engine/headless/` (Layer 1, introduced alongside work item 0068):
+
+```rust
+pub struct HeadlessLifecycle { paths: HeadlessPaths }
+
+impl HeadlessLifecycle {
+    pub fn new(session: &Session) -> Self;
+    pub fn current_pid(&self) -> Result<Option<u32>, CommandError>;
+    pub fn write_pid(&self) -> Result<(), CommandError>;
+    pub fn clear_pid(&self) -> Result<(), CommandError>;
+    pub async fn kill(&self, timeout: Duration) -> Result<KillOutcome, CommandError>;
+    pub fn daemonize(&self, args: &[OsString]) -> Result<u32, CommandError>;
+    pub fn open_log_for_append(&self) -> Result<File, CommandError>;
+}
+
+pub enum KillOutcome { ExitedCleanly, ExitedAfterSigKill, NotRunning }
+```
+
+`HeadlessStartCommand` (Layer 2) uses this lifecycle to: refuse if already running; generate/refresh the API key; optionally daemonize; write the PID file; hand the assembled `HeadlessServeConfig` to the frontend (which boots the actual HTTP server in Layer 3).
+
+The `--workdirs` flag is merged with `GlobalConfig::headless.work_dirs`, canonicalized via `OverlayPathResolver`, deduplicated, and validated (non-existent paths → `CommandError::HeadlessWorkdirNotFound`).
+
+---
+
+### What is forbidden in Layer 2
+
+- No `eprintln!`, `println!`, or direct console I/O. All status messages flow through `UserMessageSink::write_message`; all structured output flows through per-command `report_*` frontend trait methods.
+- No `clap::ArgMatches` references inside `*Command` bodies. Flag values arrive as typed fields in `*CommandFlags`, populated by Dispatch.
+- No `crossterm`, no `ratatui`, no `axum`. Those are Layer 3.
+- No "if this is CLI vs TUI vs headless" checks. Commands never know which frontend is on the other side of the trait object.
+- No git worktree calls (`create_worktree`, `merge_branch`, `remove_worktree`) directly from command bodies. All worktree operations must flow through `WorktreeLifecycle::prepare` and `WorktreeLifecycle::finalize`.
+- No business logic in projections. Projections derive structure from the catalogue; they do not interpret flag semantics.
+- No upward calls into Layer 3 or Layer 4 types.
+
+---
+
+## Layer 3: Frontend (`src/frontend/`)
+
+Layer 3 is the presentation layer. It has three sub-modules — `cli`, `tui`, and `headless` — each of which translates user input into `Dispatch` calls and renders the typed outcomes back to the user. Frontends contain **no business logic**: any behavioral decision lives in Layer 2 (`command`) or below.
+
+Layer 3 is the only layer that may:
+
+- Read from and write to terminal I/O (stdout, stderr, stdin)
+- Allocate PTYs or open raw-mode terminal sessions
+- Bind HTTP server sockets (headless mode)
+- Render Ratatui widgets (TUI mode)
+
+Layer 3 may call into Layer 0 (`data`), Layer 1 (`engine`), and Layer 2 (`command`), but **never into Layer 4** (no upward calls).
+
+---
+
+### `src/frontend/mod.rs`
+
+Declares the three sub-modules: `pub mod cli; pub mod headless; pub mod tui;`. All public symbols used by `main.rs` are re-exported from here.
+
+---
+
+### CLI Frontend (`src/frontend/cli/`)
+
+The CLI frontend is the fully implemented Layer 3 sub-module for `amux <subcommand>` invocations. Its entry point is `run(matches, ctx)`. It extracts the command path from clap's `ArgMatches`, constructs a `CliFrontend`, hands it to `Dispatch`, and renders the resulting `CommandOutcome` or `CommandError` to stdout/stderr.
+
+#### `RuntimeContext` (`mod.rs`)
+
+```rust
+pub struct RuntimeContext {
+    pub session: Arc<RwLock<Session>>,
+    pub engines: Engines,
+}
+```
+
+The bundle that `main.rs` constructs once at startup and passes to either `cli::run` or `tui::run`. Contains the current `Session` (wrapped for shared ownership) and all six engine handles. Constructed via `RuntimeContext::new(session, engines)`.
+
+#### Entry point (`mod.rs`)
+
+```rust
+pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode
+```
+
+Extracts the command path via `command_path_from_matches`, builds a `CliFrontend`, creates a `Dispatch`, calls `dispatch.run_command(&path)`, and routes the result to `render_outcome` or `render_error`. The function body is intentionally small — all behavioral decisions live in Layer 2.
+
+```rust
+fn render_outcome(outcome: &CommandOutcome) -> ExitCode
+fn render_error(err: &CommandError) -> ExitCode
+pub(crate) fn error_exit_code(err: &CommandError) -> u8
+```
+
+`render_outcome` pattern-matches on typed outcome variants and writes to stdout; every variant has a dedicated human-readable rendering completed in work item 0070. `render_error` writes the error message to stderr. `error_exit_code` is the pure mapping factored out for unit testing:
+
+| Error category | Exit code |
+|----------------|-----------|
+| `Aborted` | 130 |
+| Usage errors (`UnknownCommand`, `UnknownFlag`, `MissingRequiredFlag`, `MissingRequiredArgument`, `MutuallyExclusive`, `InvalidFlagValue`, `InvalidArgumentValue`, `CommandBoxParse`) | 2 |
+| All other errors | 1 |
+
+#### `CliFrontend` (`command_frontend.rs`)
+
+```rust
+pub struct CliFrontend {
+    matches: ArgMatches,
+    command_path: Vec<String>,
+    messages: CliUserMessageQueue,
+}
+```
+
+The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`AuthCommandFrontend`, `ConfigCommandFrontend`, `DownloadCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `HeadlessCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules.
+
+`CliFrontend::new(matches)` pre-computes `command_path` so it doesn't re-traverse the matches tree on every call.
+
+**`CommandFrontend` flag methods:**
+
+| Method | clap equivalent | Notes |
+|--------|----------------|-------|
+| `flag_bool(path, flag)` | `get_flag(flag)` | Returns `Some(false)` for known Bool flags absent from argv; `None` for unknown paths |
+| `flag_string(path, flag)` | `get_one::<String>(flag)` | Returns `None` when absent |
+| `flag_strings(path, flag)` | `get_many::<String>(flag)` | Returns empty `Vec` when absent |
+| `flag_path(path, flag)` | `get_one::<String>(flag)` then `PathBuf::from` | Returns `None` when absent |
+| `flag_enum(path, flag)` | delegates to `flag_string` | Enum flags are stored as strings in the clap projection |
+| `flag_u16(path, flag)` | `get_one::<u16>(flag)` | Used for `--port` on `headless start` |
+| `argument(path, name)` | `get_one::<String>(name)` or `get_many` joined | `TrailingVarArgs` arguments are joined with spaces |
+| `arguments(path, name)` | `get_many::<String>(name)` | Returns the raw token vector |
+
+`matches_for(path)` resolves the correct `ArgMatches` sub-tree for nested subcommands by walking the clap matches tree one segment at a time.
+
+**`command_path_from_matches(matches) -> Vec<String>`** (exported):
+
+Walks `ArgMatches::subcommand()` recursively and collects the subcommand names into a path vector. The resulting vector is what `Dispatch::run_command` consumes. A bare invocation returns an empty vector.
+
+#### Output helpers (`output.rs`)
+
+```rust
+pub fn stderr_is_tty() -> bool
+pub fn stdin_is_tty() -> bool
+```
+
+Pure TTY-detection helpers used by per-command frontends to decide whether to apply ANSI color codes and whether to fall back to safe defaults when stdin is not a TTY (e.g., piped). No business logic — the _decision_ of what to do with the detection result lives in the per-command module.
+
+#### Message queue (`user_message.rs`)
+
+```rust
+pub struct CliUserMessageQueue {
+    pty_active: bool,
+    queue: Vec<UserMessage>,
+}
+```
+
+Implements `UserMessageSink`. The `pty_active` flag controls two modes:
+
+- **`pty_active = false`** (default): `write_message` writes immediately to stderr with a level-prefixed format (`amux:`, `amux warning:`, `amux error:`).
+- **`pty_active = true`**: `write_message` pushes to the queue instead. Used when a PTY-bound container owns the terminal — messages accumulated during container execution are replayed after the container exits via `replay_queued`.
+
+`replay_queued` drains the queue to stderr in insertion order and clears it. `set_pty_active(bool)` toggles the mode; the per-command frontends for container-running commands call this before and after `ContainerExecution::wait`.
+
+#### Per-command modules (`per_command/`)
+
+Each module in this directory implements the richer `*CommandFrontend` trait (and related engine frontend traits) for commands that require more than just flag extraction:
+
+| Module | Traits implemented | Key behavior |
+|--------|--------------------|-------------|
+| `chat.rs` | `ChatCommandFrontend` | Marker (no extra methods beyond `UserMessageSink`) |
+| `exec_prompt.rs` | `ExecPromptCommandFrontend` | Marker |
+| `exec_workflow.rs` | `ExecWorkflowCommandFrontend`, `ContainerFrontend`, `WorkflowFrontend` | Integrates container output, workflow control, and worktree lifecycle for the exec-workflow command path |
+| `headless.rs` | `HeadlessStartCommandFrontend` | Calls `crate::frontend::headless::serve(config)` — a peer Layer 3 call, not an upward call |
+| `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config |
+| `ready.rs` | `ReadyCommandFrontend`, `ReadyFrontend` | Reports `ReadyPhase` transitions to stderr; prompts for Dockerfile creation and legacy-migration decisions |
+| `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin; defaults to `DeclineOnce` when stdin is not a TTY |
+| `agent_setup.rs` | `AgentSetupFrontend` | Asks agent setup decision on stdin; defaults to `Setup` when stdin is not a TTY |
+| `container_frontend_marker.rs` | `ContainerFrontend` | Shared marker impl for commands that don't use a PTY container |
+| `mount_scope.rs` | `MountScopeFrontend` | Asks mount scope on stdin; defaults to `MountGitRoot` when stdin is not a TTY |
+| `workflow_frontend_marker.rs` | `WorkflowFrontend` | Shared marker impl for commands that don't use workflows |
+| `worktree_lifecycle_marker.rs` | `WorktreeLifecycleFrontend` | Shared marker impl for commands that don't use worktrees |
+
+The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matches the headless defaults from WI 0069 §7u: interactive prompts return the non-destructive option rather than blocking.
+
+---
+
+### TUI Frontend (`src/frontend/tui/`)
+
+The TUI frontend is the Ratatui-based interactive terminal UI invoked by bare `amux` (no subcommand). It is a pure presentation layer: it translates keystrokes into `Dispatch` calls and renders typed outcomes via Ratatui widgets. No business logic lives here — any behavioral decision belongs in Layer 2.
+
+#### Entry point (`mod.rs`)
+
+```rust
+pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode
+```
+
+`run` constructs an in-memory `SessionManager`, opens an initial `Tab` bound to the working directory session, creates an `App`, and enters the terminal event loop. Terminal cleanup (raw mode off, alternate screen off, mouse capture off) runs unconditionally on exit, even on error.
+
+**Startup branching:** After the initial tab is open, `run` dispatches a startup command through the standard `Dispatch` → `Command` → `Frontend` chain before entering the event loop:
+
+- **Inside a Git repository:** dispatches `["ready"]` through `TuiReadyFrontend`. This checks that the container runtime, Dockerfiles, and agent images are present. Phase transitions render as an in-place progress dialog.
+- **Not inside a Git repository:** dispatches `["status", "--watch"]` so the TUI immediately shows a live status stream.
+
+No startup logic is special-cased in `App::new`; both branches go through the normal `Dispatch::run_command` path.
+
+`run_event_loop` sets up the Crossterm backend and drives `main_loop`. The main loop renders on every iteration, polls for input events with a 50 ms timeout, and dispatches key events through the keymap.
+
+#### Application state (`app.rs`)
+
+```rust
+pub struct App {
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+    pub active_dialog: Option<Dialog>,
+    pub focus: Focus,
+    pub catalogue: &'static CommandCatalogue,
+    pub engines: Engines,
+    pub session_manager: Arc<RwLock<SessionManager>>,
+    pub command_input: TextEdit,
+    pub suggestion_row: Vec<String>,
+    pub input_error: Option<String>,
+    pub status_bar: StatusBar,
+    pub should_quit: bool,
+    pub needs_redraw: bool,
+}
+```
+
+`App` is the single shared mutable state object. It stores only UI state; commands are dispatched through `Dispatch` and results flow back through the per-command frontend trait chain.
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `active_tab()` / `active_tab_mut()` | Borrow the current tab |
+| `switch_to_prev_tab()` / `switch_to_next_tab()` | Wrap-around tab switching |
+| `close_active_tab()` | Remove tab; set `should_quit` if only one tab remains |
+| `update_suggestions()` | Refresh `suggestion_row` from `CommandCatalogue::tui_completions(partial)` |
+
+`Focus` enum has two variants: `CommandBox` and `ExecutionWindow`.
+
+#### Per-tab state (`tabs.rs`)
+
+```rust
+pub struct Tab {
+    pub session: Session,           // Layer 0 session for this tab
+    pub execution_phase: ExecutionPhase,
+    pub vt100_parser: vt100::Parser,          // 10000-line scrollback
+    pub container_window_state: ContainerWindowState,
+    pub workflow_state: Option<WorkflowViewState>,
+    pub status_log: SharedStatusLog,          // Arc<Mutex<Vec<StatusLogEntry>>>
+    pub status_log_collapsed: bool,
+    pub scroll_offset: usize,
+    pub mouse_selection: Option<TextSelection>,
+    pub workflow_agent_fallbacks: HashMap<String, String>,
+    pub auto_workflow_disabled_steps: HashSet<String>,
+    pub is_remote: bool,
+    pub output_lines: Vec<String>,
+    pub stuck: bool,
+    pub yolo_countdown: Option<u64>,
+    pub last_output_time: Option<std::time::Instant>,
+}
+```
+
+**`ExecutionPhase`** drives border colour and title:
+
+| Variant | Phase label | Border (focused) |
+|---------|-------------|-----------------|
+| `Idle` | ` amux ` | DarkGray |
+| `Running { command }` | ` ● running: {command} ` | Blue |
+| `Done { command, exit_code: 0 }` | ` ✓ done: {command} ` | Green (focused) / Gray |
+| `Done { command, exit_code: n }` | ` ✗ error: {command} (exit N) ` | Green (focused) / Gray |
+| `Error { command, .. }` | ` ✗ error: {command} ` | Red |
+
+**`ContainerWindowState`** cycles Hidden → Minimized → Maximized → Hidden via `Ctrl+M`.
+
+**Pure functions** in `tabs.rs` — safe to unit-test without a terminal:
+
+| Function | Purpose |
+|----------|---------|
+| `tab_color(tab)` | Stuck→Yellow, Remote→Magenta, Error→Red, Running+PTY→Green, Running→Blue, Idle/Done→DarkGray |
+| `window_border_color(phase, focused)` | Maps phase + focus to a Ratatui `Color` |
+| `phase_label(phase)` | Phase label string for the execution window border title |
+| `compute_tab_bar_width(n, width)` | 1 tab → ¼ width; 2 → ½; 3 → ¾/3; N → 1/N |
+
+#### Keyboard shortcuts (`keymap.rs`)
+
+Every key binding is defined in one place. `map_key(key, ctx) -> Action` is pure: no state mutation, no side effects.
+
+**`FocusContext`** determines which bindings are active:
+
+| Context | When active |
+|---------|-------------|
+| `CommandBox` | No dialog, no maximized container, focus on command box |
+| `ExecutionWindow` | No dialog, no maximized container, focus on execution window |
+| `Dialog` | A dialog is open |
+| `ContainerMaximized` | Container window is in Maximized state |
+
+Global shortcuts (available in all contexts except `ContainerMaximized`):
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+T` | `OpenNewTabDialog` |
+| `Ctrl+A` | `PreviousTab` |
+| `Ctrl+D` | `NextTab` |
+| `Ctrl+C` | `CloseTabOrQuit` |
+| `Ctrl+M` | `CycleContainerWindow` |
+| `Ctrl+,` | `OpenConfigShow` |
+
+`ContainerMaximized` context: all keys except `Ctrl+Y` (copy) and `Ctrl+M` (toggle) are forwarded to the PTY as `Action::ForwardToPty(key)`. Global shortcuts are suppressed.
+
+#### Command box (`command_box.rs`)
+
+`parse_input(text)` tokenizes the raw command-box string by calling `Dispatch::parse_command_box_input`. Returns `Ok(ParsedCommandBoxInput)` or a `CommandError`.
+
+`format_parse_error(err)` converts a `CommandError` into a user-visible string:
+- `UnknownCommand` with a close match (Levenshtein ≤ 4): `"did you mean: <suggestion>?"`
+- `UnknownCommand` with no close match: `"unknown command: <name>"`
+- `UnknownFlag`: `"unknown flag: --<name>"`
+- `CommandBoxParse`: the error message verbatim
+
+#### Hints and suggestions (`hints.rs`)
+
+`hint_for_input(input)` returns a one-line inline hint for the command currently being typed, by delegating to `CommandCatalogue::tui_hint_for`. No command names or flag names are hard-coded here.
+
+`format_suggestion_row(suggestions)` formats the suggestion list as:
+```
+> chat · exec · implement · ready · …
+```
+Suggestions are separated by middots (` · `). An empty list produces an empty string.
+
+#### Dialog system (`dialogs/mod.rs`)
+
+The `Dialog` enum holds the state for every modal overlay. One dialog is active at a time (`App::active_dialog: Option<Dialog>`). Dialogs are pure presentation: they render centered on the terminal frame and map key presses to typed Layer 2 enum values.
+
+Available dialog variants:
+
+| Variant | Purpose |
+|---------|---------|
+| `QuitConfirm` | Quit confirmation: `[y]` quits, `[n]`/Esc cancels |
+| `CloseTabConfirm` | Multi-tab close: `[q]` quits app, `[c]` closes tab, `[n]`/Esc cancels |
+| `YesNo { title, body }` | Generic yes/no prompt |
+| `YesNoCancel { title, body }` | Generic yes/no/cancel prompt |
+| `TextInput { title, prompt, editor }` | Single-line text input |
+| `MultilineInput { title, prompt, editor }` | Multiline text input; Ctrl+Enter submits |
+| `ListPicker { title, items, selected }` | Arrow-key selection list; Enter selects |
+| `KindSelect { title, options }` | Numbered option select |
+| `WorkflowControlBoard(..)` | Workflow step navigation (→ ← ↑ ↓ d Ctrl+Enter Ctrl+C Esc) |
+| `WorkflowStepError(..)` | Step failure prompt: `[r]`/`[1]` retry, `[q]`/`[2]`/Esc pause, `[a]` abort |
+| `WorkflowYoloCountdown(..)` | Yolo countdown display; Esc dismisses |
+| `AgentSetup(..)` | Agent build/setup confirmation |
+| `MountScope(..)` | Git root vs CWD mount selection |
+| `AgentAuth(..)` | Agent credential injection consent |
+| `ConfigShow(..)` | Full-screen config editor table |
+| `Loading { title }` | "loading…" placeholder during async data fetch |
+| `Custom { title, body, keys }` | Ad-hoc dialog with arbitrary key/label pairs |
+
+`DialogRequest` and `DialogResponse` are the channel types for async communication between the command thread and the event loop.
+
+#### Per-command frontend traits (`per_command/`)
+
+Each file implements the `*CommandFrontend` trait for one command, opening the appropriate `Dialog` variant for each interactive Q&A method. The pattern:
+
+1. The command (Layer 2) calls a trait method (e.g. `ask_agent_setup(decision_info)`)
+2. The TUI implementation sends a `DialogRequest` to the event loop
+3. The event loop renders the dialog and waits for a `DialogResponse`
+4. The TUI implementation maps the response to the typed Layer 2 enum and returns it
+
+Commands with no interactive methods use marker impls that delegate to `UserMessageSink` only.
+
+#### PTY management (`pty.rs`)
+
+`PtySession` wraps `portable-pty` to provide interactive shell access inside container windows. Background threads handle read (PTY → channel), exit-wait, and write (keystrokes → PTY).
+
+`PtyEvent` enum: `Data(Vec<u8>)`, `Exit(i32)`.
+
+`spawn_text_command()` runs non-PTY commands (init, ready) as async tasks piping stdout/stderr to the vt100 parser as plain text.
+
+#### UI rendering (`render.rs`)
+
+`render_frame(app, frame)` lays out the full terminal area top-to-bottom:
+
+| Slot | Height | Content |
+|------|--------|---------|
+| Tab bar | 3 rows | Colored tabs with project name and command label |
+| Execution window | fills remaining (min 5) | Status log or PTY output; border color by phase |
+| Minimized container bar | 3 rows (conditional) | One-line PTY summary |
+| Workflow strip | 3 rows (conditional) | Step status boxes |
+| Status bar | 1 row | Git root path; optional status text |
+| Command box | 3 rows | Text input with inline hint |
+| Suggestion row | 1 row | `> sugg1 · sugg2 · …` |
+
+Container overlay (Maximized) and active dialogs are rendered as floating layers on top of the base layout.
+
+**Welcome message** (Idle phase, no output): two dark-gray lines:
+```
+Welcome to amux.
+Running 'amux ready' to check your environment...
+```
+
+#### Text editing widget (`text_edit.rs`)
+
+`TextEdit` is the shared single-line/multiline text editing primitive used by the command box and dialog text inputs.
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Move cursor |
+| `Ctrl+←` / `Ctrl+→` | Move by word |
+| `Home` / `End` | Move to line start/end |
+| `Backspace` | Delete previous character |
+| `Ctrl+Backspace` | Delete previous word |
+| `Delete` | Delete next character |
+| `Ctrl+Enter` or `Shift+Enter` | Insert newline (multiline mode) |
+
+#### Message sink (`user_message.rs`)
+
+`TuiUserMessageSink` implements `UserMessageSink` by appending to the active tab's `SharedStatusLog` with level-colored prefixes:
+
+| Level | Color |
+|-------|-------|
+| Info | DarkGray |
+| Warning | Yellow |
+| Error | Red |
+| Success | Green |
+
+`SharedStatusLog` is `Arc<Mutex<Vec<StatusLogEntry>>>`. The status log is collapsed by default (shows only the most recent entry); press `l` in the execution window to toggle expanded view.
+
+---
+
+### Headless Frontend (`src/frontend/headless/`)
+
+The headless frontend is a full HTTP server (Axum + axum-server with optional rustls TLS) that dispatches commands through `Dispatch::run_command` rather than spawning child `amux` processes. It was completed in WI 0072 and is exercised end-to-end by `tests/headless_parity/`.
+
+The HTTP routes are defined in `src/frontend/headless/routes.rs`; the per-command frontends live alongside in `per_command/`. Sessions and commands are persisted to SQLite via `SqliteSessionStore` (`src/data/fs/headless_db.rs`).
+
+`HeadlessServeConfig` is the configuration type that the CLI's `HeadlessStartCommandFrontend` impl populates and passes into `serve`:
+
+```rust
+pub struct HeadlessServeConfig {
+    pub port: u16,
+    pub workdirs: Vec<PathBuf>,
+    pub dangerously_skip_auth: bool,
+}
+```
+
+The `serve(config)` function signature is the public contract that WI 0072 must preserve:
+
+```rust
+pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError>
+```
+
+---
+
+## Layer 4: Binary (`src/main.rs`)
+
+`main.rs` is the Layer 4 binary entrypoint. It contains no business logic: its sole responsibility is to construct the runtime context and route to the appropriate frontend.
+
+### Startup sequence
+
+1. **Build clap**: `CommandCatalogue::get().build_clap_command()` — the clap command is derived entirely from the catalogue; `main.rs` does not hard-code any subcommand or flag name.
+2. **Parse argv**: `clap_cmd.get_matches()` — clap handles `--help`, `--version`, and error formatting.
+3. **Load global config**: `GlobalConfig::load()` — used to select the container runtime.
+4. **Construct engines**:
+   - `ContainerRuntime::detect(&global_config)` — selects Docker or Apple Containers
+   - `GitEngine::new()` — used to resolve the git root
+   - `Session::open(working_dir, &git_engine, SessionOpenOptions::default())` — resolves git root, loads per-repo and global config, records timestamps
+   - `OverlayEngine::new(&session)` — resolves overlay paths from config
+   - `AuthEngine::new(&session)` — sets up the keychain credential path
+   - `AgentEngine::new(overlay_engine, runtime)` — wraps the overlay and runtime for agent execution
+   - `EngineWorkflowStateStore::at_git_root(session.git_root())` — filesystem workflow state store
+5. **Construct `RuntimeContext`**: `RuntimeContext::new(session, engines)` — wraps the session in `Arc<RwLock<Session>>`.
+6. **Route**: `matches.subcommand_name().is_some()` → `cli::run(matches, ctx)` (CLI); otherwise → `tui::run(matches, ctx)` (TUI).
+
+### Routing rule
+
+```rust
+if matches.subcommand_name().is_some() {
+    cli::run(matches, ctx).await
+} else {
+    tui::run(matches, ctx).await
+}
+```
+
+The headless server is launched by the `headless start` *command* (Layer 2 → Layer 3), not by `main.rs`. `main.rs` never branches on `headless`.
+
+### Size constraint
+
+Per the architecture tenet, the `main.rs` function body must remain small (under ~100 lines). Any logic that wants to live in `main.rs` belongs in Layer 2 or below. This is enforced by code review, not by the compiler.
+
+### `#![forbid(unsafe_code)]`
+
+The binary crate opts out of all unsafe code at the crate level. Layer 3 and Layer 4 are entirely safe Rust.
+
+---
+
+## Legacy Architecture (`oldsrc/`)
+
+The following describes the legacy `amux` source that was the user-facing binary before the grand architecture refactor. It is preserved here purely as historical reference for engineers tracing the migration. The `oldsrc/` tree is frozen — no edits are allowed — and is no longer compiled by Cargo. The developer will delete `oldsrc/` (and the legacy `tests/`/`benches/` files) after manual testing of the new tree, at which point this section will be removed.
+
+### High-level Overview
 
 ```
 User
@@ -29,10 +2527,10 @@ amux binary ──► command mode  ──► commands/{init,ready,implement,cha
 
 ---
 
-## Source Layout
+### Source Layout
 
 ```
-src/
+oldsrc/
   main.rs                  Entry point: dispatch TUI or command mode
   lib.rs                   Re-exports public API for integration tests
   cli.rs                   clap CLI: Cli, Command, Agent enums
@@ -162,7 +2660,6 @@ templates/
   Dockerfile.opencode      Agent template (same pattern as claude)
   Dockerfile.maki          Agent template (same pattern as claude)
   Dockerfile.gemini        Agent template (same pattern as claude)
-  Dockerfile.nanoclaw      Nanoclaw persistent-agent template (see docs/06-nanoclaw.md)
 tests/
   cli_integration.rs       Binary-level integration tests
   command_tui_parity.rs    Verifies command/TUI mode share the same logic
@@ -171,14 +2668,11 @@ tests/
   memory_bounds.rs         vt100 scrollback cap, tab cleanup, memory-per-tab bounds
   terminal_selection.rs    Text selection, clipboard (MockClipboard), scrollback depth,
                            coordinate mapping, resize-clears-selection integration tests
-docs/
-  usage.md                 End-user reference
-  architecture.md          This file
 ```
 
 ---
 
-## The `OutputSink` Abstraction
+### The `OutputSink` Abstraction
 
 Every command function (`init::run_with_sink`, `ready::run_with_sink`, etc.) accepts
 an `OutputSink` instead of calling `println!` directly:
@@ -201,10 +2695,10 @@ In TUI mode, `execute_command()` passes `OutputSink::Channel(app.output_tx.clone
 
 ---
 
-## The `AgentRuntime` Abstraction
+### The `AgentRuntime` Abstraction
 
 All container operations go through a single `AgentRuntime` trait defined in
-`src/runtime/mod.rs`. This decouples the agent-launching logic from any
+`oldsrc/runtime/mod.rs`. This decouples the agent-launching logic from any
 specific container technology.
 
 ```rust
@@ -242,38 +2736,17 @@ pub trait AgentRuntime: Send + Sync {
 
 The runtime is resolved once at startup via `resolve_runtime(&GlobalConfig)`,
 which reads the `runtime` config field and returns an `Arc<dyn AgentRuntime>`.
-This `Arc` is threaded from `main.rs` through the command dispatcher into every
-command handler and the TUI event loop.
 
 ### Runtime implementations
 
 | Struct | File | Notes |
 |--------|------|-------|
-| `DockerRuntime` | `src/runtime/docker.rs` | Wraps the `docker` CLI; identical behavior to the old `src/docker/mod.rs` |
-| `AppleContainersRuntime` | `src/runtime/apple.rs` | Wraps the `container` CLI; `#[cfg(target_os = "macos")]` |
-
-### Shared utilities
-
-The following free functions in `src/runtime/mod.rs` are not runtime-specific
-and are used by all implementations:
-
-- `generate_container_name()` — produces `amux-{hash}` names
-- `project_image_tag()` — produces `amux-{project}:latest` (the project base image)
-- `agent_image_tag()` — produces `amux-{project}-{agent}:latest` (the agent-specific image used for `chat` and `implement`)
-- `parse_cpu_percent()` / `parse_memory_mb()` — stat output parsers (each
-  runtime may use its own format variant)
-- `format_build_cmd()` / `format_run_cmd()` — display-only command string builders
-
-### `HostSettings`
-
-`HostSettings` (the sanitized Claude config mount — `.claude.json` and
-`settings.json`) lives in `src/runtime/mod.rs`. It is not Docker-specific; all
-runtime implementations that support bind mounts use it for credential
-injection.
+| `DockerRuntime` | `oldsrc/runtime/docker.rs` | Wraps the `docker` CLI |
+| `AppleContainersRuntime` | `oldsrc/runtime/apple.rs` | Wraps the `container` CLI; `#[cfg(target_os = "macos")]` |
 
 ---
 
-## Working Directory Contract
+### Working Directory Contract
 
 All `run_with_sink` functions accept an explicit `cwd: &Path` parameter that
 determines where the Git root is searched from. This ensures correctness for
@@ -286,21 +2759,15 @@ both execution modes:
 
 **Rule:** No command implementation may call `find_git_root()` (which reads the
 process CWD). All callers must use `find_git_root_from(cwd)` with an explicitly
-provided `cwd`. This prevents TUI tabs from accidentally operating on the wrong
-repository when a tab's working directory differs from the process's launch
-directory.
-
-The `find_git_root()` helper (which reads `std::env::current_dir()`) exists only
-for the CLI `run()` entry points, which call it once to determine the `cwd` to
-pass down.
+provided `cwd`.
 
 ---
 
-## TUI State Machine
+### TUI State Machine
 
 The TUI state is split across three orthogonal enums plus the `App` struct:
 
-### `Focus`
+#### `Focus`
 
 ```
 CommandBox  ←──── Esc ────── ExecutionWindow
@@ -308,7 +2775,7 @@ CommandBox  ←──── Esc ────── ExecutionWindow
     └─────── ↑ arrow / running ──────┘
 ```
 
-### `ExecutionPhase`
+#### `ExecutionPhase`
 
 ```
 Idle ──[Submit]──► Running ──[exit 0]──► Done
@@ -316,15 +2783,7 @@ Idle ──[Submit]──► Running ──[exit 0]──► Done
                       └──[exit ≠ 0]──► Error
 ```
 
-`Done` and `Error` are both read-only scroll states. Any non-scroll key press
-in the window, or any new Submit, transitions back through `Idle → Running`.
-
-Mouse scrolling is enabled via `crossterm::EnableMouseCapture` and works in all
-phases and focus states. Scroll events adjust `App::scroll_offset` by 3 lines
-per tick, allowing the user to navigate output even while a process is running
-and capturing keyboard input.
-
-### `Dialog`
+#### `Dialog`
 
 ```
 None ──[q / Ctrl+C]──────────────────────────► QuitConfirm      ──[y]──► quit
@@ -334,46 +2793,19 @@ None ──[q / Ctrl+C]───────────────────
      ──[init, all other cases]────────────────────────────────────────►  InitAuditConfirm ──[y/n]──► InitWorkItemsSetup ──[y/n]──► launch_init()
 ```
 
-Dialogs intercept all key events until dismissed. For the `init` flow, dialogs
-collect answers into a `TuiInitAnswers` struct; `launch_init()` reads those answers
-via `TuiInitQa` and delegates to `init_flow::execute()`. A `PendingCommand` enum
-(`Ready { refresh, non_interactive }`,
-`Implement { agent, work_item, non_interactive, plan, allow_docker, workflow, worktree, mount_ssh, yolo, auto }`,
-or `Chat { agent, non_interactive, plan, allow_docker, mount_ssh, yolo, auto }`)
-and the mount path are preserved in `App` fields while a dialog is active, so
-the correct command resumes after the dialog is dismissed. All flag fields —
-including `agent: Option<String>` — are populated from the parsed TUI command
-line before any dialog is shown, so the flag values survive through the dialog
-flow and are applied when the command launches.
-
 ---
 
-## CLI/TUI Flag Unification
-
-Before work item 0053, every command's flags were defined in three separate
-places with no structural guarantee they stayed in sync:
-
-| Location | Role |
-|---|---|
-| `src/cli.rs` — clap struct | CLI argument parsing |
-| `src/tui/mod.rs` — `parse_chat_flags()` / `parse_implement_flags()` | TUI command-line parsing |
-| `src/tui/input.rs` — hint lists in `flag_suggestions_for()` | TUI autocomplete |
-
-This meant a flag added to `cli.rs` could be silently ignored in the TUI: the
-parser would not extract it, the `PendingCommand` had no field for it, and
-autocomplete would not hint it.
-
-### `CommandSpec` — single source of truth (`src/commands/spec.rs`)
+### CLI/TUI Flag Unification
 
 `spec.rs` is the leaf module that all three sites import from. It defines every
 flag for every subcommand as static data:
 
 ```rust
 pub struct FlagSpec {
-    pub name: &'static str,       // long flag name without "--"
-    pub takes_value: bool,        // true for --agent NAME, false for --plan
-    pub value_name: &'static str, // metavar shown in hints ("NAME", "FILE", "")
-    pub hint: &'static str,       // short description for autocomplete display
+    pub name: &'static str,
+    pub takes_value: bool,
+    pub value_name: &'static str,
+    pub hint: &'static str,
 }
 
 pub struct CommandSpec {
@@ -388,473 +2820,42 @@ pub static ALL_COMMANDS: &[CommandSpec] = &[
 ];
 ```
 
-`spec.rs` has zero imports from `cli.rs`, `tui/mod.rs`, or `tui/input.rs`. It is
-re-exported from `src/commands/mod.rs`.
-
-### Generic TUI flag parser (`src/tui/flag_parser.rs`)
-
-`parse_flags(parts, spec)` replaces all ad-hoc `parse_*_flags()` functions. It
-accepts a tokenized command line and a `&CommandSpec`, and returns a
-`HashMap<&'static str, String>` of flag name → value (empty string for boolean
-flags):
-
-- `--flag value` and `--flag=value` forms are both handled
-- Unknown flags are silently ignored (the user may be mid-typing)
-- A value token that starts with `--` is never consumed as the value of a
-  preceding flag (e.g. `--workflow --non-interactive` does not treat
-  `--non-interactive` as the workflow path)
-- `--flag=` (empty value) is parsed as `Some("")`
-
-The deleted functions `parse_chat_flags()`, `parse_implement_flags()`, and
-`parse_agent_flag()` are all replaced by calls to `parse_flags()` with the
-corresponding `CommandSpec`.
-
-### Autocomplete driven by `CommandSpec` (`src/tui/input.rs`)
-
-`flag_suggestions_for(cmd)` is now a thin wrapper over `ALL_COMMANDS`:
-
-```rust
-pub fn flag_suggestions_for(cmd: &str) -> Vec<String> {
-    let Some(spec) = ALL_COMMANDS.iter().find(|c| c.name == cmd) else {
-        return vec![];
-    };
-    spec.flags.iter().map(|f| {
-        if f.takes_value {
-            format!("--{} <{}>  — {}", f.name, f.value_name, f.hint)
-        } else {
-            format!("--{}  — {}", f.name, f.hint)
-        }
-    }).collect()
-}
-```
-
-The handwritten hint strings for positional argument examples (e.g.
-`"implement <NNNN>  e.g. implement 0001"`) are prepended separately.
-Because the flag hints are now derived, there is no separate hint list to drift.
-
-### Enforcement tests
-
-#### CLI/spec parity (compile-time guarantee)
-
-A `#[test]` in `src/cli.rs` enumerates all clap `Arg` long names for each
-subcommand and asserts they match the corresponding `spec::*_FLAGS` table
-bidirectionally. The test fails immediately when a flag is added to `cli.rs`
-but not `spec.rs`, or vice versa. A single test failure surfaces both problems:
-the missing spec entry and the missing CLI arg.
-
-#### TUI parser coverage
-
-A unit test for each `CommandSpec` in `ALL_COMMANDS` calls `parse_flags()` with
-every flag in both `--flag value` and `--flag=value` forms and asserts the
-correct value is extracted. A separate test verifies that a value-taking flag
-followed by another `--flag` does not consume the second flag as the value.
-
-#### Autocomplete structural guarantee
-
-Because `flag_suggestions_for()` reads directly from `ALL_COMMANDS`, there is no
-separate hint list that could drift out of sync. The derivation itself is the
-guarantee — no additional test is needed for autocomplete completeness.
+`parse_flags(parts, spec)` in `tui/flag_parser.rs` replaces all ad-hoc `parse_*_flags()` functions and drives both TUI parsing and autocomplete from the same `CommandSpec`.
 
 ### Agent override resolution order
 
-The agent used for a session is resolved in this order, matching both CLI and TUI:
-
 1. **Flag** — `--agent <name>` passed on the command line (CLI or TUI)
-2. **Repo config** — `agent` field in `aspec/.amux.json`
+2. **Repo config** — `agent` field in `.amux/config.json`
 3. **Global config** — `default_agent` field in `~/.amux/config.json`
 4. **Built-in default** — `claude`
 
 ---
 
-## Ready Command
+### Ready Command
 
 The `ready` command has two modes based on the `--refresh` flag:
 
-### Without `--refresh` (default)
+**Without `--refresh`** (default): check runtime, Dockerfile.dev, and images; print summary.
 
-1. Check configured runtime is available (`runtime.is_available()`) — report name and status
-2. Check `Dockerfile.dev` exists (init from template if missing)
-3. Check project image exists (build if missing, with streaming output)
-4. Print skip message and tip about `--refresh`
-5. Display summary table
+**With `--refresh`**: check runtime → launch agent to audit Dockerfile.dev → rebuild images → print summary.
 
-### With `--refresh`
-
-1–3: Same as above
-4. Launch agent to audit `Dockerfile.dev` (interactive or non-interactive)
-5. Rebuild image with updated `Dockerfile.dev` (streaming output)
-6. Display summary table
-
-### `ReadyOptions`
-
-```rust
-pub struct ReadyOptions {
-    pub refresh: bool,          // run the Dockerfile audit
-    pub build: bool,            // force rebuild the dev image
-    pub no_cache: bool,         // pass --no-cache to docker build
-    pub non_interactive: bool,  // launch agent in print mode
-    pub allow_docker: bool,     // mount Docker socket into audit container
-    pub auto_create_dockerfile: bool, // create Dockerfile.dev if missing (TUI: skip prompting)
-    pub legacy_mode: bool,      // use project image only; skip agent image steps
-}
-```
-
-Shared between command mode and TUI mode. All fields default to `false`.
-
-The `build` flag is set to `true` programmatically after a successful legacy
-layout migration, overriding the value computed by `compute_ready_build_flag()`.
-This ensures the project image is rebuilt from the new minimal `Dockerfile.dev`
-before the audit runs.
-
-### `ReadySummary`
-
-```rust
-pub struct ReadySummary {
-    pub docker_daemon: StepStatus,
-    pub dockerfile: StepStatus,
-    pub aspec_folder: StepStatus,
-    pub work_items_config: StepStatus,
-    pub local_agent: StepStatus,
-    pub dev_image: StepStatus,
-    pub refresh: StepStatus,
-    pub image_rebuild: StepStatus,
-}
-```
-
-Each step status is one of `Pending`, `Ok(msg)`, `Skipped(msg)`, `Failed(msg)`,
-or `Warn(msg)`. The summary table is rendered via `print_summary()` at the end
-of every ready run.
-
-The `ReadySummary` produced by `run_pre_audit()` is passed to `run_post_audit()`
-so that post-audit can include the pre-audit results (docker_daemon, dockerfile,
-dev_image) in the final printed table. In TUI mode, the summary is stored in
-`Tab.ready_summary` between phases rather than being reconstructed from defaults.
-
-### Interactive Notice
-
-Before launching any interactive agent (in `ready --refresh` or `implement`),
-`print_interactive_notice()` displays a large ASCII-art banner alerting the user
-that:
-- The agent is in interactive mode
-- They need to quit the agent when done
-
-This notice is suppressed when `--non-interactive` is used.
-
-### Ready Engine Functions
-
-All business logic for the `ready` command lives in `src/commands/ready.rs` (the
-engine). `src/tui/mod.rs` is the orchestrator: it sequences phases, manages I/O
-routing, and holds state — but contains no inline Docker or filesystem operations
-related to `ready`. Every such operation goes through a function in `ready.rs`.
-
-Both CLI (`run()` in `ready.rs`) and TUI (`execute_command`, `launch_ready*` in
-`mod.rs`) call the same engine functions. The only differences between CLI and TUI
-are:
-
-- **User Q&A mechanism**: stdin prompts (CLI) vs. dialogs/actions (TUI)
-- **Audit container execution**: inherited stdio (CLI) vs. PTY session (TUI)
-
-All other logic — detection, migration, flag computation, build sequencing,
-socket checks, entrypoint selection, image selection, host-settings application,
-summary accumulation — uses the shared engine functions.
-
-| Engine function | Description |
-|---|---|
-| `compute_ready_build_flag(refresh, build)` | Returns `build` unless `refresh` is set (refresh always rebuilds post-audit, so forcing a pre-audit build is redundant). Migration overrides this value afterward. |
-| `is_legacy_layout(git_root, agent_name)` | Returns `true` when `Dockerfile.dev` exists, the agent is a known amux agent, and `.amux/Dockerfile.{agent}` does not yet exist. |
-| `perform_legacy_migration(git_root)` | Backs up `Dockerfile.dev` to `Dockerfile.dev.bak` and overwrites it with the minimal project base template. Returns display messages. |
-| `gather_ready_env_vars(git_root, agent_name)` | Calls `resolve_auth()` (handles keychain, env-var, and file-based auth) then appends `effective_env_passthrough` vars not already present. |
-| `create_ready_host_settings(agent_name)` | Thin wrapper: calls `passthrough_for_agent(agent_name).prepare_host_settings()`. |
-| `apply_ready_user_directive(host_settings, ctx)` | Applies the USER directive from the agent dockerfile to host settings so files are mounted at the correct home directory inside the container. Called after `run_pre_audit()` returns, before the audit container launches. |
-| `check_allow_docker(out, allow_docker, runtime)` | Verifies the host Docker socket is accessible when `--allow-docker` is set. Returns `Ok(())` when not needed or when socket is found (with a warning); returns `Err` when socket is missing. |
-| `build_audit_setup(ctx, non_interactive)` | Returns an `AuditSetup` with the image tag (agent image when available, project image in legacy mode) and the correct entrypoint. |
-| `run_pre_audit(…)` | Phase 1: daemon check, Dockerfile init, aspec check, local agent check, image build. Returns `ReadyContext`. |
-| `run_post_audit(…)` | Phase 3: rebuilds both images after the audit agent updates `Dockerfile.dev`. |
-
-### `AuditSetup`
-
-```rust
-pub struct AuditSetup {
-    pub image_tag: String,
-    pub entrypoint: Vec<String>,
-}
-```
-
-Produced by `build_audit_setup()`. Carries the image and entrypoint for the audit
-container: uses the agent image (`amux-{project}-{agent}:latest`) when available,
-or the project base image in legacy mode. The entrypoint uses the interactive form
-unless `non_interactive` is `true`.
+All business logic for `ready` lives in `oldsrc/commands/ready.rs`. The TUI and CLI call the same engine functions; the only difference is how user input is collected and how the audit container is executed.
 
 ---
 
-## Implement Command
+### Init Command
 
-The `implement` command accepts a 4-digit work item number (e.g. `0001`) and
-launches the configured agent to implement it. The agent receives a structured
-prompt that instructs it to implement the work item, iterate on builds and tests,
-write documentation, and ensure final success.
-
-### Interactive Mode (default)
-
-Uses `agent_entrypoint()` which launches the agent in interactive mode. An
-ASCII-art interactive notice is shown before launch.
-
-### Non-Interactive Mode (`--non-interactive`)
-
-Uses `agent_entrypoint_non_interactive()` which adds print-mode flags:
-- Claude: `-p` flag
-- Codex: `--quiet` flag
-- Opencode: same `run` subcommand
-
-Output is captured via `docker::run_container_captured()` and displayed.
-A tip suggests removing `--non-interactive` for direct interaction.
-
-### Plan Mode (`--plan`)
-
-When `--plan` is passed, the agent is initialized in read-only plan mode.
-Plan flags are appended after the regular entrypoint arguments via
-`append_plan_flags()`:
-- Claude: `--plan`
-- Codex: `--approval-mode plan`
-- Opencode: no plan mode (flag is silently ignored)
-
-`--plan` can be combined with `--non-interactive`.
-
-Host agent settings are mounted read-only into the container via
-`docker::HostSettings::prepare()`, which copies sanitized versions of
-`~/.claude.json` (with `oauthAccount` stripped) and `~/.claude/settings.json`
-into a temporary directory. These are mounted at `/root/.claude.json:ro` and
-`/root/.claude:ro`. The temp directory is cleaned up automatically when the
-`HostSettings` struct is dropped (after the container exits).
-
-When the host has no `~/.claude.json` (first-time users, CI machines),
-`HostSettings::prepare()` returns `None`. In this case, callers fall back to
-`HostSettings::prepare_minimal()`, which creates a settings-only mount with
-LSP suppression but no auth forwarding. This guarantees that LSP recommendation
-dialogs are always suppressed regardless of whether the host has a Claude config.
-
-Authentication is handled entirely via the `CLAUDE_CODE_OAUTH_TOKEN` environment
-variable — the host settings mount provides agent configuration (onboarding
-state, model preferences, plugins) without interfering with auth.
+All business logic lives in `oldsrc/commands/init_flow.rs`, called identically from the CLI (`init.rs`) and TUI adapters. The two differ only in `InitQa` (stdin vs. pre-collected TUI answers) and `InitContainerLauncher` (synchronous vs. background task).
 
 ---
 
-## Chat Command
+### Docker Build Streaming
 
-The `chat` command starts a freeform agent session with no pre-configured prompt.
-It shares the same underlying container-launching logic as `implement` via the
-`commands/agent.rs` module.
-
-### Shared Agent Launching (`commands/agent.rs`)
-
-The `run_agent_with_sink()` function is the shared code path for both `implement`
-and `chat`. It handles:
-
-- Git root detection and config loading
-- Mount path resolution
-- Docker image tag derivation
-- Docker command display (with masked secrets)
-- Interactive notice display
-- Container launching (interactive or captured)
-
-The only differences between `chat` and `implement` are:
-- **Entrypoint**: `chat` passes just the agent command (e.g. `["claude"]`);
-  `implement` passes the agent command + a structured prompt
-- **Status message**: `chat` shows "Starting chat session"; `implement` shows
-  the work item being implemented
-
-### Chat Entrypoints
-
-| Agent | Interactive | Non-Interactive | Plan (appended) |
-|-------|-----------|-----------------|-----------------|
-| `claude` | `["claude"]` | `["claude", "-p"]` | `["--plan"]` |
-| `codex` | `["codex"]` | `["codex", "--quiet"]` | `["--approval-mode", "plan"]` |
-| `opencode` | `["opencode"]` | `["opencode"]` | (none) |
+`docker::build_image_streaming()` spawns `docker build` and reads stdout and stderr concurrently in separate background threads, forwarding lines through a shared `mpsc` channel to the `on_line` callback as they arrive.
 
 ---
 
-## New Command
-
-The `new` command creates a new work item from the `0000-template.md` template.
-
-1. Locates the template at `GITROOT/aspec/work-items/0000-template.md`
-2. Scans existing work item files to determine the next sequential number
-3. Collects the work item kind (Feature/Bug/Task) and title
-4. Generates a slug from the title (lowercase, spaces→hyphens, strip non-alphanumeric)
-5. Writes the new file with template substitutions applied
-6. Opens the file in VS Code if running in the VS Code terminal
-
-In **command mode**, kind and title are collected via stdin prompts.
-In **TUI mode**, two dialog overlays (`NewKindSelect` → `NewTitleInput`) collect
-the information, then `run_with_sink` is called with the pre-supplied values.
-
----
-
-## Init Command
-
-The `init` command sets up a new project for use with amux. All business logic
-lives in `src/commands/init_flow.rs`, which is called identically from both the
-CLI and TUI adapters. The two surfaces differ only in how they collect user input
-(`InitQa` trait) and how they launch containers (`InitContainerLauncher` trait).
-It is structurally impossible for the two surfaces to diverge in stage coverage
-or file output.
-
-### Unified Engine (`src/commands/init_flow.rs`)
-
-`InitFlow::execute()` is the single entry point for everything `init` does:
-
-```rust
-pub async fn execute<Q: InitQa, L: InitContainerLauncher>(
-    params: InitParams,
-    qa: &mut Q,
-    launcher: &L,
-    sink: &OutputSink,
-    runtime: &dyn AgentRuntime,
-) -> anyhow::Result<InitSummary>
-```
-
-Stages run in order, each updating `InitSummary`. If an early stage fails, later
-stages set their status to `Skipped` rather than running against broken
-preconditions.
-
-| # | Stage | Description |
-|---|-------|-------------|
-| 1 | Collect Q&A | Calls `qa.ask_replace_aspec()` and `qa.ask_run_audit()` |
-| 2 | Repo config | Reads or creates `aspec/.amux.json` with the chosen agent |
-| 3 | aspec folder | Downloads or skips `aspec/` based on `params.aspec` flag |
-| 4 | Dockerfile.dev | Writes project base template if absent |
-| 5 | Agent dockerfile | Writes `.amux/Dockerfile.{agent}` template if absent |
-| 6 | Runtime check | Verifies container runtime is available; exits early on error |
-| 7a | With audit | Build project image → build agent image → run audit → rebuild both |
-| 7b | Without audit (new files only) | Build project image → build agent image |
-| 8 | Work items setup | Calls `qa.ask_work_items_setup()`; writes result to repo config |
-| 9 | Summary | Prints `InitSummary` table and "What's Next?" guide |
-
-Stage 7a rebuilds both images after the audit because the audit agent may rewrite
-`Dockerfile.dev`. This rebuild is non-optional and is always performed by the
-launcher, not gated by a flag.
-
-### `InitQa` Trait
-
-Handles all user question-and-answer interactions during the flow:
-
-```rust
-pub trait InitQa {
-    fn ask_replace_aspec(&mut self) -> anyhow::Result<bool>;
-    fn ask_run_audit(&mut self) -> anyhow::Result<bool>;
-    fn ask_work_items_setup(&mut self) -> anyhow::Result<Option<WorkItemsConfig>>;
-}
-```
-
-| Implementation | Backing mechanism |
-|---|---|
-| `CliInitQa` | `ask_yes_no_stdin()` and `read_line()` — blocks on stdin |
-| `TuiInitQa` | Holds a pre-collected `TuiInitAnswers` struct; returns answers immediately without blocking |
-
-`TuiInitQa` can accurately represent "the user was never asked this question"
-(e.g. `ask_replace_aspec` is skipped when `--aspec` was not passed or `aspec/`
-does not exist) — this is encoded as `replace_aspec = false`, never as an error.
-
-### `InitContainerLauncher` Trait
-
-Decouples the flow from any specific blocking vs. async container strategy:
-
-```rust
-pub trait InitContainerLauncher {
-    fn build_image(&self, tag: &str, dockerfile: &Path, context: &Path, sink: &OutputSink) -> anyhow::Result<()>;
-    fn run_audit(&self, agent: Agent, cwd: &Path, sink: &OutputSink) -> anyhow::Result<()>;
-}
-```
-
-| Implementation | Behavior |
-|---|---|
-| `CliContainerLauncher` | Delegates to `AgentRuntime`; blocks synchronously (inherited stdio) |
-| `TuiContainerLauncher` | Runs inside the background task spawned by `launch_init()`; blocking there is safe since the task has its own thread |
-
-Both implementations delegate to `AgentRuntime` rather than calling Docker
-directly — `InitContainerLauncher` is an orchestration boundary, not a
-runtime abstraction.
-
-### CLI Adapter (`src/commands/init.rs`)
-
-A thin shim with no business logic:
-
-```rust
-pub async fn run(agent: Agent, aspec: bool, cwd: PathBuf, runtime: &dyn AgentRuntime) -> anyhow::Result<()> {
-    let git_root = find_git_root_from(&cwd)?;
-    let mut qa = CliInitQa::new(&git_root);
-    let launcher = CliContainerLauncher::new(runtime);
-    let sink = OutputSink::Stdout;
-    let params = InitParams { agent, aspec, git_root };
-    init_flow::execute(params, &mut qa, &launcher, &sink, runtime).await?;
-    Ok(())
-}
-```
-
-All Q&A (including `ask_replace_aspec` and `ask_run_audit`) happens inside
-`execute()` at the correct stage — there is no upfront pre-flight Q&A outside the
-flow.
-
-### TUI Adapter (`src/tui/mod.rs`)
-
-The TUI collects answers through three dialog states before calling `launch_init()`:
-
-| Dialog | Purpose | Condition |
-|--------|---------|-----------|
-| `InitReplaceAspec` | Ask whether to overwrite existing `aspec/` | Only when `--aspec` was passed and `aspec/` already exists |
-| `InitAuditConfirm` | Ask whether to run the Dockerfile audit | Always |
-| `InitWorkItemsSetup` | Ask for work items directory / template paths | When `aspec/` will not be downloaded and no work items dir is configured |
-
-All three dialogs populate a `TuiInitAnswers` struct. When the final dialog is
-dismissed, `launch_init()` constructs `TuiInitQa { answers }` and
-`TuiContainerLauncher` and calls `init_flow::execute()` inside a background task
-— identical in shape to how `launch_ready()` drives `ready.rs`.
-
-The `pending_init_run_audit` flag and `check_init_continuation()` that
-previously deferred the audit to a separate `ready --refresh` invocation no longer
-exist. The audit is now run inline inside `execute()` via `TuiContainerLauncher`.
-
-### `InitSummary`
-
-```rust
-pub struct InitSummary {
-    pub config:           StepStatus,
-    pub aspec_folder:     StepStatus,
-    pub dockerfile_dev:   StepStatus,
-    pub agent_dockerfile: StepStatus,
-    pub agent_audit:      StepStatus,
-    pub base_image:       StepStatus,
-    pub agent_image:      StepStatus,
-    pub work_items:       StepStatus,
-}
-```
-
-Each `StepStatus` is one of `Pending`, `Ok(msg)`, `Skipped(msg)`, `Failed(msg)`,
-or `Warn(msg)`. `print_init_summary()` renders the table shown at the end of
-every `init` run. `InitSummary` lives in `init_flow.rs` — it is part of the
-shared flow, not the CLI or TUI presentation layer.
-
----
-
-## Docker Build Streaming
-
-`docker::build_image_streaming()` spawns `docker build` and reads stdout and
-stderr concurrently in separate background threads. Both threads send lines
-through a shared `std::sync::mpsc` channel, and the calling thread receives
-lines from the channel and forwards them to the `on_line` callback as they
-arrive. This ensures real-time streaming of Docker build output — including
-stderr, where Docker emits most of its build progress — rather than buffering
-stderr until after stdout finishes.
-
-The `OutputSink`'s `Clone` implementation enables passing it into the streaming
-callback closure.
-
----
-
-## PTY Architecture
-
-For `implement`, the container process must have a real terminal (PTY) so that
-interactive agent CLIs (Claude, Codex, etc.) work correctly.
+### PTY Architecture
 
 ```
 App::pty (PtySession)
@@ -869,166 +2870,9 @@ PtyEvent channel (std::sync::mpsc)
     └── wait thread   → Exit(i32)         ← child.wait() → finish_command()
 ```
 
-Key design decisions:
-- `master` stays on the main thread (no `Send` required); only `resize()` is called on it
-- The writer (`Box<dyn Write + Send>`) is moved to a dedicated `std::thread` and communicated
-  with via a bounded `std::sync::mpsc::sync_channel`
-- The child (`Box<dyn Child + Send>`) is moved to a wait thread; its exit code is sent
-  back via `std::sync::mpsc`
-- PTY output bytes are processed for `\r` (carriage return) and `\n` (newline) from
-  the raw byte stream *before* ANSI stripping, because `strip_ansi_escapes::strip`
-  removes `\r` characters. A bare `\r` clears the line buffer (overwrite from start),
-  `\r\n` is treated as a newline, and content segments between control characters are
-  ANSI-stripped before appending. A "live line" at the end of `output_lines` is updated
-  in-place until finalized by `\n`, enabling correct display of terminal spinners and
-  progress indicators. Full terminal emulation (cursor tracking, screen clearing) is
-  a future enhancement.
-
-For `init` and `ready` (no PTY needed), `spawn_text_command` runs a tokio task that
-passes an `OutputSink::Channel` to `run_with_sink` and sends the exit code through
-a `tokio::sync::oneshot` channel.
-
-### Dockerfile Audit (ready --refresh)
-
-The `ready --refresh` command runs a three-phase workflow:
-
-1. **Pre-audit** (text command via `OutputSink`): checks Docker daemon, ensures
-   `Dockerfile.dev` exists, checks aspec folder, checks local agent, builds the
-   image (streaming). Returns a `ReadyContext` with the image tag, mount path,
-   agent name, env vars, and agent image tag. Also returns a `ReadySummary` with
-   the status of each pre-audit step.
-2. **Audit** (interactive PTY or captured): launches the agent to scan the project
-   and update `Dockerfile.dev`. In command mode with interactive: uses
-   `runtime.run_container()` with inherited stdio. In command mode with
-   `--non-interactive`: uses `runtime.run_container_captured()`. In TUI mode:
-   uses a PTY session (interactive) or captured command (non-interactive).
-3. **Post-audit** (text command): rebuilds both the project base image and the
-   agent image with streaming output, then prints the final summary table.
-
-Without `--refresh`, only phase 1 runs, followed by the summary table.
-
-In TUI mode, `ReadyPhase` tracks which phase is active. When a phase completes,
-`check_ready_continuation()` automatically launches the next phase.
-
-**Summary continuity in TUI mode**: after phase 1 completes, `check_ready_continuation()`
-stores both the `ReadyContext` and the `ReadySummary` in `Tab.ready_ctx` and
-`Tab.ready_summary`. Phase 3 (`launch_ready_post_audit()`) retrieves this stored
-summary and passes it directly to `run_post_audit()`, so the final table includes
-the docker_daemon, dockerfile, and dev_image statuses from phase 1 — not
-reconstructed defaults.
-
-Image tags are project-specific (`amux-{projectname}:latest`) derived from the
-Git root folder name via `runtime::project_image_tag()`.
-
-**Migration and image rebuild**: when a legacy layout migration runs, `build`
-is set to `true` after `perform_legacy_migration()` succeeds. `run_pre_audit()`
-checks `opts.build` as part of its `needs_build` condition, so the project base
-image is rebuilt from the new minimal `Dockerfile.dev` before the agent image is
-built on top of it. Without this flag, the cached legacy image would be used and
-the audit would run inside the old environment.
-
-### Host Settings Injection
-
-`docker::HostSettings` encapsulates the preparation and lifetime of the
-sanitized Claude configuration that is bind-mounted into every agent container.
-
-```
-~/.claude.json          ──sanitize──► temp/claude.json       (oauthAccount removed,
-~/.claude/              ──filter──►  temp/dot-claude/         /workspace trust added,
-                                         settings.json        LSP suppression applied)
-                                         (denylist applied)
-```
-
-**Sanitization steps performed by `HostSettings::prepare()`:**
-
-1. Read `~/.claude.json`; strip `oauthAccount` (OAuth tokens live in the
-   macOS keychain, not in this file, but the field references the account and
-   can produce broken state inside the container).
-2. Inject `/workspace` project trust so Claude Code does not show the
-   "do you trust this project?" dialog inside the container.
-3. Copy `~/.claude/` into a temp directory with a denylist filter that excludes
-   large, host-specific, or irrelevant entries (`projects/`, `sessions/`,
-   `history.jsonl`, `telemetry/`, etc.).
-4. Call `disable_lsp_recommendations()` to write the correct suppression key
-   into `settings.json`, preventing LSP installation dialogs inside the container
-   (containers have no IDE and no pre-installed language servers).
-
-**LSP recommendation suppression (`disable_lsp_recommendations`):**
-
-Reads the existing `settings.json` (or starts from `{}`), merges the LSP
-suppression key, and writes the result back. Existing settings keys are
-preserved. If `settings.json` contains invalid JSON, the function falls back to
-`{}` so that the container launch is never blocked.
-
-**Fallback when host has no `~/.claude.json` (`HostSettings::prepare_minimal`):**
-
-`prepare()` returns `None` when the host has no `~/.claude.json` (first-time
-users, CI machines). Callers use `or_else(|| HostSettings::prepare_minimal())`
-to ensure a minimal settings mount is always created. `prepare_minimal()` skips
-auth and config forwarding but still applies LSP suppression, guaranteeing that
-LSP dialogs are suppressed even on machines where Claude has never been used.
-
-**Lifetime management:**
-
-`HostSettings` holds a `tempfile::TempDir` (RAII). The temp directory — and all
-bind-mounted files — is automatically deleted when `HostSettings` is dropped,
-which occurs after the container exits. `prepare_to_dir` writes into a
-caller-supplied stable directory instead so that bind-mount sources survive
-process restarts (used by the TUI's persistent session path).
-
-**Denylist (`CLAUDE_DIR_DENYLIST`):**
-
-Top-level `~/.claude/` entries skipped during copy:
-`projects`, `sessions`, `session-env`, `debug`, `file-history`,
-`history.jsonl`, `telemetry`, `downloads`, `ide`, `shell-snapshots`,
-`paste-cache`.
-
-### Agent Credential Passing
-
-Agent credentials are extracted from the macOS system keychain and passed
-into the container via a single environment variable:
-
-- **`CLAUDE_CODE_OAUTH_TOKEN`**: The OAuth credential JSON (containing
-  `accessToken`, `refreshToken`, `expiresAt`), passed via `-e`. Claude Code
-  reads this env var on startup for authentication.
-
-No credential files are mounted. The environment variable is the only
-credential passed to the container. Host agent settings (model preferences,
-onboarding state) are mounted separately via `HostSettings` — see the
-Implement Command section above.
-
-The credential extraction flow:
-
-1. `auth::read_keychain_raw()` calls macOS `security find-generic-password`
-   to read the full JSON blob from the keychain (service: `Claude Code-credentials`)
-2. `auth::extract_token_from_keychain_json()` parses the JSON and extracts
-   the `claudeAiOauth` inner object as a JSON string
-3. The JSON is returned and passed as the `CLAUDE_CODE_OAUTH_TOKEN` env var
-
-`auth::resolve_auth()` always returns keychain credentials (auto-passthrough)
-without prompting. No opt-in dialog is needed.
-
-`docker::append_env_args()` translates `(key, value)` pairs into
-`-e KEY=VALUE` Docker flags.
-
-For display purposes (CLI output, TUI window), `build_run_args_display()`
-masks env var values as `KEY=***` to prevent accidental secret exposure.
-
-### Docker Command Visibility
-
-Every `docker build` and `docker run` invocation is formatted as a CLI string
-via `docker::format_build_cmd()` / `docker::format_run_cmd()` and printed
-through the `OutputSink` before execution. In command mode this appears on
-stdout; in TUI mode it appears in the execution window output.
-
 ---
 
-## Container Window
-
-When `implement`, `chat`, or `ready --refresh` launches an interactive agent, the TUI
-displays a dedicated **container window** overlaying the outer execution window.
-
-### State Machine
+### Container Window
 
 ```
 Hidden ──[start_container()]──► Maximized ──[Esc]──► Minimized ──['c']──► Maximized
@@ -1036,198 +2880,27 @@ Hidden ──[start_container()]──► Maximized ──[Esc]──► Minimiz
                                      └────[finish]────────┘──► Hidden + Summary bar
 ```
 
-`ContainerWindowState` is an enum with three variants: `Hidden`, `Maximized`,
-and `Minimized`. The state transitions are:
+When maximized, the container window covers 95% of the outer execution window. When minimized, a 1-line green-bordered bar shows the agent name and live stats.
 
-- **Hidden → Maximized**: `start_container()` is called when an agent launches.
-  It sets the container name, agent display name, start time, and initializes
-  the stats channel receiver.
-- **Maximized → Minimized**: User presses `Esc`. The outer window becomes
-  visible and scrollable while the container continues running in the background.
-  A 1-line green-bordered bar shows the agent name and live stats.
-- **Minimized → Maximized**: User presses `c`. The container window re-overlays
-  the outer window and keyboard input is forwarded to the container again.
-- **Maximized/Minimized → Hidden**: `finish_command()` transitions the container
-  window to `Hidden` and generates a `LastContainerSummary` with average CPU,
-  peak memory, and total runtime.
-
-### Layout
-
-When **maximized**, the container window covers 95% of the outer execution
-window's width and height, centered. It has a green border with:
-- Left title: `🔒 {agent} (containerized)` (e.g. `🔒 Claude Code (containerized)`)
-- Right title: `{container_name} | CPU {cpu}% | Mem {mem}MB | {runtime}`
-
-When **minimized**, a 1-line bar with green border appears between the outer
-execution window and the command box, showing agent name and live stats.
-
-After the container **exits**, a summary bar with dashed border shows:
-`{agent} exited | avg CPU {cpu}% | peak mem {mem}MB | runtime {duration}`
-
-### Container Scrollback
-
-When the container window is maximized, the mouse scroll wheel scrolls through
-the vt100 terminal's scrollback buffer at 5 lines per tick. The view is
-controlled via the vt100 crate's `set_scrollback()` API:
-
-- **Scroll up**: increases `container_scroll_offset` (capped at the actual
-  scrollback depth). `parser.set_scrollback(offset)` shifts the rendered view
-  into the buffer; `render_vt100_screen_no_cursor()` displays that slice.
-- **Scroll down**: decreases the offset; at 0 the live screen is shown and
-  `render_vt100_screen()` (with cursor) is used instead.
-- **Indicator**: a centered yellow title (`↑ scrollback (N / M lines)`) appears
-  in the container border when scrolled — `N` is the current offset and `M` is
-  the total scrollback depth available.
-
-**Scrollback depth probe:**
-
-The `vt100::Screen` does not expose a direct `scrollback_len()` accessor. The
-actual depth is probed by calling `parser.set_scrollback(usize::MAX)` (which
-internally clamps to the real length) and then reading `screen.scrollback()`:
-
-```rust
-parser.set_scrollback(usize::MAX);
-let max = parser.screen().scrollback();
-parser.set_scrollback(0);
-```
-
-This probe is performed in both the scroll handler (to cap the offset) and the
-renderer (to compute the `M` value for the scrollback indicator). The parser is
-reset to `0` (live view) before any rendering begins.
-
-**Configurable scrollback capacity:**
-
-The parser is created with `vt100::Parser::new(rows, cols, scrollback_lines)`,
-where `scrollback_lines` comes from `tab.terminal_scrollback_lines`. This field
-defaults to `DEFAULT_SCROLLBACK_LINES` (10,000) and is loaded from config before
-each `start_container()` call via `config::effective_scrollback_lines()`.
-
-Config precedence: per-repo (`GITROOT/.amux/config.json`) → global
-(`$HOME/.amux/config.json`) → built-in default (10,000). A 10,000-line buffer at
-80 columns uses approximately 3 MB per tab.
-
-Scrollback state (`container_scroll_offset`) resets to 0 when a new container starts.
-
-### Terminal Text Selection
-
-When the container window is maximized, users can select terminal output with
-the mouse and copy it to the clipboard with **Ctrl+Y**.
-
-**Selection state (`TabState`):**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `terminal_selection_start` | `Option<(u16, u16)>` | Anchor cell in vt100 (row, col) space; set on `MouseDown` |
-| `terminal_selection_end` | `Option<(u16, u16)>` | End cell; extended on `MouseDrag`, finalized on `MouseUp` |
-| `terminal_selection_snapshot` | `Option<Vec<Vec<String>>>` | Grid of cell strings captured at `MouseDown`; isolated from live output |
-| `container_inner_area` | `Option<Rect>` | Inner content area recorded each render frame; used for mouse→vt100 coordinate conversion |
-
-**Coordinate conversion:**
-
-Mouse terminal coordinates are converted to vt100 cell positions using the
-stored `container_inner_area`:
-
-```
-vt100_col = mouse.column - inner.x
-vt100_row = mouse.row   - inner.y
-```
-
-Drag events clamp to `inner.width - 1` / `inner.height - 1` to stay within
-bounds. Any click outside the `container_inner_area` rectangle is ignored.
-
-**Output snapshot isolation:**
-
-When `MouseDown` fires, `capture_vt100_snapshot()` captures the current
-`vt100::Screen` cell contents into `terminal_selection_snapshot`. Subsequent
-drag and copy operations read from this snapshot instead of the live parser,
-preventing live output from shifting cell coordinates under the selection.
-
-**Text extraction:**
-
-`extract_selection_text()` normalises the selection so start ≤ end in row-major
-order, iterates the snapshot rows and columns within the range, strips trailing
-spaces from each row, and joins rows with `\n`. ANSI attributes are not present
-in the snapshot — cell contents are already plain text.
-
-**Clipboard abstraction:**
-
-Clipboard writes go through the `ClipboardWriter` trait (defined in
-`tui/mod.rs`), which has a single method `set_text(&str) -> Result<(), String>`.
-The production implementation wraps `arboard::Clipboard`. A `MockClipboard` is
-provided in tests. The public `copy_selection_to_clipboard(tab, clipboard)`
-function drives extraction and write; it returns `true` if non-empty text was
-written successfully.
-
-In headless environments (no X11/Wayland display server), `arboard::Clipboard::new()`
-returns an error; `amux` logs a warning and degrades gracefully — the copy
-keybinding does nothing rather than panicking.
-
-**Selection lifecycle:**
-
-| Event | Effect |
-|-------|--------|
-| `MouseDown` inside inner area | Sets `terminal_selection_start`, `terminal_selection_end`, captures snapshot |
-| `MouseDrag` (left button) | Updates `terminal_selection_end` (clamped) |
-| `MouseUp` | No-op; selection already set |
-| Ctrl+Y (selection active) | Calls `copy_selection_to_clipboard`; clears selection |
-| Ctrl+Y (no selection) | Forwarded to PTY (byte 0x19) |
-| Esc | Minimizes window; clears selection via `clear_terminal_selection()` |
-| Terminal resize | `clear_terminal_selection()` on all tabs (vt100 re-wraps on resize) |
-| `start_container()` | Clears selection |
-
-**Rendering:**
-
-`render_vt100_screen()` and `render_vt100_screen_no_cursor()` accept a
-`selection: Option<((u16, u16), (u16, u16))>`. Selected cells have
-`Modifier::REVERSED` applied on top of their normal style, matching standard
-terminal selection appearance. The selection is normalised inside each render
-function before the `cell_in_selection()` helper is called per cell.
-
-### PTY Output Routing
-
-PTY output bytes are routed to different line buffers depending on the container
-window state:
-
-- **Container window active** (`Maximized` or `Minimized`): PTY data goes to
-  `container_output_lines`, displayed inside the container window.
-- **Container window hidden**: PTY data goes to `output_lines`, displayed in
-  the outer execution window (original behavior).
-
-The routing decision is made in `process_pty_data()` using `pty_uses_container()`,
-which returns `true` when `container_window` is not `Hidden`. This avoids a
-mutable borrow conflict by returning a boolean flag instead of a mutable
-reference to the target buffer.
-
-### Docker Stats Polling
-
-When a container starts, `spawn_stats_poller()` creates a tokio task that polls
-Docker stats every 5 seconds:
-
-```
-tokio::spawn ──► loop {
-    interval.tick().await           (5s)
-    spawn_blocking(query_container_stats)
-    tx.send(stats)
-}
-```
-
-`query_container_stats()` runs `docker stats --no-stream --format` and parses
-the JSON output into a `ContainerStats` struct (name, cpu_percent, memory).
-The stats are sent via `tokio::sync::mpsc::unbounded_channel` and drained in
-`App::tick()` each render cycle.
-
-Each polled stats snapshot is appended to `ContainerInfo::stats_history` for
-computing averages and peaks when the container exits.
-
-### Container Naming
-
-`generate_container_name()` produces a deterministic name (`amux-{pid}-{nanos}`)
-passed to `docker run --name`. This allows `query_container_stats()` to query
-stats for the specific container by name.
+Container stats are polled every 5 seconds via a tokio task that calls `docker stats --no-stream`.
 
 ---
 
-## Agent Auth Flow
+### Host Settings Injection
+
+`HostSettings` encapsulates the preparation and lifetime of the sanitized agent configuration mounted into every container:
+
+```
+~/.claude.json   ──sanitize──► temp/claude.json      (oauthAccount removed,
+~/.claude/       ──filter──►   temp/dot-claude/        /workspace trust added,
+                                   settings.json        LSP suppression applied)
+```
+
+The denylist excludes `projects/`, `sessions/`, `history.jsonl`, `telemetry/`, and similar host-only artefacts.
+
+---
+
+### Agent Auth Flow
 
 ```
 ready/implement/chat submitted
@@ -1236,124 +2909,25 @@ ready/implement/chat submitted
    read_keychain_raw() → extract OAuth JSON → CLAUDE_CODE_OAUTH_TOKEN env var
 ```
 
-If the host agent is installed and authenticated, credentials are sourced from
-the macOS system keychain and passed automatically into the container — no
-prompting required. If credentials are unavailable, the container launches
-without them.
+Credentials are sourced from the macOS system keychain and passed as an environment variable — never mounted as files.
 
 ---
 
-## Performance Characteristics
+### Performance Characteristics
 
-This section documents the performance design of amux, based on the audit conducted in work item 0033. It covers the render loop, memory model, async task architecture, and Docker interaction overhead.
+**Render loop:** `terminal.draw()` is called unconditionally on every loop iteration (~60 Hz). Ratatui double-buffering means terminal I/O is proportional to changed cells, not screen size.
 
----
+**Output buffer:** `TabState` holds an `output_lines: Vec<String>`. A 10,000-line cap (configurable) applies to the vt100 container parser. The outer text buffer is bounded by a VecDeque cap (see work item 0035).
 
-### Render Loop
+**Docker interaction:** all Docker operations spawn a new `std::process::Command` child. Stats are polled every 5 seconds per active container.
 
-The TUI event loop runs in `src/tui/mod.rs` and drives all rendering:
-
-```
-loop {
-    terminal.draw(|f| render::draw(f, &mut app))?;  // redraws every iteration
-    if event::poll(Duration::from_millis(16))? {    // ≤16ms wait
-        // handle key/mouse event
-    }
-    tick_all(&mut app);   // drains channels, updates state
-}
-```
-
-**Always-redraw (current behaviour):** `terminal.draw()` is called unconditionally on every loop iteration (~60 Hz), regardless of whether any state changed. When the user is idle and no container is running, the full widget tree is rebuilt and diffed every ~16 ms. A dirty-flag optimisation is planned (work item 0034) that will skip `terminal.draw()` when no state has changed.
-
-**Ratatui double-buffering:** `Terminal::draw()` compares the new widget cell buffer against the previous frame and emits only changed cells as terminal escape codes. This means terminal I/O is proportional to changed cells, not screen size, so the idle-CPU cost is widget construction rather than terminal output.
-
-**Tick rate:** the `event::poll(16ms)` call caps the maximum frame rate at ~60 Hz.
+**Scalability target:** 20 concurrent tabs.
 
 ---
 
-### Output Buffer
+### Headless Mode
 
-Each `TabState` holds an `output_lines: Vec<String>` for non-container (text command) output. This buffer is currently **unbounded** — lines accumulate for the lifetime of the tab. A bounded ring-buffer replacement using `VecDeque<String>` with a configurable cap (default 10,000 lines) is planned in work item 0035.
-
-**Memory estimates at current behaviour:**
-- Typical terminal line: ~80 bytes average after ANSI stripping
-- After 1 hour of moderate output: ~4–8 MB per tab
-- After 3+ hours of high-throughput output: can grow to tens of MB per tab
-
-**Cleanup on tab close:** `TabState` is dropped when a tab is closed, freeing `output_lines` immediately via Rust's ownership model. There is no cross-tab leak — the risk is growth during the tab's own lifetime.
-
-The `vt100::Parser` used for container window rendering is initialised with a **1,000-line scrollback cap** (matching common terminal emulators), which is a hard memory bound on the full-terminal emulation path.
-
-The scroll computation in `draw_exec_window` iterates all retained lines each frame to compute the total visual row count for scroll offset rendering (O(n) where n = lines in buffer). With a bounded buffer this becomes O(max_lines); until work item 0035 lands, n is unbounded.
-
----
-
-### Async Task Architecture
-
-amux uses a mixed async/thread model:
-
-| Task/Thread | Spawn mechanism | Exit condition |
-|---|---|---|
-| Stats poller | `tokio::spawn` + `spawn_blocking` for Docker call | `stats_rx` receiver dropped on `finish_command` |
-| Text command (init, ready, non-interactive implement) | `tokio::spawn` via `spawn_text_command` | Function returns |
-| PTY reader | `std::thread::spawn` | EOF on PTY master (process exit or master close) |
-| PTY wait | `std::thread::spawn` | Child process exits |
-| PTY writer | `std::thread::spawn` | `input_rx` channel closed when `PtySession` is dropped |
-| Docker build stdout/stderr | `std::thread::spawn` | EOF on subprocess stdout/stderr |
-| Status watch | `tokio::spawn` via `spawn_text_command` | `status_watch_cancel_tx` fires cancel |
-
-**Tab close cleanup:** dropping a `TabState` closes the PTY master (`Box<dyn MasterPty>`), which sends SIGHUP to the foreground process group of the PTY on Linux and macOS. This causes the `docker run` child process to exit, which in turn causes the PTY reader thread and wait thread to exit. Dropping `PtySession` closes the writer channel, causing the writer thread to exit. Cleanup is RAII-driven; no explicit join or cancel call is needed for PTY sessions.
-
-**Blocking calls and Tokio:** `run_container_captured` and `run_container` are synchronous functions that block until the Docker subprocess exits. They are called inside `tokio::spawn` tasks via `spawn_text_command` without `spawn_blocking`, which occupies a Tokio worker thread for the container's full runtime. During a long agent run (minutes), this can starve other tasks scheduled on that worker thread. The stats poller correctly uses `spawn_blocking` for its `docker stats` call and serves as the model for the fix planned in work item 0036.
-
-**Channel sizing:**
-
-| Channel | Type | Capacity |
-|---|---|---|
-| PTY event (`PtyEvent`) | `std::sync::mpsc::sync_channel` | 256 |
-| PTY input | `std::sync::mpsc::sync_channel` | 64 |
-| Text output (`output_tx`/`output_rx`) | `tokio::sync::mpsc::unbounded_channel` | Unbounded (bounded+lossy replacement planned in work item 0038) |
-| Stats | `tokio::sync::mpsc::unbounded_channel` | Unbounded (≤1 message queued at 5s poll rate; effectively bounded) |
-
----
-
-### Docker Interaction Overhead
-
-All Docker operations spawn a new `std::process::Command` child process. There is no persistent Docker HTTP client. Typical per-operation costs:
-
-| Operation | Approximate latency |
-|---|---|
-| `docker info` (daemon check) | 50–200 ms |
-| `docker stats --no-stream` (stats poll) | 200–500 ms |
-| `docker build` | seconds–minutes (cache-dependent) |
-| `docker run` startup | dominated by container init, not subprocess spawn (~5 ms) |
-
-Stats are polled every **5 seconds** per active container, amortising the ~300 ms Docker call cost adequately. Each container session has its own stats poller task; in normal usage containers have unique generated names so there is no deduplication overhead.
-
-Container cleanup uses `--rm` on all `docker run` invocations, causing Docker to remove the container immediately on exit. No manual cleanup is required.
-
----
-
-### Scalability Target
-
-**20 concurrent tabs** (containers) is the validated scalability target. Key O(n) paths and their cost at 20 tabs:
-
-| Path | Complexity | Cost at 20 tabs |
-|---|---|---|
-| `tick_all()` | O(tabs) | ~20 µs (negligible) |
-| `draw_tab_bar()` | O(tabs) | Negligible |
-| `draw_exec_window()` | O(output_lines of active tab only) | Unaffected by tab count |
-| `tui_tabs_shared` lock | O(tabs) | Brief write lock per tick; no contention |
-
-Inactive tabs are rendered only as a tab bar entry — the full render path runs only for the active tab.
-
----
-
-## Headless Mode
-
-The headless server is a third execution mode alongside command mode and the TUI. It is implemented entirely within `src/commands/headless/` and shares no state with the TUI event loop.
-
-### Request flow
+The headless server runs as a third execution mode alongside command mode and the TUI.
 
 ```
 HTTP client
@@ -1365,8 +2939,6 @@ axum router (server.rs)
      │
      └── POST /v1/commands ──► validate session (DB)
                                      │
-                                     ├── acquire per-session mutex (in-memory)
-                                     │
                                      └── tokio::spawn ──► commands::run() dispatch
                                                                │
                                                                ▼
@@ -1375,119 +2947,46 @@ axum router (server.rs)
                                                          status → db::update_command()
 ```
 
-### `AppState`
+`AppState` holds the allowlist, a `Mutex<Connection>`, and a per-session mutex map. The `AMUX_HEADLESS_ROOT` env var overrides the storage root for test isolation.
 
-The axum router is backed by a shared `AppState` (wrapped in `Arc`) that holds:
-
-- The resolved working-directory allowlist (`Vec<PathBuf>`)
-- A `tokio::sync::Mutex<rusqlite::Connection>` — single writer, avoids `SQLITE_BUSY` under concurrent requests
-- A `HashMap<Uuid, Arc<Mutex<()>>>` — one mutex per active session, enforces the one-command-at-a-time invariant without blocking unrelated sessions
-
-### Database access
-
-`db.rs` is a leaf module with no knowledge of axum or the HTTP layer. All data-access functions accept a `MutexGuard<Connection>`. The schema is created on first run inside `db::init_schema()` and never migrated — future schema changes require a new version.
-
-The `AMUX_HEADLESS_ROOT` environment variable overrides the storage root (`~/.amux/headless/`). Set it in tests to redirect all DB and log-file writes to a `tempfile::TempDir`, keeping tests hermetic.
-
-### Subcommand execution
-
-When `POST /v1/commands` is accepted:
-
-1. A new `commands` row is written with `status = pending`.
-2. A Tokio task is spawned. The task:
-   a. Updates the row to `status = running` and records `started_at`.
-   b. Creates `~/.amux/headless/sessions/<session-id>/commands/<command-id>/` and opens `stdout.log` and `stderr.log` for incremental async writes (`tokio::fs`).
-   c. Dispatches to the existing `commands::run()` path with an `OutputSink` wired to the log files, using the session's `workdir` as the execution CWD.
-   d. On completion, updates the row with `status`, `exit_code`, and `finished_at`.
-3. The HTTP response (`{ "command_id": "..." }`) is returned before step 2 completes — execution is fire-and-forget from the client's perspective.
-
-All file I/O within the server uses `tokio::fs` (async) to avoid blocking the Tokio executor. Synchronous `std::fs` is restricted to startup and shutdown paths.
-
-### Background mode
-
-`process.rs` encapsulates all OS-specific daemonization:
-
-| Platform | Strategy |
-|----------|----------|
-| Linux (systemd) | `systemd-run --user --unit=amux-headless.service -- amux headless start …` (without `--background`) |
-| macOS (launchd) | Writes `~/Library/LaunchAgents/io.amux.headless.plist`; calls `launchctl load` |
-| Fallback | Double-fork via `nix::unistd::fork()`; setsid; redirect stdio to `/dev/null` |
-
-In all cases the child PID is written to `~/.amux/headless/amux.pid`. `run_kill()` reads the PID, sends `SIGTERM`, and waits up to 5 seconds before `SIGKILL`; then removes the PID file and (on macOS) unloads the plist.
-
-### Logging
-
-`logging.rs` configures `tracing-subscriber` differently by mode:
-
-- **Foreground**: `fmt::Subscriber` with `ANSI` colours, directed to stdout.
-- **Background**: `fmt::Subscriber` with JSON format, appending to `~/.amux/headless/amux.log`. A size guard truncates the log when it exceeds 100 MB (keeping the last 10 MB) to prevent unbounded growth.
-
-A heartbeat task logs an `INFO`-level summary every 60 seconds: active session count, running command count.
+Background daemonization: systemd-run on Linux, launchd plist on macOS, double-fork fallback elsewhere.
 
 ---
 
-## Testing Strategy
+### Testing Strategy
 
 | Layer | Location | What is tested |
 |-------|----------|----------------|
-| Unit — per module | inline `#[cfg(test)]` | Individual functions, data structures |
-| Unit — border colors | `tui::state::tests` | All 6 combinations of phase × focus |
-| Unit — PTY data | `tui::state::tests` | `\r`/`\n`/`\r\n` processing, live-line updates |
-| Unit — container window | `tui::state::tests` | Container state transitions, PTY routing, summary generation |
-| Unit — container render | `tui::render::tests` | Container window overlay, minimized bar, summary bar |
-| Unit — container input | `tui::input::tests` | Key handling in maximized/minimized/hidden states |
-| Unit — CLI/spec parity | `cli::tests` | Every clap flag for each subcommand is present in `spec::*_FLAGS` and vice versa — fails immediately when the two diverge |
-| Unit — flag parser | `tui::flag_parser::tests` | `parse_flags()` with every flag in `--flag value` and `--flag=value` forms; unknown flags ignored; value-taking flag not consuming a following `--flag` token; empty-value form |
-| Unit — autocomplete completeness | `tui::input::tests` | `flag_suggestions_for("chat")` contains `--agent`; `flag_suggestions_for("implement")` contains `--agent` and `--workflow` |
-| Integration — TUI chat with `--agent` | `tui::mod::tests` | Submitting `"chat --agent codex"` produces `PendingCommand::Chat { agent: Some("codex"), .. }` |
-| Integration — TUI implement with `--agent=` | `tui::mod::tests` | Submitting `"implement 0042 --agent=opencode"` produces `PendingCommand::Implement { agent: Some("opencode"), .. }` |
-| Unit — docker build streaming | `docker::tests` | Incremental line delivery, stderr capture, failure handling |
-| Unit — docker stats | `docker::tests` | Stats parsing, container name generation |
-| Unit — host settings / LSP suppression | `docker::tests` | `disable_lsp_recommendations` file creation, key merging, invalid-JSON fallback; `prepare_minimal` returns valid settings with LSP key |
-| Unit — PTY | `tui::pty::tests` | Real `echo` and `sh -c 'exit 42'` processes |
-| Unit — ready | `commands::ready::tests` | Summary table, interactive notice, options, entrypoints; `--json` flag produces valid JSON with expected top-level keys |
-| Unit — implement | `commands::implement::tests` | Entrypoints (interactive + non-interactive) |
-| Unit — chat | `commands::chat::tests` | Entrypoints, no-prompt verification |
-| Unit — exec | `commands::exec::tests` | `run_prompt` builds same container launch call as `chat::run_with_sink` with prompt injection; `run_workflow` with `work_item = None` skips work item lookup and leaves `{{work_item}}` unexpanded |
-| Unit — agent | `commands::agent::tests` | Shared agent launching |
-| Unit — new | `commands::new::tests` | Slugify, numbering, template, find_template, kind parsing, run_with_sink |
-| Unit — init flow | `commands::init_flow::tests` | Each stage independently via mock `InitQa` + `InitContainerLauncher`; `InitSummary` correctness; no filesystem or Docker access |
-| Unit — CliInitQa | `commands::init_flow::tests` | Parses stdin responses (yes/no/empty/EOF) via byte cursor; edge cases for `ask_work_items_setup` |
-| Unit — TuiInitQa | `commands::init_flow::tests` | Pre-collected answers returned without blocking; "never asked" represented as `false` not error |
-| Integration — init CLI | `commands::init_flow::tests` | Temp git repo + mock launchers; asserts expected files written and `InitSummary` reports Ok per stage |
-| Integration — init TUI parity | `commands::init_flow::tests` | Same scenario with `TuiInitQa`/`TuiContainerLauncher`; asserts identical file outcomes to CLI — structural guarantee surfaces cannot diverge |
-| Integration — CLI | `tests/cli_integration.rs` | Binary-level: help, version, flags, work items |
-| Integration — parity | `tests/command_tui_parity.rs` | Shared logic between command/TUI modes, container lifecycle, tab-cwd correctness |
-| Unit — download | `commands::download::tests` | Tarball extraction, file counting, empty tarball error |
-| Integration — download | `tests/download_integration.rs` | GitHub template downloads, aspec folder download, init integration, fallback |
-| Integration — Docker | `tests/dockerfile_build.rs` | Builds each agent template Dockerfile to verify validity |
-| Unit — headless db | `commands::headless::db::tests` | Schema creation, session CRUD, command CRUD, UUID uniqueness, field round-trips through serde |
-| Unit — headless process | `commands::headless::process::tests` | PID file write/read/delete; live vs. stopped process detection; missing PID file handling |
-| Unit — headless config | `config::tests` | `HeadlessConfig` round-trips through JSON with both fields set, with only one set, and with neither set; `headless.workDirs` deserializes from nested `GlobalConfig` JSON; `headless.alwaysNonInteractive` defaults to `false` when absent |
-| Unit — headless CLI parsing | `cli::tests` | Each `HeadlessAction` variant parses correctly: `--port`, `--workdirs` (single and multiple), `--background`; default values |
-| Integration — headless HTTP | `commands::headless::server::tests` | Full session + command lifecycle against a server on a random port: create session → submit command → poll status → retrieve stdout; DB state matches HTTP responses |
-| Integration — headless allowlist | `commands::headless::server::tests` | Server started with one allowlisted dir; session creation with non-allowlisted dir returns HTTP 403 |
-| Integration — headless exec dispatch | `commands::headless::server::tests` | `POST /v1/commands` with `subcommand = "exec"` and args `["prompt", "hello"]` is accepted; `exec workflow` and `exec wf` alias both accepted |
-| Integration — exec prompt | `tests/exec_integration.rs` | Container launch args include the prompt string and all flag-driven options (plan, yolo, model, etc.) |
-| Integration — exec workflow | `tests/exec_integration.rs` | Without work item: `{{work_item}}` placeholders left unexpanded; with `--work-item 0053`: identical to `implement 0053 --workflow` |
-| End-to-end — headless | `tests/headless_integration.rs` | `amux headless start` in a subprocess; HTTP requests via `reqwest`; assert response shape, log files created, DB entries exist |
-
-### Window Border Color Matrix
-
-| Phase | Focus | Color |
-|-------|-------|-------|
-| Running | ExecutionWindow (selected) | Blue |
-| Running | CommandBox (unselected) | Grey |
-| Done | ExecutionWindow (selected) | Green |
-| Done | CommandBox (unselected) | Grey |
-| Error | ExecutionWindow (selected) | Red |
-| Error | CommandBox (unselected) | Red |
-| Idle | any | DarkGray |
-
-The parity tests are the most important: they verify that `run_with_sink`,
-`find_work_item`, autocomplete, auth functions, summary table, interactive notice,
-and non-interactive entrypoints produce the same results regardless of which
-caller invokes them.
+| Layer 0 unit | `src/data/**/#[cfg(test)]` | Session, SessionManager, all config types, all fs stores |
+| Layer 2 — catalogue | `src/command/dispatch/catalogue.rs` | Every command and flag present with correct name, kind, default, frontends; lookup happy/error paths; alias resolution |
+| Layer 2 — projections | `src/command/dispatch/projections/**` | `catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_headless_consistency` (catalogue ↔ projection agreement) |
+| Layer 2 — Dispatch | `src/command/dispatch/mod.rs` | `run_command` builds expected `*Command`; missing/unknown/mutually-exclusive flags; implication rules; `parse_command_box_input` happy/error paths; `--non-interactive` from flag and config |
+| Layer 2 — WorktreeLifecycle | `src/command/commands/worktree_lifecycle.rs` | All `prepare` paths (happy, uncommitted files, existing worktree, abort); all `finalize` paths (merge, discard, keep, conflict) |
+| Layer 2 — RemoteClient | `src/command/commands/remote_client.rs` | `resolve_api_key` precedence; `send_command` 200 + non-2xx; `stream_command` valid SSE + malformed; timeout + connection-refused mapping |
+| Layer 2 — per-command | `src/command/commands/<name>.rs` | Happy path; all frontend interactions; error mapping; `*Outcome` serde round-trip |
+| Layer 3 — CLI routing | `src/frontend/cli/mod.rs` | `error_exit_code` data-table (all `CommandError` variants); `subcommand_present_routes_to_cli`; `bare_invocation_routes_to_tui`; `render_outcome_empty_is_success` |
+| Layer 3 — CliFrontend | `src/frontend/cli/command_frontend.rs` | `command_path_from_matches` (top-level, nested, bare, 3-level); `flag_bool` data-table; `flag_string`/`flag_enum`; `flag_strings` (single, repeated, absent); `flag_path`; `flag_u16`; `argument` (positional, TrailingVarArgs single + multi); `arguments`; cross-flag independence; parent-path isolation |
+| Layer 3 — CliUserMessageQueue | `src/frontend/cli/user_message.rs` | Queue-when-active; write-through-when-inactive; `replay_queued` drains; PTY toggle changes behavior |
+| Layer 3 — TUI routing | `src/frontend/tui/mod.rs` | Bare invocation has no subcommand; any subcommand routes away from TUI |
+| Layer 3 — TUI keymap | `src/frontend/tui/keymap.rs` | Every key in every FocusContext produces the expected Action variant; global shortcuts available in CommandBox/ExecutionWindow/Dialog but not ContainerMaximized |
+| Layer 3 — TUI tabs | `src/frontend/tui/tabs.rs` | `tab_color` for every ExecutionPhase and flag combination; `compute_tab_bar_width` for 0–5+ tabs; `window_border_color` matrix; `phase_label` formatting |
+| Layer 3 — TUI command box | `src/frontend/tui/command_box.rs` | `parse_input` valid/invalid/edge cases; `format_parse_error` did-you-mean and no-match paths |
+| Layer 3 — TUI App | `src/frontend/tui/app.rs` | `update_suggestions` empty/match/no-match; tab switch wrap-around; `close_active_tab` single/multi |
+| Layer 3 — TUI hints | `src/frontend/tui/hints.rs` | `format_suggestion_row` empty/single/multi; `hint_for_input` known/unknown/flag inclusion |
+| Layer 3 — Headless placeholder | `src/frontend/headless/mod.rs` | `serve()` returns `NotImplemented`; `HeadlessServeConfig` struct fields are valid |
+| Layer 4 — binary routing | `src/main.rs` | Subcommand presence signals CLI branch (data-table over representative argv); bare invocation signals TUI branch; `exec workflow` alias resolves correctly |
+| Unit — per module | `oldsrc/**/#[cfg(test)]` | Individual functions, data structures (legacy reference only — not compiled) |
+| Unit — border colors | `oldsrc/tui::state::tests` | All 6 combinations of phase × focus (legacy reference) |
+| Unit — PTY data | `oldsrc/tui::state::tests` | `\r`/`\n`/`\r\n` processing, live-line updates (legacy reference) |
+| Unit — container window | `oldsrc/tui::state::tests` | Container state transitions, PTY routing, summary generation (legacy reference) |
+| Unit — CLI/spec parity | `oldsrc/cli::tests` | Every clap flag for each subcommand is present in `spec::*_FLAGS` and vice versa (legacy reference) |
+| Unit — flag parser | `oldsrc/tui::flag_parser::tests` | `parse_flags()` with every flag in both forms (legacy reference) |
+| Unit — init flow | `oldsrc/commands::init_flow::tests` | Each stage via mock InitQa + InitContainerLauncher (legacy reference) |
+| Unit — headless db | `oldsrc/commands::headless::db::tests` | Schema creation, session/command CRUD (legacy reference) |
+| Integration — CLI | `tests/cli_integration.rs` | Binary-level: help, version, flags, work items (rebuilt in WI 0072) |
+| Integration — parity | `tests/command_tui_parity.rs` | Shared logic between command/TUI modes (rebuilt in WI 0072) |
+| Integration — headless HTTP | `oldsrc/commands::headless::server::tests` | Full session + command lifecycle (legacy reference) |
+| End-to-end — headless | `tests/headless_integration.rs` | `amux headless start` subprocess; HTTP requests via reqwest (rebuilt in WI 0072) |
 
 ---
 

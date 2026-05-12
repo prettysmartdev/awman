@@ -145,7 +145,11 @@
       "Bash(rm /tmp/symlink-probe/cargo /tmp/symlink-probe/rustc)",
       "Bash(rmdir /tmp/symlink-probe)",
       "Bash(./target/release/amux --version)",
-      "Bash(./target/release/amux --help)"
+      "Bash(./target/release/amux --help)",
+      "Bash(sudo chown *)",
+      "WebFetch(domain:google-gemini.github.io)",
+      "WebFetch(domain:developers.openai.com)",
+      "Bash(CARGO_TARGET_DIR=/tmp/amux-target cargo test)"
     ]
   }
 }

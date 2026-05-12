@@ -4,6 +4,8 @@ Name: amux
 Type: CLI
 Purpose: A containerized code and claw agent manager.
 
+amux is organized as a **four-layer architecture** to ensure clean separation between data persistence, business logic, command dispatch, and presentation frontends (CLI, TUI, Headless). See `aspec/architecture/design.md` for details.
+
 # Technical Foundation
 
 ## Languages and Frameworks

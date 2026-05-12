@@ -23,33 +23,6 @@ fn version_exits_successfully() {
 }
 
 #[test]
-fn implement_missing_work_item_prints_error() {
-    let output = amux()
-        .args(["implement", "9999"])
-        .output()
-        .expect("failed to run amux");
-    // Should fail (non-zero exit) because work item 9999 does not exist.
-    assert!(!output.status.success());
-}
-
-#[test]
-fn implement_accepts_four_digit_work_item() {
-    let output = amux()
-        .args(["implement", "0099"])
-        .output()
-        .expect("failed to run amux");
-    // Should fail because work item 0099 doesn't exist, but the input should be accepted.
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Should report the work item is missing, not an invalid number error.
-    assert!(
-        stderr.contains("work item") || stderr.contains("0099") || stderr.contains("99"),
-        "Expected work-item-not-found error, got: {}",
-        stderr
-    );
-}
-
-#[test]
 fn ready_help_shows_refresh_flag() {
     let output = amux()
         .args(["ready", "--help"])
@@ -74,20 +47,6 @@ fn ready_help_shows_non_interactive_flag() {
     assert!(
         stdout.contains("--non-interactive"),
         "ready --help should mention --non-interactive flag"
-    );
-}
-
-#[test]
-fn implement_help_shows_non_interactive_flag() {
-    let output = amux()
-        .args(["implement", "--help"])
-        .output()
-        .expect("failed to run amux");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("--non-interactive"),
-        "implement --help should mention --non-interactive flag"
     );
 }
 
@@ -595,21 +554,6 @@ fn chat_unknown_agent_exits_nonzero_with_error() {
     );
 }
 
-#[test]
-fn implement_help_shows_agent_flag() {
-    let output = amux()
-        .args(["implement", "--help"])
-        .output()
-        .expect("failed to run amux");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("--agent"),
-        "implement --help should mention --agent flag; got: {}",
-        stdout
-    );
-}
-
 // ── exec subcommand integration tests (work item 0058) ───────────────────────
 
 #[test]
@@ -893,28 +837,18 @@ fn new_help_lists_workflow_and_skill_subcommands() {
     assert!(stdout.contains("spec"), "`new --help` must mention 'spec'; got: {stdout}");
 }
 
-// 2. `amux new spec --help` and `amux specs new --help` both show --interview.
+// 2. `amux new spec --help` shows --interview.
 #[test]
-fn new_spec_and_specs_new_help_both_mention_interview() {
-    let out1 = amux()
+fn new_spec_help_mentions_interview() {
+    let out = amux()
         .args(["new", "spec", "--help"])
         .output()
         .expect("failed to run amux new spec --help");
-    let out2 = amux()
-        .args(["specs", "new", "--help"])
-        .output()
-        .expect("failed to run amux specs new --help");
-    assert!(out1.status.success());
-    assert!(out2.status.success());
-    let stdout1 = String::from_utf8_lossy(&out1.stdout);
-    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout1.contains("--interview"),
-        "`new spec --help` must mention --interview; got: {stdout1}"
-    );
-    assert!(
-        stdout2.contains("--interview"),
-        "`specs new --help` must mention --interview; got: {stdout2}"
+        stdout.contains("--interview"),
+        "`new spec --help` must mention --interview; got: {stdout}"
     );
 }
 
@@ -1297,52 +1231,3 @@ fn new_skill_output_has_parseable_yaml_frontmatter() {
     );
 }
 
-// 15. `amux specs new` and `amux new spec` produce identical skeleton files.
-#[test]
-fn specs_new_and_new_spec_produce_identical_skeleton_files() {
-    // Stdin: kind=1 (Feature), title="Equiv Test".
-    let stdin = b"1\nEquiv Test\n";
-
-    let home1 = TempDir::new().unwrap();
-    let repo1 = make_git_repo();
-    let out1 = run_amux_with_stdin(
-        amux_with_home(home1.path())
-            .current_dir(repo1.path())
-            .args(["specs", "new"]),
-        stdin,
-    );
-    assert!(
-        out1.status.success(),
-        "amux specs new must succeed; stderr: {}",
-        String::from_utf8_lossy(&out1.stderr)
-    );
-
-    let home2 = TempDir::new().unwrap();
-    let repo2 = make_git_repo();
-    let out2 = run_amux_with_stdin(
-        amux_with_home(home2.path())
-            .current_dir(repo2.path())
-            .args(["new", "spec"]),
-        stdin,
-    );
-    assert!(
-        out2.status.success(),
-        "amux new spec must succeed; stderr: {}",
-        String::from_utf8_lossy(&out2.stderr)
-    );
-
-    // Both repos start empty — aspec is downloaded, placing work items in aspec/work-items/.
-    let expected_name = "0001-equiv-test.md";
-    let path1 = repo1.path().join("aspec").join("work-items").join(expected_name);
-    let path2 = repo2.path().join("aspec").join("work-items").join(expected_name);
-
-    assert!(path1.exists(), "specs new must create {expected_name}; repo: {}", repo1.path().display());
-    assert!(path2.exists(), "new spec must create {expected_name}; repo: {}", repo2.path().display());
-
-    let content1 = std::fs::read_to_string(&path1).unwrap();
-    let content2 = std::fs::read_to_string(&path2).unwrap();
-    assert_eq!(
-        content1, content2,
-        "`amux specs new` and `amux new spec` must produce identical skeleton files"
-    );
-}

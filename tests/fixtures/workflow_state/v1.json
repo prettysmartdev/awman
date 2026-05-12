@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "workflow_name": "example",
+  "workflow_hash": "abc12345",
+  "work_item": null,
+  "step_states": {
+    "alpha": "Pending",
+    "beta": "Pending"
+  },
+  "completed_steps": [],
+  "current_step_index": null,
+  "started_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:00:00Z"
+}

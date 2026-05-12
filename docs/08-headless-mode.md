@@ -2,7 +2,7 @@
 
 Headless mode exposes amux's session and subcommand execution over HTTP. Start a persistent server with `amux headless start`, then drive sessions and subcommands from scripts, CI pipelines, or any HTTP client — no interactive terminal or TUI required.
 
-A **session** in headless mode is conceptually identical to a TUI tab: a named, isolated workspace bound to a working directory. Subcommands dispatched to a session (`implement`, `chat`, etc.) execute exactly as they would in a TUI tab — inside a Docker container, with all the same security and isolation guarantees.
+A **session** in headless mode is conceptually identical to a TUI tab: a named, isolated workspace bound to a working directory. Subcommands dispatched to a session (`exec workflow`, `chat`, etc.) execute exactly as they would in a TUI tab — inside a Docker container, with all the same security and isolation guarantees.
 
 All operations, inputs, and outputs are recorded durably in `~/.amux/headless/` for auditability.
 
@@ -12,13 +12,13 @@ All operations, inputs, and outputs are recorded durably in `~/.amux/headless/` 
 
 Headless mode is useful for:
 
-- CI pipelines that trigger `implement` or `exec prompt` runs and poll for results
-- Scripts or tooling that submit work items and retrieve output programmatically
+- CI pipelines that trigger `exec workflow` or `exec prompt` runs and poll for results
+- Scripts or tooling that execute workflows and retrieve output programmatically
 - Remote integrations where the amux server runs on one machine and clients run elsewhere
 - Audit-heavy environments where a complete durable record of every agent action is required
 - One-shot agent invocations from scripts using `amux exec prompt` or `amux exec workflow`
 
-For single interactive sessions, use `amux chat` or `amux implement` instead.
+For single interactive sessions, use `amux chat` instead.
 
 ---
 
@@ -63,13 +63,13 @@ error: prompt cannot be empty
 | `--agent=<name>` | Override the agent for this run |
 | `--model=<NAME>` | Override the model for this run |
 
-All flags behave identically to their `chat` counterparts. See [Agent Sessions](02-agent-sessions.md#flags-common-to-chat-and-implement).
+All flags behave identically to their `chat` counterparts. See [Agent Sessions](02-agent-sessions.md#flags-common-to-chat-and-other-commands).
 
 ---
 
 ### `amux exec workflow <path>` / `amux exec wf <path>`
 
-Runs a workflow file without requiring a paired work item. Behaves identically to `amux implement --workflow`, except the work item is optional.
+Runs a workflow file. The work item is optional — when provided, it's used for template variable substitution within the workflow.
 
 ```sh
 # Run a workflow without a work item
@@ -93,7 +93,7 @@ amux exec workflow ./aspec/workflows/review.md --non-interactive
 warning: workflow uses {{work_item_content}} but no --work-item was provided; placeholder left unexpanded
 ```
 
-When `--work-item <N>` is provided, amux resolves the work item file exactly as `implement` does, and substitutes all template variables.
+When `--work-item <N>` is provided, amux resolves the work item file from the configured work items directory and substitutes all template variables.
 
 **Workflow state files:** When no work item is given, the state file is keyed by the workflow file's name and content hash:
 
@@ -101,7 +101,7 @@ When `--work-item <N>` is provided, amux resolves the work item file exactly as 
 ~/.amux/headless/<workflow-name>-<content-hash8>.state.json
 ```
 
-When a work item is given, the state file follows the same path as `implement`:
+When a work item is given, the state file is saved to:
 
 ```
 $GITROOT/.amux/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
@@ -122,7 +122,7 @@ $GITROOT/.amux/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 | `--agent=<name>` | Default agent for steps that do not specify an `Agent:` field |
 | `--model=<NAME>` | Default model for steps that do not specify a `Model:` field |
 
-All flags behave identically to their `implement --workflow` counterparts. See [Workflows](04-workflows.md#flags).
+All workflow flags are described in [Workflows](04-workflows.md#flags).
 
 ---
 
@@ -458,10 +458,10 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'x-amux-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"implement","args":["0057"]}'
+  -d '{"subcommand":"chat"}'
 ```
 
-Dispatches a subcommand to the session identified by the `x-amux-session` header. Valid values for `subcommand`: `implement`, `chat`, `ready`, `exec`, `remote`.
+Dispatches a subcommand to the session identified by the `x-amux-session` header. Valid values for `subcommand`: `chat`, `ready`, `exec`, `remote`.
 
 For `exec`, the `args` array starts with the exec action (`prompt` or `workflow`/`wf`), followed by any further arguments:
 
@@ -620,7 +620,7 @@ curl -s http://localhost:9876/v1/status \
 
 ### Workflow state
 
-When a command runs a workflow (`exec workflow`, `implement --workflow`), the headless server writes a `workflow.state.json` file to the per-command directory. This file is updated atomically on every step transition. The `GET /v1/workflows/:command_id` endpoint exposes that state over HTTP.
+When a command runs a workflow (`exec workflow`), the headless server writes a `workflow.state.json` file to the per-command directory. This file is updated atomically on every step transition. The `GET /v1/workflows/:command_id` endpoint exposes that state over HTTP.
 
 #### Get workflow state
 
@@ -629,7 +629,7 @@ curl -s http://localhost:9876/v1/workflows/<command-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current `WorkflowState` for the given command. The structure is identical to the local workflow state format — the same JSON produced by `amux implement --workflow` when it writes state to `$GITROOT/.amux/workflows/`.
+Returns the current `WorkflowState` for the given command. The structure is identical to the local workflow state format produced by `amux exec workflow` when it writes state to `$GITROOT/.amux/workflows/`.
 
 ```json
 {
@@ -658,7 +658,7 @@ Use the `status` field in the response body to determine completion — do not r
 |-------------|---------|
 | 200 | Workflow state found; body contains the full `WorkflowState` JSON |
 | 404 `{"error": "command not found"}` | No command with that ID exists |
-| 404 `{"error": "no workflow for this command"}` | The command exists but did not run a workflow (e.g. `exec prompt` or `implement` without `--workflow`) |
+| 404 `{"error": "no workflow for this command"}` | The command exists but did not run a workflow (e.g. `exec prompt` or `chat`) |
 | 401 | Missing or invalid API key (same auth middleware as all other endpoints) |
 
 **Polling for live workflow progress:**
@@ -704,7 +704,7 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-amux-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"implement","args":["0057"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.md"]}' | jq -r .command_id)
 echo "Command: $CMD"
 
 # 3. Poll until done

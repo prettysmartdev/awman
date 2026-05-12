@@ -7,9 +7,45 @@ on:
     branches: ["**"]
 
 jobs:
-  test:
-    name: Run tests
+  fast:
+    name: Fast checks (lint, fmt, clippy, hermetic tests)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-fast-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fast-
+
+      - name: Architecture lint
+        run: make architecture-lint
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Hermetic tests
+        run: make test-fast
+
+  full-linux-docker:
+    name: Full tests with Docker (Linux)
+    runs-on: ubuntu-latest
+    needs: fast
     steps:
       - uses: actions/checkout@v4
 
@@ -25,9 +61,41 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-full-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-full-
 
-      - name: Run tests
-        run: make test
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Full test suite (real Docker, real git)
+        run: make test-full
+
+  build-macos:
+    name: Build smoke (macOS)
+    runs-on: macos-latest
+    needs: fast
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-mac-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-mac-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Hermetic tests
+        run: make test-fast

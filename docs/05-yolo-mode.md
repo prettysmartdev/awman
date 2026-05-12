@@ -26,14 +26,14 @@ Yolo mode is **not** appropriate for:
 ## Basic usage
 
 ```sh
-amux implement 0027 --yolo
+amux exec workflow aspec/workflows/implement-feature.md --yolo
 amux chat --yolo
 ```
 
 For the safest yolo experience — fully autonomous, changes isolated to a branch, easy to review or discard:
 
 ```sh
-amux implement 0027 --yolo --workflow aspec/workflows/implement-feature.md
+amux exec workflow aspec/workflows/implement-feature.md --yolo
 ```
 
 This implies `--worktree` automatically (see below).
@@ -72,21 +72,21 @@ Any tools listed in `yoloDisallowedTools` in your config are passed to the agent
 | `crush` | *(no equivalent — a warning is printed)* |
 | `cline` | *(no equivalent — a warning is printed)* |
 
-### 3. Implies `--worktree` when combined with `--workflow`
+### 3. Implies `--worktree` for workflow execution
 
-When both `--yolo` and `--workflow` are present, amux automatically creates an isolated Git worktree. A message is printed at startup:
+When running a workflow with `--yolo`, amux automatically creates an isolated Git worktree. A message is printed at startup:
 
 ```
---yolo with --workflow implies --worktree. Running in isolated worktree.
+--yolo with workflow execution implies --worktree. Running in isolated worktree.
 ```
 
 If `--worktree` is also passed explicitly, it is silently accepted — no duplicate worktree is created.
 
-When `--yolo` is used **without** `--workflow`, `--worktree` is **not** implied. The flag only affects permission prompts and disallowed tools. Use `--worktree` explicitly if you want isolation in a single-step yolo run.
+When `--yolo` is used with other commands (e.g. `chat`), `--worktree` is **not** implied. The flag only affects permission prompts and disallowed tools. Use `--worktree` explicitly if you want isolation.
 
 ### 4. Auto-advances stuck workflow steps
 
-Instead of opening the manual [workflow control board](04-workflows.md#workflow-control-board), amux begins a **yolo countdown** when a workflow step goes silent for 10 seconds. How the countdown is presented depends on whether the tab is active or in the background.
+When a workflow step goes silent for 30 seconds, amux begins a **yolo countdown** instead of opening the manual [workflow control board](04-workflows.md#workflow-control-board). The countdown timer automatically advances to the next step when it expires. How the countdown is presented depends on whether the tab is active or in the background.
 
 **Active tab — yolo countdown dialog:**
 
@@ -103,7 +103,7 @@ When the stuck tab is currently active, the countdown dialog opens:
 ╰──────────────────────────────────────────╯
 ```
 
-**Active-tab suppression:** If you are actively pressing keys or scrolling on the tab, the stuck timer is held back and the dialog will not open. Both the container and the user must be idle for 10 seconds before the countdown starts.
+**Active-tab suppression:** If you are actively pressing keys or scrolling on the tab, the stuck timer is held back and the dialog will not open. Both the container and the user must be idle for 30 seconds before the countdown starts.
 
 **Background tab — tab bar countdown:**
 
@@ -131,7 +131,7 @@ The countdown runs for **60 seconds**. When it expires:
 
 **Cancellation:**
 - Any PTY output during the countdown immediately dismisses the countdown — the agent is no longer stuck
-- Press **Esc** to dismiss the active-tab dialog manually; the same 10-second backoff applies before the dialog re-opens (the countdown timer continues running during the backoff, so auto-advance will typically fire before the dialog reopens)
+- Press **Esc** to dismiss the active-tab dialog manually; if the container goes silent again, a fresh 60-second countdown begins (there is no backoff between cancellation and the next countdown)
 
 ---
 
@@ -217,23 +217,17 @@ When both `--yolo` and `--auto` are passed, `--yolo` wins.
 ## Examples
 
 ```sh
-# Implement a work item with no prompts, changes in an isolated worktree
-amux implement 0027 --yolo --workflow aspec/workflows/implement-feature.md
+# Run a workflow with no prompts, changes in an isolated worktree
+amux exec workflow aspec/workflows/implement-feature.md --yolo
 
-# Single-step autonomous implementation (no worktree implied — add explicitly if wanted)
-amux implement 0027 --yolo
-
-# Single-step autonomous implementation, explicitly isolated
-amux implement 0027 --yolo --worktree
+# Run a workflow with explicit worktree flag — identical to omitting it
+amux exec workflow aspec/workflows/implement-feature.md --yolo --worktree
 
 # Autonomous chat session with Bash tool blocked
 # (add to aspec/.amux.json: "yoloDisallowedTools": ["Bash"])
 amux chat --yolo
-
-# Explicit worktree flag with yolo + workflow — identical to omitting it
-amux implement 0027 --yolo --worktree --workflow aspec/workflows/implement-feature.md
 ```
 
 ---
 
-[← Workflows](04-workflows.md) · [Next: Nanoclaw →](06-nanoclaw.md)
+[← Workflows](04-workflows.md) · [Next: Configuration →](07-configuration.md)

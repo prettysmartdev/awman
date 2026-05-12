@@ -4,7 +4,7 @@ INSTALL_PATH ?= /usr/local/bin
 # default of `target`.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build install test clean release
+.PHONY: all build install test test-fast test-full clean release architecture-lint pre-push
 
 all: build
 
@@ -15,6 +15,20 @@ install: build
 	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
 
 test:
+	cargo test --quiet
+
+test-fast:
+	cargo test --quiet -- --skip docker --skip real_git --skip real_network
+
+test-full:
+	cargo test --quiet
+
+architecture-lint:
+	@bash tools/architecture-lint.sh
+
+pre-push: architecture-lint
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
 	cargo test --quiet
 
 clean:

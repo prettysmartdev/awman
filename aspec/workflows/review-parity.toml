@@ -1,0 +1,156 @@
+title = "Review Parity: new-amux vs old-amux"
+
+[[steps]]
+name = "command-subcommand-parity"
+model = "claude-opus-4-7"
+prompt = """
+Review command and subcommand parity between old-amux and new-amux.
+
+old-amux source of truth: oldsrc/cli.rs (clap-based Cli struct and subcommand enums)
+new-amux source of truth: src/command/dispatch/catalogue.rs (CommandCatalogue static data)
+
+For every top-level command and every subcommand in old-amux, verify it exists in new-amux with
+the same name (or a documented alias). Check:
+
+1. Top-level commands: init, ready, implement, chat, specs, claws, status, config, exec, headless,
+   remote, new — all must be present and registered in the ROOT CommandSpec subcommands list.
+
+2. Subcommands at every level:
+   - specs: new, amend
+   - claws: init, ready, chat
+   - config: show, get, set
+   - exec: prompt, workflow (alias: wf)
+   - headless: start, kill, logs, status
+   - remote: run, session
+   - remote session: start, kill
+   - new: spec, workflow, skill
+
+3. Path aliases: verify the `specs new` → `new spec` path alias is registered in PATH_ALIASES.
+   Verify the `exec wf` string alias for `exec workflow` is present.
+
+4. For each command that exists in old-amux but cannot be found in new-amux, or vice versa,
+   flag it as a parity gap. For each alias present in old-amux (e.g. clap `#[command(alias)]`)
+   that is missing from new-amux, flag it.
+
+5. Check that all command help strings in new-amux reasonably match the doc strings in old-amux
+   (same intent, equivalent wording). Flag significant divergences.
+
+Produce a structured report: a table of every command/subcommand path with a "present in old",
+"present in new", and "notes" column. Then list any gaps or discrepancies found and their severity
+(critical / medium / minor). Do NOT fix anything yet — this is a review-only step.
+"""
+
+[[steps]]
+name = "flag-parity"
+depends_on = ["command-subcommand-parity"]
+model = "claude-opus-4-7"
+prompt = """
+Review flag parity between old-amux and new-amux for every command and subcommand.
+
+old-amux source of truth: oldsrc/cli.rs (clap field attributes on each command variant)
+new-amux source of truth: src/command/dispatch/catalogue.rs (FlagSpec entries in each CommandSpec)
+
+For each command path, compare the set of flags available in old-amux vs new-amux:
+
+1. Root flags: --build, --no-cache, --refresh
+2. init: --agent, --aspec
+3. ready: --refresh, --build, --no-cache, --non-interactive (-n), --allow-docker, --json
+4. implement: --non-interactive (-n), --plan, --allow-docker, --workflow, --worktree,
+              --mount-ssh, --yolo, --auto, --agent, --model, --overlay
+5. chat: --non-interactive (-n), --plan, --allow-docker, --mount-ssh, --yolo, --auto,
+         --agent, --model, --overlay
+6. specs new: --interview, --non-interactive (-n)
+7. specs amend: --non-interactive (-n), --allow-docker
+8. exec prompt: --non-interactive (-n), --plan, --allow-docker, --mount-ssh, --yolo,
+                --auto, --agent, --model, --overlay
+9. exec workflow: --work-item, --non-interactive (-n), --plan, --allow-docker, --worktree,
+                  --mount-ssh, --yolo, --auto, --agent, --model, --overlay
+10. headless start: --port, --workdirs, --background, --refresh-key, --dangerously-skip-auth
+11. remote run: --remote-addr, --session, --follow (-f), --api-key
+12. remote session start: --remote-addr, --api-key
+13. remote session kill: --remote-addr, --api-key
+14. new spec: --interview, --non-interactive (-n)
+15. new workflow: --interview, --non-interactive (-n), --global, --format
+16. new skill: --interview, --non-interactive (-n), --global
+
+For each flag, verify:
+- Name matches (long form and short alias if present)
+- Type matches (bool, string, optional string, vec, enum, path, u16)
+- Default value matches
+- FrontendVisibility is appropriate (e.g. headless start flags should be CliOnly)
+- implies / conflicts_with relationships match the old-amux behaviour (e.g. --json implies
+  --non-interactive on ready; --yolo implies --worktree on exec workflow)
+- Flag is optional vs required
+
+Also check the claws subcommands (init, ready, chat) — old-amux defines them with no flags;
+verify new-amux matches.
+
+Produce a structured report per command path: a table of flag name, old-amux type/default,
+new-amux type/default, and a "match?" column. List any gaps, missing flags, mismatched types,
+wrong defaults, or missing short aliases. Rate each gap critical / medium / minor.
+Do NOT fix anything — review only.
+"""
+
+[[steps]]
+name = "ux-parity"
+depends_on = ["command-subcommand-parity", "flag-parity"]
+model = "claude-opus-4-7"
+prompt = """
+Review user-experience parity between old-amux and new-amux. This step focuses on what the user
+actually sees and experiences when running commands — beyond just the structural presence of
+commands and flags.
+
+Reference files:
+- oldsrc/cli.rs — old clap-based CLI (help text, error messages, validation)
+- oldsrc/commands/ — old command handler logic
+- src/command/dispatch/ — new dispatch system
+- src/command/commands/ — new command handlers
+- src/frontend/tui/ — TUI frontend (if relevant)
+- aspec/work-items/new-amux-issues.md — known observed issues with new-amux
+
+Evaluate the following dimensions:
+
+1. Help text and usage strings
+   - Does `amux --help` and `amux <command> --help` produce output that matches old-amux's
+     structure (subcommand listing, flag descriptions, positional argument names)?
+   - Are help strings for all commands and flags accurate and complete in new-amux?
+   - Does `amux exec workflow --help` show the `wf` alias?
+
+2. Error messages
+   - Does new-amux produce clear, user-friendly error messages for:
+     - Unknown commands
+     - Missing required arguments (e.g. `amux implement` with no work item number)
+     - Invalid flag values (e.g. bad --agent name, bad --port, bad --format)
+     - Mutually exclusive flags (--yolo + --plan)
+   - Compare error message quality and phrasing to old-amux (clap produces good messages
+     automatically; does new-amux match this quality?)
+
+3. Input validation
+   - Does new-amux validate --agent against the known agent list at parse time (like old-amux)?
+   - Does `exec prompt` with an empty string reject it with a helpful message (like old-amux's
+     `parse_non_empty_prompt` validator)?
+   - Are positional arguments (work_item, prompt, workflow path, config field, session_id) checked
+     for correctness before dispatch?
+
+4. Interactive vs non-interactive behaviour
+   - Does `amux implement` (interactive) launch the TUI correctly?
+   - Does `amux implement 0001 --non-interactive` run headlessly and print output to stdout?
+   - Does `amux new spec` ask what kind of work item (as noted in new-amux-issues.md ISSUE-1.1)?
+   - Does `amux new spec --interview` correctly launch an agent container with auth passthrough
+     (ISSUE-1.3)?
+   - Does `amux exec workflow` with `--yolo` and a countdown work correctly (ISSUE-2.4)?
+
+5. Output formatting
+   - Does `amux status` produce readable, well-formatted output?
+   - Does `amux ready --json` produce valid JSON and suppress human output?
+   - Does `amux exec workflow` show the workflow status table correctly (ISSUE-2.2)?
+
+6. TUI UX (if applicable)
+   - Does the TUI expose all commands that old-amux's interactive mode supported?
+   - Are keyboard shortcuts and navigation consistent with what a user would expect?
+
+Produce a report structured by dimension. For each issue found, note its location in the code,
+its severity (critical / medium / minor / trivial), and a suggested fix direction. Cross-reference
+with new-amux-issues.md to flag any known issues that are still unresolved. Do NOT fix anything
+— review only.
+"""

@@ -64,5 +64,10 @@ make test     # run all tests
 Work items live in `aspec/work-items/`. Use `aspec/work-items/0000-template.md` as the template for new work items.
 
 After implementing a work item:
-1. Review and update `docs/` to reflect the current state of the tool (comprehensive docs, not per-work-item)
+1. Review and update `docs/` to reflect the current state of the tool
+   - **Documentation must be user-facing, NOT work-item-specific**
+   - Do not create "WI 0XYZ implementation guide" docs
+   - Instead, update existing user docs (e.g., `docs/08-headless-mode.md`) to describe current behavior
+   - If a new feature warrants a new doc file, create it as a user guide (e.g., `docs/10-new-feature.md`), not as implementation/architecture notes
+   - Implementation details, decisions, and technical notes belong in the work item spec or code comments, never in published docs
 2. Follow the patterns, conventions, and architecture established in the `aspec/` spec

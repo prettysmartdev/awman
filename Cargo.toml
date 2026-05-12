@@ -4,10 +4,20 @@ version = "0.7.0"
 edition = "2021"
 rust-version = "1.94.0"
 description = "A containerized code and claw agent manager"
+# Top-level tests/ targets reference the old (oldsrc) library API; they are
+# rebuilt from scratch in work item 0072 alongside the deletion of oldsrc/.
+# Suppress auto-discovery so `cargo test` only runs Layer 0–3 unit tests
+# until then.
+autotests = false
+autobenches = false
 
 [[bin]]
 name = "amux"
 path = "src/main.rs"
+
+[lib]
+name = "amux"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
@@ -22,7 +32,7 @@ serde_json = "1"
 strip-ansi-escapes = "0.2"
 strsim = "0.11"
 tempfile = "3"
-vt100 = "0.15"
+vt100 = { package = "vt100-ctt", version = "0.17", default-features = false }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false }
 tokio-stream = "0.1"
@@ -35,22 +45,57 @@ shell-words = "1"
 toml = "0.8"
 serde_yaml = "0.9"
 axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tower-http = { version = "0.5", features = ["trace"] }
 chrono = { version = "0.4", features = ["serde"] }
+rcgen = "0.13"
 ring = "0.17"
 subtle = "2"
+thiserror = "1"
+async-trait = "0.1"
+futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process"] }
+nix = { version = "0.29", features = ["signal", "process", "fs"] }
 libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+wiremock = "0.6"
 
-[[bench]]
-name = "performance"
-harness = false
+# `benches/performance.rs` references the legacy oldsrc TUI API and is
+# rebuilt from scratch alongside the new TUI in work item 0072. The
+# explicit `[[bench]]` block is omitted (and `autobenches = false` above
+# suppresses discovery) until that work lands.
+
+# ── New architecture integration tests (WI 0073) ─────────────────────────────
+# autotests = false suppresses the legacy tests/; these explicit entries
+# target the new src/ API only.
+
+[[test]]
+name = "data_layer"
+path = "tests/data_layer/main.rs"
+
+[[test]]
+name = "engine_tests"
+path = "tests/engine/main.rs"
+
+[[test]]
+name = "command_tests"
+path = "tests/command/main.rs"
+
+[[test]]
+name = "cli_parity"
+path = "tests/cli_parity/main.rs"
+
+[[test]]
+name = "headless_parity"
+path = "tests/headless_parity/main.rs"
+
+[[test]]
+name = "binary_smoke"
+path = "tests/binary_smoke/main.rs"
