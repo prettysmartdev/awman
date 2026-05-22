@@ -48,7 +48,7 @@ pub struct AgentRunOptions {
     pub env_passthrough: Option<Vec<String>>,
     /// User-supplied directory overlays.
     pub directory_overlays: Vec<DirectorySpec>,
-    /// When true, mount the global amux skills directory into the agent's
+    /// When true, mount the global awman skills directory into the agent's
     /// native skills path inside the container.
     pub include_skills: bool,
 }

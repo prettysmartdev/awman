@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use amux::commands::headless::auth;
-use amux::commands::headless::db;
-use amux::commands::headless::server::{AppState, AuthMode, build_router};
-use amux::runtime::{
+use awman::commands::headless::auth;
+use awman::commands::headless::db;
+use awman::commands::headless::server::{AppState, AuthMode, build_router};
+use awman::runtime::{
     AgentRuntime, ContainerStats, HostSettings, StoppedContainerInfo,
 };
 use tempfile::TempDir;
@@ -1429,11 +1429,11 @@ async fn workflow_endpoint_returns_404_when_state_file_absent() {
     let client = reqwest::Client::new();
 
     // Insert a session + command directly via DB helpers (no workflow file written).
-    let conn = amux::commands::headless::db::open_db(root.path()).unwrap();
-    amux::commands::headless::db::insert_session(
+    let conn = awman::commands::headless::db::open_db(root.path()).unwrap();
+    awman::commands::headless::db::insert_session(
         &conn, "sess-wf-absent", "/tmp/proj", "2024-01-01T00:00:00Z",
     ).unwrap();
-    amux::commands::headless::db::insert_command(
+    awman::commands::headless::db::insert_command(
         &conn, "cmd-wf-absent", "sess-wf-absent", "exec", "[]", "/dev/null",
     ).unwrap();
     drop(conn);
@@ -1467,19 +1467,19 @@ async fn workflow_endpoint_returns_200_with_full_workflow_state() {
     let command_id = "cmd-wf-present";
 
     // Insert session + command into the DB.
-    let conn = amux::commands::headless::db::open_db(root.path()).unwrap();
-    amux::commands::headless::db::insert_session(
+    let conn = awman::commands::headless::db::open_db(root.path()).unwrap();
+    awman::commands::headless::db::insert_session(
         &conn, session_id, "/tmp/proj", "2024-01-01T00:00:00Z",
     ).unwrap();
-    amux::commands::headless::db::insert_command(
+    awman::commands::headless::db::insert_command(
         &conn, command_id, session_id, "exec", "[]", "/dev/null",
     ).unwrap();
     drop(conn);
 
     // Build a WorkflowState and write it to the path the server expects.
-    let wf = amux::workflow::WorkflowState::new(
+    let wf = awman::workflow::WorkflowState::new(
         Some("My Test Workflow".to_string()),
-        vec![amux::workflow::parser::WorkflowStep {
+        vec![awman::workflow::parser::WorkflowStep {
             name: "step-alpha".to_string(),
             depends_on: vec![],
             prompt_template: "do the thing".to_string(),
@@ -1544,7 +1544,7 @@ async fn workflow_endpoint_returns_200_with_full_workflow_state() {
 #[tokio::test]
 async fn workflow_endpoint_returns_401_without_auth_key_when_auth_enabled() {
     let api_key = "super-secret-test-key-0061";
-    let key_hash = amux::commands::headless::auth::hash_api_key(api_key);
+    let key_hash = awman::commands::headless::auth::hash_api_key(api_key);
     let auth_mode = AuthMode::Enabled { key_hash };
     let (_root, base) = start_test_server_with_auth(vec![], auth_mode).await;
     let client = reqwest::Client::new();
@@ -1580,11 +1580,11 @@ async fn workflow_state_file_concurrent_write_and_read_never_yields_partial_json
     let command_id = "cmd-atomic";
 
     // Seed DB rows so the endpoint can look up the command.
-    let conn = amux::commands::headless::db::open_db(root.path()).unwrap();
-    amux::commands::headless::db::insert_session(
+    let conn = awman::commands::headless::db::open_db(root.path()).unwrap();
+    awman::commands::headless::db::insert_session(
         &conn, session_id, "/tmp/atomic", "2024-01-01T00:00:00Z",
     ).unwrap();
-    amux::commands::headless::db::insert_command(
+    awman::commands::headless::db::insert_command(
         &conn, command_id, session_id, "exec", "[]", "/dev/null",
     ).unwrap();
     drop(conn);
@@ -1597,9 +1597,9 @@ async fn workflow_state_file_concurrent_write_and_read_never_yields_partial_json
         .join("workflow.state.json");
     std::fs::create_dir_all(wf_path.parent().unwrap()).unwrap();
 
-    let wf = amux::workflow::WorkflowState::new(
+    let wf = awman::workflow::WorkflowState::new(
         None,
-        vec![amux::workflow::parser::WorkflowStep {
+        vec![awman::workflow::parser::WorkflowStep {
             name: "s1".to_string(),
             depends_on: vec![],
             prompt_template: "p".to_string(),

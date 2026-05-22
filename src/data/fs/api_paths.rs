@@ -1,6 +1,6 @@
-//! Typed accessors for headless-mode storage paths.
+//! Typed accessors for API-mode storage paths.
 //!
-//! Replaces ad-hoc `dirs::data_dir().join("amux/headless/...")` calls scattered
+//! Replaces ad-hoc `dirs::data_dir().join("awman/api/...")` calls scattered
 //! through `oldsrc/commands/headless/`.
 
 use std::path::{Path, PathBuf};
@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::error::DataError;
 
-/// Filename of the headless sqlite database.
-pub const HEADLESS_DB_FILENAME: &str = "amux.db";
+/// Filename of the API sqlite database.
+pub const API_DB_FILENAME: &str = "awman.db";
 
-/// Subdirectory under the global home that hosts headless state.
-const HEADLESS_SUBDIR: &str = "headless";
+/// Subdirectory under the global home that hosts API state.
+const API_SUBDIR: &str = "api";
 
 /// Subdirectory holding per-session command logs.
 const SESSIONS_SUBDIR: &str = "sessions";
@@ -20,41 +20,41 @@ const SESSIONS_SUBDIR: &str = "sessions";
 /// Subdirectory holding TLS materials.
 const TLS_SUBDIR: &str = "tls";
 
-/// Resolves every path under the headless storage root.
+/// Resolves every path under the API storage root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeadlessPaths {
+pub struct ApiPaths {
     root: PathBuf,
 }
 
-impl HeadlessPaths {
-    /// Build a `HeadlessPaths` rooted at an explicit directory.
+impl ApiPaths {
+    /// Build a `ApiPaths` rooted at an explicit directory.
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
-    /// Resolve from the current process environment, honouring `AMUX_HEADLESS_ROOT`
-    /// when set, otherwise falling back to `$HOME/.amux/headless`.
+    /// Resolve from the current process environment, honouring `AWMAN_API_ROOT`
+    /// when set, otherwise falling back to `$HOME/.awman/api`.
     pub fn from_process_env() -> Result<Self, DataError> {
         Self::from_env(&Env::from_process())
     }
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        if let Some(root) = env.headless_root() {
+        if let Some(root) = env.api_root() {
             return Ok(Self::from_root(root));
         }
         let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
-        Ok(Self::from_root(home.join(".amux").join(HEADLESS_SUBDIR)))
+        Ok(Self::from_root(home.join(".awman").join(API_SUBDIR)))
     }
 
-    /// The headless root directory.
+    /// The API root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Path to the headless sqlite database.
+    /// Path to the API sqlite database.
     pub fn db_path(&self) -> PathBuf {
-        self.root.join(HEADLESS_DB_FILENAME)
+        self.root.join(API_DB_FILENAME)
     }
 
     /// Directory holding per-session subdirectories.
@@ -104,21 +104,21 @@ impl HeadlessPaths {
         self.tls_dir().join("bind_ip")
     }
 
-    /// Headless server PID file.
+    /// API server PID file.
     pub fn pid_file(&self) -> PathBuf {
-        self.root.join("amux.pid")
+        self.root.join("awman.pid")
     }
 
     /// Sidecar metadata for the running server (port, scheme). Written next
-    /// to the PID file so `headless status` can HTTP-probe the right
+    /// to the PID file so `api status` can HTTP-probe the right
     /// endpoint without needing CLI flags.
     pub fn server_meta_file(&self) -> PathBuf {
         self.root.join("server.json")
     }
 
-    /// Headless server log file.
+    /// API server log file.
     pub fn log_file(&self) -> PathBuf {
-        self.root.join("amux.log")
+        self.root.join("awman.log")
     }
 
     /// API key hash file (mode 0o600 on Unix).

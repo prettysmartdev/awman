@@ -1,4 +1,4 @@
-//! `engine::ready` — `ReadyEngine`. Multi-phase state machine for `amux ready`.
+//! `engine::ready` — `ReadyEngine`. Multi-phase state machine for `awman ready`.
 
 use std::sync::Arc;
 
@@ -161,28 +161,20 @@ impl ReadyEngine {
                     self.summary.aspec_folder = StepStatus::Warn("aspec/ folder not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
-                        text: "aspec/ folder not found in git root; run `amux init` to create it."
+                        text: "aspec/ folder not found in git root; run `awman init` to create it."
                             .to_string(),
                     });
                 }
-                // Modern repo config: .amux/config.json
-                let modern_config = git_root.join(".amux").join("config.json");
-                // Legacy path: only warn if it EXISTS (user should migrate)
-                let legacy_config = git_root.join("aspec").join(".amux.json");
-                if modern_config.exists() {
+                // Repo config: .awman/config.json
+                let repo_config = git_root.join(".awman").join("config.json");
+                if repo_config.exists() {
                     self.summary.work_items_config = StepStatus::Done;
-                    if legacy_config.exists() {
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
-                            text: "Legacy aspec/.amux.json found alongside .amux/config.json; consider removing the legacy file.".to_string(),
-                        });
-                    }
                 } else {
                     self.summary.work_items_config =
-                        StepStatus::Warn(".amux/config.json not found".into());
+                        StepStatus::Warn(".awman/config.json not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
-                        text: ".amux/config.json not found; run `amux init` to create it."
+                        text: ".awman/config.json not found; run `awman init` to create it."
                             .to_string(),
                     });
                 }
@@ -259,7 +251,7 @@ impl ReadyEngine {
                 let tag = project_image_tag(&git_root);
                 // Legacy gate: rebuild when --build was passed, when the base
                 // image is missing, or when the legacy migration just rewrote
-                // Dockerfile.dev. Otherwise skip (`amux ready` is idempotent).
+                // Dockerfile.dev. Otherwise skip (`awman ready` is idempotent).
                 let needs_build = self.options.build
                     || matches!(self.summary.legacy_migration, StepStatus::Done)
                     || !self.container_runtime.image_exists(&tag);
@@ -642,9 +634,9 @@ impl ReadyEngine {
                         }
 
                         // Issue 9: Also rebuild agent images that layer FROM the project base.
-                        let amux_dir = git_root.join(".amux");
-                        if amux_dir.exists() {
-                            if let Ok(entries) = std::fs::read_dir(&amux_dir) {
+                        let awman_dir = git_root.join(".awman");
+                        if awman_dir.exists() {
+                            if let Ok(entries) = std::fs::read_dir(&awman_dir) {
                                 for entry in entries.flatten() {
                                     let name = entry.file_name();
                                     let name_str = name.to_string_lossy().to_string();
@@ -693,7 +685,7 @@ impl ReadyEngine {
     ///
     /// Matches old-amux `is_legacy_layout` semantics: the "migrate to modular
     /// layout?" question is only meaningful when `Dockerfile.dev` exists AND
-    /// no per-agent `.amux/Dockerfile.<agent>` file has been written yet. If
+    /// no per-agent `.awman/Dockerfile.<agent>` file has been written yet. If
     /// the per-agent file is already present, the project is on the modular
     /// layout — skip the migration phases entirely.
     fn next_phase_after_dockerfile_present(&mut self) -> ReadyPhase {
@@ -831,11 +823,11 @@ mod tests {
         run_audit: bool,
     ) -> (ReadyEngine, FakeReadyFrontend, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        // Pre-create .amux/Dockerfile.claude so the ready engine does not
+        // Pre-create .awman/Dockerfile.claude so the ready engine does not
         // attempt a network download during tests.
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Arc::new(
             crate::data::session::Session::open(

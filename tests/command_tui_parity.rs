@@ -2,25 +2,25 @@
 ///
 /// These tests call the shared `run_with_sink` / helper functions directly,
 /// confirming that the same code paths are exercised regardless of execution mode.
-use amux::commands::auth::{
+use awman::commands::auth::{
     apply_auth_decision, agent_keychain_credentials, read_keychain_raw,
     AgentCredentials,
 };
-use amux::commands::chat::{
+use awman::commands::chat::{
     chat_entrypoint, chat_entrypoint_non_interactive,
 };
-use amux::commands::new::{
+use awman::commands::new::{
     apply_template, find_template, next_work_item_number, slugify, WorkItemKind,
 };
-use amux::commands::output::OutputSink;
-use amux::commands::ready::{
+use awman::commands::output::OutputSink;
+use awman::commands::ready::{
     audit_entrypoint, audit_entrypoint_non_interactive,
     ReadyOptions, ReadySummary, StepStatus,
     print_summary, print_interactive_notice,
 };
-use amux::commands::{init_flow, new, ready_flow};
-use amux::runtime::docker::DockerRuntime;
-use amux::tui::input::{autocomplete_suggestions, closest_subcommand};
+use awman::commands::{init_flow, new, ready_flow};
+use awman::runtime::docker::DockerRuntime;
+use awman::tui::input::{autocomplete_suggestions, closest_subcommand};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -46,10 +46,10 @@ async fn init_via_sink_produces_output_lines() {
     // aspec=false to avoid downloading; run_audit=false to skip Docker (Channel sink defaults Q&A to "no").
     let cwd = std::env::current_dir().unwrap();
     let git_root = init_flow::find_git_root_from(&cwd).unwrap_or(cwd);
-    let runtime = std::sync::Arc::new(amux::runtime::DockerRuntime::new());
+    let runtime = std::sync::Arc::new(awman::runtime::DockerRuntime::new());
     let mut qa = init_flow::CliInitQa::new(&git_root, sink.clone());
     let launcher = init_flow::CliContainerLauncher::new(runtime.clone());
-    let params = init_flow::InitParams { agent: amux::cli::Agent::Claude, aspec: false, git_root };
+    let params = init_flow::InitParams { agent: awman::cli::Agent::Claude, aspec: false, git_root };
     let result = init_flow::execute(params, &mut qa, &launcher, &sink, runtime).await;
     drop(result); // may succeed or fail; we only care that the sink was used.
 
@@ -79,7 +79,7 @@ async fn ready_via_sink_emits_checking_message() {
         allow_docker: false,
     };
     let cwd = std::env::current_dir().unwrap();
-    let git_root = match amux::commands::init_flow::find_git_root_from(&cwd) {
+    let git_root = match awman::commands::init_flow::find_git_root_from(&cwd) {
         Some(r) => r,
         None => return, // skip if not in a git repo
     };
@@ -139,7 +139,7 @@ fn ready_audit_entrypoint_for_each_agent() {
 
 #[test]
 fn ready_uses_project_specific_image_tag() {
-    let tag = amux::runtime::project_image_tag(std::path::Path::new("/home/user/myproject"));
+    let tag = awman::runtime::project_image_tag(std::path::Path::new("/home/user/myproject"));
     assert_eq!(tag, "amux-myproject:latest");
 }
 
@@ -254,11 +254,11 @@ fn init_via_sink_includes_whats_next() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let cwd = std::env::current_dir().unwrap();
     let git_root = init_flow::find_git_root_from(&cwd).unwrap_or(cwd);
-    let runtime = std::sync::Arc::new(amux::runtime::DockerRuntime::new());
+    let runtime = std::sync::Arc::new(awman::runtime::DockerRuntime::new());
     let _ = rt.block_on(async {
         let mut qa = init_flow::CliInitQa::new(&git_root, sink.clone());
         let launcher = init_flow::CliContainerLauncher::new(runtime.clone());
-        let params = init_flow::InitParams { agent: amux::cli::Agent::Claude, aspec: false, git_root };
+        let params = init_flow::InitParams { agent: awman::cli::Agent::Claude, aspec: false, git_root };
         init_flow::execute(params, &mut qa, &launcher, &sink, runtime).await
     });
 
@@ -275,7 +275,7 @@ fn init_via_sink_includes_whats_next() {
 
 #[test]
 fn ready_greetings_all_valid() {
-    use amux::commands::ready::{GREETINGS, select_random_greeting};
+    use awman::commands::ready::{GREETINGS, select_random_greeting};
     assert_eq!(GREETINGS.len(), 50, "Expected exactly 50 greetings");
     let greeting = select_random_greeting();
     assert!(GREETINGS.contains(&greeting), "Selected greeting not in list");
@@ -287,9 +287,9 @@ fn ready_greetings_all_valid() {
 
 #[test]
 fn ready_dockerfile_matches_template_for_project() {
-    use amux::commands::init_flow::{dockerfile_for_agent_embedded, project_dockerfile_embedded};
-    use amux::commands::ready::dockerfile_matches_template;
-    use amux::cli::Agent;
+    use awman::commands::init_flow::{dockerfile_for_agent_embedded, project_dockerfile_embedded};
+    use awman::commands::ready::dockerfile_matches_template;
+    use awman::cli::Agent;
     // Project template matches itself.
     let project_content = project_dockerfile_embedded();
     assert!(dockerfile_matches_template(&project_content));
@@ -365,8 +365,8 @@ fn autocomplete_ready_shows_all_flags() {
 #[test]
 fn agent_env_vars_passed_to_container() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-test".into())];
-    use amux::runtime::{AgentRuntime};
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_pty("img", "/repo", &[], &env, None, false, None, None);
+    use awman::runtime::{AgentRuntime};
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_pty("img", "/repo", &[], &env, None, false, None, None);
     assert!(args.contains(&"-e".to_string()));
     assert!(args.contains(&"ANTHROPIC_API_KEY=sk-test".to_string()));
 }
@@ -374,8 +374,8 @@ fn agent_env_vars_passed_to_container() {
 #[test]
 fn display_args_mask_env_var_values() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-secret".into())];
-    use amux::runtime::{AgentRuntime};
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
+    use awman::runtime::{AgentRuntime};
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
     assert!(
         args.contains(&"ANTHROPIC_API_KEY=***".to_string()),
         "Display args must mask env var values, got: {:?}",
@@ -396,11 +396,11 @@ fn auth_apply_decision_saves_config() {
     let tmp = TempDir::new().unwrap();
 
     apply_auth_decision(tmp.path(), "claude", true).unwrap();
-    let config = amux::config::load_repo_config(tmp.path()).unwrap();
+    let config = awman::config::load_repo_config(tmp.path()).unwrap();
     assert_eq!(config.auto_agent_auth_accepted, Some(true));
 
     apply_auth_decision(tmp.path(), "claude", false).unwrap();
-    let config = amux::config::load_repo_config(tmp.path()).unwrap();
+    let config = awman::config::load_repo_config(tmp.path()).unwrap();
     assert_eq!(config.auto_agent_auth_accepted, Some(false));
 }
 
@@ -641,7 +641,7 @@ fn autocomplete_specs_shows_amend_hint() {
 
 #[test]
 fn container_window_lifecycle() {
-    use amux::tui::state::{App, ContainerWindowState, ExecutionPhase};
+    use awman::tui::state::{App, ContainerWindowState, ExecutionPhase};
 
     let mut app = App::new(std::path::PathBuf::new());
     assert_eq!(app.active_tab().container_window, ContainerWindowState::Hidden);
@@ -675,7 +675,7 @@ fn container_window_lifecycle() {
 
 #[test]
 fn container_pty_output_routing() {
-    use amux::tui::state::{App, ExecutionPhase};
+    use awman::tui::state::{App, ExecutionPhase};
 
     let mut app = App::new(std::path::PathBuf::new());
     app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
@@ -704,9 +704,9 @@ fn container_pty_output_routing() {
 
 #[test]
 fn docker_stats_parsing() {
-    assert!((amux::runtime::parse_cpu_percent("5.23%") - 5.23).abs() < 0.001);
-    assert!((amux::runtime::parse_memory_mb("200MiB") - 200.0).abs() < 0.1);
-    assert!((amux::runtime::parse_memory_mb("1.5GiB") - 1536.0).abs() < 0.1);
+    assert!((awman::runtime::parse_cpu_percent("5.23%") - 5.23).abs() < 0.001);
+    assert!((awman::runtime::parse_memory_mb("200MiB") - 200.0).abs() < 0.1);
+    assert!((awman::runtime::parse_memory_mb("1.5GiB") - 1536.0).abs() < 0.1);
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +715,7 @@ fn docker_stats_parsing() {
 
 #[test]
 fn container_name_generation() {
-    let name = amux::runtime::generate_container_name();
+    let name = awman::runtime::generate_container_name();
     assert!(name.starts_with("amux-"));
 }
 
@@ -725,7 +725,7 @@ fn container_name_generation() {
 
 #[test]
 fn duration_formatting() {
-    use amux::tui::state::format_duration;
+    use awman::tui::state::format_duration;
     assert_eq!(format_duration(0), "0s");
     assert_eq!(format_duration(45), "45s");
     assert_eq!(format_duration(60), "1m");
@@ -739,8 +739,8 @@ fn duration_formatting() {
 
 #[test]
 fn agent_display_names() {
-    use amux::cli::Agent;
-    use amux::tui::state::agent_display_name;
+    use awman::cli::Agent;
+    use awman::tui::state::agent_display_name;
     // Every agent known to the CLI must have a non-empty display name in the TUI.
     for agent in Agent::all() {
         let name = agent_display_name(agent.as_str());
@@ -771,7 +771,7 @@ fn agent_display_names() {
 
 #[test]
 fn tui_init_autocomplete_covers_all_cli_agents() {
-    use amux::tui::input::autocomplete_suggestions;
+    use awman::tui::input::autocomplete_suggestions;
 
     // "init --" triggers flag-completion for the init subcommand.
     // The new spec-driven format generates a single "--agent <NAME>  — ..." entry
@@ -791,14 +791,14 @@ fn tui_init_autocomplete_covers_all_cli_agents() {
 
 #[test]
 fn pty_args_container_name() {
-    use amux::runtime::AgentRuntime;
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_pty(
+    use awman::runtime::AgentRuntime;
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_pty(
         "img", "/repo", &[], &[], None, false, Some("amux-test-42"), None,
     );
     assert!(args.contains(&"--name".to_string()));
     assert!(args.contains(&"amux-test-42".to_string()));
 
-    let args_no_name = amux::runtime::docker::DockerRuntime::new().build_run_args_pty(
+    let args_no_name = awman::runtime::docker::DockerRuntime::new().build_run_args_pty(
         "img", "/repo", &[], &[], None, false, None, None,
     );
     assert!(!args_no_name.contains(&"--name".to_string()));
@@ -810,7 +810,7 @@ fn pty_args_container_name() {
 
 #[test]
 fn container_summary_averages_stats() {
-    use amux::tui::state::{App, ExecutionPhase};
+    use awman::tui::state::{App, ExecutionPhase};
 
     let mut app = App::new(std::path::PathBuf::new());
     app.active_tab_mut().phase = ExecutionPhase::Running { command: "implement 0001".into() };
@@ -839,22 +839,22 @@ fn auth_reads_project_local_config() {
     let tmp = TempDir::new().unwrap();
 
     // Initially None → prompt should be shown.
-    let config = amux::config::load_repo_config(tmp.path()).unwrap();
+    let config = awman::config::load_repo_config(tmp.path()).unwrap();
     assert_eq!(config.auto_agent_auth_accepted, None);
 
     // Accept → saved to project-local config.
     apply_auth_decision(tmp.path(), "claude", true).unwrap();
-    let config = amux::config::load_repo_config(tmp.path()).unwrap();
+    let config = awman::config::load_repo_config(tmp.path()).unwrap();
     assert_eq!(config.auto_agent_auth_accepted, Some(true));
 
     // Check that the config file is at the correct path.
-    let config_path = amux::config::repo_config_path(tmp.path());
+    let config_path = awman::config::repo_config_path(tmp.path());
     assert!(config_path.exists());
     assert!(config_path.to_str().unwrap().contains(".amux/config.json"));
 
     // Decline → saved as false.
     apply_auth_decision(tmp.path(), "claude", false).unwrap();
-    let config = amux::config::load_repo_config(tmp.path()).unwrap();
+    let config = awman::config::load_repo_config(tmp.path()).unwrap();
     assert_eq!(config.auto_agent_auth_accepted, Some(false));
 }
 
@@ -908,8 +908,8 @@ fn agent_credentials_default_is_empty() {
 #[test]
 fn docker_args_without_settings_has_workspace_mount_only() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-test".into())];
-    use amux::runtime::AgentRuntime;
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_pty("img", "/repo", &[], &env, None, false, None, None);
+    use awman::runtime::AgentRuntime;
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_pty("img", "/repo", &[], &env, None, false, None, None);
     // Without host_settings or allow_docker, only the workspace mount should be present.
     let volume_mounts: Vec<&String> = args.windows(2)
         .filter(|w| w[0] == "-v")
@@ -927,8 +927,8 @@ fn docker_args_without_settings_has_workspace_mount_only() {
 #[test]
 fn docker_display_args_mask_secrets() {
     let env = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-oat01-secret".into())];
-    use amux::runtime::AgentRuntime;
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
+    use awman::runtime::AgentRuntime;
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_display("img", "/repo", &[], &env, None, false, None, None);
     assert!(args.contains(&"ANTHROPIC_API_KEY=***".to_string()), "API key should be masked");
     assert!(!args.iter().any(|a: &String| a.contains("sk-ant-oat01-secret")), "Secret must not appear");
 }
@@ -1007,7 +1007,7 @@ fn autocomplete_chat_shows_hints() {
 
 #[test]
 fn pending_command_chat_variant() {
-    use amux::tui::state::PendingCommand;
+    use awman::tui::state::PendingCommand;
 
     let cmd = PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: false, allow_docker: false, mount_ssh: false, yolo: false, auto: false, overlay: None };
     assert_eq!(cmd, PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: false, allow_docker: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
@@ -1042,7 +1042,7 @@ fn chat_entrypoint_non_interactive_has_no_prompt() {
 
 #[test]
 fn pending_command_ready_build_no_cache_fields() {
-    use amux::tui::state::PendingCommand;
+    use awman::tui::state::PendingCommand;
 
     let cmd = PendingCommand::Ready {
         refresh: false,
@@ -1080,7 +1080,7 @@ fn pending_command_ready_build_no_cache_fields() {
 
 #[test]
 fn docker_format_build_cmd_no_cache() {
-    let cmd = amux::runtime::format_build_cmd_no_cache("docker", "img:latest", "Dockerfile.dev", "/repo");
+    let cmd = awman::runtime::format_build_cmd_no_cache("docker", "img:latest", "Dockerfile.dev", "/repo");
     assert!(cmd.contains("--no-cache"), "Should contain --no-cache flag");
     assert!(cmd.contains("img:latest"), "Should contain image tag");
     assert!(cmd.contains("Dockerfile.dev"), "Should contain dockerfile");
@@ -1092,7 +1092,7 @@ fn docker_format_build_cmd_no_cache() {
 
 #[test]
 fn cli_ready_build_flag() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "ready", "--build"]);
@@ -1104,7 +1104,7 @@ fn cli_ready_build_flag() {
 
 #[test]
 fn cli_ready_no_cache_flag() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "ready", "--no-cache"]);
@@ -1116,7 +1116,7 @@ fn cli_ready_no_cache_flag() {
 
 #[test]
 fn cli_ready_build_and_no_cache() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "ready", "--build", "--no-cache"]);
@@ -1131,7 +1131,7 @@ fn cli_ready_build_and_no_cache() {
 
 #[test]
 fn cli_ready_all_flags_combined() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "ready", "--refresh", "--build", "--no-cache", "--non-interactive"]);
@@ -1148,7 +1148,7 @@ fn cli_ready_all_flags_combined() {
 
 #[test]
 fn cli_ready_defaults_all_false() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "ready"]);
@@ -1171,7 +1171,7 @@ fn cli_ready_defaults_all_false() {
 /// and should be forwarded to the `ready` command when the TUI starts.
 #[test]
 fn root_build_flag_parsed_for_tui_startup() {
-    use amux::cli::Cli;
+    use awman::cli::Cli;
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "--build"]);
@@ -1183,7 +1183,7 @@ fn root_build_flag_parsed_for_tui_startup() {
 
 #[test]
 fn root_no_cache_flag_parsed_for_tui_startup() {
-    use amux::cli::Cli;
+    use awman::cli::Cli;
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "--no-cache"]);
@@ -1193,7 +1193,7 @@ fn root_no_cache_flag_parsed_for_tui_startup() {
 
 #[test]
 fn root_refresh_flag_parsed_for_tui_startup() {
-    use amux::cli::Cli;
+    use awman::cli::Cli;
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "--refresh"]);
@@ -1203,7 +1203,7 @@ fn root_refresh_flag_parsed_for_tui_startup() {
 
 #[test]
 fn root_all_flags_parsed_for_tui_startup() {
-    use amux::cli::Cli;
+    use awman::cli::Cli;
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "--build", "--no-cache", "--refresh"]);
@@ -1219,7 +1219,7 @@ fn root_all_flags_parsed_for_tui_startup() {
 
 #[test]
 fn cli_chat_plan_flag() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "chat", "--plan"]);
@@ -1234,7 +1234,7 @@ fn cli_chat_plan_flag() {
 
 #[test]
 fn cli_chat_plan_and_non_interactive() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::parse_from(&["amux", "chat", "--plan", "--non-interactive"]);
@@ -1295,7 +1295,7 @@ fn plan_false_does_not_add_flags() {
 
 #[test]
 fn pending_command_chat_plan_field() {
-    use amux::tui::state::PendingCommand;
+    use awman::tui::state::PendingCommand;
 
     let cmd = PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: true, allow_docker: false, mount_ssh: false, yolo: false, auto: false, overlay: None };
     assert_eq!(cmd, PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: true, allow_docker: false, mount_ssh: false, yolo: false, auto: false, overlay: None });
@@ -1322,7 +1322,7 @@ fn autocomplete_chat_shows_plan_hint() {
 
 #[test]
 fn cli_chat_allow_docker_flag() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::try_parse_from(["amux", "chat", "--allow-docker"]).unwrap();
@@ -1336,7 +1336,7 @@ fn cli_chat_allow_docker_flag() {
 
 #[test]
 fn cli_chat_no_allow_docker_by_default() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::try_parse_from(["amux", "chat"]).unwrap();
@@ -1350,7 +1350,7 @@ fn cli_chat_no_allow_docker_by_default() {
 
 #[test]
 fn cli_ready_allow_docker_flag() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::try_parse_from(["amux", "ready", "--allow-docker"]).unwrap();
@@ -1364,7 +1364,7 @@ fn cli_ready_allow_docker_flag() {
 
 #[test]
 fn cli_ready_no_allow_docker_by_default() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::try_parse_from(["amux", "ready"]).unwrap();
@@ -1378,7 +1378,7 @@ fn cli_ready_no_allow_docker_by_default() {
 
 #[test]
 fn cli_chat_allow_docker_with_plan() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::try_parse_from(["amux", "chat", "--allow-docker", "--plan"]).unwrap();
@@ -1393,7 +1393,7 @@ fn cli_chat_allow_docker_with_plan() {
 
 #[test]
 fn cli_ready_allow_docker_with_refresh() {
-    use amux::cli::{Cli, Command};
+    use awman::cli::{Cli, Command};
     use clap::Parser;
 
     let cli = Cli::try_parse_from(["amux", "ready", "--allow-docker", "--refresh"]).unwrap();
@@ -1412,7 +1412,7 @@ fn cli_ready_allow_docker_with_refresh() {
 
 #[test]
 fn pending_command_chat_allow_docker_field() {
-    use amux::tui::state::PendingCommand;
+    use awman::tui::state::PendingCommand;
 
     let cmd = PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: false, allow_docker: true, mount_ssh: false, yolo: false, auto: false, overlay: None };
     assert_eq!(cmd, PendingCommand::Chat { agent: None, model: None, non_interactive: false, plan: false, allow_docker: true, mount_ssh: false, yolo: false, auto: false, overlay: None });
@@ -1421,7 +1421,7 @@ fn pending_command_chat_allow_docker_field() {
 
 #[test]
 fn pending_command_ready_allow_docker_field() {
-    use amux::tui::state::PendingCommand;
+    use awman::tui::state::PendingCommand;
 
     let cmd = PendingCommand::Ready { refresh: false, build: false, no_cache: false, non_interactive: false, allow_docker: true, migrate_decision: None, template_audit_decision: None };
     assert_eq!(cmd, PendingCommand::Ready { refresh: false, build: false, no_cache: false, non_interactive: false, allow_docker: true, migrate_decision: None, template_audit_decision: None });
@@ -1434,12 +1434,12 @@ fn pending_command_ready_allow_docker_field() {
 
 #[test]
 fn allow_docker_adds_socket_mount_to_run_args() {
-    use amux::runtime::AgentRuntime;
+    use awman::runtime::AgentRuntime;
 
-    let socket_path = amux::runtime::docker::docker_socket_path();
+    let socket_path = awman::runtime::docker::docker_socket_path();
     let socket_str = socket_path.to_string_lossy().to_string();
 
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_pty(
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_pty(
         "test-image",
         "/workspace",
         &["entrypoint.sh"],
@@ -1464,12 +1464,12 @@ fn allow_docker_adds_socket_mount_to_run_args() {
 
 #[test]
 fn no_allow_docker_omits_socket_mount_from_run_args() {
-    use amux::runtime::AgentRuntime;
+    use awman::runtime::AgentRuntime;
 
-    let socket_path = amux::runtime::docker::docker_socket_path();
+    let socket_path = awman::runtime::docker::docker_socket_path();
     let socket_str = socket_path.to_string_lossy().to_string();
 
-    let args = amux::runtime::docker::DockerRuntime::new().build_run_args_pty(
+    let args = awman::runtime::docker::DockerRuntime::new().build_run_args_pty(
         "test-image",
         "/workspace",
         &["entrypoint.sh"],
@@ -1534,12 +1534,12 @@ async fn init_uses_explicit_cwd_not_process_cwd() {
 
     // Run init pointing at the git repo — should succeed.
     // Channel sink defaults Q&A to "no", so audit and work-items are skipped.
-    let runtime1 = std::sync::Arc::new(amux::runtime::DockerRuntime::new());
+    let runtime1 = std::sync::Arc::new(awman::runtime::DockerRuntime::new());
     let git_root1 = git_repo.path().to_path_buf();
     let result_ok = {
         let mut qa = init_flow::CliInitQa::new(&git_root1, sink1.clone());
         let launcher = init_flow::CliContainerLauncher::new(runtime1.clone());
-        let params = init_flow::InitParams { agent: amux::cli::Agent::Claude, aspec: false, git_root: git_root1 };
+        let params = init_flow::InitParams { agent: awman::cli::Agent::Claude, aspec: false, git_root: git_root1 };
         init_flow::execute(params, &mut qa, &launcher, &sink1, runtime1).await
     };
     assert!(
@@ -1666,13 +1666,13 @@ async fn new_fails_when_explicit_cwd_has_no_git_repo() {
 // Workflow state tests
 // ---------------------------------------------------------------------------
 
-use amux::workflow::{
+use awman::workflow::{
     StepStatus as WfStepStatus, WorkflowState,
 };
 
 #[test]
 fn workflow_resume_loads_correct_ready_steps() {
-    use amux::workflow::WorkflowStepState;
+    use awman::workflow::WorkflowStepState;
     // Build a two-step workflow state: step "plan" Done, step "implement" Pending (depends on plan).
     let steps = vec![
         WorkflowStepState {
@@ -1709,7 +1709,7 @@ fn workflow_resume_loads_correct_ready_steps() {
 
 #[test]
 fn workflow_state_file_removed_on_completion() {
-    use amux::workflow::{save_workflow_state, load_workflow_state, workflow_state_path, WorkflowStepState};
+    use awman::workflow::{save_workflow_state, load_workflow_state, workflow_state_path, WorkflowStepState};
 
     let tmp = TempDir::new().unwrap();
     let git_root = tmp.path().to_path_buf();
@@ -1753,7 +1753,7 @@ fn workflow_state_file_removed_on_completion() {
 
 #[test]
 fn workflow_set_container_id_overwrites_on_retry() {
-    use amux::workflow::WorkflowStepState;
+    use awman::workflow::WorkflowStepState;
 
     let steps = vec![
         WorkflowStepState {
@@ -1804,8 +1804,8 @@ async fn run_agent_with_sink_mount_ssh_emits_warning() {
 
     // mount_override avoids the interactive stdin prompt.
     let mount_path = PathBuf::from("/tmp");
-    let runtime = amux::runtime::docker::DockerRuntime::new();
-    let result = amux::commands::agent::run_agent_with_sink(
+    let runtime = awman::runtime::docker::DockerRuntime::new();
+    let result = awman::commands::agent::run_agent_with_sink(
         vec!["echo".to_string(), "hello".to_string()],
         "test status",
         &sink,
@@ -1847,8 +1847,8 @@ async fn run_agent_with_sink_no_mount_ssh_no_warning() {
     let sink = OutputSink::Channel(tx);
 
     let mount_path = PathBuf::from("/tmp");
-    let runtime = amux::runtime::docker::DockerRuntime::new();
-    let result = amux::commands::agent::run_agent_with_sink(
+    let runtime = awman::runtime::docker::DockerRuntime::new();
+    let result = awman::commands::agent::run_agent_with_sink(
         vec!["echo".to_string(), "hello".to_string()],
         "test status",
         &sink,
@@ -1891,8 +1891,8 @@ async fn run_agent_with_sink_mount_ssh_display_cmd_includes_ssh_path() {
     let sink = OutputSink::Channel(tx);
 
     let mount_path = PathBuf::from("/tmp");
-    let runtime = amux::runtime::docker::DockerRuntime::new();
-    let result = amux::commands::agent::run_agent_with_sink(
+    let runtime = awman::runtime::docker::DockerRuntime::new();
+    let result = awman::commands::agent::run_agent_with_sink(
         vec!["echo".to_string()],
         "test status",
         &sink,
@@ -1940,8 +1940,8 @@ async fn run_agent_with_sink_no_mount_ssh_display_cmd_excludes_ssh_path() {
     let sink = OutputSink::Channel(tx);
 
     let mount_path = PathBuf::from("/tmp");
-    let runtime = amux::runtime::docker::DockerRuntime::new();
-    let result = amux::commands::agent::run_agent_with_sink(
+    let runtime = awman::runtime::docker::DockerRuntime::new();
+    let result = awman::commands::agent::run_agent_with_sink(
         vec!["echo".to_string()],
         "test status",
         &sink,
@@ -1990,8 +1990,8 @@ async fn run_agent_with_sink_mount_ssh_missing_ssh_dir_errors() {
     let sink = OutputSink::Channel(tx);
 
     let mount_path = PathBuf::from("/tmp");
-    let runtime = amux::runtime::docker::DockerRuntime::new();
-    let result = amux::commands::agent::run_agent_with_sink(
+    let runtime = awman::runtime::docker::DockerRuntime::new();
+    let result = awman::commands::agent::run_agent_with_sink(
         vec!["echo".to_string()],
         "test status",
         &sink,
@@ -2038,7 +2038,7 @@ async fn run_agent_with_sink_mount_ssh_missing_ssh_dir_errors() {
 #[test]
 fn worktree_path_structure() {
     let _lock = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let path = amux::git::worktree_path(std::path::Path::new("/projects/myrepo"), 30).unwrap();
+    let path = awman::git::worktree_path(std::path::Path::new("/projects/myrepo"), 30).unwrap();
     let home = dirs::home_dir().unwrap();
     let expected = home
         .join(".amux")
@@ -2050,8 +2050,8 @@ fn worktree_path_structure() {
 
 #[test]
 fn worktree_branch_name_format() {
-    assert_eq!(amux::git::worktree_branch_name(30), "amux/work-item-0030");
-    assert_eq!(amux::git::worktree_branch_name(1), "amux/work-item-0001");
+    assert_eq!(awman::git::worktree_branch_name(30), "amux/work-item-0030");
+    assert_eq!(awman::git::worktree_branch_name(1), "amux/work-item-0001");
 }
 
 // ---------------------------------------------------------------------------
@@ -2079,7 +2079,7 @@ async fn e2e_chat_mount_ssh_displays_warning_and_docker_mount() {
 
     let cwd = std::env::current_dir().unwrap();
     let runtime = DockerRuntime::new();
-    let _ = amux::commands::chat::run_with_sink(
+    let _ = awman::commands::chat::run_with_sink(
         &sink,
         Some(cwd),
         vec![],

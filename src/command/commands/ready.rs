@@ -60,7 +60,7 @@ impl From<ReadySummary> for ReadyOutcome {
 }
 
 impl ReadyOutcome {
-    /// Render the outcome in the legacy `amux ready --json` schema:
+    /// Render the outcome in the legacy `awman ready --json` schema:
     ///
     /// ```json
     /// { "ready": <bool>,

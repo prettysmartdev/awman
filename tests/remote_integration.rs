@@ -8,14 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use amux::commands::headless::db;
-use amux::commands::headless::server::{AppState, AuthMode, build_router};
-use amux::commands::output::OutputSink;
-use amux::commands::remote::{
+use awman::commands::headless::db;
+use awman::commands::headless::server::{AppState, AuthMode, build_router};
+use awman::commands::output::OutputSink;
+use awman::commands::remote::{
     fetch_sessions, fetch_workflow_state, run_remote_run, run_remote_session_kill,
     run_remote_session_start, stream_command_logs,
 };
-use amux::runtime::{AgentRuntime, ContainerStats, HostSettings, StoppedContainerInfo};
+use awman::runtime::{AgentRuntime, ContainerStats, HostSettings, StoppedContainerInfo};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -590,11 +590,11 @@ async fn fetch_workflow_state_returns_none_for_command_without_workflow() {
     let (root, base) = start_test_server(vec![]).await;
 
     // Seed a session + command without writing a workflow.state.json.
-    let conn = amux::commands::headless::db::open_db(root.path()).unwrap();
-    amux::commands::headless::db::insert_session(
+    let conn = awman::commands::headless::db::open_db(root.path()).unwrap();
+    awman::commands::headless::db::insert_session(
         &conn, "sess-ri-no-wf", "/tmp/proj", "2024-01-01T00:00:00Z",
     ).unwrap();
-    amux::commands::headless::db::insert_command(
+    awman::commands::headless::db::insert_command(
         &conn, "cmd-ri-no-wf", "sess-ri-no-wf", "exec", "[]", "/dev/null",
     ).unwrap();
     drop(conn);
@@ -617,19 +617,19 @@ async fn fetch_workflow_state_returns_some_when_state_file_exists() {
     let command_id = "cmd-ri-with-wf";
 
     // Seed DB.
-    let conn = amux::commands::headless::db::open_db(root.path()).unwrap();
-    amux::commands::headless::db::insert_session(
+    let conn = awman::commands::headless::db::open_db(root.path()).unwrap();
+    awman::commands::headless::db::insert_session(
         &conn, session_id, "/tmp/proj", "2024-01-01T00:00:00Z",
     ).unwrap();
-    amux::commands::headless::db::insert_command(
+    awman::commands::headless::db::insert_command(
         &conn, command_id, session_id, "exec", "[]", "/dev/null",
     ).unwrap();
     drop(conn);
 
     // Write a known workflow state to the server's expected path.
-    let wf = amux::workflow::WorkflowState::new(
+    let wf = awman::workflow::WorkflowState::new(
         Some("Remote Integration WF".to_string()),
-        vec![amux::workflow::parser::WorkflowStep {
+        vec![awman::workflow::parser::WorkflowStep {
             name: "verify-step".to_string(),
             depends_on: vec![],
             prompt_template: "check something".to_string(),

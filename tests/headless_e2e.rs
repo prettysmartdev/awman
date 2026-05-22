@@ -26,7 +26,7 @@ fn find_free_port() -> u16 {
 
 /// Return the path to the compiled `amux` binary.
 fn amux_bin() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_amux"))
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_awman"))
 }
 
 /// Poll `GET {base}/v1/status` until the server responds with 200 or the
@@ -61,10 +61,10 @@ async fn e2e_headless_start_subprocess_responds_to_http() {
     let base = format!("http://127.0.0.1:{port}");
 
     // Spawn the server process, redirecting its output to /dev/null to keep
-    // test output clean.  AMUX_HEADLESS_ROOT forces it to use our temp dir.
+    // test output clean.  AWMAN_API_ROOT forces it to use our temp dir.
     let mut child = std::process::Command::new(amux_bin())
         .args([
-            "headless",
+            "api",
             "start",
             "--port",
             &port.to_string(),
@@ -72,7 +72,7 @@ async fn e2e_headless_start_subprocess_responds_to_http() {
             workdir.path().to_str().unwrap(),
             "--dangerously-skip-auth",
         ])
-        .env("AMUX_HEADLESS_ROOT", root_dir.path())
+        .env("AWMAN_API_ROOT", root_dir.path())
         // Suppress tracing output so it doesn't pollute the test runner.
         .env("RUST_LOG", "off")
         .stdout(std::process::Stdio::null())
@@ -185,8 +185,8 @@ async fn e2e_headless_start_subprocess_responds_to_http() {
     );
 
     // ── Verify the session is in the DB ──────────────────────────────────
-    let conn = amux::commands::headless::db::open_db(root_dir.path()).unwrap();
-    let row = amux::commands::headless::db::get_session(&conn, session_id)
+    let conn = awman::commands::headless::db::open_db(root_dir.path()).unwrap();
+    let row = awman::commands::headless::db::get_session(&conn, session_id)
         .unwrap()
         .expect("session created via HTTP must be present in the DB");
     assert_eq!(row.workdir, canonical_workdir.to_str().unwrap());
@@ -214,7 +214,7 @@ async fn background_flag_daemonises_server_and_kill_terminates_it() {
     // Start in background mode.
     let status = std::process::Command::new(amux_bin())
         .args([
-            "headless",
+            "api",
             "start",
             "--port",
             &port.to_string(),
@@ -222,7 +222,7 @@ async fn background_flag_daemonises_server_and_kill_terminates_it() {
             workdir.path().to_str().unwrap(),
             "--background",
         ])
-        .env("AMUX_HEADLESS_ROOT", root_dir.path())
+        .env("AWMAN_API_ROOT", root_dir.path())
         .env("RUST_LOG", "off")
         .status()
         .expect("failed to run amux headless start --background");
@@ -254,14 +254,14 @@ async fn background_flag_daemonises_server_and_kill_terminates_it() {
     let pid_str = std::fs::read_to_string(&pid_file).unwrap();
     let pid: u32 = pid_str.trim().parse().expect("amux.pid must contain a valid PID");
     assert!(
-        amux::commands::headless::process::is_process_alive(pid),
+        awman::commands::headless::process::is_process_alive(pid),
         "background server process (PID {pid}) must be alive"
     );
 
     // Kill the server via `amux headless kill`.
     let kill_status = std::process::Command::new(amux_bin())
-        .args(["headless", "kill"])
-        .env("AMUX_HEADLESS_ROOT", root_dir.path())
+        .args(["api", "kill"])
+        .env("AWMAN_API_ROOT", root_dir.path())
         .status()
         .expect("failed to run amux headless kill");
     assert!(kill_status.success(), "amux headless kill must exit 0");
@@ -283,7 +283,7 @@ async fn background_flag_daemonises_server_and_kill_terminates_it() {
         "amux.pid must be removed after headless kill"
     );
     assert!(
-        !amux::commands::headless::process::is_process_alive(pid),
+        !awman::commands::headless::process::is_process_alive(pid),
         "process (PID {pid}) must be dead after headless kill"
     );
 }

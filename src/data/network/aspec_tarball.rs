@@ -20,7 +20,7 @@ pub enum NetworkError {
 /// Download the aspec tarball into memory.
 pub async fn download_aspec_tarball() -> Result<Vec<u8>, NetworkError> {
     let client = reqwest::Client::builder()
-        .user_agent("amux")
+        .user_agent("awman")
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(30))
         .build()

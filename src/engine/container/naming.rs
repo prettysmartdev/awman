@@ -1,17 +1,17 @@
 //! Container naming helpers.
 //!
-//! `amux-<pid>-<nanos>` for ephemeral runs.
+//! `awman-<pid>-<nanos>` for ephemeral runs.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Generate an ephemeral container name: `amux-<pid>-<subsec-nanos>`.
+/// Generate an ephemeral container name: `awman-<pid>-<subsec-nanos>`.
 pub fn generate_container_name() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    format!("amux-{pid}-{nanos}")
+    format!("awman-{pid}-{nanos}")
 }
 
 #[cfg(test)]
@@ -19,10 +19,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_format_starts_with_amux() {
+    fn name_format_starts_with_awman() {
         let n = generate_container_name();
-        assert!(n.starts_with("amux-"), "got: {n}");
-        assert!(n.len() > "amux-".len() + 5);
+        assert!(n.starts_with("awman-"), "got: {n}");
+        assert!(n.len() > "awman-".len() + 5);
     }
 
     #[test]

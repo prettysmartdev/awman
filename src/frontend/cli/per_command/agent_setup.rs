@@ -29,7 +29,7 @@ impl AgentSetupFrontend for CliFrontend {
             format!("Set up agent {}", requested.as_str())
         };
         eprintln!(
-            "amux: {action}? [y]es / [n]o{}",
+            "awman: {action}? [y]es / [n]o{}",
             if default_available && default.as_str() != requested.as_str() {
                 format!(" / [f]allback to {}", default.as_str())
             } else {

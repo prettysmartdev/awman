@@ -1,9 +1,9 @@
 # Using the TUI
 
-amux has two execution modes:
+awman has two execution modes:
 
-- **TUI mode** — run `amux` with no arguments to open the interactive terminal UI. This is the primary interface for ongoing agent work: it supports multiple simultaneous sessions, live tab state, and a full in-process terminal emulator for agent output.
-- **Command mode** — run `amux <subcommand>` directly from your shell. It executes the command and exits. Useful for scripting, CI, or quick one-off actions.
+- **TUI mode** — run `awman` with no arguments to open the interactive terminal UI. This is the primary interface for ongoing agent work: it supports multiple simultaneous sessions, live tab state, and a full in-process terminal emulator for agent output.
+- **Command mode** — run `awman <subcommand>` directly from your shell. It executes the command and exits. Useful for scripting, CI, or quick one-off actions.
 
 This guide covers TUI mode.
 
@@ -11,17 +11,17 @@ This guide covers TUI mode.
 
 ## Startup
 
-When you run `amux` with no arguments, the TUI opens immediately in an alternate terminal screen. What happens next depends on your environment:
+When you run `awman` with no arguments, the TUI opens immediately in an alternate terminal screen. What happens next depends on your environment:
 
 **Inside a Git repository:**
 
-The TUI runs `amux ready` automatically on the first tab. This checks that your container runtime is available, that `Dockerfile.dev` and `.amux/Dockerfile.{agent}` exist, and that your agent image is built. If anything needs attention, `ready` will guide you through it. Once `ready` passes, the TUI shows the welcome message and waits for your first command.
+The TUI runs `awman ready` automatically on the first tab. This checks that your container runtime is available, that `Dockerfile.dev` and `.awman/Dockerfile.{agent}` exist, and that your agent image is built. If anything needs attention, `ready` will guide you through it. Once `ready` passes, the TUI shows the welcome message and waits for your first command.
 
 **Outside a Git repository:**
 
-If the working directory is not inside a Git repository, the TUI runs `amux status --watch` instead, streaming a live status view. This is useful for monitoring a headless server or checking the state of remote sessions. Most agent commands require a Git repo — navigate to one and open a new tab with **Ctrl+T**.
+If the working directory is not inside a Git repository, the TUI runs `awman status --watch` instead, streaming a live status view. This is useful for monitoring an API server or checking the state of remote sessions. Most agent commands require a Git repo — navigate to one and open a new tab with **Ctrl+T**.
 
-In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if amux crashes.
+In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
 
 ---
 
@@ -58,7 +58,7 @@ The TUI is composed of three areas:
 
 ## The command box
 
-The command box is where you interact with amux. Type any subcommand and press **Enter**.
+The command box is where you interact with awman. Type any subcommand and press **Enter**.
 
 | Key | Action |
 |-----|--------|
@@ -73,7 +73,7 @@ The command box is where you interact with amux. Type any subcommand and press *
 | **Ctrl+Backspace** | Delete previous word |
 | **Tab** | Cycle to next autocomplete suggestion |
 | **Shift+Tab** | Cycle to previous autocomplete suggestion |
-| **q** | Quit amux (when command box is empty and idle) |
+| **q** | Quit awman (when command box is empty and idle) |
 | **Ctrl+C** | Close tab (multiple tabs) or open quit confirmation (single tab) |
 
 ### Input handling
@@ -94,7 +94,7 @@ As you type, matching command completions appear in the suggestion row below the
 > chat · init · status
 ```
 
-When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** to cycle through suggestions and fill them into the input. Every command available in `amux` is also available in the TUI command box. Both `--flag value` and `--flag=value` forms are accepted. For example:
+When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** to cycle through suggestions and fill them into the input. Every command available in `awman` is also available in the TUI command box. Both `--flag value` and `--flag=value` forms are accepted. For example:
 
 ```
 chat --agent codex
@@ -128,10 +128,10 @@ If a worktree is active for the session, it shows the worktree path:
 Using Worktree: /home/user/myproject-worktree
 ```
 
-If you type an unrecognised command, amux suggests the closest known one:
+If you type an unrecognised command, awman suggests the closest known one:
 
 ```
-'exex' is not an amux command.  Did you mean: exec
+'exex' is not an awman command.  Did you mean: exec
 ```
 
 ### Quitting
@@ -139,7 +139,7 @@ If you type an unrecognised command, amux suggests the closest known one:
 Press **Ctrl+C** from the command box to open the quit confirmation dialog:
 
 ```
-╭─── Quit amux? ───────────────────╮
+╭─── Quit awman? ───────────────────╮
 │  Are you sure you want to quit?   │
 │  [y/n]                            │
 ╰───────────────────────────────────╯
@@ -149,7 +149,7 @@ Press **y** to quit, **n** or **Esc** to cancel. With multiple tabs open, **Ctrl
 
 ```
 ╭─── Close tab? ──────────────────────────────╮
-│  [q] Quit amux   [c] Close this tab   [n] Cancel │
+│  [q] Quit awman   [c] Close this tab   [n] Cancel │
 ╰──────────────────────────────────────────────╯
 ```
 
@@ -173,7 +173,7 @@ When the window is selected (press **↑** from the command box to select it):
 
 ### Status log
 
-amux itself writes informational messages — not agent output, but messages from amux about what it is doing — into a per-tab **status log**. Examples include "container started", "worktree created", "auth token accepted", and error messages from failed commands.
+awman itself writes informational messages — not agent output, but messages from awman about what it is doing — into a per-tab **status log**. Examples include "container started", "worktree created", "auth token accepted", and error messages from failed commands.
 
 The status log appears in the execution window. By default it is **collapsed**: only the most recent message is shown as a single line at the bottom of the output area.
 
@@ -201,7 +201,7 @@ The status log is per-tab and accumulates for the lifetime of the session. It do
 
 ## The container window
 
-Whenever amux launches a container to run a code agent, a **container window** appears overlaying the execution window. This window contains a full terminal emulator — all keyboard input, ANSI colour codes, cursor movement, and interactive TUI apps (like Claude Code's own UI) work exactly as they would in a real terminal.
+Whenever awman launches a container to run a code agent, a **container window** appears overlaying the execution window. This window contains a full terminal emulator — all keyboard input, ANSI colour codes, cursor movement, and interactive TUI apps (like Claude Code's own UI) work exactly as they would in a real terminal.
 
 ```
 ╭─ 🔒 Claude Code (containerized) ── myproject | 5% | 200mb ──╮
@@ -228,7 +228,7 @@ When the container window is visible and maximized, almost all keyboard input is
 | Mouse drag | Select text (highlighted with inverted colours) |
 | **Ctrl+Y** | Copy the current selection to clipboard (ANSI stripped) |
 
-> **Note on Ctrl+M:** `Ctrl+M` produces the same byte (`\r`) as carriage return in many terminals. amux intercepts Ctrl+M before it reaches the agent, so agents cannot receive a raw `\r` from this key combination. In practice this is not a problem — agents use Enter (which produces `\r\n` or `\n`) for line input, not Ctrl+M.
+> **Note on Ctrl+M:** `Ctrl+M` produces the same byte (`\r`) as carriage return in many terminals. awman intercepts Ctrl+M before it reaches the agent, so agents cannot receive a raw `\r` from this key combination. In practice this is not a problem — agents use Enter (which produces `\r\n` or `\n`) for line input, not Ctrl+M.
 
 Scrollback holds up to 10,000 lines by default. While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth. Scroll back to the bottom to return to the live view.
 
@@ -246,7 +246,7 @@ Press **Ctrl+M** to cycle the container window between three states:
 ─ 🔒 claude | myproject | 5% | 200mb | 1m 23s ─────────────────
 ```
 
-When you cycle the container window, amux automatically resizes the running container's PTY to match the new display dimensions. This ensures interactive agents see the correct terminal size.
+When you cycle the container window, awman automatically resizes the running container's PTY to match the new display dimensions. This ensures interactive agents see the correct terminal size.
 
 From the minimized or hidden state:
 
@@ -344,14 +344,14 @@ Tab names are truncated at 14 characters with `…`. The tab bar distributes wid
 | Grey | Idle or completed |
 | Blue | Running (no container) |
 | Green | Running with active container |
-| Purple / Magenta | Permanently bound to a remote headless session |
+| Purple / Magenta | Permanently bound to a remote API session |
 | Red | Exited with error |
 | Yellow | Container silent for >30 seconds (stuck warning) |
 | Alternating Yellow / Purple | Background yolo countdown in progress: tab label alternates between `⚠️ yolo in Ns` and `🤘 yolo in Ns` every 2 seconds (see [Yolo Mode](05-yolo-mode.md#background-yolo-countdown)) |
 
 ### Remote-bound tabs
 
-When `remote.defaultAddr` is set in `~/.amux/config.json`, opening a new tab with **Ctrl+T** offers an option to bind the tab to a remote headless session. A **remote-bound tab** forwards every command you type to the remote host via the headless API — no `remote run` prefix or session flags needed.
+When `remote.defaultAddr` is set in `~/.awman/config.json`, opening a new tab with **Ctrl+T** offers an option to bind the tab to a remote API session. A **remote-bound tab** forwards every command you type to the remote host via the API API — no `remote run` prefix or session flags needed.
 
 Remote-bound tabs are **purple** in the tab bar. The tab label shows `host:port` of the remote host instead of the local directory name. When a workflow runs on the remote session, the workflow state strip appears automatically and updates every 5 seconds.
 
@@ -369,7 +369,7 @@ If a running container produces no output for more than 30 seconds, the tab turn
 
 **Active-tab suppression:** On the currently active tab, any keypress or mouse scroll also resets the stuck timer directly. If you are actively reading or scrolling through output, the tab will not turn yellow or show any stuck indicator — the timer only starts when both the container and the user have been idle for 30 seconds. Background tabs are not affected by this; they use output time alone to determine stuck state.
 
-For workflow tabs, amux goes further: the [workflow control board](04-workflows.md#workflow-control-board) opens automatically so you can act without having to notice the yellow indicator. In yolo mode, background tabs show a live countdown directly in the tab bar instead of a dialog. See [Workflows](04-workflows.md) and [Yolo Mode](05-yolo-mode.md) for details.
+For workflow tabs, awman goes further: the [workflow control board](04-workflows.md#workflow-control-board) opens automatically so you can act without having to notice the yellow indicator. In yolo mode, background tabs show a live countdown directly in the tab bar instead of a dialog. See [Workflows](04-workflows.md) and [Yolo Mode](05-yolo-mode.md) for details.
 
 ---
 
@@ -385,7 +385,7 @@ For workflow tabs, amux goes further: the [workflow control board](04-workflows.
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
 | **Ctrl+,** | Open / close the configuration dialog |
-| **Ctrl+C** | Quit amux (single tab) or close current tab (multiple tabs open) |
+| **Ctrl+C** | Quit awman (single tab) or close current tab (multiple tabs open) |
 
 ### Command box
 
@@ -400,7 +400,7 @@ For workflow tabs, amux goes further: the [workflow control board](04-workflows.
 | **Backspace / Delete** | Delete characters |
 | **Ctrl+Backspace** | Delete the previous word |
 | **↑** | Focus the execution window (for scrolling) |
-| **q** | Quit amux (when command box is empty and tab is idle) |
+| **q** | Quit awman (when command box is empty and tab is idle) |
 
 ### Execution window
 
@@ -464,7 +464,7 @@ For workflow tabs, amux goes further: the [workflow control board](04-workflows.
 |---------|-----|--------|
 | Quit confirmation | **y** | Confirm quit |
 | Quit confirmation | **n** or **Esc** | Cancel |
-| Close-tab dialog | **q** | Quit amux |
+| Close-tab dialog | **q** | Quit awman |
 | Close-tab dialog | **c** | Close current tab only |
 | Close-tab dialog | **n** or **Esc** | Cancel |
 | Lightweight step-confirm | **Enter** | Advance to next step |

@@ -35,7 +35,7 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
         _completed_steps: usize,
         _total_steps: usize,
     ) -> Result<bool, CommandError> {
-        // Non-interactive default: resume from saved state. The CLI/headless
+        // Non-interactive default: resume from saved state. The CLI/API
         // path has no dialog system; preserving state is the safer choice
         // (matches old-amux behavior).
         Ok(true)

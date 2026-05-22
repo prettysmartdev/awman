@@ -1,4 +1,4 @@
-//! `src/command/commands/` — one struct per amux command.
+//! `src/command/commands/` — one struct per awman command.
 //!
 //! Each module contains the `*Command` struct (owning every flag value and
 //! engine reference it needs), its `*CommandFrontend` trait (defining the
@@ -15,7 +15,7 @@ pub mod config;
 pub mod download;
 pub mod exec_prompt;
 pub mod exec_workflow;
-pub mod headless;
+pub mod api_server;
 pub mod init;
 pub mod mount_scope;
 pub mod new;
@@ -79,7 +79,7 @@ pub fn parse_overlay_spec(spec: &str) -> Result<crate::engine::overlay::Director
 }
 
 /// Parse a comma-separated list of typed overlay expressions from the
-/// `AMUX_OVERLAYS` env var or config arrays.
+/// `AWMAN_OVERLAYS` env var or config arrays.
 ///
 /// Grammar: `dir(host:container[:perm])` or `skill()` expressions separated
 /// by commas. Bare `host:container[:perm]` strings (no type tag) are accepted
@@ -227,7 +227,7 @@ pub fn config_overlay_to_spec(
 }
 
 /// Collect all directory overlays from effective config sources (global config,
-/// repo config, AMUX_OVERLAYS env var) and merge with CLI flag overlays.
+/// repo config, AWMAN_OVERLAYS env var) and merge with CLI flag overlays.
 ///
 /// Returns `(directory_specs, skills_enabled)` where `skills_enabled` is true
 /// when any source (config, env var, or CLI) requests the skills overlay.
@@ -263,7 +263,7 @@ pub fn collect_all_overlay_specs(
         }
     }
 
-    // 3. AMUX_OVERLAYS env var.
+    // 3. AWMAN_OVERLAYS env var.
     if let Some(env_str) = ec.env().overlays() {
         if let Ok(parsed) = parse_overlay_list(env_str) {
             for typed in parsed {
@@ -336,7 +336,7 @@ mod skill_parser_tests {
 #[cfg(test)]
 mod collect_overlay_specs_tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AMUX_CONFIG_HOME, AMUX_OVERLAYS};
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, AWMAN_OVERLAYS};
     use crate::data::config::global::GlobalConfig;
     use crate::data::config::repo::{OverlaysConfig, RepoConfig};
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
@@ -364,7 +364,7 @@ mod collect_overlay_specs_tests {
         };
         repo_config.save(git_tmp.path()).unwrap();
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
@@ -383,7 +383,7 @@ mod collect_overlay_specs_tests {
             ..Default::default()
         };
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         global_config.save_with(&env).unwrap();
         let session = open_session(git_tmp.path(), env);
 
@@ -392,25 +392,25 @@ mod collect_overlay_specs_tests {
     }
 
     #[test]
-    fn skills_enabled_when_amux_overlays_env_contains_skill() {
+    fn skills_enabled_when_awman_overlays_env_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([
-            (AMUX_CONFIG_HOME, tmp.path().to_str().unwrap()),
-            (AMUX_OVERLAYS, "skill()"),
+            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_OVERLAYS, "skill()"),
         ]);
         let session = open_session(tmp.path(), env);
 
         let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
         assert!(
             skills_enabled,
-            "skills must be enabled when AMUX_OVERLAYS contains skill()"
+            "skills must be enabled when AWMAN_OVERLAYS contains skill()"
         );
     }
 
     #[test]
     fn skills_enabled_when_cli_typed_overlays_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![TypedOverlay::Skill]);
@@ -423,7 +423,7 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skills_disabled_when_no_source_enables_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
@@ -447,7 +447,7 @@ mod collect_overlay_specs_tests {
             ..Default::default()
         };
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         global_config.save_with(&env).unwrap();
         // Repo config has no overlays; no CLI TypedOverlay::Skill.
         let session = open_session(git_tmp.path(), env);

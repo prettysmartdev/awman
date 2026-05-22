@@ -1,5 +1,5 @@
 //! `engine::auth` — `AuthEngine`. Consolidates host-side agent credential
-//! resolution and headless server authentication (API key generation,
+//! resolution and API server authentication (API key generation,
 //! hashing, comparison, persistence, refresh, TLS material).
 
 use std::net::IpAddr;
@@ -10,7 +10,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 
 use crate::data::fs::auth_paths::AuthPathResolver;
-use crate::data::fs::headless_paths::HeadlessPaths;
+use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
@@ -75,28 +75,28 @@ pub struct TlsMaterial {
 #[derive(Debug, Clone)]
 pub struct AuthEngine {
     auth_paths: AuthPathResolver,
-    headless_paths: HeadlessPaths,
+    api_paths: ApiPaths,
 }
 
 impl AuthEngine {
     pub fn new(_session: &Session) -> Result<Self, EngineError> {
         let auth_paths = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
-        let headless_paths = HeadlessPaths::from_process_env().map_err(EngineError::Data)?;
+        let api_paths = ApiPaths::from_process_env().map_err(EngineError::Data)?;
         Ok(Self {
             auth_paths,
-            headless_paths,
+            api_paths,
         })
     }
 
-    pub fn with_paths(auth_paths: AuthPathResolver, headless_paths: HeadlessPaths) -> Self {
+    pub fn with_paths(auth_paths: AuthPathResolver, api_paths: ApiPaths) -> Self {
         Self {
             auth_paths,
-            headless_paths,
+            api_paths,
         }
     }
 
-    pub fn headless_paths(&self) -> &HeadlessPaths {
-        &self.headless_paths
+    pub fn api_paths(&self) -> &ApiPaths {
+        &self.api_paths
     }
 
     // ── Agent credential discovery ──────────────────────────────────────────
@@ -150,7 +150,7 @@ impl AuthEngine {
         self.agent_keychain_credentials(agent)
     }
 
-    // ── Headless API-key lifecycle ─────────────────────────────────────────
+    // ── API-key lifecycle ──────────────────────────────────────────────────
 
     /// Generate a fresh 32-byte API key, hex-encoded (64 chars). Matches
     /// the old-amux wire format so existing scripts/regex/docs keep working.
@@ -168,9 +168,9 @@ impl AuthEngine {
         ApiKeyHash(hex_encode(h.as_ref()))
     }
 
-    /// Persist the hash to `<headless-root>/api_key.hash` with mode 0o600 on Unix.
+    /// Persist the hash to `<api-root>/api_key.hash` with mode 0o600 on Unix.
     pub fn write_api_key_hash(&self, hash: &ApiKeyHash) -> Result<(), EngineError> {
-        let path = self.headless_paths.api_key_hash_file();
+        let path = self.api_paths.api_key_hash_file();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
         }
@@ -180,7 +180,7 @@ impl AuthEngine {
 
     /// Read the persisted hash, or `None` when absent.
     pub fn read_api_key_hash(&self) -> Result<Option<ApiKeyHash>, EngineError> {
-        let path = self.headless_paths.api_key_hash_file();
+        let path = self.api_paths.api_key_hash_file();
         match std::fs::read_to_string(&path) {
             Ok(s) => Ok(Some(ApiKeyHash(s.trim().to_string()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -235,10 +235,10 @@ impl AuthEngine {
         &self,
         bind_ip: IpAddr,
     ) -> Result<(TlsMaterial, bool), EngineError> {
-        let tls_dir = self.headless_paths.tls_dir();
-        let cert_path = self.headless_paths.tls_cert_file();
-        let key_path = self.headless_paths.tls_key_file();
-        let bind_ip_path = self.headless_paths.tls_bind_ip_file();
+        let tls_dir = self.api_paths.tls_dir();
+        let cert_path = self.api_paths.tls_cert_file();
+        let key_path = self.api_paths.tls_key_file();
+        let bind_ip_path = self.api_paths.tls_bind_ip_file();
 
         if cert_path.exists() && key_path.exists() {
             let stored_ip = std::fs::read_to_string(&bind_ip_path)
@@ -264,7 +264,7 @@ impl AuthEngine {
         params.distinguished_name = rcgen::DistinguishedName::new();
         params.distinguished_name.push(
             rcgen::DnType::CommonName,
-            format!("amux-headless-{ip_short_hash}"),
+            format!("awman-api-{ip_short_hash}"),
         );
 
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
@@ -417,12 +417,12 @@ fn write_file_secure(path: &Path, content: &[u8]) -> Result<PathBuf, EngineError
 mod tests {
     use super::*;
     use crate::data::fs::auth_paths::AuthPathResolver;
-    use crate::data::fs::headless_paths::HeadlessPaths;
+    use crate::data::fs::api_paths::ApiPaths;
 
-    fn engine_with(home: &Path, headless_root: &Path) -> AuthEngine {
+    fn engine_with(home: &Path, api_root: &Path) -> AuthEngine {
         AuthEngine::with_paths(
             AuthPathResolver::at_home(home),
-            HeadlessPaths::at_root(headless_root),
+            ApiPaths::at_root(api_root),
         )
     }
 
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn read_api_key_hash_returns_none_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         let e = engine_with(tmp.path(), &head);
         assert!(e.read_api_key_hash().unwrap().is_none());
     }
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn ensure_self_signed_tls_generates_cert_and_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn ensure_self_signed_tls_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn ensure_self_signed_tls_regenerates_on_bind_ip_change() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn refresh_api_key_writes_hash_and_returns_plaintext() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 

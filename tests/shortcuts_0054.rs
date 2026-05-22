@@ -5,8 +5,8 @@
 /// - From CommandBox focus: single tab → QuitConfirm; multiple tabs → CloseTabConfirm.
 /// - From ExecutionWindow focus (Running, no container window, no status-watch cancel):
 ///   forward the Ctrl-C byte (0x03) to the PTY.
-use amux::tui::input::{handle_key, Action};
-use amux::tui::state::{App, ContainerWindowState, Dialog, ExecutionPhase, Focus};
+use awman::tui::input::{handle_key, Action};
+use awman::tui::state::{App, ContainerWindowState, Dialog, ExecutionPhase, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn new_app() -> App {

@@ -1,7 +1,7 @@
-//! Sqlite-backed persistence for headless-mode session and command metadata.
+//! Sqlite-backed persistence for API-mode session and command metadata.
 //!
 //! Schema parity with `oldsrc/commands/headless/db.rs` is preserved so that
-//! existing on-disk databases written by prior amux releases can be opened
+//! existing on-disk databases written by prior awman releases can be opened
 //! by the new store without losing state.
 
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection};
 
 use crate::data::error::DataError;
-use crate::data::fs::headless_paths::HeadlessPaths;
+use crate::data::fs::api_paths::ApiPaths;
 
 /// Persistable session metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,11 +44,11 @@ pub struct SqliteSessionStore {
 }
 
 impl SqliteSessionStore {
-    /// Open (or create) a sqlite database at `<root>/amux.db`, run migrations,
+    /// Open (or create) a sqlite database at `<root>/awman.db`, run migrations,
     /// and enable WAL mode for concurrent reads.
     pub fn open(root: &Path) -> Result<Self, DataError> {
         std::fs::create_dir_all(root).map_err(|e| DataError::io(root, e))?;
-        let db_file = root.join(crate::data::fs::headless_paths::HEADLESS_DB_FILENAME);
+        let db_file = root.join(crate::data::fs::api_paths::API_DB_FILENAME);
         let conn = Connection::open(&db_file)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Self::migrate(&conn)?;
@@ -58,7 +58,7 @@ impl SqliteSessionStore {
     }
 
     /// Convenience constructor that opens at the path resolved from `paths`.
-    pub fn open_from_paths(paths: &HeadlessPaths) -> Result<Self, DataError> {
+    pub fn open_from_paths(paths: &ApiPaths) -> Result<Self, DataError> {
         Self::open(paths.root())
     }
 
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn legacy_schema_db_is_readable_by_new_store() {
         let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("amux.db");
+        let db_path = tmp.path().join("awman.db");
 
         // Step 1: create the DB using the exact legacy schema.
         {
@@ -619,7 +619,7 @@ mod tests {
             )
             .unwrap();
 
-            // Insert rows as the old amux code would have.
+            // Insert rows as the old awman code would have.
             conn.execute(
                 "INSERT INTO sessions (id, workdir, created_at, status) \
                  VALUES ('legacy-id-1', '/old/repo', '2023-06-01T10:00:00Z', 'active')",

@@ -8,11 +8,11 @@
 
 use std::collections::HashSet;
 
-use amux::data::error::DataError;
-use amux::data::workflow_dag::WorkflowDag;
-use amux::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
-use amux::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
-use amux::data::EngineWorkflowStateStore;
+use awman::data::error::DataError;
+use awman::data::workflow_dag::WorkflowDag;
+use awman::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
+use awman::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
+use awman::data::EngineWorkflowStateStore;
 
 // ─── Workflow parsing parity across formats ───────────────────────────────────
 

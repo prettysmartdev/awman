@@ -1,15 +1,15 @@
-title = "Review Parity: new-amux vs old-amux"
+title = "Review Parity: new-awman vs old-amux"
 
 [[steps]]
 name = "command-subcommand-parity"
 model = "claude-opus-4-7"
 prompt = """
-Review command and subcommand parity between old-amux and new-amux.
+Review command and subcommand parity between old-amux and new-awman.
 
 old-amux source of truth: oldsrc/cli.rs (clap-based Cli struct and subcommand enums)
-new-amux source of truth: src/command/dispatch/catalogue.rs (CommandCatalogue static data)
+new-awman source of truth: src/command/dispatch/catalogue.rs (CommandCatalogue static data)
 
-For every top-level command and every subcommand in old-amux, verify it exists in new-amux with
+For every top-level command and every subcommand in old-amux, verify it exists in new-awman with
 the same name (or a documented alias). Check:
 
 1. Top-level commands: init, ready, implement, chat, specs, claws, status, config, exec, headless,
@@ -28,11 +28,11 @@ the same name (or a documented alias). Check:
 3. Path aliases: verify the `specs new` → `new spec` path alias is registered in PATH_ALIASES.
    Verify the `exec wf` string alias for `exec workflow` is present.
 
-4. For each command that exists in old-amux but cannot be found in new-amux, or vice versa,
+4. For each command that exists in old-amux but cannot be found in new-awman, or vice versa,
    flag it as a parity gap. For each alias present in old-amux (e.g. clap `#[command(alias)]`)
-   that is missing from new-amux, flag it.
+   that is missing from new-awman, flag it.
 
-5. Check that all command help strings in new-amux reasonably match the doc strings in old-amux
+5. Check that all command help strings in new-awman reasonably match the doc strings in old-amux
    (same intent, equivalent wording). Flag significant divergences.
 
 Produce a structured report: a table of every command/subcommand path with a "present in old",
@@ -45,12 +45,12 @@ name = "flag-parity"
 depends_on = ["command-subcommand-parity"]
 model = "claude-opus-4-7"
 prompt = """
-Review flag parity between old-amux and new-amux for every command and subcommand.
+Review flag parity between old-amux and new-awman for every command and subcommand.
 
 old-amux source of truth: oldsrc/cli.rs (clap field attributes on each command variant)
-new-amux source of truth: src/command/dispatch/catalogue.rs (FlagSpec entries in each CommandSpec)
+new-awman source of truth: src/command/dispatch/catalogue.rs (FlagSpec entries in each CommandSpec)
 
-For each command path, compare the set of flags available in old-amux vs new-amux:
+For each command path, compare the set of flags available in old-amux vs new-awman:
 
 1. Root flags: --build, --no-cache, --refresh
 2. init: --agent, --aspec
@@ -83,10 +83,10 @@ For each flag, verify:
 - Flag is optional vs required
 
 Also check the claws subcommands (init, ready, chat) — old-amux defines them with no flags;
-verify new-amux matches.
+verify new-awman matches.
 
 Produce a structured report per command path: a table of flag name, old-amux type/default,
-new-amux type/default, and a "match?" column. List any gaps, missing flags, mismatched types,
+new-awman type/default, and a "match?" column. List any gaps, missing flags, mismatched types,
 wrong defaults, or missing short aliases. Rate each gap critical / medium / minor.
 Do NOT fix anything — review only.
 """
@@ -96,7 +96,7 @@ name = "ux-parity"
 depends_on = ["command-subcommand-parity", "flag-parity"]
 model = "claude-opus-4-7"
 prompt = """
-Review user-experience parity between old-amux and new-amux. This step focuses on what the user
+Review user-experience parity between old-amux and new-awman. This step focuses on what the user
 actually sees and experiences when running commands — beyond just the structural presence of
 commands and flags.
 
@@ -106,44 +106,44 @@ Reference files:
 - src/command/dispatch/ — new dispatch system
 - src/command/commands/ — new command handlers
 - src/frontend/tui/ — TUI frontend (if relevant)
-- aspec/work-items/new-amux-issues.md — known observed issues with new-amux
+- aspec/work-items/new-amux-issues.md — known observed issues with new-awman
 
 Evaluate the following dimensions:
 
 1. Help text and usage strings
-   - Does `amux --help` and `amux <command> --help` produce output that matches old-amux's
+   - Does `awman --help` and `awman <command> --help` produce output that matches old-amux's
      structure (subcommand listing, flag descriptions, positional argument names)?
-   - Are help strings for all commands and flags accurate and complete in new-amux?
-   - Does `amux exec workflow --help` show the `wf` alias?
+   - Are help strings for all commands and flags accurate and complete in new-awman?
+   - Does `awman exec workflow --help` show the `wf` alias?
 
 2. Error messages
-   - Does new-amux produce clear, user-friendly error messages for:
+   - Does new-awman produce clear, user-friendly error messages for:
      - Unknown commands
-     - Missing required arguments (e.g. `amux implement` with no work item number)
+     - Missing required arguments (e.g. `awman implement` with no work item number)
      - Invalid flag values (e.g. bad --agent name, bad --port, bad --format)
      - Mutually exclusive flags (--yolo + --plan)
    - Compare error message quality and phrasing to old-amux (clap produces good messages
-     automatically; does new-amux match this quality?)
+     automatically; does new-awman match this quality?)
 
 3. Input validation
-   - Does new-amux validate --agent against the known agent list at parse time (like old-amux)?
+   - Does new-awman validate --agent against the known agent list at parse time (like old-amux)?
    - Does `exec prompt` with an empty string reject it with a helpful message (like old-amux's
      `parse_non_empty_prompt` validator)?
    - Are positional arguments (work_item, prompt, workflow path, config field, session_id) checked
      for correctness before dispatch?
 
 4. Interactive vs non-interactive behaviour
-   - Does `amux implement` (interactive) launch the TUI correctly?
-   - Does `amux implement 0001 --non-interactive` run headlessly and print output to stdout?
-   - Does `amux new spec` ask what kind of work item (as noted in new-amux-issues.md ISSUE-1.1)?
-   - Does `amux new spec --interview` correctly launch an agent container with auth passthrough
+   - Does `awman implement` (interactive) launch the TUI correctly?
+   - Does `awman implement 0001 --non-interactive` run headlessly and print output to stdout?
+   - Does `awman new spec` ask what kind of work item (as noted in new-amux-issues.md ISSUE-1.1)?
+   - Does `awman new spec --interview` correctly launch an agent container with auth passthrough
      (ISSUE-1.3)?
-   - Does `amux exec workflow` with `--yolo` and a countdown work correctly (ISSUE-2.4)?
+   - Does `awman exec workflow` with `--yolo` and a countdown work correctly (ISSUE-2.4)?
 
 5. Output formatting
-   - Does `amux status` produce readable, well-formatted output?
-   - Does `amux ready --json` produce valid JSON and suppress human output?
-   - Does `amux exec workflow` show the workflow status table correctly (ISSUE-2.2)?
+   - Does `awman status` produce readable, well-formatted output?
+   - Does `awman ready --json` produce valid JSON and suppress human output?
+   - Does `awman exec workflow` show the workflow status table correctly (ISSUE-2.2)?
 
 6. TUI UX (if applicable)
    - Does the TUI expose all commands that old-amux's interactive mode supported?

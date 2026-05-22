@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-/// A reference to a container image (e.g. `amux-myproj-claude:latest`).
+/// A reference to a container image (e.g. `awman-myproj-claude:latest`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef(pub String);
 
@@ -30,7 +30,7 @@ impl Entrypoint {
     }
 }
 
-/// Stable name for a container (e.g. `amux-abc123`).
+/// Stable name for a container (e.g. `awman-abc123`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerName(pub String);
 
@@ -160,8 +160,8 @@ pub enum ContainerOption {
     /// Container-side `$HOME` remapped from `/root` when a non-root `USER`
     /// directive is detected in the agent's Dockerfile.
     DockerfileUser(String),
-    /// Session identifier — emitted as `--label amux.session=<id>` so
-    /// `list_running` can attribute containers to a specific amux session.
+    /// Session identifier — emitted as `--label awman.session=<id>` so
+    /// `list_running` can attribute containers to a specific awman session.
     SessionLabel(String),
     /// Per-agent mode flags (yolo, auto, plan) — emitted as literal argv
     /// strings after the entrypoint in `build_run_argv`.

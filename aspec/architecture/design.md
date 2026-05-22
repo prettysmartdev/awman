@@ -2,7 +2,7 @@
 
 ## Overview
 
-amux follows a **four-layer architecture** that separates data, business logic, command dispatch, and presentation. This design ensures functional parity across three frontend modalities (CLI, TUI, Headless) while maintaining code health and enabling future frontend implementations.
+awman follows a **four-layer architecture** that separates data, business logic, command dispatch, and presentation. This design ensures functional parity across three frontend modalities (CLI, TUI, API) while maintaining code health and enabling future frontend implementations.
 
 Pattern: single statically-linked binary
 
@@ -26,7 +26,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 │  Layer 4: Binary                    │ src/main.rs
 │  (Entry point only)                 │
 ├─────────────────────────────────────┤
-│  Layer 3: Frontends                 │ src/frontend/{cli,tui,headless}
+│  Layer 3: Frontends                 │ src/frontend/{cli,tui,api}
 │  (Presentation + Input, no logic)   │
 ├─────────────────────────────────────┤
 │  Layer 2: Command                   │ src/command/
@@ -69,7 +69,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 ### Layer 3: Frontend (`src/frontend/`)
 - CLI (clap-based command-line interface)
 - TUI (Ratatui-based terminal UI)
-- Headless (HTTP API server)
+- API (HTTP API server)
 
 **Constraint**: Frontends are presentation-only. All business logic lives in Layer 2. Frontends communicate with lower layers via traits that delegate user input and receive outcomes for display.
 
@@ -80,7 +80,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 
 ### Layer 4: Binary (`src/main.rs`)
 - Single entry point
-- Sets up chosen frontend (CLI, TUI, or Headless)
+- Sets up chosen frontend (CLI, TUI, or API)
 - Delegates to frontend for all functionality
 
 ## High-level Data Flow
@@ -122,7 +122,7 @@ All agent code execution occurs inside isolated containers managed by the `Conta
 - Merged configuration (repo, global, environment, flags)
 - Current `SessionState` (ongoing command execution, workflow state, errors)
 
-The CLI is a single-session frontend (one session per invocation). The TUI and Headless frontends manage multiple sessions concurrently via `SessionManager`.
+The CLI is a single-session frontend (one session per invocation). The TUI and API frontends manage multiple sessions concurrently via `SessionManager`.
 
 ### Command Dispatch
 `Dispatch` is the central command router. It:

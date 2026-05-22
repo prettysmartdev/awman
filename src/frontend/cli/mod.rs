@@ -55,7 +55,7 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
     let path = command_path_from_matches(&matches);
     if path.is_empty() {
         // `main.rs` should already have routed bare invocations to the TUI.
-        eprintln!("amux: no subcommand supplied; run `amux --help` for usage.");
+        eprintln!("awman: no subcommand supplied; run `awman --help` for usage.");
         return ExitCode::from(2);
     }
     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
@@ -82,20 +82,20 @@ pub(crate) fn format_outcome(outcome: &CommandOutcome) -> Option<String> {
 /// Format a [`CommandError`] to the user-visible stderr string.
 ///
 /// Each variant gets a friendly message + an optional "next step" hint
-/// where actionable. The "amux: " prefix is always present so user output
+/// where actionable. The "awman: " prefix is always present so user output
 /// is consistent across error types.
 pub(crate) fn format_error(err: &CommandError) -> String {
     let body = match err {
         CommandError::Aborted => "command aborted by user".to_string(),
         CommandError::UnknownCommand { path } => {
             format!(
-                "unknown command: {}\n  try `amux --help` for the full command list",
+                "unknown command: {}\n  try `awman --help` for the full command list",
                 path.join(" ")
             )
         }
         CommandError::UnknownFlag { command, flag } => {
             format!(
-                "unknown flag '--{flag}' for command `{}`\n  try `amux {} --help`",
+                "unknown flag '--{flag}' for command `{}`\n  try `awman {} --help`",
                 command.join(" "),
                 command.join(" ")
             )
@@ -157,20 +157,20 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         }
         CommandError::MalformedSseEvent(msg) => format!("malformed SSE event from remote: {msg}"),
         CommandError::RemoteTransport(msg) => format!("remote transport error: {msg}"),
-        CommandError::HeadlessWorkdirNotFound { path } => {
-            format!("headless workdir not found: {}", path.display())
+        CommandError::ApiWorkdirNotFound { path } => {
+            format!("API workdir not found: {}", path.display())
         }
-        CommandError::HeadlessAlreadyRunning { pid } => {
+        CommandError::ApiServerAlreadyRunning { pid } => {
             format!(
-                "headless server is already running on PID {pid}; run `amux headless kill` first"
+                "API server is already running on PID {pid}; run `awman api kill` first"
             )
         }
-        CommandError::HeadlessNotRunning => "headless server is not running".into(),
-        CommandError::HeadlessAuthMissing => {
-            "no API key configured. Run `amux headless start --refresh-key` first, or pass `--dangerously-skip-auth`.".into()
+        CommandError::ApiServerNotRunning => "API server is not running".into(),
+        CommandError::ApiServerAuthMissing => {
+            "no API key configured. Run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`.".into()
         }
         CommandError::RemoteSessionMissing => {
-            "no remote session id; pass --session <id> or run `amux remote session start` first".into()
+            "no remote session id; pass --session <id> or run `awman remote session start` first".into()
         }
         CommandError::RemoteSessionKillFailed { session_id, reason } => {
             format!("failed to kill remote session '{session_id}': {reason}")
@@ -182,7 +182,7 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         }
         CommandError::SpecTemplateMissing { path } => {
             format!(
-                "spec template missing at {}; run `amux init --aspec` to create it",
+                "spec template missing at {}; run `awman init --aspec` to create it",
                 path.display()
             )
         }
@@ -200,10 +200,10 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         }
         CommandError::Engine(e) => match e {
             crate::engine::error::EngineError::AgentRequiresProjectImage { tag } => format!(
-                "agent image build requires the project base image first ({tag}); run `amux ready --build`"
+                "agent image build requires the project base image first ({tag}); run `awman ready --build`"
             ),
             crate::engine::error::EngineError::Container(msg) => format!(
-                "container backend error: {msg}\n  amux requires Docker; install Docker Desktop / docker-engine and retry"
+                "container backend error: {msg}\n  awman requires Docker; install Docker Desktop / docker-engine and retry"
             ),
             crate::engine::error::EngineError::Network(msg) => {
                 format!("network error: {msg}")
@@ -273,7 +273,7 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         },
         CommandError::Data(e) => format!("{e}"),
     };
-    format!("amux: {body}")
+    format!("awman: {body}")
 }
 
 /// Render a successful [`CommandOutcome`] to stdout and return the
@@ -322,7 +322,7 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         CommandError::WorkItemNotFound { .. }
         | CommandError::SpecTemplateMissing { .. }
         | CommandError::WorkflowFileNotFound { .. }
-        | CommandError::HeadlessWorkdirNotFound { .. } => 4,
+        | CommandError::ApiWorkdirNotFound { .. } => 4,
 
         // Exit 3 — missing container runtime
         CommandError::Engine(crate::engine::error::EngineError::Container(_))
@@ -341,9 +341,9 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::RemoteHttpStatus { .. }
         | CommandError::MalformedSseEvent(_)
         | CommandError::RemoteTransport(_) => 1,
-        CommandError::HeadlessAlreadyRunning { .. }
-        | CommandError::HeadlessNotRunning
-        | CommandError::HeadlessAuthMissing
+        CommandError::ApiServerAlreadyRunning { .. }
+        | CommandError::ApiServerNotRunning
+        | CommandError::ApiServerAuthMissing
         | CommandError::RemoteSessionMissing
         | CommandError::RemoteSessionKillFailed { .. } => 1,
         CommandError::NotImplemented(_) => 1,
@@ -420,7 +420,7 @@ mod tests {
             CommandError::RemoteTimeout,
             CommandError::MissingRemoteAddress,
             CommandError::MissingApiKey,
-            CommandError::HeadlessAlreadyRunning { pid: 42 },
+            CommandError::ApiServerAlreadyRunning { pid: 42 },
         ];
         for err in other_errors {
             assert_eq!(
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn subcommand_present_routes_to_cli() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         // main.rs uses `matches.subcommand_name().is_some()` to pick CLI.
         assert!(m.subcommand_name().is_some());
     }
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn bare_invocation_routes_to_tui() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman"]).unwrap();
         // main.rs uses `matches.subcommand_name().is_none()` to pick TUI.
         assert!(m.subcommand_name().is_none());
     }
@@ -472,7 +472,7 @@ mod tests {
             tip: "test tip".into(),
         });
         let s = format_outcome(&outcome).expect("status must render text");
-        assert!(s.contains("AMUX STATUS DASHBOARD"));
+        assert!(s.contains("AWMAN STATUS DASHBOARD"));
         assert!(!s.contains('{'), "status must not be rendered as JSON");
     }
 
@@ -490,8 +490,8 @@ mod tests {
     // ─── format_error — per-variant rendering assertions ─────────────────────
 
     #[test]
-    fn format_error_prefix_is_always_amux() {
-        // Every error message must start with "amux: " for consistent UX.
+    fn format_error_prefix_is_always_awman() {
+        // Every error message must start with "awman: " for consistent UX.
         let errors: &[CommandError] = &[
             CommandError::Aborted,
             CommandError::NotImplemented("x"),
@@ -503,8 +503,8 @@ mod tests {
         for err in errors {
             let s = format_error(err);
             assert!(
-                s.starts_with("amux: "),
-                "error must start with 'amux: ', got: {s:?}"
+                s.starts_with("awman: "),
+                "error must start with 'awman: ', got: {s:?}"
             );
         }
     }
@@ -532,10 +532,10 @@ mod tests {
 
     #[test]
     fn format_error_not_implemented_includes_message() {
-        let err = CommandError::NotImplemented("headless");
+        let err = CommandError::NotImplemented("api");
         let s = format_error(&err);
         assert!(
-            s.contains("headless"),
+            s.contains("api"),
             "NotImplemented error must include the message: {s:?}"
         );
     }

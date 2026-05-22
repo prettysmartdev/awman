@@ -3,7 +3,7 @@
 //! Confirms that every command documented in `aspec/uxui/cli.md` is present in
 //! `CommandCatalogue` and that flag implications / conflicts are registered.
 
-use amux::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
+use awman::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
 
 fn cat() -> &'static CommandCatalogue {
     CommandCatalogue::get()
@@ -15,7 +15,7 @@ fn cat() -> &'static CommandCatalogue {
 fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
-        "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote", "new",
+        "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
     ] {
         assert!(
             names.contains(expected),
@@ -74,11 +74,11 @@ fn chat_has_non_interactive_short_flag() {
     assert_eq!(flag.unwrap().short, Some('n'));
 }
 
-// ─── headless start ──────────────────────────────────────────────────────────
+// ─── api start ──────────────────────────────────────────────────────────
 
 #[test]
-fn headless_start_has_workdirs_flag() {
-    let cmd = cat().lookup(&["headless", "start"]).unwrap();
+fn api_start_has_workdirs_flag() {
+    let cmd = cat().lookup(&["api", "start"]).unwrap();
     assert!(cmd.find_flag("workdirs").is_some());
 }
 

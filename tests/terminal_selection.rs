@@ -3,7 +3,7 @@
 //! Covers: resize-clears-selection, snapshot isolation from live output,
 //! and end-to-end scrollback display.
 
-use amux::tui::state::{ContainerWindowState, TabState};
+use awman::tui::state::{ContainerWindowState, TabState};
 use std::path::PathBuf;
 
 // ─── resize clears selection ──────────────────────────────────────────────────
@@ -238,11 +238,11 @@ fn new_tab_default_scrollback_lines_is_ten_thousand() {
     let tab = TabState::new(PathBuf::from("/tmp/default-sb"));
     assert_eq!(
         tab.terminal_scrollback_lines,
-        amux::config::DEFAULT_SCROLLBACK_LINES,
+        awman::config::DEFAULT_SCROLLBACK_LINES,
         "new tab must default to DEFAULT_SCROLLBACK_LINES"
     );
     assert_eq!(
-        amux::config::DEFAULT_SCROLLBACK_LINES,
+        awman::config::DEFAULT_SCROLLBACK_LINES,
         10_000,
         "DEFAULT_SCROLLBACK_LINES must be 10,000"
     );

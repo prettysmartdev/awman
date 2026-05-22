@@ -50,14 +50,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Create the amux user (idempotent in case base evolves) ────────────────────
-RUN { id -u amux >/dev/null 2>&1 \
-       || useradd -m -s /bin/bash -d /home/amux amux 2>/dev/null \
-       || useradd -s /bin/bash -d /home/amux amux ; } \
-    && mkdir -p /home/amux \
-    && chown -R amux:amux /home/amux
+# ── Create the awman user (idempotent in case base evolves) ───────────────────
+RUN { id -u awman >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/awman awman 2>/dev/null \
+       || useradd -s /bin/bash -d /home/awman awman ; } \
+    && mkdir -p /home/awman \
+    && chown -R awman:awman /home/awman
 
-# ── Rust toolchain (installed as root, then ownership transferred to amux) ────
+# ── Rust toolchain (installed as root, then ownership transferred to awman) ───
 # Pin to the MSRV declared in Cargo.toml (rust-version = "1.94.0").
 # RUSTUP_HOME and CARGO_HOME are placed under /usr/local so the installation
 # is shared across all users without needing per-user ~/.cargo in PATH.
@@ -71,9 +71,9 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl -sSf https://sh.rustup.rs \
         | sh -s -- --no-modify-path --default-toolchain ${RUST_VERSION} -y \
     && rustup target add x86_64-unknown-linux-musl \
-    && chown -R amux:amux $RUSTUP_HOME $CARGO_HOME
+    && chown -R awman:awman $RUSTUP_HOME $CARGO_HOME
 
-USER amux
-ENV HOME=/home/amux
+USER awman
+ENV HOME=/home/awman
 
 WORKDIR /workspace

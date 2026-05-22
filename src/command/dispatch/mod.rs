@@ -1,7 +1,7 @@
 //! `Dispatch` — Layer 2's gateway from frontends into typed `*Command` values.
 //!
 //! Frontends construct a `Dispatch` with a frontend-specific
-//! [`CommandFrontend`] implementation (CLI, TUI, headless). Dispatch reads
+//! [`CommandFrontend`] implementation (CLI, TUI, API). Dispatch reads
 //! flag values from the frontend, applies catalogue-driven validation
 //! (mutually-exclusive flags, type errors, implications), and returns a typed
 //! [`BuiltCommand`] enum containing the constructed `*Command` struct.
@@ -24,9 +24,9 @@ use crate::command::commands::exec_prompt::{
 use crate::command::commands::exec_workflow::{
     ExecWorkflowCommand, ExecWorkflowCommandFlags, ExecWorkflowCommandFrontend,
 };
-use crate::command::commands::headless::{
-    HeadlessCommand, HeadlessCommandFrontend, HeadlessKillFlags, HeadlessLogsFlags,
-    HeadlessStartFlags, HeadlessStatusFlags, HeadlessSubcommand,
+use crate::command::commands::api_server::{
+    ApiServerCommand, ApiServerCommandFrontend, ApiServerKillFlags, ApiServerLogsFlags,
+    ApiServerStartFlags, ApiServerStatusFlags, ApiServerSubcommand,
 };
 use crate::command::commands::init::{InitCommand, InitCommandFlags, InitCommandFrontend};
 use crate::command::commands::new::{
@@ -104,7 +104,7 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
 // ─── Frontend supertrait ────────────────────────────────────────────────────
 
 /// Frontend type accepted by [`Dispatch::run_command`]. A single concrete
-/// frontend (CLI, TUI, or headless) implements every per-command frontend
+/// frontend (CLI, TUI, or API) implements every per-command frontend
 /// trait via this supertrait so that dispatch can move the frontend value
 /// into the matching `Box<dyn *CommandFrontend>` for whichever variant
 /// `build_command` returned. Layer 3 frontends typically derive this
@@ -119,7 +119,7 @@ pub trait DispatchFrontend:
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
-    + HeadlessCommandFrontend
+    + ApiServerCommandFrontend
     + RemoteCommandFrontend
     + NewCommandFrontend
     + AuthCommandFrontend
@@ -138,7 +138,7 @@ impl<T> DispatchFrontend for T where
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
-        + HeadlessCommandFrontend
+        + ApiServerCommandFrontend
         + RemoteCommandFrontend
         + NewCommandFrontend
         + AuthCommandFrontend
@@ -162,7 +162,7 @@ pub enum CommandOutcome {
     Config(crate::command::commands::config::ConfigOutcome),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
-    Headless(crate::command::commands::headless::HeadlessOutcome),
+    ApiServer(crate::command::commands::api_server::ApiServerOutcome),
     Remote(crate::command::commands::remote::RemoteOutcome),
     New(crate::command::commands::new::NewOutcome),
     Specs(crate::command::commands::specs::SpecsOutcome),
@@ -183,7 +183,7 @@ pub enum BuiltCommand {
     Config(ConfigCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
-    Headless(HeadlessCommand),
+    ApiServer(ApiServerCommand),
     Remote(RemoteCommand),
     New(NewCommand),
     Auth(AuthCommand),
@@ -397,7 +397,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                     session.clone(),
                 )))
             }
-            ["headless", "start"] => {
+            ["api", "start"] => {
                 let port = self
                     .frontend
                     .flag_u16(&canonical_refs, "port")?
@@ -415,8 +415,8 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "dangerously-skip-auth")?
                     .unwrap_or(false);
-                Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                    HeadlessSubcommand::Start(HeadlessStartFlags {
+                Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                    ApiServerSubcommand::Start(ApiServerStartFlags {
                         port,
                         workdirs,
                         background,
@@ -426,16 +426,16 @@ impl<F: CommandFrontend> Dispatch<F> {
                     self.engines.clone(),
                 )))
             }
-            ["headless", "kill"] => Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                HeadlessSubcommand::Kill(HeadlessKillFlags {}),
+            ["api", "kill"] => Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                ApiServerSubcommand::Kill(ApiServerKillFlags {}),
                 self.engines.clone(),
             ))),
-            ["headless", "logs"] => Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                HeadlessSubcommand::Logs(HeadlessLogsFlags {}),
+            ["api", "logs"] => Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                ApiServerSubcommand::Logs(ApiServerLogsFlags {}),
                 self.engines.clone(),
             ))),
-            ["headless", "status"] => Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                HeadlessSubcommand::Status(HeadlessStatusFlags {}),
+            ["api", "status"] => Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                ApiServerSubcommand::Status(ApiServerStatusFlags {}),
                 self.engines.clone(),
             ))),
             ["remote", "run"] => {
@@ -616,11 +616,11 @@ impl<F: DispatchFrontend> Dispatch<F> {
                     .await
                     .map(CommandOutcome::ExecWorkflow)
             }
-            BuiltCommand::Headless(cmd) => {
-                let boxed: Box<dyn HeadlessCommandFrontend> = Box::new(frontend);
+            BuiltCommand::ApiServer(cmd) => {
+                let boxed: Box<dyn ApiServerCommandFrontend> = Box::new(frontend);
                 cmd.run_with_frontend(boxed)
                     .await
-                    .map(CommandOutcome::Headless)
+                    .map(CommandOutcome::ApiServer)
             }
             BuiltCommand::Remote(cmd) => {
                 let boxed: Box<dyn RemoteCommandFrontend> = Box::new(frontend);
@@ -839,7 +839,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -1011,12 +1011,12 @@ mod tests {
     }
 
     #[test]
-    fn build_headless_start_with_port() {
+    fn build_api_start_with_port() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.u16s.insert("port".into(), 1234);
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-        let built = dispatch.build_command(&["headless", "start"]).unwrap();
-        assert!(matches!(built, BuiltCommand::Headless(_)));
+        let built = dispatch.build_command(&["api", "start"]).unwrap();
+        assert!(matches!(built, BuiltCommand::ApiServer(_)));
     }
 
     #[test]

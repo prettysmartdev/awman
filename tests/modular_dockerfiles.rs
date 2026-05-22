@@ -5,12 +5,12 @@
 //!   no Docker daemon required.
 //! - End-to-end tests: invoke the compiled `amux` binary with a temporary git repo;
 //!   require a running Docker daemon and are skipped when Docker is unavailable.
-use amux::cli::Agent;
-use amux::commands::init_flow::{
+use awman::cli::Agent;
+use awman::commands::init_flow::{
     dockerfile_for_agent_embedded, project_dockerfile_embedded, write_agent_dockerfile,
     write_project_dockerfile,
 };
-use amux::commands::output::OutputSink;
+use awman::commands::output::OutputSink;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
@@ -19,7 +19,7 @@ use tokio::sync::mpsc::unbounded_channel;
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn amux_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_amux"))
+    Command::new(env!("CARGO_BIN_EXE_awman"))
 }
 
 fn docker_available() -> bool {
@@ -92,7 +92,7 @@ async fn write_agent_dockerfile_creates_file_at_expected_path() {
 /// without a network call so the assertion is not affected by the remote template version.
 #[test]
 fn embedded_agent_template_substitution_produces_correct_from_line() {
-    use amux::runtime::project_image_tag;
+    use awman::runtime::project_image_tag;
     use std::path::Path;
 
     let base_tag = project_image_tag(Path::new("/repos/testproject"));

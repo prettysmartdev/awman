@@ -30,7 +30,7 @@ impl WorkflowFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(NextAction::LaunchNext);
         }
-        eprintln!("amux: workflow paused — choose next action:");
+        eprintln!("awman: workflow paused — choose next action:");
         if available.can_launch_next {
             eprintln!("  [n] Launch next step (new container)");
         }
@@ -148,7 +148,7 @@ impl WorkflowFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(false);
         }
-        eprintln!("amux: workflow file changed since last run; resume anyway? [y/n]");
+        eprintln!("awman: workflow file changed since last run; resume anyway? [y/n]");
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return Ok(false);
@@ -169,7 +169,7 @@ impl WorkflowFrontend for CliFrontend {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "—".to_string());
         eprintln!(
-            "amux: step '{}' failed (exit {}, signal {signal_str}). [r]etry / [p]ause / [a]bort?",
+            "awman: step '{}' failed (exit {}, signal {signal_str}). [r]etry / [p]ause / [a]bort?",
             step.name, exit.exit_code,
         );
         let mut buf = String::new();
@@ -193,13 +193,13 @@ impl WorkflowFrontend for CliFrontend {
                 exit_code,
             } => {
                 eprintln!(
-                    "amux: workflow failed at step '{}' (exit {}).",
+                    "awman: workflow failed at step '{}' (exit {}).",
                     last_step, exit_code
                 );
                 return;
             }
         };
-        eprintln!("amux: {}", msg);
+        eprintln!("awman: {}", msg);
     }
 
     fn report_workflow_progress(&mut self, steps: &[WorkflowStepProgressInfo]) {

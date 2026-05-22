@@ -687,7 +687,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -814,7 +814,7 @@ mod tests {
         };
         tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
             agent_display_name: "Claude".into(),
-            container_name: "amux-test-1234".into(),
+            container_name: "awman-test-1234".into(),
             start_time: std::time::Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
@@ -829,7 +829,7 @@ mod tests {
 
         // Simulate a stats result arriving on the channel.
         let stats = crate::engine::container::instance::ContainerStats {
-            name: "amux-test-1234".into(),
+            name: "awman-test-1234".into(),
             cpu_percent: 42.5,
             memory_mb: 256.0,
         };
@@ -846,7 +846,7 @@ mod tests {
         let s = info.latest_stats.as_ref().unwrap();
         assert_eq!(s.cpu_percent, 42.5);
         assert_eq!(s.memory_mb, 256.0);
-        assert_eq!(s.name, "amux-test-1234");
+        assert_eq!(s.name, "awman-test-1234");
         assert_eq!(info.stats_history.len(), 1);
     }
 
@@ -867,13 +867,13 @@ mod tests {
 
         // Simulate the engine reporting the container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
-            *guard = Some("amux-new-container".into());
+            *guard = Some("awman-new-container".into());
         }
 
         app.tick_all_tabs();
 
         let info = app.active_tab().container_info.as_ref().unwrap();
-        assert_eq!(info.container_name, "amux-new-container");
+        assert_eq!(info.container_name, "awman-new-container");
     }
 
     #[test]
@@ -885,10 +885,10 @@ mod tests {
         };
         tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
             agent_display_name: "Claude".into(),
-            container_name: "amux-old-container".into(),
+            container_name: "awman-old-container".into(),
             start_time: std::time::Instant::now(),
             latest_stats: Some(crate::engine::container::instance::ContainerStats {
-                name: "amux-old-container".into(),
+                name: "awman-old-container".into(),
                 cpu_percent: 10.0,
                 memory_mb: 100.0,
             }),
@@ -897,13 +897,13 @@ mod tests {
 
         // Simulate a workflow step transition reporting a new container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
-            *guard = Some("amux-step2-container".into());
+            *guard = Some("awman-step2-container".into());
         }
 
         app.tick_all_tabs();
 
         let info = app.active_tab().container_info.as_ref().unwrap();
-        assert_eq!(info.container_name, "amux-step2-container");
+        assert_eq!(info.container_name, "awman-step2-container");
         assert!(
             info.latest_stats.is_none(),
             "latest_stats must be cleared when a new container name arrives"
@@ -919,10 +919,10 @@ mod tests {
         let tab = app.active_tab_mut();
         tab.container_info = Some(ContainerInfo {
             agent_display_name: "Claude".into(),
-            container_name: "amux-test".into(),
+            container_name: "awman-test".into(),
             start_time: std::time::Instant::now(),
             latest_stats: Some(ContainerStats {
-                name: "amux-test".into(),
+                name: "awman-test".into(),
                 cpu_percent: 42.5,
                 memory_mb: 256.0,
             }),
@@ -936,7 +936,7 @@ mod tests {
             "title must contain memory: {title}"
         );
         assert!(
-            title.contains("amux-test"),
+            title.contains("awman-test"),
             "title must contain name: {title}"
         );
     }

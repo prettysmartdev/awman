@@ -9,7 +9,7 @@ impl AuthCommandFrontend for TuiCommandFrontend {
     fn ask_consent(&mut self, _default: bool) -> Result<AuthConsentChoice, CommandError> {
         let response = self.ask_dialog(DialogRequest::Custom {
             title: "Agent credentials?".into(),
-            body: "Allow amux to pass credentials to the agent container?".into(),
+            body: "Allow awman to pass credentials to the agent container?".into(),
             keys: vec![
                 ('y', "Accept".into()),
                 ('n', "Decline".into()),

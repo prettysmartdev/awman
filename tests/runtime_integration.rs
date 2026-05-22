@@ -5,13 +5,13 @@
 /// - `AppleContainersRuntime` integration (macOS-only, opt-in via `AMUX_TEST_APPLE_CONTAINERS=1`)
 /// - End-to-end CLI checks via the compiled `amux` binary
 /// - Error path: unavailable runtime produces a user-facing message, not a panic
-use amux::runtime::AgentRuntime;
+use awman::runtime::AgentRuntime;
 use std::process::{Command, Stdio};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn amux() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_amux"))
+    Command::new(env!("CARGO_BIN_EXE_awman"))
 }
 
 fn docker_available() -> bool {
@@ -30,13 +30,13 @@ fn docker_available() -> bool {
 /// of whether Docker is actually installed — these are pure in-process calls.
 #[test]
 fn docker_runtime_name_is_docker() {
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     assert_eq!(rt.name(), "docker");
 }
 
 #[test]
 fn docker_runtime_cli_binary_is_docker() {
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     assert_eq!(rt.cli_binary(), "docker");
 }
 
@@ -44,7 +44,7 @@ fn docker_runtime_cli_binary_is_docker() {
 /// whether Docker is installed or the daemon is running.
 #[test]
 fn docker_runtime_is_available_returns_bool_without_panic() {
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let _: bool = rt.is_available(); // must not panic
 }
 
@@ -55,7 +55,7 @@ fn docker_runtime_is_available_when_daemon_running() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     assert!(rt.is_available());
 }
 
@@ -67,7 +67,7 @@ fn docker_runtime_image_exists_false_for_nonexistent_image() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     assert!(!rt.image_exists("amux-test-nonexistent-image-zzz-99999:latest"));
 }
 
@@ -78,7 +78,7 @@ fn docker_runtime_find_stopped_container_returns_none_when_missing() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let result = rt.find_stopped_container("amux-test-nonexistent-xyz", "no-such-image:latest");
     assert!(result.is_none());
 }
@@ -91,7 +91,7 @@ fn docker_runtime_list_containers_by_prefix_returns_empty_when_none_match() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let names = rt.list_running_containers_by_prefix("amux-test-nonexistent-prefix-zzz");
     assert!(names.is_empty());
 }
@@ -104,7 +104,7 @@ fn docker_runtime_query_stats_returns_none_for_nonexistent_container() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let stats = rt.query_container_stats("amux-test-nonexistent-container-zzz");
     assert!(stats.is_none());
 }
@@ -115,19 +115,19 @@ fn docker_runtime_query_stats_returns_none_for_nonexistent_container() {
 /// "docker" — accessible from the integration test crate.
 #[test]
 fn resolve_runtime_default_resolves_to_docker() {
-    let config = amux::config::GlobalConfig { runtime: None, ..Default::default() };
-    let rt = amux::runtime::resolve_runtime(&config).unwrap();
+    let config = awman::config::GlobalConfig { runtime: None, ..Default::default() };
+    let rt = awman::runtime::resolve_runtime(&config).unwrap();
     assert_eq!(rt.name(), "docker");
 }
 
 /// An unknown runtime name must not panic — it falls back to Docker with a warning.
 #[test]
 fn resolve_runtime_unknown_string_does_not_panic() {
-    let config = amux::config::GlobalConfig {
+    let config = awman::config::GlobalConfig {
         runtime: Some("nonexistent-runtime".into()),
         ..Default::default()
     };
-    let rt = amux::runtime::resolve_runtime(&config).unwrap();
+    let rt = awman::runtime::resolve_runtime(&config).unwrap();
     assert_eq!(rt.name(), "docker");
 }
 
@@ -135,11 +135,11 @@ fn resolve_runtime_unknown_string_does_not_panic() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn resolve_runtime_apple_containers_on_non_macos_returns_err() {
-    let config = amux::config::GlobalConfig {
+    let config = awman::config::GlobalConfig {
         runtime: Some("apple-containers".into()),
         ..Default::default()
     };
-    let err = amux::runtime::resolve_runtime(&config)
+    let err = awman::runtime::resolve_runtime(&config)
         .err()
         .expect("apple-containers must be rejected on non-macOS, got Ok");
     let msg = err.to_string();
@@ -155,7 +155,7 @@ fn docker_runtime_start_nonexistent_container_returns_err() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let result = rt.start_container("amux-test-nonexistent-container-zzz-99999");
     assert!(result.is_err(), "start_container must return Err for nonexistent container");
     let msg = result.unwrap_err().to_string();
@@ -169,7 +169,7 @@ fn docker_runtime_stop_nonexistent_container_returns_err() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let result = rt.stop_container("amux-test-nonexistent-container-zzz-99999");
     assert!(result.is_err(), "stop_container must return Err for nonexistent container");
 }
@@ -181,7 +181,7 @@ fn docker_runtime_remove_nonexistent_container_returns_err() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let result = rt.remove_container("amux-test-nonexistent-container-zzz-99999");
     assert!(result.is_err(), "remove_container must return Err for nonexistent container");
 }
@@ -193,7 +193,7 @@ fn docker_runtime_get_workspace_mount_returns_none_for_nonexistent() {
         eprintln!("Docker not available, skipping");
         return;
     }
-    let rt = amux::runtime::DockerRuntime::new();
+    let rt = awman::runtime::DockerRuntime::new();
     let result = rt.get_container_workspace_mount("amux-test-nonexistent-container-zzz-99999");
     assert!(result.is_none());
 }
@@ -307,14 +307,14 @@ mod apple_containers {
     #[test]
     fn apple_runtime_name_and_binary_without_daemon() {
         // Metadata is always available, even if the daemon is not running.
-        let rt = amux::runtime::apple::AppleContainersRuntime::new();
+        let rt = awman::runtime::apple::AppleContainersRuntime::new();
         assert_eq!(rt.name(), "apple-containers");
         assert_eq!(rt.cli_binary(), "container");
     }
 
     #[test]
     fn apple_runtime_is_available_returns_bool_without_panic() {
-        let rt = amux::runtime::apple::AppleContainersRuntime::new();
+        let rt = awman::runtime::apple::AppleContainersRuntime::new();
         let _: bool = rt.is_available();
     }
 
@@ -324,7 +324,7 @@ mod apple_containers {
             eprintln!("Apple Containers not available or AMUX_TEST_APPLE_CONTAINERS not set, skipping");
             return;
         }
-        let rt = amux::runtime::apple::AppleContainersRuntime::new();
+        let rt = awman::runtime::apple::AppleContainersRuntime::new();
         assert!(rt.is_available());
     }
 
@@ -334,7 +334,7 @@ mod apple_containers {
             eprintln!("Apple Containers not available, skipping");
             return;
         }
-        let rt = amux::runtime::apple::AppleContainersRuntime::new();
+        let rt = awman::runtime::apple::AppleContainersRuntime::new();
         assert!(!rt.image_exists("amux-test-nonexistent-image-zzz:latest"));
     }
 
@@ -344,7 +344,7 @@ mod apple_containers {
             eprintln!("Apple Containers not available, skipping");
             return;
         }
-        let rt = amux::runtime::apple::AppleContainersRuntime::new();
+        let rt = awman::runtime::apple::AppleContainersRuntime::new();
         let result = rt.find_stopped_container("amux-test-nonexistent", "no-such-image:latest");
         assert!(result.is_none());
     }
@@ -355,7 +355,7 @@ mod apple_containers {
             eprintln!("Apple Containers not available, skipping");
             return;
         }
-        let rt = amux::runtime::apple::AppleContainersRuntime::new();
+        let rt = awman::runtime::apple::AppleContainersRuntime::new();
         let names = rt.list_running_containers_by_prefix("amux-test-nonexistent-prefix-zzz");
         assert!(names.is_empty());
     }

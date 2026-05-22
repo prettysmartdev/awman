@@ -54,7 +54,7 @@ make test     # run all tests
 
 ## Configuration
 
-- Per-repo config: `GITROOT/aspec/.amux.json`
+- Per-repo config: `GITROOT/.awman/config.json`
 - Global config: `$HOME/.amux/config.json`
 - Binary install path: `/usr/local/bin/`
 - Data/storage: `$HOME/.amux/`

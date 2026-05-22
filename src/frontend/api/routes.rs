@@ -1,4 +1,4 @@
-//! HTTP route registration and handlers for the headless server.
+//! HTTP route registration and handlers for the API server.
 //!
 //! Wire-identical to `oldsrc/commands/headless/server.rs::build_router`.
 
@@ -19,10 +19,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::TraceLayer;
 
 use crate::command::dispatch::{Dispatch, Engines};
-use crate::data::fs::headless_db::SqliteSessionStore;
-use crate::data::fs::headless_paths::HeadlessPaths;
+use crate::data::fs::api_db::SqliteSessionStore;
+use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
-use crate::frontend::headless::command_frontend::HeadlessDispatchFrontend;
+use crate::frontend::api::command_frontend::ApiDispatchFrontend;
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
@@ -36,7 +36,7 @@ pub enum AuthMode {
 
 pub struct AppState {
     pub store: SqliteSessionStore,
-    pub paths: HeadlessPaths,
+    pub paths: ApiPaths,
     pub workdirs: Vec<PathBuf>,
     pub started_at: Instant,
     pub busy_sessions: tokio::sync::Mutex<HashSet<String>>,
@@ -457,13 +457,13 @@ async fn handle_create_command(
     headers: HeaderMap,
     Json(body): Json<CreateCommandRequest>,
 ) -> Response {
-    let session_id = match headers.get("x-amux-session") {
+    let session_id = match headers.get("x-awman-session") {
         Some(val) => match val.to_str() {
             Ok(s) => s.to_string(),
             Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    error_json("Invalid x-amux-session header value"),
+                    error_json("Invalid x-awman-session header value"),
                 )
                     .into_response();
             }
@@ -471,7 +471,7 @@ async fn handle_create_command(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                error_json("Missing required header: x-amux-session"),
+                error_json("Missing required header: x-awman-session"),
             )
                 .into_response();
         }
@@ -642,8 +642,8 @@ async fn execute_command(
         .await;
     }
 
-    // Construct the headless frontend that writes to the log file.
-    let frontend = match HeadlessDispatchFrontend::new(&subcommand, &args, &log_path) {
+    // Construct the API frontend that writes to the log file.
+    let frontend = match ApiDispatchFrontend::new(&subcommand, &args, &log_path) {
         Ok(f) => f,
         Err(e) => {
             tracing::error!(error = %e, command_id = %command_id, "Failed to create frontend");
@@ -829,7 +829,7 @@ async fn handle_stream_command_logs(
                     tracing::error!(error = %e, "Failed to read log for SSE");
                 }
             }
-            let _ = tx.send(Ok(Event::default().data("[amux:done]")));
+            let _ = tx.send(Ok(Event::default().data("[awman:done]")));
         });
     } else {
         let state_clone = Arc::clone(&state);
@@ -848,7 +848,7 @@ async fn handle_stream_command_logs(
                             waited += 1;
                         }
                         Err(_) => {
-                            let _ = tx.send(Ok(Event::default().data("[amux:done]")));
+                            let _ = tx.send(Ok(Event::default().data("[awman:done]")));
                             return;
                         }
                     }
@@ -872,7 +872,7 @@ async fn handle_stream_command_logs(
                                     return;
                                 }
                             }
-                            let _ = tx.send(Ok(Event::default().data("[amux:done]")));
+                            let _ = tx.send(Ok(Event::default().data("[awman:done]")));
                             return;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -889,7 +889,7 @@ async fn handle_stream_command_logs(
                         }
                     }
                     Err(_) => {
-                        let _ = tx.send(Ok(Event::default().data("[amux:done]")));
+                        let _ = tx.send(Ok(Event::default().data("[awman:done]")));
                         return;
                     }
                 }
@@ -977,15 +977,15 @@ mod tests {
     fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {
         use crate::command::dispatch::Engines;
         use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::data::fs::headless_db::SqliteSessionStore;
-        use crate::data::fs::headless_paths::HeadlessPaths;
+        use crate::data::fs::api_db::SqliteSessionStore;
+        use crate::data::fs::api_paths::ApiPaths;
         use crate::engine::agent::AgentEngine;
         use crate::engine::auth::AuthEngine;
         use crate::engine::container::ContainerRuntime;
         use crate::engine::git::GitEngine;
         use crate::engine::overlay::OverlayEngine;
 
-        let paths = HeadlessPaths::at_root(tmp);
+        let paths = ApiPaths::at_root(tmp);
         let store = SqliteSessionStore::open(tmp).unwrap();
         let runtime = Arc::new(ContainerRuntime::docker());
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(

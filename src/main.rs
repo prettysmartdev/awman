@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Layer 4 — the `amux` binary entrypoint.
+//! Layer 4 — the `awman` binary entrypoint.
 //!
 //! Per `aspec/architecture/2026-grand-architecture.md`, `main.rs`
 //! contains no business logic: it builds clap from `CommandCatalogue`,
@@ -12,22 +12,32 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use amux::command::dispatch::catalogue::CommandCatalogue;
-use amux::command::dispatch::Engines;
-use amux::data::config::global::GlobalConfig;
-use amux::data::session::{Session, SessionOpenOptions};
-use amux::engine::agent::AgentEngine;
-use amux::engine::auth::AuthEngine;
-use amux::engine::container::ContainerRuntime;
-use amux::engine::git::GitEngine;
-use amux::engine::overlay::OverlayEngine;
-use amux::frontend::cli::{self, RuntimeContext};
-use amux::frontend::tui;
+use awman::command::dispatch::catalogue::CommandCatalogue;
+use awman::command::dispatch::Engines;
+use awman::data::config::global::GlobalConfig;
+use awman::data::error::DataError;
+use awman::data::migration;
+use awman::data::session::{GitRootResolver, Session, SessionOpenOptions};
+use awman::engine::agent::AgentEngine;
+use awman::engine::auth::AuthEngine;
+use awman::engine::container::ContainerRuntime;
+use awman::engine::git::GitEngine;
+use awman::engine::overlay::OverlayEngine;
+use awman::frontend::cli::{self, RuntimeContext};
+use awman::frontend::tui;
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let clap_cmd = CommandCatalogue::get().build_clap_command();
     let matches = clap_cmd.get_matches();
+
+    // One-time migration from legacy amux paths and env vars.
+    if let Some(msg) = migration::migrate_global_dir() {
+        eprintln!("{msg}");
+    }
+    for warning in migration::check_deprecated_env_vars() {
+        eprintln!("{warning}");
+    }
 
     let global_config = GlobalConfig::load().unwrap_or_default();
     let runtime = Arc::new(
@@ -36,9 +46,23 @@ async fn main() -> Result<ExitCode> {
     let git_engine = Arc::new(GitEngine::new());
 
     let working_dir = std::env::current_dir().context("could not read current directory")?;
-    let session = Session::open_or_workdir_fallback(
+
+    // Resolve git root first so we can migrate the repo-local `.amux/` → `.awman/`
+    // BEFORE `Session::open` reads `RepoConfig` from disk. If we deferred this,
+    // a user's first post-rename run would silently fall back to default repo
+    // config because the load would miss the legacy `.amux/config.json`.
+    let git_root = match git_engine.resolve(&working_dir) {
+        Ok(root) => root,
+        Err(DataError::GitRootNotFound { .. }) => working_dir.clone(),
+        Err(other) => return Err(anyhow::Error::new(other).context("failed to resolve git root")),
+    };
+    if let Some(msg) = migration::migrate_repo_dir(&git_root) {
+        eprintln!("{msg}");
+    }
+
+    let session = Session::open_at_git_root(
         working_dir.clone(),
-        git_engine.as_ref(),
+        git_root,
         SessionOpenOptions::default(),
     )
     .context("failed to open session")?;
@@ -48,7 +72,7 @@ async fn main() -> Result<ExitCode> {
     let auth_engine =
         Arc::new(AuthEngine::new(&session).context("failed to construct auth engine")?);
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
-    let workflow_state_store = Arc::new(amux::data::EngineWorkflowStateStore::at_git_root(
+    let workflow_state_store = Arc::new(awman::data::EngineWorkflowStateStore::at_git_root(
         session.git_root().to_path_buf(),
     ));
 
@@ -79,21 +103,21 @@ async fn main() -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use amux::command::dispatch::catalogue::CommandCatalogue;
-    use amux::frontend::cli::command_path_from_matches;
+    use awman::command::dispatch::catalogue::CommandCatalogue;
+    use awman::frontend::cli::command_path_from_matches;
 
     /// A subcommand in argv → `subcommand_name().is_some()` → CLI branch.
     #[test]
     fn subcommand_present_signals_cli_branch() {
         let cmd = CommandCatalogue::get().build_clap_command();
         for argv in [
-            vec!["amux", "status"],
-            vec!["amux", "ready"],
-            vec!["amux", "chat"],
-            vec!["amux", "init"],
-            vec!["amux", "exec", "workflow", "wf.toml"],
-            vec!["amux", "headless", "start"],
-            vec!["amux", "remote", "session", "start"],
+            vec!["awman", "status"],
+            vec!["awman", "ready"],
+            vec!["awman", "chat"],
+            vec!["awman", "init"],
+            vec!["awman", "exec", "workflow", "wf.toml"],
+            vec!["awman", "api", "start"],
+            vec!["awman", "remote", "session", "start"],
         ] {
             let m = cmd
                 .clone()
@@ -109,14 +133,14 @@ mod tests {
         }
     }
 
-    /// Bare `amux` → `subcommand_name().is_none()` → TUI branch.
+    /// Bare `awman` → `subcommand_name().is_none()` → TUI branch.
     #[test]
     fn bare_invocation_signals_tui_branch() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman"]).unwrap();
         assert!(
             m.subcommand_name().is_none(),
-            "bare `amux` must have no subcommand — routes to TUI"
+            "bare `awman` must have no subcommand — routes to TUI"
         );
         let path = command_path_from_matches(&m);
         assert!(
@@ -130,7 +154,7 @@ mod tests {
     fn exec_workflow_alias_wf_routes_to_cli() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "wf", "wf.toml"])
+            .try_get_matches_from(["awman", "exec", "wf", "wf.toml"])
             .unwrap();
         assert!(m.subcommand_name().is_some());
         let path = command_path_from_matches(&m);

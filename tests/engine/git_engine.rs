@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use amux::data::worktree_paths::{
+use awman::data::worktree_paths::{
     worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
 };
 
@@ -43,19 +43,19 @@ fn worktree_path_for_workflow_uses_wf_prefix() {
 
 #[test]
 fn worktree_branch_name_42_is_zero_padded() {
-    assert_eq!(worktree_branch_name(42), "amux/work-item-0042");
+    assert_eq!(worktree_branch_name(42), "awman/work-item-0042");
 }
 
 #[test]
 fn worktree_branch_name_9999_no_truncation() {
-    assert_eq!(worktree_branch_name(9999), "amux/work-item-9999");
+    assert_eq!(worktree_branch_name(9999), "awman/work-item-9999");
 }
 
 #[test]
 fn worktree_branch_name_for_workflow_hyphen() {
     assert_eq!(
         worktree_branch_name_for_workflow("my-wf"),
-        "amux/workflow-my-wf"
+        "awman/workflow-my-wf"
     );
 }
 
@@ -106,8 +106,8 @@ fn real_git_engine_resolves_root_of_fresh_repo() {
         eprintln!("SKIP: git not available — run on a host with git");
         return;
     }
-    use amux::data::session::GitRootResolver;
-    use amux::engine::git::GitEngine;
+    use awman::data::session::GitRootResolver;
+    use awman::engine::git::GitEngine;
 
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -135,7 +135,7 @@ fn real_git_worktree_create_merge_remove_cycle() {
         eprintln!("SKIP: git not available — run on a host with git");
         return;
     }
-    use amux::engine::git::GitEngine;
+    use awman::engine::git::GitEngine;
 
     let tmp = tempfile::tempdir().unwrap();
     let git_root = tmp.path();
@@ -143,9 +143,9 @@ fn real_git_worktree_create_merge_remove_cycle() {
 
     let engine = GitEngine::new();
     let branch = engine.branch_name_for_work_item(42);
-    assert_eq!(branch, "amux/work-item-0042");
+    assert_eq!(branch, "awman/work-item-0042");
 
-    let worktree_path: PathBuf = tmp.path().parent().unwrap().join("amux-test-wt-0042");
+    let worktree_path: PathBuf = tmp.path().parent().unwrap().join("awman-test-wt-0042");
     // Clean up any leftover from a previous run.
     let _ = std::fs::remove_dir_all(&worktree_path);
 
@@ -184,7 +184,7 @@ fn real_git_worktree_create_merge_remove_cycle() {
         .expect("git log");
     let subject = String::from_utf8_lossy(&log.stdout).trim().to_string();
     assert_eq!(
-        subject, "Implement amux/work-item-0042",
+        subject, "Implement awman/work-item-0042",
         "merge_branch must commit with `Implement <branch>` subject"
     );
 

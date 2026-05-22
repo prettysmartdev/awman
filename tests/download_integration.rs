@@ -3,10 +3,10 @@
 /// These tests verify that the download module correctly fetches files from GitHub,
 /// extracts tarball contents, and integrates with the init and ready commands.
 /// Tests that require network access are skipped when offline.
-use amux::cli::Agent;
-use amux::commands::download;
-use amux::commands::init_flow::{self, CliContainerLauncher, CliInitQa, InitParams};
-use amux::commands::output::OutputSink;
+use awman::cli::Agent;
+use awman::commands::download;
+use awman::commands::init_flow::{self, CliContainerLauncher, CliInitQa, InitParams};
+use awman::commands::output::OutputSink;
 use tempfile::TempDir;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -178,7 +178,7 @@ async fn init_downloads_aspec_folder_when_missing() {
     let out = OutputSink::Channel(tx);
 
     // Pass aspec=true so the aspec folder is downloaded.
-    let runtime = std::sync::Arc::new(amux::runtime::DockerRuntime::new());
+    let runtime = std::sync::Arc::new(awman::runtime::DockerRuntime::new());
     let git_root = tmp.path().to_path_buf();
     let mut qa = CliInitQa::new(&git_root, out.clone());
     let launcher = CliContainerLauncher::new(runtime.clone());
@@ -197,9 +197,9 @@ async fn init_downloads_aspec_folder_when_missing() {
         "Dockerfile.dev should be created"
     );
 
-    // Config should be written (to the current config path, not legacy aspec/.amux.json).
+    // Config should be written to .awman/config.json.
     assert!(
-        tmp.path().join(".amux/config.json").exists(),
+        tmp.path().join(".awman/config.json").exists(),
         "Config should be written"
     );
 
@@ -222,7 +222,7 @@ async fn init_skips_aspec_download_when_folder_exists() {
     let out = OutputSink::Channel(tx);
 
     // Pass aspec=true so init tries to download, but the folder already exists.
-    let runtime = std::sync::Arc::new(amux::runtime::DockerRuntime::new());
+    let runtime = std::sync::Arc::new(awman::runtime::DockerRuntime::new());
     let git_root = tmp.path().to_path_buf();
     let mut qa = CliInitQa::new(&git_root, out.clone());
     let launcher = CliContainerLauncher::new(runtime.clone());

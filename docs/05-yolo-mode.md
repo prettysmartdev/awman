@@ -1,6 +1,6 @@
 # Yolo Mode
 
-Yolo mode is amux's fully autonomous operation mode. When `--yolo` is active, the agent skips all permission prompts and proceeds without pausing for confirmation on any action it would normally stop for.
+Yolo mode is awman's fully autonomous operation mode. When `--yolo` is active, the agent skips all permission prompts and proceeds without pausing for confirmation on any action it would normally stop for.
 
 Use it when you want to hand a task to the agent and return to a finished result — no babysitting required.
 
@@ -26,14 +26,14 @@ Yolo mode is **not** appropriate for:
 ## Basic usage
 
 ```sh
-amux exec workflow aspec/workflows/implement-feature.md --yolo
-amux chat --yolo
+awman exec workflow aspec/workflows/implement-feature.md --yolo
+awman chat --yolo
 ```
 
 For the safest yolo experience — fully autonomous, changes isolated to a branch, easy to review or discard:
 
 ```sh
-amux exec workflow aspec/workflows/implement-feature.md --yolo
+awman exec workflow aspec/workflows/implement-feature.md --yolo
 ```
 
 This implies `--worktree` automatically (see below).
@@ -74,7 +74,7 @@ Any tools listed in `yoloDisallowedTools` in your config are passed to the agent
 
 ### 3. Implies `--worktree` for workflow execution
 
-When running a workflow with `--yolo`, amux automatically creates an isolated Git worktree. A message is printed at startup:
+When running a workflow with `--yolo`, awman automatically creates an isolated Git worktree. A message is printed at startup:
 
 ```
 --yolo with workflow execution implies --worktree. Running in isolated worktree.
@@ -86,7 +86,7 @@ When `--yolo` is used with other commands (e.g. `chat`), `--worktree` is **not**
 
 ### 4. Auto-advances stuck workflow steps
 
-When a workflow step goes silent for 30 seconds, amux begins a **yolo countdown** instead of opening the manual [workflow control board](04-workflows.md#workflow-control-board). The countdown timer automatically advances to the next step when it expires. How the countdown is presented depends on whether the tab is active or in the background.
+When a workflow step goes silent for 30 seconds, awman begins a **yolo countdown** instead of opening the manual [workflow control board](04-workflows.md#workflow-control-board). The countdown timer automatically advances to the next step when it expires. How the countdown is presented depends on whether the tab is active or in the background.
 
 **Active tab — yolo countdown dialog:**
 
@@ -126,7 +126,7 @@ If you switch to a tab that has a countdown in progress, the yolo dialog opens i
 Press **Ctrl+A** or **Ctrl+D** while the yolo dialog is open to navigate to the previous or next tab. The dialog closes and the countdown continues in the background (shown in the tab bar). You are not forced to resolve the dialog before switching away.
 
 The countdown runs for **60 seconds**. When it expires:
-- If this is not the last step — amux advances to the next step in a new container
+- If this is not the last step — awman advances to the next step in a new container
 - If this is the last step — the workflow transitions to complete
 
 **Cancellation:**
@@ -137,7 +137,7 @@ The countdown runs for **60 seconds**. When it expires:
 
 ## Background yolo countdown
 
-When you are working across multiple tabs and a background tab's yolo workflow step goes silent, amux does not interrupt you with a dialog. Instead, the tab bar shows a live countdown for each affected tab:
+When you are working across multiple tabs and a background tab's yolo workflow step goes silent, awman does not interrupt you with a dialog. Instead, the tab bar shows a live countdown for each affected tab:
 
 - The tab alternates between **yellow** and **purple** every second
 - The label cycles between `⚠️  yolo in N` and `🤘 yolo in N` (where `N` is the seconds remaining)
@@ -207,10 +207,10 @@ When both `--yolo` and `--auto` are passed, `--yolo` wins.
 - The `yoloDisallowedTools` config provides a floor — operations the agent can never perform autonomously, even with `--yolo`.
 - Combine `--yolo` with `--workflow` to get automatic `--worktree` isolation, making it easy to review the full diff before merging into your main branch.
 - `--yolo --workflow` is the recommended pattern for long-running autonomous tasks: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
-- Gemini's `--yolo` flag skips all tool confirmations including shell commands. Gemini's `--approval-mode=auto_edit` (amux `--auto`) is the more conservative choice — file writes are approved automatically but shell operations are not.
+- Gemini's `--yolo` flag skips all tool confirmations including shell commands. Gemini's `--approval-mode=auto_edit` (awman `--auto`) is the more conservative choice — file writes are approved automatically but shell operations are not.
 - Copilot maps both `--yolo` and `--auto` to `--autopilot` — there is no intermediate CLI mode. Use `yoloDisallowedTools` config to restrict specific operations if needed (though copilot does not support the flag directly; a warning is printed and the session launches unrestricted).
 - Crush maps both `--yolo` and `--auto` to its `--yolo` flag, which auto-approves all permissions. A warning is printed when `--auto` is used, since crush has no intermediate mode.
-- Cline's `--auto-approve-all` (amux `--auto`) keeps interactive mode while auto-approving actions. Cline's `--yolo` (amux `--yolo`) fully skips confirmations and implies non-interactive operation.
+- Cline's `--auto-approve-all` (awman `--auto`) keeps interactive mode while auto-approving actions. Cline's `--yolo` (awman `--yolo`) fully skips confirmations and implies non-interactive operation.
 
 ---
 
@@ -218,14 +218,14 @@ When both `--yolo` and `--auto` are passed, `--yolo` wins.
 
 ```sh
 # Run a workflow with no prompts, changes in an isolated worktree
-amux exec workflow aspec/workflows/implement-feature.md --yolo
+awman exec workflow aspec/workflows/implement-feature.md --yolo
 
 # Run a workflow with explicit worktree flag — identical to omitting it
-amux exec workflow aspec/workflows/implement-feature.md --yolo --worktree
+awman exec workflow aspec/workflows/implement-feature.md --yolo --worktree
 
 # Autonomous chat session with Bash tool blocked
-# (add to aspec/.amux.json: "yoloDisallowedTools": ["Bash"])
-amux chat --yolo
+# (add to .awman/config.json: "yoloDisallowedTools": ["Bash"])
+awman chat --yolo
 ```
 
 ---

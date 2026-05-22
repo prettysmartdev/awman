@@ -1,4 +1,4 @@
-//! `engine::git` — `GitEngine`. Consolidates every git operation amux performs.
+//! `engine::git` — `GitEngine`. Consolidates every git operation awman performs.
 //!
 //! Replaces the free `pub fn`s in `oldsrc/git.rs` with a typed object whose
 //! methods are the only public surface. Implements Layer 0's
@@ -135,24 +135,24 @@ impl GitEngine {
             .collect())
     }
 
-    /// `~/.amux/worktrees/<repo-name>/<NNNN>/` for a work-item.
+    /// `~/.awman/worktrees/<repo-name>/<NNNN>/` for a work-item.
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError> {
         let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
         Ok(p.for_work_item(git_root, work_item))
     }
 
-    /// `~/.amux/worktrees/<repo-name>/wf-<name>/` for a named workflow.
+    /// `~/.awman/worktrees/<repo-name>/wf-<name>/` for a named workflow.
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError> {
         let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
         Ok(p.for_workflow(git_root, name))
     }
 
-    /// Branch name for a work-item (`amux/work-item-NNNN`).
+    /// Branch name for a work-item (`awman/work-item-NNNN`).
     pub fn branch_name_for_work_item(&self, work_item: u32) -> String {
         worktree_branch_name(work_item)
     }
 
-    /// Branch name for a named workflow (`amux/workflow-<name>`).
+    /// Branch name for a named workflow (`awman/workflow-<name>`).
     pub fn branch_name_for_workflow(&self, name: &str) -> String {
         worktree_branch_name_for_workflow(name)
     }
@@ -338,7 +338,7 @@ impl GitEngine {
     // These methods mirror the unlogged methods above but push every git
     // command and its output to a `UserMessageSink`. Used from the
     // `WorktreeLifecycle` command layer so the user can see exactly what
-    // amux is doing.
+    // awman is doing.
 
     pub fn uncommitted_files_logged(
         &self,
@@ -509,13 +509,13 @@ mod tests {
     #[test]
     fn branch_name_for_work_item_format() {
         let g = GitEngine::new();
-        assert_eq!(g.branch_name_for_work_item(7), "amux/work-item-0007");
+        assert_eq!(g.branch_name_for_work_item(7), "awman/work-item-0007");
     }
 
     #[test]
     fn branch_name_for_workflow_format() {
         let g = GitEngine::new();
-        assert_eq!(g.branch_name_for_workflow("x"), "amux/workflow-x");
+        assert_eq!(g.branch_name_for_workflow("x"), "awman/workflow-x");
     }
 
     fn init_repo(dir: &std::path::Path) {
@@ -527,14 +527,14 @@ mod tests {
             .status()
             .unwrap();
         Command::new("git")
-            .args(["config", "user.email", "test@amux.test"])
+            .args(["config", "user.email", "test@awman.test"])
             .current_dir(dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
         Command::new("git")
-            .args(["config", "user.name", "amux-test"])
+            .args(["config", "user.name", "awman-test"])
             .current_dir(dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -632,7 +632,7 @@ mod tests {
         init_repo(repo_tmp.path());
         let g = GitEngine::new();
         let wt_path = wt_tmp.path().join("my-worktree");
-        let branch = "amux/test-wt-branch";
+        let branch = "awman/test-wt-branch";
 
         g.create_worktree(repo_tmp.path(), &wt_path, branch)
             .expect("create_worktree should succeed");

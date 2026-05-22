@@ -1,4 +1,4 @@
-//! Configuration concerns for amux: per-repo config, global config, env-var
+//! Configuration concerns for awman: per-repo config, global config, env-var
 //! reads, typed flag values, and the merged effective view.
 
 pub mod effective;
@@ -12,7 +12,7 @@ pub use env::{Env, EnvSnapshot};
 pub use flags::FlagConfig;
 pub use global::GlobalConfig;
 pub use repo::{
-    DirectoryOverlayConfig, HeadlessConfig, OverlaysConfig, RemoteConfig, RepoConfig,
+    DirectoryOverlayConfig, ApiConfig, OverlaysConfig, RemoteConfig, RepoConfig,
     WorkItemsConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
 

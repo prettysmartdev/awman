@@ -5,7 +5,7 @@
 use std::process::Command;
 
 fn amux() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_amux"))
+    Command::new(env!("CARGO_BIN_EXE_awman"))
 }
 
 #[test]
@@ -98,7 +98,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 /// Build an `amux` Command with a controlled HOME directory so tests do not
-/// touch the developer's real `~/.amux/config.json`.
+/// touch the developer's real `~/.awman/config.json`.
 fn amux_with_home(home: &Path) -> Command {
     let mut cmd = amux();
     cmd.env("HOME", home);
@@ -116,16 +116,16 @@ fn make_git_repo() -> TempDir {
     repo
 }
 
-/// Write a JSON string to `<dir>/.amux/config.json`, creating dirs as needed.
+/// Write a JSON string to `<dir>/.awman/config.json`, creating dirs as needed.
 fn write_repo_config(dir: &Path, json: &str) {
-    let config_dir = dir.join(".amux");
+    let config_dir = dir.join(".awman");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("config.json"), json).unwrap();
 }
 
-/// Write a JSON string to `<home>/.amux/config.json`, creating dirs as needed.
+/// Write a JSON string to `<home>/.awman/config.json`, creating dirs as needed.
 fn write_global_config(home: &Path, json: &str) {
-    let config_dir = home.join(".amux");
+    let config_dir = home.join(".awman");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(config_dir.join("config.json"), json).unwrap();
 }
@@ -306,7 +306,7 @@ fn config_set_agent_writes_repo_config_and_get_returns_it() {
     );
 
     // Verify the written JSON.
-    let config_path = repo.path().join(".amux").join("config.json");
+    let config_path = repo.path().join(".awman").join("config.json");
     let json = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         json.contains(r#""agent""#) && json.contains("codex"),
@@ -342,7 +342,7 @@ fn config_set_global_default_agent_writes_to_global_config() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let config_path = home.path().join(".amux").join("config.json");
+    let config_path = home.path().join(".awman").join("config.json");
     let json = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         json.contains("default_agent") && json.contains("gemini"),
@@ -368,7 +368,7 @@ fn config_set_invalid_agent_value_exits_nonzero_and_does_not_write() {
         "invalid agent value should exit non-zero"
     );
     assert!(
-        !repo.path().join(".amux").join("config.json").exists(),
+        !repo.path().join(".awman").join("config.json").exists(),
         "config file must not be created after a failed set"
     );
 }
@@ -391,7 +391,7 @@ fn config_set_auto_agent_auth_accepted_exits_nonzero() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        !repo.path().join(".amux").join("config.json").exists(),
+        !repo.path().join(".awman").join("config.json").exists(),
         "config file must not be created after a rejected set"
     );
 }
@@ -422,7 +422,7 @@ fn config_set_global_runtime_apple_containers_warns_on_non_macos() {
         stderr
     );
     // Verify value was still written.
-    let config_path = home.path().join(".amux").join("config.json");
+    let config_path = home.path().join(".awman").join("config.json");
     let json = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         json.contains("apple-containers"),
@@ -471,7 +471,7 @@ fn config_set_env_passthrough_empty_string_writes_empty_array() {
         "config set env_passthrough '' should succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let config_path = repo.path().join(".amux").join("config.json");
+    let config_path = repo.path().join(".awman").join("config.json");
     let json = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         json.contains("envPassthrough") && json.contains("[]"),
@@ -710,51 +710,51 @@ fn exec_workflow_without_git_repo_exits_with_git_error_not_unknown_subcommand() 
     );
 }
 
-// ── headless config integration tests (work item 0058) ───────────────────────
+// ── api config integration tests (work item 0058) ───────────────────────
 
 #[test]
-fn config_get_headless_always_non_interactive_default_is_false() {
+fn config_get_api_always_non_interactive_default_is_false() {
     let home = TempDir::new().unwrap();
     let repo = make_git_repo();
 
     let output = amux_with_home(home.path())
         .current_dir(repo.path())
-        .args(["config", "get", "headless.alwaysNonInteractive"])
+        .args(["config", "get", "api.alwaysNonInteractive"])
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "config get headless.alwaysNonInteractive must exit 0; stderr: {}",
+        "config get api.alwaysNonInteractive must exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Effective value when not set should be "false" (the built-in default).
     assert!(
         stdout.contains("false"),
-        "headless.alwaysNonInteractive must default to false; stdout: {stdout}"
+        "api.alwaysNonInteractive must default to false; stdout: {stdout}"
     );
 }
 
 #[test]
-fn config_set_and_get_headless_always_non_interactive_global() {
+fn config_set_and_get_api_always_non_interactive_global() {
     let home = TempDir::new().unwrap();
     let repo = make_git_repo();
 
     // Set the flag globally.
     let set_out = amux_with_home(home.path())
         .current_dir(repo.path())
-        .args(["config", "set", "--global", "headless.alwaysNonInteractive", "true"])
+        .args(["config", "set", "--global", "api.alwaysNonInteractive", "true"])
         .output()
         .unwrap();
     assert!(
         set_out.status.success(),
-        "config set --global headless.alwaysNonInteractive true must succeed; stderr: {}",
+        "config set --global api.alwaysNonInteractive true must succeed; stderr: {}",
         String::from_utf8_lossy(&set_out.stderr)
     );
 
     // Verify the written JSON uses the camelCase nested key.
-    let config_path = home.path().join(".amux").join("config.json");
+    let config_path = home.path().join(".awman").join("config.json");
     let json = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         json.contains("alwaysNonInteractive") && json.contains("true"),
@@ -764,7 +764,7 @@ fn config_set_and_get_headless_always_non_interactive_global() {
     // config get must reflect the new value.
     let get_out = amux_with_home(home.path())
         .current_dir(repo.path())
-        .args(["config", "get", "headless.alwaysNonInteractive"])
+        .args(["config", "get", "api.alwaysNonInteractive"])
         .output()
         .unwrap();
     assert!(get_out.status.success());
@@ -776,27 +776,27 @@ fn config_set_and_get_headless_always_non_interactive_global() {
 }
 
 #[test]
-fn config_get_headless_work_dirs_works() {
+fn config_get_api_work_dirs_works() {
     let home = TempDir::new().unwrap();
     let repo = make_git_repo();
 
     // Query the field without setting it first — must succeed and show default.
     let output = amux_with_home(home.path())
         .current_dir(repo.path())
-        .args(["config", "get", "headless.workDirs"])
+        .args(["config", "get", "api.workDirs"])
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "config get headless.workDirs must exit 0; stderr: {}",
+        "config get api.workDirs must exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     // Default is empty (no work dirs configured).
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("empty") || stdout.contains("(not set)") || stdout.contains("[]"),
-        "headless.workDirs must show empty/not-set when unconfigured; stdout: {stdout}"
+        "api.workDirs must show empty/not-set when unconfigured; stdout: {stdout}"
     );
 }
 
@@ -979,11 +979,11 @@ fn new_workflow_format_md_writes_md_file() {
     assert!(content.starts_with("# MD Workflow"), "MD file must start with title heading");
 }
 
-// 8. `amux new workflow --global` writes to ~/.amux/workflows/.
+// 8. `amux new workflow --global` writes to ~/.awman/workflows/.
 #[test]
 fn new_workflow_global_writes_to_global_workflows_dir() {
     let home = TempDir::new().unwrap();
-    // AMUX_CONFIG_HOME redirects global_workflows_dir() to home/.amux.
+    // AWMAN_CONFIG_HOME redirects global_workflows_dir() to home/.amux.
     // The integration binary uses this env var for the global dir.
     // We run outside a git repo to confirm --global works without one.
     let not_a_repo = TempDir::new().unwrap();
@@ -992,7 +992,7 @@ fn new_workflow_global_writes_to_global_workflows_dir() {
 
     let output = run_amux_with_stdin(
         amux_with_home(home.path())
-            .env("AMUX_CONFIG_HOME", home.path().join(".amux"))
+            .env("AWMAN_CONFIG_HOME", home.path().join(".awman"))
             .current_dir(not_a_repo.path())
             .args(["new", "workflow", "--global"]),
         stdin,
@@ -1004,7 +1004,7 @@ fn new_workflow_global_writes_to_global_workflows_dir() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let dest = home.path().join(".amux").join("workflows").join("global-wf.toml");
+    let dest = home.path().join(".awman").join("workflows").join("global-wf.toml");
     assert!(dest.exists(), "global TOML file must be created at {}", dest.display());
     let content = std::fs::read_to_string(&dest).unwrap();
     assert!(content.contains("Global Workflow"));
@@ -1021,7 +1021,7 @@ fn new_workflow_interview_global_writes_skeleton_before_agent_lookup_fails() {
 
     let output = run_amux_with_stdin(
         amux_with_home(home.path())
-            .env("AMUX_CONFIG_HOME", home.path().join(".amux"))
+            .env("AWMAN_CONFIG_HOME", home.path().join(".awman"))
             .current_dir(not_a_repo.path())
             .args(["new", "workflow", "--interview", "--global"]),
         stdin,
@@ -1033,7 +1033,7 @@ fn new_workflow_interview_global_writes_skeleton_before_agent_lookup_fails() {
         "amux new workflow --interview --global must fail without a git repo"
     );
     // But the skeleton file should have been written before the failure.
-    let dest = home.path().join(".amux").join("workflows").join("interview-wf.toml");
+    let dest = home.path().join(".awman").join("workflows").join("interview-wf.toml");
     assert!(
         dest.exists(),
         "skeleton file must be created before agent lookup fails; path: {}",
@@ -1078,7 +1078,7 @@ fn new_skill_stdin_writes_skill_md_to_claude_skills() {
     assert!(content.contains("Run the tests."), "body must be written");
 }
 
-// 11. `amux new skill --global` writes to ~/.amux/skills/<name>/SKILL.md.
+// 11. `amux new skill --global` writes to ~/.awman/skills/<name>/SKILL.md.
 #[test]
 fn new_skill_global_writes_to_global_skills_dir() {
     let home = TempDir::new().unwrap();
@@ -1088,7 +1088,7 @@ fn new_skill_global_writes_to_global_skills_dir() {
 
     let output = run_amux_with_stdin(
         amux_with_home(home.path())
-            .env("AMUX_CONFIG_HOME", home.path().join(".amux"))
+            .env("AWMAN_CONFIG_HOME", home.path().join(".awman"))
             .current_dir(not_a_repo.path())
             .args(["new", "skill", "--global"]),
         stdin,
@@ -1102,7 +1102,7 @@ fn new_skill_global_writes_to_global_skills_dir() {
 
     let dest = home
         .path()
-        .join(".amux")
+        .join(".awman")
         .join("skills")
         .join("global-skill")
         .join("SKILL.md");
@@ -1123,7 +1123,7 @@ fn new_skill_interview_global_writes_skeleton_before_agent_lookup_fails() {
 
     let output = run_amux_with_stdin(
         amux_with_home(home.path())
-            .env("AMUX_CONFIG_HOME", home.path().join(".amux"))
+            .env("AWMAN_CONFIG_HOME", home.path().join(".awman"))
             .current_dir(not_a_repo.path())
             .args(["new", "skill", "--interview", "--global"]),
         stdin,
@@ -1137,7 +1137,7 @@ fn new_skill_interview_global_writes_skeleton_before_agent_lookup_fails() {
     // Skeleton must be written before the failure.
     let dest = home
         .path()
-        .join(".amux")
+        .join(".awman")
         .join("skills")
         .join("interview-skill")
         .join("SKILL.md");

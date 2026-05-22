@@ -1,47 +1,47 @@
-# Headless Mode
+# API Mode
 
-Headless mode exposes amux's session and subcommand execution over HTTP. Start a persistent server with `amux headless start`, then drive sessions and subcommands from scripts, CI pipelines, or any HTTP client — no interactive terminal or TUI required.
+API mode exposes awman's session and subcommand execution over HTTP. Start a persistent server with `awman api start`, then drive sessions and subcommands from scripts, CI pipelines, or any HTTP client — no interactive terminal or TUI required.
 
-A **session** in headless mode is conceptually identical to a TUI tab: a named, isolated workspace bound to a working directory. Subcommands dispatched to a session (`exec workflow`, `chat`, etc.) execute exactly as they would in a TUI tab — inside a Docker container, with all the same security and isolation guarantees.
+A **session** in API mode is conceptually identical to a TUI tab: a named, isolated workspace bound to a working directory. Subcommands dispatched to a session (`exec workflow`, `chat`, etc.) execute exactly as they would in a TUI tab — inside a Docker container, with all the same security and isolation guarantees.
 
-All operations, inputs, and outputs are recorded durably in `~/.amux/headless/` for auditability.
+All operations, inputs, and outputs are recorded durably in `~/.awman/api/` for auditability.
 
 ---
 
-## When to use headless mode
+## When to use API mode
 
-Headless mode is useful for:
+API mode is useful for:
 
 - CI pipelines that trigger `exec workflow` or `exec prompt` runs and poll for results
 - Scripts or tooling that execute workflows and retrieve output programmatically
-- Remote integrations where the amux server runs on one machine and clients run elsewhere
+- Remote integrations where the awman server runs on one machine and clients run elsewhere
 - Audit-heavy environments where a complete durable record of every agent action is required
-- One-shot agent invocations from scripts using `amux exec prompt` or `amux exec workflow`
+- One-shot agent invocations from scripts using `awman exec prompt` or `awman exec workflow`
 
-For single interactive sessions, use `amux chat` instead.
+For single interactive sessions, use `awman chat` instead.
 
 ---
 
 ## One-shot scripted execution (`exec`)
 
-The `exec` subcommand group provides two commands for running agent tasks non-interactively from scripts, CI pipelines, or the headless HTTP server — without a persistent session or TUI.
+The `exec` subcommand group provides two commands for running agent tasks non-interactively from scripts, CI pipelines, or the API server — without a persistent session or TUI.
 
-### `amux exec prompt <prompt>`
+### `awman exec prompt <prompt>`
 
-Launches an agent container with a pre-supplied prompt. Behaves identically to `amux chat`, except the initial prompt is baked into the launch arguments rather than requiring a live terminal session.
+Launches an agent container with a pre-supplied prompt. Behaves identically to `awman chat`, except the initial prompt is baked into the launch arguments rather than requiring a live terminal session.
 
 ```sh
 # Run a single task and exit
-amux exec prompt "Fix the failing tests in src/api"
+awman exec prompt "Fix the failing tests in src/api"
 
 # Non-interactive: agent executes and exits; output goes to stdout
-amux exec prompt "Summarise recent changes" --non-interactive
+awman exec prompt "Summarise recent changes" --non-interactive
 
 # Use a specific agent and model
-amux exec prompt "Refactor the auth module" --agent codex --model gpt-4o
+awman exec prompt "Refactor the auth module" --agent codex --model gpt-4o
 
 # Full autonomous run
-amux exec prompt "Implement caching for the API layer" --yolo --non-interactive
+awman exec prompt "Implement caching for the API layer" --yolo --non-interactive
 ```
 
 The prompt must be non-empty. Passing an empty string exits immediately with:
@@ -67,22 +67,22 @@ All flags behave identically to their `chat` counterparts. See [Agent Sessions](
 
 ---
 
-### `amux exec workflow <path>` / `amux exec wf <path>`
+### `awman exec workflow <path>` / `awman exec wf <path>`
 
 Runs a workflow file. The work item is optional — when provided, it's used for template variable substitution within the workflow.
 
 ```sh
 # Run a workflow without a work item
-amux exec workflow ./aspec/workflows/implement-feature.md
+awman exec workflow ./aspec/workflows/implement-feature.md
 
 # Alias: exec wf
-amux exec wf ./aspec/workflows/implement-feature.md
+awman exec wf ./aspec/workflows/implement-feature.md
 
 # Optionally associate a work item for template variable substitution
-amux exec workflow ./aspec/workflows/implement-feature.md --work-item 0053
+awman exec workflow ./aspec/workflows/implement-feature.md --work-item 0053
 
 # Non-interactive workflow run
-amux exec workflow ./aspec/workflows/review.md --non-interactive
+awman exec workflow ./aspec/workflows/review.md --non-interactive
 ```
 
 `exec workflow` and `exec wf` are identical — `wf` is a short alias.
@@ -93,18 +93,18 @@ amux exec workflow ./aspec/workflows/review.md --non-interactive
 warning: workflow uses {{work_item_content}} but no --work-item was provided; placeholder left unexpanded
 ```
 
-When `--work-item <N>` is provided, amux resolves the work item file from the configured work items directory and substitutes all template variables.
+When `--work-item <N>` is provided, awman resolves the work item file from the configured work items directory and substitutes all template variables.
 
 **Workflow state files:** When no work item is given, the state file is keyed by the workflow file's name and content hash:
 
 ```
-~/.amux/headless/<workflow-name>-<content-hash8>.state.json
+~/.awman/api/<workflow-name>-<content-hash8>.state.json
 ```
 
 When a work item is given, the state file is saved to:
 
 ```
-$GITROOT/.amux/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
+$GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 ```
 
 **Flags accepted by `exec workflow`:**
@@ -131,23 +131,23 @@ All workflow flags are described in [Workflows](04-workflows.md#flags).
 ### Foreground
 
 ```sh
-amux headless start --port 9876 --workdirs /path/to/repo
+awman api start --port 9876 --workdirs /path/to/repo
 ```
 
 The server starts on the specified port (default `9876`) and accepts HTTP requests for the life of the process. Logs are emitted to stdout in human-readable format. Press `Ctrl+C` to stop.
 
 ```sh
 # Multiple working directories
-amux headless start --workdirs /repo-a --workdirs /repo-b
+awman api start --workdirs /repo-a --workdirs /repo-b
 
 # Custom port
-amux headless start --port 8080 --workdirs /repo
+awman api start --port 8080 --workdirs /repo
 
 # Rotate the API key and print the new one to stdout
-amux headless start --refresh-key --port 9876 --workdirs /repo
+awman api start --refresh-key --port 9876 --workdirs /repo
 
 # Disable authentication for this run (WARNING: anyone can reach the server)
-amux headless start --dangerously-skip-auth --port 9876 --workdirs /repo
+awman api start --dangerously-skip-auth --port 9876 --workdirs /repo
 ```
 
 `--workdirs` accepts one or more absolute paths (repeat the flag for multiple values). Only working directories on the allowlist can be used to create sessions — requests with any other path are rejected with HTTP 403. See [Working directory allowlist](#working-directory-allowlist).
@@ -162,7 +162,7 @@ amux headless start --dangerously-skip-auth --port 9876 --workdirs /repo
 ### Background
 
 ```sh
-amux headless start --background --port 9876 --workdirs /path/to/repo
+awman api start --background --port 9876 --workdirs /path/to/repo
 ```
 
 `--background` daemonizes the server using the OS process manager:
@@ -170,12 +170,12 @@ amux headless start --background --port 9876 --workdirs /path/to/repo
 | Platform | Mechanism |
 |----------|-----------|
 | Linux (systemd available) | `systemd-run --user` writes a transient unit |
-| macOS (launchd) | Writes `~/Library/LaunchAgents/io.amux.headless.plist` and calls `launchctl load` |
+| macOS (launchd) | Writes `~/Library/LaunchAgents/io.awman.api.plist` and calls `launchctl load` |
 | Fallback (no systemd/launchd) | Double-fork; PID written directly |
 
-The PID is stored at `~/.amux/headless/amux.pid`. Logs go to `~/.amux/headless/amux.log`.
+The PID is stored at `~/.awman/api/awman.pid`. Logs go to `~/.awman/api/awman.log`.
 
-If a server is already running (detected via `amux.pid` and a live process check), `start` prints an error and exits with a non-zero code rather than silently competing for the port.
+If a server is already running (detected via `awman.pid` and a live process check), `start` prints an error and exits with a non-zero code rather than silently competing for the port.
 
 If `bind()` fails because the port is already in use, the error message includes the port number and the PID holding it (when discoverable):
 
@@ -190,7 +190,7 @@ error: port 9876 is already in use (PID 41290)
 ### Status
 
 ```sh
-amux headless status
+awman api status
 ```
 
 Prints whether the server is running, its PID, port, active session count, and uptime:
@@ -212,22 +212,22 @@ Status:  not running
 ### Logs
 
 ```sh
-amux headless logs
+awman api logs
 ```
 
-Streams `~/.amux/headless/amux.log` to stdout in real time (equivalent to `tail -f`). Only available when the server was started with `--background`. Press `Ctrl+C` to stop streaming.
+Streams `~/.awman/api/awman.log` to stdout in real time (equivalent to `tail -f`). Only available when the server was started with `--background`. Press `Ctrl+C` to stop streaming.
 
 If no log file exists:
 
 ```
-error: no log file found at ~/.amux/headless/amux.log
+error: no log file found at ~/.awman/api/awman.log
        start the server with --background to enable file logging
 ```
 
 ### Kill
 
 ```sh
-amux headless kill
+awman api kill
 ```
 
 Sends `SIGTERM` to the background server process, allows in-flight requests to drain (up to the graceful shutdown period), and removes the PID file. On macOS, also unloads the launchd plist.
@@ -242,31 +242,31 @@ info: server is not running (no PID file found)
 
 ## Authentication
 
-The headless server uses cryptographic API key authentication. Every HTTP request must include the API key; unauthenticated requests are rejected with HTTP 401 before reaching any handler.
+The API server uses cryptographic API key authentication. Every HTTP request must include the API key; unauthenticated requests are rejected with HTTP 401 before reaching any handler.
 
 ### First start — key generation
 
-On the first start (when no `api_key.hash` file exists in `~/.amux/headless/`), amux automatically generates a cryptographically random 32-byte key, stores only its SHA-256 hash on disk (never the plaintext), and prints the key to stdout once:
+On the first start (when no `api_key.hash` file exists in `~/.awman/api/`), awman automatically generates a cryptographically random 32-byte key, stores only its SHA-256 hash on disk (never the plaintext), and prints the key to stdout once:
 
 ```
 ╔═══════════════════════════════════════════════════════════════════╗
-║  amux headless API key (store this — it will not be shown again)  ║
+║  awman API key (store this — it will not be shown again)          ║
 ║  a3f8b2c1...64-character-hex-key...d7e9f0a1                       ║
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
-**This is the only time the plaintext key appears.** Store it immediately. Key generation happens before the log file is opened, so the key cannot appear in `amux.log` under any circumstances.
+**This is the only time the plaintext key appears.** Store it immediately. Key generation happens before the log file is opened, so the key cannot appear in `awman.log` under any circumstances.
 
 ### Subsequent starts
 
-On subsequent starts (when `~/.amux/headless/api_key.hash` already exists), the server loads the stored hash silently and starts normally — no banner is printed. The same key continues to work without any client-side changes.
+On subsequent starts (when `~/.awman/api/api_key.hash` already exists), the server loads the stored hash silently and starts normally — no banner is printed. The same key continues to work without any client-side changes.
 
 ### Rotating the key — `--refresh-key`
 
 To invalidate the current key and generate a new one:
 
 ```sh
-amux headless start --refresh-key --port 9876 --workdirs /repo
+awman api start --refresh-key --port 9876 --workdirs /repo
 ```
 
 A new key is generated and its hash replaces the file on disk. The new plaintext key is printed to stdout using the same banner format. All clients using the old key will immediately receive HTTP 401 and must be updated.
@@ -274,7 +274,7 @@ A new key is generated and its hash replaces the file on disk. The new plaintext
 ### Disabling authentication — `--dangerously-skip-auth`
 
 ```sh
-amux headless start --dangerously-skip-auth --port 9876 --workdirs /repo
+awman api start --dangerously-skip-auth --port 9876 --workdirs /repo
 ```
 
 Skips all authentication checks for this process lifetime. The `api_key.hash` file is not modified; the next normal start re-enables authentication. Use only in isolated, trusted environments (e.g. a local loopback-only setup with strict firewall rules).
@@ -293,7 +293,7 @@ curl -s http://localhost:9876/v1/status \
   -H "Authorization: <your-api-key>"
 ```
 
-When using `amux remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](09-remote-mode.md#api-key-authentication).
+When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](09-remote-mode.md#api-key-authentication).
 
 **Error responses from the middleware:**
 
@@ -306,7 +306,7 @@ Hash comparisons use constant-time comparison (`ring::constant_time::verify_slic
 
 ### Key storage
 
-The key hash is stored at `~/.amux/headless/api_key.hash` with mode `0o600` (owner read/write only on Unix). Only the SHA-256 hex digest is written — the plaintext key is never persisted anywhere.
+The key hash is stored at `~/.awman/api/api_key.hash` with mode `0o600` (owner read/write only on Unix). Only the SHA-256 hex digest is written — the plaintext key is never persisted anywhere.
 
 ---
 
@@ -316,8 +316,8 @@ The server maintains a strict allowlist of working directories. Any session crea
 
 **At startup**, the allowlist is populated from two sources:
 
-1. `--workdirs` flags passed to `amux headless start`
-2. `headless.workDirs` in the global config (`~/.amux/config.json`)
+1. `--workdirs` flags passed to `awman api start`
+2. `api.workDirs` in the global config (`~/.awman/config.json`)
 
 Both sources are merged. Every path is resolved to its canonical form (symlinks resolved, trailing slashes stripped) via `std::fs::canonicalize`. If a listed path does not exist at startup, a warning is logged but the server still starts — the path stays on the allowlist in case the directory is created later.
 
@@ -456,27 +456,27 @@ Commands are submitted to a session and execute asynchronously. Submit a command
 ```sh
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-amux-session: <session-id>' \
+  -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
   -d '{"subcommand":"chat"}'
 ```
 
-Dispatches a subcommand to the session identified by the `x-amux-session` header. Valid values for `subcommand`: `chat`, `ready`, `exec`, `remote`.
+Dispatches a subcommand to the session identified by the `x-awman-session` header. Valid values for `subcommand`: `chat`, `ready`, `exec`, `remote`.
 
 For `exec`, the `args` array starts with the exec action (`prompt` or `workflow`/`wf`), followed by any further arguments:
 
 ```sh
-# exec prompt via headless API
+# exec prompt via API
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-amux-session: <session-id>' \
+  -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
   -d '{"subcommand":"exec","args":["prompt","Fix the failing tests","--non-interactive"]}'
 
-# exec workflow via headless API
+# exec workflow via API
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
-  -H 'x-amux-session: <session-id>' \
+  -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
   -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.md","--work-item","0053"]}'
 ```
@@ -505,7 +505,7 @@ Error responses:
 | Session not found or closed | 404 | `"session not found"` (includes session UUID) |
 | Another command is running | 403 | `"session busy"` |
 | Unknown subcommand | 400 | `"unknown subcommand"` (includes list of valid subcommands) |
-| `x-amux-session` header missing | 400 | `"missing x-amux-session header"` |
+| `x-awman-session` header missing | 400 | `"missing x-awman-session header"` |
 
 #### Get command status
 
@@ -526,7 +526,7 @@ Returns the current status and metadata for a command:
   "exit_code": null,
   "started_at": "2026-04-20T12:01:00Z",
   "finished_at": null,
-  "log_path": "~/.amux/headless/sessions/a1b2c3d4-.../commands/e5f6a7b8-.../output.log"
+  "log_path": "~/.awman/api/sessions/a1b2c3d4-.../commands/e5f6a7b8-.../output.log"
 }
 ```
 
@@ -561,7 +561,7 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Opens a persistent HTTP response using [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). The server replays any output already written, then tails the log file and sends new lines as they arrive. When the command completes, the server sends a `[amux:done]` sentinel event and closes the response.
+Opens a persistent HTTP response using [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). The server replays any output already written, then tails the log file and sends new lines as they arrive. When the command completes, the server sends a `[awman:done]` sentinel event and closes the response.
 
 **SSE event format:**
 
@@ -570,11 +570,11 @@ data: <line of log output>
 
 data: <another line>
 
-data: [amux:done]
+data: [awman:done]
 
 ```
 
-Each event is terminated by a blank line (standard SSE format). The sentinel `[amux:done]` signals that the command has finished — no more output will follow.
+Each event is terminated by a blank line (standard SSE format). The sentinel `[awman:done]` signals that the command has finished — no more output will follow.
 
 **Shell example — stream and print until done:**
 
@@ -583,21 +583,21 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
   -H 'Authorization: Bearer <api-key>' \
 | while IFS= read -r line; do
     case "$line" in
-      "data: [amux:done]") echo "--- done ---"; break ;;
-      data:\ *)             echo "${line#data: }" ;;
+      "data: [awman:done]") echo "--- done ---"; break ;;
+      data:\ *)              echo "${line#data: }" ;;
     esac
   done
 ```
 
 **Behaviour notes:**
 
-- If the command has already completed when you connect, the server replays the full historical log and sends `[amux:done]` immediately — no output is missed.
+- If the command has already completed when you connect, the server replays the full historical log and sends `[awman:done]` immediately — no output is missed.
 - If the client disconnects mid-stream, the command continues executing unaffected.
 - If the log file does not yet exist (the command is `pending`), the server waits up to 10 s for it to appear before returning HTTP 404.
 - The `Content-Type` response header is `text/event-stream`.
-- **Read timeout:** `amux remote run --follow` uses a 10-minute read timeout per SSE event. Any output from the server resets the timer, so long-running commands that produce incremental output can stream for hours. If the server is completely silent for 10 minutes, the client disconnects with a timeout message; the command continues running on the server. When using cURL directly with `--no-buffer`, consider adding `--max-time 0` to disable cURL's own timeout for very long-running commands.
+- **Read timeout:** `awman remote run --follow` uses a 10-minute read timeout per SSE event. Any output from the server resets the timer, so long-running commands that produce incremental output can stream for hours. If the server is completely silent for 10 minutes, the client disconnects with a timeout message; the command continues running on the server. When using cURL directly with `--no-buffer`, consider adding `--max-time 0` to disable cURL's own timeout for very long-running commands.
 
-`amux remote run --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the amux binary is unavailable on the client.
+`awman remote run --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
 
 ---
 
@@ -620,7 +620,7 @@ curl -s http://localhost:9876/v1/status \
 
 ### Workflow state
 
-When a command runs a workflow (`exec workflow`), the headless server writes a `workflow.state.json` file to the per-command directory. This file is updated atomically on every step transition. The `GET /v1/workflows/:command_id` endpoint exposes that state over HTTP.
+When a command runs a workflow (`exec workflow`), the API server writes a `workflow.state.json` file to the per-command directory. This file is updated atomically on every step transition. The `GET /v1/workflows/:command_id` endpoint exposes that state over HTTP.
 
 #### Get workflow state
 
@@ -629,7 +629,7 @@ curl -s http://localhost:9876/v1/workflows/<command-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current `WorkflowState` for the given command. The structure is identical to the local workflow state format produced by `amux exec workflow` when it writes state to `$GITROOT/.amux/workflows/`.
+Returns the current `WorkflowState` for the given command. The structure is identical to the local workflow state format produced by `awman exec workflow` when it writes state to `$GITROOT/.awman/workflows/`.
 
 ```json
 {
@@ -682,7 +682,7 @@ done
 
 If the endpoint returns HTTP 404 on the first poll, the command either has not started yet or is not a workflow command — treat 404 as "no workflow" and skip the strip. If 404 is returned after a non-404 response, the workflow was removed; stop polling.
 
-The [Remote-bound TUI tabs](09-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote headless server.
+The [Remote-bound TUI tabs](09-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
 
 ---
 
@@ -702,7 +702,7 @@ echo "Session: $SESSION"
 # 2. Submit a command
 CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-amux-session: $SESSION" \
+  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
   -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.md"]}' | jq -r .command_id)
 echo "Command: $CMD"
@@ -731,13 +731,13 @@ For tasks that don't need a persistent session, `exec prompt` can be run directl
 
 ```sh
 # Run a single one-shot task; output goes to stdout; exit code reflects agent result
-amux exec prompt "Fix the failing tests in src/api" --non-interactive
+awman exec prompt "Fix the failing tests in src/api" --non-interactive
 
 # Combine with shell tools
-amux exec prompt "List all TODO comments in the codebase" --non-interactive | tee todos.txt
+awman exec prompt "List all TODO comments in the codebase" --non-interactive | tee todos.txt
 ```
 
-To drive the same task via the headless HTTP server (so the result is logged and auditable):
+To drive the same task via the API server (so the result is logged and auditable):
 
 ```sh
 SERVER=http://localhost:9876
@@ -750,7 +750,7 @@ SESSION=$(curl -s -X POST "$SERVER/v1/sessions" \
 
 CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-amux-session: $SESSION" \
+  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
   -d '{"subcommand":"exec","args":["prompt","Fix the failing tests","--non-interactive"]}' | jq -r .command_id)
 
@@ -761,13 +761,13 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
 
 ## Storage layout
 
-Everything headless mode writes lives under `~/.amux/headless/`:
+Everything API mode writes lives under `~/.awman/api/`:
 
 ```
-~/.amux/headless/
-  amux.log                         # server log (background mode only)
-  amux.pid                         # PID file for the background process
-  amux.db                          # SQLite database: sessions + commands
+~/.awman/api/
+  awman.log                        # server log (background mode only)
+  awman.pid                        # PID file for the background process
+  awman.db                         # SQLite database: sessions + commands
   api_key.hash                     # SHA-256 hex digest of the API key (mode 0600)
   sessions/
     <session-uuid>/
@@ -778,9 +778,9 @@ Everything headless mode writes lives under `~/.amux/headless/`:
           workflow.state.json      # workflow state — only present for workflow commands
 ```
 
-`workflow.state.json` is written and updated atomically (write to a temp file, then rename) each time the workflow advances to a new step. The file uses the identical JSON structure as the local workflow state in `$GITROOT/.amux/workflows/`. It is created only when the command runs a workflow; it is never present for `exec prompt`, `chat`, `implement` (without `--workflow`), or other non-workflow commands.
+`workflow.state.json` is written and updated atomically (write to a temp file, then rename) each time the workflow advances to a new step. The file uses the identical JSON structure as the local workflow state in `$GITROOT/.awman/workflows/`. It is created only when the command runs a workflow; it is never present for `exec prompt`, `chat`, `implement` (without `--workflow`), or other non-workflow commands.
 
-`amux.db` contains two tables:
+`awman.db` contains two tables:
 
 **`sessions`** — one row per session: `id` (UUID), `workdir`, `status` (`active`/`closed`), `created_at`, `closed_at`.
 
@@ -806,11 +806,11 @@ The database is the authoritative record of all activity. The per-command log fi
 
 ## Configuration
 
-Headless mode settings live under a `headless` key in the global config (`~/.amux/config.json`). All fields are optional.
+API mode settings live under an `api` key in the global config (`~/.awman/config.json`). All fields are optional.
 
 ```json
 {
-  "headless": {
+  "api": {
     "workDirs": [
       "/home/user/my-project",
       "/home/user/other-project"
@@ -820,35 +820,35 @@ Headless mode settings live under a `headless` key in the global config (`~/.amu
 }
 ```
 
-### `headless.workDirs`
+### `api.workDirs`
 
 Pre-configure working directories so you don't have to repeat `--workdirs` every time you start the server:
 
 ```sh
-amux config set --global headless.workDirs "/home/user/my-project,/home/user/other-project"
+awman config set --global api.workDirs "/home/user/my-project,/home/user/other-project"
 ```
 
-Paths from `headless.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](07-configuration.md#global-config) for the full global config reference.
+Paths from `api.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](07-configuration.md#global-config) for the full global config reference.
 
-### `headless.alwaysNonInteractive`
+### `api.alwaysNonInteractive`
 
-When set to `true`, amux automatically injects `--non-interactive` into every dispatched command that supports it — including `implement`, `chat`, `exec prompt`, `exec workflow`, `ready`, and `specs amend`.
+When set to `true`, awman automatically injects `--non-interactive` into every dispatched command that supports it — including `implement`, `chat`, `exec prompt`, `exec workflow`, `ready`, and `specs amend`.
 
 ```sh
-amux config set --global headless.alwaysNonInteractive true
+awman config set --global api.alwaysNonInteractive true
 ```
 
-This is the recommended setting for headless server deployments where no TTY is available. It guarantees that no command blocks waiting for interactive input.
+This is the recommended setting for API server deployments where no TTY is available. It guarantees that no command blocks waiting for interactive input.
 
 When `alwaysNonInteractive` is `true` and a command is dispatched via the HTTP API, the flag is automatically injected into the args vector — you do not need to include `--non-interactive` in your API requests explicitly.
 
-The setting defaults to `false` so that amux's interactive defaults remain unchanged for users who have not configured a headless server.
+The setting defaults to `false` so that awman's interactive defaults remain unchanged for users who have not configured an API server.
 
 ---
 
 ## Security
 
-Headless mode preserves all of amux's container isolation guarantees: every subcommand runs inside a Docker container, never directly on the host.
+API mode preserves all of awman's container isolation guarantees: every subcommand runs inside a Docker container, never directly on the host.
 
 The HTTP server enforces cryptographic API key authentication on every request by default. The plaintext key is shown once at server start and never logged or persisted; only its SHA-256 hash is stored on disk. See [Authentication](#authentication) for the full key lifecycle.
 
@@ -860,7 +860,7 @@ For additional defense in depth, bind the server to `localhost` (the default) an
 
 ## Session cleanup
 
-At server startup, amux automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `amux.db` along with all associated command records. The on-disk output logs in `~/.amux/headless/sessions/<uuid>/` are **not** deleted — they remain for audit purposes.
+At server startup, awman automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `awman.db` along with all associated command records. The on-disk output logs in `~/.awman/api/sessions/<uuid>/` are **not** deleted — they remain for audit purposes.
 
 The cleanup runs once, before the server begins accepting connections. Each purged session is logged at `INFO` level:
 
@@ -876,7 +876,7 @@ Sessions closed within the last 24 hours are not touched. The 24-hour boundary (
 
 ## Graceful shutdown
 
-On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and allows running commands up to 30 seconds to complete before force-terminating them. Both shutdown start and completion are logged. The 30-second grace period applies whether the server was stopped by `amux headless kill` or by sending the signal directly.
+On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and allows running commands up to 30 seconds to complete before force-terminating them. Both shutdown start and completion are logged. The 30-second grace period applies whether the server was stopped by `awman api kill` or by sending the signal directly.
 
 ---
 
@@ -887,17 +887,17 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403; response includes the list of allowed directories |
 | Session not found or already closed on `POST /v1/commands` | HTTP 404; response includes the session UUID |
 | Second `POST /v1/commands` while one is running | HTTP 403 `"session busy"`; includes running command ID |
-| Server already running when `headless start` is invoked | Error printed; exits non-zero |
+| Server already running when `api start` is invoked | Error printed; exits non-zero |
 | Port already bound (EADDRINUSE) | Error includes the port number and PID holding it |
 | `--workdirs` path doesn't exist at startup | Warning logged; path remains on allowlist |
-| `amux headless kill` when server is not running | Informational message; exits 0 |
-| `amux headless logs` with no log file | Clear error suggesting `--background` |
+| `awman api kill` when server is not running | Informational message; exits 0 |
+| `awman api logs` with no log file | Clear error suggesting `--background` |
 | Unknown `subcommand` in `POST /v1/commands` | HTTP 400; response lists valid subcommands |
-| `x-amux-session` header missing | HTTP 400 |
+| `x-awman-session` header missing | HTTP 400 |
 | `exec prompt` with empty string | CLI validation error: `"prompt cannot be empty"` before any container launches |
 | `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning printed; placeholder left unexpanded; workflow continues |
 | `exec workflow --work-item <N>` where file not found | Error pointing to the expected path pattern; same message as `implement` |
-| `headless.alwaysNonInteractive` true + duplicate `--non-interactive` flag in args | Flag is deduplicated; no error |
+| `api.alwaysNonInteractive` true + duplicate `--non-interactive` flag in args | Flag is deduplicated; no error |
 | `exec` dispatched via HTTP API with unknown action (not `prompt`/`workflow`/`wf`) | HTTP 400; response lists valid exec actions |
 | `remote` subcommand dispatched via HTTP API without required args (e.g. no `--session`) | Subprocess exits with a clear error; output appears in the command log |
 | No `Authorization` header on any request | HTTP 401 with JSON body explaining which header to use |
@@ -908,7 +908,7 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | `GET /v1/sessions?status=active` with no active sessions | Returns `{"sessions":[]}` (empty list); HTTP 200 |
 | Session transitions to closed between list fetch and command dispatch | Server enforces rejection at `POST /v1/commands` regardless of filter; client receives HTTP 404 |
 | Startup cleanup: sessions closed exactly 24h ago | Not deleted until the next second boundary passes (exclusive `<` comparison) |
-| Startup cleanup: on-disk log files for cleaned sessions | Not deleted; they remain in `~/.amux/headless/sessions/<uuid>/` for audit purposes |
+| Startup cleanup: on-disk log files for cleaned sessions | Not deleted; they remain in `~/.awman/api/sessions/<uuid>/` for audit purposes |
 | `GET /v1/workflows/:command_id` — unknown command ID | HTTP 404 `{"error": "command not found"}` |
 | `GET /v1/workflows/:command_id` — command is not a workflow command | HTTP 404 `{"error": "no workflow for this command"}`; `workflow.state.json` is never created |
 | `GET /v1/workflows/:command_id` — command is `pending` (not yet started) | HTTP 404 `{"error": "no workflow for this command"}`; file does not exist yet |

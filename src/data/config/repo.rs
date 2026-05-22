@@ -1,4 +1,4 @@
-//! Per-repository configuration: `<git_root>/.amux/config.json`.
+//! Per-repository configuration: `<git_root>/.awman/config.json`.
 //!
 //! Schema parity with the legacy `RepoConfig` (`oldsrc/config/mod.rs`) is
 //! preserved for forward and backward compatibility — users upgrading from a
@@ -10,17 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
 
-/// Subdirectory under the git root in which amux stores per-repo state.
-pub const REPO_CONFIG_SUBDIR: &str = ".amux";
+/// Subdirectory under the git root in which awman stores per-repo state.
+pub const REPO_CONFIG_SUBDIR: &str = ".awman";
 
 /// Filename of the per-repo config inside `REPO_CONFIG_SUBDIR`.
 pub const REPO_CONFIG_FILENAME: &str = "config.json";
-
-/// Legacy subdirectory used before the move to `.amux/`.
-const LEGACY_REPO_CONFIG_SUBDIR: &str = "aspec";
-
-/// Legacy filename used before the move to `config.json`.
-const LEGACY_REPO_CONFIG_FILENAME: &str = ".amux.json";
 
 /// Remote-mode configuration nested inside `GlobalConfig`.
 ///
@@ -36,9 +30,9 @@ pub struct RemoteConfig {
     pub default_api_key: Option<String>,
 }
 
-/// Headless server configuration nested inside `GlobalConfig`.
+/// API server configuration nested inside `GlobalConfig`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HeadlessConfig {
+pub struct ApiConfig {
     #[serde(rename = "workDirs", skip_serializing_if = "Option::is_none")]
     pub work_dirs: Option<Vec<String>>,
     #[serde(
@@ -53,7 +47,7 @@ pub struct HeadlessConfig {
 pub struct OverlaysConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directories: Option<Vec<DirectoryOverlayConfig>>,
-    /// When true, mount the global amux skills dir into the agent container.
+    /// When true, mount the global awman skills dir into the agent container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<bool>,
 }
@@ -81,7 +75,7 @@ pub struct WorkItemsConfig {
     pub template: Option<String>,
 }
 
-/// Per-repository configuration stored at `<git_root>/.amux/config.json`.
+/// Per-repository configuration stored at `<git_root>/.awman/config.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,13 +105,6 @@ impl RepoConfig {
         git_root.join(REPO_CONFIG_SUBDIR).join(REPO_CONFIG_FILENAME)
     }
 
-    /// Path to the pre-`.amux/` legacy config under a git root.
-    pub fn legacy_path(git_root: &Path) -> PathBuf {
-        git_root
-            .join(LEGACY_REPO_CONFIG_SUBDIR)
-            .join(LEGACY_REPO_CONFIG_FILENAME)
-    }
-
     /// Load the repo config from disk.
     ///
     /// Returns `RepoConfig::default()` when no file is present.
@@ -140,24 +127,6 @@ impl RepoConfig {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
         std::fs::write(&path, content).map_err(|e| DataError::io(&path, e))
-    }
-
-    /// Migrate a legacy `aspec/.amux.json` to `.amux/config.json` if and only
-    /// if the legacy file exists and the new path does not. Removes the legacy
-    /// file on success. Returns `true` when a migration was performed.
-    pub fn migrate_legacy(git_root: &Path) -> Result<bool, DataError> {
-        let legacy = Self::legacy_path(git_root);
-        let current = Self::path(git_root);
-        if !legacy.exists() || current.exists() {
-            return Ok(false);
-        }
-        let content = std::fs::read_to_string(&legacy).map_err(|e| DataError::io(&legacy, e))?;
-        if let Some(parent) = current.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
-        }
-        std::fs::write(&current, &content).map_err(|e| DataError::io(&current, e))?;
-        std::fs::remove_file(&legacy).map_err(|e| DataError::io(&legacy, e))?;
-        Ok(true)
     }
 
     /// Resolve the configured work items directory relative to `git_root`.
@@ -245,62 +214,15 @@ mod tests {
     #[test]
     fn load_malformed_json_returns_config_parse_error() {
         let tmp = make_git_root();
-        let amux_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join(REPO_CONFIG_FILENAME), b"{not valid json").unwrap();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join(REPO_CONFIG_FILENAME), b"{not valid json").unwrap();
 
         let err = RepoConfig::load(tmp.path()).unwrap_err();
         assert!(
             matches!(err, DataError::ConfigParse { .. }),
             "expected ConfigParse, got {err:?}"
         );
-    }
-
-    #[test]
-    fn migrate_legacy_moves_file_and_removes_old() {
-        let tmp = make_git_root();
-        let legacy_dir = tmp.path().join("aspec");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        let legacy_content = r#"{"agent":"claude"}"#;
-        std::fs::write(legacy_dir.join(".amux.json"), legacy_content).unwrap();
-
-        let migrated = RepoConfig::migrate_legacy(tmp.path()).unwrap();
-        assert!(migrated, "expected migration to be performed");
-
-        // Legacy file must be gone.
-        assert!(!RepoConfig::legacy_path(tmp.path()).exists());
-        // New file must exist and be readable.
-        assert!(RepoConfig::path(tmp.path()).exists());
-        let loaded = RepoConfig::load(tmp.path()).unwrap();
-        assert_eq!(loaded.agent.as_deref(), Some("claude"));
-    }
-
-    #[test]
-    fn migrate_legacy_no_op_when_both_files_exist() {
-        let tmp = make_git_root();
-        // Write both legacy and new config.
-        let legacy_dir = tmp.path().join("aspec");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join(".amux.json"), r#"{"agent":"old"}"#).unwrap();
-
-        let new_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
-        std::fs::create_dir_all(&new_dir).unwrap();
-        std::fs::write(new_dir.join(REPO_CONFIG_FILENAME), r#"{"agent":"new"}"#).unwrap();
-
-        let migrated = RepoConfig::migrate_legacy(tmp.path()).unwrap();
-        assert!(
-            !migrated,
-            "migration should be a no-op when new file already exists"
-        );
-        // Legacy file should still be there.
-        assert!(RepoConfig::legacy_path(tmp.path()).exists());
-    }
-
-    #[test]
-    fn migrate_legacy_no_op_when_neither_file_exists() {
-        let tmp = make_git_root();
-        let migrated = RepoConfig::migrate_legacy(tmp.path()).unwrap();
-        assert!(!migrated);
     }
 
     #[test]
@@ -339,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn path_is_inside_amux_subdir() {
+    fn path_is_inside_awman_subdir() {
         let tmp = make_git_root();
         let p = RepoConfig::path(tmp.path());
         assert_eq!(
@@ -348,13 +270,6 @@ mod tests {
                 .join(REPO_CONFIG_SUBDIR)
                 .join(REPO_CONFIG_FILENAME)
         );
-    }
-
-    #[test]
-    fn legacy_path_is_inside_aspec_dir() {
-        let tmp = make_git_root();
-        let p = RepoConfig::legacy_path(tmp.path());
-        assert_eq!(p, tmp.path().join("aspec").join(".amux.json"));
     }
 
     // ─── OverlaysConfig / skills deserialization ──────────────────────────────

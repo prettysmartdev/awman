@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/release.sh — idempotent release script for amux
+# scripts/release.sh — idempotent release script for awman
 # Usage: scripts/release.sh v1.2.3
 #
 # Each step detects whether it has already been completed, so the script can
@@ -57,7 +57,7 @@ if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]; then
   die "Version must match vX.Y.Z format, got: $VERSION"
 fi
 
-echo -e "\n${BOLD}Releasing amux ${VERSION}${NC}"
+echo -e "\n${BOLD}Releasing awman ${VERSION}${NC}"
 
 # ── PRE-CHECKS ────────────────────────────────────────────────────────────────
 
@@ -128,12 +128,12 @@ CURRENT_CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1
 if [ "$CURRENT_CARGO_VERSION" = "$BARE_VERSION" ]; then
   ok "Cargo.toml already at $BARE_VERSION"
 else
-  # Sanity-check that `amux --version` still reports the old value (not some
+  # Sanity-check that `awman --version` still reports the old value (not some
   # newer version that disagrees with Cargo.toml).
-  if command -v amux &>/dev/null; then
-    BINARY_VERSION=$(amux --version 2>/dev/null | awk '{print $NF}' || true)
+  if command -v awman &>/dev/null; then
+    BINARY_VERSION=$(awman --version 2>/dev/null | awk '{print $NF}' || true)
     if [ -n "$BINARY_VERSION" ] && [ "$BINARY_VERSION" != "$CURRENT_CARGO_VERSION" ]; then
-      warn "Installed amux reports version $BINARY_VERSION but Cargo.toml says $CURRENT_CARGO_VERSION."
+      warn "Installed awman reports version $BINARY_VERSION but Cargo.toml says $CURRENT_CARGO_VERSION."
     fi
   fi
 
@@ -178,10 +178,10 @@ if grep -qF "$TEMPLATE_MARKER" "$NOTES_FILE"; then
   echo ""
   echo "  Edit $NOTES_FILE with the release notes, then re-run this script."
   echo ""
-  read -r -p "  Launch 'amux chat' to write release notes now? [Y/n] " REPLY < /dev/tty
+  read -r -p "  Launch 'awman chat' to write release notes now? [Y/n] " REPLY < /dev/tty
   REPLY="${REPLY:-Y}"
   if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-    amux chat
+    awman chat
     # After chat exits, check again
     if grep -qF "$TEMPLATE_MARKER" "$NOTES_FILE"; then
       die "Release notes still contain the placeholder. Edit $NOTES_FILE and re-run."
@@ -240,10 +240,10 @@ else
       touch "$TESTS_SENTINEL"
     else
       echo ""
-      read -r -p "  Launch 'amux chat' to fix the failing tests? [Y/n] " REPLY < /dev/tty
+      read -r -p "  Launch 'awman chat' to fix the failing tests? [Y/n] " REPLY < /dev/tty
       REPLY="${REPLY:-Y}"
       if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-        amux chat
+        awman chat
         die "Re-run this script after verifying the tests pass."
       else
         die "Fix the tests and re-run this script."

@@ -5,8 +5,8 @@
 /// - Background yolo countdown: tab-bar color and label alternation
 /// - Background yolo countdown expiry → workflow auto-advance flag
 /// - Tab-switching with an in-progress yolo countdown dialog
-use amux::tui::input::{handle_key, Action};
-use amux::tui::state::{
+use awman::tui::input::{handle_key, Action};
+use awman::tui::state::{
     App, Dialog, ExecutionPhase, TabState, STUCK_TIMEOUT, YOLO_COUNTDOWN_DURATION,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

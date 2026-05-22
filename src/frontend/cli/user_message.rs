@@ -53,10 +53,10 @@ impl UserMessageSink for CliUserMessageQueue {
 
 fn write_to_stderr(msg: &UserMessage) {
     let prefix = match msg.level {
-        MessageLevel::Info => "amux:",
-        MessageLevel::Warning => "amux warning:",
-        MessageLevel::Error => "amux error:",
-        MessageLevel::Success => "amux:",
+        MessageLevel::Info => "awman:",
+        MessageLevel::Warning => "awman warning:",
+        MessageLevel::Error => "awman error:",
+        MessageLevel::Success => "awman:",
     };
     let _ = writeln!(std::io::stderr(), "{prefix} {}", msg.text);
     let _ = std::io::stderr().flush();

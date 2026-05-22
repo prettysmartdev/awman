@@ -17,9 +17,9 @@ use crate::command::commands::config::{
 use crate::command::commands::download::DownloadOutcome;
 use crate::command::commands::exec_prompt::ExecPromptOutcome;
 use crate::command::commands::exec_workflow::ExecWorkflowOutcome;
-use crate::command::commands::headless::{
-    HeadlessKillOutcome, HeadlessLogsOutcome, HeadlessOutcome, HeadlessStartOutcome,
-    HeadlessStatusOutcome,
+use crate::command::commands::api_server::{
+    ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
+    ApiServerStatusOutcome,
 };
 use crate::command::commands::init::InitOutcome;
 use crate::command::commands::new::{
@@ -48,7 +48,7 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
         CommandOutcome::ExecPrompt(o) => render_exec_prompt(o),
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
         CommandOutcome::Config(o) => render_config(o),
-        CommandOutcome::Headless(o) => render_headless(o),
+        CommandOutcome::ApiServer(o) => render_api_server(o),
         CommandOutcome::Remote(o) => render_remote(o),
         CommandOutcome::New(o) => render_new(o),
         CommandOutcome::Specs(o) => render_specs(o),
@@ -61,12 +61,12 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
 
 pub fn render_status(o: &StatusOutcome) -> String {
     let mut out = String::new();
-    out.push_str("AMUX STATUS DASHBOARD\n\n");
+    out.push_str("AWMAN STATUS DASHBOARD\n\n");
 
     out.push_str("CODE AGENTS\n");
     if o.containers.is_empty() {
         out.push_str("  No code agents running.\n");
-        out.push_str("  To start one: amux exec workflow <file>  or  amux chat\n");
+        out.push_str("  To start one: awman exec workflow <file>  or  awman chat\n");
     } else {
         let headers = ["●", "Container", "ID", "Image", "CPU%", "Mem MB", "Started"];
         let rows: Vec<Vec<String>> = o.containers.iter().map(render_container_row).collect();
@@ -222,7 +222,7 @@ fn render_config_show(o: &ConfigShowOutcome) -> String {
             ]
         })
         .collect();
-    let mut out = String::from("AMUX CONFIG\n\n");
+    let mut out = String::from("AWMAN CONFIG\n\n");
     out.push_str(&format_table(&headers, &rows));
     out
 }
@@ -242,18 +242,18 @@ fn render_config_set(o: &ConfigSetOutcome) -> String {
     format!("Set {} ({}) = {}", o.field, o.scope, o.value)
 }
 
-// ─── headless ────────────────────────────────────────────────────────────────
+// ─── api ────────────────────────────────────────────────────────────────
 
-fn render_headless(o: &HeadlessOutcome) -> Option<String> {
+fn render_api_server(o: &ApiServerOutcome) -> Option<String> {
     match o {
-        HeadlessOutcome::Start(s) => Some(render_headless_start(s)),
-        HeadlessOutcome::Kill(k) => Some(render_headless_kill(k)),
-        HeadlessOutcome::Logs(l) => Some(render_headless_logs(l)),
-        HeadlessOutcome::Status(s) => Some(render_headless_status(s)),
+        ApiServerOutcome::Start(s) => Some(render_api_server_start(s)),
+        ApiServerOutcome::Kill(k) => Some(render_api_server_kill(k)),
+        ApiServerOutcome::Logs(l) => Some(render_api_server_logs(l)),
+        ApiServerOutcome::Status(s) => Some(render_api_server_status(s)),
     }
 }
 
-fn render_headless_start(o: &HeadlessStartOutcome) -> String {
+fn render_api_server_start(o: &ApiServerStartOutcome) -> String {
     let mode = if o.background {
         "background"
     } else {
@@ -270,29 +270,29 @@ fn render_headless_start(o: &HeadlessStartOutcome) -> String {
         ""
     };
     format!(
-        "Headless server started on port {} in {mode} mode.\n  workdirs: {workdirs}{key}",
+        "API server started on port {} in {mode} mode.\n  workdirs: {workdirs}{key}",
         o.port
     )
 }
 
-fn render_headless_kill(o: &HeadlessKillOutcome) -> String {
+fn render_api_server_kill(o: &ApiServerKillOutcome) -> String {
     match o.stopped_pid {
-        Some(pid) => format!("Headless server (PID {pid}) stopped."),
-        None => "Headless server is not running.".to_string(),
+        Some(pid) => format!("API server (PID {pid}) stopped."),
+        None => "API server is not running.".to_string(),
     }
 }
 
-fn render_headless_logs(o: &HeadlessLogsOutcome) -> String {
+fn render_api_server_logs(o: &ApiServerLogsOutcome) -> String {
     if o.log_path.is_empty() {
-        "No headless server log found.".to_string()
+        "No API server log found.".to_string()
     } else {
-        format!("Tailing headless logs at {}", o.log_path)
+        format!("Tailing API server logs at {}", o.log_path)
     }
 }
 
-fn render_headless_status(o: &HeadlessStatusOutcome) -> String {
+fn render_api_server_status(o: &ApiServerStatusOutcome) -> String {
     if !o.running {
-        return "Headless server is not running.".to_string();
+        return "API server is not running.".to_string();
     }
     let pid_part = o.pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
     let addr_part = o
@@ -310,7 +310,7 @@ fn render_headless_status(o: &HeadlessStatusOutcome) -> String {
     } else {
         " — process alive but HTTP probe failed"
     };
-    format!("Headless server is running{pid_part}{addr_part}{version_part}{responsive_part}.")
+    format!("API server is running{pid_part}{addr_part}{version_part}{responsive_part}.")
 }
 
 // ─── remote ──────────────────────────────────────────────────────────────────
@@ -434,7 +434,7 @@ mod tests {
             tip: "test tip".into(),
         };
         let s = render_status(&o);
-        assert!(s.contains("AMUX STATUS DASHBOARD"));
+        assert!(s.contains("AWMAN STATUS DASHBOARD"));
         assert!(s.contains("No code agents running"));
         assert!(s.contains("Tip: test tip"));
     }
@@ -444,8 +444,8 @@ mod tests {
         let o = StatusOutcome {
             containers: vec![StatusContainerRow {
                 id: "abc1234567890".into(),
-                name: "amux-1".into(),
-                image: "amux/dev:latest".into(),
+                name: "awman-1".into(),
+                image: "awman/dev:latest".into(),
                 started_at: "2025-01-01T00:00:00Z".into(),
                 kind: ContainerKind::Agent,
                 tab_number: None,
@@ -459,7 +459,7 @@ mod tests {
         };
         let s = render_status(&o);
         assert!(s.contains("CODE AGENTS"), "{s}");
-        assert!(s.contains("amux-1"), "{s}");
+        assert!(s.contains("awman-1"), "{s}");
     }
 
     #[test]
@@ -539,15 +539,15 @@ mod tests {
     }
 
     #[test]
-    fn render_headless_status_running_with_pid() {
-        let s = render_headless_status(&HeadlessStatusOutcome {
+    fn render_api_server_status_running_with_pid() {
+        let s = render_api_server_status(&ApiServerStatusOutcome {
             running: true,
             pid: Some(1234),
             bound_addr: Some("https://127.0.0.1:9876".into()),
             version: Some("0.7.0".into()),
             responsive: true,
         });
-        assert!(s.contains("Headless server is running"));
+        assert!(s.contains("API server is running"));
         assert!(s.contains("PID 1234"));
         assert!(s.contains("at https://127.0.0.1:9876"));
         assert!(s.contains("version 0.7.0"));
@@ -555,8 +555,8 @@ mod tests {
     }
 
     #[test]
-    fn render_headless_status_alive_but_unresponsive() {
-        let s = render_headless_status(&HeadlessStatusOutcome {
+    fn render_api_server_status_alive_but_unresponsive() {
+        let s = render_api_server_status(&ApiServerStatusOutcome {
             running: true,
             pid: Some(1234),
             bound_addr: None,
@@ -567,15 +567,15 @@ mod tests {
     }
 
     #[test]
-    fn render_headless_status_not_running() {
-        let s = render_headless_status(&HeadlessStatusOutcome {
+    fn render_api_server_status_not_running() {
+        let s = render_api_server_status(&ApiServerStatusOutcome {
             running: false,
             pid: None,
             bound_addr: None,
             version: None,
             responsive: false,
         });
-        assert_eq!(s, "Headless server is not running.");
+        assert_eq!(s, "API server is not running.");
     }
 
     #[test]
@@ -707,7 +707,7 @@ mod tests {
             ],
         };
         let s = render_config_show(&o);
-        assert!(s.contains("AMUX CONFIG"), "must have header");
+        assert!(s.contains("AWMAN CONFIG"), "must have header");
         assert!(s.contains("Field"), "must have Field column");
         assert!(s.contains("Global"), "must have Global column");
         assert!(s.contains("Repo"), "must have Repo column");
@@ -778,7 +778,7 @@ mod tests {
             interview: false,
             global: true,
             format: "yaml".into(),
-            path: Some("/home/user/.amux/workflows/my-wf.yaml".into()),
+            path: Some("/home/user/.awman/workflows/my-wf.yaml".into()),
         };
         let s = render_new_workflow(&o);
         assert!(s.contains("global"), "must mention global scope");
@@ -789,7 +789,7 @@ mod tests {
         let o = NewSkillOutcome {
             interview: false,
             global: true,
-            path: Some("/home/user/.amux/skills/my-skill/SKILL.md".into()),
+            path: Some("/home/user/.awman/skills/my-skill/SKILL.md".into()),
         };
         let s = render_new_skill(&o);
         assert!(s.contains("global"), "must mention global scope");
@@ -897,34 +897,34 @@ mod tests {
         );
     }
 
-    // ── render_headless ───────────────────────────────────────────────────────
+    // ── render_api_server ───────────────────────────────────────────────────────
 
-    use crate::command::commands::headless::{
-        HeadlessKillOutcome, HeadlessLogsOutcome, HeadlessStartOutcome,
+    use crate::command::commands::api_server::{
+        ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerStartOutcome,
     };
 
     #[test]
-    fn render_headless_start_shows_port_and_mode() {
-        let o = HeadlessStartOutcome {
+    fn render_api_server_start_shows_port_and_mode() {
+        let o = ApiServerStartOutcome {
             port: 9876,
             background: true,
             workdirs: vec!["/repo".into()],
             refreshed_key: false,
         };
-        let s = render_headless_start(&o);
+        let s = render_api_server_start(&o);
         assert!(s.contains("9876"), "port must appear: {s}");
         assert!(s.contains("background"), "mode must appear: {s}");
     }
 
     #[test]
-    fn render_headless_start_foreground_mode() {
-        let o = HeadlessStartOutcome {
+    fn render_api_server_start_foreground_mode() {
+        let o = ApiServerStartOutcome {
             port: 8080,
             background: false,
             workdirs: vec![],
             refreshed_key: true,
         };
-        let s = render_headless_start(&o);
+        let s = render_api_server_start(&o);
         assert!(s.contains("foreground"), "must say foreground: {s}");
         assert!(
             s.contains("api key refreshed"),
@@ -933,8 +933,8 @@ mod tests {
     }
 
     #[test]
-    fn render_headless_kill_with_stopped_pid() {
-        let s = render_headless_kill(&HeadlessKillOutcome {
+    fn render_api_server_kill_with_stopped_pid() {
+        let s = render_api_server_kill(&ApiServerKillOutcome {
             stopped_pid: Some(5678),
         });
         assert!(s.contains("5678"), "PID must appear: {s}");
@@ -942,25 +942,25 @@ mod tests {
     }
 
     #[test]
-    fn render_headless_kill_without_pid_says_not_running() {
-        let s = render_headless_kill(&HeadlessKillOutcome { stopped_pid: None });
+    fn render_api_server_kill_without_pid_says_not_running() {
+        let s = render_api_server_kill(&ApiServerKillOutcome { stopped_pid: None });
         assert!(s.contains("not running"), "must say not running: {s}");
     }
 
     #[test]
-    fn render_headless_logs_with_path() {
-        let s = render_headless_logs(&HeadlessLogsOutcome {
-            log_path: "/tmp/amux.log".into(),
+    fn render_api_server_logs_with_path() {
+        let s = render_api_server_logs(&ApiServerLogsOutcome {
+            log_path: "/tmp/awman.log".into(),
         });
-        assert!(s.contains("/tmp/amux.log"), "log path must appear: {s}");
+        assert!(s.contains("/tmp/awman.log"), "log path must appear: {s}");
     }
 
     #[test]
-    fn render_headless_logs_empty_path() {
-        let s = render_headless_logs(&HeadlessLogsOutcome {
+    fn render_api_server_logs_empty_path() {
+        let s = render_api_server_logs(&ApiServerLogsOutcome {
             log_path: String::new(),
         });
-        assert!(s.contains("No headless server log"), "must say no log: {s}");
+        assert!(s.contains("No API server log"), "must say no log: {s}");
     }
 
     // ── render_remote ─────────────────────────────────────────────────────────

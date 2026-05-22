@@ -1,4 +1,4 @@
-//! `HeadlessCommand` — `headless start | kill | logs | status`.
+//! `ApiServerCommand` — `api start | kill | logs | status`.
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -9,15 +9,15 @@ use std::path::PathBuf;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::data::fs::headless_process;
+use crate::data::fs::api_process;
 use crate::engine::auth::TlsMaterial;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
-/// Configuration handed from the `headless start` command to Layer 3's
+/// Configuration handed from the `api start` command to Layer 3's
 /// `serve_until_shutdown`. Lives in Layer 2 so the trait signature does
 /// not pull Layer 3 types into the command layer.
 #[derive(Debug, Clone)]
-pub struct HeadlessServeConfig {
+pub struct ApiServeConfig {
     pub port: u16,
     pub bind_ip: IpAddr,
     pub workdirs: Vec<PathBuf>,
@@ -28,7 +28,7 @@ pub struct HeadlessServeConfig {
 pub mod banner;
 
 #[derive(Debug, Clone)]
-pub struct HeadlessStartFlags {
+pub struct ApiServerStartFlags {
     pub port: u16,
     pub workdirs: Vec<String>,
     pub background: bool,
@@ -37,24 +37,24 @@ pub struct HeadlessStartFlags {
 }
 
 #[derive(Debug, Clone)]
-pub struct HeadlessKillFlags {}
+pub struct ApiServerKillFlags {}
 
 #[derive(Debug, Clone)]
-pub struct HeadlessLogsFlags {}
+pub struct ApiServerLogsFlags {}
 
 #[derive(Debug, Clone)]
-pub struct HeadlessStatusFlags {}
+pub struct ApiServerStatusFlags {}
 
 #[derive(Debug, Clone)]
-pub enum HeadlessSubcommand {
-    Start(HeadlessStartFlags),
-    Kill(HeadlessKillFlags),
-    Logs(HeadlessLogsFlags),
-    Status(HeadlessStatusFlags),
+pub enum ApiServerSubcommand {
+    Start(ApiServerStartFlags),
+    Kill(ApiServerKillFlags),
+    Logs(ApiServerLogsFlags),
+    Status(ApiServerStatusFlags),
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HeadlessStartOutcome {
+pub struct ApiServerStartOutcome {
     pub port: u16,
     pub background: bool,
     pub workdirs: Vec<String>,
@@ -62,17 +62,17 @@ pub struct HeadlessStartOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HeadlessKillOutcome {
+pub struct ApiServerKillOutcome {
     pub stopped_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HeadlessLogsOutcome {
+pub struct ApiServerLogsOutcome {
     pub log_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HeadlessStatusOutcome {
+pub struct ApiServerStatusOutcome {
     pub running: bool,
     pub pid: Option<u32>,
     /// Bound endpoint (e.g. `http://127.0.0.1:9876` or `https://...`),
@@ -87,70 +87,70 @@ pub struct HeadlessStatusOutcome {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload")]
-pub enum HeadlessOutcome {
-    Start(HeadlessStartOutcome),
-    Kill(HeadlessKillOutcome),
-    Logs(HeadlessLogsOutcome),
-    Status(HeadlessStatusOutcome),
+pub enum ApiServerOutcome {
+    Start(ApiServerStartOutcome),
+    Kill(ApiServerKillOutcome),
+    Logs(ApiServerLogsOutcome),
+    Status(ApiServerStatusOutcome),
 }
 
-/// Methods Layer 3 must provide to the headless start command.
+/// Methods Layer 3 must provide to the api start command.
 #[async_trait]
-pub trait HeadlessStartCommandFrontend: UserMessageSink + Send + Sync {
+pub trait ApiServerStartCommandFrontend: UserMessageSink + Send + Sync {
     async fn serve_until_shutdown(
         &mut self,
-        config: HeadlessServeConfig,
+        config: ApiServeConfig,
     ) -> Result<(), CommandError>;
 }
 
-pub trait HeadlessKillCommandFrontend: UserMessageSink + Send + Sync {}
-pub trait HeadlessLogsCommandFrontend: UserMessageSink + Send + Sync {}
-pub trait HeadlessStatusCommandFrontend: UserMessageSink + Send + Sync {}
+pub trait ApiServerKillCommandFrontend: UserMessageSink + Send + Sync {}
+pub trait ApiServerLogsCommandFrontend: UserMessageSink + Send + Sync {}
+pub trait ApiServerStatusCommandFrontend: UserMessageSink + Send + Sync {}
 
-/// Catch-all frontend for the umbrella `HeadlessCommand`. Includes
+/// Catch-all frontend for the umbrella `ApiServerCommand`. Includes
 /// `serve_until_shutdown` so the dispatched frontend can boot the server.
 #[async_trait]
-pub trait HeadlessCommandFrontend: UserMessageSink + Send + Sync {
+pub trait ApiServerCommandFrontend: UserMessageSink + Send + Sync {
     async fn serve_until_shutdown(
         &mut self,
-        config: HeadlessServeConfig,
+        config: ApiServeConfig,
     ) -> Result<(), CommandError>;
 }
 
-pub struct HeadlessCommand {
-    sub: HeadlessSubcommand,
+pub struct ApiServerCommand {
+    sub: ApiServerSubcommand,
     engines: Engines,
 }
 
-impl HeadlessCommand {
-    pub fn new(sub: HeadlessSubcommand, engines: Engines) -> Self {
+impl ApiServerCommand {
+    pub fn new(sub: ApiServerSubcommand, engines: Engines) -> Self {
         Self { sub, engines }
     }
 
-    pub fn subcommand(&self) -> &HeadlessSubcommand {
+    pub fn subcommand(&self) -> &ApiServerSubcommand {
         &self.sub
     }
 }
 
 #[async_trait]
-impl Command for HeadlessCommand {
-    type Frontend = Box<dyn HeadlessCommandFrontend>;
-    type Outcome = HeadlessOutcome;
+impl Command for ApiServerCommand {
+    type Frontend = Box<dyn ApiServerCommandFrontend>;
+    type Outcome = ApiServerOutcome;
 
     async fn run_with_frontend(
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let headless_paths = self.engines.auth_engine.headless_paths();
-        headless_paths.ensure_root().map_err(CommandError::Data)?;
+        let api_paths = self.engines.auth_engine.api_paths();
+        api_paths.ensure_root().map_err(CommandError::Data)?;
 
         let outcome = match self.sub {
-            HeadlessSubcommand::Start(f) => {
-                run_start(f, &self.engines, &mut *frontend, headless_paths).await?
+            ApiServerSubcommand::Start(f) => {
+                run_start(f, &self.engines, &mut *frontend, api_paths).await?
             }
-            HeadlessSubcommand::Kill(_) => run_kill(headless_paths, &mut *frontend)?,
-            HeadlessSubcommand::Logs(_) => run_logs(headless_paths, &mut *frontend)?,
-            HeadlessSubcommand::Status(_) => run_status(headless_paths).await?,
+            ApiServerSubcommand::Kill(_) => run_kill(api_paths, &mut *frontend)?,
+            ApiServerSubcommand::Logs(_) => run_logs(api_paths, &mut *frontend)?,
+            ApiServerSubcommand::Status(_) => run_status(api_paths).await?,
         };
         frontend.replay_queued();
         Ok(outcome)
@@ -158,22 +158,22 @@ impl Command for HeadlessCommand {
 }
 
 async fn run_start(
-    flags: HeadlessStartFlags,
+    flags: ApiServerStartFlags,
     engines: &Engines,
-    frontend: &mut dyn HeadlessCommandFrontend,
-    headless_paths: &crate::data::fs::HeadlessPaths,
-) -> Result<HeadlessOutcome, CommandError> {
-    let pid_path = headless_paths.pid_file();
+    frontend: &mut dyn ApiServerCommandFrontend,
+    api_paths: &crate::data::fs::ApiPaths,
+) -> Result<ApiServerOutcome, CommandError> {
+    let pid_path = api_paths.pid_file();
 
     // Check if already running.
-    if let Some(pid) = headless_process::check_already_running(&pid_path)? {
-        return Err(CommandError::HeadlessAlreadyRunning { pid });
+    if let Some(pid) = api_process::check_already_running(&pid_path)? {
+        return Err(CommandError::ApiServerAlreadyRunning { pid });
     }
 
-    // Resolve workdirs by merging CLI --workdirs with the global headless config.
+    // Resolve workdirs by merging CLI --workdirs with the global API config.
     let config_workdirs: Vec<String> = crate::data::config::global::GlobalConfig::load()
         .unwrap_or_default()
-        .headless
+        .api
         .as_ref()
         .and_then(|h| h.work_dirs.clone())
         .unwrap_or_default();
@@ -186,7 +186,7 @@ async fn run_start(
             level: MessageLevel::Info,
             text: banner::render_api_key_banner(key.as_str()),
         });
-        return Ok(HeadlessOutcome::Start(HeadlessStartOutcome {
+        return Ok(ApiServerOutcome::Start(ApiServerStartOutcome {
             port: flags.port,
             background: false,
             workdirs: workdirs.iter().map(|p| p.display().to_string()).collect(),
@@ -196,7 +196,7 @@ async fn run_start(
 
     // Auth check: when not skipping auth, ensure an API key hash exists.
     if !flags.dangerously_skip_auth && engines.auth_engine.read_api_key_hash()?.is_none() {
-        return Err(CommandError::HeadlessAuthMissing);
+        return Err(CommandError::ApiServerAuthMissing);
     }
 
     let workdir_strings: Vec<String> = workdirs.iter().map(|p| p.display().to_string()).collect();
@@ -204,9 +204,9 @@ async fn run_start(
     // Background mode: spawn a child process and exit.
     if flags.background {
         let binary = std::env::current_exe()
-            .map_err(|e| CommandError::Other(format!("cannot determine amux binary: {e}")))?;
+            .map_err(|e| CommandError::Other(format!("cannot determine awman binary: {e}")))?;
         let mut args = vec![
-            "headless".to_string(),
+            "api".to_string(),
             "start".to_string(),
             "--port".to_string(),
             flags.port.to_string(),
@@ -219,31 +219,31 @@ async fn run_start(
             args.push(w.clone());
         }
 
-        let log_path = headless_paths.log_file();
-        let child_pid = headless_process::spawn_background(&binary, &args, &log_path)?;
+        let log_path = api_paths.log_file();
+        let child_pid = api_process::spawn_background(&binary, &args, &log_path)?;
         if child_pid > 0 {
-            // Use exclusive write so a racing parallel `headless start --background`
+            // Use exclusive write so a racing parallel `api start --background`
             // can't trample the PID we just spawned.
-            if !headless_process::write_pid_exclusive(&pid_path, child_pid)? {
-                if let Some(existing) = headless_process::read_pid(&pid_path)? {
+            if !api_process::write_pid_exclusive(&pid_path, child_pid)? {
+                if let Some(existing) = api_process::read_pid(&pid_path)? {
                     if existing != child_pid
-                        && headless_process::is_process_alive(existing)
-                        && headless_process::pid_is_amux(existing)
+                        && api_process::is_process_alive(existing)
+                        && api_process::pid_is_awman(existing)
                     {
-                        return Err(CommandError::HeadlessAlreadyRunning { pid: existing });
+                        return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
                     }
                 }
                 // Stale or matching — overwrite.
-                headless_process::write_pid(&pid_path, child_pid)?;
+                api_process::write_pid(&pid_path, child_pid)?;
             }
         }
 
         frontend.write_message(UserMessage {
             level: MessageLevel::Success,
-            text: format!("Headless server started in background (PID {child_pid})."),
+            text: format!("API server started in background (PID {child_pid})."),
         });
 
-        return Ok(HeadlessOutcome::Start(HeadlessStartOutcome {
+        return Ok(ApiServerOutcome::Start(ApiServerStartOutcome {
             port: flags.port,
             background: true,
             workdirs: workdir_strings,
@@ -253,25 +253,25 @@ async fn run_start(
 
     // Foreground mode: write PID race-safely, boot HTTP server, clean up on
     // exit. If the exclusive write loses the race against another fresh
-    // start, surface HeadlessAlreadyRunning rather than overwriting.
-    if !headless_process::write_pid_exclusive(&pid_path, std::process::id())? {
-        if let Some(existing) = headless_process::read_pid(&pid_path)? {
-            if headless_process::is_process_alive(existing)
-                && headless_process::pid_is_amux(existing)
+    // start, surface ApiServerAlreadyRunning rather than overwriting.
+    if !api_process::write_pid_exclusive(&pid_path, std::process::id())? {
+        if let Some(existing) = api_process::read_pid(&pid_path)? {
+            if api_process::is_process_alive(existing)
+                && api_process::pid_is_awman(existing)
             {
-                return Err(CommandError::HeadlessAlreadyRunning { pid: existing });
+                return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
             }
         }
         // Stale file slipped through — clean up and retake.
-        headless_process::clear_pid(&pid_path)?;
-        headless_process::write_pid(&pid_path, std::process::id())?;
+        api_process::clear_pid(&pid_path)?;
+        api_process::write_pid(&pid_path, std::process::id())?;
     }
 
     // TLS material: generate or load now so the bind_ip warning surfaces
     // BEFORE we hand off to serve_until_shutdown.
     let bind_ip: std::net::IpAddr = "127.0.0.1".parse().expect("static loopback ip");
     let (tls_material, regenerated) = engines.auth_engine.ensure_self_signed_tls(bind_ip)?;
-    if regenerated && headless_paths.tls_bind_ip_file().exists() {
+    if regenerated && api_paths.tls_bind_ip_file().exists() {
         // Existing sidecar file means a previous cert was here — emit the
         // re-pin warning. (We can't reliably distinguish "first ever cert"
         // from "regenerated for new IP" without extra state, but the sidecar
@@ -284,19 +284,19 @@ async fn run_start(
         });
     }
 
-    // Persist server metadata so `headless status` and remote clients can
+    // Persist server metadata so `api status` and remote clients can
     // probe the right endpoint.
-    let meta_path = headless_paths.server_meta_file();
-    let _ = headless_process::write_server_meta(
+    let meta_path = api_paths.server_meta_file();
+    let _ = api_process::write_server_meta(
         &meta_path,
-        &headless_process::ServerMeta {
+        &api_process::ServerMeta {
             port: flags.port,
             bind_ip: bind_ip.to_string(),
             scheme: "https".into(),
         },
     );
 
-    let config = HeadlessServeConfig {
+    let config = ApiServeConfig {
         port: flags.port,
         bind_ip,
         workdirs,
@@ -307,12 +307,12 @@ async fn run_start(
     let serve_result = frontend.serve_until_shutdown(config).await;
 
     // Always clean up PID + meta files.
-    let _ = headless_process::clear_pid(&pid_path);
-    let _ = headless_process::clear_server_meta(&meta_path);
+    let _ = api_process::clear_pid(&pid_path);
+    let _ = api_process::clear_server_meta(&meta_path);
 
     serve_result?;
 
-    Ok(HeadlessOutcome::Start(HeadlessStartOutcome {
+    Ok(ApiServerOutcome::Start(ApiServerStartOutcome {
         port: flags.port,
         background: false,
         workdirs: workdir_strings,
@@ -321,61 +321,61 @@ async fn run_start(
 }
 
 fn run_kill(
-    headless_paths: &crate::data::fs::HeadlessPaths,
-    frontend: &mut dyn HeadlessCommandFrontend,
-) -> Result<HeadlessOutcome, CommandError> {
-    let pid_path = headless_paths.pid_file();
+    api_paths: &crate::data::fs::ApiPaths,
+    frontend: &mut dyn ApiServerCommandFrontend,
+) -> Result<ApiServerOutcome, CommandError> {
+    let pid_path = api_paths.pid_file();
 
-    let pid = match headless_process::read_pid(&pid_path)? {
+    let pid = match api_process::read_pid(&pid_path)? {
         Some(pid) => pid,
         None => {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
-                text: "No headless server is running (no PID file found).".to_string(),
+                text: "No API server is running (no PID file found).".to_string(),
             });
-            return Err(CommandError::HeadlessNotRunning);
+            return Err(CommandError::ApiServerNotRunning);
         }
     };
 
-    if !headless_process::is_process_alive(pid) {
-        headless_process::clear_pid(&pid_path)?;
+    if !api_process::is_process_alive(pid) {
+        api_process::clear_pid(&pid_path)?;
         frontend.write_message(UserMessage {
             level: MessageLevel::Warning,
             text: format!("Stale PID file removed (PID {pid} was not running)."),
         });
-        return Err(CommandError::HeadlessNotRunning);
+        return Err(CommandError::ApiServerNotRunning);
     }
 
-    if !headless_process::pid_is_amux(pid) {
-        headless_process::clear_pid(&pid_path)?;
+    if !api_process::pid_is_awman(pid) {
+        api_process::clear_pid(&pid_path)?;
         frontend.write_message(UserMessage {
             level: MessageLevel::Warning,
             text: format!(
-                "PID {pid} is alive but is not an amux server; stale PID file cleaned up."
+                "PID {pid} is alive but is not an awman server; stale PID file cleaned up."
             ),
         });
-        return Err(CommandError::HeadlessNotRunning);
+        return Err(CommandError::ApiServerNotRunning);
     }
 
-    headless_process::kill_process(pid)?;
-    headless_process::clear_pid(&pid_path)?;
-    let _ = headless_process::clear_server_meta(&headless_paths.server_meta_file());
+    api_process::kill_process(pid)?;
+    api_process::clear_pid(&pid_path)?;
+    let _ = api_process::clear_server_meta(&api_paths.server_meta_file());
 
     frontend.write_message(UserMessage {
         level: MessageLevel::Success,
-        text: format!("Headless server (PID {pid}) stopped."),
+        text: format!("API server (PID {pid}) stopped."),
     });
 
-    Ok(HeadlessOutcome::Kill(HeadlessKillOutcome {
+    Ok(ApiServerOutcome::Kill(ApiServerKillOutcome {
         stopped_pid: Some(pid),
     }))
 }
 
 fn run_logs(
-    headless_paths: &crate::data::fs::HeadlessPaths,
-    frontend: &mut dyn HeadlessCommandFrontend,
-) -> Result<HeadlessOutcome, CommandError> {
-    let log_path = headless_paths.log_file();
+    api_paths: &crate::data::fs::ApiPaths,
+    frontend: &mut dyn ApiServerCommandFrontend,
+) -> Result<ApiServerOutcome, CommandError> {
+    let log_path = api_paths.log_file();
     let log_str = log_path.display().to_string();
 
     match std::fs::read_to_string(&log_path) {
@@ -400,23 +400,23 @@ fn run_logs(
         }
     }
 
-    Ok(HeadlessOutcome::Logs(HeadlessLogsOutcome {
+    Ok(ApiServerOutcome::Logs(ApiServerLogsOutcome {
         log_path: log_str,
     }))
 }
 
 async fn run_status(
-    headless_paths: &crate::data::fs::HeadlessPaths,
-) -> Result<HeadlessOutcome, CommandError> {
-    let pid_path = headless_paths.pid_file();
-    let meta_path = headless_paths.server_meta_file();
+    api_paths: &crate::data::fs::ApiPaths,
+) -> Result<ApiServerOutcome, CommandError> {
+    let pid_path = api_paths.pid_file();
+    let meta_path = api_paths.server_meta_file();
 
-    let pid = match headless_process::check_already_running(&pid_path)? {
+    let pid = match api_process::check_already_running(&pid_path)? {
         Some(pid) => pid,
         None => {
             // Cleanup any orphan meta file when no server is running.
-            let _ = headless_process::clear_server_meta(&meta_path);
-            return Ok(HeadlessOutcome::Status(HeadlessStatusOutcome {
+            let _ = api_process::clear_server_meta(&meta_path);
+            return Ok(ApiServerOutcome::Status(ApiServerStatusOutcome {
                 running: false,
                 pid: None,
                 bound_addr: None,
@@ -426,7 +426,7 @@ async fn run_status(
         }
     };
 
-    let meta = headless_process::read_server_meta(&meta_path)?;
+    let meta = api_process::read_server_meta(&meta_path)?;
     let bound_addr = meta
         .as_ref()
         .map(|m| format!("{}://{}:{}", m.scheme, m.bind_ip, m.port));
@@ -457,7 +457,7 @@ async fn run_status(
         (false, None)
     };
 
-    Ok(HeadlessOutcome::Status(HeadlessStatusOutcome {
+    Ok(ApiServerOutcome::Status(ApiServerStatusOutcome {
         running: true,
         pid: Some(pid),
         bound_addr,
@@ -479,7 +479,7 @@ pub fn resolve_workdirs(
     for raw in cli.iter().chain(config.iter()) {
         let path = std::path::PathBuf::from(raw);
         if !path.exists() {
-            return Err(CommandError::HeadlessWorkdirNotFound { path });
+            return Err(CommandError::ApiWorkdirNotFound { path });
         }
         let canon = path.canonicalize().unwrap_or(path);
         if seen.insert(canon.clone()) {
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn resolve_workdirs_errors_on_missing_path() {
         let err = resolve_workdirs(&["/no/such/path".into()], &[]).unwrap_err();
-        assert!(matches!(err, CommandError::HeadlessWorkdirNotFound { .. }));
+        assert!(matches!(err, CommandError::ApiWorkdirNotFound { .. }));
     }
 
     #[test]
@@ -519,13 +519,13 @@ mod tests {
 
     use crate::command::dispatch::Engines;
     use crate::data::fs::auth_paths::AuthPathResolver;
-    use crate::data::fs::headless_paths::HeadlessPaths;
+    use crate::data::fs::api_paths::ApiPaths;
     use crate::engine::auth::AuthEngine;
     use crate::engine::message::{UserMessage, UserMessageSink};
     use std::sync::Arc;
 
     fn make_engines(tmp: &std::path::Path) -> Engines {
-        let headless_paths = HeadlessPaths::at_root(tmp);
+        let api_paths = ApiPaths::at_root(tmp);
         let auth_paths = AuthPathResolver::at_home(tmp);
         let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
         let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
@@ -536,7 +536,7 @@ mod tests {
             overlay.clone(),
             runtime.clone(),
         ));
-        let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, headless_paths));
+        let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, api_paths));
         let workflow_state_store =
             Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(tmp));
         Engines {
@@ -559,10 +559,10 @@ mod tests {
         fn replay_queued(&mut self) {}
     }
     #[async_trait::async_trait]
-    impl HeadlessCommandFrontend for NullFrontend {
+    impl ApiServerCommandFrontend for NullFrontend {
         async fn serve_until_shutdown(
             &mut self,
-            _config: HeadlessServeConfig,
+            _config: ApiServeConfig,
         ) -> Result<(), crate::command::error::CommandError> {
             Ok(())
         }
@@ -573,12 +573,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
+        let api_paths = engines.auth_engine.api_paths().clone();
 
-        // Ensure headless root exists.
-        headless_paths.ensure_root().unwrap();
+        // Ensure API root exists.
+        api_paths.ensure_root().unwrap();
 
-        let flags = HeadlessStartFlags {
+        let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
             background: false,
@@ -589,9 +589,9 @@ mod tests {
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_start(flags, &engines, &mut frontend, &headless_paths).await;
+        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
         assert!(result.is_ok(), "refresh_key must short-circuit: {result:?}");
-        if let Ok(HeadlessOutcome::Start(outcome)) = result {
+        if let Ok(ApiServerOutcome::Start(outcome)) = result {
             assert!(outcome.refreshed_key, "refreshed_key must be true");
         }
     }
@@ -601,10 +601,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
-        let flags = HeadlessStartFlags {
+        let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
             background: false,
@@ -615,10 +615,10 @@ mod tests {
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_start(flags, &engines, &mut frontend, &headless_paths).await;
+        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
         assert!(
-            matches!(result, Err(CommandError::HeadlessAuthMissing)),
-            "missing auth hash must error with HeadlessAuthMissing: {result:?}"
+            matches!(result, Err(CommandError::ApiServerAuthMissing)),
+            "missing auth hash must error with ApiServerAuthMissing: {result:?}"
         );
     }
 
@@ -627,10 +627,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
-        let flags = HeadlessStartFlags {
+        let flags = ApiServerStartFlags {
             port: 9876,
             workdirs: Vec::new(),
             background: false,
@@ -641,7 +641,7 @@ mod tests {
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_start(flags, &engines, &mut frontend, &headless_paths).await;
+        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
         assert!(
             result.is_ok(),
             "dangerously_skip_auth must bypass auth check: {result:?}"
@@ -649,48 +649,48 @@ mod tests {
     }
 
     #[test]
-    fn kill_no_pid_file_returns_headless_not_running_with_warning() {
+    fn kill_no_pid_file_returns_api_not_running_with_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_kill(&headless_paths, &mut frontend);
+        let result = run_kill(&api_paths, &mut frontend);
         assert!(
-            matches!(result, Err(CommandError::HeadlessNotRunning)),
-            "kill with no PID file must surface HeadlessNotRunning: {result:?}"
+            matches!(result, Err(CommandError::ApiServerNotRunning)),
+            "kill with no PID file must surface ApiServerNotRunning: {result:?}"
         );
         assert!(
             frontend
                 .messages
                 .iter()
-                .any(|m| m.contains("No headless") || m.contains("no PID")),
+                .any(|m| m.contains("No API") || m.contains("no PID")),
             "must emit a warning; got: {:?}",
             frontend.messages
         );
     }
 
     #[test]
-    fn kill_stale_pid_file_is_cleaned_up_and_returns_headless_not_running() {
+    fn kill_stale_pid_file_is_cleaned_up_and_returns_api_not_running() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
-        let pid_path = headless_paths.pid_file();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
+        let pid_path = api_paths.pid_file();
 
         // Write a PID that can't possibly be alive.
-        crate::data::fs::headless_process::write_pid(&pid_path, u32::MAX - 1).unwrap();
+        crate::data::fs::api_process::write_pid(&pid_path, u32::MAX - 1).unwrap();
 
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_kill(&headless_paths, &mut frontend);
+        let result = run_kill(&api_paths, &mut frontend);
         assert!(
-            matches!(result, Err(CommandError::HeadlessNotRunning)),
-            "stale PID must surface HeadlessNotRunning: {result:?}"
+            matches!(result, Err(CommandError::ApiServerNotRunning)),
+            "stale PID must surface ApiServerNotRunning: {result:?}"
         );
         assert!(
             !pid_path.exists(),
@@ -702,12 +702,12 @@ mod tests {
     async fn status_no_pid_file_returns_not_running() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
-        let result = run_status(&headless_paths).await;
+        let result = run_status(&api_paths).await;
         assert!(result.is_ok());
-        if let Ok(HeadlessOutcome::Status(outcome)) = result {
+        if let Ok(ApiServerOutcome::Status(outcome)) = result {
             assert!(!outcome.running);
             assert!(outcome.pid.is_none());
             assert!(!outcome.responsive, "no server → not responsive");
@@ -720,22 +720,22 @@ mod tests {
     async fn status_with_alive_pid_but_no_meta_reports_not_responsive() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
-        // Write our own PID — definitely alive and "amux"-named on most CI.
-        // On platforms where pid_is_amux returns false for the test binary,
+        // Write our own PID — definitely alive and "awman"-named on most CI.
+        // On platforms where pid_is_awman returns false for the test binary,
         // check_already_running will treat it as stale; that's still a
         // useful signal — running=false, responsive=false.
-        crate::data::fs::headless_process::write_pid(
-            &headless_paths.pid_file(),
+        crate::data::fs::api_process::write_pid(
+            &api_paths.pid_file(),
             std::process::id(),
         )
         .unwrap();
 
-        let result = run_status(&headless_paths).await.unwrap();
-        if let HeadlessOutcome::Status(outcome) = result {
-            // Either the test binary identifies as "amux" (running=true) or
+        let result = run_status(&api_paths).await.unwrap();
+        if let ApiServerOutcome::Status(outcome) = result {
+            // Either the test binary identifies as "awman" (running=true) or
             // not (running=false, stale-cleanup). In both cases responsive=false
             // because we wrote no server meta.
             assert!(!outcome.responsive, "no meta + no server → not responsive");
@@ -746,13 +746,13 @@ mod tests {
     fn logs_missing_log_file_emits_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_logs(&headless_paths, &mut frontend);
+        let result = run_logs(&api_paths, &mut frontend);
         assert!(
             result.is_ok(),
             "missing log file must not error: {result:?}"
@@ -771,17 +771,17 @@ mod tests {
     fn logs_existing_log_file_streams_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
-        let headless_paths = engines.auth_engine.headless_paths().clone();
-        headless_paths.ensure_root().unwrap();
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
 
         // Write a log file.
-        let log_path = headless_paths.log_file();
+        let log_path = api_paths.log_file();
         std::fs::write(&log_path, "line one\nline two\nline three\n").unwrap();
 
         let mut frontend = NullFrontend {
             messages: Vec::new(),
         };
-        let result = run_logs(&headless_paths, &mut frontend);
+        let result = run_logs(&api_paths, &mut frontend);
         assert!(result.is_ok());
         assert_eq!(frontend.messages.len(), 3, "must stream all lines");
         assert_eq!(frontend.messages[0], "line one");

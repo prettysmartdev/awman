@@ -106,7 +106,7 @@ impl ReadyFrontend for TuiCommandFrontend {
             );
         }
 
-        self.messages.success("amux is ready.".to_string());
+        self.messages.success("awman is ready.".to_string());
     }
 }
 

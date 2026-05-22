@@ -15,7 +15,7 @@ pub enum MountScopeDecision {
 
 pub trait MountScopeFrontend: UserMessageSink + Send + Sync {
     /// Prompt the user when cwd is below git_root. The frontend may apply a
-    /// safe default (e.g. headless returns `MountGitRoot`).
+    /// safe default (e.g. API returns `MountGitRoot`).
     fn ask_mount_scope(
         &mut self,
         git_root: &Path,

@@ -186,7 +186,7 @@ impl ContainerExecution {
     }
 
     /// Hand ownership of the running container back to the caller without
-    /// joining. Useful for headless background mode.
+    /// joining. Useful for API background mode.
     pub fn detach(mut self) -> ContainerHandle {
         self.inner = ExecutionState::Detached;
         self.handle

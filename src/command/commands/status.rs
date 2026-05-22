@@ -48,7 +48,7 @@ fn classify_container(_name: &str) -> ContainerKind {
     ContainerKind::Agent
 }
 
-/// Optional context supplied by the TUI; CLI / headless leave this `None`.
+/// Optional context supplied by the TUI; CLI / API leave this `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusCommandTuiContext {
     pub tabs: Vec<TuiTabSnapshot>,
@@ -65,7 +65,7 @@ pub struct TuiTabSnapshot {
 pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
     /// Optional TUI context, returned as an owned clone so implementations
     /// can serve a fresh value from a shared slot on every call.
-    /// Defaults to `None` for CLI / headless.
+    /// Defaults to `None` for CLI / API.
     fn tui_context(&self) -> Option<StatusCommandTuiContext> {
         None
     }
@@ -76,7 +76,7 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
     }
 
     /// Emit a clear-screen marker so the CLI can redraw the status table in
-    /// place. No-op for TUI / headless frontends.
+    /// place. No-op for TUI / API frontends.
     fn write_clear_marker(&mut self) {}
 
     /// Render the status dashboard. Default writes plain text via
@@ -85,7 +85,7 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
     fn write_status_dashboard(&mut self, containers: &[StatusContainerRow], tip: &str) {
         self.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "AMUX STATUS DASHBOARD".into(),
+            text: "AWMAN STATUS DASHBOARD".into(),
         });
         self.write_message(UserMessage {
             level: MessageLevel::Info,
@@ -102,7 +102,7 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
             });
             self.write_message(UserMessage {
                 level: MessageLevel::Info,
-                text: "  To start one: amux exec workflow <file>  or  amux chat".into(),
+                text: "  To start one: awman exec workflow <file>  or  awman chat".into(),
             });
         } else {
             for c in containers {
@@ -249,7 +249,7 @@ mod tests {
         let tabs = vec![
             TuiTabSnapshot {
                 tab_number: 1,
-                container_name: Some("amux-abc".into()),
+                container_name: Some("awman-abc".into()),
                 is_stuck: false,
                 command_label: "chat".into(),
             },
@@ -272,15 +272,15 @@ mod tests {
         // a row and applying the TUI context logic directly.
         let ctx = StatusCommandTuiContext::new(vec![TuiTabSnapshot {
             tab_number: 3,
-            container_name: Some("amux-mycontainer".into()),
+            container_name: Some("awman-mycontainer".into()),
             is_stuck: true,
             command_label: "exec workflow 0042".into(),
         }]);
-        let name = "amux-mycontainer".to_string();
+        let name = "awman-mycontainer".to_string();
         let mut row = StatusContainerRow {
             id: "deadbeef1234".into(),
             name: name.clone(),
-            image: "amux/dev:latest".into(),
+            image: "awman/dev:latest".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
             tab_number: None,
             stuck: false,
@@ -310,7 +310,7 @@ mod tests {
         // command_label stay at their default values.
         let row = StatusContainerRow {
             id: "abc".into(),
-            name: "amux-x".into(),
+            name: "awman-x".into(),
             image: "img".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
             kind: ContainerKind::Agent,
@@ -329,13 +329,13 @@ mod tests {
     fn tui_context_no_match_leaves_row_unchanged() {
         let ctx = StatusCommandTuiContext::new(vec![TuiTabSnapshot {
             tab_number: 1,
-            container_name: Some("amux-other".into()),
+            container_name: Some("awman-other".into()),
             is_stuck: false,
             command_label: "chat".into(),
         }]);
         let mut row = StatusContainerRow {
             id: "abc".into(),
-            name: "amux-mine".into(),
+            name: "awman-mine".into(),
             image: "img".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
             kind: ContainerKind::Agent,
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn classify_agent_containers() {
-        assert_eq!(classify_container("amux-123-456"), ContainerKind::Agent);
-        assert_eq!(classify_container("amux-abc"), ContainerKind::Agent);
+        assert_eq!(classify_container("awman-123-456"), ContainerKind::Agent);
+        assert_eq!(classify_container("awman-abc"), ContainerKind::Agent);
     }
 }

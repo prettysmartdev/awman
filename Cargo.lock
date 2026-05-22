@@ -36,53 +36,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "amux"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "arboard",
- "async-trait",
- "axum",
- "axum-server",
- "chrono",
- "clap",
- "criterion",
- "crossterm",
- "dirs",
- "flate2",
- "futures-util",
- "libc",
- "nix 0.29.0",
- "portable-pty",
- "ratatui",
- "rcgen",
- "reqwest",
- "ring",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "shell-words",
- "strip-ansi-escapes",
- "strsim",
- "subtle",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "toml",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "unicode-width",
- "uuid",
- "vt100-ctt",
- "wiremock",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,6 +182,53 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "awman"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "chrono",
+ "clap",
+ "criterion",
+ "crossterm",
+ "dirs",
+ "flate2",
+ "futures-util",
+ "libc",
+ "nix 0.29.0",
+ "portable-pty",
+ "ratatui",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "shell-words",
+ "strip-ansi-escapes",
+ "strsim",
+ "subtle",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+ "uuid",
+ "vt100-ctt",
+ "wiremock",
+]
 
 [[package]]
 name = "aws-lc-rs"

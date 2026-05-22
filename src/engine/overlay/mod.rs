@@ -35,7 +35,7 @@ pub const CLAUDE_DENYLIST: &[&str] = &[
 pub struct OverlayRequest {
     /// Inline directory specs (host:container[:perm]).
     pub directories: Vec<DirectorySpec>,
-    /// When true, mount the global amux skills directory into the agent's
+    /// When true, mount the global awman skills directory into the agent's
     /// native skills/commands path inside the container.
     pub include_skills: bool,
     /// Whether to include agent-settings overlays for `agent`. When `Some`
@@ -127,7 +127,7 @@ impl OverlayEngine {
             }
         }
 
-        // 3. Skills overlay (mount ~/.amux/skills/ read-only into agent's native path).
+        // 3. Skills overlay (mount ~/.awman/skills/ read-only into agent's native path).
         if request.include_skills {
             if let Some(agent) = &request.agent {
                 for spec in
@@ -413,7 +413,7 @@ fn sanitize_claude_config(src: &Path) -> Result<(tempfile::TempDir, PathBuf), st
         }
     }
 
-    let tmp_dir = tempfile::Builder::new().prefix("amux-claude-").tempdir()?;
+    let tmp_dir = tempfile::Builder::new().prefix("awman-claude-").tempdir()?;
     let dest = tmp_dir.path().join("claude.json");
     let body = serde_json::to_string_pretty(&value).unwrap_or(raw);
     std::fs::write(&dest, body)?;
@@ -428,7 +428,7 @@ fn sanitize_claude_settings_dir(
     yolo: bool,
 ) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
     let tmp = tempfile::Builder::new()
-        .prefix("amux-claude-dir-")
+        .prefix("awman-claude-dir-")
         .tempdir()?;
     let tmp_root = tmp.path().to_path_buf();
     // Mirror only the entries that are not on the denylist.
@@ -497,7 +497,7 @@ fn synthesize_minimal_claude_config() -> Result<(tempfile::TempDir, PathBuf), st
         }
     });
     let tmp_dir = tempfile::Builder::new()
-        .prefix("amux-claude-minimal-")
+        .prefix("awman-claude-minimal-")
         .tempdir()?;
     let dest = tmp_dir.path().join("claude.json");
     let body = serde_json::to_string_pretty(&value).unwrap_or_default();
@@ -511,7 +511,7 @@ fn synthesize_minimal_claude_settings_dir(
     yolo: bool,
 ) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
     let tmp = tempfile::Builder::new()
-        .prefix("amux-claude-dir-minimal-")
+        .prefix("awman-claude-dir-minimal-")
         .tempdir()?;
     let tmp_root = tmp.path().to_path_buf();
     let mut settings = serde_json::json!({});
@@ -558,11 +558,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Detect the container home directory by inspecting `Dockerfile.<agent>`.
 ///
 /// Looks for a `USER <name>` directive (where `<name>` is not "root" or "0")
-/// in `Dockerfile.<agent>` files under `<git_root>/.amux/` and `<home>/.amux/`.
+/// in `Dockerfile.<agent>` files under `<git_root>/.awman/` and `<home>/.awman/`.
 /// Returns `Some("/home/<name>")` when found, `None` otherwise.
 fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -> Option<String> {
     let dockerfile_name = format!("Dockerfile.{agent}");
-    let search_dirs: Vec<PathBuf> = [git_root.join(".amux"), home.join(".amux")]
+    let search_dirs: Vec<PathBuf> = [git_root.join(".awman"), home.join(".awman")]
         .into_iter()
         .collect();
 
@@ -615,21 +615,21 @@ mod tests {
     use super::*;
     use crate::data::session::AgentName;
 
-    /// Serialises tests that write to `AMUX_CONFIG_HOME` (a process-global env var).
-    static AMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serialises tests that write to `AWMAN_CONFIG_HOME` (a process-global env var).
+    static AWMAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Set `AMUX_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
-    fn with_amux_config_home<F, R>(home: &Path, f: F) -> R
+    /// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
+    fn with_awman_config_home<F, R>(home: &Path, f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        let _g = AMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("AMUX_CONFIG_HOME").ok();
-        std::env::set_var("AMUX_CONFIG_HOME", home.to_str().unwrap());
+        let _g = AWMAN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AWMAN_CONFIG_HOME").ok();
+        std::env::set_var("AWMAN_CONFIG_HOME", home.to_str().unwrap());
         let result = f();
         match prev {
-            Some(v) => std::env::set_var("AMUX_CONFIG_HOME", v),
-            None => std::env::remove_var("AMUX_CONFIG_HOME"),
+            Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
+            None => std::env::remove_var("AWMAN_CONFIG_HOME"),
         }
         result
     }
@@ -655,7 +655,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -687,7 +687,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("codex").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -712,7 +712,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("gemini").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -737,7 +737,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("opencode").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -762,7 +762,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("copilot").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -787,7 +787,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("crush").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -812,7 +812,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("cline").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -838,7 +838,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -856,7 +856,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("maki").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &None, Path::new("/"))
                 .unwrap()
@@ -875,7 +875,7 @@ mod tests {
         let agent = AgentName::new("claude").unwrap();
         let override_home = Some("/home/appuser".to_string());
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine
                 .skill_overlays(&agent, &override_home, Path::new("/"))
                 .unwrap()
@@ -898,7 +898,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
 
-        let specs = with_amux_config_home(tmp.path(), || {
+        let specs = with_awman_config_home(tmp.path(), || {
             engine.skill_overlays(&agent, &None, tmp.path()).unwrap()
         });
 
@@ -1162,10 +1162,10 @@ mod tests {
     #[test]
     fn detect_container_home_finds_user_directive() {
         let tmp = tempfile::tempdir().unwrap();
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
         std::fs::write(
-            amux_dir.join("Dockerfile.claude"),
+            awman_dir.join("Dockerfile.claude"),
             "FROM ubuntu:22.04\nRUN apt-get update\nUSER appuser\nWORKDIR /home/appuser\n",
         )
         .unwrap();
@@ -1192,10 +1192,10 @@ mod tests {
     #[test]
     fn detect_container_home_returns_none_for_root_user() {
         let tmp = tempfile::tempdir().unwrap();
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
         std::fs::write(
-            amux_dir.join("Dockerfile.claude"),
+            awman_dir.join("Dockerfile.claude"),
             "FROM ubuntu:22.04\nUSER root\n",
         )
         .unwrap();
@@ -1211,10 +1211,10 @@ mod tests {
     #[test]
     fn detect_container_home_returns_none_for_user_zero() {
         let tmp = tempfile::tempdir().unwrap();
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
         std::fs::write(
-            amux_dir.join("Dockerfile.claude"),
+            awman_dir.join("Dockerfile.claude"),
             "FROM ubuntu:22.04\nUSER 0\n",
         )
         .unwrap();

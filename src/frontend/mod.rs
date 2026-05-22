@@ -6,11 +6,11 @@
 //!
 //! - [`cli`]    — argv-driven, stdout/stderr/stdin rendering.
 //! - [`tui`]    — Ratatui-based interactive terminal UI.
-//! - [`headless`] — HTTP server for programmatic / remote access.
+//! - [`api`] — HTTP server for programmatic / remote access.
 //!
 //! Frontends contain NO business logic; every behavioral decision lives in
 //! Layer 2.
 
 pub mod cli;
-pub mod headless;
+pub mod api;
 pub mod tui;

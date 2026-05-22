@@ -9,8 +9,8 @@
 //!
 //! Results are written to `target/criterion/` as HTML reports.
 
-use amux::tui::{render, state::App, state::TabState};
-use amux::workflow::{dag, parser::WorkflowStep};
+use awman::tui::{render, state::App, state::TabState};
+use awman::workflow::{dag, parser::WorkflowStep};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ratatui::{backend::TestBackend, Terminal};
 use std::path::PathBuf;

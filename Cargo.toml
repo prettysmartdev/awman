@@ -1,9 +1,9 @@
 [package]
-name = "amux"
+name = "awman"
 version = "0.8.0"
 edition = "2021"
 rust-version = "1.94.0"
-description = "A containerized code and claw agent manager"
+description = "A containerized code agent manager"
 # Top-level tests/ targets reference the old (oldsrc) library API; they are
 # rebuilt from scratch in work item 0072 alongside the deletion of oldsrc/.
 # Suppress auto-discovery so `cargo test` only runs Layer 0–3 unit tests
@@ -12,11 +12,11 @@ autotests = false
 autobenches = false
 
 [[bin]]
-name = "amux"
+name = "awman"
 path = "src/main.rs"
 
 [lib]
-name = "amux"
+name = "awman"
 path = "src/lib.rs"
 
 [dependencies]
@@ -93,8 +93,8 @@ name = "cli_parity"
 path = "tests/cli_parity/main.rs"
 
 [[test]]
-name = "headless_parity"
-path = "tests/headless_parity/main.rs"
+name = "api_parity"
+path = "tests/api_parity/main.rs"
 
 [[test]]
 name = "binary_smoke"

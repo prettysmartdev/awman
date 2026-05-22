@@ -21,7 +21,7 @@ impl MountScopeFrontend for CliFrontend {
             return Ok(MountScopeDecision::MountGitRoot);
         }
         eprintln!(
-            "amux: cwd ({}) is below git root ({}). Mount [r]oot / [c]urrent dir / [a]bort?",
+            "awman: cwd ({}) is below git root ({}). Mount [r]oot / [c]urrent dir / [a]bort?",
             cwd.display(),
             git_root.display()
         );

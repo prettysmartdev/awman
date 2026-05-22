@@ -1,4 +1,4 @@
-//! PID file lifecycle and background process spawning for the headless server.
+//! PID file lifecycle and background process spawning for the API server.
 //!
 //! Ported from `oldsrc/commands/headless/process.rs`.
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
 
-/// Sidecar metadata for the running headless server. Written next to the PID
+/// Sidecar metadata for the running API server. Written next to the PID
 /// file when the server boots so other commands (status, kill) can locate
 /// the bound endpoint without re-parsing flags.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub fn write_pid(pid_path: &Path, pid: u32) -> Result<(), DataError> {
 }
 
 /// Race-safe PID write: opens the PID file with `O_CREAT|O_EXCL` so two
-/// concurrent `headless start` invocations cannot both pass the
+/// concurrent `api start` invocations cannot both pass the
 /// `check_already_running` check and end up overwriting each other's PID.
 /// Returns `Ok(false)` when the file already exists (caller should re-run
 /// `check_already_running`).
@@ -118,50 +118,50 @@ pub fn is_process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns `true` when the OS reports the process command name contains "amux".
+/// Returns `true` when the OS reports the process command name contains "awman".
 /// Used to disambiguate stale PID files from PIDs reused by unrelated processes
 /// after a reboot. On platforms where the command name is not readable, returns
-/// `true` so we err on the side of "trust the PID file" — matches old-amux.
+/// `true` so we err on the side of "trust the PID file" — matches old-awman.
 #[cfg(target_os = "linux")]
-pub fn pid_is_amux(pid: u32) -> bool {
+pub fn pid_is_awman(pid: u32) -> bool {
     let path = format!("/proc/{pid}/comm");
     std::fs::read_to_string(&path)
-        .map(|s| s.trim().contains("amux"))
+        .map(|s| s.trim().contains("awman"))
         .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
-pub fn pid_is_amux(pid: u32) -> bool {
+pub fn pid_is_awman(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("amux"))
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("awman"))
         .unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]
-pub fn pid_is_amux(pid: u32) -> bool {
+pub fn pid_is_awman(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .to_lowercase()
-                .contains("amux")
+                .contains("awman")
         })
         .unwrap_or(false)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub fn pid_is_amux(_pid: u32) -> bool {
+pub fn pid_is_awman(_pid: u32) -> bool {
     true
 }
 
 /// Check the PID file. Returns `Some(pid)` only when the process is alive AND
-/// looks like an amux server. Stale or wrong-process PIDs are cleaned up.
+/// looks like an awman server. Stale or wrong-process PIDs are cleaned up.
 pub fn check_already_running(pid_path: &Path) -> Result<Option<u32>, DataError> {
     match read_pid(pid_path)? {
-        Some(pid) if is_process_alive(pid) && pid_is_amux(pid) => Ok(Some(pid)),
+        Some(pid) if is_process_alive(pid) && pid_is_awman(pid) => Ok(Some(pid)),
         Some(_) => {
             clear_pid(pid_path)?;
             Ok(None)
@@ -192,7 +192,7 @@ pub fn kill_process(pid: u32) -> Result<(), DataError> {
     Ok(())
 }
 
-/// Spawn the headless server in the background. Returns the child PID.
+/// Spawn the API server in the background. Returns the child PID.
 pub fn spawn_background(
     binary_path: &Path,
     args: &[String],
@@ -232,7 +232,7 @@ fn try_systemd_run(binary_path: &Path, args: &[String]) -> Result<Option<u32>, D
     }
 
     let mut cmd = std::process::Command::new("systemd-run");
-    cmd.args(["--user", "--unit=amux-headless", "--"])
+    cmd.args(["--user", "--unit=awman-api", "--"])
         .arg(binary_path)
         .args(args);
 
@@ -263,7 +263,7 @@ fn try_launchd(
     log_path: &Path,
 ) -> Result<Option<u32>, DataError> {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let plist_path = home.join("Library/LaunchAgents/io.amux.headless.plist");
+    let plist_path = home.join("Library/LaunchAgents/io.awman.api.plist");
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
     }
@@ -282,7 +282,7 @@ fn try_launchd(
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.amux.headless</string>
+    <string>io.awman.api</string>
     <key>ProgramArguments</key>
     <array>
 {program_args}    </array>
@@ -385,16 +385,16 @@ mod tests {
     }
 
     #[test]
-    fn pid_is_amux_returns_false_for_a_clearly_non_amux_pid() {
+    fn pid_is_awman_returns_false_for_a_clearly_non_awman_pid() {
         // PID 1 is `init`/`launchd` on Unix and `System Idle Process` on Windows;
-        // none of those are named "amux".
-        assert!(!pid_is_amux(1), "PID 1 is not amux");
+        // none of those are named "awman".
+        assert!(!pid_is_awman(1), "PID 1 is not awman");
     }
 
     #[test]
     fn check_already_running_for_unrelated_alive_pid_treats_as_stale() {
         // PID 1 is alive on every Unix-y test host (init/launchd) but is NOT
-        // amux. check_already_running must treat that as stale and clean up.
+        // awman. check_already_running must treat that as stale and clean up.
         let tmp = tempfile::tempdir().unwrap();
         let pid_path = tmp.path().join("foreign.pid");
         write_pid(&pid_path, 1).unwrap();

@@ -639,7 +639,7 @@ mod tests {
 
     fn make_engines_with_root(root: &std::path::Path) -> crate::command::dispatch::Engines {
         use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::data::fs::headless_paths::HeadlessPaths;
+        use crate::data::fs::api_paths::ApiPaths;
         use crate::engine::container::ContainerRuntime;
         use crate::engine::overlay::OverlayEngine;
         use std::sync::Arc;
@@ -653,7 +653,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             AuthPathResolver::at_home(root),
-            HeadlessPaths::at_root(root),
+            ApiPaths::at_root(root),
         ));
         crate::command::dispatch::Engines {
             runtime,

@@ -2,7 +2,7 @@
 
 A workflow breaks a large implementation task into discrete phases — for example: plan → implement → review → docs. Each phase runs as its own agent session. You review the output between phases and decide whether to advance, retry, or redirect.
 
-Workflows are files you write and commit to your repo — in Markdown, TOML, or YAML. amux parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input.
+Workflows are files you write and commit to your repo — in Markdown, TOML, or YAML. awman parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input.
 
 ---
 
@@ -21,16 +21,16 @@ Workflows are useful when:
 
 ```sh
 # Run a workflow file
-amux exec workflow aspec/workflows/implement-feature.md
+awman exec workflow aspec/workflows/implement-feature.md
 
 # Run a workflow and associate a work item for template variable substitution
-amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow aspec/workflows/implement-feature.md --work-item 0027
 
 # Run a workflow without a work item
-amux exec workflow aspec/workflows/review.md
+awman exec workflow aspec/workflows/review.md
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [Headless Mode](08-headless-mode.md#amux-exec-workflow-path--amux-exec-wf-path) for usage in CI and scripting contexts.
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [API Mode](08-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts.
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -38,13 +38,13 @@ The TUI shows a **workflow status strip** between the execution window and the c
 
 ## Creating a workflow file
 
-Use `amux new workflow` to create a workflow file interactively without having to remember the schema by hand.
+Use `awman new workflow` to create a workflow file interactively without having to remember the schema by hand.
 
 ### Interactive step entry
 
 ```sh
 # CLI
-amux new workflow
+awman new workflow
 
 # TUI command box
 new workflow
@@ -61,7 +61,7 @@ Both modes prompt for:
    - Depends-on (optional — comma-separated step names, press Enter to skip)
    - Prompt text — enter multiple lines and end with a line containing only `.`
 
-After each step you are asked whether to add another. When finished, amux writes the file and prints its path.
+After each step you are asked whether to add another. When finished, awman writes the file and prints its path.
 
 **TUI key bindings** (workflow dialog):
 
@@ -72,17 +72,17 @@ After each step you are asked whether to add another. When finished, amux writes
 | **Ctrl-Enter** | Finish — write the file and close the dialog |
 | **Esc** | Cancel without writing |
 
-By default amux writes to `aspec/workflows/<name>.toml` inside the current repo. Pass `--format` to choose a different format:
+By default awman writes to `aspec/workflows/<name>.toml` inside the current repo. Pass `--format` to choose a different format:
 
 ```sh
-amux new workflow --format yaml   # writes aspec/workflows/<name>.yaml
-amux new workflow --format md     # writes aspec/workflows/<name>.md
+awman new workflow --format yaml   # writes aspec/workflows/<name>.yaml
+awman new workflow --format md     # writes aspec/workflows/<name>.md
 ```
 
 ### Interview mode
 
 ```sh
-amux new workflow --interview
+awman new workflow --interview
 ```
 
 Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `new spec --interview` writes a work item.
@@ -92,19 +92,19 @@ In the TUI, the dialog switches to a two-field layout: workflow name and summary
 ### Global workflows
 
 ```sh
-amux new workflow --global
+awman new workflow --global
 ```
 
-Writes to `~/.amux/workflows/<name>.<ext>` instead of the current repo. Use this to build a personal library of reusable workflows that travel with you across projects.
+Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use this to build a personal library of reusable workflows that travel with you across projects.
 
-`--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.amux/workflows/` directory — not the whole repo or home directory — so your other files stay safe. This still requires being inside a git repository (for agent image lookup).
+`--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.awman/workflows/` directory — not the whole repo or home directory — so your other files stay safe. This still requires being inside a git repository (for agent image lookup).
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
 | `--interview` | Let a code agent complete the workflow from a short summary |
-| `--global` | Write to `~/.amux/workflows/` instead of the current repo |
+| `--global` | Write to `~/.awman/workflows/` instead of the current repo |
 | `--format <fmt>` | Output format: `toml` (default), `yaml`, or `md` |
 
 ### Edge cases
@@ -112,8 +112,8 @@ Writes to `~/.amux/workflows/<name>.<ext>` instead of the current repo. Use this
 | Situation | Behaviour |
 |-----------|-----------|
 | Name contains spaces or path separators | Rejected immediately with a descriptive error |
-| Workflow file already exists | Error with the existing path; amux does not overwrite silently |
-| Not inside a git repo (non-global) | Error: run with `--global` to write to `~/.amux/` |
+| Workflow file already exists | Error with the existing path; awman does not overwrite silently |
+| Not inside a git repo (non-global) | Error: run with `--global` to write to `~/.awman/` |
 | `--global --interview` outside a git repo | Error: agent image lookup requires a git repo |
 | Empty step name in TUI | Inline error; dialog stays open |
 | No steps added before Ctrl-Enter (TUI) | Inline error: "At least one step is required" |
@@ -124,7 +124,7 @@ Writes to `~/.amux/workflows/<name>.<ext>` instead of the current repo. Use this
 
 ## Workflow file formats
 
-amux supports three workflow file formats: **Markdown** (`.md`), **TOML** (`.toml`), and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. All three formats produce identical execution behaviour — you can pass any of them to `--workflow` interchangeably.
+awman supports three workflow file formats: **Markdown** (`.md`), **TOML** (`.toml`), and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. All three formats produce identical execution behaviour — you can pass any of them to `--workflow` interchangeably.
 
 | Extension | Format |
 |-----------|--------|
@@ -152,7 +152,7 @@ Field names in TOML and YAML are **lowercase only** (`name`, `depends_on`, `agen
 
 ### Markdown (`.md`)
 
-The original format. amux looks for:
+The original format. awman looks for:
 
 | Element | Description |
 |---------|-------------|
@@ -300,15 +300,15 @@ Steps without an `Agent:` field use the workflow default agent — the value fro
 
 ### Agent pre-flight check
 
-Before the first step runs, amux collects every distinct agent name required across all steps and checks that the corresponding image exists. If an image is missing, amux prompts:
+Before the first step runs, awman collects every distinct agent name required across all steps and checks that the corresponding image exists. If an image is missing, awman prompts:
 
 ```
 Agent 'codex' has no Dockerfile. Download and build it? [y/N]:
 ```
 
-**Accept** — amux downloads the agent Dockerfile template, builds the project base image (if needed), then builds the agent image. If your repo has multiple agents to set up, each is prompted in turn before the workflow begins.
+**Accept** — awman downloads the agent Dockerfile template, builds the project base image (if needed), then builds the agent image. If your repo has multiple agents to set up, each is prompted in turn before the workflow begins.
 
-**Decline** — amux asks whether to substitute the default agent for that step instead:
+**Decline** — awman asks whether to substitute the default agent for that step instead:
 
 ```
 Use the default agent (claude) for steps that specify 'codex'? [y/N]:
@@ -327,7 +327,7 @@ An unknown agent name in an `Agent:` field is caught at parse time, before any c
 
 ### Resuming workflows with per-step agents
 
-When resuming a saved workflow, the per-step agent assignments from the original run are preserved in the state file. If you pass a different `--agent` flag on resume, amux warns you; the persisted assignments still take precedence.
+When resuming a saved workflow, the per-step agent assignments from the original run are preserved in the state file. If you pass a different `--agent` flag on resume, awman warns you; the persisted assignments still take precedence.
 
 ---
 
@@ -356,7 +356,7 @@ In this example, `plan` uses a large model for deep reasoning, `implement` uses 
 
 ### Model resolution order
 
-For each step, amux resolves the effective model using this priority:
+For each step, awman resolves the effective model using this priority:
 
 | Priority | Source | Applies when |
 |----------|--------|-------------|
@@ -370,7 +370,7 @@ The `--model` flag acts as the **default** for all steps without a `Model:` fiel
 
 `Model:` must appear in the step header block — after any `Depends-on:` and `Agent:` lines and before the `Prompt:` line. A `Model:` that appears after `Prompt:` is treated as prompt text, not as a directive. A `Model:` line with no value is treated as absent — it does not pass an empty string to the agent.
 
-`Agent:` and `Model:` are independent overrides. A step can specify one, both, or neither. When both are present, amux resolves the agent first (using the same logic as without `Model:`), then resolves the model.
+`Agent:` and `Model:` are independent overrides. A step can specify one, both, or neither. When both are present, awman resolves the agent first (using the same logic as without `Model:`), then resolves the model.
 
 ### Workflow resume and model persistence
 
@@ -401,10 +401,10 @@ When a step completes, a confirmation dialog appears. Press **Enter** or **y** t
 ### In command mode
 
 ```sh
-amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow aspec/workflows/implement-feature.md --work-item 0027
 ```
 
-Between steps, amux prints the step summary and prompts:
+Between steps, awman prints the step summary and prompts:
 
 ```
 Step 'plan' completed.
@@ -444,7 +444,7 @@ There are two variants of the control board:
 
 ### Lightweight step confirmation (between steps)
 
-When a step completes and the next step is ready, amux shows a compact confirmation dialog:
+When a step completes and the next step is ready, awman shows a compact confirmation dialog:
 
 ```
 ╭─ Step 'implement' done. Advance to 'test'? ─╮
@@ -502,7 +502,7 @@ The dialog title shows `Workflow Control (step running)` when opened mid-step. A
 
 ### Next step: same container
 
-The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, amux falls back to a new container and shows a status message.
+The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, awman falls back to a new container and shows a status message.
 
 If the next step requires a **different agent** than the current step, the **↓** option is unavailable. In the TUI it renders greyed out with the message:
 
@@ -523,7 +523,7 @@ Ctrl+W works:
 
 ### Next step: same container
 
-The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, amux falls back to a new container and shows a status message.
+The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, awman falls back to a new container and shows a status message.
 
 If the next step requires a **different agent** than the current step, the **↓** option is unavailable. In the TUI it renders greyed out with the message:
 
@@ -572,7 +572,7 @@ Steps that share the same dependencies form a **parallel group** and execute seq
 
 ### Viewing the full control board
 
-When a step completes, amux shows the lightweight confirmation dialog. To see all available actions and options, press **Ctrl+W** to open the full control board. Pressing **Esc** on the lightweight dialog pauses the workflow for manual input.
+When a step completes, awman shows the lightweight confirmation dialog. To see all available actions and options, press **Ctrl+W** to open the full control board. Pressing **Esc** on the lightweight dialog pauses the workflow for manual input.
 
 ---
 
@@ -591,17 +591,17 @@ Stuck detection fires independently per tab — background tabs detect and repor
 
 ## Workflow state persistence
 
-amux saves workflow state to:
+awman saves workflow state to:
 
 ```
-$GITROOT/.amux/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
+$GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 ```
 
 The file records the status of every step, the container ID used for each step, and a SHA-256 hash of the workflow file.
 
 ### Resuming
 
-If a saved state file exists when you run `exec workflow`, amux offers to resume:
+If a saved state file exists when you run `exec workflow`, awman offers to resume:
 
 ```
 Found a saved workflow state for 'implement-feature' (work item 0027).
@@ -612,7 +612,7 @@ Found a saved workflow state for 'implement-feature' (work item 0027).
 
 ### Workflow file changed
 
-If the workflow file has been modified since the state was saved, amux warns you:
+If the workflow file has been modified since the state was saved, awman warns you:
 
 ```
 WARNING: The workflow file has changed since the last run.
@@ -621,11 +621,11 @@ WARNING: The workflow file has changed since the last run.
   [1/2]:
 ```
 
-If you choose `2`, amux verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
+If you choose `2`, awman verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
 
 ### Interrupted steps
 
-If a step was running when amux last exited:
+If a step was running when awman last exited:
 
 ```
 Step 'implement' was running when the previous session ended.
@@ -636,7 +636,7 @@ Start it over (s) or skip to next step (n)? [s/n]:
 
 ## Parallel groups
 
-Steps that share the same `Depends-on` set form a **parallel group**. amux executes them sequentially in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically. If a group has more than two steps, the third box shows `+ N more…`.
+Steps that share the same `Depends-on` set form a **parallel group**. awman executes them sequentially in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically. If a group has more than two steps, the third box shows `+ N more…`.
 
 ---
 

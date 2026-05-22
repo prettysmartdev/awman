@@ -402,7 +402,7 @@ impl Command for ExecWorkflowCommand {
     ) -> Result<Self::Outcome, CommandError> {
         // Resolve the workflow path relative to the session's working
         // directory so that relative paths work regardless of where the
-        // amux process was originally launched.
+        // awman process was originally launched.
         let workflow_path = if self.flags.workflow.is_absolute() {
             self.flags.workflow.clone()
         } else {
@@ -1071,7 +1071,7 @@ prompt = "do something"
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();

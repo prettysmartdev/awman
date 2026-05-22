@@ -14,7 +14,7 @@ use crate::engine::container::instance::{
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
-const AMUX_LABEL: &str = "amux=true";
+const AWMAN_LABEL: &str = "awman=true";
 
 /// Extract the container name from an Apple Containers JSON row.
 ///
@@ -119,13 +119,13 @@ fn is_apple_running(row: &serde_json::Value) -> bool {
     }
 }
 
-/// Check whether the row's name matches amux container patterns.
-fn is_amux_container(name: &str) -> bool {
-    name.starts_with("amux-") || name.contains("nanoclaw")
+/// Check whether the row's name matches awman container patterns.
+fn is_awman_container(name: &str) -> bool {
+    name.starts_with("awman-") || name.contains("nanoclaw")
 }
 
 /// Parse the JSON output of `container list --format json` into container
-/// handles, filtering for running amux containers.
+/// handles, filtering for running awman containers.
 fn parse_apple_list_output(stdout: &str) -> Vec<ContainerHandle> {
     let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(stdout);
     let rows: Vec<serde_json::Value> = match arr {
@@ -141,7 +141,7 @@ fn parse_apple_list_output(stdout: &str) -> Vec<ContainerHandle> {
             continue;
         }
         let name = extract_apple_name(&row);
-        if !is_amux_container(&name) {
+        if !is_awman_container(&name) {
             continue;
         }
         let id = name.clone();
@@ -684,29 +684,29 @@ mod apple_tests {
     }
 
     #[test]
-    fn parse_apple_list_picks_up_running_amux_containers() {
+    fn parse_apple_list_picks_up_running_awman_containers() {
         let json = r#"[
             {
                 "status": "running",
                 "configuration": {
-                    "id": "amux-12345-999",
-                    "image": {"repository": "amux/dev", "tag": "latest"}
+                    "id": "awman-12345-999",
+                    "image": {"repository": "awman/dev", "tag": "latest"}
                 },
                 "startedDate": 1715000000.0
             },
             {
                 "status": "running",
                 "configuration": {
-                    "id": "amux-claws-controller",
-                    "image": {"repository": "amux/dev", "tag": "latest"}
+                    "id": "awman-claws-controller",
+                    "image": {"repository": "awman/dev", "tag": "latest"}
                 },
                 "startedDate": 1715000100.5
             },
             {
                 "status": "stopped",
                 "configuration": {
-                    "id": "amux-old-stopped",
-                    "image": {"repository": "amux/dev", "tag": "latest"}
+                    "id": "awman-old-stopped",
+                    "image": {"repository": "awman/dev", "tag": "latest"}
                 },
                 "startedDate": 1714000000.0
             },
@@ -721,9 +721,9 @@ mod apple_tests {
         ]"#;
         let handles = parse_apple_list_output(json);
         assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0].name, "amux-12345-999");
-        assert_eq!(handles[0].id, "amux-12345-999");
-        assert_eq!(handles[1].name, "amux-claws-controller");
+        assert_eq!(handles[0].name, "awman-12345-999");
+        assert_eq!(handles[0].id, "awman-12345-999");
+        assert_eq!(handles[1].name, "awman-claws-controller");
     }
 
     #[test]
@@ -732,7 +732,7 @@ mod apple_tests {
             "status": "running",
             "configuration": {
                 "id": "nanoclaw-worker-1",
-                "image": {"repository": "amux/dev"}
+                "image": {"repository": "awman/dev"}
             },
             "startedDate": 1715000000.0
         }]"#;
@@ -751,7 +751,7 @@ mod apple_tests {
     fn parse_apple_list_skips_non_running() {
         let json = r#"[{
             "status": "stopping",
-            "configuration": { "id": "amux-dying" },
+            "configuration": { "id": "awman-dying" },
             "startedDate": 1715000000.0
         }]"#;
         let handles = parse_apple_list_output(json);
@@ -761,34 +761,34 @@ mod apple_tests {
     #[test]
     fn extract_apple_image_formats_repo_and_tag() {
         let row: serde_json::Value = serde_json::from_str(
-            r#"{"configuration": {"image": {"repository": "amux/dev", "tag": "latest"}}}"#,
+            r#"{"configuration": {"image": {"repository": "awman/dev", "tag": "latest"}}}"#,
         )
         .unwrap();
-        assert_eq!(extract_apple_image(&row), "amux/dev:latest");
+        assert_eq!(extract_apple_image(&row), "awman/dev:latest");
     }
 
     #[test]
     fn extract_apple_image_repo_only_without_tag() {
         let row: serde_json::Value =
-            serde_json::from_str(r#"{"configuration": {"image": {"repository": "amux/dev"}}}"#)
+            serde_json::from_str(r#"{"configuration": {"image": {"repository": "awman/dev"}}}"#)
                 .unwrap();
-        assert_eq!(extract_apple_image(&row), "amux/dev");
+        assert_eq!(extract_apple_image(&row), "awman/dev");
     }
 
     #[test]
     fn extract_apple_image_plain_string() {
         let row: serde_json::Value =
-            serde_json::from_str(r#"{"configuration": {"image": "amux/dev:latest"}}"#).unwrap();
-        assert_eq!(extract_apple_image(&row), "amux/dev:latest");
+            serde_json::from_str(r#"{"configuration": {"image": "awman/dev:latest"}}"#).unwrap();
+        assert_eq!(extract_apple_image(&row), "awman/dev:latest");
     }
 
     #[test]
     fn extract_apple_image_reference_field() {
         let row: serde_json::Value = serde_json::from_str(
-            r#"{"configuration": {"image": {"reference": "ghcr.io/amux/dev:latest"}}}"#,
+            r#"{"configuration": {"image": {"reference": "ghcr.io/awman/dev:latest"}}}"#,
         )
         .unwrap();
-        assert_eq!(extract_apple_image(&row), "ghcr.io/amux/dev:latest");
+        assert_eq!(extract_apple_image(&row), "ghcr.io/awman/dev:latest");
     }
 
     #[test]
@@ -799,7 +799,7 @@ mod apple_tests {
                 "image": {
                     "descriptor": {
                         "annotations": {
-                            "com.apple.containerization.image.name": "amux-amux-claude:latest"
+                            "com.apple.containerization.image.name": "awman-myproj-claude:latest"
                         }
                     }
                 }
@@ -807,7 +807,7 @@ mod apple_tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(extract_apple_image(&row), "amux-amux-claude:latest");
+        assert_eq!(extract_apple_image(&row), "awman-myproj-claude:latest");
     }
 
     #[test]
@@ -815,11 +815,11 @@ mod apple_tests {
         let json = r#"[{
             "status": "running",
             "configuration": {
-                "id": "amux-test",
+                "id": "awman-test",
                 "image": {
                     "descriptor": {
                         "annotations": {
-                            "com.apple.containerization.image.name": "amux-amux-claude:latest"
+                            "com.apple.containerization.image.name": "awman-myproj-claude:latest"
                         }
                     }
                 }
@@ -828,7 +828,7 @@ mod apple_tests {
         }]"#;
         let handles = parse_apple_list_output(json);
         assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].image_tag, "amux-amux-claude:latest");
+        assert_eq!(handles[0].image_tag, "awman-myproj-claude:latest");
     }
 
     #[test]

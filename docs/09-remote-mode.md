@@ -1,133 +1,133 @@
 # Remote Mode
 
-Remote mode lets you connect to a headless amux server running on another machine and run commands there — from your terminal, from a CI pipeline, or from inside the TUI. Live log streaming lets you watch agent output in real time, exactly as if the session were local.
+Remote mode lets you connect to an API awman server running on another machine and run commands there — from your terminal, from a CI pipeline, or from inside the TUI. Live log streaming lets you watch agent output in real time, exactly as if the session were local.
 
 ---
 
 ## Overview
 
-A typical setup has one machine running `amux headless start` (the _remote host_), and one or more developers or pipelines using `amux remote` (the _client_) to dispatch work to it. The remote host manages all sessions and containers. The client only needs the server's address.
+A typical setup has one machine running `awman api start` (the _remote host_), and one or more developers or pipelines using `awman remote` (the _client_) to dispatch work to it. The remote host manages all sessions and containers. The client only needs the server's address.
 
 ```
 Local machine                          Remote host
 ──────────────                         ──────────────────────────
-amux remote run exec workflow my.md -f ─► POST /v1/commands
+awman remote run exec workflow my.md -f ─► POST /v1/commands
                                        ◄─── SSE stream: log output
-                                       ◄─── [amux:done] sentinel
+                                       ◄─── [awman:done] sentinel
 ```
 
 Three subcommands cover the full lifecycle:
 
 | Command | What it does |
 |---------|-------------|
-| `amux remote run <command>` | Dispatch a command to a session on the remote host |
-| `amux remote session start [dir]` | Create a new session on the remote host |
-| `amux remote session kill [session-id]` | Close a session on the remote host |
+| `awman remote run <command>` | Dispatch a command to a session on the remote host |
+| `awman remote session start [dir]` | Create a new session on the remote host |
+| `awman remote session kill [session-id]` | Close a session on the remote host |
 
-All three subcommands work from the terminal (CLI mode) and from inside the TUI (where interactive pickers are also available). A headless server can also delegate `remote` subcommands to itself as subprocesses when triggered via the HTTP API.
+All three subcommands work from the terminal (CLI mode) and from inside the TUI (where interactive pickers are also available). An API server can also delegate `remote` subcommands to itself as subprocesses when triggered via the HTTP API.
 
-`<command>` can be any amux command — for example `exec workflow path/to/workflow.md`, `chat`, `exec prompt "Fix the tests" --yolo`, or `ready`.
+`<command>` can be any awman command — for example `exec workflow path/to/workflow.md`, `chat`, `exec prompt "Fix the tests" --yolo`, or `ready`.
 
 ---
 
 ## Connecting to a remote host
 
-Every `remote` subcommand needs to know the address of the remote headless server. The address is resolved in this order:
+Every `remote` subcommand needs to know the address of the remote API server. The address is resolved in this order:
 
 | Priority | Source |
 |----------|--------|
 | 1 | `--remote-addr <URL>` flag on the command |
-| 2 | `AMUX_REMOTE_ADDR` environment variable |
-| 3 | `remote.defaultAddr` in `~/.amux/config.json` |
+| 2 | `AWMAN_REMOTE_ADDR` environment variable |
+| 3 | `remote.defaultAddr` in `~/.awman/config.json` |
 
 If none of the three sources provides an address, the command fails immediately with:
 
 ```
-error: No remote address configured. Pass --remote-addr, set AMUX_REMOTE_ADDR,
-       or set remote.defaultAddr in ~/.amux/config.json.
+error: No remote address configured. Pass --remote-addr, set AWMAN_REMOTE_ADDR,
+       or set remote.defaultAddr in ~/.awman/config.json.
 ```
 
 The most convenient setup for day-to-day use is to set a default address once:
 
 ```sh
-amux config set --global remote.defaultAddr http://build-server.example.com:9876
+awman config set --global remote.defaultAddr http://build-server.example.com:9876
 ```
 
-After that, every `amux remote` command targets that host by default, with no flag required.
+After that, every `awman remote` command targets that host by default, with no flag required.
 
 ---
 
 ## API key authentication
 
-When the remote headless server has authentication enabled (the default), every request must include the API key. The key is resolved automatically from one of these sources, in priority order:
+When the remote API server has authentication enabled (the default), every request must include the API key. The key is resolved automatically from one of these sources, in priority order:
 
 | Priority | Source |
 |----------|--------|
 | 1 | `--api-key <KEY>` flag on the command |
-| 2 | `AMUX_API_KEY` environment variable |
-| 3 | `remote.defaultAPIKey` in `~/.amux/config.json` — **only when the target address exactly matches `remote.defaultAddr`** |
+| 2 | `AWMAN_API_KEY` environment variable |
+| 3 | `remote.defaultAPIKey` in `~/.awman/config.json` — **only when the target address exactly matches `remote.defaultAddr`** |
 
-The host-match guard on `remote.defaultAPIKey` prevents a stored key from being silently forwarded to a different server. If you change `--remote-addr` or `AMUX_REMOTE_ADDR` to point at a different host, the config key is ignored and the request proceeds without auth — resulting in an HTTP 401 if that server requires a key.
+The host-match guard on `remote.defaultAPIKey` prevents a stored key from being silently forwarded to a different server. If you change `--remote-addr` or `AWMAN_REMOTE_ADDR` to point at a different host, the config key is ignored and the request proceeds without auth — resulting in an HTTP 401 if that server requires a key.
 
 ### Storing the key
 
 The recommended approach for day-to-day use is to store the key in global config:
 
 ```sh
-amux config set --global remote.defaultAPIKey <your-api-key>
+awman config set --global remote.defaultAPIKey <your-api-key>
 ```
 
-With both `remote.defaultAddr` and `remote.defaultAPIKey` configured, every `amux remote` command to the default host is fully authenticated with no extra flags.
+With both `remote.defaultAddr` and `remote.defaultAPIKey` configured, every `awman remote` command to the default host is fully authenticated with no extra flags.
 
 For CI pipelines, use the environment variable:
 
 ```sh
-export AMUX_REMOTE_ADDR=http://build-server.internal:9876
-export AMUX_API_KEY=<your-api-key>
+export AWMAN_REMOTE_ADDR=http://build-server.internal:9876
+export AWMAN_API_KEY=<your-api-key>
 
-amux remote run exec workflow aspec/workflows/implement-feature.md --follow
+awman remote run exec workflow aspec/workflows/implement-feature.md --follow
 ```
 
 ### Security note
 
-`AMUX_API_KEY` is visible in `/proc/<pid>/environ` on Linux. In security-sensitive contexts, prefer passing the key via `--api-key` piped from a secrets manager, or store it in `~/.amux/config.json` with restricted file permissions (`chmod 600 ~/.amux/config.json`).
+`AWMAN_API_KEY` is visible in `/proc/<pid>/environ` on Linux. In security-sensitive contexts, prefer passing the key via `--api-key` piped from a secrets manager, or store it in `~/.awman/config.json` with restricted file permissions (`chmod 600 ~/.awman/config.json`).
 
 ---
 
-## `amux remote run`
+## `awman remote run`
 
-Dispatches an amux subcommand to a session on the remote host.
+Dispatches an awman subcommand to a session on the remote host.
 
 ```sh
-amux remote run <command> [--session <ID>] [--follow] [--remote-addr <URL>]
+awman remote run <command> [--session <ID>] [--follow] [--remote-addr <URL>]
 ```
 
-`<command>` is any amux subcommand that the remote host can execute — for example `exec workflow path/to/workflow.md`, `exec prompt "Fix the tests" --yolo`, or `chat`. Everything after `remote run` (except the `--session`, `--follow`, and `--remote-addr` flags) is forwarded to the remote host verbatim.
+`<command>` is any awman subcommand that the remote host can execute — for example `exec workflow path/to/workflow.md`, `exec prompt "Fix the tests" --yolo`, or `chat`. Everything after `remote run` (except the `--session`, `--follow`, and `--remote-addr` flags) is forwarded to the remote host verbatim.
 
 ### Basic usage
 
 ```sh
 # Dispatch a workflow to a session; return a command ID immediately
-amux remote run exec workflow path/to/workflow.md --session abc123
+awman remote run exec workflow path/to/workflow.md --session abc123
 
 # Wait for the command to complete and stream its output to your terminal
-amux remote run exec workflow path/to/workflow.md --session abc123 --follow
+awman remote run exec workflow path/to/workflow.md --session abc123 --follow
 
 # Short form for --follow
-amux remote run exec workflow path/to/workflow.md --session abc123 -f
+awman remote run exec workflow path/to/workflow.md --session abc123 -f
 
-# Pass inner-command flags through unchanged; amux does not consume them
-amux remote run exec prompt "Fix the tests" --yolo --non-interactive --session abc123 -f
+# Pass inner-command flags through unchanged; awman does not consume them
+awman remote run exec prompt "Fix the tests" --yolo --non-interactive --session abc123 -f
 ```
 
 ### Flags
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--session <ID>` | | Session ID on the remote host. Required in CLI mode; interactive in TUI mode. Overrides `AMUX_REMOTE_SESSION` |
+| `--session <ID>` | | Session ID on the remote host. Required in CLI mode; interactive in TUI mode. Overrides `AWMAN_REMOTE_SESSION` |
 | `--follow` | `-f` | Stream log output until the command completes, then print a summary table |
-| `--remote-addr <URL>` | | Remote host address. Overrides `AMUX_REMOTE_ADDR` and `remote.defaultAddr` |
-| `--api-key <KEY>` | | API key for the remote server. Overrides `AMUX_API_KEY` and `remote.defaultAPIKey` |
+| `--remote-addr <URL>` | | Remote host address. Overrides `AWMAN_REMOTE_ADDR` and `remote.defaultAddr` |
+| `--api-key <KEY>` | | API key for the remote server. Overrides `AWMAN_API_KEY` and `remote.defaultAPIKey` |
 
 ### Session resolution
 
@@ -136,15 +136,15 @@ For `remote run`, the session is resolved in this order:
 | Priority | Source |
 |----------|--------|
 | 1 | `--session <ID>` flag |
-| 2 | `AMUX_REMOTE_SESSION` environment variable |
-| 3 | TUI only — last session used in this tab (not available in CLI/headless) |
+| 2 | `AWMAN_REMOTE_SESSION` environment variable |
+| 3 | TUI only — last session used in this tab (not available in CLI/API) |
 | 4 | TUI only — interactive session picker |
 
-In CLI mode, if neither `--session` nor `AMUX_REMOTE_SESSION` is set, the command fails with:
+In CLI mode, if neither `--session` nor `AWMAN_REMOTE_SESSION` is set, the command fails with:
 
 ```
-error: No session specified. Pass --session <ID> or set AMUX_REMOTE_SESSION.
-       Use `amux remote session start` to create a session, or list sessions
+error: No session specified. Pass --session <ID> or set AWMAN_REMOTE_SESSION.
+       Use `awman remote session start` to create a session, or list sessions
        with `curl <remote-addr>/v1/sessions`.
 ```
 
@@ -156,10 +156,10 @@ Without `--follow`, `remote run` submits the command and returns immediately wit
 Command dispatched: e5f6a7b8-...
 ```
 
-With `--follow`, amux connects to the SSE log-streaming endpoint and relays the command's output to your terminal in real time, as if the session were local:
+With `--follow`, awman connects to the SSE log-streaming endpoint and relays the command's output to your terminal in real time, as if the session were local:
 
 ```sh
-amux remote run exec workflow path/to/workflow.md --session abc123 --follow
+awman remote run exec workflow path/to/workflow.md --session abc123 --follow
 ```
 
 ```
@@ -170,7 +170,7 @@ Implementing work item 0059...
 ...
 ```
 
-Once the command completes, amux prints a summary table and exits:
+Once the command completes, awman prints a summary table and exits:
 
 ```
 ┌──────────────┬────────────────────────────────────────┐
@@ -192,51 +192,51 @@ When output is piped rather than printed to a terminal, log lines are written wi
 
 ---
 
-## `amux remote session start`
+## `awman remote session start`
 
 Creates a new session on the remote host.
 
 ```sh
-amux remote session start [dir] [--remote-addr <URL>] [--api-key <KEY>]
+awman remote session start [dir] [--remote-addr <URL>] [--api-key <KEY>]
 ```
 
 `dir` is the absolute path (on the remote host) of the working directory for the session. It must be in the remote host's `--workdirs` allowlist.
 
 ```sh
 # Start a session bound to /home/user/my-project
-amux remote session start /home/user/my-project
+awman remote session start /home/user/my-project
 
 # Specify a non-default remote host and key
-amux remote session start /home/user/my-project \
+awman remote session start /home/user/my-project \
   --remote-addr http://alt-host:9876 \
   --api-key <key>
 ```
 
-On success, amux prints the new session ID:
+On success, awman prints the new session ID:
 
 ```
 Session started: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 Workdir: /home/user/my-project
 ```
 
-In CLI mode, `dir` is required. In TUI mode, `dir` is optional — if omitted and saved directories are configured, amux shows an interactive picker (see [TUI interactive flows](#tui-interactive-flows)).
+In CLI mode, `dir` is required. In TUI mode, `dir` is optional — if omitted and saved directories are configured, awman shows an interactive picker (see [TUI interactive flows](#tui-interactive-flows)).
 
 ---
 
-## `amux remote session kill`
+## `awman remote session kill`
 
 Closes a session on the remote host.
 
 ```sh
-amux remote session kill [session-id] [--remote-addr <URL>] [--api-key <KEY>]
+awman remote session kill [session-id] [--remote-addr <URL>] [--api-key <KEY>]
 ```
 
 ```sh
 # Kill a specific session
-amux remote session kill a1b2c3d4-e5f6-7890-abcd-ef1234567890
+awman remote session kill a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
 # Specify a non-default remote host and key
-amux remote session kill abc123 \
+awman remote session kill abc123 \
   --remote-addr http://alt-host:9876 \
   --api-key <key>
 ```
@@ -247,17 +247,17 @@ On success:
 Session closed: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
-In CLI mode, `session-id` is required. In TUI mode, if omitted, amux fetches the active session list from the remote host and shows an interactive picker.
+In CLI mode, `session-id` is required. In TUI mode, if omitted, awman fetches the active session list from the remote host and shows an interactive picker.
 
 ---
 
 ## TUI interactive flows
 
-When used inside the amux TUI, `remote` subcommands gain interactive capabilities that are not available in CLI mode.
+When used inside the awman TUI, `remote` subcommands gain interactive capabilities that are not available in CLI mode.
 
 ### Session picker (`remote run` without `--session`)
 
-If you run `remote run` in the TUI without specifying a session, and no session is stored from previous activity in the current tab, amux fetches the **active** session list from the remote host (using `GET /v1/sessions?status=active`) and displays an interactive picker. Closed sessions are never shown in the picker.
+If you run `remote run` in the TUI without specifying a session, and no session is stored from previous activity in the current tab, awman fetches the **active** session list from the remote host (using `GET /v1/sessions?status=active`) and displays an interactive picker. Closed sessions are never shown in the picker.
 
 The picker dialog has a dynamic width that adjusts to fit long session IDs and working directory paths. Session IDs are truncated with `…` if necessary to preserve the full workdir path — the part most useful for identification.
 
@@ -281,7 +281,7 @@ No active sessions on http://build-server.example.com:9876. Run `remote session 
 
 ### Saved-dir picker (`remote session start` without a directory)
 
-If you run `remote session start` in the TUI without a directory argument, and `remote.savedDirs` is configured, amux shows a directory picker:
+If you run `remote session start` in the TUI without a directory argument, and `remote.savedDirs` is configured, awman shows a directory picker:
 
 ```
 ╭─── Select Directory ───────────────────────────────────────────────────────╮
@@ -317,17 +317,17 @@ When you start a session with a directory that is not in `remote.savedDirs`, the
 
 ### Session kill picker (`remote session kill` without a session ID)
 
-If you run `remote session kill` in the TUI without a session ID, amux fetches the active session list (`?status=active`) and shows a picker titled "Kill Session". Closed sessions are not listed. Navigation is identical to the session picker above.
+If you run `remote session kill` in the TUI without a session ID, awman fetches the active session list (`?status=active`) and shows a picker titled "Kill Session". Closed sessions are not listed. Navigation is identical to the session picker above.
 
 ---
 
 ## Remote-bound TUI tabs
 
-When `remote.defaultAddr` is configured in `~/.amux/config.json`, the TUI's **new-tab dialog** (opened with **Ctrl+T**) can permanently bind a new tab to a remote headless session. Every command typed in a remote-bound tab is forwarded to the remote host via the headless API — no `remote run` prefix or `--session` flag required.
+When `remote.defaultAddr` is configured in `~/.awman/config.json`, the TUI's **new-tab dialog** (opened with **Ctrl+T**) can permanently bind a new tab to a remote API session. Every command typed in a remote-bound tab is forwarded to the remote host via the API API — no `remote run` prefix or `--session` flag required.
 
 ### Creating a remote-bound tab
 
-Press **Ctrl+T**. When `remote.defaultAddr` is configured, amux asynchronously fetches the list of active sessions from the remote host and displays them below the working directory field:
+Press **Ctrl+T**. When `remote.defaultAddr` is configured, awman asynchronously fetches the list of active sessions from the remote host and displays them below the working directory field:
 
 ```
 ┌──── New Tab ─────────────────────────────────────────────┐
@@ -415,7 +415,7 @@ Closing a remote-bound tab (with **Ctrl+C** when multiple tabs are open) cancels
 
 When a workflow command is dispatched from a remote-bound tab (`exec workflow`), the workflow state strip appears automatically — exactly as it does for local workflow runs.
 
-Starting 5 seconds after the command is dispatched, amux polls `GET /v1/workflows/:command_id` on the remote headless server every 5 seconds. As soon as a workflow state is found, the strip renders and continues updating until the workflow reaches a terminal state (`complete` or `error`).
+Starting 5 seconds after the command is dispatched, awman polls `GET /v1/workflows/:command_id` on the remote API server every 5 seconds. As soon as a workflow state is found, the strip renders and continues updating until the workflow reaches a terminal state (`complete` or `error`).
 
 The remote workflow strip is visually identical to the local strip: parallel steps, paused states, running steps, and completion markers all render the same way. No extra configuration is required.
 
@@ -434,7 +434,7 @@ The remote workflow strip is visually identical to the local strip: parallel ste
 
 ## Configuration
 
-Remote mode settings live under a `remote` key in the global config (`~/.amux/config.json`). All fields are optional.
+Remote mode settings live under a `remote` key in the global config (`~/.awman/config.json`). All fields are optional.
 
 ```json
 {
@@ -451,25 +451,25 @@ Remote mode settings live under a `remote` key in the global config (`~/.amux/co
 
 ### `remote.defaultAddr`
 
-The default address of the remote headless amux server. When set, you don't need to pass `--remote-addr` on every command.
+The default address of the remote API awman server. When set, you don't need to pass `--remote-addr` on every command.
 
 ```sh
-amux config set --global remote.defaultAddr http://build-server.example.com:9876
+awman config set --global remote.defaultAddr http://build-server.example.com:9876
 ```
 
-Overridden per-invocation by `--remote-addr` or `AMUX_REMOTE_ADDR`.
+Overridden per-invocation by `--remote-addr` or `AWMAN_REMOTE_ADDR`.
 
 ### `remote.defaultAPIKey`
 
-The default API key to send when authenticating to the remote headless server. When set alongside `remote.defaultAddr`, every `amux remote` command to that host is authenticated automatically with no extra flags.
+The default API key to send when authenticating to the remote API server. When set alongside `remote.defaultAddr`, every `awman remote` command to that host is authenticated automatically with no extra flags.
 
 ```sh
-amux config set --global remote.defaultAPIKey <your-api-key>
+awman config set --global remote.defaultAPIKey <your-api-key>
 ```
 
-**Security constraint:** this key is **only sent when the target address exactly matches `remote.defaultAddr`** (scheme, host, and port, after stripping trailing slashes). If you use `--remote-addr` or `AMUX_REMOTE_ADDR` to point at a different server, the stored key is ignored — it is never silently forwarded to an unintended host.
+**Security constraint:** this key is **only sent when the target address exactly matches `remote.defaultAddr`** (scheme, host, and port, after stripping trailing slashes). If you use `--remote-addr` or `AWMAN_REMOTE_ADDR` to point at a different server, the stored key is ignored — it is never silently forwarded to an unintended host.
 
-Overridden per-invocation by `--api-key` or `AMUX_API_KEY`.
+Overridden per-invocation by `--api-key` or `AWMAN_API_KEY`.
 
 ### `remote.savedDirs`
 
@@ -477,13 +477,13 @@ A list of working directory paths (absolute paths on the remote host) for use by
 
 ```sh
 # Set a single directory
-amux config set --global remote.savedDirs /home/user/my-project
+awman config set --global remote.savedDirs /home/user/my-project
 
 # Set multiple directories (comma-separated)
-amux config set --global remote.savedDirs "/home/user/my-project,/home/user/other-project"
+awman config set --global remote.savedDirs "/home/user/my-project,/home/user/other-project"
 
 # Clear all saved directories
-amux config set --global remote.savedDirs ""
+awman config set --global remote.savedDirs ""
 ```
 
 Directories can also be added interactively from the TUI: when you start a session with a directory not already in the list, the TUI offers to save it for you.
@@ -494,21 +494,21 @@ Directories can also be added interactively from the TUI: when you start a sessi
 
 ```sh
 # Configure the remote host and API key once
-amux config set --global remote.defaultAddr http://build-server.example.com:9876
-amux config set --global remote.defaultAPIKey <your-api-key>
+awman config set --global remote.defaultAddr http://build-server.example.com:9876
+awman config set --global remote.defaultAPIKey <your-api-key>
 
 # Create a session on the remote host
-SESSION=$(amux remote session start /home/user/my-project | grep 'Session started:' | awk '{print $NF}')
+SESSION=$(awman remote session start /home/user/my-project | grep 'Session started:' | awk '{print $NF}')
 echo "Session: $SESSION"
 
 # Dispatch a command and stream its output
-amux remote run exec workflow path/to/workflow.md --session "$SESSION" --follow
+awman remote run exec workflow path/to/workflow.md --session "$SESSION" --follow
 
 # Or pipe into a log file (no ANSI decoration)
-amux remote run exec workflow path/to/workflow.md --session "$SESSION" --follow > workflow.log
+awman remote run exec workflow path/to/workflow.md --session "$SESSION" --follow > workflow.log
 
 # Kill the session when you are done
-amux remote session kill "$SESSION"
+awman remote session kill "$SESSION"
 ```
 
 ---
@@ -516,21 +516,21 @@ amux remote session kill "$SESSION"
 ## Full example: CI pipeline
 
 ```sh
-export AMUX_REMOTE_ADDR=http://build-server.internal:9876
-export AMUX_API_KEY=<your-api-key>
-export AMUX_REMOTE_SESSION=<pre-provisioned-session-id>
+export AWMAN_REMOTE_ADDR=http://build-server.internal:9876
+export AWMAN_API_KEY=<your-api-key>
+export AWMAN_REMOTE_SESSION=<pre-provisioned-session-id>
 
 # Dispatch the workflow; exit code reflects the command's exit code
-amux remote run exec workflow path/to/workflow.md --follow
+awman remote run exec workflow path/to/workflow.md --follow
 ```
 
-For CI contexts where a session is long-lived and pre-provisioned, setting `AMUX_REMOTE_SESSION` and `AMUX_API_KEY` in the pipeline environment avoids per-command flags entirely.
+For CI contexts where a session is long-lived and pre-provisioned, setting `AWMAN_REMOTE_SESSION` and `AWMAN_API_KEY` in the pipeline environment avoids per-command flags entirely.
 
 ---
 
 ## Using cURL directly
 
-Because `remote run` is built on the headless HTTP API, you can use cURL (or any HTTP client) wherever `amux remote` is inconvenient — for example, in scripts with no amux binary available:
+Because `remote run` is built on the API HTTP API, you can use cURL (or any HTTP client) wherever `awman remote` is inconvenient — for example, in scripts with no awman binary available:
 
 ```sh
 SERVER=http://build-server.example.com:9876
@@ -540,7 +540,7 @@ SESSION=a1b2c3d4-...
 # Submit a command
 CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
-  -H "x-amux-session: $SESSION" \
+  -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
   -d '{"subcommand":"exec","args":["workflow","path/to/workflow.md"]}' | jq -r .command_id)
 
@@ -549,7 +549,7 @@ curl -s "$SERVER/v1/commands/$CMD/logs/stream" \
   -H "Authorization: Bearer $KEY" \
 | while IFS= read -r line; do
   case "$line" in
-    "data: [amux:done]") echo "--- done ---"; break ;;
+    "data: [awman:done]") echo "--- done ---"; break ;;
     data:\ *)             echo "${line#data: }" ;;
   esac
 done
@@ -565,7 +565,7 @@ curl -s "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" | jq -r .output
 ```
 
-See [Headless Mode](08-headless-mode.md) for the full HTTP API reference, including session management endpoints.
+See [API Mode](08-api-mode.md) for the full HTTP API reference, including session management endpoints.
 
 ---
 
@@ -573,8 +573,8 @@ See [Headless Mode](08-headless-mode.md) for the full HTTP API reference, includ
 
 | Situation | Behaviour |
 |-----------|-----------|
-| No remote address configured | Error with instructions to pass `--remote-addr`, set `AMUX_REMOTE_ADDR`, or configure `remote.defaultAddr` |
-| `remote run` without `--session` in CLI/headless mode | Error with instructions to pass `--session` or set `AMUX_REMOTE_SESSION` |
+| No remote address configured | Error with instructions to pass `--remote-addr`, set `AWMAN_REMOTE_ADDR`, or configure `remote.defaultAddr` |
+| `remote run` without `--session` in CLI/API mode | Error with instructions to pass `--session` or set `AWMAN_REMOTE_SESSION` |
 | `remote session start` without a directory in CLI mode | Error with instructions to pass a directory argument |
 | `remote session kill` without a session ID in CLI mode | Error with instructions to pass a session ID |
 | Session not found on remote | HTTP 404 from the server; error message includes the session ID and suggests `remote session start` |
@@ -608,4 +608,4 @@ See [Headless Mode](08-headless-mode.md) for the full HTTP API reference, includ
 
 ---
 
-[← Headless Mode](08-headless-mode.md) · [Architecture →](architecture.md)
+[← API Mode](08-api-mode.md) · [Architecture →](architecture.md)

@@ -754,15 +754,15 @@ pub fn window_border_color(phase: &ExecutionPhase, focused: bool) -> ratatui::st
 
 /// Phase label shown in the execution window border.
 ///
-/// Glyphs and text mirror old amux exactly:
-/// - Idle → `" amux "`
+/// Glyphs and text mirror old awman exactly:
+/// - Idle → `" awman "`
 /// - Running → `" ● running: {cmd} "`  (U+25CF)
 /// - Done (exit 0) → `" ✓ done: {cmd} "`  (U+2713)
 /// - Done (non-zero exit) → `" ✗ error: {cmd} (exit N) "`  (U+2717)
 /// - Error → `" ✗ error: {cmd} "`
 pub fn phase_label(phase: &ExecutionPhase) -> String {
     match phase {
-        ExecutionPhase::Idle => " amux ".to_string(),
+        ExecutionPhase::Idle => " awman ".to_string(),
         ExecutionPhase::Running { command } => format!(" \u{25cf} running: {command} "),
         ExecutionPhase::Done { command, exit_code } if *exit_code == 0 => {
             format!(" \u{2713} done: {command} ")
@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn phase_label_idle() {
-        assert_eq!(phase_label(&ExecutionPhase::Idle), " amux ");
+        assert_eq!(phase_label(&ExecutionPhase::Idle), " awman ");
     }
 
     #[test]

@@ -136,7 +136,7 @@ mod tests {
             vec!["config", "show"],
             vec!["config", "get"],
             vec!["config", "set"],
-            vec!["headless", "start"],
+            vec!["api", "start"],
             vec!["remote", "run"],
             vec!["new", "spec"],
         ] {
@@ -198,8 +198,8 @@ mod tests {
     #[test]
     fn completions_do_not_include_cli_only_flags() {
         let cat = CommandCatalogue::get();
-        // headless start's CliOnly flags must not appear in TUI completions.
-        let comps = cat.tui_completions("headless start ");
+        // api start's CliOnly flags must not appear in TUI completions.
+        let comps = cat.tui_completions("api start ");
         let flag_completions: Vec<&str> = comps.iter().map(|c| c.completion.as_str()).collect();
         for cli_only_flag in &["--port", "--workdirs", "--background", "--refresh-key"] {
             assert!(

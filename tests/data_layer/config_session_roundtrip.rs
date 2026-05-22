@@ -3,12 +3,12 @@
 //! Validates that Session::open, EffectiveConfig, RepoConfig, GlobalConfig,
 //! and FlagConfig interact correctly across the module boundaries.
 
-use amux::data::config::flags::FlagConfig;
-use amux::data::config::global::GlobalConfig;
-use amux::data::config::repo::{RepoConfig, REPO_CONFIG_SUBDIR};
-use amux::data::error::DataError;
-use amux::data::session::{AgentName, Session, SessionLogKind, SessionOpenOptions};
-use amux::data::worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow};
+use awman::data::config::flags::FlagConfig;
+use awman::data::config::global::GlobalConfig;
+use awman::data::config::repo::{RepoConfig, REPO_CONFIG_SUBDIR};
+use awman::data::error::DataError;
+use awman::data::session::{AgentName, Session, SessionLogKind, SessionOpenOptions};
+use awman::data::worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow};
 
 use crate::helpers::IsolatedEnv;
 
@@ -35,7 +35,7 @@ fn session_open_falls_back_when_git_root_not_found() {
     let env = IsolatedEnv::new();
     // FailingResolver is defined inline.
     struct Fail;
-    impl amux::data::session::GitRootResolver for Fail {
+    impl awman::data::session::GitRootResolver for Fail {
         fn resolve(&self, wd: &std::path::Path) -> Result<std::path::PathBuf, DataError> {
             Err(DataError::GitRootNotFound {
                 working_dir: wd.to_path_buf(),
@@ -56,7 +56,7 @@ fn session_open_falls_back_when_git_root_not_found() {
 fn session_open_propagates_git_root_not_found_without_fallback() {
     let env = IsolatedEnv::new();
     struct Fail;
-    impl amux::data::session::GitRootResolver for Fail {
+    impl awman::data::session::GitRootResolver for Fail {
         fn resolve(&self, wd: &std::path::Path) -> Result<std::path::PathBuf, DataError> {
             Err(DataError::GitRootNotFound {
                 working_dir: wd.to_path_buf(),
@@ -84,10 +84,10 @@ fn repo_config_missing_file_returns_defaults() {
 #[test]
 fn repo_config_present_file_is_loaded() {
     let env = IsolatedEnv::new();
-    let amux_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
-    std::fs::create_dir_all(&amux_dir).unwrap();
+    let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
+    std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
-        amux_dir.join("config.json"),
+        awman_dir.join("config.json"),
         r#"{"agent":"codex","terminal_scrollback_lines":5000}"#,
     )
     .unwrap();
@@ -100,9 +100,9 @@ fn repo_config_present_file_is_loaded() {
 #[test]
 fn repo_config_malformed_json_returns_error() {
     let env = IsolatedEnv::new();
-    let amux_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
-    std::fs::create_dir_all(&amux_dir).unwrap();
-    std::fs::write(amux_dir.join("config.json"), b"{ not valid json }").unwrap();
+    let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
+    std::fs::create_dir_all(&awman_dir).unwrap();
+    std::fs::write(awman_dir.join("config.json"), b"{ not valid json }").unwrap();
 
     let err = RepoConfig::load(env.git_root.path()).unwrap_err();
     assert!(matches!(err, DataError::ConfigParse { .. }));
@@ -111,8 +111,8 @@ fn repo_config_malformed_json_returns_error() {
 #[test]
 fn repo_config_save_and_reload_roundtrip() {
     let env = IsolatedEnv::new();
-    let amux_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
-    std::fs::create_dir_all(&amux_dir).unwrap();
+    let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
+    std::fs::create_dir_all(&awman_dir).unwrap();
 
     let cfg = RepoConfig {
         agent: Some("maki".to_string()),
@@ -161,9 +161,9 @@ fn global_config_save_and_reload_roundtrip() {
 fn effective_config_flag_agent_wins_over_repo_and_global() {
     let env = IsolatedEnv::new();
 
-    let amux_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
-    std::fs::create_dir_all(&amux_dir).unwrap();
-    std::fs::write(amux_dir.join("config.json"), r#"{"agent":"repo-agent"}"#).unwrap();
+    let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
+    std::fs::create_dir_all(&awman_dir).unwrap();
+    std::fs::write(awman_dir.join("config.json"), r#"{"agent":"repo-agent"}"#).unwrap();
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
     std::fs::write(
         env.home_dir.path().join("config.json"),
@@ -188,9 +188,9 @@ fn effective_config_flag_agent_wins_over_repo_and_global() {
 fn effective_config_repo_agent_wins_over_global() {
     let env = IsolatedEnv::new();
 
-    let amux_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
-    std::fs::create_dir_all(&amux_dir).unwrap();
-    std::fs::write(amux_dir.join("config.json"), r#"{"agent":"repo-agent"}"#).unwrap();
+    let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
+    std::fs::create_dir_all(&awman_dir).unwrap();
+    std::fs::write(awman_dir.join("config.json"), r#"{"agent":"repo-agent"}"#).unwrap();
     std::fs::create_dir_all(env.home_dir.path()).unwrap();
     std::fs::write(
         env.home_dir.path().join("config.json"),
@@ -226,10 +226,10 @@ fn effective_config_global_agent_used_when_repo_absent() {
 fn effective_config_scrollback_repo_wins_over_global() {
     let env = IsolatedEnv::new();
 
-    let amux_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
-    std::fs::create_dir_all(&amux_dir).unwrap();
+    let awman_dir = env.git_root.path().join(REPO_CONFIG_SUBDIR);
+    std::fs::create_dir_all(&awman_dir).unwrap();
     std::fs::write(
-        amux_dir.join("config.json"),
+        awman_dir.join("config.json"),
         r#"{"terminal_scrollback_lines":7777}"#,
     )
     .unwrap();
@@ -338,31 +338,31 @@ fn agent_name_space_rejected() {
 
 #[test]
 fn worktree_branch_name_zero_padded() {
-    assert_eq!(worktree_branch_name(42), "amux/work-item-0042");
-    assert_eq!(worktree_branch_name(1), "amux/work-item-0001");
-    assert_eq!(worktree_branch_name(9999), "amux/work-item-9999");
+    assert_eq!(worktree_branch_name(42), "awman/work-item-0042");
+    assert_eq!(worktree_branch_name(1), "awman/work-item-0001");
+    assert_eq!(worktree_branch_name(9999), "awman/work-item-9999");
 }
 
 #[test]
 fn worktree_branch_name_for_workflow_prefixed() {
     assert_eq!(
         worktree_branch_name_for_workflow("my-wf"),
-        "amux/workflow-my-wf"
+        "awman/workflow-my-wf"
     );
 }
 
 #[test]
 fn worktree_paths_for_work_item_correct_structure() {
-    use amux::data::worktree_paths::WorktreePaths;
+    use awman::data::worktree_paths::WorktreePaths;
     let paths = WorktreePaths::with_home("/fake-home");
     let wt = paths.for_work_item(std::path::Path::new("/r/myrepo"), 42);
-    // Should be ~/.amux/worktrees/myrepo/0042
+    // Should be ~/.awman/worktrees/myrepo/0042
     assert!(wt.ends_with("worktrees/myrepo/0042"), "got {wt:?}");
 }
 
 #[test]
 fn worktree_paths_for_workflow_uses_wf_prefix() {
-    use amux::data::worktree_paths::WorktreePaths;
+    use awman::data::worktree_paths::WorktreePaths;
     let paths = WorktreePaths::with_home("/fake-home");
     let wt = paths.for_workflow(std::path::Path::new("/r/myrepo"), "my-flow");
     assert!(wt.ends_with("worktrees/myrepo/wf-my-flow"), "got {wt:?}");
@@ -372,19 +372,19 @@ fn worktree_paths_for_workflow_uses_wf_prefix() {
 
 #[test]
 fn project_image_tag_uses_folder_name() {
-    let tag = amux::data::project_image_tag(std::path::Path::new("/srv/myproject"));
-    assert_eq!(tag, "amux-myproject:latest");
+    let tag = awman::data::project_image_tag(std::path::Path::new("/srv/myproject"));
+    assert_eq!(tag, "awman-myproject:latest");
 }
 
 #[test]
 fn agent_image_tag_includes_agent_name() {
-    let tag = amux::data::agent_image_tag(std::path::Path::new("/srv/myproject"), "claude");
-    assert_eq!(tag, "amux-myproject-claude:latest");
+    let tag = awman::data::agent_image_tag(std::path::Path::new("/srv/myproject"), "claude");
+    assert_eq!(tag, "awman-myproject-claude:latest");
 }
 
 #[test]
 fn repo_hash_is_eight_hex_chars() {
-    let h = amux::data::repo_hash(std::path::Path::new("/some/nonexistent/path"));
+    let h = awman::data::repo_hash(std::path::Path::new("/some/nonexistent/path"));
     assert_eq!(h.len(), 8);
     assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
 }
@@ -392,5 +392,5 @@ fn repo_hash_is_eight_hex_chars() {
 #[test]
 fn repo_hash_is_deterministic() {
     let p = std::path::Path::new("/some/nonexistent/path");
-    assert_eq!(amux::data::repo_hash(p), amux::data::repo_hash(p));
+    assert_eq!(awman::data::repo_hash(p), awman::data::repo_hash(p));
 }

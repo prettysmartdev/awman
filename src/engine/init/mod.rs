@@ -1,4 +1,4 @@
-//! `engine::init` — `InitEngine`. Multi-phase state machine for `amux init`.
+//! `engine::init` — `InitEngine`. Multi-phase state machine for `awman init`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,9 +82,9 @@ impl InitEngine {
             InitPhase::Preflight => {
                 let _ = self.git_engine;
                 let _ = self.overlay_engine;
-                let amux_dir = git_root.join(".amux");
-                if let Err(e) = std::fs::create_dir_all(&amux_dir) {
-                    tracing::warn!("failed to create .amux directory: {e}");
+                let awman_dir = git_root.join(".awman");
+                if let Err(e) = std::fs::create_dir_all(&awman_dir) {
+                    tracing::warn!("failed to create .awman directory: {e}");
                 }
                 InitPhase::AwaitingAspecDecision
             }
@@ -157,7 +157,7 @@ impl InitEngine {
                 // Issue 10: Next phase creates the agent Dockerfile.
                 InitPhase::SettingUpAgentDockerfile
             }
-            // Issue 10: Ensure .amux/Dockerfile.<agent> exists.
+            // Issue 10: Ensure .awman/Dockerfile.<agent> exists.
             InitPhase::SettingUpAgentDockerfile => {
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
@@ -191,7 +191,7 @@ impl InitEngine {
                 } else {
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Info,
-                        text: "aspec/.amux.json already present — preserving existing config."
+                        text: ".awman/config.json already present — preserving existing config."
                             .to_string(),
                     });
                 }
@@ -565,9 +565,9 @@ mod tests {
     fn make_engine(git_root: &std::path::Path) -> InitEngine {
         // Pre-create agent Dockerfile so the engine does not attempt a network
         // download during tests.
-        let amux_dir = git_root.join(".amux");
-        let _ = std::fs::create_dir_all(&amux_dir);
-        let _ = std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n");
+        let awman_dir = git_root.join(".awman");
+        let _ = std::fs::create_dir_all(&awman_dir);
+        let _ = std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n");
         let resolver = StaticGitRootResolver::new(git_root);
         let session = Arc::new(
             crate::data::session::Session::open(
@@ -752,14 +752,14 @@ mod tests {
         );
     }
 
-    // ─── Preflight creates .amux/ ─────────────────────────────────────────────
+    // ─── Preflight creates .awman/ ─────────────────────────────────────────────
 
     #[tokio::test]
-    async fn explicit_amux_dir_created_in_preflight() {
+    async fn explicit_awman_dir_created_in_preflight() {
         let tmp = tempfile::tempdir().unwrap();
-        // Use a fresh directory that has no .amux/ yet, but make_engine pre-creates
+        // Use a fresh directory that has no .awman/ yet, but make_engine pre-creates
         // it (and the agent Dockerfile). We need to test that the Preflight phase
-        // creates .amux/ on a pristine repo. Re-create the engine without
+        // creates .awman/ on a pristine repo. Re-create the engine without
         // make_engine so we can skip pre-seeding:
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Arc::new(
@@ -791,11 +791,11 @@ mod tests {
             },
         );
 
-        // The .amux dir must not exist before Preflight runs.
-        let amux_dir = tmp.path().join(".amux");
+        // The .awman dir must not exist before Preflight runs.
+        let awman_dir = tmp.path().join(".awman");
         assert!(
-            !amux_dir.exists(),
-            ".amux dir must not exist before Preflight"
+            !awman_dir.exists(),
+            ".awman dir must not exist before Preflight"
         );
 
         let mut frontend = FakeInitFrontend {
@@ -808,8 +808,8 @@ mod tests {
         engine.step(&mut frontend).await.unwrap();
 
         assert!(
-            amux_dir.exists(),
-            "Preflight must create the .amux/ directory"
+            awman_dir.exists(),
+            "Preflight must create the .awman/ directory"
         );
     }
 }

@@ -288,8 +288,8 @@ pub fn render_yes_no(title: &str, body: &str, area: Rect, frame: &mut Frame) {
 pub fn render_quit_confirm(area: Rect, frame: &mut Frame) {
     let width = 56u16.min(area.width.saturating_sub(4).max(40));
     let dialog_area = centered_fixed(width, 8, area);
-    let inner = render_dialog_frame("Quit amux?", Color::Yellow, dialog_area, frame);
-    let text = "  Press Ctrl-C again to quit amux\n\n  [Esc] cancel";
+    let inner = render_dialog_frame("Quit awman?", Color::Yellow, dialog_area, frame);
+    let text = "  Press Ctrl-C again to quit awman\n\n  [Esc] cancel";
     frame.render_widget(
         Paragraph::new(text)
             .wrap(ratatui::widgets::Wrap { trim: false })
@@ -304,7 +304,7 @@ pub fn render_close_tab_confirm(area: Rect, frame: &mut Frame) {
     let dialog_area = centered_fixed(width, 9, area);
     let inner = render_dialog_frame("Close tab?", Color::Yellow, dialog_area, frame);
     let text =
-        "  Press Ctrl-C again to quit amux\n  Press Ctrl-T to close this tab\n\n  [Esc] cancel";
+        "  Press Ctrl-C again to quit awman\n  Press Ctrl-T to close this tab\n\n  [Esc] cancel";
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,

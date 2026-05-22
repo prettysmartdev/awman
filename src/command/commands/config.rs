@@ -31,14 +31,14 @@ const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
     ("agentStuckTimeout", FieldScope::Both),
     ("runtime", FieldScope::GlobalOnly),
     ("default_agent", FieldScope::GlobalOnly),
-    ("headless", FieldScope::GlobalOnly),
+    ("api", FieldScope::GlobalOnly),
     ("remote", FieldScope::Both),
     // Dot-notation nested fields
     ("work_items.dir", FieldScope::RepoOnly),
     ("work_items.template", FieldScope::RepoOnly),
-    ("headless.workDirs", FieldScope::GlobalOnly),
-    ("headless.port", FieldScope::GlobalOnly),
-    ("headless.background", FieldScope::GlobalOnly),
+    ("api.workDirs", FieldScope::GlobalOnly),
+    ("api.port", FieldScope::GlobalOnly),
+    ("api.background", FieldScope::GlobalOnly),
     ("remote.defaultAddr", FieldScope::Both),
     ("remote.defaultAPIKey", FieldScope::Both),
 ];
@@ -75,7 +75,7 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
             }
             Ok(serde_json::Value::String(value.to_string()))
         }
-        "yoloDisallowedTools" | "envPassthrough" | "headless.workDirs" => {
+        "yoloDisallowedTools" | "envPassthrough" | "api.workDirs" => {
             // Parse comma-separated into array
             let items: Vec<&str> = value
                 .split(',')
@@ -89,7 +89,7 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
                     .collect(),
             ))
         }
-        "terminal_scrollback_lines" | "agentStuckTimeout" | "headless.port" => {
+        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => {
             // Must be a positive integer
             value
                 .parse::<u64>()
@@ -217,16 +217,16 @@ pub enum ConfigFieldKind {
 fn config_field_kind(name: &str) -> ConfigFieldKind {
     match name {
         "agent" | "default_agent" => ConfigFieldKind::Enum,
-        "auto_agent_auth_accepted" | "headless.background" => ConfigFieldKind::Bool,
-        "terminal_scrollback_lines" | "agentStuckTimeout" | "headless.port" => {
+        "auto_agent_auth_accepted" | "api.background" => ConfigFieldKind::Bool,
+        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => {
             ConfigFieldKind::Number
         }
         _ => ConfigFieldKind::String,
     }
 }
 
-/// Fields whose value is computed by amux itself and cannot be set by the
-/// user via `amux config set`. Surfaced with `(read-only)` in the table.
+/// Fields whose value is computed by awman itself and cannot be set by the
+/// user via `awman config set`. Surfaced with `(read-only)` in the table.
 const READ_ONLY_FIELDS: &[&str] = &["auto_agent_auth_accepted"];
 
 const SENSITIVE_FIELDS: &[&str] = &["remote.defaultAPIKey"];

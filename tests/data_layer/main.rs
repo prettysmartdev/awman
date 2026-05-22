@@ -7,4 +7,5 @@
 mod helpers;
 
 mod config_session_roundtrip;
+mod rename_0077;
 mod sqlite_upgrade_compat;

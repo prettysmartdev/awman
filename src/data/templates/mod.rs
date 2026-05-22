@@ -6,7 +6,7 @@ pub mod audit_prompts;
 
 pub use audit_prompts::{init_audit_prompt, ready_audit_prompt};
 
-/// The project base Dockerfile. Written by `amux init` and `amux ready`
+/// The project base Dockerfile. Written by `awman init` and `awman ready`
 /// when no `Dockerfile.dev` exists at the git root.
 pub fn project_dockerfile_dev() -> &'static str {
     include_str!("../../../templates/Dockerfile.project")

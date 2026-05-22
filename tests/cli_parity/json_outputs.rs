@@ -2,7 +2,7 @@
 //!
 //! This is a catalogue-level check — no subprocess invocation.
 
-use amux::command::dispatch::catalogue::CommandCatalogue;
+use awman::command::dispatch::catalogue::CommandCatalogue;
 
 fn cat() -> &'static CommandCatalogue {
     CommandCatalogue::get()

@@ -1,4 +1,4 @@
-//! `RemoteClient` — typed HTTP client for talking to a remote amux headless
+//! `RemoteClient` — typed HTTP client for talking to a remote awman API
 //! server. Constructed fresh per `RemoteCommand` invocation; not exported
 //! beyond `command/commands/`.
 
@@ -35,7 +35,7 @@ impl RemoteClient {
     }
 
     /// Construct a client that additionally trusts a specific PEM-encoded
-    /// certificate. Used when talking to a loopback amux headless server with
+    /// certificate. Used when talking to a loopback awman API server with
     /// a self-signed cert: the cert PEM is loaded from the local `tls/`
     /// directory and added as a trusted root, effectively pinning by identity.
     /// For non-loopback targets, the caller MUST NOT pass `pinned_cert_pem` —
@@ -91,7 +91,7 @@ impl RemoteClient {
         matches!(host, "127.0.0.1" | "::1" | "localhost")
     }
 
-    /// API-key resolution per spec §6.5: explicit > AMUX_API_KEY > global
+    /// API-key resolution per spec §6.5: explicit > AWMAN_API_KEY > global
     /// config (only when target_addr matches global default_addr).
     pub fn resolve_api_key(
         session: &Session,
@@ -134,7 +134,7 @@ impl RemoteClient {
     }
 
     /// Like `send_command` but also attaches request headers — used to set
-    /// `x-amux-session` on `POST /v1/commands` (the server reads the session
+    /// `x-awman-session` on `POST /v1/commands` (the server reads the session
     /// from the header, not the body).
     pub async fn send_command_with_headers(
         &self,
@@ -258,7 +258,7 @@ impl RemoteClient {
             }
         }
 
-        // Stream ended without [amux:done] — emit any partial event then close.
+        // Stream ended without [awman:done] — emit any partial event then close.
         if !buffer.trim().is_empty() {
             let trailing = std::mem::take(&mut buffer);
             if Self::dispatch_sse_event(&trailing, sink) {
@@ -270,7 +270,7 @@ impl RemoteClient {
     }
 
     /// Parse one `\n\n`-delimited SSE event block and forward it to the sink.
-    /// Returns `true` when the block was the `[amux:done]` sentinel (caller
+    /// Returns `true` when the block was the `[awman:done]` sentinel (caller
     /// should stop streaming).
     fn dispatch_sse_event(block: &str, sink: &mut dyn RemoteEventSink) -> bool {
         if block.trim().is_empty() {
@@ -290,7 +290,7 @@ impl RemoteClient {
             }
         }
         let data = data_lines.join("\n");
-        if data == "[amux:done]" {
+        if data == "[awman:done]" {
             sink.on_done();
             return true;
         }
@@ -408,7 +408,7 @@ mod tests {
     fn make_session_with_global_config(config_json: &str) -> (tempfile::TempDir, Session) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("config.json"), config_json).unwrap();
-        let env = EnvSnapshot::with_overrides([("AMUX_CONFIG_HOME", tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
         let opts = SessionOpenOptions {
             env: Some(env),
             ..Default::default()
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn resolve_api_key_explicit_takes_priority_over_env_and_config() {
-        let env = EnvSnapshot::with_overrides([("AMUX_API_KEY", "env-key")]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_API_KEY", "env-key")]);
         let (_tmp, session) = make_session(env);
         let result =
             RemoteClient::resolve_api_key(&session, "http://localhost:9876", Some("explicit-key"));
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn resolve_api_key_env_var_used_when_no_explicit() {
-        let env = EnvSnapshot::with_overrides([("AMUX_API_KEY", "env-key")]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_API_KEY", "env-key")]);
         let (_tmp, session) = make_session(env);
         let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", None);
         assert!(result.is_ok());
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn resolve_api_key_explicit_blank_falls_through_to_env() {
-        let env = EnvSnapshot::with_overrides([("AMUX_API_KEY", "env-key")]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_API_KEY", "env-key")]);
         let (_tmp, session) = make_session(env);
         // An explicit empty string should fall through to env.
         let result = RemoteClient::resolve_api_key(&session, "http://localhost:9876", Some("   "));
@@ -574,7 +574,7 @@ mod tests {
     async fn stream_command_parses_sse_events_and_calls_sink() {
         use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
-        let sse_body = "data: hello world\n\ndata: second line\n\ndata: [amux:done]\n\n";
+        let sse_body = "data: hello world\n\ndata: second line\n\ndata: [awman:done]\n\n";
 
         let server = MockServer::start().await;
         Mock::given(matchers::method("GET"))

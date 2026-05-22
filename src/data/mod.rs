@@ -9,6 +9,7 @@
 pub mod config;
 pub mod error;
 pub mod fs;
+pub mod migration;
 pub mod image_tags;
 pub mod network;
 pub mod repo_dockerfile_paths;

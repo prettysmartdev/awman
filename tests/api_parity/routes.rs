@@ -1,46 +1,46 @@
-//! Route table and headless-path tests.
+//! Route table and API-path tests.
 //!
 //! Does NOT start a real server — just verifies the data-layer types used
-//! by the headless server are correct.
+//! by the API server are correct.
 
-use amux::data::config::env::{EnvSnapshot, AMUX_HEADLESS_ROOT};
-use amux::data::fs::headless_db::SqliteSessionStore;
-use amux::data::fs::headless_paths::HeadlessPaths;
+use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT};
+use awman::data::fs::api_db::SqliteSessionStore;
+use awman::data::fs::api_paths::ApiPaths;
 
-// ─── HeadlessPaths resolution ─────────────────────────────────────────────────
+// ─── ApiPaths resolution ─────────────────────────────────────────────────
 
 #[test]
-fn headless_paths_from_root_has_correct_db_path() {
-    let paths = HeadlessPaths::from_root("/tmp/amux-test");
+fn api_paths_from_root_has_correct_db_path() {
+    let paths = ApiPaths::from_root("/tmp/awman-test");
     assert_eq!(
         paths.db_path(),
-        std::path::PathBuf::from("/tmp/amux-test/amux.db")
+        std::path::PathBuf::from("/tmp/awman-test/awman.db")
     );
 }
 
 #[test]
-fn headless_paths_from_env_honours_amux_headless_root() {
-    let env = EnvSnapshot::with_overrides([(AMUX_HEADLESS_ROOT, "/custom/root")]);
-    let paths = HeadlessPaths::from_env(&env).unwrap();
+fn api_paths_from_env_honours_awman_api_root() {
+    let env = EnvSnapshot::with_overrides([(AWMAN_API_ROOT, "/custom/root")]);
+    let paths = ApiPaths::from_env(&env).unwrap();
     assert_eq!(paths.root(), std::path::Path::new("/custom/root"));
 }
 
 #[test]
-fn headless_paths_sessions_dir_under_root() {
-    let paths = HeadlessPaths::from_root("/srv/headless");
+fn api_paths_sessions_dir_under_root() {
+    let paths = ApiPaths::from_root("/srv/api");
     let sessions = paths.sessions_dir();
     assert!(
-        sessions.starts_with("/srv/headless"),
+        sessions.starts_with("/srv/api"),
         "sessions dir should be under root: {sessions:?}"
     );
 }
 
 #[test]
-fn headless_paths_tls_dir_under_root() {
-    let paths = HeadlessPaths::from_root("/srv/headless");
+fn api_paths_tls_dir_under_root() {
+    let paths = ApiPaths::from_root("/srv/api");
     let tls = paths.tls_dir();
     assert!(
-        tls.starts_with("/srv/headless"),
+        tls.starts_with("/srv/api"),
         "tls dir should be under root: {tls:?}"
     );
 }
@@ -96,12 +96,12 @@ fn v1_commands_stream_route_present() {
     assert!(has_stream);
 }
 
-// ─── SqliteSessionStore as headless persistence layer ────────────────────────
+// ─── SqliteSessionStore as API persistence layer ────────────────────────
 
 #[test]
-fn headless_store_open_from_paths() {
+fn api_store_open_from_paths() {
     let tmp = tempfile::tempdir().unwrap();
-    let paths = HeadlessPaths::from_root(tmp.path());
+    let paths = ApiPaths::from_root(tmp.path());
     let store = SqliteSessionStore::open_from_paths(&paths).expect("open from paths");
     // Round-trip session to confirm the store works.
     store
@@ -112,9 +112,9 @@ fn headless_store_open_from_paths() {
 }
 
 #[test]
-fn headless_store_session_dir_is_under_sessions_dir() {
+fn api_store_session_dir_is_under_sessions_dir() {
     let tmp = tempfile::tempdir().unwrap();
-    let paths = HeadlessPaths::from_root(tmp.path());
+    let paths = ApiPaths::from_root(tmp.path());
     let session_dir = paths.session_dir("my-session-id");
     assert!(
         session_dir.starts_with(paths.sessions_dir()),
@@ -123,11 +123,11 @@ fn headless_store_session_dir_is_under_sessions_dir() {
 }
 
 #[test]
-fn headless_paths_api_key_hash_file_under_root() {
-    let paths = HeadlessPaths::from_root("/srv/headless");
+fn api_paths_api_key_hash_file_under_root() {
+    let paths = ApiPaths::from_root("/srv/api");
     let hash = paths.api_key_hash_file();
     assert!(
-        hash.starts_with("/srv/headless"),
+        hash.starts_with("/srv/api"),
         "api_key.hash should be under root: {hash:?}"
     );
     assert_eq!(hash.file_name().unwrap(), "api_key.hash");

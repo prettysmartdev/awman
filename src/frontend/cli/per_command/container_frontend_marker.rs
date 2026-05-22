@@ -71,9 +71,9 @@ impl UserMessageSink for CliContainerProxy {
         // have a PTY gate — write immediately to stderr.
         use crate::engine::message::MessageLevel;
         let prefix = match msg.level {
-            MessageLevel::Info | MessageLevel::Success => "amux:",
-            MessageLevel::Warning => "amux warning:",
-            MessageLevel::Error => "amux error:",
+            MessageLevel::Info | MessageLevel::Success => "awman:",
+            MessageLevel::Warning => "awman warning:",
+            MessageLevel::Error => "awman error:",
         };
         let _ = writeln!(std::io::stderr(), "{prefix} {}", msg.text);
     }

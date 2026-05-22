@@ -146,7 +146,7 @@ fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
 
     for (i, tab) in app.tabs.iter().enumerate() {
         let x = area.x + (i as u16) * tab_width;
-        // Stop drawing when the next cell would overflow — old amux did the
+        // Stop drawing when the next cell would overflow — old awman did the
         // same; there is no overflow indicator.
         if x + tab_width > area.x + area.width {
             break;
@@ -238,15 +238,15 @@ fn render_execution_window(app: &App, area: Rect, frame: &mut Frame) {
         .unwrap_or(true);
 
     if matches!(tab.execution_phase, ExecutionPhase::Idle) && log_empty {
-        // Three-line welcome stub matching old amux exactly.
+        // Three-line welcome stub matching old awman exactly.
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Welcome to amux.",
+                "  Welcome to awman.",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                "  Running `amux ready` to check your environment...",
+                "  Running `awman ready` to check your environment...",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -352,7 +352,7 @@ fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
     // Title.
     let title = Paragraph::new(vec![
         Line::from(Span::styled(
-            " AMUX STATUS DASHBOARD",
+            " AWMAN STATUS DASHBOARD",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -369,7 +369,7 @@ fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                " To start one:  amux exec workflow <file>  or  amux chat",
+                " To start one:  awman exec workflow <file>  or  awman chat",
                 Style::default().fg(Color::DarkGray),
             )),
         ]);
@@ -1525,7 +1525,7 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
     let popup = dialogs::centered_fixed(popup_width, popup_height, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(" amux config ")
+        .title(" awman config ")
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)

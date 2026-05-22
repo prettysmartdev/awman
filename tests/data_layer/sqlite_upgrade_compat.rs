@@ -2,9 +2,9 @@
 //!
 //! Verifies that SqliteSessionStore creates the expected schema, persists
 //! records correctly, and satisfies the on-disk compatibility requirement
-//! from WI 0073 §1 (opens databases written by prior amux releases).
+//! from WI 0073 §1 (opens databases written by prior awman releases).
 
-use amux::data::fs::headless_db::SqliteSessionStore;
+use awman::data::fs::api_db::SqliteSessionStore;
 
 use crate::helpers::IsolatedEnv;
 
@@ -13,15 +13,15 @@ use crate::helpers::IsolatedEnv;
 #[test]
 fn store_opens_fresh_dir_creates_db_file() {
     let env = IsolatedEnv::new();
-    let root = env.headless_root();
+    let root = env.api_root();
     let _store = SqliteSessionStore::open(&root).expect("open store");
-    assert!(root.join("amux.db").exists());
+    assert!(root.join("awman.db").exists());
 }
 
 #[test]
 fn store_open_is_idempotent() {
     let env = IsolatedEnv::new();
-    let root = env.headless_root();
+    let root = env.api_root();
     let _s1 = SqliteSessionStore::open(&root).expect("first open");
     let _s2 = SqliteSessionStore::open(&root).expect("second open");
 }
@@ -231,7 +231,7 @@ fn sqlite_upgrade_compat_legacy_fixture_opens_cleanly() {
     use rusqlite::Connection;
 
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("amux.db");
+    let db_path = tmp.path().join("awman.db");
 
     // Construct a minimal legacy-shaped database directly.
     {

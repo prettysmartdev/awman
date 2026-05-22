@@ -12,9 +12,9 @@
 
 use std::path::PathBuf;
 
-use amux::data::config::env::{EnvSnapshot, AMUX_CONFIG_HOME, AMUX_HEADLESS_ROOT};
-use amux::data::config::flags::FlagConfig;
-use amux::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, AWMAN_API_ROOT};
+use awman::data::config::flags::FlagConfig;
+use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 
 // ─── Runtime skip helpers ────────────────────────────────────────────────────
 
@@ -86,21 +86,21 @@ impl IsolatedEnv {
     }
 
     pub fn env(&self) -> EnvSnapshot {
-        let headless_root = self.home_dir.path().join("headless");
+        let api_root = self.home_dir.path().join("api");
         EnvSnapshot::with_overrides([
             (
-                AMUX_CONFIG_HOME.to_string(),
+                AWMAN_CONFIG_HOME.to_string(),
                 self.home_dir.path().to_str().unwrap().to_string(),
             ),
             (
-                AMUX_HEADLESS_ROOT.to_string(),
-                headless_root.to_str().unwrap().to_string(),
+                AWMAN_API_ROOT.to_string(),
+                api_root.to_str().unwrap().to_string(),
             ),
         ])
     }
 
-    pub fn headless_root(&self) -> PathBuf {
-        self.home_dir.path().join("headless")
+    pub fn api_root(&self) -> PathBuf {
+        self.home_dir.path().join("api")
     }
 
     pub fn open_session(&self) -> Session {
@@ -120,7 +120,7 @@ impl IsolatedEnv {
 
 // ─── Minimal workflow definition builders ───────────────────────────────────
 
-pub use amux::data::workflow_definition::WorkflowStep;
+pub use awman::data::workflow_definition::WorkflowStep;
 
 pub fn wf_step(name: &str, deps: &[&str], prompt: &str) -> WorkflowStep {
     WorkflowStep {

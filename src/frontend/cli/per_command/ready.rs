@@ -90,11 +90,11 @@ impl ReadyFrontend for CliFrontend {
         let box_str =
             render_summary_box(&format!("Ready Summary ({})", summary.runtime_name), &rows);
         // Write the summary box directly to stderr without the per-line
-        // "amux:" prefix used for status updates — the box is multi-line
+        // "awman:" prefix used for status updates — the box is multi-line
         // content that reads better unprefixed.
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
-            format!("\n{box_str}amux is ready.\n").as_bytes(),
+            format!("\n{box_str}awman is ready.\n").as_bytes(),
         );
 
         let has_missing = summary

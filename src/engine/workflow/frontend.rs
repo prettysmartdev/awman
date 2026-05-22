@@ -19,7 +19,7 @@ use crate::engine::workflow::EngineRequest;
 
 /// Per-workflow frontend the engine uses for every Q&A and status report.
 ///
-/// The engine treats CLI, TUI, and headless implementations identically; the
+/// The engine treats CLI, TUI, and API implementations identically; the
 /// engine never knows which is on the other side.
 pub trait WorkflowFrontend: UserMessageSink + Send {
     // === Engine-driven display commands (blocking) ===

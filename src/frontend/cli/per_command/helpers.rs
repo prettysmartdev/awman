@@ -11,7 +11,7 @@ pub fn yes_no(prompt: &str, default_yes: bool) -> bool {
         return default_yes;
     }
     let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    eprintln!("amux: {prompt} {suffix}");
+    eprintln!("awman: {prompt} {suffix}");
     let mut buf = String::new();
     if std::io::stdin().read_line(&mut buf).is_err() {
         return default_yes;
@@ -30,7 +30,7 @@ pub fn read_line(prompt: &str) -> Option<String> {
     if !stdin_is_tty() {
         return None;
     }
-    eprintln!("amux: {prompt}");
+    eprintln!("awman: {prompt}");
     let mut buf = String::new();
     if std::io::stdin().read_line(&mut buf).is_err() {
         return None;
@@ -46,8 +46,8 @@ pub fn read_multiline(prompt: &str) -> Option<String> {
     if !stdin_is_tty() {
         return None;
     }
-    eprintln!("amux: {prompt}");
-    eprintln!("amux: (enter a blank line or press Ctrl+D when done)");
+    eprintln!("awman: {prompt}");
+    eprintln!("awman: (enter a blank line or press Ctrl+D when done)");
     let stdin = std::io::stdin();
     let mut lines: Vec<String> = Vec::new();
     for line in stdin.lock().lines() {

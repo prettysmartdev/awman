@@ -26,7 +26,7 @@ impl AgentAuthFrontend for CliFrontend {
             env_var_names.join(", ")
         };
         eprintln!(
-            "amux: Inject host credentials ({vars}) into the {} container? [y]es / [n]o / [o]nce",
+            "awman: Inject host credentials ({vars}) into the {} container? [y]es / [n]o / [o]nce",
             agent.as_str()
         );
         let mut buf = String::new();

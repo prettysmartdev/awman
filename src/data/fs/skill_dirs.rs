@@ -21,7 +21,7 @@ pub struct SkillDirs {
 
 impl SkillDirs {
     /// Construct from the current process environment, resolving the global
-    /// home via `AMUX_CONFIG_HOME` (when set) or `$HOME/.amux`.
+    /// home via `AWMAN_CONFIG_HOME` (when set) or `$HOME/.awman`.
     pub fn from_process_env(git_root: Option<PathBuf>) -> Result<Self, DataError> {
         Self::from_env(&Env::from_process(), git_root)
     }

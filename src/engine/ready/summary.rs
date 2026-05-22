@@ -19,7 +19,7 @@ pub struct ReadySummary {
     pub legacy_migration: StepStatus,
     /// Whether the `aspec/` folder exists.
     pub aspec_folder: StepStatus,
-    /// Whether `aspec/.amux.json` (work-items config) exists.
+    /// Whether `.awman/config.json` (per-repo config) exists.
     pub work_items_config: StepStatus,
     /// Per-agent image status for non-default agents.
     /// Each entry is (agent_name, image_status).

@@ -1,4 +1,4 @@
-//! Live headless server smoke test.
+//! Live API server smoke test.
 //!
 //! Boots the real Axum router (via `routes::build_router`) on an ephemeral
 //! loopback port, hits each documented endpoint with `reqwest`, and tears down
@@ -9,20 +9,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use amux::command::dispatch::Engines;
-use amux::data::fs::auth_paths::AuthPathResolver;
-use amux::data::fs::headless_db::SqliteSessionStore;
-use amux::data::fs::headless_paths::HeadlessPaths;
-use amux::data::EngineWorkflowStateStore;
-use amux::engine::agent::AgentEngine;
-use amux::engine::auth::AuthEngine;
-use amux::engine::container::ContainerRuntime;
-use amux::engine::git::GitEngine;
-use amux::engine::overlay::OverlayEngine;
-use amux::frontend::headless::routes::{build_router, AppState, AuthMode};
+use awman::command::dispatch::Engines;
+use awman::data::fs::auth_paths::AuthPathResolver;
+use awman::data::fs::api_db::SqliteSessionStore;
+use awman::data::fs::api_paths::ApiPaths;
+use awman::data::EngineWorkflowStateStore;
+use awman::engine::agent::AgentEngine;
+use awman::engine::auth::AuthEngine;
+use awman::engine::container::ContainerRuntime;
+use awman::engine::git::GitEngine;
+use awman::engine::overlay::OverlayEngine;
+use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 
 fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
-    let paths = HeadlessPaths::from_root(root);
+    let paths = ApiPaths::from_root(root);
     paths.ensure_root().expect("ensure_root");
     let store = SqliteSessionStore::open(paths.root()).expect("open sqlite");
 
@@ -73,7 +73,7 @@ async fn spawn_router(
 }
 
 #[tokio::test]
-async fn real_network_headless_status_endpoint_returns_ok() {
+async fn real_network_api_status_endpoint_returns_ok() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_app_state(tmp.path(), AuthMode::Disabled);
     let Some((addr, server)) = spawn_router(state).await else {
@@ -102,7 +102,7 @@ async fn real_network_headless_status_endpoint_returns_ok() {
 }
 
 #[tokio::test]
-async fn real_network_headless_unknown_route_returns_404() {
+async fn real_network_api_unknown_route_returns_404() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_app_state(tmp.path(), AuthMode::Disabled);
     let Some((addr, server)) = spawn_router(state).await else {
@@ -118,7 +118,7 @@ async fn real_network_headless_unknown_route_returns_404() {
 }
 
 #[tokio::test]
-async fn real_network_headless_workdirs_endpoint_returns_200() {
+async fn real_network_api_workdirs_endpoint_returns_200() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_app_state(tmp.path(), AuthMode::Disabled);
     let Some((addr, server)) = spawn_router(state).await else {
@@ -134,7 +134,7 @@ async fn real_network_headless_workdirs_endpoint_returns_200() {
 }
 
 #[tokio::test]
-async fn real_network_headless_auth_required_when_enabled() {
+async fn real_network_api_auth_required_when_enabled() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_app_state(
         tmp.path(),
@@ -159,7 +159,7 @@ async fn real_network_headless_auth_required_when_enabled() {
 }
 
 #[tokio::test]
-async fn real_network_headless_auth_accepts_valid_key() {
+async fn real_network_api_auth_accepts_valid_key() {
     use ring::digest;
     let tmp = tempfile::tempdir().unwrap();
 

@@ -9,7 +9,7 @@ use crate::data::error::DataError;
 /// Directory name for global workflows under the global home.
 pub const GLOBAL_WORKFLOWS_SUBDIR: &str = "workflows";
 
-/// Directory name for per-repo workflows under `<git_root>/.amux/`.
+/// Directory name for per-repo workflows under `<git_root>/.awman/`.
 pub const REPO_WORKFLOWS_SUBDIR: &str = "workflows";
 
 /// Resolves global and per-repo workflow directories.
@@ -43,12 +43,12 @@ impl WorkflowDirs {
     pub fn repo_dir(&self) -> Option<PathBuf> {
         self.git_root
             .as_ref()
-            .map(|r| r.join(".amux").join(REPO_WORKFLOWS_SUBDIR))
+            .map(|r| r.join(".awman").join(REPO_WORKFLOWS_SUBDIR))
     }
 
     /// Path to the per-repo workflows directory, given an explicit git root.
     pub fn repo_dir_for(git_root: &Path) -> PathBuf {
-        git_root.join(".amux").join(REPO_WORKFLOWS_SUBDIR)
+        git_root.join(".awman").join(REPO_WORKFLOWS_SUBDIR)
     }
 
     /// Create the global workflows directory on disk, if missing.

@@ -10,3 +10,4 @@
 mod helpers;
 
 mod cli_subprocess;
+mod rename_0077;

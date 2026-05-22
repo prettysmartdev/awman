@@ -5,7 +5,7 @@
 //! (`InitEngine`, `ReadyEngine`) can consume them without crossing
 //! into Layer 2.
 
-/// Prompt used by `amux ready --build` and the init audit phase.
+/// Prompt used by `awman ready --build` and the init audit phase.
 pub fn ready_audit_prompt() -> &'static str {
     "scan this project and determine every tool needed to build, run, \
 and test it per the local development workflows defined in the aspec. Modify Dockerfile.dev \
@@ -15,7 +15,7 @@ and can be executed by the container entrypoint command. Only modify Dockerfile.
 modify any other files. Do not add any new files."
 }
 
-/// Prompt used by `amux init` for the post-build audit. Same as the ready
+/// Prompt used by `awman init` for the post-build audit. Same as the ready
 /// prompt today; isolated so it can diverge if the user-facing flow changes.
 pub fn init_audit_prompt() -> &'static str {
     ready_audit_prompt()

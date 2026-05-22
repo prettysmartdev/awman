@@ -30,7 +30,7 @@ pub struct ContainerProgress {
 /// Byte-stream I/O channels detached from a frontend so the engine can bridge
 /// them to a real PTY in the container backend.
 ///
-/// When a frontend opts into PTY bridging (TUI, headless), the engine takes
+/// When a frontend opts into PTY bridging (TUI, API), the engine takes
 /// ownership of these channels in `run_with_frontend` and spawns reader/writer
 /// tasks against the PTY master. When a frontend does not opt in (the bare
 /// CLI), `take_container_io` returns `None` and the backend falls back to its
@@ -59,9 +59,9 @@ pub struct ContainerIo {
 }
 
 /// Abstract container-side I/O. Implementations live in Layer 3 (CLI binds
-/// stdio, TUI binds a PTY, headless binds an SSE/WebSocket stream).
+/// stdio, TUI binds a PTY, API binds an SSE/WebSocket stream).
 ///
-/// `read_stdin` is async so that async frontends (TUI, headless) do not need
+/// `read_stdin` is async so that async frontends (TUI, API) do not need
 /// to block a thread. CLI frontends use `tokio::task::spawn_blocking` at their
 /// implementation site.
 #[async_trait]
@@ -79,7 +79,7 @@ pub trait ContainerFrontend: UserMessageSink + Send {
     ///
     /// If `Some`, the backend should bridge the container's PTY directly via
     /// these channels (instead of inheriting host stdio). The default
-    /// implementation returns `None` — appropriate for CLI/headless frontends
+    /// implementation returns `None` — appropriate for CLI/API frontends
     /// that have no PTY to bridge.
     ///
     /// Once channels have been taken, `write_stdout`/`read_stdin`/`resize_pty`

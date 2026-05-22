@@ -92,21 +92,21 @@ pub enum CommandError {
     #[error("remote transport error: {0}")]
     RemoteTransport(String),
 
-    // ── Headless ──────────────────────────────────────────────────────────
-    #[error("headless workdir not found: {path}")]
-    HeadlessWorkdirNotFound { path: PathBuf },
+    // ── API ───────────────────────────────────────────────────────────────
+    #[error("API workdir not found: {path}")]
+    ApiWorkdirNotFound { path: PathBuf },
 
-    #[error("headless server already running on PID {pid}")]
-    HeadlessAlreadyRunning { pid: u32 },
+    #[error("API server already running on PID {pid}")]
+    ApiServerAlreadyRunning { pid: u32 },
 
-    #[error("headless server is not running")]
-    HeadlessNotRunning,
+    #[error("API server is not running")]
+    ApiServerNotRunning,
 
-    #[error("no API key configured; run `amux headless start --refresh-key` first, or pass `--dangerously-skip-auth`")]
-    HeadlessAuthMissing,
+    #[error("no API key configured; run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`")]
+    ApiServerAuthMissing,
 
     // ── Remote ────────────────────────────────────────────────────────────
-    #[error("no remote session id; pass --session <id> or run `amux remote session start`")]
+    #[error("no remote session id; pass --session <id> or run `awman remote session start`")]
     RemoteSessionMissing,
 
     #[error("failed to kill remote session '{session_id}': {reason}")]
@@ -116,7 +116,7 @@ pub enum CommandError {
     #[error("work item {number} not found in aspec/work-items/")]
     WorkItemNotFound { number: u32 },
 
-    #[error("spec template missing at {path}; run `amux init --aspec` to create it")]
+    #[error("spec template missing at {path}; run `awman init --aspec` to create it")]
     SpecTemplateMissing { path: std::path::PathBuf },
 
     #[error("invalid overlay spec '{spec}': {reason}")]

@@ -1,8 +1,8 @@
-//! `HeadlessDispatchFrontend` — the single Layer 3 struct that implements
-//! every per-command frontend trait for headless HTTP command dispatch.
+//! `ApiDispatchFrontend` — the single Layer 3 struct that implements
+//! every per-command frontend trait for API HTTP command dispatch.
 //!
 //! When a `POST /v1/commands` request arrives, the route handler constructs
-//! a `HeadlessDispatchFrontend` pre-loaded with the parsed args/flags from
+//! a `ApiDispatchFrontend` pre-loaded with the parsed args/flags from
 //! the HTTP request body, then hands it to `Dispatch::run_command`. All
 //! output (UserMessages, container stdout/stderr) is written to the
 //! command's `output.log` file on disk. SSE clients tailing the log see
@@ -29,8 +29,8 @@ use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest,
 use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
 use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
-use crate::command::commands::headless::HeadlessCommandFrontend;
-use crate::command::commands::headless::HeadlessServeConfig;
+use crate::command::commands::api_server::ApiServerCommandFrontend;
+use crate::command::commands::api_server::ApiServeConfig;
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
@@ -75,14 +75,14 @@ struct ParsedArgs {
     args_vec: HashMap<String, Vec<String>>,
 }
 
-/// The headless dispatch frontend. Owns a handle to the command's log file
+/// The API dispatch frontend. Owns a handle to the command's log file
 /// for streaming output.
-pub struct HeadlessDispatchFrontend {
+pub struct ApiDispatchFrontend {
     parsed: ParsedArgs,
     log_file: Arc<Mutex<std::fs::File>>,
 }
 
-impl HeadlessDispatchFrontend {
+impl ApiDispatchFrontend {
     /// Construct a new frontend from the HTTP request's subcommand + args.
     ///
     /// `log_path` is the `output.log` file that all output will be written to.
@@ -229,7 +229,7 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
         }
     }
 
-    // --non-interactive is always implied for headless dispatch.
+    // --non-interactive is always implied for API dispatch.
     bools.insert("non-interactive".to_string(), true);
 
     ParsedArgs {
@@ -246,7 +246,7 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
 
 // ─── UserMessageSink ────────────────────────────────────────────────────────
 
-impl UserMessageSink for HeadlessDispatchFrontend {
+impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
         let prefix = match msg.level {
             crate::engine::message::MessageLevel::Info => "[INFO]",
@@ -262,7 +262,7 @@ impl UserMessageSink for HeadlessDispatchFrontend {
 
 // ─── CommandFrontend (flag/argument access) ─────────────────────────────────
 
-impl CommandFrontend for HeadlessDispatchFrontend {
+impl CommandFrontend for ApiDispatchFrontend {
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         Ok(self.parsed.bools.get(flag).copied())
     }
@@ -320,7 +320,7 @@ impl CommandFrontend for HeadlessDispatchFrontend {
 // ─── ContainerFrontend ──────────────────────────────────────────────────────
 
 #[async_trait]
-impl ContainerFrontend for HeadlessDispatchFrontend {
+impl ContainerFrontend for ApiDispatchFrontend {
     fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
         if let Ok(mut f) = self.log_file.lock() {
             let _ = f.write_all(bytes);
@@ -338,7 +338,7 @@ impl ContainerFrontend for HeadlessDispatchFrontend {
     }
 
     async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        Ok(0) // EOF — headless has no interactive stdin
+        Ok(0) // EOF — API frontend has no interactive stdin
     }
 
     fn report_status(&mut self, status: ContainerStatus) {
@@ -372,20 +372,20 @@ impl ContainerFrontend for HeadlessDispatchFrontend {
 
 // ─── HasContainerFrontend ───────────────────────────────────────────────────
 
-impl HasContainerFrontend for HeadlessDispatchFrontend {
+impl HasContainerFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-        Box::new(HeadlessContainerSink {
+        Box::new(ApiContainerSink {
             log_file: Arc::clone(&self.log_file),
         })
     }
 }
 
 /// Standalone container frontend that writes to the shared log file.
-struct HeadlessContainerSink {
+struct ApiContainerSink {
     log_file: Arc<Mutex<std::fs::File>>,
 }
 
-impl UserMessageSink for HeadlessContainerSink {
+impl UserMessageSink for ApiContainerSink {
     fn write_message(&mut self, msg: UserMessage) {
         let prefix = match msg.level {
             crate::engine::message::MessageLevel::Info => "[INFO]",
@@ -402,7 +402,7 @@ impl UserMessageSink for HeadlessContainerSink {
 }
 
 #[async_trait]
-impl ContainerFrontend for HeadlessContainerSink {
+impl ContainerFrontend for ApiContainerSink {
     fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
         if let Ok(mut f) = self.log_file.lock() {
             let _ = f.write_all(bytes);
@@ -427,7 +427,7 @@ impl ContainerFrontend for HeadlessContainerSink {
 
 // ─── MountScopeFrontend ─────────────────────────────────────────────────────
 
-impl MountScopeFrontend for HeadlessDispatchFrontend {
+impl MountScopeFrontend for ApiDispatchFrontend {
     fn ask_mount_scope(
         &mut self,
         _git_root: &Path,
@@ -439,7 +439,7 @@ impl MountScopeFrontend for HeadlessDispatchFrontend {
 
 // ─── AgentSetupFrontend ─────────────────────────────────────────────────────
 
-impl AgentSetupFrontend for HeadlessDispatchFrontend {
+impl AgentSetupFrontend for ApiDispatchFrontend {
     fn ask_agent_setup(
         &mut self,
         _requested: &AgentName,
@@ -459,7 +459,7 @@ impl AgentSetupFrontend for HeadlessDispatchFrontend {
 
 // ─── AgentAuthFrontend ──────────────────────────────────────────────────────
 
-impl AgentAuthFrontend for HeadlessDispatchFrontend {
+impl AgentAuthFrontend for ApiDispatchFrontend {
     fn ask_agent_auth_consent(
         &mut self,
         _agent: &AgentName,
@@ -471,7 +471,7 @@ impl AgentAuthFrontend for HeadlessDispatchFrontend {
 
 // ─── WorkflowFrontend ───────────────────────────────────────────────────────
 
-impl WorkflowFrontend for HeadlessDispatchFrontend {
+impl WorkflowFrontend for ApiDispatchFrontend {
     fn show_workflow_control_board(
         &mut self,
         _state: &crate::data::workflow_state::WorkflowState,
@@ -518,7 +518,7 @@ impl WorkflowFrontend for HeadlessDispatchFrontend {
 
 // ─── WorktreeLifecycleFrontend ──────────────────────────────────────────────
 
-impl WorktreeLifecycleFrontend for HeadlessDispatchFrontend {
+impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
     fn ask_pre_worktree_uncommitted_files(
         &mut self,
         _files: &[String],
@@ -597,7 +597,7 @@ impl WorktreeLifecycleFrontend for HeadlessDispatchFrontend {
 
 // ─── InitFrontend ───────────────────────────────────────────────────────────
 
-impl InitFrontend for HeadlessDispatchFrontend {
+impl InitFrontend for ApiDispatchFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
         Ok(false)
     }
@@ -614,7 +614,7 @@ impl InitFrontend for HeadlessDispatchFrontend {
         self.write_to_log(&format!("[INFO] Init step '{step}': {status:?}"));
     }
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-        Box::new(HeadlessContainerSink {
+        Box::new(ApiContainerSink {
             log_file: Arc::clone(&self.log_file),
         })
     }
@@ -623,7 +623,7 @@ impl InitFrontend for HeadlessDispatchFrontend {
 
 // ─── ReadyFrontend ──────────────────────────────────────────────────────────
 
-impl ReadyFrontend for HeadlessDispatchFrontend {
+impl ReadyFrontend for ApiDispatchFrontend {
     fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
         Ok(true)
     }
@@ -640,7 +640,7 @@ impl ReadyFrontend for HeadlessDispatchFrontend {
         self.write_to_log(&format!("[INFO] Ready step '{step}': {status:?}"));
     }
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-        Box::new(HeadlessContainerSink {
+        Box::new(ApiContainerSink {
             log_file: Arc::clone(&self.log_file),
         })
     }
@@ -649,14 +649,14 @@ impl ReadyFrontend for HeadlessDispatchFrontend {
 
 // ─── Per-command frontend markers ───────────────────────────────────────────
 
-impl RemoteCommandFrontend for HeadlessDispatchFrontend {}
-impl DownloadCommandFrontend for HeadlessDispatchFrontend {}
+impl RemoteCommandFrontend for ApiDispatchFrontend {}
+impl DownloadCommandFrontend for ApiDispatchFrontend {}
 
-impl StatusCommandFrontend for HeadlessDispatchFrontend {}
+impl StatusCommandFrontend for ApiDispatchFrontend {}
 
-impl AuthCommandFrontend for HeadlessDispatchFrontend {}
+impl AuthCommandFrontend for ApiDispatchFrontend {}
 
-impl ConfigCommandFrontend for HeadlessDispatchFrontend {
+impl ConfigCommandFrontend for ApiDispatchFrontend {
     fn present_config_table(
         &mut self,
         _rows: &[ConfigFieldRow],
@@ -666,25 +666,25 @@ impl ConfigCommandFrontend for HeadlessDispatchFrontend {
 }
 
 #[async_trait]
-impl HeadlessCommandFrontend for HeadlessDispatchFrontend {
+impl ApiServerCommandFrontend for ApiDispatchFrontend {
     async fn serve_until_shutdown(
         &mut self,
-        _config: HeadlessServeConfig,
+        _config: ApiServeConfig,
     ) -> Result<(), CommandError> {
         Err(CommandError::Other(
-            "Cannot start a nested headless server from within headless dispatch".into(),
+            "Cannot start a nested API server from within API dispatch".into(),
         ))
     }
 }
 
-impl ChatCommandFrontend for HeadlessDispatchFrontend {
+impl ChatCommandFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
 }
 
-impl ExecPromptCommandFrontend for HeadlessDispatchFrontend {}
+impl ExecPromptCommandFrontend for ApiDispatchFrontend {}
 
 #[async_trait]
-impl ExecWorkflowCommandFrontend for HeadlessDispatchFrontend {
+impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.write_to_log(&format!(
@@ -698,14 +698,14 @@ impl ExecWorkflowCommandFrontend for HeadlessDispatchFrontend {
         _completed_steps: usize,
         _total_steps: usize,
     ) -> Result<bool, CommandError> {
-        // Headless mode has no interactive prompt; resume by default.
+        // API mode has no interactive prompt; resume by default.
         Ok(true)
     }
 }
 
-impl SpecsCommandFrontend for HeadlessDispatchFrontend {}
+impl SpecsCommandFrontend for ApiDispatchFrontend {}
 
-impl NewCommandFrontend for HeadlessDispatchFrontend {}
+impl NewCommandFrontend for ApiDispatchFrontend {}
 
 #[cfg(test)]
 mod tests {
@@ -715,10 +715,10 @@ mod tests {
         subcommand: &str,
         args: &[&str],
         tmp: &std::path::Path,
-    ) -> HeadlessDispatchFrontend {
+    ) -> ApiDispatchFrontend {
         let log_path = tmp.join("test.log");
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        HeadlessDispatchFrontend::new(subcommand, &args, &log_path).unwrap()
+        ApiDispatchFrontend::new(subcommand, &args, &log_path).unwrap()
     }
 
     // ─── flag_bool ────────────────────────────────────────────────────────────
@@ -742,7 +742,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = make_frontend("chat", &["--background", "true"], tmp.path());
         assert_eq!(
-            f.flag_bool(&["headless", "start"], "background").unwrap(),
+            f.flag_bool(&["api", "start"], "background").unwrap(),
             Some(true)
         );
     }
@@ -752,7 +752,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = make_frontend("chat", &["--background", "false"], tmp.path());
         assert_eq!(
-            f.flag_bool(&["headless", "start"], "background").unwrap(),
+            f.flag_bool(&["api", "start"], "background").unwrap(),
             Some(false)
         );
     }
@@ -791,9 +791,9 @@ mod tests {
     #[test]
     fn flag_u16_parses_port_value() {
         let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("headless start", &["--port", "9876"], tmp.path());
+        let f = make_frontend("api start", &["--port", "9876"], tmp.path());
         assert_eq!(
-            f.flag_u16(&["headless", "start"], "port").unwrap(),
+            f.flag_u16(&["api", "start"], "port").unwrap(),
             Some(9876)
         );
     }
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(
             f.flag_bool(&["chat"], "non-interactive").unwrap(),
             Some(true),
-            "non-interactive must always be set in headless mode"
+            "non-interactive must always be set in API mode"
         );
     }
 
@@ -841,11 +841,11 @@ mod tests {
     fn flag_strings_collects_multiple_values() {
         let tmp = tempfile::tempdir().unwrap();
         let f = make_frontend(
-            "headless start",
+            "api start",
             &["--workdirs", "/a", "--workdirs", "/b"],
             tmp.path(),
         );
-        let dirs = f.flag_strings(&["headless", "start"], "workdirs").unwrap();
+        let dirs = f.flag_strings(&["api", "start"], "workdirs").unwrap();
         assert!(dirs.contains(&"/a".to_string()));
         assert!(dirs.contains(&"/b".to_string()));
     }

@@ -1,8 +1,8 @@
-# amux Architecture Overview
+# awman Architecture Overview
 
 ## For Contributors
 
-amux is organized as a **four-layer architecture** that ensures clean separation of concerns and functional parity across CLI, TUI, and Headless frontends.
+awman is organized as a **four-layer architecture** that ensures clean separation of concerns and functional parity across CLI, TUI, and API frontends.
 
 ### The Four Layers
 
@@ -10,8 +10,8 @@ amux is organized as a **four-layer architecture** that ensures clean separation
 Handles all persistent state, configuration, and file I/O.
 
 - **Session and workflow state**: `Session` is the core type representing a session's context (git repo, config, agents, current execution state)
-- **Configuration**: Repo-level (`.amux/config.json`) and global (`~/.amux/config.json`) config with environment variable merging
-- **Persistence**: SQLite storage (headless sessions), JSON (workflows and state)
+- **Configuration**: Repo-level (`.awman/config.json`) and global (`~/.awman/config.json`) config with environment variable merging
+- **Persistence**: SQLite storage (API sessions), JSON (workflows and state)
 - **File I/O**: Reading/writing configs, overlays, workspace directories
 
 **Imports**: Only `std`, external crates, and `crate::data::*`
@@ -42,7 +42,7 @@ Pure presentation layer. No business logic. Three implementations:
 
 - **CLI** (`src/frontend/cli/`): Command-line interface using `clap`
 - **TUI** (`src/frontend/tui/`): Interactive terminal UI using `Ratatui`
-- **Headless** (`src/frontend/headless/`): HTTP API server with WebSocket/SSE streaming
+- **API** (`src/frontend/API/`): HTTP API server with WebSocket/SSE streaming
 
 Frontends communicate with Layer 2 via **trait delegation**. For example:
 - `ContainerFrontend` trait: provides PTY binding or stdout capture
@@ -69,17 +69,17 @@ Prefer structured objects with methods over free `pub fn` signatures. For exampl
 - **Layer 0**: Hermetic tests (temp files, no network)
 - **Layer 1**: Real-system tests (Docker, git, filesystem)
 - **Layer 2**: Integration tests with real Layers 0+1
-- **Layer 3**: Parity tests ensuring CLI/TUI/Headless behave identically
+- **Layer 3**: Parity tests ensuring CLI/TUI/API behave identically
 - **Layer 4**: Smoke tests of the binary
 
 ---
 
-## For Users: How amux Works
+## For Users: How awman Works
 
-You interact with amux through one of three frontends:
+You interact with awman through one of three frontends:
 
 ### Interactive Mode (TUI)
-Run `amux` with no arguments to launch the interactive terminal UI. Manage multiple sessions (tabs), execute agents, and monitor workflows in real-time.
+Run `awman` with no arguments to launch the interactive terminal UI. Manage multiple sessions (tabs), execute agents, and monitor workflows in real-time.
 
 **Behind the scenes**:
 1. `src/main.rs` detects interactive mode and launches the TUI frontend
@@ -90,7 +90,7 @@ Run `amux` with no arguments to launch the interactive terminal UI. Manage multi
 6. TUI receives the outcome and renders it
 
 ### Command Mode (CLI)
-Run `amux <command> [flags]` to execute a single command and exit.
+Run `awman <command> [flags]` to execute a single command and exit.
 
 **Behind the scenes**:
 1. `src/main.rs` parses the command line via `clap` (populated from `Dispatch`)
@@ -99,11 +99,11 @@ Run `amux <command> [flags]` to execute a single command and exit.
 4. Same Layer 1–0 execution as TUI
 5. CLI renders output to stdout/stderr and exits
 
-### Headless Mode (HTTP API)
-Run `amux headless start` to launch a server providing HTTP endpoints for remote agents.
+### API Mode (HTTP API)
+Run `awman api start` to launch a server providing HTTP endpoints for remote agents.
 
 **Behind the scenes**:
-1. Headless frontend binds to a port and starts an HTTP server
+1. API frontend binds to a port and starts an HTTP server
 2. Incoming requests are routed to handlers that call `Dispatch`
 3. Responses are streamed back as JSON or Server-Sent Events (SSE)
 4. Session state is persisted in SQLite
@@ -126,13 +126,13 @@ Every command execution operates within a `Session`. The session captures:
 This ensures consistent behavior regardless of invocation mode.
 
 ### Rule 3: Identical Behavior Across Frontends
-Because business logic lives in Layer 2 and frontends are presentation-only, all three frontends execute identical code. A workflow behaves the same in CLI, TUI, and Headless mode.
+Because business logic lives in Layer 2 and frontends are presentation-only, all three frontends execute identical code. A workflow behaves the same in CLI, TUI, and API mode.
 
 ---
 
 ## Adding a New Feature
 
-To add a new command or feature to amux:
+To add a new command or feature to awman:
 
 1. **Define the data model** (Layer 0, `src/data/`)
    - Add structs to store new state
@@ -150,13 +150,13 @@ To add a new command or feature to amux:
 
 4. **Implement frontend-specific trait handlers** (Layer 3, `src/frontend/`)
    - If the command needs user input, define a trait in Layer 2
-   - Implement the trait in each frontend (CLI, TUI, Headless)
+   - Implement the trait in each frontend (CLI, TUI, API)
 
 5. **Write tests**
    - Layer 0: Hermetic config/persistence tests
    - Layer 1: Real-system tests if using containers/git
    - Layer 2: Integration tests of the command
-   - Layer 3: Parity tests in `tests/cli_parity/`, `tests/tui_parity/`, `tests/headless_parity/`
+   - Layer 3: Parity tests in `tests/cli_parity/`, `tests/tui_parity/`, `tests/api_parity/`
 
 ---
 

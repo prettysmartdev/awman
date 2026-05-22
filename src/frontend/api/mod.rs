@@ -1,4 +1,4 @@
-//! Headless HTTP frontend — full Axum server.
+//! API HTTP frontend — full Axum server.
 //!
 //! Wire-identical to `oldsrc/commands/headless/server.rs`; the only internal
 //! change is that `POST /v1/commands` dispatches through Layer 2 instead of
@@ -7,22 +7,22 @@
 pub mod command_frontend;
 pub mod routes;
 
-use crate::command::commands::headless::HeadlessServeConfig;
+use crate::command::commands::api_server::ApiServeConfig;
 use crate::command::error::CommandError;
 
-/// Boot the headless HTTP server and block until shutdown signal.
-pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
+/// Boot the API HTTP server and block until shutdown signal.
+pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use crate::data::fs::headless_db::SqliteSessionStore;
-    use crate::data::fs::headless_paths::HeadlessPaths;
+    use crate::data::fs::api_db::SqliteSessionStore;
+    use crate::data::fs::api_paths::ApiPaths;
 
-    let headless_paths = HeadlessPaths::from_process_env().map_err(CommandError::Data)?;
-    headless_paths.ensure_root().map_err(CommandError::Data)?;
+    let api_paths = ApiPaths::from_process_env().map_err(CommandError::Data)?;
+    api_paths.ensure_root().map_err(CommandError::Data)?;
 
-    let store = SqliteSessionStore::open(headless_paths.root()).map_err(CommandError::Data)?;
+    let store = SqliteSessionStore::open(api_paths.root()).map_err(CommandError::Data)?;
 
     // Startup cleanup: remove closed sessions older than 24 hours.
     if let Ok(deleted) = store.delete_closed_sessions_older_than(24) {
@@ -38,14 +38,14 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
     let auth_paths = crate::data::fs::auth_paths::AuthPathResolver::from_process_env()
         .map_err(CommandError::Data)?;
     let auth_engine =
-        crate::engine::auth::AuthEngine::with_paths(auth_paths.clone(), headless_paths.clone());
+        crate::engine::auth::AuthEngine::with_paths(auth_paths.clone(), api_paths.clone());
 
     let auth_mode = if config.dangerously_skip_auth {
         routes::AuthMode::Disabled
     } else {
         let hash = auth_engine.read_api_key_hash()?.ok_or_else(|| {
             CommandError::Other(
-                "No API key hash on disk. Run `amux auth --refresh-key` first.".into(),
+                "No API key hash on disk. Run `awman auth --refresh-key` first.".into(),
             )
         })?;
         routes::AuthMode::Enabled {
@@ -68,7 +68,7 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
     // session-scoped store via the workdir, but Engines requires one at
     // construction time.
     let workflow_state_store = Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-        headless_paths.root(),
+        api_paths.root(),
     ));
 
     let engines = crate::command::dispatch::Engines {
@@ -111,7 +111,7 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
 
     let state = Arc::new(routes::AppState {
         store,
-        paths: headless_paths,
+        paths: api_paths,
         workdirs: config.workdirs,
         started_at: Instant::now(),
         busy_sessions: tokio::sync::Mutex::new(HashSet::new()),
@@ -128,7 +128,7 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
         port = config.port,
         bind_ip = %config.bind_ip,
         tls = config.tls_material.is_some(),
-        "Headless server starting"
+        "awman API mode starting"
     );
 
     // Spawn the shutdown signal as a background task — we trigger
@@ -200,7 +200,7 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
         CommandError::Other(format!("Server error: {e}"))
     })?;
 
-    tracing::info!(port = config.port, "Headless server listening");
+    tracing::info!(port = config.port, "awman API mode listening");
 
     // Grace period for running commands (30s).
     const GRACE_SECS: u64 = 30;
@@ -222,6 +222,6 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError> {
         }
     }
 
-    tracing::info!("Headless server stopped");
+    tracing::info!("awman API mode stopped");
     Ok(())
 }

@@ -1,5 +1,5 @@
 //! Legacy box-drawing banner emitted when a fresh API key is generated.
-//! Format is byte-identical to `oldsrc/commands/headless/auth.rs::print_key_banner`.
+//! Format is byte-identical to `oldsrc/commands/api_server/auth.rs::print_key_banner`.
 
 /// Render the legacy banner around a 64-char hex API key.
 pub fn render_api_key_banner(key: &str) -> String {
@@ -7,7 +7,7 @@ pub fn render_api_key_banner(key: &str) -> String {
     let inner_width: usize = 67;
     let key_line = format!("  {key}  ");
     let key_padded = format!("{:<width$}", key_line, width = inner_width);
-    let title_line = "  amux headless API key (store this — it will not be shown again)  ";
+    let title_line = "  awman API key (store this — it will not be shown again)         ";
     let bar = "═".repeat(inner_width);
     format!("╔{bar}╗\n║{title_line}║\n║{key_padded}║\n╚{bar}╝")
 }
@@ -22,8 +22,8 @@ mod tests {
         assert!(out.starts_with("╔"), "banner must open with ╔");
         assert!(out.ends_with("╝"), "banner must close with ╝");
         assert!(
-            out.contains("amux headless API key (store this"),
-            "banner must include legacy title"
+            out.contains("awman API key (store this"),
+            "banner must include title"
         );
     }
 

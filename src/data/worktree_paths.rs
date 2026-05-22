@@ -1,6 +1,6 @@
 //! Worktree path resolution — Layer 0.
 //!
-//! Resolves `~/.amux/worktrees/<repo-name>/...` paths and the deterministic
+//! Resolves `~/.awman/worktrees/<repo-name>/...` paths and the deterministic
 //! branch names that go with them. Pure path computation — no git invocation
 //! (that's `GitEngine`).
 
@@ -8,17 +8,17 @@ use std::path::{Path, PathBuf};
 
 use crate::data::error::DataError;
 
-/// Branch name for a work-item worktree: `amux/work-item-NNNN`.
+/// Branch name for a work-item worktree: `awman/work-item-NNNN`.
 pub fn worktree_branch_name(work_item: u32) -> String {
-    format!("amux/work-item-{work_item:04}")
+    format!("awman/work-item-{work_item:04}")
 }
 
-/// Branch name for a named workflow worktree: `amux/workflow-<name>`.
+/// Branch name for a named workflow worktree: `awman/workflow-<name>`.
 pub fn worktree_branch_name_for_workflow(name: &str) -> String {
-    format!("amux/workflow-{name}")
+    format!("awman/workflow-{name}")
 }
 
-/// Resolves worktree paths beneath `<HOME>/.amux/worktrees/<repo-name>/`.
+/// Resolves worktree paths beneath `<HOME>/.awman/worktrees/<repo-name>/`.
 #[derive(Debug, Clone)]
 pub struct WorktreePaths {
     home: PathBuf,
@@ -37,27 +37,27 @@ impl WorktreePaths {
         Self { home: home.into() }
     }
 
-    /// `~/.amux/worktrees/<repo-name>/<NNNN>/`.
+    /// `~/.awman/worktrees/<repo-name>/<NNNN>/`.
     pub fn for_work_item(&self, git_root: &Path, work_item: u32) -> PathBuf {
         let repo = git_root
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("repo");
         self.home
-            .join(".amux")
+            .join(".awman")
             .join("worktrees")
             .join(repo)
             .join(format!("{work_item:04}"))
     }
 
-    /// `~/.amux/worktrees/<repo-name>/wf-<name>/`.
+    /// `~/.awman/worktrees/<repo-name>/wf-<name>/`.
     pub fn for_workflow(&self, git_root: &Path, name: &str) -> PathBuf {
         let repo = git_root
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("repo");
         self.home
-            .join(".amux")
+            .join(".awman")
             .join("worktrees")
             .join(repo)
             .join(format!("wf-{name}"))
@@ -84,8 +84,8 @@ mod tests {
 
     #[test]
     fn branch_names_are_stable() {
-        assert_eq!(worktree_branch_name(0), "amux/work-item-0000");
-        assert_eq!(worktree_branch_name(42), "amux/work-item-0042");
-        assert_eq!(worktree_branch_name_for_workflow("x"), "amux/workflow-x");
+        assert_eq!(worktree_branch_name(0), "awman/work-item-0000");
+        assert_eq!(worktree_branch_name(42), "awman/work-item-0042");
+        assert_eq!(worktree_branch_name_for_workflow("x"), "awman/workflow-x");
     }
 }

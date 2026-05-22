@@ -39,7 +39,7 @@ impl ContainerRuntime {
             }
             Some(other) => {
                 eprintln!(
-                    "amux: warning: unknown runtime '{}', falling back to Docker",
+                    "awman: warning: unknown runtime '{}', falling back to Docker",
                     other
                 );
                 Backend::Docker
@@ -179,7 +179,7 @@ impl ContainerRuntime {
         }
     }
 
-    /// List all running amux containers without requiring a session.
+    /// List all running awman containers without requiring a session.
     /// Used by the TUI event loop for stats polling.
     pub fn list_running_sync(&self) -> Result<Vec<ContainerHandle>, EngineError> {
         self.backend.list_running_all()

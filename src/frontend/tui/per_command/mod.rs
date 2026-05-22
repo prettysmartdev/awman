@@ -13,7 +13,7 @@ mod container_frontend;
 mod download;
 mod exec_prompt;
 mod exec_workflow;
-mod headless;
+mod api_server;
 mod init;
 mod mount_scope;
 mod new;

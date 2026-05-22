@@ -30,7 +30,7 @@ use crate::engine::error::EngineError;
 
 /// Docker label applied to every amux-spawned container so `list_running`
 /// can filter to ours.
-const AMUX_LABEL: &str = "amux=true";
+const AWMAN_LABEL: &str = "awman=true";
 
 #[derive(Debug, Default)]
 pub(super) struct DockerBackend;
@@ -85,8 +85,8 @@ impl ContainerBackend for DockerBackend {
         // deduplicated by container ID.
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
-            &["ps", "--filter", "label=amux=true", "--format", format],
-            &["ps", "--filter", "name=amux-", "--format", format],
+            &["ps", "--filter", "label=awman=true", "--format", format],
+            &["ps", "--filter", "name=awman-", "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -137,8 +137,8 @@ impl ContainerBackend for DockerBackend {
     fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
-            &["ps", "--filter", "label=amux=true", "--format", format],
-            &["ps", "--filter", "name=amux-", "--format", format],
+            &["ps", "--filter", "label=awman=true", "--format", format],
+            &["ps", "--filter", "name=awman-", "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -627,16 +627,16 @@ pub(super) fn build_run_argv(
     args.push("--name".into());
     args.push(name.0.clone());
 
-    // Standard amux label so `list_running` can filter.
+    // Standard awman label so `list_running` can filter.
     args.push("--label".into());
-    args.push(AMUX_LABEL.into());
+    args.push(AWMAN_LABEL.into());
 
     // Session-scoped label — emitted when the option-builder threaded the
     // session id through. Lets `list_running` attribute containers to a
-    // specific amux session.
+    // specific awman session.
     if let Some(session_id) = &options.session_label {
         args.push("--label".into());
-        args.push(format!("amux.session={session_id}"));
+        args.push(format!("awman.session={session_id}"));
     }
 
     // Working dir.
@@ -782,7 +782,7 @@ pub(super) fn build_run_argv(
 }
 
 fn parse_stats_line(line: &str, fallback_name: &str) -> Result<ContainerStats, EngineError> {
-    // Format: "name|cpu%|memUsage" e.g. "amux-x|2.31%|123MiB / 4GiB"
+    // Format: "name|cpu%|memUsage" e.g. "awman-x|2.31%|123MiB / 4GiB"
     let parts: Vec<&str> = line.splitn(3, '|').collect();
     if parts.len() < 3 {
         return Err(EngineError::Container(format!(
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"--rm".to_string()));
         assert!(argv.contains(&"--label".to_string()));
-        assert!(argv.contains(&AMUX_LABEL.to_string()));
+        assert!(argv.contains(&AWMAN_LABEL.to_string()));
         // Image is the final positional arg.
         assert_eq!(argv.last().map(String::as_str), Some("img:latest"));
     }
@@ -932,22 +932,22 @@ mod tests {
 
     #[test]
     fn build_run_argv_env_passthrough_only_when_set() {
-        std::env::set_var("AMUX_TEST_ENV_DOCKER", "v1");
+        std::env::set_var("AWMAN_TEST_ENV_DOCKER", "v1");
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar("AMUX_TEST_ENV_DOCKER".into())),
-            ContainerOption::EnvPassthrough(EnvVar("AMUX_TEST_NEVER_SET_DOCKER".into())),
+            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_ENV_DOCKER".into())),
+            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_NEVER_SET_DOCKER".into())),
         ]);
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
         );
-        assert!(argv.contains(&"AMUX_TEST_ENV_DOCKER=v1".to_string()));
+        assert!(argv.contains(&"AWMAN_TEST_ENV_DOCKER=v1".to_string()));
         assert!(!argv
             .iter()
-            .any(|a| a.contains("AMUX_TEST_NEVER_SET_DOCKER")));
-        std::env::remove_var("AMUX_TEST_ENV_DOCKER");
+            .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")));
+        std::env::remove_var("AWMAN_TEST_ENV_DOCKER");
     }
 
     #[test]

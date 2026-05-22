@@ -91,7 +91,7 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
     match run_event_loop(&mut app) {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
-            eprintln!("amux: TUI error: {e}");
+            eprintln!("awman: TUI error: {e}");
             ExitCode::from(1)
         }
     }
@@ -1387,7 +1387,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -1464,10 +1464,10 @@ mod tests {
     #[test]
     fn bare_invocation_has_no_subcommand() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman"]).unwrap();
         assert!(
             m.subcommand_name().is_none(),
-            "bare `amux` must have no subcommand — main.rs uses this to route to TUI"
+            "bare `awman` must have no subcommand — main.rs uses this to route to TUI"
         );
     }
 
@@ -1475,9 +1475,9 @@ mod tests {
     fn subcommand_presence_routes_away_from_tui() {
         let cmd = CommandCatalogue::get().build_clap_command();
         for argv in [
-            vec!["amux", "status"],
-            vec!["amux", "ready"],
-            vec!["amux", "chat"],
+            vec!["awman", "status"],
+            vec!["awman", "ready"],
+            vec!["awman", "chat"],
         ] {
             let m = cmd.clone().try_get_matches_from(&argv).unwrap();
             assert!(
@@ -2403,7 +2403,7 @@ mod tests {
             crate::frontend::tui::tabs::ContainerWindowState::Maximized;
         while resize_rx.try_recv().is_ok() {}
         press_key(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
-        // Minimized ≠ Hidden so resize is attempted (may fail in headless env).
+        // Minimized ≠ Hidden so resize is attempted (may fail in CI env).
         // The key assertion: cycling from Hidden should not send resize even if Hidden
         // is explicitly set.
         app.active_tab_mut().container_window_state =

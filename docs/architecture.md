@@ -1,12 +1,12 @@
-# amux Architecture
+# awman Architecture
 
 ## Overview
 
 **Status**: The grand architecture refactor is complete as of work item 0073 (May 2026).
 
-amux is now built from a single, unified four-layer architecture:
+awman is now built from a single, unified four-layer architecture:
 
-- **`src/`** — the production source tree organized as a four-layer architecture. The `amux` binary is built from `src/main.rs`.
+- **`src/`** — the production source tree organized as a four-layer architecture. The `awman` binary is built from `src/main.rs`.
 
 For the best introduction to the new architecture, see the [Architecture Overview](10-architecture-overview.md) guide. The detailed specification is in [`aspec/architecture/2026-grand-architecture.md`](../aspec/architecture/2026-grand-architecture.md).
 
@@ -16,19 +16,19 @@ For the best introduction to the new architecture, see the [Architecture Overvie
 
 ### Purpose
 
-amux initially grew into three execution modes (CLI, TUI, headless) that share the same core functionality but implement it separately, producing subtle behavioural drift and making parity across modes impossible to guarantee. The grand architecture refactor (completed May 2026) reorganized the codebase into a strict four-layer system where every frontend is a thin presentation shell over a shared, tested core.
+awman initially grew into three execution modes (CLI, TUI, API) that share the same core functionality but implement it separately, producing subtle behavioural drift and making parity across modes impossible to guarantee. The grand architecture refactor (completed May 2026) reorganized the codebase into a strict four-layer system where every frontend is a thin presentation shell over a shared, tested core.
 
 ### Tenets
 
 1. **No upward calls.** Lower layers never call functions or use types from higher layers. If a lower layer needs to delegate upward, it defines a trait that a higher layer implements.
-2. **Frontends are dumb.** No frontend (CLI, TUI, headless) may implement business logic. All logic lives in Layer 2 (`command`) or below.
+2. **Frontends are dumb.** No frontend (CLI, TUI, API) may implement business logic. All logic lives in Layer 2 (`command`) or below.
 3. **Typed objects over free functions.** Every significant abstraction is a struct with methods. Free `pub fn` is acceptable only for stateless helpers, constructors, and one-off utilities.
 
 ### Layers
 
 ```
 Layer 4: binary    main.rs — sets up frontends, delegates everything
-Layer 3: frontend  CLI, TUI, Headless — input/output only
+Layer 3: frontend  CLI, TUI, API — input/output only
 Layer 2: command   Dispatch, per-command business logic
 Layer 1: engine    ContainerRuntime, WorkflowEngine, GitEngine, OverlayEngine, AuthEngine
 Layer 0: data      Session, config, filesystem, database, typed data
@@ -40,7 +40,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
 
-**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. All three frontends are fully functional. See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
+**Layer 3 (frontend)** contains the CLI, TUI, and API server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. All three frontends are fully functional. See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
 
 **Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, constructs engines, opens a `Session`, and routes to the CLI or TUI frontend. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
 
@@ -55,7 +55,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 | Layer 4 (binary) | WI 0069 | ✓ Complete | Apr 2026 |
 | Validation & Audit | WI 0073 | ✓ Complete | May 2026 |
 
-**Summary**: All layers fully implemented and validated. Full parity across CLI, TUI, and Headless frontends. Architecture lint passes. Test suite (>100 tests) covers all layers.
+**Summary**: All layers fully implemented and validated. Full parity across CLI, TUI, and API frontends. Architecture lint passes. Test suite (>100 tests) covers all layers.
 
 ---
 
@@ -63,7 +63,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 ```
 src/
-  main.rs                 Layer 4 entry point (the `amux` binary)
+  main.rs                 Layer 4 entry point (the `awman` binary)
   lib.rs                  Re-exports the four layers
   data/                   Layer 0 — fully implemented
     mod.rs
@@ -85,8 +85,8 @@ src/
       effective.rs        EffectiveConfig (merged view)
     fs/
       mod.rs
-      headless_db.rs      SqliteSessionStore, SessionRecord, CommandRecord
-      headless_paths.rs   HeadlessPaths
+      api_db.rs      SqliteSessionStore, SessionRecord, CommandRecord
+      api_paths.rs   ApiPaths
       workflow_state.rs   WorkflowStateStore (legacy alias kept for compat)
       skill_dirs.rs       SkillDirs
       workflow_dirs.rs    WorkflowDirs
@@ -118,7 +118,7 @@ src/
     overlay/
       mod.rs              OverlayEngine, OverlayRequest, DirectorySpec, CLAUDE_DENYLIST
     auth/
-      mod.rs              AuthEngine (headless API keys, TLS, keychain credentials)
+      mod.rs              AuthEngine (API API keys, TLS, keychain credentials)
       keychain.rs         Per-OS keychain backend (keyring crate)
     agent/
       mod.rs              AgentEngine, AgentRunOptions
@@ -146,7 +146,7 @@ src/
         mod.rs            Re-exports
         clap.rs           CommandCatalogue::build_clap_command()
         tui_hints.rs      CommandCatalogue::tui_hint_for(), tui_completions()
-        headless_schema.rs CommandCatalogue::openapi_schema(), rest_route_table()
+        api_schema.rs CommandCatalogue::openapi_schema(), rest_route_table()
     commands/
       mod.rs              Re-exports all *Command types
       command_trait.rs    Command trait (run_with_frontend)
@@ -158,9 +158,9 @@ src/
       download.rs         DownloadCommand, DownloadOutcome
       exec_prompt.rs      ExecPromptCommand, ExecPromptCommandFrontend, ExecPromptCommandFlags, ExecPromptOutcome
       exec_workflow.rs    ExecWorkflowCommand, ExecWorkflowCommandFrontend, ExecWorkflowCommandFlags, ExecWorkflowOutcome, WorkflowSummary
-      headless.rs         HeadlessCommand, HeadlessSubcommand, HeadlessStartFlags, HeadlessKillFlags, HeadlessLogsFlags, HeadlessStatusFlags, HeadlessOutcome
-      headless/
-        banner.rs         Legacy headless banner format constants
+      api.rs         ApiCommand, ApiSubcommand, ApiStartFlags, ApiKillFlags, ApiLogsFlags, ApiStatusFlags, ApiOutcome
+      API/
+        banner.rs         Legacy API banner format constants
       prompt_templates.rs Interview/amend prompt builders for `specs amend` and `new {spec,workflow,skill}`
       init.rs             InitCommand, InitCommandFrontend, InitCommandFlags, InitOutcome
       mount_scope.rs      MountScope, MountScopeFrontend, MountScopeDecision
@@ -172,7 +172,7 @@ src/
       status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
       worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
   frontend/
-    mod.rs                Declares cli, tui, headless sub-modules
+    mod.rs                Declares cli, tui, API sub-modules
     cli/
       mod.rs              RuntimeContext; run() entry point; render_outcome/render_error; error_exit_code
       command_frontend.rs CliFrontend (implements CommandFrontend + all *CommandFrontend marker traits); command_path_from_matches
@@ -183,7 +183,7 @@ src/
         chat.rs           ChatCommandFrontend impl
         exec_prompt.rs    ExecPromptCommandFrontend impl
         exec_workflow.rs  ExecWorkflowCommandFrontend + ContainerFrontend + WorkflowFrontend impls
-        headless.rs       HeadlessStartCommandFrontend impl (calls frontend::headless::serve)
+        api.rs       ApiStartCommandFrontend impl (calls frontend::api::serve)
         init.rs           InitCommandFrontend + InitFrontend impls
         ready.rs          ReadyCommandFrontend + ReadyFrontend impls
         agent_auth.rs     AgentAuthFrontend impl
@@ -214,7 +214,7 @@ src/
         download.rs       DownloadCommandFrontend impl
         exec_prompt.rs    ExecPromptCommandFrontend impl
         exec_workflow.rs  ExecWorkflowCommandFrontend impl
-        headless.rs       HeadlessCommandFrontend impl
+        api.rs       ApiCommandFrontend impl
         init.rs           InitCommandFrontend impl
         mount_scope.rs    MountScopeFrontend impl
         new.rs            NewCommandFrontend impl
@@ -230,8 +230,8 @@ src/
       text_edit.rs        TextEdit — single-line/multiline text editing with cursor and word movement
       user_message.rs     TuiUserMessageSink, SharedStatusLog, StatusLogEntry
       workflow_view.rs    render_workflow_strip() — per-step status strip
-    headless/
-      mod.rs              HeadlessServeConfig; placeholder serve() — ships in 0072
+    API/
+      mod.rs              ApiServeConfig; placeholder serve() — ships in 0072
   main.rs                 Layer 4 binary entrypoint
 ```
 
@@ -253,11 +253,11 @@ Nothing in `src/data/` ever spawns a process, opens a network socket, calls `git
 
 ### Session (`src/data/session.rs`)
 
-`Session` is the ruling type for every amux operation. It ties together a working directory, a resolved git root, loaded configurations, and the in-flight runtime state. Every command and workflow invocation starts with a `Session`.
+`Session` is the ruling type for every awman operation. It ties together a working directory, a resolved git root, loaded configurations, and the in-flight runtime state. Every command and workflow invocation starts with a `Session`.
 
 - The **CLI** creates one `Session` per invocation.
 - The **TUI** creates one `Session` per tab.
-- The **headless server** creates one `Session` per API session.
+- The **API server** creates one `Session` per API session.
 
 #### `SessionId`
 
@@ -306,7 +306,7 @@ Mutable runtime state owned by a `Session`. `record_error(msg)` and `record_note
 
 `CommandInvocation` is the persistable record of a single in-flight command (subcommand name, args, status, exit code, timestamps). `WorkflowInvocation` is the persistable record of a running workflow (workflow name and hash, work item, step records, paused/yolo/auto flags, current step index).
 
-Both are serializable via serde and stored in `SessionState` for persistence by the headless server.
+Both are serializable via serde and stored in `SessionState` for persistence by the API server.
 
 #### `GitRootResolver` trait
 
@@ -392,7 +392,7 @@ impl SessionManager {
 }
 ```
 
-`SessionManager::in_memory()` creates a manager with no persistence backend (used by the CLI for its single session and by the TUI for per-tab sessions). `SessionManager::with_persistence(store)` attaches a `SessionStore` backend that receives an `upsert` call on every `create` or `update` and a `remove` call on every `remove`. The headless server uses this variant with `SqliteSessionStore`.
+`SessionManager::in_memory()` creates a manager with no persistence backend (used by the CLI for its single session and by the TUI for per-tab sessions). `SessionManager::with_persistence(store)` attaches a `SessionStore` backend that receives an `upsert` call on every `create` or `update` and a `remove` call on every `remove`. The API server uses this variant with `SqliteSessionStore`.
 
 `update` takes a closure instead of returning `&mut Session` to avoid exposing an unguarded mutable reference across an `await` point.
 
@@ -423,7 +423,7 @@ The merge is enforced by `EffectiveConfig` and is never duplicated elsewhere.
 
 #### `RepoConfig` (`config/repo.rs`)
 
-Per-repository configuration stored at `<git_root>/.amux/config.json`.
+Per-repository configuration stored at `<git_root>/.awman/config.json`.
 
 ```rust
 pub struct RepoConfig {
@@ -442,19 +442,19 @@ Key methods:
 
 | Method | Description |
 |--------|-------------|
-| `RepoConfig::path(git_root)` | Returns `<git_root>/.amux/config.json` |
-| `RepoConfig::legacy_path(git_root)` | Returns `<git_root>/aspec/.amux.json` (pre-migration path) |
+| `RepoConfig::path(git_root)` | Returns `<git_root>/.awman/config.json` |
+| `RepoConfig::legacy_path(git_root)` | Returns `<git_root>/.awman/config.json` (pre-migration path) |
 | `RepoConfig::load(git_root)` | Loads from disk; returns `default()` when absent, `DataError::ConfigParse` on malformed JSON |
 | `RepoConfig::save(&self, git_root)` | Persists to disk, creating parent dirs as needed |
-| `RepoConfig::migrate_legacy(git_root)` | Moves `aspec/.amux.json` → `.amux/config.json` if and only if legacy exists and new path does not; returns `true` when migration occurred |
+| `RepoConfig::migrate_legacy(git_root)` | Moves `.awman/config.json` → `.awman/config.json` if and only if legacy exists and new path does not; returns `true` when migration occurred |
 | `RepoConfig::work_items_dir(git_root)` | Resolves configured work items directory |
 | `RepoConfig::work_items_template(git_root)` | Resolves configured work item template path |
 
-Nested types: `WorkItemsConfig` (dir, template), `OverlaysConfig` (directories list), `DirectoryOverlayConfig` (host, container, permission), `HeadlessConfig` (workDirs, alwaysNonInteractive), `RemoteConfig` (defaultAddr, savedDirs, defaultAPIKey).
+Nested types: `WorkItemsConfig` (dir, template), `OverlaysConfig` (directories list), `DirectoryOverlayConfig` (host, container, permission), `APIConfig` (workDirs, alwaysNonInteractive), `RemoteConfig` (defaultAddr, savedDirs, defaultAPIKey).
 
 #### `GlobalConfig` (`config/global.rs`)
 
-Global configuration stored at `$HOME/.amux/config.json`. The path is overridden by the `AMUX_CONFIG_HOME` environment variable (used by tests to isolate state).
+Global configuration stored at `$HOME/.awman/config.json`. The path is overridden by the `AWMAN_CONFIG_HOME` environment variable (used by tests to isolate state).
 
 ```rust
 pub struct GlobalConfig {
@@ -463,7 +463,7 @@ pub struct GlobalConfig {
     pub runtime: Option<String>,
     pub yolo_disallowed_tools: Option<Vec<String>>,
     pub env_passthrough: Option<Vec<String>>,
-    pub headless: Option<HeadlessConfig>,
+    pub API: Option<APIConfig>,
     pub remote: Option<RemoteConfig>,
     pub overlays: Option<OverlaysConfig>,
     pub agent_stuck_timeout_secs: Option<u64>,
@@ -474,7 +474,7 @@ Key methods:
 
 | Method | Description |
 |--------|-------------|
-| `GlobalConfig::home_dir()` | Resolves `$AMUX_CONFIG_HOME` or `$HOME/.amux` |
+| `GlobalConfig::home_dir()` | Resolves `$AWMAN_CONFIG_HOME` or `$HOME/.awman` |
 | `GlobalConfig::home_dir_with(env)` | Same, reading from an `EnvSnapshot` |
 | `GlobalConfig::path()` / `path_with(env)` | Resolves the full config file path |
 | `GlobalConfig::load()` / `load_with(env)` | Loads from disk; returns `default()` when absent |
@@ -482,7 +482,7 @@ Key methods:
 
 #### `EnvSnapshot` and `Env` (`config/env.rs`)
 
-`EnvSnapshot` is a frozen snapshot of every environment variable amux reads. No scattered `std::env::var()` calls appear elsewhere in Layer 0.
+`EnvSnapshot` is a frozen snapshot of every environment variable awman reads. No scattered `std::env::var()` calls appear elsewhere in Layer 0.
 
 ```rust
 pub struct EnvSnapshot { … }
@@ -493,27 +493,27 @@ impl EnvSnapshot {
     pub fn get(&self, key: &str) -> Option<&str>;
 
     // Typed accessors for known vars
-    pub fn config_home(&self) -> Option<PathBuf>;    // AMUX_CONFIG_HOME
-    pub fn headless_root(&self) -> Option<PathBuf>;  // AMUX_HEADLESS_ROOT
-    pub fn overlays(&self) -> Option<&str>;          // AMUX_OVERLAYS
-    pub fn remote_addr(&self) -> Option<&str>;       // AMUX_REMOTE_ADDR
-    pub fn remote_session(&self) -> Option<&str>;    // AMUX_REMOTE_SESSION
-    pub fn api_key(&self) -> Option<&str>;           // AMUX_API_KEY
+    pub fn config_home(&self) -> Option<PathBuf>;    // AWMAN_CONFIG_HOME
+    pub fn api_root(&self) -> Option<PathBuf>;  // AWMAN_API_ROOT
+    pub fn overlays(&self) -> Option<&str>;          // AWMAN_OVERLAYS
+    pub fn remote_addr(&self) -> Option<&str>;       // AWMAN_REMOTE_ADDR
+    pub fn remote_session(&self) -> Option<&str>;    // AWMAN_REMOTE_SESSION
+    pub fn api_key(&self) -> Option<&str>;           // AWMAN_API_KEY
 }
 ```
 
-`Env` is a stateless namespace used to read from the real process environment at startup. Tests use `EnvSnapshot::with_overrides([("AMUX_CONFIG_HOME", tmp_path)])` to avoid touching the filesystem.
+`Env` is a stateless namespace used to read from the real process environment at startup. Tests use `EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp_path)])` to avoid touching the filesystem.
 
-Defined constants for every env var amux reads:
+Defined constants for every env var awman reads:
 
 | Constant | Variable | Purpose |
 |----------|----------|---------|
-| `AMUX_CONFIG_HOME` | `AMUX_CONFIG_HOME` | Override global config home dir |
-| `AMUX_HEADLESS_ROOT` | `AMUX_HEADLESS_ROOT` | Override headless storage root |
-| `AMUX_OVERLAYS` | `AMUX_OVERLAYS` | Comma-separated overlay specs |
-| `AMUX_REMOTE_ADDR` | `AMUX_REMOTE_ADDR` | Override remote server address |
-| `AMUX_REMOTE_SESSION` | `AMUX_REMOTE_SESSION` | Sticky session id for remote ops |
-| `AMUX_API_KEY` | `AMUX_API_KEY` | API key for headless server |
+| `AWMAN_CONFIG_HOME` | `AWMAN_CONFIG_HOME` | Override global config home dir |
+| `AWMAN_API_ROOT` | `AWMAN_API_ROOT` | Override API storage root |
+| `AWMAN_OVERLAYS` | `AWMAN_OVERLAYS` | Comma-separated overlay specs |
+| `AWMAN_REMOTE_ADDR` | `AWMAN_REMOTE_ADDR` | Override remote server address |
+| `AWMAN_REMOTE_SESSION` | `AWMAN_REMOTE_SESSION` | Sticky session id for remote ops |
+| `AWMAN_API_KEY` | `AWMAN_API_KEY` | API key for API server |
 
 #### `FlagConfig` (`config/flags.rs`)
 
@@ -548,7 +548,7 @@ impl EffectiveConfig {
     pub fn yolo_disallowed_tools(&self) -> Vec<String>; // flag > repo > global > []
     pub fn scrollback_lines(&self) -> usize;         // flag > repo > global > 10_000
     pub fn agent_stuck_timeout(&self) -> Duration;   // flag > repo > global > 30s
-    pub fn headless_work_dirs(&self) -> Vec<String>; // global only
+    pub fn api_work_dirs(&self) -> Vec<String>; // global only
     pub fn always_non_interactive(&self) -> bool;    // flag > global > false
     pub fn remote_default_addr(&self) -> Option<String>;  // flag > env > global
     pub fn remote_default_api_key(&self) -> Option<String>; // flag > env > global
@@ -566,16 +566,16 @@ Built-in defaults: `scrollback_lines` = 10,000 lines; `agent_stuck_timeout` = 30
 
 Every direct filesystem or database interaction in Layer 0 is encapsulated in a typed object in this module. Higher layers consume these objects; they never call `std::fs::*` or `rusqlite::*` directly.
 
-#### `SqliteSessionStore` (`fs/headless_db.rs`)
+#### `SqliteSessionStore` (`fs/api_db.rs`)
 
-Sqlite-backed persistence for headless-mode session and command metadata. Schema is compatible with `oldsrc/commands/headless/db.rs` so that existing on-disk databases written by earlier amux releases remain readable.
+Sqlite-backed persistence for API-mode session and command metadata. Schema is compatible with `oldsrc/commands/API/db.rs` so that existing on-disk databases written by earlier awman releases remain readable.
 
 ```rust
 pub struct SqliteSessionStore { conn: Mutex<Connection> }
 
 impl SqliteSessionStore {
     pub fn open(root: &Path) -> Result<Self, DataError>;
-    pub fn open_from_paths(paths: &HeadlessPaths) -> Result<Self, DataError>;
+    pub fn open_from_paths(paths: &ApiPaths) -> Result<Self, DataError>;
 
     pub fn insert_session(&self, id, workdir, created_at) -> Result<(), DataError>;
     pub fn close_session(&self, id, closed_at) -> Result<(), DataError>;
@@ -589,23 +589,23 @@ impl SqliteSessionStore {
 }
 ```
 
-`SqliteSessionStore::open(root)` creates the database at `<root>/amux.db`, enables WAL mode, and runs schema migrations idempotently. The schema has two tables: `sessions` and `commands`.
+`SqliteSessionStore::open(root)` creates the database at `<root>/awman.db`, enables WAL mode, and runs schema migrations idempotently. The schema has two tables: `sessions` and `commands`.
 
 `SessionRecord` and `CommandRecord` are plain structs (no Arc, no async) that carry the persisted metadata fields.
 
-#### `HeadlessPaths` (`fs/headless_paths.rs`)
+#### `ApiPaths` (`fs/api_paths.rs`)
 
-Typed accessors for every path used by the headless server. Replaces ad-hoc `dirs::data_dir().join("amux/headless/…")` calls scattered through the legacy code.
+Typed accessors for every path used by the API server. Replaces ad-hoc `dirs::data_dir().join("awman/API/…")` calls scattered through the legacy code.
 
 ```rust
-pub struct HeadlessPaths { root: PathBuf }
+pub struct ApiPaths { root: PathBuf }
 
-impl HeadlessPaths {
+impl ApiPaths {
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError>;
     pub fn root(&self) -> &Path;
-    pub fn db_path(&self) -> PathBuf;          // <root>/amux.db
-    pub fn log_path(&self) -> PathBuf;         // <root>/amux.log
-    pub fn pid_path(&self) -> PathBuf;         // <root>/amux.pid
+    pub fn db_path(&self) -> PathBuf;          // <root>/awman.db
+    pub fn log_path(&self) -> PathBuf;         // <root>/awman.log
+    pub fn pid_path(&self) -> PathBuf;         // <root>/awman.pid
     pub fn tls_dir(&self) -> PathBuf;          // <root>/tls/
     pub fn sessions_dir(&self) -> PathBuf;     // <root>/sessions/
     pub fn session_dir(&self, id) -> PathBuf;  // <root>/sessions/<id>/
@@ -615,7 +615,7 @@ impl HeadlessPaths {
 }
 ```
 
-`HeadlessPaths::from_env` reads `AMUX_HEADLESS_ROOT` from the snapshot; if unset, uses `$HOME/.amux/headless`.
+`ApiPaths::from_env` reads `AWMAN_API_ROOT` from the snapshot; if unset, uses `$HOME/.awman/API`.
 
 #### `WorkflowStateStore` (`fs/workflow_state.rs`)
 
@@ -656,11 +656,11 @@ impl SkillDirs {
 }
 ```
 
-Global skills live at `$HOME/.amux/skills/` (or `$AMUX_CONFIG_HOME/skills/`). Per-repo skills live at `<git_root>/.amux/skills/`.
+Global skills live at `$HOME/.awman/skills/` (or `$AWMAN_CONFIG_HOME/skills/`). Per-repo skills live at `<git_root>/.awman/skills/`.
 
 #### `WorkflowDirs` (`fs/workflow_dirs.rs`)
 
-Typed access to global and per-repo workflow directories. Same structure as `SkillDirs`: global at `$HOME/.amux/workflows/`, per-repo at `<git_root>/.amux/workflows/`.
+Typed access to global and per-repo workflow directories. Same structure as `SkillDirs`: global at `$HOME/.awman/workflows/`, per-repo at `<git_root>/.awman/workflows/`.
 
 #### `OverlayPathResolver` (`fs/overlay_paths.rs`)
 
@@ -766,7 +766,7 @@ pub trait UserMessageSink: Send + Sync {
 }
 ```
 
-**CLI queueing contract**: when a PTY-bound container owns the terminal, `write_message` queues the message instead of writing. `replay_queued` drains the queue after the container releases the terminal. TUI and headless implementations render live and treat `replay_queued` as a no-op.
+**CLI queueing contract**: when a PTY-bound container owns the terminal, `write_message` queues the message instead of writing. `replay_queued` drains the queue after the container releases the terminal. TUI and API implementations render live and treat `replay_queued` as a no-op.
 
 `RecordingMessageSink` (also in `message.rs`) records every message passed to it and is used by all engine unit tests.
 
@@ -914,7 +914,7 @@ pub trait ContainerFrontend: UserMessageSink + Send + Sync {
 }
 ```
 
-PTY allocation is a Layer 3 concern. Layer 1 passes raw bytes to the frontend and lets it decide whether they route through a PTY (TUI), straight to fds (CLI), or over a socket (headless).
+PTY allocation is a Layer 3 concern. Layer 1 passes raw bytes to the frontend and lets it decide whether they route through a PTY (TUI), straight to fds (CLI), or over a socket (API).
 
 #### What is forbidden in `src/engine/container/`
 
@@ -1022,7 +1022,7 @@ pub trait WorkflowFrontend: UserMessageSink + Send + Sync {
 
 #### Workflow state persistence
 
-State is persisted to `<git-root>/.amux/workflows/<hash8>-<name>.json` after every step transition. On resume, the engine checks `schema_version`; if the persisted version is newer than `WORKFLOW_STATE_SCHEMA_VERSION`, it returns `EngineError::UnsupportedWorkflowSchemaVersion`. If the workflow hash has drifted, it calls `confirm_resume`; if declined, it returns `WorkflowResumeIncompatible`.
+State is persisted to `<git-root>/.awman/workflows/<hash8>-<name>.json` after every step transition. On resume, the engine checks `schema_version`; if the persisted version is newer than `WORKFLOW_STATE_SCHEMA_VERSION`, it returns `EngineError::UnsupportedWorkflowSchemaVersion`. If the workflow hash has drifted, it calls `confirm_resume`; if declined, it returns `WorkflowResumeIncompatible`.
 
 #### What is forbidden in `WorkflowEngine`
 
@@ -1036,7 +1036,7 @@ State is persisted to `<git-root>/.amux/workflows/<hash8>-<name>.json` after eve
 
 ### Git Engine (`src/engine/git/`)
 
-`GitEngine` consolidates every git operation amux performs. It is a stateless struct whose methods are the only public surface. It implements Layer 0's `GitRootResolver` trait so `Session::open` can use it.
+`GitEngine` consolidates every git operation awman performs. It is a stateless struct whose methods are the only public surface. It implements Layer 0's `GitRootResolver` trait so `Session::open` can use it.
 
 ```rust
 pub struct GitEngine;
@@ -1048,11 +1048,11 @@ impl GitEngine {
     pub fn is_clean(&self, path: &Path) -> Result<bool, EngineError>;
     pub fn uncommitted_files(&self, path: &Path) -> Result<Vec<String>, EngineError>;
 
-    // Worktree paths (convention: ~/.amux/worktrees/<repo>/<NNNN>/ or wf-<name>/)
+    // Worktree paths (convention: ~/.awman/worktrees/<repo>/<NNNN>/ or wf-<name>/)
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError>;
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError>;
-    pub fn branch_name_for_work_item(&self, work_item: u32) -> String;  // amux/work-item-NNNN
-    pub fn branch_name_for_workflow(&self, name: &str) -> String;       // amux/workflow-<name>
+    pub fn branch_name_for_work_item(&self, work_item: u32) -> String;  // awman/work-item-NNNN
+    pub fn branch_name_for_workflow(&self, name: &str) -> String;       // awman/workflow-<name>
 
     pub fn create_worktree(&self, git_root, worktree_path, branch) -> Result<(), EngineError>;
     pub fn remove_worktree(&self, git_root, worktree_path) -> Result<(), EngineError>;
@@ -1067,10 +1067,10 @@ impl GitEngine {
 ```
 
 Naming conventions enforced by `GitEngine`:
-- Worktree path (work-item): `$HOME/.amux/worktrees/<repo-name>/<NNNN>/`
-- Worktree path (workflow): `$HOME/.amux/worktrees/<repo-name>/wf-<workflow-name>/`
-- Branch (work-item): `amux/work-item-<NNNN>` (zero-padded 4 digits)
-- Branch (workflow): `amux/workflow-<workflow-name>`
+- Worktree path (work-item): `$HOME/.awman/worktrees/<repo-name>/<NNNN>/`
+- Worktree path (workflow): `$HOME/.awman/worktrees/<repo-name>/wf-<workflow-name>/`
+- Branch (work-item): `awman/work-item-<NNNN>` (zero-padded 4 digits)
+- Branch (workflow): `awman/workflow-<workflow-name>`
 - Merge commit: `"Implement <branch>"` (verbatim format preserved)
 
 ---
@@ -1116,12 +1116,12 @@ Per-agent settings handling (`agent_settings_overlays`) replicates the legacy `H
 `AuthEngine` consolidates two previously-separate concerns:
 
 1. **Host-side agent credential discovery** — resolving credentials from the OS keychain to inject into agent containers.
-2. **Headless server authentication** — API key generation, hashing, comparison, persistence, and TLS material.
+2. **API server authentication** — API key generation, hashing, comparison, persistence, and TLS material.
 
 ```rust
 pub struct AuthEngine {
     auth_paths: AuthPathResolver,
-    headless_paths: HeadlessPaths,
+    api_paths: ApiPaths,
 }
 
 impl AuthEngine {
@@ -1132,7 +1132,7 @@ impl AuthEngine {
     pub fn resolve_agent_auth(&self, session: &Session, agent: &AgentName)
         -> Result<AgentCredentials, EngineError>;
 
-    // Headless API-key lifecycle
+    // API API-key lifecycle
     pub fn generate_api_key(&self) -> Result<ApiKey, EngineError>;
     pub fn write_api_key_hash(&self, hash: &ApiKeyHash) -> Result<(), EngineError>;
     pub fn read_api_key_hash(&self) -> Result<Option<ApiKeyHash>, EngineError>;
@@ -1193,7 +1193,7 @@ impl AgentEngine {
 ```
 
 `ensure_available` steps:
-1. Check for `<git-root>/.amux/Dockerfile.<agent>`; download if absent.
+1. Check for `<git-root>/.awman/Dockerfile.<agent>`; download if absent.
 2. Check for `<repo-hash>:<agent>:latest` locally; build if absent.
 3. If the project base image (`<repo-hash>:latest`) is missing, fail with `EngineError::AgentRequiresProjectImage` — `AgentEngine` does not build the project image (`ReadyEngine`'s job).
 
@@ -1244,7 +1244,7 @@ Duplicating `ensure_available` or `build_options` logic in any other module is a
 
 ### Ready Engine (`src/engine/ready/`)
 
-`ReadyEngine` owns all multi-phase logic for `amux ready`: preflight checks, legacy-layout detection and migration, Dockerfile.dev creation, Docker image builds, local agent check, audit container run, and post-audit rebuild. The legacy code (`oldsrc/commands/ready.rs`: 2239 lines, `oldsrc/commands/ready_flow.rs`: 726 lines) is replaced entirely.
+`ReadyEngine` owns all multi-phase logic for `awman ready`: preflight checks, legacy-layout detection and migration, Dockerfile.dev creation, Docker image builds, local agent check, audit container run, and post-audit rebuild. The legacy code (`oldsrc/commands/ready.rs`: 2239 lines, `oldsrc/commands/ready_flow.rs`: 726 lines) is replaced entirely.
 
 #### Phase state machine
 
@@ -1265,7 +1265,7 @@ pub enum ReadyPhase {
 }
 ```
 
-The state machine is forward-only. If the process is interrupted the user re-runs `amux ready` from the beginning; no partial checkpoint is written.
+The state machine is forward-only. If the process is interrupted the user re-runs `awman ready` from the beginning; no partial checkpoint is written.
 
 #### `ReadyEngine` API
 
@@ -1325,7 +1325,7 @@ pub struct ReadySummary {
 
 ### Init Engine (`src/engine/init/`)
 
-`InitEngine` owns all multi-phase logic for `amux init`: git root resolution, aspec folder creation, Dockerfile.dev setup, `.amux.json` config write, optional audit container, image build, and work-items configuration. Replaces `oldsrc/commands/init.rs` + `oldsrc/commands/init_flow.rs` (2702 lines combined).
+`InitEngine` owns all multi-phase logic for `awman init`: git root resolution, aspec folder creation, Dockerfile.dev setup, `.awman.json` config write, optional audit container, image build, and work-items configuration. Replaces `oldsrc/commands/init.rs` + `oldsrc/commands/init_flow.rs` (2702 lines combined).
 
 #### Phase state machine
 
@@ -1335,12 +1335,12 @@ pub enum InitPhase {
     AwaitingAspecDecision,      // existing aspec folder found
     CreatingAspecFolder,        // write aspec template into repo
     SettingUpDockerfile,        // create/confirm Dockerfile.dev
-    WritingConfig,              // write or update .amux.json
+    WritingConfig,              // write or update .awman.json
     AwaitingAuditDecision,      // ask whether to run audit
     BuildingImage,              // build base Docker image
     RunningAudit,               // agent scans and updates Dockerfile.dev
     AwaitingWorkItemsDecision,  // ask whether to configure work items
-    WritingWorkItemsConfig,     // write work-items config into .amux.json
+    WritingWorkItemsConfig,     // write work-items config into .awman.json
     Complete,
     Failed(InitFailure),
 }
@@ -1418,7 +1418,7 @@ pub fn detect_cycle(steps: &[WorkflowStep]) -> Result<(), DataError>;
 
 #### `WorkflowState` and `StepState` (`src/data/workflow_state.rs`)
 
-Fully serializable snapshot of workflow execution state. Stored per-workflow at `<git-root>/.amux/workflows/`.
+Fully serializable snapshot of workflow execution state. Stored per-workflow at `<git-root>/.awman/workflows/`.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1451,7 +1451,7 @@ pub enum StepState {
 pub struct WorkflowStateStore { base_dir: PathBuf }
 
 impl WorkflowStateStore {
-    pub fn new(session: &Session) -> Self;       // base_dir = <git-root>/.amux/workflows/
+    pub fn new(session: &Session) -> Self;       // base_dir = <git-root>/.awman/workflows/
     pub fn at_git_root(git_root: &Path) -> Self; // convenience for tests
     pub fn load(&self, workflow_name: &str) -> Result<Option<WorkflowState>, DataError>;
     pub fn save(&self, state: &WorkflowState) -> Result<(), DataError>;
@@ -1470,7 +1470,7 @@ Four rules govern this layer:
 1. **Layer 2 consumes Layer 0 and Layer 1 only.** No upward calls into frontends or the binary.
 2. **Frontends contain no business logic.** Every command knob — every flag, every prompt, every dialog — flows through Layer 2's `Dispatch` system or a per-command frontend trait.
 3. **Typed objects over `pub fn`.** Each command is a `*Command` struct that implements `Command` and exposes `run_with_frontend(frontend) -> Result<Outcome, CommandError>`.
-4. **The full list of available commands and flags lives only in `CommandCatalogue`.** Frontends never hard-code command names, flag names, or defaults; they ask the catalogue (or its projections) for what's available. This is the single most important guarantee against mode drift across CLI, TUI, and headless.
+4. **The full list of available commands and flags lives only in `CommandCatalogue`.** Frontends never hard-code command names, flag names, or defaults; they ask the catalogue (or its projections) for what's available. This is the single most important guarantee against mode drift across CLI, TUI, and API.
 
 ---
 
@@ -1515,15 +1515,15 @@ Key variants:
 | `CommandBoxParse(String)` | TUI command-box input could not be tokenised |
 | `Aborted` | User chose to abort in an interactive prompt |
 | `MergeConflict { branch, worktree_path }` | `WorktreeLifecycle::finalize` encountered a git merge conflict |
-| `MissingRemoteAddress` | No `--remote-addr` / `AMUX_REMOTE_ADDR` supplied |
+| `MissingRemoteAddress` | No `--remote-addr` / `AWMAN_REMOTE_ADDR` supplied |
 | `MissingApiKey` | API key could not be resolved from any source |
 | `RemoteTimeout` | HTTP request to remote server timed out |
 | `RemoteConnectionRefused(String)` | Connection to remote server was refused |
 | `RemoteHttpStatus { status, body }` | Remote returned a non-2xx HTTP status |
 | `MalformedSseEvent(String)` | SSE stream contained an unparseable event |
 | `RemoteTransport(String)` | Underlying HTTP transport error |
-| `HeadlessWorkdirNotFound { path }` | A workdir path supplied to `headless start` does not exist |
-| `HeadlessAlreadyRunning { pid }` | Headless server is already running on the given PID |
+| `ApiWorkdirNotFound { path }` | A workdir path supplied to `api start` does not exist |
+| `APIAlreadyRunning { pid }` | API server is already running on the given PID |
 
 Convenience constructors: `CommandError::unknown_command`, `missing_required_flag`, `missing_required_argument`, `unknown_flag`, `mutually_exclusive`.
 
@@ -1537,7 +1537,7 @@ Convenience constructors: `CommandError::unknown_command`, `missing_required_fla
 
 ```rust
 pub enum FrontendVisibility {
-    All,          // CLI, TUI, and headless
+    All,          // CLI, TUI, and API
     CliOnly,
     TuiOnly,
     CliAndTui,
@@ -1613,7 +1613,7 @@ impl CommandCatalogue {
 
 The catalogue covers:
 
-`init`, `ready`, `chat`, `specs` (with `amend`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `headless` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
+`init`, `ready`, `chat`, `specs` (with `amend`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `api` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
 
 ---
 
@@ -1642,7 +1642,7 @@ impl CommandCatalogue {
 
 Generates the hint string shown above the TUI command box for the currently typed command path, and the autocomplete entries shown as the user types. The TUI frontend never maintains its own hint or completion lists.
 
-#### `headless_schema.rs`
+#### `api_schema.rs`
 
 ```rust
 impl CommandCatalogue {
@@ -1651,11 +1651,11 @@ impl CommandCatalogue {
 }
 ```
 
-Generates the OpenAPI JSON schema and the REST route table used by the headless server. The headless frontend derives its API surface entirely from these projections.
+Generates the OpenAPI JSON schema and the REST route table used by the API server. The API frontend derives its API surface entirely from these projections.
 
 #### Projection consistency guarantee
 
-A suite of catalogue unit tests (`catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_headless_consistency`) walks every `Arg` in the clap output, every hint entry, and every route in the REST table and asserts each is present in the catalogue with a matching kind, default, and help string. If a flag exists in a projection but not the catalogue (or vice versa), the test fails.
+A suite of catalogue unit tests (`catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_api_consistency`) walks every `Arg` in the clap output, every hint entry, and every route in the REST table and asserts each is present in the catalogue with a matching kind, default, and help string. If a flag exists in a projection but not the catalogue (or vice versa), the test fails.
 
 ---
 
@@ -1681,7 +1681,7 @@ pub struct Engines {
 
 #### `CommandFrontend` trait
 
-Implemented by Layer 3 (CLI, TUI, headless). Supplies flag values and positional arguments to Dispatch, and extends `UserMessageSink` so commands can write status messages through the same frontend object.
+Implemented by Layer 3 (CLI, TUI, API). Supplies flag values and positional arguments to Dispatch, and extends `UserMessageSink` so commands can write status messages through the same frontend object.
 
 ```rust
 pub trait CommandFrontend: UserMessageSink + Send + Sync {
@@ -1735,7 +1735,7 @@ pub enum CommandOutcome {
     Config(ConfigOutcome),
     ExecPrompt(ExecPromptOutcome),
     ExecWorkflow(ExecWorkflowOutcome),
-    Headless(HeadlessOutcome),
+    API(ApiOutcome),
     Remote(RemoteOutcome),
     New(NewOutcome),
     Specs(SpecsOutcome),
@@ -1758,7 +1758,7 @@ Every `*Outcome` derives `Serialize`. JSON serialisation is a frontend concern (
 
 ### Per-Command Structs (`src/command/commands/`)
 
-Each amux command is one module under `src/command/commands/` containing:
+Each awman command is one module under `src/command/commands/` containing:
 
 - A `*Command` struct that owns every flag value and engine reference it needs.
 - A `*CommandFlags` struct carrying the typed flag values.
@@ -1770,19 +1770,19 @@ Each amux command is one module under `src/command/commands/` containing:
 
 | Module | Command(s) | Notes |
 |--------|-----------|-------|
-| `init.rs` | `amux init` | Thin wrapper over `InitEngine`; `InitCommandFrontend: InitFrontend + Send` |
-| `ready.rs` | `amux ready` | Thin wrapper over `ReadyEngine`; `ReadyCommandFrontend: ReadyFrontend + Send`; `--json` implies `--non-interactive` |
-| `chat.rs` | `amux chat` | Agent-launching command |
-| `exec_prompt.rs` | `amux exec prompt` | Agent-launching command with inline prompt |
-| `exec_workflow.rs` | `amux exec workflow` | Agent-launching command with full workflow file; `--yolo`/`--auto` imply `--worktree` |
-| `status.rs` | `amux status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
-| `specs.rs` | `amux specs amend` | Review/amend agent runs; shares `create_new_spec` with `new spec` |
-| `config.rs` | `amux config {show,get,set}` | Config read/write; `config set --global` writes to global config |
-| `headless.rs` | `amux headless {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
-| `remote.rs` | `amux remote {run, session start, session kill}` | Uses `RemoteClient` for HTTP + SSE |
-| `new.rs` | `amux new {spec,workflow,skill}` | Work-item and artefact creation |
-| `auth.rs` | `amux auth` | Keychain credential accept/decline per-repo |
-| `download.rs` | `amux download` | Internal helper for Dockerfile downloads |
+| `init.rs` | `awman init` | Thin wrapper over `InitEngine`; `InitCommandFrontend: InitFrontend + Send` |
+| `ready.rs` | `awman ready` | Thin wrapper over `ReadyEngine`; `ReadyCommandFrontend: ReadyFrontend + Send`; `--json` implies `--non-interactive` |
+| `chat.rs` | `awman chat` | Agent-launching command |
+| `exec_prompt.rs` | `awman exec prompt` | Agent-launching command with inline prompt |
+| `exec_workflow.rs` | `awman exec workflow` | Agent-launching command with full workflow file; `--yolo`/`--auto` imply `--worktree` |
+| `status.rs` | `awman status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
+| `specs.rs` | `awman specs amend` | Review/amend agent runs; shares `create_new_spec` with `new spec` |
+| `config.rs` | `awman config {show,get,set}` | Config read/write; `config set --global` writes to global config |
+| `api.rs` | `awman api {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
+| `remote.rs` | `awman remote {run, session start, session kill}` | Uses `RemoteClient` for HTTP + SSE |
+| `new.rs` | `awman new {spec,workflow,skill}` | Work-item and artefact creation |
+| `auth.rs` | `awman auth` | Keychain credential accept/decline per-repo |
+| `download.rs` | `awman download` | Internal helper for Dockerfile downloads |
 
 #### Agent-launching command canonical order
 
@@ -1847,7 +1847,7 @@ pub struct WorktreeLifecycle {
 }
 
 impl WorktreeLifecycle {
-    /// Branch name: `amux/workflow-<name>`; path: `~/.amux/worktrees/<repo>/wf-<name>/`
+    /// Branch name: `awman/workflow-<name>`; path: `~/.awman/worktrees/<repo>/wf-<name>/`
     pub fn for_workflow(git_engine: Arc<GitEngine>, git_root: PathBuf, workflow_name: &str) -> Self;
 
     pub fn worktree_path(&self) -> &Path;
@@ -1890,7 +1890,7 @@ impl MountScope {
 }
 ```
 
-Default behaviors per frontend (implemented by Layer 3): CLI prompts with `[r]oot / [c]urrent dir / [a]bort`; TUI shows the `MountScope` modal dialog; headless returns `MountGitRoot` unless the request body specifies `mount_scope: "cwd"`.
+Default behaviors per frontend (implemented by Layer 3): CLI prompts with `[r]oot / [c]urrent dir / [a]bort`; TUI shows the `MountScope` modal dialog; API returns `MountGitRoot` unless the request body specifies `mount_scope: "cwd"`.
 
 Every agent-launching command frontend trait adds `MountScopeFrontend` as a supertrait bound.
 
@@ -1947,7 +1947,7 @@ Decision handling by commands:
 
 ### `RemoteClient` (`src/command/commands/remote_client.rs`)
 
-A typed HTTP client for communicating with a remote amux headless server. Constructed fresh per `RemoteCommand` invocation; not exported beyond `src/command/commands/`.
+A typed HTTP client for communicating with a remote awman api server. Constructed fresh per `RemoteCommand` invocation; not exported beyond `src/command/commands/`.
 
 ```rust
 pub struct RemoteClient {
@@ -1971,7 +1971,7 @@ impl RemoteClient {
 
     pub fn new(base_url: &str, api_key: Option<&ApiKey>) -> Result<Self, CommandError>;
 
-    /// Resolution order: explicit arg > AMUX_API_KEY env > GlobalConfig::remote.default_api_key
+    /// Resolution order: explicit arg > AWMAN_API_KEY env > GlobalConfig::remote.default_api_key
     /// (only when target_addr matches GlobalConfig::remote.default_addr after URL canonicalization).
     /// Returns None when no key is available (server may have --dangerously-skip-auth).
     pub fn resolve_api_key(session: &Session, target_addr: &str, explicit: Option<&str>) -> Result<Option<ApiKey>, CommandError>;
@@ -2004,18 +2004,18 @@ pub struct TuiTabSnapshot {
 }
 ```
 
-In CLI and headless mode the context is `None` and the status output contains no tab annotation columns. In TUI mode the frontend provides the context via `StatusCommandFrontend::tui_context()`.
+In CLI and API mode the context is `None` and the status output contains no tab annotation columns. In TUI mode the frontend provides the context via `StatusCommandFrontend::tui_context()`.
 
 ---
 
-### `HeadlessLifecycle` — server process management
+### `APILifecycle` — server process management
 
-The headless server process lifecycle (PID files, daemonization, log rotation, SIGTERM) is encapsulated in `HeadlessLifecycle` in `src/engine/headless/` (Layer 1, introduced alongside work item 0068):
+The API server process lifecycle (PID files, daemonization, log rotation, SIGTERM) is encapsulated in `APILifecycle` in `src/engine/API/` (Layer 1, introduced alongside work item 0068):
 
 ```rust
-pub struct HeadlessLifecycle { paths: HeadlessPaths }
+pub struct APILifecycle { paths: ApiPaths }
 
-impl HeadlessLifecycle {
+impl APILifecycle {
     pub fn new(session: &Session) -> Self;
     pub fn current_pid(&self) -> Result<Option<u32>, CommandError>;
     pub fn write_pid(&self) -> Result<(), CommandError>;
@@ -2028,9 +2028,9 @@ impl HeadlessLifecycle {
 pub enum KillOutcome { ExitedCleanly, ExitedAfterSigKill, NotRunning }
 ```
 
-`HeadlessStartCommand` (Layer 2) uses this lifecycle to: refuse if already running; generate/refresh the API key; optionally daemonize; write the PID file; hand the assembled `HeadlessServeConfig` to the frontend (which boots the actual HTTP server in Layer 3).
+`APIStartCommand` (Layer 2) uses this lifecycle to: refuse if already running; generate/refresh the API key; optionally daemonize; write the PID file; hand the assembled `ApiServeConfig` to the frontend (which boots the actual HTTP server in Layer 3).
 
-The `--workdirs` flag is merged with `GlobalConfig::headless.work_dirs`, canonicalized via `OverlayPathResolver`, deduplicated, and validated (non-existent paths → `CommandError::HeadlessWorkdirNotFound`).
+The `--workdirs` flag is merged with `GlobalConfig::API.work_dirs`, canonicalized via `OverlayPathResolver`, deduplicated, and validated (non-existent paths → `CommandError::ApiWorkdirNotFound`).
 
 ---
 
@@ -2039,7 +2039,7 @@ The `--workdirs` flag is merged with `GlobalConfig::headless.work_dirs`, canonic
 - No `eprintln!`, `println!`, or direct console I/O. All status messages flow through `UserMessageSink::write_message`; all structured output flows through per-command `report_*` frontend trait methods.
 - No `clap::ArgMatches` references inside `*Command` bodies. Flag values arrive as typed fields in `*CommandFlags`, populated by Dispatch.
 - No `crossterm`, no `ratatui`, no `axum`. Those are Layer 3.
-- No "if this is CLI vs TUI vs headless" checks. Commands never know which frontend is on the other side of the trait object.
+- No "if this is CLI vs TUI vs API" checks. Commands never know which frontend is on the other side of the trait object.
 - No git worktree calls (`create_worktree`, `merge_branch`, `remove_worktree`) directly from command bodies. All worktree operations must flow through `WorktreeLifecycle::prepare` and `WorktreeLifecycle::finalize`.
 - No business logic in projections. Projections derive structure from the catalogue; they do not interpret flag semantics.
 - No upward calls into Layer 3 or Layer 4 types.
@@ -2048,13 +2048,13 @@ The `--workdirs` flag is merged with `GlobalConfig::headless.work_dirs`, canonic
 
 ## Layer 3: Frontend (`src/frontend/`)
 
-Layer 3 is the presentation layer. It has three sub-modules — `cli`, `tui`, and `headless` — each of which translates user input into `Dispatch` calls and renders the typed outcomes back to the user. Frontends contain **no business logic**: any behavioral decision lives in Layer 2 (`command`) or below.
+Layer 3 is the presentation layer. It has three sub-modules — `cli`, `tui`, and `api` — each of which translates user input into `Dispatch` calls and renders the typed outcomes back to the user. Frontends contain **no business logic**: any behavioral decision lives in Layer 2 (`command`) or below.
 
 Layer 3 is the only layer that may:
 
 - Read from and write to terminal I/O (stdout, stderr, stdin)
 - Allocate PTYs or open raw-mode terminal sessions
-- Bind HTTP server sockets (headless mode)
+- Bind HTTP server sockets (API mode)
 - Render Ratatui widgets (TUI mode)
 
 Layer 3 may call into Layer 0 (`data`), Layer 1 (`engine`), and Layer 2 (`command`), but **never into Layer 4** (no upward calls).
@@ -2063,13 +2063,13 @@ Layer 3 may call into Layer 0 (`data`), Layer 1 (`engine`), and Layer 2 (`comman
 
 ### `src/frontend/mod.rs`
 
-Declares the three sub-modules: `pub mod cli; pub mod headless; pub mod tui;`. All public symbols used by `main.rs` are re-exported from here.
+Declares the three sub-modules: `pub mod cli; pub mod API; pub mod tui;`. All public symbols used by `main.rs` are re-exported from here.
 
 ---
 
 ### CLI Frontend (`src/frontend/cli/`)
 
-The CLI frontend is the fully implemented Layer 3 sub-module for `amux <subcommand>` invocations. Its entry point is `run(matches, ctx)`. It extracts the command path from clap's `ArgMatches`, constructs a `CliFrontend`, hands it to `Dispatch`, and renders the resulting `CommandOutcome` or `CommandError` to stdout/stderr.
+The CLI frontend is the fully implemented Layer 3 sub-module for `awman <subcommand>` invocations. Its entry point is `run(matches, ctx)`. It extracts the command path from clap's `ArgMatches`, constructs a `CliFrontend`, hands it to `Dispatch`, and renders the resulting `CommandOutcome` or `CommandError` to stdout/stderr.
 
 #### `RuntimeContext` (`mod.rs`)
 
@@ -2114,7 +2114,7 @@ pub struct CliFrontend {
 }
 ```
 
-The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`AuthCommandFrontend`, `ConfigCommandFrontend`, `DownloadCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `HeadlessCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules.
+The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`AuthCommandFrontend`, `ConfigCommandFrontend`, `DownloadCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `ApiCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules.
 
 `CliFrontend::new(matches)` pre-computes `command_path` so it doesn't re-traverse the matches tree on every call.
 
@@ -2127,7 +2127,7 @@ The single CLI frontend struct. Implements `CommandFrontend` (flag extraction fr
 | `flag_strings(path, flag)` | `get_many::<String>(flag)` | Returns empty `Vec` when absent |
 | `flag_path(path, flag)` | `get_one::<String>(flag)` then `PathBuf::from` | Returns `None` when absent |
 | `flag_enum(path, flag)` | delegates to `flag_string` | Enum flags are stored as strings in the clap projection |
-| `flag_u16(path, flag)` | `get_one::<u16>(flag)` | Used for `--port` on `headless start` |
+| `flag_u16(path, flag)` | `get_one::<u16>(flag)` | Used for `--port` on `api start` |
 | `argument(path, name)` | `get_one::<String>(name)` or `get_many` joined | `TrailingVarArgs` arguments are joined with spaces |
 | `arguments(path, name)` | `get_many::<String>(name)` | Returns the raw token vector |
 
@@ -2157,7 +2157,7 @@ pub struct CliUserMessageQueue {
 
 Implements `UserMessageSink`. The `pty_active` flag controls two modes:
 
-- **`pty_active = false`** (default): `write_message` writes immediately to stderr with a level-prefixed format (`amux:`, `amux warning:`, `amux error:`).
+- **`pty_active = false`** (default): `write_message` writes immediately to stderr with a level-prefixed format (`awman:`, `awman warning:`, `awman error:`).
 - **`pty_active = true`**: `write_message` pushes to the queue instead. Used when a PTY-bound container owns the terminal — messages accumulated during container execution are replayed after the container exits via `replay_queued`.
 
 `replay_queued` drains the queue to stderr in insertion order and clears it. `set_pty_active(bool)` toggles the mode; the per-command frontends for container-running commands call this before and after `ContainerExecution::wait`.
@@ -2171,7 +2171,7 @@ Each module in this directory implements the richer `*CommandFrontend` trait (an
 | `chat.rs` | `ChatCommandFrontend` | Marker (no extra methods beyond `UserMessageSink`) |
 | `exec_prompt.rs` | `ExecPromptCommandFrontend` | Marker |
 | `exec_workflow.rs` | `ExecWorkflowCommandFrontend`, `ContainerFrontend`, `WorkflowFrontend` | Integrates container output, workflow control, and worktree lifecycle for the exec-workflow command path |
-| `headless.rs` | `HeadlessStartCommandFrontend` | Calls `crate::frontend::headless::serve(config)` — a peer Layer 3 call, not an upward call |
+| `api.rs` | `ApiStartCommandFrontend` | Calls `crate::frontend::api::serve(config)` — a peer Layer 3 call, not an upward call |
 | `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config |
 | `ready.rs` | `ReadyCommandFrontend`, `ReadyFrontend` | Reports `ReadyPhase` transitions to stderr; prompts for Dockerfile creation and legacy-migration decisions |
 | `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin; defaults to `DeclineOnce` when stdin is not a TTY |
@@ -2181,13 +2181,13 @@ Each module in this directory implements the richer `*CommandFrontend` trait (an
 | `workflow_frontend_marker.rs` | `WorkflowFrontend` | Shared marker impl for commands that don't use workflows |
 | `worktree_lifecycle_marker.rs` | `WorktreeLifecycleFrontend` | Shared marker impl for commands that don't use worktrees |
 
-The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matches the headless defaults from WI 0069 §7u: interactive prompts return the non-destructive option rather than blocking.
+The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matches the API defaults from WI 0069 §7u: interactive prompts return the non-destructive option rather than blocking.
 
 ---
 
 ### TUI Frontend (`src/frontend/tui/`)
 
-The TUI frontend is the Ratatui-based interactive terminal UI invoked by bare `amux` (no subcommand). It is a pure presentation layer: it translates keystrokes into `Dispatch` calls and renders typed outcomes via Ratatui widgets. No business logic lives here — any behavioral decision belongs in Layer 2.
+The TUI frontend is the Ratatui-based interactive terminal UI invoked by bare `awman` (no subcommand). It is a pure presentation layer: it translates keystrokes into `Dispatch` calls and renders typed outcomes via Ratatui widgets. No business logic lives here — any behavioral decision belongs in Layer 2.
 
 #### Entry point (`mod.rs`)
 
@@ -2266,7 +2266,7 @@ pub struct Tab {
 
 | Variant | Phase label | Border (focused) |
 |---------|-------------|-----------------|
-| `Idle` | ` amux ` | DarkGray |
+| `Idle` | ` awman ` | DarkGray |
 | `Running { command }` | ` ● running: {command} ` | Blue |
 | `Done { command, exit_code: 0 }` | ` ✓ done: {command} ` | Green (focused) / Gray |
 | `Done { command, exit_code: n }` | ` ✗ error: {command} (exit N) ` | Green (focused) / Gray |
@@ -2394,8 +2394,8 @@ Container overlay (Maximized) and active dialogs are rendered as floating layers
 
 **Welcome message** (Idle phase, no output): two dark-gray lines:
 ```
-Welcome to amux.
-Running 'amux ready' to check your environment...
+Welcome to awman.
+Running 'awman ready' to check your environment...
 ```
 
 #### Text editing widget (`text_edit.rs`)
@@ -2427,16 +2427,16 @@ Running 'amux ready' to check your environment...
 
 ---
 
-### Headless Frontend (`src/frontend/headless/`)
+### API Frontend (`src/frontend/API/`)
 
-The headless frontend is a full HTTP server (Axum + axum-server with optional rustls TLS) that dispatches commands through `Dispatch::run_command` rather than spawning child `amux` processes. It was completed in WI 0072 and is exercised end-to-end by `tests/headless_parity/`.
+The API frontend is a full HTTP server (Axum + axum-server with optional rustls TLS) that dispatches commands through `Dispatch::run_command` rather than spawning child `awman` processes. It was completed in WI 0072 and is exercised end-to-end by `tests/api_parity/`.
 
-The HTTP routes are defined in `src/frontend/headless/routes.rs`; the per-command frontends live alongside in `per_command/`. Sessions and commands are persisted to SQLite via `SqliteSessionStore` (`src/data/fs/headless_db.rs`).
+The HTTP routes are defined in `src/frontend/api/routes.rs`; the per-command frontends live alongside in `per_command/`. Sessions and commands are persisted to SQLite via `SqliteSessionStore` (`src/data/fs/api_db.rs`).
 
-`HeadlessServeConfig` is the configuration type that the CLI's `HeadlessStartCommandFrontend` impl populates and passes into `serve`:
+`ApiServeConfig` is the configuration type that the CLI's `ApiStartCommandFrontend` impl populates and passes into `serve`:
 
 ```rust
-pub struct HeadlessServeConfig {
+pub struct ApiServeConfig {
     pub port: u16,
     pub workdirs: Vec<PathBuf>,
     pub dangerously_skip_auth: bool,
@@ -2446,7 +2446,7 @@ pub struct HeadlessServeConfig {
 The `serve(config)` function signature is the public contract that WI 0072 must preserve:
 
 ```rust
-pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError>
+pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError>
 ```
 
 ---
@@ -2481,7 +2481,7 @@ if matches.subcommand_name().is_some() {
 }
 ```
 
-The headless server is launched by the `headless start` *command* (Layer 2 → Layer 3), not by `main.rs`. `main.rs` never branches on `headless`.
+The API server is launched by the `api start` *command* (Layer 2 → Layer 3), not by `main.rs`. `main.rs` never branches on `api`.
 
 ### Size constraint
 
@@ -2493,4 +2493,4 @@ The binary crate opts out of all unsafe code at the crate level. Layer 3 and Lay
 
 ---
 
-[← Headless Mode](08-headless-mode.md) · [Contents](contents.md)
+[← API Mode](08-api-mode.md) · [Contents](contents.md)

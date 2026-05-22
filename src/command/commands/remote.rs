@@ -19,7 +19,7 @@ fn build_remote_client(
     api_key: Option<&crate::engine::auth::ApiKey>,
 ) -> Result<RemoteClient, CommandError> {
     let pinned: Option<String> = if RemoteClient::is_loopback_addr(addr) {
-        let cert_path = engines.auth_engine.headless_paths().tls_cert_file();
+        let cert_path = engines.auth_engine.api_paths().tls_cert_file();
         std::fs::read_to_string(&cert_path).ok()
     } else {
         None
@@ -89,7 +89,7 @@ pub enum RemoteOutcome {
 }
 
 /// Frontend hooks for the `remote` command family. Default impls return safe
-/// non-interactive choices (first option / declined save) so headless dispatch
+/// non-interactive choices (first option / declined save) so API dispatch
 /// "just works"; CLI/TUI override to actually prompt.
 pub trait RemoteCommandFrontend: UserMessageSink + Send + Sync {
     /// Choose one of multiple sessions reported by the server. Default: first.
@@ -119,7 +119,7 @@ pub trait RemoteCommandFrontend: UserMessageSink + Send + Sync {
     }
 
     /// Should the just-used directory be persisted to the user's saved-dirs
-    /// list? Default: no — headless mode never persists side-effects without
+    /// list? Default: no — API mode never persists side-effects without
     /// an explicit signal.
     fn confirm_save_dir(&mut self, _dir: &str) -> Result<bool, CommandError> {
         Ok(false)
@@ -230,7 +230,7 @@ async fn run_remote_run(
                 ("subcommand", serde_json::json!(subcommand)),
                 ("args", serde_json::json!(args)),
             ],
-            &[("x-amux-session", session_id.as_str())],
+            &[("x-awman-session", session_id.as_str())],
         )
         .await?;
 
@@ -410,7 +410,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config_json = format!(r#"{{"remote":{{"defaultAddr":"{addr}"}}}}"#);
         std::fs::write(tmp.path().join("config.json"), &config_json).unwrap();
-        let env = EnvSnapshot::with_overrides([("AMUX_CONFIG_HOME", tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
         let opts = SessionOpenOptions {
             env: Some(env),
             ..Default::default()

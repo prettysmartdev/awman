@@ -1,22 +1,22 @@
-//! Global configuration: `$HOME/.amux/config.json`.
+//! Global configuration: `$HOME/.awman/config.json`.
 //!
-//! `AMUX_CONFIG_HOME` overrides the location for tests and bespoke installs.
+//! `AWMAN_CONFIG_HOME` overrides the location for tests and bespoke installs.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::repo::{HeadlessConfig, OverlaysConfig, RemoteConfig};
+use crate::data::config::repo::{ApiConfig, OverlaysConfig, RemoteConfig};
 use crate::data::error::DataError;
 
 /// Filename of the global config inside the resolved global directory.
 pub const GLOBAL_CONFIG_FILENAME: &str = "config.json";
 
-/// Subdirectory under `$HOME` that hosts global amux state.
-pub const GLOBAL_CONFIG_HOME_SUBDIR: &str = ".amux";
+/// Subdirectory under `$HOME` that hosts global awman state.
+pub const GLOBAL_CONFIG_HOME_SUBDIR: &str = ".awman";
 
-/// Global configuration stored at `$HOME/.amux/config.json` (or `$AMUX_CONFIG_HOME/config.json`).
+/// Global configuration stored at `$HOME/.awman/config.json` (or `$AWMAN_CONFIG_HOME/config.json`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,7 +33,7 @@ pub struct GlobalConfig {
     #[serde(rename = "envPassthrough", skip_serializing_if = "Option::is_none")]
     pub env_passthrough: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub headless: Option<HeadlessConfig>,
+    pub api: Option<ApiConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,8 +43,8 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
-    /// Resolve the global config home directory. Honours `AMUX_CONFIG_HOME` for
-    /// tests and overrides; otherwise falls back to `$HOME/.amux`.
+    /// Resolve the global config home directory. Honours `AWMAN_CONFIG_HOME` for
+    /// tests and overrides; otherwise falls back to `$HOME/.awman`.
     pub fn home_dir() -> Result<PathBuf, DataError> {
         Self::home_dir_with(&Env::from_process())
     }
@@ -103,11 +103,11 @@ impl GlobalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::AMUX_CONFIG_HOME;
-    use crate::data::config::repo::{HeadlessConfig, RemoteConfig};
+    use crate::data::config::env::AWMAN_CONFIG_HOME;
+    use crate::data::config::repo::{ApiConfig, RemoteConfig};
 
     fn isolated_env(home_dir: &std::path::Path) -> EnvSnapshot {
-        EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, home_dir.to_str().unwrap())])
+        EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_dir.to_str().unwrap())])
     }
 
     #[test]
@@ -130,7 +130,7 @@ mod tests {
             runtime: Some("docker".to_string()),
             yolo_disallowed_tools: Some(vec!["rm".to_string()]),
             env_passthrough: Some(vec!["HOME".to_string()]),
-            headless: Some(HeadlessConfig {
+            api: Some(ApiConfig {
                 work_dirs: Some(vec!["/work".to_string()]),
                 always_non_interactive: Some(true),
             }),
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn amux_config_home_overrides_resolution() {
+    fn awman_config_home_overrides_resolution() {
         let tmp = tempfile::tempdir().unwrap();
         let env = isolated_env(tmp.path());
         let path = GlobalConfig::path_with(&env).unwrap();
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn home_dir_with_returns_amux_config_home_when_set() {
+    fn home_dir_with_returns_awman_config_home_when_set() {
         let tmp = tempfile::tempdir().unwrap();
         let env = isolated_env(tmp.path());
         let home = GlobalConfig::home_dir_with(&env).unwrap();

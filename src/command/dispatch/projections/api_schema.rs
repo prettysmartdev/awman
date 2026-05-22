@@ -6,7 +6,7 @@ use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, CommandSpec, FlagKind, FrontendVisibility,
 };
 
-/// One row of the headless REST routing table.
+/// One row of the api REST routing table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestRoute {
     /// HTTP method, always `POST` for command-style routes.
@@ -49,7 +49,7 @@ impl CommandCatalogue {
                 }));
             }
             for flag in spec.flags {
-                if !flag_visible_to_headless(flag.frontends) {
+                if !flag_visible_to_api(flag.frontends) {
                     continue;
                 }
                 params.push(json!({
@@ -73,7 +73,7 @@ impl CommandCatalogue {
         }
         json!({
             "openapi": "3.0.0",
-            "info": { "title": "amux headless API", "version": "1" },
+            "info": { "title": "awman API", "version": "1" },
             "paths": Value::Object(paths),
         })
     }
@@ -94,7 +94,7 @@ fn collect_routes(spec: &'static CommandSpec, path: &mut Vec<String>, out: &mut 
     }
 }
 
-fn flag_visible_to_headless(v: FrontendVisibility) -> bool {
+fn flag_visible_to_api(v: FrontendVisibility) -> bool {
     matches!(v, FrontendVisibility::All)
 }
 
@@ -157,7 +157,7 @@ mod tests {
 
     // Walk every leaf command in the catalogue and assert it appears in both
     // the rest_route_table and the openapi_schema paths.
-    fn walk_and_verify_headless_leaf(
+    fn walk_and_verify_api_leaf(
         _cat: &CommandCatalogue,
         spec: &'static crate::command::dispatch::catalogue::CommandSpec,
         path: Vec<String>,
@@ -187,12 +187,12 @@ mod tests {
         for sub in spec.subcommands {
             let mut new_path = path.clone();
             new_path.push(sub.name.to_string());
-            walk_and_verify_headless_leaf(_cat, sub, new_path, routes, schema_paths);
+            walk_and_verify_api_leaf(_cat, sub, new_path, routes, schema_paths);
         }
     }
 
     #[test]
-    fn catalogue_headless_consistency_every_leaf_in_route_table_and_schema() {
+    fn catalogue_api_consistency_every_leaf_in_route_table_and_schema() {
         let cat = CommandCatalogue::get();
         let routes = cat.rest_route_table();
         let schema = cat.openapi_schema();
@@ -201,7 +201,7 @@ mod tests {
             .expect("openapi_schema must have 'paths'")
             .as_object()
             .expect("paths must be an object");
-        walk_and_verify_headless_leaf(cat, cat.root(), vec![], &routes, schema_paths);
+        walk_and_verify_api_leaf(cat, cat.root(), vec![], &routes, schema_paths);
     }
 
     #[test]
@@ -219,10 +219,10 @@ mod tests {
             "/v1/config/set",
             "/v1/exec/prompt",
             "/v1/exec/workflow",
-            "/v1/headless/start",
-            "/v1/headless/kill",
-            "/v1/headless/logs",
-            "/v1/headless/status",
+            "/v1/api/start",
+            "/v1/api/kill",
+            "/v1/api/logs",
+            "/v1/api/status",
             "/v1/remote/run",
             "/v1/remote/session/start",
             "/v1/remote/session/kill",
@@ -243,7 +243,7 @@ mod tests {
         let cat = CommandCatalogue::get();
         let schema = cat.openapi_schema();
         assert_eq!(schema["openapi"], "3.0.0");
-        assert_eq!(schema["info"]["title"], "amux headless API");
+        assert_eq!(schema["info"]["title"], "awman API");
         let paths = schema["paths"].as_object().unwrap();
         assert!(!paths.is_empty(), "schema must have at least one path");
     }

@@ -222,7 +222,7 @@ impl CommandFrontend for CliFrontend {
 // just declare the marker impl here.
 //
 // The richer per-command traits (`Init`, `Ready`, `Chat`, `ExecPrompt`,
-// `ExecWorkflow`, `Headless`) gain method bodies in the per-command
+// `ExecWorkflow`, `Api`) gain method bodies in the per-command
 // modules under `src/frontend/cli/per_command/`.
 
 impl AuthCommandFrontend for CliFrontend {
@@ -241,7 +241,7 @@ impl AuthCommandFrontend for CliFrontend {
             });
         }
         let suffix = if default { "[Y/n/o]" } else { "[y/N/o]" };
-        eprintln!("amux: persist agent auth consent for this repo? {suffix}");
+        eprintln!("awman: persist agent auth consent for this repo? {suffix}");
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return Ok(if default {
@@ -329,7 +329,7 @@ impl SpecsCommandFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(WorkItemKind::Task);
         }
-        eprintln!("amux: work item kind?");
+        eprintln!("awman: work item kind?");
         eprintln!("  [1] Feature");
         eprintln!("  [2] Bug");
         eprintln!("  [3] Task");
@@ -397,7 +397,7 @@ fn require_multiline_input(prompt: &str) -> Result<String, CommandError> {
         }),
     }
 }
-// HeadlessCommandFrontend for CliFrontend is in per_command/headless.rs
+// ApiServerCommandFrontend for CliFrontend is in per_command/api_server.rs
 
 impl StatusCommandFrontend for CliFrontend {
     /// Watch loop continues until the user presses Ctrl+C.
@@ -448,8 +448,8 @@ fn ensure_watch_signal_handler_installed() {
     }
 }
 
-// `HeadlessStartCommandFrontend` requires a `serve_until_shutdown` method
-// — provided in `per_command::headless`.
+// `ApiServerStartCommandFrontend` requires a `serve_until_shutdown` method
+// — provided in `per_command::api_server`.
 
 // Check that flag_bool returns sensible values for SetTrue actions:
 // when not present, clap fills `false`; we surface that as `Some(false)`
@@ -464,7 +464,7 @@ mod tests {
     fn command_path_from_matches_extracts_nested_subcommand() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "wf.toml"])
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
             .unwrap();
         let path = command_path_from_matches(&m);
         assert_eq!(path, vec!["exec", "workflow"]);
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn command_path_from_matches_top_level_subcommand() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let path = command_path_from_matches(&m);
         assert_eq!(path, vec!["status"]);
     }
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn command_path_from_matches_bare_invocation_is_empty() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman"]).unwrap();
         let path = command_path_from_matches(&m);
         assert!(path.is_empty());
     }
@@ -490,7 +490,7 @@ mod tests {
     fn command_path_from_matches_three_level_deep() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "remote", "session", "start"])
+            .try_get_matches_from(["awman", "remote", "session", "start"])
             .unwrap();
         let path = command_path_from_matches(&m);
         assert_eq!(path, vec!["remote", "session", "start"]);
@@ -502,7 +502,7 @@ mod tests {
     fn flag_bool_reads_set_true_flag_from_arg_matches() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "wf.toml", "--yolo"])
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--yolo"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_bool(&["exec", "workflow"], "yolo").unwrap();
@@ -513,7 +513,7 @@ mod tests {
     fn flag_bool_absent_returns_some_false_for_known_bool_flag() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "wf.toml"])
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         // ArgAction::SetTrue stores false when the flag is absent.
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn flag_bool_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
         // Querying a flag on a different subcommand path returns None.
         let v = frontend.flag_bool(&["init"], "aspec").unwrap();
@@ -542,61 +542,61 @@ mod tests {
         }
         let cases = [
             Case {
-                argv: &["amux", "init", "--aspec"],
+                argv: &["awman", "init", "--aspec"],
                 path: &["init"],
                 flag: "aspec",
                 expected: Some(true),
             },
             Case {
-                argv: &["amux", "init"],
+                argv: &["awman", "init"],
                 path: &["init"],
                 flag: "aspec",
                 expected: Some(false),
             },
             Case {
-                argv: &["amux", "ready", "--build"],
+                argv: &["awman", "ready", "--build"],
                 path: &["ready"],
                 flag: "build",
                 expected: Some(true),
             },
             Case {
-                argv: &["amux", "ready", "--no-cache"],
+                argv: &["awman", "ready", "--no-cache"],
                 path: &["ready"],
                 flag: "no-cache",
                 expected: Some(true),
             },
             Case {
-                argv: &["amux", "ready"],
+                argv: &["awman", "ready"],
                 path: &["ready"],
                 flag: "no-cache",
                 expected: Some(false),
             },
             Case {
-                argv: &["amux", "chat", "--yolo"],
+                argv: &["awman", "chat", "--yolo"],
                 path: &["chat"],
                 flag: "yolo",
                 expected: Some(true),
             },
             Case {
-                argv: &["amux", "chat"],
+                argv: &["awman", "chat"],
                 path: &["chat"],
                 flag: "yolo",
                 expected: Some(false),
             },
             Case {
-                argv: &["amux", "status", "--watch"],
+                argv: &["awman", "status", "--watch"],
                 path: &["status"],
                 flag: "watch",
                 expected: Some(true),
             },
             Case {
-                argv: &["amux", "config", "set", "agent", "claude"],
+                argv: &["awman", "config", "set", "agent", "claude"],
                 path: &["config", "set"],
                 flag: "global",
                 expected: Some(false),
             },
             Case {
-                argv: &["amux", "config", "set", "agent", "claude", "--global"],
+                argv: &["awman", "config", "set", "agent", "claude", "--global"],
                 path: &["config", "set"],
                 flag: "global",
                 expected: Some(true),
@@ -623,7 +623,7 @@ mod tests {
     fn flag_enum_reads_agent_on_init() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "init", "--agent", "codex"])
+            .try_get_matches_from(["awman", "init", "--agent", "codex"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_enum(&["init"], "agent").unwrap();
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn flag_enum_default_returns_catalogue_default() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "init"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "init"]).unwrap();
         let frontend = CliFrontend::new(m);
         // The catalogue default for `--agent` on `init` is "claude".
         let v = frontend.flag_enum(&["init"], "agent").unwrap();
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn flag_string_optional_agent_absent_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "chat"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "chat"]).unwrap();
         let frontend = CliFrontend::new(m);
         // `--agent` on chat is OptionalString with no default.
         let v = frontend.flag_string(&["chat"], "agent").unwrap();
@@ -654,7 +654,7 @@ mod tests {
     fn flag_string_optional_agent_present() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "chat", "--agent", "gemini"])
+            .try_get_matches_from(["awman", "chat", "--agent", "gemini"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_string(&["chat"], "agent").unwrap();
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn flag_string_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_string(&["init"], "agent").unwrap();
         assert_eq!(v, None);
@@ -676,7 +676,7 @@ mod tests {
     fn flag_strings_reads_single_overlay() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "chat", "--overlay", "/src"])
+            .try_get_matches_from(["awman", "chat", "--overlay", "/src"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
@@ -687,7 +687,7 @@ mod tests {
     fn flag_strings_reads_repeated_overlay_flags() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "chat", "--overlay", "/a", "--overlay", "/b"])
+            .try_get_matches_from(["awman", "chat", "--overlay", "/a", "--overlay", "/b"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn flag_strings_returns_empty_when_flag_absent() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "chat"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "chat"]).unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
         assert!(v.is_empty());
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn flag_strings_wrong_path_returns_empty() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
         assert!(v.is_empty());
@@ -718,7 +718,7 @@ mod tests {
     fn flag_path_reads_path_argument_for_exec_workflow() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "/path/to/wf.toml"])
+            .try_get_matches_from(["awman", "exec", "workflow", "/path/to/wf.toml"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend
@@ -731,7 +731,7 @@ mod tests {
     fn flag_path_reads_first_positional_argument_for_path_args() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "wf.toml"])
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend
@@ -746,10 +746,10 @@ mod tests {
     fn flag_u16_reads_port_flag() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "headless", "start", "--port", "1234"])
+            .try_get_matches_from(["awman", "api", "start", "--port", "1234"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["headless", "start"], "port").unwrap();
+        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
         assert_eq!(v, Some(1234u16));
     }
 
@@ -757,20 +757,20 @@ mod tests {
     fn flag_u16_default_value_when_absent() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "headless", "start"])
+            .try_get_matches_from(["awman", "api", "start"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        // Default for `--port` on `headless start` is 9876.
-        let v = frontend.flag_u16(&["headless", "start"], "port").unwrap();
+        // Default for `--port` on `api start` is 9876.
+        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
         assert_eq!(v, Some(9876u16));
     }
 
     #[test]
     fn flag_u16_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["headless", "start"], "port").unwrap();
+        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
         assert_eq!(v, None);
     }
 
@@ -780,7 +780,7 @@ mod tests {
     fn argument_reads_work_item_positional() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "specs", "amend", "0069"])
+            .try_get_matches_from(["awman", "specs", "amend", "0069"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
@@ -791,7 +791,7 @@ mod tests {
     fn argument_trailing_var_args_joins_multi_token_command() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "remote", "run", "exec", "prompt", "hello"])
+            .try_get_matches_from(["awman", "remote", "run", "exec", "prompt", "hello"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.argument(&["remote", "run"], "command").unwrap();
@@ -802,7 +802,7 @@ mod tests {
     fn argument_trailing_var_args_single_token() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "remote", "run", "status"])
+            .try_get_matches_from(["awman", "remote", "run", "status"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.argument(&["remote", "run"], "command").unwrap();
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn argument_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
         assert_eq!(v, None);
@@ -824,7 +824,7 @@ mod tests {
     fn arguments_reads_trailing_var_args_as_vec() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "remote", "run", "exec", "prompt", "hello"])
+            .try_get_matches_from(["awman", "remote", "run", "exec", "prompt", "hello"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.arguments(&["remote", "run"], "command").unwrap();
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn arguments_wrong_path_returns_empty_vec() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.arguments(&["remote", "run"], "command").unwrap();
         assert!(v.is_empty());
@@ -854,7 +854,7 @@ mod tests {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
             .try_get_matches_from([
-                "amux",
+                "awman",
                 "chat",
                 "--yolo",
                 "--agent",
@@ -883,7 +883,7 @@ mod tests {
         // because `exec` itself has no ArgMatches with those flags.
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "wf.toml", "--yolo"])
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--yolo"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         // Querying the `exec` path (not the `exec workflow` path).
