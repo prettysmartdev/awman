@@ -2,7 +2,7 @@
   <strong>Run and coordinate AI code agents from your terminal.</strong> <br>
   Parallel sessions, multi-step workflows, full container isolation.<br>
   <br>
-  <img src="./docs/awman_logo_v3.svg" width="320" alt="awman">
+  <img src="./docs/awman_logo.svg" width="320" alt="awman">
 </p>
 
 <p align="center">
@@ -11,7 +11,7 @@
 
 ---
 
-`awman` (Agentic Workflow Manager) is a terminal multiplexer for AI code agents. Open multiple agent sessions in parallel, run them through structured multi-step workflows, run agents on a fleet of machines, and keep everything safe — every agent runs inside a container, never on the host.
+`awman` (Agentic Workflow Manager) is a developer tool that adds structure and automation to the entire agentic software development lifecycle, from issue to merged PR. Run multiple agent sessions in parallel, execute structured multi-step workflows, run agents on a fleet of remote machines, and keep everything safe — every agent runs inside a container, never on the host.
 
 ![awman TUI](./docs/blog/images/tui-screenshot.png)
 
@@ -85,7 +85,7 @@ See the [Getting Started Guide](docs/00-getting-started.md) for a full walkthrou
 
 ### Run multiple agents at once
 
-Open a new tab with **Ctrl+T**. Each tab is independent — its own working directory, its own container, running in the background while you work in another tab. Switch between tabs with **Ctrl+A** / **Ctrl+D**.
+From the `awman` TUI, Open new tabs with **Ctrl+T**. Each tab is independent — its own working directory, its own container, running in the background while you work in another tab. Switch between tabs with **Ctrl+A** / **Ctrl+D**.
 
 If a running agent gets stuck or completes its task, its tab turns yellow so you know to check in.
 
@@ -135,7 +135,7 @@ Prompt: Review for correctness and style.
 Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`. Steps without an `Agent:` field use your configured default.
 
 
-### Hand off to the agent completely (yolo mode)
+### Hand off to the agent workflow completely (yolo mode)
 
 ![awman yolo mode](./docs/blog/images/tui-yolo-mode.png)
 
