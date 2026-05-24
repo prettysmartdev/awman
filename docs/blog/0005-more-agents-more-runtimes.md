@@ -45,7 +45,7 @@ Docker Desktop on Mac has always felt more bloated than it needs to be (especial
 { "runtime": "apple-containers" }
 ```
 
-That's all you need to do (though I do reccomend reviewing the default Apple Container resource allocations using `container system property list`, the defaults are scrawny). Your project's `Dockerfile.dev`, workflow files, and every other amux feature works exactly the same — amux maps all operations to the right container runtime behind the scenes. `amux ready` validates the runtime and ensures it's ready before you start your work.
+That's all you need to do (though I do recommend reviewing the default Apple Container resource allocations using `container system property list`, the defaults are scrawny). Your project's `Dockerfile.dev`, workflow files, and every other amux feature works exactly the same — amux maps all operations to the right container runtime behind the scenes. `amux ready` validates the runtime and ensures it's ready before you start your work.
 
 ---
 
