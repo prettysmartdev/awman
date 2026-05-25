@@ -803,4 +803,4 @@ The tag push triggers the release CI pipeline, which builds binaries for all pla
 
 ---
 
-[← Yolo Mode](05-yolo-mode.md) · [Next: API Mode →](08-api-mode.md)
+[← Headless Mode](06-headless-mode.md) · [Next: API Mode →](08-api-mode.md)

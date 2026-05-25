@@ -783,18 +783,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContainerFrontend for FakeContainerFrontend {
-        fn write_stdout(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn write_stderr(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-            Ok(0)
-        }
         fn report_status(&mut self, _status: ContainerStatus) {}
         fn report_progress(&mut self, _progress: ContainerProgress) {}
-        fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+            let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::engine::container::frontend::ContainerIo {
+                stdout: stdout_tx,
+                stderr: stderr_tx,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
     }
 
     impl UserMessageSink for FakeReadyFrontend {

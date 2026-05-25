@@ -217,11 +217,6 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
-        // Apple's `container stats --no-stream --format json` emits raw
-        // counters: `cpuUsageUsec` (cumulative CPU time) and
-        // `memoryUsageBytes`. Computing CPU% from a single sample isn't
-        // possible, so take two samples ~200ms apart and divide the delta
-        // by elapsed wall-clock time. Mirrors old-amux behavior.
         let take_sample = |name: &str| -> Result<(u64, u64), EngineError> {
             let out = Command::new("container")
                 .args(["stats", "--no-stream", "--format", "json", name])
@@ -244,7 +239,6 @@ impl ContainerBackend for AppleBackend {
                 )));
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
-            // Apple emits a JSON array; some other versions emit per-line.
             let value: serde_json::Value = serde_json::from_str(stdout.trim())
                 .or_else(|_| {
                     stdout
@@ -353,111 +347,43 @@ impl ContainerInstance for AppleContainerInstance {
         self: Box<Self>,
         mut frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
     ) -> Result<ContainerExecution, EngineError> {
-        // The Apple `container` CLI honours the same `run` argv shape; reuse
-        // the Docker assembler.
         let argv = build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
-        let interactive = self.options.interactive;
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
 
-        // PTY-bridged path: the TUI frontend exposes a `ContainerIo`. We
-        // spawn the Apple `container run -it` binary via portable-pty so the
-        // PTY master is bridged into the frontend's vt100 parser.
         frontend.report_status(
             crate::engine::container::frontend::ContainerStatus::Running {
                 container_name: self.name.0.clone(),
             },
         );
 
-        let pty_io = if interactive {
-            frontend.take_container_io()
-        } else {
-            None
-        };
-        if let Some(io) = pty_io {
-            return spawn_pty_bridged_apple(self, frontend, io, argv, started_at, handle);
+        let io = frontend.take_container_io();
+
+        // PTY-bridged path
+        if io.initial_size.is_some() {
+            return spawn_pty_bridged_apple(self, io, argv, seeded, started_at, handle);
         }
 
-        let mut cmd = Command::new("container");
-        cmd.args(&argv);
-        if interactive {
-            // Interactive (no PTY bridge): open /dev/tty directly so Apple
-            // Containers gets a fresh terminal fd for PTY setup. After CLI
-            // prompts have consumed buffered reads on fd 0, inheriting stdin
-            // can fail with ENOTTY because Apple Containers calls
-            // ioctl(TIOCGWINSZ) on the fd.
-            #[cfg(unix)]
-            {
-                let tty_stdin = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/tty")
-                    .map(std::process::Stdio::from)
-                    .unwrap_or_else(|_| Stdio::inherit());
-                cmd.stdin(tty_stdin);
-            }
-            #[cfg(not(unix))]
-            cmd.stdin(Stdio::inherit());
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-        } else if seeded.is_some() {
-            cmd.stdin(Stdio::piped());
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-        } else {
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-        }
-
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                EngineError::ContainerRuntimeUnavailable {
-                    binary: "container".into(),
-                }
-            } else {
-                EngineError::Container(format!("spawn container: {e}"))
-            }
-        })?;
-
-        if let Some(prompt) = seeded {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(prompt.as_bytes());
-                let _ = stdin.write_all(b"\n");
-                drop(stdin);
-            }
-        }
-
-        let backend = AppleExecution {
-            child: Some(child),
-            pty_child: None,
-            pty_master: None,
-            stdin_injector: None,
-            container_name: self.name.0.clone(),
-            started_at,
-        };
-        Ok(ContainerExecution::new(handle, Box::new(backend)))
+        // Piped path
+        spawn_piped_apple(self, io, argv, seeded, started_at, handle)
     }
 }
 
 /// Spawn the Apple `container run -it` binary via `portable-pty` and bridge
-/// the PTY master to the frontend's `ContainerIo` channels. Mirrors
-/// `docker.rs::spawn_pty_bridged_docker` exactly — same reader thread,
-/// writer task, and resize task — but talks to the Apple `container` CLI
-/// instead of `docker`.
+/// the PTY master to the frontend's `ContainerIo` channels via the shared
+/// I/O bridge.
 fn spawn_pty_bridged_apple(
     instance: Box<AppleContainerInstance>,
-    _frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
     io: crate::engine::container::frontend::ContainerIo,
     argv: Vec<String>,
+    seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::ContainerHandle,
 ) -> Result<ContainerExecution, EngineError> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-    let (cols, rows) = io.initial_size;
+    let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -478,77 +404,77 @@ fn spawn_pty_bridged_apple(
         .spawn_command(cmd)
         .map_err(|e| EngineError::Container(format!("spawn container via pty: {e}")))?;
 
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+    // Write seeded prompt into stdin channel before the writer task starts.
+    if let Some(prompt) = seeded {
+        let _ = io.stdin_tx.send(prompt.into_bytes());
+        let _ = io.stdin_tx.send(b"\n".to_vec());
+    }
 
-    // Reader thread: PTY → frontend stdout channel.
-    let stdout_tx = io.stdout;
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdout_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // Writer task: stdin channel → PTY. Same channel feeds keystrokes from
-    // the frontend AND `inject_prompt`.
-    let mut stdin_rx = io.stdin_rx;
-    tokio::spawn(async move {
-        use std::io::Write;
-        while let Some(bytes) = stdin_rx.recv().await {
-            if writer.write_all(&bytes).is_err() {
-                break;
-            }
-            if writer.flush().is_err() {
-                break;
-            }
-        }
-    });
-
-    // Resize task: forward terminal resizes to the PTY master.
-    let master_arc = std::sync::Arc::new(std::sync::Mutex::new(pair.master));
-    let master_for_resize = std::sync::Arc::clone(&master_arc);
-    let mut resize_rx = io.resize;
-    tokio::spawn(async move {
-        while let Some((cols, rows)) = resize_rx.recv().await {
-            if let Ok(master) = master_for_resize.lock() {
-                let _ = master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            }
-        }
-    });
+    let (master_arc, bridge) =
+        crate::engine::container::io_bridge::bridge_pty(io, pair)?;
 
     let backend = AppleExecution {
         child: None,
         pty_child: Some(child),
         pty_master: Some(master_arc),
-        stdin_injector: Some(io.stdin_tx),
+        stdin_injector: Some(bridge.stdin_injector),
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(handle, Box::new(backend)))
+    Ok(ContainerExecution::new(handle, Box::new(backend), bridge.stuck_tx))
+}
+
+/// Spawn `container run` with piped stdio and bridge through `ContainerIo`.
+fn spawn_piped_apple(
+    instance: Box<AppleContainerInstance>,
+    io: crate::engine::container::frontend::ContainerIo,
+    argv: Vec<String>,
+    seeded: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    handle: crate::data::session::ContainerHandle,
+) -> Result<ContainerExecution, EngineError> {
+    let mut cmd = Command::new("container");
+    cmd.args(&argv);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            EngineError::ContainerRuntimeUnavailable {
+                binary: "container".into(),
+            }
+        } else {
+            EngineError::Container(format!("spawn container: {e}"))
+        }
+    })?;
+
+    // Write seeded prompt into stdin channel before the writer task starts.
+    if let Some(prompt) = seeded {
+        let _ = io.stdin_tx.send(prompt.into_bytes());
+        let _ = io.stdin_tx.send(b"\n".to_vec());
+    }
+
+    let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child);
+
+    // Non-interactive (piped) path: drop the engine's stdin_injector so the
+    // writer task sees EOF after draining the seeded prompt and closes the
+    // child's stdin pipe. See docker.rs::spawn_piped_docker for rationale.
+    drop(bridge.stdin_injector);
+
+    let backend = AppleExecution {
+        child: Some(child),
+        pty_child: None,
+        pty_master: None,
+        stdin_injector: None,
+        container_name: instance.name.0.clone(),
+        started_at,
+    };
+    Ok(ContainerExecution::new(handle, Box::new(backend), bridge.stuck_tx))
 }
 
 struct AppleExecution {
-    /// Set when running with inherit-stdio.
+    /// Set when running with piped stdio.
     child: Option<std::process::Child>,
     /// Set when running PTY-bridged via portable-pty.
     pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,

@@ -38,22 +38,71 @@ pub struct CliFrontend {
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
+    /// Effective non-interactive mode: true when explicitly requested via
+    /// `--non-interactive` OR when stdin is not a TTY.
+    pub(crate) non_interactive: bool,
     /// Receiver end of the background stdin-reader thread spawned for yolo
     /// countdown input. `None` until the first `yolo_countdown_tick` call on a
     /// TTY; consumed lines are mapped to `YoloTickOutcome` by the
     /// `WorkflowFrontend` impl. Wrapped in `Mutex` to satisfy the `Sync` bound
     /// on frontend traits (access is single-threaded in practice).
     pub(crate) yolo_stdin_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
+    /// Throttle: last time a yolo countdown message was emitted to stderr.
+    pub(crate) last_sink_message_time: Option<std::time::Instant>,
+    /// RAII guard that restores cooked mode when dropped. Present while a
+    /// full-screen interactive container owns the terminal.
+    pub(crate) raw_mode_guard: Option<RawModeGuard>,
+    /// Shutdown flag for the interactive `/dev/stdin` reader thread. Set
+    /// by `report_step_status` on a terminal status so the thread exits
+    /// without waiting for a final keystroke; the thread polls this on
+    /// every iteration of its `poll(2)` loop.
+    pub(crate) stdin_reader_shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// RAII guard: enables raw mode on creation, disables it on drop.
+pub(crate) struct RawModeGuard;
+
+impl RawModeGuard {
+    pub fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
 }
 
 impl CliFrontend {
     pub fn new(matches: ArgMatches) -> Self {
         let command_path = command_path_from_matches(&matches);
+        let explicit_flag = {
+            let path_strs: Vec<&str> = command_path.iter().map(|s| s.as_str()).collect();
+            let mut m = &matches;
+            for seg in &path_strs {
+                match m.subcommand_matches(seg) {
+                    Some(sub) => m = sub,
+                    None => break,
+                }
+            }
+            m.try_get_one::<bool>("non-interactive")
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+        };
+        let non_interactive = crate::frontend::effective_non_interactive(explicit_flag);
         Self {
             matches,
             command_path,
             messages: CliUserMessageQueue::new(),
+            non_interactive,
             yolo_stdin_rx: None,
+            last_sink_message_time: None,
+            raw_mode_guard: None,
+            stdin_reader_shutdown: None,
         }
     }
 

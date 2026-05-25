@@ -10,14 +10,9 @@ use ratatui::layout::Rect;
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
-use crate::engine::container::instance::ContainerStats;
+use crate::engine::container::instance::{ContainerStats, StuckEvent};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::user_message::SharedStatusLog;
-
-/// How long a tab can produce no PTY output before being marked "stuck".
-/// The tab color flips to yellow and a warning glyph is added to the tab
-/// label, so the user knows to check on it.
-pub const STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Per-tab execution lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,9 +116,15 @@ pub type SharedResizeTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u
 
 /// Shared engine sender. The engine creates the channel and publishes
 /// the sender via `set_engine_sender`; the TUI event loop reads it
-/// to send Ctrl-W, StepStuck, and StepUnstuck requests.
+/// to send Ctrl-W requests.
 pub type SharedEngineTx =
     Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>>>;
+
+/// Shared stuck sender. The engine publishes the container's stuck
+/// broadcast sender via `set_stuck_sender`; the TUI event loop subscribes
+/// from it for tab-coloring (stuck indicator).
+pub type SharedStuckSender =
+    Arc<Mutex<Option<Arc<tokio::sync::broadcast::Sender<StuckEvent>>>>>;
 
 /// Shared TUI context for the status command. The event loop refreshes this
 /// on every tick so the status watch loop always sees live tab data.
@@ -219,11 +220,9 @@ pub struct Tab {
     pub output_lines: Vec<String>,
     pub stuck: bool,
     pub yolo_mode: bool,
-    pub last_output_time: Option<Instant>,
-    /// Last time the user touched this tab (key press, mouse). Used together
-    /// with `last_output_time` to suppress stuck detection while the user is
-    /// actively engaged.
-    pub last_user_activity_time: Option<Instant>,
+    /// Broadcast receiver for stuck/unstuck events from the container engine.
+    /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
+    pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
 
     // ── Async command plumbing ───────────────────────────────────────────
     /// Event loop drains container stdout/stderr into the vt100 parser.
@@ -250,6 +249,9 @@ pub struct Tab {
     pub resize_tx_shared: SharedResizeTx,
     /// Shared control board sender for mid-step WCB requests.
     pub engine_tx_shared: SharedEngineTx,
+    /// Shared stuck sender from the container engine. The event loop
+    /// subscribes from it when a new sender appears.
+    pub stuck_sender_shared: SharedStuckSender,
     /// Shared active worktree path: set by the worktree-lifecycle frontend
     /// after a worktree is created/resumed, cleared after the workflow
     /// finalize step. Drives the "Using worktree: <path>" bottom-bar line.
@@ -287,8 +289,7 @@ impl Tab {
             output_lines: Vec::new(),
             stuck: false,
             yolo_mode: false,
-            last_output_time: None,
-            last_user_activity_time: None,
+            stuck_rx: None,
             container_stdout_rx: None,
             container_stdin_tx: None,
             container_resize_tx: None,
@@ -300,6 +301,7 @@ impl Tab {
             stdin_tx_shared: Arc::new(Mutex::new(None)),
             resize_tx_shared: Arc::new(Mutex::new(None)),
             engine_tx_shared: Arc::new(Mutex::new(None)),
+            stuck_sender_shared: Arc::new(Mutex::new(None)),
             active_worktree_path: Arc::new(Mutex::new(None)),
             tui_context_shared: Arc::new(Mutex::new(
                 crate::command::commands::status::StatusCommandTuiContext::default(),
@@ -307,52 +309,23 @@ impl Tab {
         }
     }
 
-    /// Recompute the `stuck` flag based on `last_output_time` vs. now.
-    ///
-    /// A tab is considered stuck when:
-    /// - it is currently Running
-    /// - a container is open (Maximized or Minimized)
-    /// - no PTY bytes have arrived for `STUCK_TIMEOUT`
-    /// - if this is the active tab, the user hasn't touched it for at least
-    ///   `STUCK_TIMEOUT` either (so we don't flag a tab the user is plainly
-    ///   working in).
-    pub fn recompute_stuck(&mut self, is_active: bool) {
-        let was_stuck = self.stuck;
-        self.stuck = self.is_stuck(is_active, STUCK_TIMEOUT);
-        if !was_stuck && self.stuck {
-            // Cosmetic: nothing else; the tab color picks this up.
+    /// Drain pending stuck events from the broadcast channel and update
+    /// the `stuck` flag for tab coloring.
+    pub fn drain_stuck_events(&mut self) {
+        // Pick up a new stuck sender from the engine if available.
+        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
+            if let Some(sender) = guard.take() {
+                self.stuck_rx = Some(sender.subscribe());
+            }
         }
-    }
-
-    fn is_stuck(&self, is_active: bool, timeout: std::time::Duration) -> bool {
-        if !matches!(self.execution_phase, ExecutionPhase::Running { .. }) {
-            return false;
-        }
-        if self.container_window_state == ContainerWindowState::Hidden {
-            return false;
-        }
-        let output_stale = self
-            .last_output_time
-            .map(|t| t.elapsed() >= timeout)
-            .unwrap_or(false);
-        if !output_stale {
-            return false;
-        }
-        if is_active {
-            // Active tab: don't flag while the user is actively typing.
-            if let Some(activity) = self.last_user_activity_time {
-                if activity.elapsed() < timeout {
-                    return false;
+        if let Some(ref mut rx) = self.stuck_rx {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    StuckEvent::Stuck => self.stuck = true,
+                    StuckEvent::Unstuck => self.stuck = false,
                 }
             }
         }
-        true
-    }
-
-    /// Stamp `last_user_activity_time` to suppress stuck detection while the
-    /// user is engaged. Called on key/mouse events.
-    pub fn record_user_activity(&mut self) {
-        self.last_user_activity_time = Some(Instant::now());
     }
 
     /// Activate the container overlay for a fresh PTY container session.
@@ -376,7 +349,6 @@ impl Tab {
         );
         self.last_container_summary = None;
         self.mouse_selection = None;
-        self.last_output_time = Some(Instant::now());
         self.container_info = Some(ContainerInfo {
             agent_display_name,
             container_name,
@@ -444,7 +416,7 @@ impl Tab {
             format!("{}: {}", cmd, workflow_suffix)
         };
 
-        let prefix = if self.stuck && self.is_stuck(is_active, STUCK_TIMEOUT) {
+        let prefix = if self.stuck {
             "\u{26a0}\u{fe0f} "
         } else {
             ""
@@ -526,7 +498,6 @@ impl Tab {
             let mut received_any = false;
             while let Ok(bytes) = rx.try_recv() {
                 self.vt100_parser.process(&bytes);
-                self.last_output_time = Some(Instant::now());
                 received_any = true;
             }
             if received_any && self.container_window_state == ContainerWindowState::Hidden {
@@ -577,8 +548,8 @@ impl Tab {
         self.container_inner_area = None;
         self.mouse_selection = None;
         self.container_scroll_offset = 0;
-        self.last_output_time = None;
         self.stuck = false;
+        self.stuck_rx = None;
     }
 
     /// Check if the command task has completed; update execution phase.

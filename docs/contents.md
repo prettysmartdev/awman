@@ -14,6 +14,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 03 | [Security & Isolation](03-security-and-isolation.md) | Worktrees, SSH keys, Docker socket, container transparency |
 | 04 | [Workflows](04-workflows.md) | Multi-step workflows, control board, state persistence |
 | 05 | [Yolo Mode](05-yolo-mode.md) | Fully autonomous operation, disallowed tools, countdown |
+| 06 | [Headless Mode](06-headless-mode.md) | TTY detection, non-interactive operation, CI/CD integration |
 | 07 | [Configuration](07-configuration.md) | Config files, runtime selection, all fields |
 | 08 | [API Mode](08-api-mode.md) | HTTP server, sessions, commands, CI/automation, auditability |
 | 09 | [Remote Mode](09-remote-mode.md) | `remote run`, `remote session`, live log streaming, TUI pickers |

@@ -196,11 +196,12 @@ impl App {
         };
 
         let container_io = crate::engine::container::frontend::ContainerIo {
-            stdout: stdout_tx,
+            stdout: stdout_tx.clone(),
+            stderr: stdout_tx,
             stdin_tx: stdin_tx_for_engine,
             stdin_rx,
-            resize: resize_rx,
-            initial_size,
+            resize: Some(resize_rx),
+            initial_size: Some(initial_size),
         };
 
         // Build the TUI frontend. Workflow + yolo overlays share the same
@@ -224,6 +225,7 @@ impl App {
             tab.stdin_tx_shared.clone(),
             tab.resize_tx_shared.clone(),
             tab.engine_tx_shared.clone(),
+            tab.stuck_sender_shared.clone(),
             tab.active_worktree_path.clone(),
             tab.status_dashboard.clone(),
             tab.tui_context_shared.clone(),
@@ -343,15 +345,10 @@ impl App {
     /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
         let active = self.active_tab;
-        let mut stuck_transitions: Vec<(usize, bool, bool)> = Vec::new();
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
+        for tab in self.tabs.iter_mut() {
             tab.drain_container_output();
             tab.poll_command_completion();
-            let was_stuck = tab.stuck;
-            tab.recompute_stuck(i == active);
-            if tab.stuck != was_stuck {
-                stuck_transitions.push((i, was_stuck, tab.stuck));
-            }
+            tab.drain_stuck_events();
 
             // TUI-4: Sync the vt100 parser size with the actual rendered
             // container overlay dimensions. The overlay size varies with
@@ -508,37 +505,6 @@ impl App {
                         }
                     }
                 });
-            }
-        }
-
-        // ENG-1: Stuck-container → notify the engine.
-        //
-        // Transitions were captured in the first loop above. Send StepStuck
-        // when a tab becomes stuck; StepUnstuck when it recovers.
-        for (tab_idx, was_stuck, is_stuck) in stuck_transitions {
-            let tab = &self.tabs[tab_idx];
-            let has_workflow_step = tab
-                .workflow_state
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|ws| ws.current_step.clone()))
-                .is_some();
-            if !has_workflow_step {
-                continue;
-            }
-
-            if is_stuck && !was_stuck {
-                if let Ok(guard) = tab.engine_tx_shared.lock() {
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(crate::engine::workflow::EngineRequest::StepStuck);
-                    }
-                }
-            } else if !is_stuck && was_stuck {
-                if let Ok(guard) = tab.engine_tx_shared.lock() {
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(crate::engine::workflow::EngineRequest::StepUnstuck);
-                    }
-                }
             }
         }
 

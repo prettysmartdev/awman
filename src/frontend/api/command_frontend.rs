@@ -93,6 +93,8 @@ pub struct ApiDispatchFrontend {
     /// Latched once `Done` has been emitted, so both `emit_done` and `Drop`
     /// stay idempotent.
     done_emitted: std::sync::atomic::AtomicBool,
+    /// Throttle: last time a yolo countdown status message was emitted.
+    last_sink_message_time: Option<std::time::Instant>,
 }
 
 impl ApiDispatchFrontend {
@@ -112,6 +114,7 @@ impl ApiDispatchFrontend {
             step_indices: std::sync::Mutex::new(HashMap::new()),
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
+            last_sink_message_time: None,
         }
     }
 
@@ -303,8 +306,14 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
         }
     }
 
-    // --yolo and --non-interactive are always implied for API dispatch.
-    bools.insert("non-interactive".to_string(), true);
+    // --yolo is always implied for API dispatch.
+    // --non-interactive is derived from the shared TTY-detection logic;
+    // in an HTTP server context stdin is never a TTY, so this is always true.
+    let ni_requested = bools.get("non-interactive").copied().unwrap_or(false);
+    bools.insert(
+        "non-interactive".to_string(),
+        crate::frontend::effective_non_interactive(ni_requested),
+    );
     bools.insert("yolo".to_string(), true);
 
     ParsedArgs {
@@ -399,32 +408,6 @@ impl CommandFrontend for ApiDispatchFrontend {
 
 #[async_trait]
 impl ContainerFrontend for ApiDispatchFrontend {
-    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        self.line_buffer_stdout.push_str(&text);
-        while let Some(pos) = self.line_buffer_stdout.find('\n') {
-            let line = self.line_buffer_stdout[..pos].to_string();
-            self.line_buffer_stdout = self.line_buffer_stdout[pos + 1..].to_string();
-            self.event_bus.emit(EventPayload::StdoutLine(line));
-        }
-        Ok(())
-    }
-
-    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        self.line_buffer_stderr.push_str(&text);
-        while let Some(pos) = self.line_buffer_stderr.find('\n') {
-            let line = self.line_buffer_stderr[..pos].to_string();
-            self.line_buffer_stderr = self.line_buffer_stderr[pos + 1..].to_string();
-            self.event_bus.emit(EventPayload::StderrLine(line));
-        }
-        Ok(())
-    }
-
-    async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        Ok(0)
-    }
-
     fn report_status(&mut self, status: ContainerStatus) {
         let message = match &status {
             ContainerStatus::Building => "Building container image...".to_string(),
@@ -450,7 +433,60 @@ impl ContainerFrontend for ApiDispatchFrontend {
         });
     }
 
-    fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+        let event_bus_stdout = self.event_bus.clone();
+        let event_bus_stderr = self.event_bus.clone();
+
+        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        // API never has interactive stdin: the engine owns the only sender
+        // and drops it after seeding the prompt (see `spawn_piped_docker`)
+        // so the container sees EOF promptly.
+
+        // Drain stdout → event bus (line-buffered).
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            while let Some(bytes) = stdout_rx.recv().await {
+                let text = String::from_utf8_lossy(&bytes);
+                buf.push_str(&text);
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].to_string();
+                    buf = buf[pos + 1..].to_string();
+                    event_bus_stdout.emit(EventPayload::StdoutLine(line));
+                }
+            }
+            if !buf.is_empty() {
+                event_bus_stdout.emit(EventPayload::StdoutLine(buf));
+            }
+        });
+
+        // Drain stderr → event bus (line-buffered).
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            while let Some(bytes) = stderr_rx.recv().await {
+                let text = String::from_utf8_lossy(&bytes);
+                buf.push_str(&text);
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].to_string();
+                    buf = buf[pos + 1..].to_string();
+                    event_bus_stderr.emit(EventPayload::StderrLine(line));
+                }
+            }
+            if !buf.is_empty() {
+                event_bus_stderr.emit(EventPayload::StderrLine(buf));
+            }
+        });
+
+        crate::engine::container::frontend::ContainerIo {
+            stdout: stdout_tx,
+            stderr: stderr_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
 }
 
 // ─── HasContainerFrontend ───────────────────────────────────────────────────
@@ -490,29 +526,6 @@ impl UserMessageSink for ApiContainerSink {
 
 #[async_trait]
 impl ContainerFrontend for ApiContainerSink {
-    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        self.line_buffer_stdout.push_str(&text);
-        while let Some(pos) = self.line_buffer_stdout.find('\n') {
-            let line = self.line_buffer_stdout[..pos].to_string();
-            self.line_buffer_stdout = self.line_buffer_stdout[pos + 1..].to_string();
-            self.event_bus.emit(EventPayload::StdoutLine(line));
-        }
-        Ok(())
-    }
-    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        self.line_buffer_stderr.push_str(&text);
-        while let Some(pos) = self.line_buffer_stderr.find('\n') {
-            let line = self.line_buffer_stderr[..pos].to_string();
-            self.line_buffer_stderr = self.line_buffer_stderr[pos + 1..].to_string();
-            self.event_bus.emit(EventPayload::StderrLine(line));
-        }
-        Ok(())
-    }
-    async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        Ok(0)
-    }
     fn report_status(&mut self, status: ContainerStatus) {
         let message = match &status {
             ContainerStatus::Building => "Building container image...".to_string(),
@@ -536,7 +549,58 @@ impl ContainerFrontend for ApiContainerSink {
             message: progress.message,
         });
     }
-    fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+
+    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+        let event_bus_stdout = self.event_bus.clone();
+        let event_bus_stderr = self.event_bus.clone();
+
+        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            while let Some(bytes) = stdout_rx.recv().await {
+                let text = String::from_utf8_lossy(&bytes);
+                buf.push_str(&text);
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].to_string();
+                    buf = buf[pos + 1..].to_string();
+                    event_bus_stdout.emit(EventPayload::StdoutLine(line));
+                }
+            }
+            if !buf.is_empty() {
+                event_bus_stdout.emit(EventPayload::StdoutLine(buf));
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            while let Some(bytes) = stderr_rx.recv().await {
+                let text = String::from_utf8_lossy(&bytes);
+                buf.push_str(&text);
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].to_string();
+                    buf = buf[pos + 1..].to_string();
+                    event_bus_stderr.emit(EventPayload::StderrLine(line));
+                }
+            }
+            if !buf.is_empty() {
+                event_bus_stderr.emit(EventPayload::StderrLine(buf));
+            }
+        });
+
+        // Engine owns the single stdin_tx and drops it after seeding so EOF
+        // arrives at the container's stdin pipe (see `spawn_piped_docker`).
+        crate::engine::container::frontend::ContainerIo {
+            stdout: stdout_tx,
+            stderr: stderr_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
 }
 
 // ─── MountScopeFrontend ─────────────────────────────────────────────────────
@@ -600,11 +664,32 @@ impl WorkflowFrontend for ApiDispatchFrontend {
 
     fn yolo_countdown_tick(
         &mut self,
-        _step_name: &str,
-        _remaining: Duration,
+        step_name: &str,
+        remaining: Duration,
         _total: Duration,
     ) -> Result<YoloTickOutcome, EngineError> {
-        Ok(YoloTickOutcome::AdvanceNow)
+        use crate::engine::workflow::timing::YOLO_SINK_THROTTLE_INTERVAL;
+
+        let should_emit = self
+            .last_sink_message_time
+            .map(|t| t.elapsed() >= YOLO_SINK_THROTTLE_INTERVAL)
+            .unwrap_or(true);
+        if should_emit {
+            self.event_bus.emit(EventPayload::StatusMessage {
+                phase: "yolo_countdown".to_string(),
+                message: format!(
+                    "Step '{}': auto-advancing in {}s",
+                    step_name,
+                    remaining.as_secs()
+                ),
+            });
+            self.last_sink_message_time = Some(std::time::Instant::now());
+        }
+        Ok(YoloTickOutcome::Continue)
+    }
+
+    fn yolo_countdown_finished(&mut self, _step_name: &str) {
+        self.last_sink_message_time = None;
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
@@ -1108,7 +1193,11 @@ mod tests {
         let bus = crate::frontend::api::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        fe.write_stdout(b"a line\n").unwrap();
+        let io = fe.take_container_io();
+        io.stdout.send(b"a line\n".to_vec()).unwrap();
+        drop(io);
+        // Give the drain task a moment to process.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(fe);
 
         let line = rx.recv().await.unwrap();
@@ -1127,14 +1216,19 @@ mod tests {
         let bus = crate::frontend::api::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        // No trailing newline — the line lives in the buffer until flush.
-        fe.write_stdout(b"trailing partial").unwrap();
+        let io = fe.take_container_io();
+        // No trailing newline — the line lives in the drain task buffer until
+        // the sender is dropped and the drain flushes.
+        io.stdout.send(b"trailing partial".to_vec()).unwrap();
+        drop(io);
+        // Give the drain task a moment to process and flush.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(fe);
 
         let line = rx.recv().await.unwrap();
         assert!(
             matches!(line.payload, EventPayload::StdoutLine(ref s) if s == "trailing partial"),
-            "partial stdout line must be flushed by Drop; got {:?}",
+            "partial stdout line must be flushed by drain task; got {:?}",
             line.payload
         );
         let done = rx.recv().await.unwrap();
@@ -1147,13 +1241,17 @@ mod tests {
         let bus = crate::frontend::api::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        fe.write_stderr(b"err partial").unwrap();
+        let io = fe.take_container_io();
+        io.stderr.send(b"err partial".to_vec()).unwrap();
+        drop(io);
+        // Give the drain task a moment to process and flush.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         drop(fe);
 
         let line = rx.recv().await.unwrap();
         assert!(
             matches!(line.payload, EventPayload::StderrLine(ref s) if s == "err partial"),
-            "partial stderr line must be flushed by Drop; got {:?}",
+            "partial stderr line must be flushed by drain task; got {:?}",
             line.payload
         );
         let done = rx.recv().await.unwrap();
@@ -1177,5 +1275,107 @@ mod tests {
             "Drop must NOT emit a second Done after explicit emit_done; got {:?}",
             again
         );
+    }
+
+    // ── yolo countdown message throttle ──────────────────────────────────────
+
+    fn count_countdown_events(rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>) -> usize {
+        let mut count = 0;
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(
+                &evt.payload,
+                EventPayload::StatusMessage { phase, .. } if phase == "yolo_countdown"
+            ) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Ten rapid ticks must produce exactly one `yolo_countdown` status message
+    /// because all subsequent calls fall within the 10-second throttle window.
+    #[tokio::test]
+    async fn yolo_countdown_throttles_api_messages_within_window() {
+        use crate::engine::workflow::frontend::WorkflowFrontend as _;
+        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+
+        for i in 0..10u64 {
+            fe.yolo_countdown_tick(
+                "step",
+                std::time::Duration::from_secs(60u64.saturating_sub(i)),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        }
+
+        // Allow any async tasks to flush.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let count = count_countdown_events(&mut rx);
+        assert_eq!(
+            count, 1,
+            "only the first tick should emit within the 10-second throttle window"
+        );
+    }
+
+    /// After `yolo_countdown_finished` resets the timer, the very next tick
+    /// must emit a fresh message.
+    #[tokio::test]
+    async fn yolo_countdown_tick_emits_again_after_finished_resets_timer() {
+        use crate::engine::workflow::frontend::WorkflowFrontend as _;
+        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+
+        // First tick: emits.
+        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(60), std::time::Duration::from_secs(60))
+            .unwrap();
+        // Rapid second tick: throttled.
+        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(59), std::time::Duration::from_secs(60))
+            .unwrap();
+
+        // Reset.
+        fe.yolo_countdown_finished("step");
+
+        // Next tick after reset: must emit again.
+        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(60), std::time::Duration::from_secs(60))
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let count = count_countdown_events(&mut rx);
+        assert_eq!(
+            count, 2,
+            "expect 2 events: initial tick + tick after countdown_finished reset"
+        );
+    }
+
+    /// Simulating an elapsed throttle window by rewinding `last_sink_message_time`
+    /// makes the next tick emit a new message.
+    #[tokio::test]
+    async fn yolo_countdown_tick_emits_after_throttle_window_elapses() {
+        use crate::engine::workflow::frontend::WorkflowFrontend as _;
+        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+
+        // First tick emits.
+        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(60), std::time::Duration::from_secs(60))
+            .unwrap();
+
+        // Rewind the throttle timestamp to simulate 11 seconds having passed.
+        fe.last_sink_message_time =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+
+        // Next tick must emit (window elapsed).
+        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(58), std::time::Duration::from_secs(60))
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let count = count_countdown_events(&mut rx);
+        assert_eq!(count, 2, "expected 2 events: initial tick + tick after simulated 11-second gap");
     }
 }

@@ -191,10 +191,6 @@ fn command_box_locked(app: &App) -> bool {
 
 /// Determine focus context and dispatch the key event through the keymap.
 fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
-    // Any key counts as user activity. Suppresses stuck detection on the
-    // active tab and keeps `last_user_activity_time` fresh.
-    app.active_tab_mut().record_user_activity();
-
     let ctx = if app.active_dialog.is_some() {
         FocusContext::Dialog
     } else if app.active_tab().container_window_state == ContainerWindowState::Maximized
@@ -233,7 +229,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 if app.tabs.len() > 1 {
                     // Clear user-activity so the departing tab stays "stuck"
                     // and doesn't send a false StepUnstuck on switch-back.
-                    app.active_tab_mut().last_user_activity_time = None;
                     app.active_dialog = None;
                     if key.code == KeyCode::Char('a') {
                         app.switch_to_prev_tab();
@@ -466,10 +461,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                     .yolo_cancel_flag
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 app.active_dialog = None;
-                // Clear user-activity so the tab stays "stuck" without
-                // cycling through unstuck→stuck (which would re-send
-                // StepStuck and restart the yolo countdown).
-                app.active_tab_mut().last_user_activity_time = None;
                 return;
             }
             dismiss_dialog(app);
@@ -583,9 +574,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 // ─── Mouse ───────────────────────────────────────────────────────────────────
 
 fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
-    // Mouse events count as user activity for the stuck-detection clock.
-    app.active_tab_mut().record_user_activity();
-
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             // Workflow strip scroll.

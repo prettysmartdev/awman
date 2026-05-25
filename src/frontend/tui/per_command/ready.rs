@@ -126,12 +126,14 @@ mod tests {
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let container_io = crate::engine::container::frontend::ContainerIo {
             stdout: stdout_tx,
+            stderr: stderr_tx,
             stdin_tx,
             stdin_rx,
-            resize: resize_rx,
-            initial_size: (80, 24),
+            resize: Some(resize_rx),
+            initial_size: Some((80, 24)),
         };
         let status_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
@@ -153,6 +155,7 @@ mod tests {
             yolo_state,
             yolo_cancel_flag,
             pty_reset_flag,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),

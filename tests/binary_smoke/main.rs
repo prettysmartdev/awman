@@ -10,4 +10,5 @@
 mod helpers;
 
 mod cli_subprocess;
+mod headless_no_tty;
 mod rename_0077;

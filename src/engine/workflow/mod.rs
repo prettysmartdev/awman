@@ -17,7 +17,7 @@ use crate::data::workflow_dag::WorkflowDag;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
-use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo};
+use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo, StuckEvent};
 use crate::engine::container::ContainerExec;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
@@ -525,8 +525,8 @@ impl WorkflowEngine {
         })
     }
 
-    /// Like `step_once`, but processes `EngineRequest` messages (Ctrl-W,
-    /// StepStuck, StepUnstuck) while the step container runs.
+    /// Like `step_once`, but processes `EngineRequest` messages (Ctrl-W)
+    /// and container stuck events while the step container runs.
     async fn step_once_interruptible(&mut self) -> Result<InterruptibleStepResult, EngineError> {
         let step_name = self.launch_step().await?;
 
@@ -534,6 +534,17 @@ impl WorkflowEngine {
             .current_execution
             .as_ref()
             .and_then(|e| e.cancel_handle());
+
+        // Subscribe to stuck/unstuck events from the container's io_bridge.
+        let mut stuck_rx = self
+            .current_execution
+            .as_ref()
+            .map(|e| e.subscribe_stuck());
+
+        // Publish the stuck sender to the frontend (TUI uses it for tab coloring).
+        if let Some(exec) = self.current_execution.as_ref() {
+            self.frontend.set_stuck_sender(exec.stuck_sender());
+        }
 
         let mut exec = self
             .current_execution
@@ -559,6 +570,25 @@ impl WorkflowEngine {
                         self.finalize_step(&step_name, exit_result?)?
                     ));
                 }
+                Some(event) = Self::recv_stuck(&mut stuck_rx) => {
+                    match event {
+                        StuckEvent::Stuck => {
+                            let result = self.handle_step_stuck(
+                                &step_name,
+                                &cancel_handle,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                            ).await?;
+                            match result {
+                                None => continue,
+                                Some(r) => return Ok(r),
+                            }
+                        }
+                        StuckEvent::Unstuck => {
+                            // Not inside a yolo countdown — nothing to cancel.
+                        }
+                    }
+                }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     match req {
                         EngineRequest::OpenControlBoard => {
@@ -581,88 +611,15 @@ impl WorkflowEngine {
                             }
                         }
                         EngineRequest::StepStuck => {
-                            self.msg_warning(format!(
-                                "Step '{}' appears stuck (no output)",
-                                step_name,
-                            ));
-                            if self.yolo && !self.is_last_step() {
-                                let yolo_result = self.run_mid_step_yolo_countdown(
-                                    &step_name,
-                                    &cancel_handle,
-                                    &mut wait_rx,
-                                ).await?;
-                                match yolo_result {
-                                    MidStepYoloResult::StepCompleted(o) => {
-                                        return Ok(InterruptibleStepResult::StepCompleted(o));
-                                    }
-                                    MidStepYoloResult::ShowControlBoard => {
-                                        let mid = self.handle_mid_step_control_board(
-                                            &step_name,
-                                            &cancel_handle,
-                                            &mut wait_rx,
-                                        )?;
-                                        match mid {
-                                            MidStepOutcome::Continue => continue,
-                                            MidStepOutcome::StepCompleted(o) => {
-                                                return Ok(InterruptibleStepResult::StepCompleted(o));
-                                            }
-                                            MidStepOutcome::WorkflowEnded(wo) => {
-                                                return Ok(InterruptibleStepResult::WorkflowEnded(wo));
-                                            }
-                                            MidStepOutcome::LoopContinue => {
-                                                return Ok(InterruptibleStepResult::LoopContinue);
-                                            }
-                                        }
-                                    }
-                                    MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => {
-                                        continue;
-                                    }
-                                    MidStepYoloResult::Advanced => {
-                                        self.msg_info(format!(
-                                            "Yolo auto-advancing past step '{}'",
-                                            step_name,
-                                        ));
-                                        if let Some(ch) = &cancel_handle {
-                                            let _ = ch.cancel();
-                                        }
-                                        self.state.set_status(&step_name, StepState::Succeeded);
-                                        self.persist()?;
-                                        let step = self.find_step(&step_name)?;
-                                        self.frontend.report_step_status(
-                                            &step,
-                                            WorkflowStepStatus::Succeeded,
-                                        );
-                                        let progress = self.workflow_progress_info();
-                                        self.frontend.report_workflow_progress(&progress);
-
-                                        if self.is_last_step() {
-                                            let available = self.compute_available_actions()?;
-                                            let action = self.frontend
-                                                .show_workflow_control_board(&self.state, &available)?;
-                                            return self.execute_top_level_action(action);
-                                        }
-
-                                        return Ok(InterruptibleStepResult::LoopContinue);
-                                    }
-                                }
-                            } else {
-                                let mid = self.handle_mid_step_control_board(
-                                    &step_name,
-                                    &cancel_handle,
-                                    &mut wait_rx,
-                                )?;
-                                match mid {
-                                    MidStepOutcome::Continue => continue,
-                                    MidStepOutcome::StepCompleted(o) => {
-                                        return Ok(InterruptibleStepResult::StepCompleted(o));
-                                    }
-                                    MidStepOutcome::WorkflowEnded(wo) => {
-                                        return Ok(InterruptibleStepResult::WorkflowEnded(wo));
-                                    }
-                                    MidStepOutcome::LoopContinue => {
-                                        return Ok(InterruptibleStepResult::LoopContinue);
-                                    }
-                                }
+                            let result = self.handle_step_stuck(
+                                &step_name,
+                                &cancel_handle,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                            ).await?;
+                            match result {
+                                None => continue,
+                                Some(r) => return Ok(r),
                             }
                         }
                         EngineRequest::StepUnstuck => {
@@ -680,6 +637,16 @@ impl WorkflowEngine {
     ) -> Option<EngineRequest> {
         match rx {
             Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Receive from the stuck broadcast channel, or pend forever if None.
+    async fn recv_stuck(
+        rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Option<StuckEvent> {
+        match rx {
+            Some(rx) => rx.recv().await.ok(),
             None => std::future::pending().await,
         }
     }
@@ -813,6 +780,104 @@ impl WorkflowEngine {
         }
     }
 
+    /// Handle a stuck event (from broadcast channel or EngineRequest).
+    /// Returns `None` to continue the select loop, or `Some(result)` to return.
+    async fn handle_step_stuck(
+        &mut self,
+        step_name: &str,
+        cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<(
+            ContainerExecution,
+            Result<ContainerExitInfo, EngineError>,
+        )>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Result<Option<InterruptibleStepResult>, EngineError> {
+        self.msg_warning(format!(
+            "Step '{}' appears stuck (no output)",
+            step_name,
+        ));
+        if self.yolo && !self.is_last_step() {
+            let yolo_result = self.run_mid_step_yolo_countdown(
+                step_name,
+                cancel_handle,
+                wait_rx,
+                stuck_rx,
+            ).await?;
+            match yolo_result {
+                MidStepYoloResult::StepCompleted(o) => {
+                    return Ok(Some(InterruptibleStepResult::StepCompleted(o)));
+                }
+                MidStepYoloResult::ShowControlBoard => {
+                    let mid = self.handle_mid_step_control_board(
+                        step_name,
+                        cancel_handle,
+                        wait_rx,
+                    )?;
+                    return Ok(match mid {
+                        MidStepOutcome::Continue => None,
+                        MidStepOutcome::StepCompleted(o) => {
+                            Some(InterruptibleStepResult::StepCompleted(o))
+                        }
+                        MidStepOutcome::WorkflowEnded(wo) => {
+                            Some(InterruptibleStepResult::WorkflowEnded(wo))
+                        }
+                        MidStepOutcome::LoopContinue => {
+                            Some(InterruptibleStepResult::LoopContinue)
+                        }
+                    });
+                }
+                MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => {
+                    return Ok(None);
+                }
+                MidStepYoloResult::Advanced => {
+                    self.msg_info(format!(
+                        "Yolo auto-advancing past step '{}'",
+                        step_name,
+                    ));
+                    if let Some(ch) = cancel_handle {
+                        let _ = ch.cancel();
+                    }
+                    self.state.set_status(step_name, StepState::Succeeded);
+                    self.persist()?;
+                    let step = self.find_step(step_name)?;
+                    self.frontend.report_step_status(
+                        &step,
+                        WorkflowStepStatus::Succeeded,
+                    );
+                    let progress = self.workflow_progress_info();
+                    self.frontend.report_workflow_progress(&progress);
+
+                    if self.is_last_step() {
+                        let available = self.compute_available_actions()?;
+                        let action = self.frontend
+                            .show_workflow_control_board(&self.state, &available)?;
+                        return Ok(Some(self.execute_top_level_action(action)?));
+                    }
+
+                    return Ok(Some(InterruptibleStepResult::LoopContinue));
+                }
+            }
+        } else {
+            let mid = self.handle_mid_step_control_board(
+                step_name,
+                cancel_handle,
+                wait_rx,
+            )?;
+            return Ok(match mid {
+                MidStepOutcome::Continue => None,
+                MidStepOutcome::StepCompleted(o) => {
+                    Some(InterruptibleStepResult::StepCompleted(o))
+                }
+                MidStepOutcome::WorkflowEnded(wo) => {
+                    Some(InterruptibleStepResult::WorkflowEnded(wo))
+                }
+                MidStepOutcome::LoopContinue => {
+                    Some(InterruptibleStepResult::LoopContinue)
+                }
+            });
+        }
+    }
+
     /// Run a mid-step yolo countdown. The step container keeps running while
     /// the countdown ticks. The engine calls `yolo_countdown_started` at the
     /// beginning and `yolo_countdown_finished` before returning.
@@ -824,6 +889,7 @@ impl WorkflowEngine {
             ContainerExecution,
             Result<ContainerExitInfo, EngineError>,
         )>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<MidStepYoloResult, EngineError> {
         self.msg_info(format!(
             "Starting yolo countdown for step '{}' ({}s)",
@@ -874,6 +940,21 @@ impl WorkflowEngine {
                         self.finalize_step(step_name, exit_result?)?
                     ));
                 }
+                Some(event) = Self::recv_stuck(stuck_rx) => {
+                    match event {
+                        StuckEvent::Unstuck => {
+                            self.msg_info(format!(
+                                "Step '{}' recovered, cancelling countdown",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                        StuckEvent::Stuck => {
+                            // Already counting down; ignore duplicate.
+                        }
+                    }
+                }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     match req {
                         EngineRequest::OpenControlBoard => {
@@ -882,7 +963,7 @@ impl WorkflowEngine {
                         }
                         EngineRequest::StepUnstuck => {
                             self.msg_info(format!(
-                                "Step '{}' recovered, cancelling countdown",
+                                "Step '{}' recovered (engine request), cancelling countdown",
                                 step_name,
                             ));
                             self.frontend.yolo_countdown_finished(step_name);
@@ -2119,7 +2200,8 @@ mod tests {
                     name: "blocking-container".into(),
                     started_at: now,
                 };
-                Ok(ContainerExecution::new(handle, backend))
+                let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+                Ok(ContainerExecution::new(handle, backend, std::sync::Arc::new(stuck_tx)))
             } else {
                 let now = Utc::now();
                 let info = ContainerExitInfo {

@@ -59,7 +59,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process", "fs"] }
+nix = { version = "0.29", features = ["signal", "process", "fs", "poll"] }
 libc = "0.2"
 
 [dev-dependencies]

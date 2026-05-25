@@ -19,7 +19,6 @@ use crate::engine::workflow::actions::{
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
-use crate::frontend::cli::output::stdin_is_tty;
 
 impl WorkflowFrontend for CliFrontend {
     fn show_workflow_control_board(
@@ -27,7 +26,7 @@ impl WorkflowFrontend for CliFrontend {
         _state: &WorkflowState,
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
-        if !stdin_is_tty() {
+        if self.non_interactive {
             return Ok(NextAction::LaunchNext);
         }
         eprintln!("awman: workflow paused — choose next action:");
@@ -84,21 +83,69 @@ impl WorkflowFrontend for CliFrontend {
         remaining: Duration,
         _total: Duration,
     ) -> Result<YoloTickOutcome, EngineError> {
+        use crate::engine::workflow::timing::YOLO_SINK_THROTTLE_INTERVAL;
         use std::io::Write as _;
 
         if remaining.is_zero() {
-            eprintln!("\r\x1b[2K  yolo: auto-advancing to next step...");
+            if self.raw_mode_guard.is_some() {
+                // Clear the overlay line before advancing.
+                if let Ok((_, rows)) = crossterm::terminal::size() {
+                    let mut out = std::io::stdout().lock();
+                    let _ = write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b8", rows);
+                    let _ = out.flush();
+                } else {
+                    // Terminal size unavailable in raw mode: fall back to
+                    // stderr with explicit \r\n so the message lands on its
+                    // own line.
+                    let mut err = std::io::stderr().lock();
+                    let _ = write!(err, "\r\n  yolo: auto-advancing to next step...\r\n");
+                    let _ = err.flush();
+                }
+            } else {
+                eprintln!("\r\x1b[2K  yolo: auto-advancing to next step...");
+            }
             return Ok(YoloTickOutcome::Continue);
         }
 
-        let secs = remaining.as_secs();
-        eprint!(
-            "\r\x1b[2K  yolo: auto-advancing in {:2}s  [n] now  [a] abort  [p] pause",
-            secs
-        );
-        let _ = std::io::stderr().flush();
+        let should_emit = self
+            .last_sink_message_time
+            .map(|t| t.elapsed() >= YOLO_SINK_THROTTLE_INTERVAL)
+            .unwrap_or(true);
 
-        if !stdin_is_tty() {
+        if self.raw_mode_guard.is_some() {
+            // Raw mode: ANSI overlay on the last terminal line.
+            if should_emit {
+                let secs = remaining.as_secs();
+                let msg = format!(" yolo: auto-advancing in {}s ", secs);
+                if let Ok((_, rows)) = crossterm::terminal::size() {
+                    let mut out = std::io::stdout().lock();
+                    let _ = write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[0m\x1b8", rows, msg);
+                    let _ = out.flush();
+                } else {
+                    // No terminal size — can't position the overlay safely.
+                    // Fall back to stderr with explicit \r\n (the cooked-mode
+                    // newline isn't enough in raw mode).
+                    let mut err = std::io::stderr().lock();
+                    let _ = write!(err, "\r\n{}\r\n", msg);
+                    let _ = err.flush();
+                }
+                self.last_sink_message_time = Some(std::time::Instant::now());
+            }
+            // In raw mode, stdin goes to the container; no interactive input.
+            return Ok(YoloTickOutcome::Continue);
+        }
+
+        if should_emit {
+            let secs = remaining.as_secs();
+            eprint!(
+                "\r\x1b[2K  yolo: auto-advancing in {:2}s  [n] now  [a] abort  [p] pause",
+                secs
+            );
+            let _ = std::io::stderr().flush();
+            self.last_sink_message_time = Some(std::time::Instant::now());
+        }
+
+        if self.non_interactive {
             return Ok(YoloTickOutcome::Continue);
         }
 
@@ -140,12 +187,34 @@ impl WorkflowFrontend for CliFrontend {
         Ok(YoloTickOutcome::Continue)
     }
 
-    fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
+    fn yolo_countdown_finished(&mut self, _step_name: &str) {
+        self.last_sink_message_time = None;
+    }
+
+    fn report_step_status(&mut self, _step: &WorkflowStep, status: WorkflowStepStatus) {
+        match status {
+            WorkflowStepStatus::Succeeded
+            | WorkflowStepStatus::Failed { .. }
+            | WorkflowStepStatus::Cancelled => {
+                // Signal the interactive stdin reader thread to exit before
+                // dropping the raw mode guard. Without this, the thread
+                // would block in `poll(2)` until the next keystroke and
+                // race the next step's reader thread for `/dev/stdin`.
+                if let Some(flag) = self.stdin_reader_shutdown.take() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Drop the raw mode guard before any status output is printed,
+                // restoring cooked mode for the next step or workflow summary.
+                self.raw_mode_guard.take();
+            }
+            _ => {}
+        }
+    }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
 
     fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
-        if !stdin_is_tty() {
+        if self.non_interactive {
             return Ok(false);
         }
         eprintln!("awman: workflow file changed since last run; resume anyway? [y/n]");
@@ -161,7 +230,7 @@ impl WorkflowFrontend for CliFrontend {
         step: &WorkflowStep,
         exit: &ContainerExitInfo,
     ) -> Result<StepFailureChoice, EngineError> {
-        if !stdin_is_tty() {
+        if self.non_interactive {
             return Ok(StepFailureChoice::Pause);
         }
         let signal_str = exit
@@ -313,7 +382,7 @@ impl WorkflowFrontend for CliFrontend {
         agent: &str,
         _model: Option<&str>,
     ) {
-        if !stdin_is_tty() {
+        if self.non_interactive {
             return;
         }
         eprintln!();
@@ -331,5 +400,221 @@ impl WorkflowFrontend for CliFrontend {
         eprintln!("║                                                              ║");
         eprintln!("╚══════════════════════════════════════════════════════════════╝");
         eprintln!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::command::dispatch::catalogue::CommandCatalogue;
+    use crate::data::workflow_definition::WorkflowStep;
+    use crate::engine::workflow::actions::WorkflowStepStatus;
+    use crate::engine::workflow::frontend::WorkflowFrontend;
+    use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
+
+    fn make_step(name: &str) -> WorkflowStep {
+        WorkflowStep {
+            name: name.to_string(),
+            depends_on: vec![],
+            prompt_template: "test prompt".to_string(),
+            agent: None,
+            model: None,
+        }
+    }
+
+    /// Build a non-interactive `CliFrontend` suitable for unit tests.
+    /// In the test environment stdin is never a TTY, so `non_interactive` is
+    /// always set to `true` by `CliFrontend::new`.
+    fn make_frontend() -> CliFrontend {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
+            .unwrap();
+        CliFrontend::new(m)
+    }
+
+    // ── raw-mode guard lifecycle ──────────────────────────────────────────────
+
+    /// Terminal status (Succeeded) drops the guard before the call returns,
+    /// restoring cooked mode so the next step's output prints cleanly.
+    #[test]
+    fn raw_mode_guard_dropped_on_step_succeeded() {
+        let mut fe = make_frontend();
+        // Inject a guard directly (bypasses enable_raw_mode — safe in tests).
+        fe.raw_mode_guard = Some(RawModeGuard);
+        assert!(fe.raw_mode_guard.is_some());
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Succeeded);
+
+        assert!(
+            fe.raw_mode_guard.is_none(),
+            "guard must be dropped when the step Succeeds"
+        );
+    }
+
+    #[test]
+    fn raw_mode_guard_dropped_on_step_failed() {
+        let mut fe = make_frontend();
+        fe.raw_mode_guard = Some(RawModeGuard);
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Failed { exit_code: 1 });
+
+        assert!(fe.raw_mode_guard.is_none(), "guard must be dropped on Failed");
+    }
+
+    #[test]
+    fn raw_mode_guard_dropped_on_step_cancelled() {
+        let mut fe = make_frontend();
+        fe.raw_mode_guard = Some(RawModeGuard);
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Cancelled);
+
+        assert!(fe.raw_mode_guard.is_none(), "guard must be dropped on Cancelled");
+    }
+
+    /// On a terminal status, the stdin-reader-shutdown flag must be flipped
+    /// before the guard drops, so the reader thread wakes from `poll(2)` and
+    /// exits instead of racing the next step's reader for `/dev/stdin`.
+    #[test]
+    fn stdin_reader_shutdown_flag_set_on_terminal_status() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut fe = make_frontend();
+        let flag = Arc::new(AtomicBool::new(false));
+        fe.stdin_reader_shutdown = Some(flag.clone());
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Succeeded);
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "shutdown flag must be set so the poll-based stdin reader exits"
+        );
+        assert!(
+            fe.stdin_reader_shutdown.is_none(),
+            "frontend must drop its handle to the flag once signaled"
+        );
+    }
+
+    /// Non-terminal statuses must leave the shutdown flag alone — the reader
+    /// is still needed while the step is running.
+    #[test]
+    fn stdin_reader_shutdown_flag_untouched_on_running_status() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut fe = make_frontend();
+        let flag = Arc::new(AtomicBool::new(false));
+        fe.stdin_reader_shutdown = Some(flag.clone());
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Running);
+
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(fe.stdin_reader_shutdown.is_some());
+    }
+
+    /// Non-terminal statuses must leave the guard intact so raw mode is not
+    /// prematurely disabled while the container is still running.
+    #[test]
+    fn raw_mode_guard_retained_on_running_status() {
+        let mut fe = make_frontend();
+        fe.raw_mode_guard = Some(RawModeGuard);
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Running);
+
+        assert!(
+            fe.raw_mode_guard.is_some(),
+            "guard must NOT be dropped while the step is Running"
+        );
+    }
+
+    #[test]
+    fn raw_mode_guard_retained_on_pending_status() {
+        let mut fe = make_frontend();
+        fe.raw_mode_guard = Some(RawModeGuard);
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Pending);
+
+        assert!(
+            fe.raw_mode_guard.is_some(),
+            "guard must NOT be dropped for Pending status"
+        );
+    }
+
+    // ── yolo countdown message throttle ──────────────────────────────────────
+
+    /// The first `yolo_countdown_tick` call (no `last_sink_message_time` yet)
+    /// must set the timestamp, indicating a message was emitted.
+    #[tokio::test]
+    async fn yolo_countdown_first_tick_sets_throttle_timestamp() {
+        let mut fe = make_frontend();
+        assert!(fe.last_sink_message_time.is_none());
+
+        fe.yolo_countdown_tick("step", Duration::from_secs(60), Duration::from_secs(60))
+            .unwrap();
+
+        assert!(
+            fe.last_sink_message_time.is_some(),
+            "first tick must set last_sink_message_time"
+        );
+    }
+
+    /// A second rapid tick (well within the 10-second window) must NOT update
+    /// `last_sink_message_time`, proving the message was suppressed.
+    #[tokio::test]
+    async fn yolo_countdown_rapid_second_tick_is_suppressed() {
+        let mut fe = make_frontend();
+
+        fe.yolo_countdown_tick("step", Duration::from_secs(60), Duration::from_secs(60))
+            .unwrap();
+        let first_time = fe.last_sink_message_time.unwrap();
+
+        // Immediately call again — should be throttled.
+        fe.yolo_countdown_tick("step", Duration::from_secs(59), Duration::from_secs(60))
+            .unwrap();
+        let second_time = fe.last_sink_message_time.unwrap();
+
+        assert_eq!(
+            first_time, second_time,
+            "rapid second tick must not update last_sink_message_time"
+        );
+    }
+
+    /// Once 10+ seconds have elapsed (simulated by rewinding `last_sink_message_time`),
+    /// the next tick must emit and update the timestamp.
+    #[tokio::test]
+    async fn yolo_countdown_tick_emits_after_throttle_window_elapses() {
+        let mut fe = make_frontend();
+
+        fe.yolo_countdown_tick("step", Duration::from_secs(60), Duration::from_secs(60))
+            .unwrap();
+
+        // Simulate 11 seconds having passed by rewinding the timestamp.
+        fe.last_sink_message_time =
+            Some(std::time::Instant::now() - Duration::from_secs(11));
+        let rewound = fe.last_sink_message_time.unwrap();
+
+        fe.yolo_countdown_tick("step", Duration::from_secs(58), Duration::from_secs(60))
+            .unwrap();
+
+        let updated = fe.last_sink_message_time.unwrap();
+        assert!(
+            updated > rewound,
+            "tick after throttle window must refresh last_sink_message_time"
+        );
+    }
+
+    /// `yolo_countdown_finished` resets `last_sink_message_time` to `None`
+    /// so the next countdown's first tick always emits.
+    #[test]
+    fn yolo_countdown_finished_resets_throttle_timestamp() {
+        let mut fe = make_frontend();
+        fe.last_sink_message_time = Some(std::time::Instant::now());
+
+        fe.yolo_countdown_finished("step");
+
+        assert!(
+            fe.last_sink_message_time.is_none(),
+            "yolo_countdown_finished must reset last_sink_message_time to None"
+        );
     }
 }

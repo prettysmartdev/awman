@@ -86,11 +86,15 @@ When `--yolo` is used with other commands (e.g. `chat`), `--worktree` is **not**
 
 ### 4. Auto-advances stuck workflow steps
 
-When a workflow step goes silent for 30 seconds, awman begins a **yolo countdown** instead of opening the manual [workflow control board](04-workflows.md#workflow-control-board). The countdown timer automatically advances to the next step when it expires. How the countdown is presented depends on whether the tab is active or in the background.
+When a workflow step produces **no output for 30 seconds**, awman detects the step is stuck. In yolo mode, the engine automatically starts a **60-second countdown** that advances the workflow when it expires. This stuck detection is unified across all frontends (TUI, CLI, and API) and runs continuously inside the container engine.
 
-**Active tab — yolo countdown dialog:**
+**Stuck detection:** The container engine tracks output activity on stdout and stderr. When 30 seconds pass with no new output, the step is marked stuck. Any new output (even a single byte) immediately clears the stuck state.
 
-When the stuck tab is currently active, the countdown dialog opens:
+**How the countdown is presented:** The visual representation depends on the frontend and whether the tab is active.
+
+**TUI — Active tab (yolo countdown dialog):**
+
+When the stuck tab is currently active in the TUI, the countdown dialog opens:
 
 ```
 ╭─────── Yolo: Auto-Advance ──────────────╮
@@ -103,11 +107,11 @@ When the stuck tab is currently active, the countdown dialog opens:
 ╰──────────────────────────────────────────╯
 ```
 
-**Active-tab suppression:** If you are actively pressing keys or scrolling on the tab, the stuck timer is held back and the dialog will not open. Both the container and the user must be idle for 30 seconds before the countdown starts.
+The dialog updates every ~100 ms to show the remaining time. If you are actively pressing keys or scrolling on the tab, the stuck timer is suppressed — both the container and the user must be idle for 30 seconds before the countdown starts. Background tabs are always checked using output time alone.
 
-**Background tab — tab bar countdown:**
+**TUI — Background tab (tab bar countdown):**
 
-When the stuck tab is in the background, no dialog opens. Instead, the tab bar shows a live countdown directly: the tab alternates between yellow and purple every second, with the label cycling between `⚠️ yolo in N` and `🤘 yolo in N` (where `N` is the remaining seconds):
+When the stuck tab is in the background, no dialog opens. Instead, the tab bar shows a live countdown: the tab alternates between yellow and purple every second, with the label cycling between `⚠️ yolo in N` and `🤘 yolo in N` (where `N` is the remaining seconds):
 
 ```
 ┌─ Tab 1: myproject ─────────┬─ Tab 2 ⚠️  yolo in 38 ─────┐
@@ -117,21 +121,19 @@ When the stuck tab is in the background, no dialog opens. Instead, the tab bar s
 
 This lets you monitor all tabs' countdown state without leaving your current work.
 
-**Switching to a background countdown tab:**
+**Switching to a background countdown tab:** If you switch to a tab that has a countdown in progress, the yolo dialog opens immediately, showing the time remaining — the countdown is not restarted from 60 seconds. You can then let it expire, press **Esc** to dismiss, or navigate away.
 
-If you switch to a tab that has a countdown in progress, the yolo dialog opens immediately, showing the time remaining — the countdown is not restarted from 60 seconds. You can then let it expire, press **Esc** to dismiss, or navigate away.
+**Switching away from an active yolo dialog:** Press **Ctrl+A** or **Ctrl+D** while the yolo dialog is open to navigate to the previous or next tab. The dialog closes and the countdown continues in the background (shown in the tab bar). You are not forced to resolve the dialog before switching away.
 
-**Switching away from an active yolo dialog:**
+**CLI and API countdown messages:** In command-line and API modes, countdown status messages are sent to the message sink (stderr for CLI, the event stream for API). To avoid overwhelming the output, these messages are **throttled to one every 10 seconds** — even though the countdown updates internally every ~100 ms. The TUI still receives per-tick updates and renders the countdown with full granularity.
 
-Press **Ctrl+A** or **Ctrl+D** while the yolo dialog is open to navigate to the previous or next tab. The dialog closes and the countdown continues in the background (shown in the tab bar). You are not forced to resolve the dialog before switching away.
-
-The countdown runs for **60 seconds**. When it expires:
+**When the countdown expires:**
 - If this is not the last step — awman advances to the next step in a new container
 - If this is the last step — the workflow transitions to complete
 
 **Cancellation:**
-- Any PTY output during the countdown immediately dismisses the countdown — the agent is no longer stuck
-- Press **Esc** to dismiss the active-tab dialog manually; if the container goes silent again, a fresh 60-second countdown begins (there is no backoff between cancellation and the next countdown)
+- Any PTY output during the countdown immediately clears the stuck state and dismisses the countdown
+- In the TUI, press **Esc** to dismiss the active-tab dialog manually; if the container goes silent again, a fresh 60-second countdown begins (there is no backoff between cancellation and the next countdown)
 
 ---
 
@@ -230,4 +232,4 @@ awman chat --yolo
 
 ---
 
-[← Workflows](04-workflows.md) · [Next: Configuration →](07-configuration.md)
+[← Workflows](04-workflows.md) · [Next: Headless Mode →](06-headless-mode.md)

@@ -15,6 +15,7 @@ use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
+use crate::engine::container::instance::StuckEvent;
 use crate::engine::workflow::EngineRequest;
 
 /// Per-workflow frontend the engine uses for every Q&A and status report.
@@ -89,8 +90,17 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
 
     /// Called by the engine after creating its EngineRequest channel.
     /// The frontend stores the sender so the TUI event loop can route
-    /// Ctrl-W and stuck notifications to this specific engine instance.
+    /// Ctrl-W requests to this specific engine instance.
     fn set_engine_sender(&mut self, _tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {}
+
+    /// Called by the engine after launching a step's container. The stuck
+    /// sender is the broadcast channel from the container's stuck detector;
+    /// the TUI subscribes to it for tab-coloring. CLI/API frontends ignore it.
+    fn set_stuck_sender(
+        &mut self,
+        _sender: std::sync::Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    ) {
+    }
 
     // === Setup/Teardown phase output (fire-and-forget, default no-ops) ===
 

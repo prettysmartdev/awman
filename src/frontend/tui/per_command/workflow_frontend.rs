@@ -331,6 +331,15 @@ impl WorkflowFrontend for TuiCommandFrontend {
             *guard = Some(tx);
         }
     }
+
+    fn set_stuck_sender(
+        &mut self,
+        sender: std::sync::Arc<tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>>,
+    ) {
+        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
+            *guard = Some(sender);
+        }
+    }
 }
 
 /// Map a WCB dialog response to a `NextAction`.
@@ -385,12 +394,14 @@ mod tests {
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let container_io = crate::engine::container::frontend::ContainerIo {
             stdout: stdout_tx,
+            stderr: stderr_tx,
             stdin_tx,
             stdin_rx,
-            resize: resize_rx,
-            initial_size: (80, 24),
+            resize: Some(resize_rx),
+            initial_size: Some((80, 24)),
         };
         let status_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
@@ -405,6 +416,7 @@ mod tests {
         let stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let engine_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stuck_sender_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -419,6 +431,7 @@ mod tests {
             stdin_tx_shared,
             resize_tx_shared,
             engine_tx_shared,
+            stuck_sender_shared,
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(

@@ -315,32 +315,6 @@ impl UserMessageSink for SetupContainerSink {
 
 #[async_trait]
 impl ContainerFrontend for SetupContainerSink {
-    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        self.line_buffer_stdout.push_str(&text);
-        while let Some(pos) = self.line_buffer_stdout.find('\n') {
-            let line = self.line_buffer_stdout[..pos].to_string();
-            self.line_buffer_stdout = self.line_buffer_stdout[pos + 1..].to_string();
-            self.event_bus.emit(EventPayload::StdoutLine(line));
-        }
-        Ok(())
-    }
-
-    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        self.line_buffer_stderr.push_str(&text);
-        while let Some(pos) = self.line_buffer_stderr.find('\n') {
-            let line = self.line_buffer_stderr[..pos].to_string();
-            self.line_buffer_stderr = self.line_buffer_stderr[pos + 1..].to_string();
-            self.event_bus.emit(EventPayload::StderrLine(line));
-        }
-        Ok(())
-    }
-
-    async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        Ok(0)
-    }
-
     fn report_status(&mut self, status: ContainerStatus) {
         let message = match &status {
             ContainerStatus::Building => "Building container image...".to_string(),
@@ -366,5 +340,17 @@ impl ContainerFrontend for SetupContainerSink {
         });
     }
 
-    fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+        let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::engine::container::frontend::ContainerIo {
+            stdout: stdout_tx,
+            stderr: stderr_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
 }

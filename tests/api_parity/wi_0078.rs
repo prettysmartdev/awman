@@ -1319,8 +1319,8 @@ fn remote_exec_prompt_flags_parity_with_local() {
 
 // ─── ApiDispatchFrontend → EventBus end-to-end ────────────────────────────────
 
-/// Calling `write_stdout` on the API frontend's ContainerFrontend impl must
-/// emit `StdoutLine` events on the bus, one per newline-terminated line.
+/// Sending bytes through the ContainerIo stdout channel must emit
+/// `StdoutLine` events on the bus, one per newline-terminated line.
 #[tokio::test]
 async fn api_frontend_write_stdout_emits_stdout_line_events() {
     use awman::engine::container::frontend::ContainerFrontend;
@@ -1330,7 +1330,11 @@ async fn api_frontend_write_stdout_emits_stdout_line_events() {
     let mut rx = bus.subscribe();
     let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
 
-    fe.write_stdout(b"alpha\nbeta\n").unwrap();
+    let io = fe.take_container_io();
+    io.stdout.send(b"alpha\nbeta\n".to_vec()).unwrap();
+    drop(io);
+    // Give the drain task a moment to process.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     fe.emit_done();
 
     let ev1 = rx.recv().await.unwrap();

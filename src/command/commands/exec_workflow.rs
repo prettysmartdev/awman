@@ -256,39 +256,6 @@ struct ContainerFrontendProxy(Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>);
 
 #[async_trait]
 impl ContainerFrontend for ContainerFrontendProxy {
-    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        self.0.lock().unwrap().write_stdout(bytes)
-    }
-
-    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        self.0.lock().unwrap().write_stderr(bytes)
-    }
-
-    async fn read_stdin(&mut self, buf: &mut [u8]) -> Result<usize, EngineError> {
-        // Inherit-stdio mode owns the host TTY directly during the container
-        // run; this proxy is only consulted when the backend explicitly pipes
-        // stdin through us. Read from the host's stdin via spawn_blocking so
-        // we don't block the async runtime.
-        let len = buf.len();
-        let bytes = tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut local = vec![0u8; len];
-            match std::io::stdin().read(&mut local) {
-                Ok(n) => {
-                    local.truncate(n);
-                    Ok::<Vec<u8>, std::io::Error>(local)
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(|e| EngineError::Container(format!("stdin task: {e}")))?
-        .map_err(|e| EngineError::Container(format!("read stdin: {e}")))?;
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
-    }
-
     fn report_status(&mut self, status: crate::engine::container::frontend::ContainerStatus) {
         self.0.lock().unwrap().report_status(status);
     }
@@ -297,11 +264,7 @@ impl ContainerFrontend for ContainerFrontendProxy {
         self.0.lock().unwrap().report_progress(progress);
     }
 
-    fn resize_pty(&mut self, cols: u16, rows: u16) {
-        self.0.lock().unwrap().resize_pty(cols, rows);
-    }
-
-    fn take_container_io(&mut self) -> Option<crate::engine::container::frontend::ContainerIo> {
+    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
         self.0.lock().unwrap().take_container_io()
     }
 }
@@ -1143,18 +1106,21 @@ mod tests {
 
     #[async_trait]
     impl ContainerFrontend for FakeExecWorkflowFrontend {
-        fn write_stdout(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn write_stderr(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-            Err(EngineError::NotImplemented("test read_stdin"))
-        }
         fn report_status(&mut self, _status: ContainerStatus) {}
         fn report_progress(&mut self, _progress: ContainerProgress) {}
-        fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+            let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::engine::container::frontend::ContainerIo {
+                stdout: stdout_tx,
+                stderr: stderr_tx,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
     }
 
     impl WorkflowFrontend for FakeExecWorkflowFrontend {
