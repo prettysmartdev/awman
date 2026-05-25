@@ -29,39 +29,69 @@ impl WorkflowFrontend for CliFrontend {
         if self.non_interactive {
             return Ok(NextAction::LaunchNext);
         }
+
+        // If stdio is currently bound to a container PTY (e.g. the dialog
+        // was triggered by the container becoming stuck), release it before
+        // printing the menu so the user's keystrokes reach `read_line`
+        // instead of being forwarded into the container. The container is
+        // left running; we rebind below if the user picks Resume/Continue.
+        let was_bound = self.unbind_container_stdio();
+        let resume_available = was_bound && available.can_dismiss;
+
+        let mut lines_printed = 0usize;
         eprintln!("awman: workflow paused — choose next action:");
+        lines_printed += 1;
+        if resume_available {
+            eprintln!("  [s] Resume final step (return to running container)");
+            lines_printed += 1;
+        }
         if available.can_launch_next {
             eprintln!("  [n] Launch next step (new container)");
+            lines_printed += 1;
         }
         if available.can_continue_in_current_container {
             eprintln!("  [c] Continue in current container");
+            lines_printed += 1;
         } else if let Some(reason) = &available.continue_unavailable_reason {
             eprintln!("  (continue unavailable: {reason})");
+            lines_printed += 1;
         }
         if available.can_restart_current_step {
             eprintln!("  [r] Restart current step");
+            lines_printed += 1;
         }
         if available.can_cancel_to_previous_step {
             eprintln!("  [b] Back to previous step");
+            lines_printed += 1;
         } else if let Some(reason) = &available.cancel_to_previous_unavailable_reason {
             eprintln!("  (back unavailable: {reason})");
+            lines_printed += 1;
         }
         if available.can_pause {
             eprintln!("  [p] Pause workflow");
+            lines_printed += 1;
         }
         if available.can_abort {
             eprintln!("  [a] Abort workflow");
+            lines_printed += 1;
         }
         if available.can_finish_workflow {
             eprintln!("  [f] Finish workflow");
+            lines_printed += 1;
         } else if let Some(reason) = &available.finish_workflow_unavailable_reason {
             eprintln!("  (finish unavailable: {reason})");
+            lines_printed += 1;
         }
+
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return Ok(NextAction::Pause);
         }
-        Ok(match buf.trim() {
+        // The echoed user input + Enter advances the terminal one line.
+        lines_printed += 1;
+
+        let action = match buf.trim() {
+            "s" | "S" if resume_available => NextAction::Dismiss,
             "n" | "N" if available.can_launch_next => NextAction::LaunchNext,
             "c" | "C" if available.can_continue_in_current_container => {
                 NextAction::ContinueInCurrentContainer {
@@ -74,7 +104,23 @@ impl WorkflowFrontend for CliFrontend {
             "a" | "A" if available.can_abort => NextAction::Abort,
             "f" | "F" if available.can_finish_workflow => NextAction::FinishWorkflow,
             _ => NextAction::Pause,
-        })
+        };
+
+        // If the user chose to resume the still-running container (Dismiss
+        // here, or Continue which injects a prompt and keeps the container
+        // alive), erase the menu we printed and rebind stdio. For any other
+        // action, the engine will cancel the container or transition to a
+        // new step, so leaving stdio unbound is correct.
+        let resumes_container = matches!(
+            &action,
+            NextAction::Dismiss | NextAction::ContinueInCurrentContainer { .. }
+        );
+        if was_bound && resumes_container {
+            erase_lines_above(lines_printed);
+            self.rebind_container_stdio();
+        }
+
+        Ok(action)
     }
 
     fn yolo_countdown_tick(
@@ -203,9 +249,22 @@ impl WorkflowFrontend for CliFrontend {
                 if let Some(flag) = self.stdin_reader_shutdown.take() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Join the reader thread so the host stdin lock is fully
+                // released. Worktree finalize prompts and the workflow
+                // summary that follow would otherwise wait up to one poll
+                // cycle (~200ms) for the lock — and any keystrokes typed
+                // in that window would be sent into the now-dead container
+                // channel rather than `read_line`.
+                if let Some(handle) = self.stdin_reader_handle.take() {
+                    let _ = handle.join();
+                }
                 // Drop the raw mode guard before any status output is printed,
                 // restoring cooked mode for the next step or workflow summary.
                 self.raw_mode_guard.take();
+                // The container's stdin channel is now stale; clear it so a
+                // later workflow-control-board call doesn't try to rebind
+                // stdio to a dead container.
+                self.container_stdin_tx = None;
             }
             _ => {}
         }
@@ -403,6 +462,23 @@ impl WorkflowFrontend for CliFrontend {
     }
 }
 
+/// Erase `n` lines above the current cursor position (stderr).
+///
+/// Used by the workflow control board to undo its menu output when the
+/// user chooses to resume the still-running container — the menu is wiped
+/// so the user returns to the agent's last screen state. Writes the
+/// CSI sequence `ESC[<n>F` (cursor up `n` lines, column 1) followed by
+/// `ESC[J` (clear from cursor to end of screen). No-op for `n == 0`.
+fn erase_lines_above(n: usize) {
+    if n == 0 {
+        return;
+    }
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "\x1b[{n}F\x1b[J");
+    let _ = err.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -538,6 +614,111 @@ mod tests {
             fe.raw_mode_guard.is_some(),
             "guard must NOT be dropped for Pending status"
         );
+    }
+
+    /// The container's stdin channel is cleared on a terminal status, so a
+    /// later workflow control board doesn't accidentally try to rebind to a
+    /// channel whose writer task has already drained (the container is gone).
+    #[test]
+    fn container_stdin_tx_cleared_on_terminal_status() {
+        let mut fe = make_frontend();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        fe.container_stdin_tx = Some(tx);
+        fe.raw_mode_guard = Some(RawModeGuard);
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Succeeded);
+
+        assert!(
+            fe.container_stdin_tx.is_none(),
+            "container_stdin_tx must be cleared on a terminal status so it cannot \
+             be reused to rebind stdio to a dead container"
+        );
+    }
+
+    /// The container's stdin channel must persist across non-terminal status
+    /// updates (Running/Pending) — the workflow control board still needs it
+    /// to rebind stdio after a stuck-step dialog.
+    #[test]
+    fn container_stdin_tx_retained_on_running_status() {
+        let mut fe = make_frontend();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        fe.container_stdin_tx = Some(tx);
+
+        fe.report_step_status(&make_step("s"), WorkflowStepStatus::Running);
+
+        assert!(
+            fe.container_stdin_tx.is_some(),
+            "container_stdin_tx must NOT be cleared while the step is Running"
+        );
+    }
+
+    // ── unbind / rebind container stdio ───────────────────────────────────────
+
+    /// `unbind_container_stdio` returns `false` when stdio was never bound
+    /// (no raw mode guard active), so callers can detect a no-op.
+    #[test]
+    fn unbind_container_stdio_returns_false_when_not_bound() {
+        let mut fe = make_frontend();
+        assert!(fe.raw_mode_guard.is_none());
+
+        let was_bound = fe.unbind_container_stdio();
+
+        assert!(!was_bound, "unbind must report false when nothing was bound");
+    }
+
+    /// `unbind_container_stdio` returns `true` and drops both the raw mode
+    /// guard and the stdin-reader shutdown flag when stdio was bound.
+    #[test]
+    fn unbind_container_stdio_releases_raw_mode_when_bound() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut fe = make_frontend();
+        let flag = Arc::new(AtomicBool::new(false));
+        fe.raw_mode_guard = Some(RawModeGuard);
+        fe.stdin_reader_shutdown = Some(flag.clone());
+
+        let was_bound = fe.unbind_container_stdio();
+
+        assert!(was_bound, "unbind must report true when stdio was bound");
+        assert!(
+            fe.raw_mode_guard.is_none(),
+            "raw mode guard must be dropped after unbind"
+        );
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "shutdown flag must be set so the reader thread exits"
+        );
+        assert!(
+            fe.stdin_reader_shutdown.is_none(),
+            "frontend must drop its handle to the shutdown flag"
+        );
+    }
+
+    /// `rebind_container_stdio` is a no-op when there is no stored stdin
+    /// channel (e.g. the previous container's channel was cleared on
+    /// terminal status) — raw mode must NOT be re-enabled.
+    #[test]
+    fn rebind_container_stdio_noop_without_stored_channel() {
+        let mut fe = make_frontend();
+        assert!(fe.container_stdin_tx.is_none());
+        assert!(fe.raw_mode_guard.is_none());
+
+        fe.rebind_container_stdio();
+
+        assert!(
+            fe.raw_mode_guard.is_none(),
+            "rebind without a stored stdin channel must not enable raw mode"
+        );
+    }
+
+    // ── erase_lines_above ────────────────────────────────────────────────────
+
+    /// `n == 0` is a no-op — the helper writes nothing rather than emitting
+    /// an empty CSI sequence (which some terminals interpret as `1`).
+    #[test]
+    fn erase_lines_above_zero_is_noop() {
+        // Just verify it doesn't panic.
+        super::erase_lines_above(0);
     }
 
     // ── yolo countdown message throttle ──────────────────────────────────────

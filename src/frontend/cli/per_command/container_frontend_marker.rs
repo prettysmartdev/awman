@@ -102,42 +102,13 @@ impl CliFrontend {
             }
         });
 
-        // Raw-mode stdin reader: forwards bytes from the terminal into
-        // stdin_tx. The thread is woken every 200ms by `poll(2)` so it can
-        // check the shutdown flag — without this, a blocking `read()` would
-        // leave the thread alive after the container exits, racing the next
-        // step's reader thread for `/dev/stdin`. The shutdown flag is set
-        // by `report_step_status` on a terminal status.
-        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.stdin_reader_shutdown = Some(shutdown.clone());
-        let stdin_writer = stdin_tx.clone();
-        #[cfg(unix)]
-        {
-            std::thread::spawn(move || spawn_unix_stdin_reader(stdin_writer, shutdown));
-        }
-        #[cfg(not(unix))]
-        {
-            // No poll(2) on non-Unix; fall back to blocking read. The reader
-            // thread will leak until a final keystroke arrives — Windows
-            // interactive support is best-effort.
-            let _ = &shutdown; // keep ref alive for parity
-            std::thread::spawn(move || {
-                use std::io::Read as _;
-                let mut stdin = std::io::stdin().lock();
-                let mut buf = [0u8; 1024];
-                loop {
-                    match stdin.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if stdin_writer.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
+        // Retain a sender clone so the workflow control board can rebind
+        // stdio after temporarily releasing the terminal for a prompt.
+        self.container_stdin_tx = Some(stdin_tx.clone());
+
+        // Spawn the raw-mode stdin reader. See `spawn_stdin_reader` for the
+        // shutdown/poll mechanics.
+        self.stdin_reader_handle = Some(self.spawn_stdin_reader(stdin_tx.clone()));
 
         // SIGWINCH listener: propagates terminal size changes to the container PTY.
         #[cfg(unix)]
@@ -165,6 +136,87 @@ impl CliFrontend {
             resize: Some(resize_rx),
             initial_size,
         }
+    }
+
+    /// Spawn the raw-mode stdin reader thread.
+    ///
+    /// The thread polls `/dev/stdin` with a 200ms timeout so it can check the
+    /// shutdown flag (set by `report_step_status` on a terminal status or by
+    /// `unbind_container_stdio` during an interactive prompt). Without this,
+    /// a blocking `read()` would hold the host stdin lock indefinitely.
+    fn spawn_stdin_reader(
+        &mut self,
+        stdin_writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.stdin_reader_shutdown = Some(shutdown.clone());
+        #[cfg(unix)]
+        {
+            std::thread::spawn(move || spawn_unix_stdin_reader(stdin_writer, shutdown))
+        }
+        #[cfg(not(unix))]
+        {
+            // No poll(2) on non-Unix; fall back to blocking read. The reader
+            // thread will leak until a final keystroke arrives — Windows
+            // interactive support is best-effort.
+            let _ = &shutdown; // keep ref alive for parity
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut stdin = std::io::stdin().lock();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stdin_writer.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        }
+    }
+
+    /// Release the host stdio from the active container PTY: signal the
+    /// stdin reader to exit, join it (so the host stdin lock is fully
+    /// released), and drop the raw-mode guard. Returns `true` if stdio was
+    /// bound and is now unbound; `false` if there was nothing to release.
+    ///
+    /// The container itself is left running — the stdin channel sender is
+    /// retained in `container_stdin_tx` so `rebind_container_stdio` can
+    /// resume forwarding without disturbing the container.
+    pub(crate) fn unbind_container_stdio(&mut self) -> bool {
+        if self.raw_mode_guard.is_none() {
+            return false;
+        }
+        if let Some(flag) = self.stdin_reader_shutdown.take() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(handle) = self.stdin_reader_handle.take() {
+            let _ = handle.join();
+        }
+        self.raw_mode_guard.take();
+        true
+    }
+
+    /// Re-bind the host stdio to the active container PTY: re-enable raw
+    /// mode and spawn a fresh stdin reader thread that forwards bytes to
+    /// the existing `container_stdin_tx` channel. No-op when raw mode is
+    /// already active or when no container channel is stored.
+    pub(crate) fn rebind_container_stdio(&mut self) {
+        if self.raw_mode_guard.is_some() {
+            return;
+        }
+        let Some(stdin_tx) = self.container_stdin_tx.clone() else {
+            return;
+        };
+        match RawModeGuard::enable() {
+            Ok(g) => self.raw_mode_guard = Some(g),
+            Err(_) => return,
+        }
+        self.stdin_reader_handle = Some(self.spawn_stdin_reader(stdin_tx));
     }
 }
 

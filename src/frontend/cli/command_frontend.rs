@@ -57,6 +57,17 @@ pub struct CliFrontend {
     /// without waiting for a final keystroke; the thread polls this on
     /// every iteration of its `poll(2)` loop.
     pub(crate) stdin_reader_shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// JoinHandle of the interactive `/dev/stdin` reader thread. Joining it
+    /// after setting `stdin_reader_shutdown` guarantees the host stdin lock
+    /// is released before any subsequent cooked-mode `read_line` call (e.g.
+    /// the workflow control board, worktree finalize prompts).
+    pub(crate) stdin_reader_handle: Option<std::thread::JoinHandle<()>>,
+    /// Clone of the channel sender the stdin reader thread uses to forward
+    /// bytes into the currently-active container's PTY. Retained so the
+    /// workflow control board can temporarily unbind stdio for an
+    /// interactive prompt and rebind by spawning a fresh reader thread that
+    /// shares the same channel. Cleared when the active step ends.
+    pub(crate) container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// RAII guard: enables raw mode on creation, disables it on drop.
@@ -103,6 +114,8 @@ impl CliFrontend {
             last_sink_message_time: None,
             raw_mode_guard: None,
             stdin_reader_shutdown: None,
+            stdin_reader_handle: None,
+            container_stdin_tx: None,
         }
     }
 
