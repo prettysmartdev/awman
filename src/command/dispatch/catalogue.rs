@@ -330,7 +330,15 @@ const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
 // ── init ─────────────────────────────────────────────────────────────────────
 
 const AGENT_VALUES: &[&str] = &[
-    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline",
+    "claude",
+    "codex",
+    "opencode",
+    "maki",
+    "gemini",
+    "copilot",
+    "crush",
+    "cline",
+    "antigravity",
 ];
 
 const INIT: CommandSpec = CommandSpec {

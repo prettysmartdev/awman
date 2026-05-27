@@ -23,6 +23,7 @@ pub fn agent_dockerfile_for(agent: &str) -> Option<&'static str> {
         "copilot" => include_str!("../../../templates/Dockerfile.copilot"),
         "crush" => include_str!("../../../templates/Dockerfile.crush"),
         "cline" => include_str!("../../../templates/Dockerfile.cline"),
+        "antigravity" => include_str!("../../../templates/Dockerfile.antigravity"),
         _ => return None,
     })
 }

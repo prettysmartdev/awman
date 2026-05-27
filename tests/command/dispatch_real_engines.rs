@@ -154,7 +154,15 @@ fn init_agent_flag_accepts_known_agents() {
     let flag = init.find_flag("agent").unwrap();
     if let FlagKind::Enum(values) = flag.kind {
         for agent in &[
-            "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline",
+            "claude",
+            "codex",
+            "opencode",
+            "maki",
+            "gemini",
+            "copilot",
+            "crush",
+            "cline",
+            "antigravity",
         ] {
             assert!(
                 values.contains(agent),

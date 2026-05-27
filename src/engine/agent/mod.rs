@@ -504,6 +504,140 @@ mod tests {
     }
 
     #[test]
+    fn build_options_antigravity_entrypoint_is_agy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let opts = engine
+            .build_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap();
+        let entrypoint = opts
+            .iter()
+            .find_map(|o| {
+                if let ContainerOption::Entrypoint(e) = o {
+                    Some(e.0.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("Entrypoint option must be present");
+        assert_eq!(
+            entrypoint,
+            vec!["agy".to_string()],
+            "antigravity interactive entrypoint must be [\"agy\"]"
+        );
+    }
+
+    #[test]
+    fn build_options_antigravity_yolo_non_interactive_includes_print_and_skip_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            non_interactive: true,
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        // --print must appear in the entrypoint (non_interactive=true appends it).
+        let entrypoint = opts
+            .iter()
+            .find_map(|o| {
+                if let ContainerOption::Entrypoint(e) = o {
+                    Some(e.0.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("Entrypoint option must be present");
+        assert!(
+            entrypoint.contains(&"--print".to_string()),
+            "entrypoint must contain --print for non_interactive antigravity; got {entrypoint:?}"
+        );
+
+        // NonInteractivePrintFlag must also be set.
+        let has_print_flag = opts
+            .iter()
+            .any(|o| matches!(o, ContainerOption::NonInteractivePrintFlag(f) if f == "--print"));
+        assert!(
+            has_print_flag,
+            "NonInteractivePrintFlag(--print) must be present for non_interactive antigravity"
+        );
+
+        // AgentModeFlags must contain --dangerously-skip-permissions.
+        let mode_flags: Vec<String> = opts
+            .iter()
+            .filter_map(|o| {
+                if let ContainerOption::AgentModeFlags(flags) = o {
+                    Some(flags.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        assert!(
+            mode_flags.contains(&"--dangerously-skip-permissions".to_string()),
+            "AgentModeFlags must contain --dangerously-skip-permissions for antigravity yolo; got {mode_flags:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_antigravity_plan_includes_approval_mode_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            plan: Some(PlanMode::Enabled),
+            non_interactive: true,
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        let mode_flags: Vec<String> = opts
+            .iter()
+            .filter_map(|o| {
+                if let ContainerOption::AgentModeFlags(flags) = o {
+                    Some(flags.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        assert!(
+            mode_flags.contains(&"--approval-mode=plan".to_string()),
+            "AgentModeFlags must contain --approval-mode=plan for antigravity plan; got {mode_flags:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_antigravity_model_flag_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            model: Some("gemini-3.5-flash".to_string()),
+            ..Default::default()
+        };
+        let result = engine.build_options(&session, &agent, &run);
+        assert!(
+            result.is_err(),
+            "build_options with model for antigravity must return Err; got {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("antigravity"),
+            "error must name the agent 'antigravity'; got: {msg}"
+        );
+        assert!(
+            msg.contains("does not support a model flag"),
+            "error must say 'does not support a model flag'; got: {msg}"
+        );
+    }
+
+    #[test]
     fn build_options_non_interactive_false_no_print_flag() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());

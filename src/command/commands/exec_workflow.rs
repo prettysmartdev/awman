@@ -425,6 +425,14 @@ impl Command for ExecWorkflowCommand {
             self.session.working_dir().join(&self.flags.workflow)
         };
 
+        // Track whether the gemini deprecation warning has already been emitted
+        // so we never fire it twice (early CLI check + post-load TOML scan).
+        let mut gemini_warning_emitted = false;
+        if self.flags.agent.as_deref() == Some("gemini") {
+            emit_gemini_deprecation_warning(frontend.as_mut());
+            gemini_warning_emitted = true;
+        }
+
         // Emit deprecation warnings for legacy config fields.
         warn_legacy_config(&self.session, frontend.as_mut());
 
@@ -460,6 +468,16 @@ impl Command for ExecWorkflowCommand {
                 return Err(err);
             }
         };
+
+        // After load: scan the workflow's per-step and workflow-level agents,
+        // plus the session default (used when neither step nor workflow set an
+        // agent). Per-step resolution mirrors WorkflowEngine::resolve_agent so
+        // the warning fires for the same agent the engine will actually launch.
+        if !gemini_warning_emitted && workflow_resolves_to_gemini(&workflow, &self.session) {
+            emit_gemini_deprecation_warning(frontend.as_mut());
+            gemini_warning_emitted = true;
+        }
+        let _ = gemini_warning_emitted;
 
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
@@ -995,6 +1013,39 @@ impl Command for ExecWorkflowCommand {
             worktree_used: self.flags.worktree,
         })
     }
+}
+
+/// Emit the gemini → antigravity deprecation warning. Centralised so the wording
+/// stays in sync across the early CLI-flag check and the post-load workflow scan.
+fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
+    sink.write_message(UserMessage {
+        level: MessageLevel::Warning,
+        text: "The 'gemini' agent is deprecated by Google. \
+               Migrate to 'antigravity' — run 'awman chat antigravity' \
+               (or 'awman config set agent antigravity' to change your default)."
+            .to_string(),
+    });
+}
+
+/// True if any step in the workflow will resolve to the `gemini` agent under
+/// the same precedence the workflow engine uses (`step.agent` >
+/// `workflow.agent` > session default).
+fn workflow_resolves_to_gemini(workflow: &Workflow, session: &Session) -> bool {
+    let workflow_default = workflow.agent.as_deref();
+    let session_default = session
+        .default_agent()
+        .map(|a| a.as_str().to_string());
+    for step in &workflow.steps {
+        let resolved = step
+            .agent
+            .as_deref()
+            .or(workflow_default)
+            .or(session_default.as_deref());
+        if resolved == Some("gemini") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve the base image tag for setup/teardown containers.
@@ -1557,6 +1608,116 @@ prompt = "do something"
         assert!(
             !env_b.contains_key("WI0082_REVIEW_TOKEN_A"),
             "entry B's env must NOT include entry A's var (no cross-step leak); got: {env_b:?}"
+        );
+    }
+
+    // ─── Gemini deprecation: workflow-level scan (WI-0083 review fix) ────────
+
+    fn make_session_with_default_agent(
+        tmp: &tempfile::TempDir,
+        default_agent: Option<&str>,
+    ) -> Session {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+
+        if let Some(agent) = default_agent {
+            let cfg_dir = tmp.path().join(".awman");
+            std::fs::create_dir_all(&cfg_dir).unwrap();
+            std::fs::write(
+                cfg_dir.join("config.json"),
+                format!(r#"{{"agent": "{agent}"}}"#),
+            )
+            .unwrap();
+        }
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn make_workflow(workflow_agent: Option<&str>, step_agents: &[Option<&str>]) -> Workflow {
+        Workflow {
+            title: None,
+            steps: step_agents
+                .iter()
+                .enumerate()
+                .map(|(i, a)| WorkflowStep {
+                    name: format!("step{i}"),
+                    depends_on: vec![],
+                    prompt_template: "x".into(),
+                    agent: a.map(|s| s.to_string()),
+                    model: None,
+                    overlays: None,
+                })
+                .collect(),
+            agent: workflow_agent.map(|s| s.to_string()),
+            model: None,
+            setup: vec![],
+            teardown: vec![],
+            teardown_on_failure: false,
+        }
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_true_when_step_uses_gemini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, None);
+        let wf = make_workflow(None, &[Some("claude"), Some("gemini")]);
+        assert!(
+            workflow_resolves_to_gemini(&wf, &session),
+            "must detect gemini in a step's agent field"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_true_when_workflow_default_is_gemini_and_step_has_no_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, None);
+        let wf = make_workflow(Some("gemini"), &[None]);
+        assert!(
+            workflow_resolves_to_gemini(&wf, &session),
+            "must detect workflow-level agent=gemini when step omits agent"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_true_when_session_default_is_gemini_and_step_has_no_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, Some("gemini"));
+        let wf = make_workflow(None, &[None]);
+        assert!(
+            workflow_resolves_to_gemini(&wf, &session),
+            "must detect session default agent=gemini when neither step nor workflow set agent"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_false_when_step_overrides_gemini_with_other_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, Some("gemini"));
+        // step.agent (claude) wins over workflow.agent (gemini) and session default.
+        let wf = make_workflow(Some("gemini"), &[Some("claude")]);
+        assert!(
+            !workflow_resolves_to_gemini(&wf, &session),
+            "step-level agent override must win over workflow and session defaults"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_false_when_no_path_resolves_to_gemini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, Some("claude"));
+        let wf = make_workflow(Some("codex"), &[Some("claude"), None]);
+        assert!(
+            !workflow_resolves_to_gemini(&wf, &session),
+            "must return false when neither step, workflow, nor session resolves to gemini"
         );
     }
 }

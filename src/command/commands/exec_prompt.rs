@@ -109,6 +109,16 @@ impl Command for ExecPromptCommand {
                 return Err(e);
             }
         };
+        if agent.as_str() == "gemini" {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: "The 'gemini' agent is deprecated by Google. \
+                       Migrate to 'antigravity' — run 'awman chat antigravity' \
+                       (or 'awman config set agent antigravity' to change your default)."
+                    .to_string(),
+            });
+        }
+
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
             text: format!("exec prompt: using agent '{}'", agent.as_str()),

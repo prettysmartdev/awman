@@ -1,6 +1,6 @@
 # Agent Sessions
 
-An agent session is a Docker container running your configured AI agent (Claude Code, Codex, OpenCode, Maki, Gemini, GitHub Copilot CLI, Crush, or Cline) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
+An agent session is a Docker container running your configured AI agent (Claude Code, Codex, OpenCode, Maki, Gemini, Antigravity, GitHub Copilot CLI, Crush, or Cline) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
 
 There are two session types: **freeform chat** and **work item implementation**.
 
@@ -26,7 +26,7 @@ Press **Ctrl+C** to exit the agent session when you're done.
 
 ### `--agent <name>`
 
-Override the configured agent for this session. Available agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`.
+Override the configured agent for this session. Available agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
 
 ```sh
 # CLI
@@ -48,7 +48,7 @@ If the agent image does not yet exist, awman offers to download the template and
 Passing an unknown agent name exits immediately with a list of valid options:
 
 ```
-error: unknown agent "foo"; available agents: claude, codex, opencode, maki, gemini, copilot, crush, cline
+error: unknown agent "foo"; available agents: claude, codex, opencode, maki, gemini, antigravity, copilot, crush, cline
 ```
 
 ### `--model <NAME>`
@@ -77,6 +77,7 @@ Per-agent translation and expected `<NAME>` format:
 | `claude` | `--model <NAME>` | bare model ID (e.g. `claude-opus-4-6`) |
 | `codex` | `--model <NAME>` | bare model ID (e.g. `gpt-4o`) |
 | `gemini` | `--model <NAME>` | bare model ID (e.g. `gemini-2.0-flash`) |
+| `antigravity` | *(not supported — an error is returned)* | — |
 | `opencode` | `--model <NAME>` | **`provider/model` required** (e.g. `anthropic/claude-3-5-sonnet`) |
 | `maki` | `--model <NAME>` | `provider/model-id` (e.g. `anthropic/claude-opus-4-6`) |
 | `crush` | `--model <NAME>` (on the `run` subcommand) | bare model ID *or* `provider/model` to disambiguate when multiple providers expose the same model name |
@@ -85,7 +86,7 @@ Per-agent translation and expected `<NAME>` format:
 
 For agents that support multiple providers (`opencode`, `crush`, `maki`), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
-If an agent does not support `--model`, a `WARNING:` is printed to stderr and the session launches without the flag — it is not aborted. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
+If an agent does not support `--model`, the behaviour varies. For Antigravity, the command exits with an error; configure the model via `~/.gemini/antigravity-cli/settings.json` or the `/model` slash command inside the agent session instead. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `Model:` field. See [Per-step model overrides](04-workflows.md#per-step-model-overrides).
 
@@ -100,6 +101,7 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 | OpenCode | `run` subcommand |
 | Maki | `--print` |
 | Gemini | `-p` (`--prompt`) |
+| Antigravity | `--print` |
 | Copilot | `-p` (prompt mode — reads from stdin, suppresses interactive prompts, exits when done) |
 | Crush | `run` subcommand (`crush run` streams output and exits) |
 | Cline | `--json` on the `task` subcommand (triggers non-interactive structured output) |
@@ -117,6 +119,7 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 | OpenCode | Not supported (flag is silently ignored) |
 | Maki | Not supported (flag is silently ignored) |
 | Gemini | `--approval-mode=plan` |
+| Antigravity | `--approval-mode=plan` |
 | Copilot | `--plan` |
 | Crush | Not supported (flag is silently ignored) |
 | Cline | `--plan` (on the `task` subcommand) |
@@ -176,6 +179,7 @@ Enable intermediate autonomous operation — the agent auto-approves file edits 
 | `opencode` | *(no equivalent — a warning is printed, flag omitted)* |
 | `maki` | `--yolo` (maki's own flag) |
 | `gemini` | `--approval-mode=auto_edit` |
+| `antigravity` | `--approval-mode=auto_edit` |
 | `copilot` | `--autopilot` (copilot's only CLI autonomous mode — same flag as `--yolo`) |
 | `crush` | `--yolo` (crush's only autonomous flag — same as `--yolo`; a warning is printed that no intermediate mode exists) |
 | `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
@@ -367,6 +371,7 @@ For Claude Code, awman reads the OAuth token from the macOS Keychain (service: `
 | `opencode` | — |
 | `maki` | API key via `envPassthrough` |
 | `gemini` | API key via `envPassthrough` and/or `~/.gemini/` OAuth directory mount |
+| `antigravity` | API key via `envPassthrough` (`ANTIGRAVITY_API_KEY`) and/or `~/.gemini/antigravity-cli/` OAuth directory mount |
 | `copilot` | GitHub token via `envPassthrough` (`COPILOT_GITHUB_TOKEN` or `GH_TOKEN`) |
 | `crush` | Provider API key(s) via `envPassthrough` |
 | `cline` | `~/.cline/data/` directory mount (contains `secrets.json` with API keys) |
@@ -423,6 +428,65 @@ The mount is a copy, not a bind mount — changes the agent makes to its auth st
 ### Auth precedence
 
 When both an API key env var and OAuth tokens are present, Gemini uses the API key. This is Gemini's own resolution logic — awman does not arbitrate. If you want to use OAuth auth exclusively, omit the key variables from `envPassthrough`.
+
+---
+
+## Antigravity authentication
+
+Antigravity supports two authentication paths, similar to Gemini. You can use either or both — awman sets up both automatically.
+
+### API key (`envPassthrough`)
+
+Add `ANTIGRAVITY_API_KEY` to your `envPassthrough` config:
+
+```json
+{ "envPassthrough": ["ANTIGRAVITY_API_KEY"] }
+```
+
+Get an API key from [Google AI Studio](https://aistudio.google.com/apikey) or through your Antigravity account. awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
+
+Supported Antigravity auth environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `ANTIGRAVITY_API_KEY` | Antigravity API key |
+| `GOOGLE_API_KEY` | Vertex AI API key (takes precedence over `ANTIGRAVITY_API_KEY`) |
+| `GOOGLE_CLOUD_PROJECT` | Vertex AI project ID |
+| `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
+
+### OAuth token (`~/.gemini/antigravity-cli/` mount)
+
+Antigravity's interactive auth stores OAuth tokens in `~/.gemini/antigravity-cli/settings.json` after you run `agy` for the first time and complete authentication. awman automatically copies `~/.gemini/antigravity-cli/` into a temporary directory and mounts it into the container at `/root/.gemini/antigravity-cli`, so the agent picks up your existing OAuth session without a manual login step.
+
+If `~/.gemini/antigravity-cli/` does not exist on the host (you've never run `agy` locally), awman creates an empty directory and mounts that instead. Antigravity will prompt for authentication inside the container on first interactive use.
+
+The mount is a copy, not a bind mount — changes the agent makes to its auth state inside the container do not affect the live `~/.gemini/antigravity-cli/` on your host.
+
+### Auth precedence
+
+When both an API key env var and OAuth tokens are present, Antigravity uses the API key. If you want to use OAuth auth exclusively, omit the key variables from `envPassthrough`.
+
+### Model configuration
+
+Antigravity does not support the `--model` flag. Configure the model in `~/.gemini/antigravity-cli/settings.json` on your host, or use the `/model` slash command inside an interactive session to change the model for that session only.
+
+---
+
+## Gemini deprecation notice
+
+The `gemini` agent is deprecated by Google in favor of Antigravity. When you launch a `gemini` session using `awman chat gemini` or set `agent = "gemini"` in your config, a deprecation warning appears before the container starts:
+
+```
+The 'gemini' agent is deprecated by Google. Migrate to 'antigravity' — run 'awman chat antigravity' (or 'awman config set agent antigravity' to change your default).
+```
+
+The warning does not block execution — your gemini session still starts. However, you should plan to migrate to `antigravity`:
+
+1. Try it once — `awman chat antigravity` automatically downloads `Dockerfile.antigravity` and builds the agent image on first use.
+2. Make it your default: `awman config set agent antigravity` (add `--global` to apply across all repos).
+3. Set up authentication as described in [Antigravity authentication](#antigravity-authentication) above.
+
+Antigravity is a drop-in replacement for Gemini with the same CLI interface and Docker-based isolation.
 
 ---
 
@@ -592,7 +656,7 @@ Downloads a static asset from the awman distribution servers into the current re
 | `aspec` or `aspec-tarball` | `awman download aspec` | `<git_root>/aspec/` (tarball extracted in-place) |
 | `dockerfile-<agent>` | `awman download dockerfile-claude` | `<git_root>/.awman/Dockerfile.<agent>` |
 
-Valid agent names for Dockerfile download: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`.
+Valid agent names for Dockerfile download: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
 
 ### Examples
 
@@ -638,7 +702,7 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 | Flag | Values | Default |
 |------|--------|---------|
-| `--agent` | `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline` | `claude` |
+| `--agent` | `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline` | `claude` |
 | `--aspec` | (flag) | off |
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.

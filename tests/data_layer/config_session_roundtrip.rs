@@ -298,7 +298,15 @@ fn session_touch_advances_last_active_at() {
 #[test]
 fn agent_name_all_valid_agent_matrix() {
     for name in &[
-        "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline",
+        "claude",
+        "codex",
+        "opencode",
+        "maki",
+        "gemini",
+        "copilot",
+        "crush",
+        "cline",
+        "antigravity",
     ] {
         assert!(
             AgentName::new(*name).is_ok(),

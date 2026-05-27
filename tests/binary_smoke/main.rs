@@ -9,6 +9,7 @@
 #[path = "../helpers/mod.rs"]
 mod helpers;
 
+mod antigravity_0083;
 mod cli_subprocess;
 mod headless_no_tty;
 mod overlay_0082;

@@ -38,7 +38,7 @@ async fn download_dockerfile_template_claude() {
     assert!(result.is_ok(), "Download failed: {:?}", result.err());
 
     let content = result.unwrap();
-    assert!(content.contains("{{AMUX_BASE_IMAGE}}"), "Template should use AMUX_BASE_IMAGE placeholder");
+    assert!(content.contains("{{AWMAN_BASE_IMAGE}}"), "Template should use AWMAN_BASE_IMAGE placeholder");
     assert!(content.contains("claude"), "Template should reference claude");
 
     // Verify log messages were emitted.
@@ -68,7 +68,7 @@ async fn download_dockerfile_template_codex() {
     assert!(result.is_ok(), "Download failed: {:?}", result.err());
 
     let content = result.unwrap();
-    assert!(content.contains("{{AMUX_BASE_IMAGE}}"));
+    assert!(content.contains("{{AWMAN_BASE_IMAGE}}"));
     assert!(content.contains("codex") || content.contains("Codex"));
 }
 
@@ -85,7 +85,7 @@ async fn download_dockerfile_template_opencode() {
     assert!(result.is_ok(), "Download failed: {:?}", result.err());
 
     let content = result.unwrap();
-    assert!(content.contains("{{AMUX_BASE_IMAGE}}"));
+    assert!(content.contains("{{AWMAN_BASE_IMAGE}}"));
     assert!(content.contains("opencode"));
 }
 

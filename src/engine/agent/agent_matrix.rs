@@ -7,7 +7,7 @@ use crate::engine::error::EngineError;
 /// Supported agent names — derived from the legacy `Agent` enum in
 /// `oldsrc/cli.rs`.
 pub const SUPPORTED_AGENTS: &[&str] = &[
-    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline",
+    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline", "antigravity",
 ];
 
 /// Per-agent metadata used by `AgentEngine::build_options`.
@@ -152,6 +152,18 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
         },
+        "antigravity" => AgentMatrix {
+            agent: "antigravity",
+            interactive_entrypoint: vec!["agy"],
+            non_interactive_flag: Some("--print"),
+            plan_flag: Some(&["--approval-mode=plan"]),
+            yolo_flag: Some("--dangerously-skip-permissions"),
+            auto_flag: Some(&["--approval-mode=auto_edit"]),
+            disallowed_tools_flag: None,
+            allowed_tools_flag: None,
+            model_flag: ModelFlagDelivery::Unsupported,
+            supports_stdin_injection: false,
+        },
         other => {
             return Err(EngineError::Other(format!(
                 "unknown agent '{other}'; supported: {}",
@@ -212,5 +224,54 @@ mod tests {
     fn opencode_plan_unsupported() {
         let m = matrix_for("opencode").unwrap();
         assert!(m.plan_flag.is_none());
+    }
+
+    #[test]
+    fn antigravity_yolo_flag_is_dangerously_skip_permissions() {
+        let m = matrix_for("antigravity").unwrap();
+        assert_eq!(
+            m.yolo_flag,
+            Some("--dangerously-skip-permissions"),
+            "antigravity yolo_flag must be --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn antigravity_non_interactive_flag_is_print() {
+        let m = matrix_for("antigravity").unwrap();
+        assert_eq!(
+            m.non_interactive_flag,
+            Some("--print"),
+            "antigravity non_interactive_flag must be --print"
+        );
+    }
+
+    #[test]
+    fn antigravity_model_flag_unsupported_returns_err() {
+        let m = matrix_for("antigravity").unwrap();
+        let result = model_flag_for(&m, "gemini-3.5-flash");
+        assert!(
+            result.is_err(),
+            "model_flag_for antigravity must return Err (Unsupported); got {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("antigravity"),
+            "error must name the agent; got: {msg}"
+        );
+        assert!(
+            msg.contains("does not support a model flag"),
+            "error must say 'does not support a model flag'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn antigravity_interactive_entrypoint_is_agy() {
+        let m = matrix_for("antigravity").unwrap();
+        assert_eq!(
+            m.interactive_entrypoint,
+            vec!["agy"],
+            "antigravity interactive_entrypoint must be [\"agy\"]"
+        );
     }
 }

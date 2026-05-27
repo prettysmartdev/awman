@@ -326,6 +326,19 @@ impl OverlayEngine {
                     }
                 }
             }
+            "antigravity" => {
+                if let Some(dir) = paths.settings_dir.as_ref() {
+                    if dir.exists() {
+                        out.push(OverlaySpec {
+                            host_path: dir.clone(),
+                            container_path: PathBuf::from(format!(
+                                "{container_home}/.gemini/antigravity-cli"
+                            )),
+                            permission: OverlayPermission::ReadWrite,
+                        });
+                    }
+                }
+            }
             "opencode" => {
                 if let Some(dir) = paths.settings_dir.as_ref() {
                     if dir.exists() {
@@ -402,6 +415,7 @@ impl OverlayEngine {
             "codex" => format!("{container_home}/.codex/skills"),
             "opencode" => format!("{container_home}/.config/opencode/commands"),
             "gemini" => format!("{container_home}/.gemini/commands"),
+            "antigravity" => format!("{container_home}/.gemini/antigravity-cli/skills"),
             "copilot" => format!("{container_home}/.copilot/instructions"),
             "crush" => format!("{container_home}/.config/crush/commands"),
             "cline" => format!("{container_home}/.cline/skills"),
@@ -712,6 +726,55 @@ mod tests {
         (tmp, skills_canon)
     }
 
+    // ─── antigravity agent_settings_overlays ─────────────────────────────────
+
+    #[test]
+    fn antigravity_settings_overlay_when_dir_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create ~/.gemini/antigravity-cli/ so the overlay fires.
+        let antigravity_dir = tmp.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&antigravity_dir).unwrap();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("antigravity").unwrap();
+
+        let overlays = engine
+            .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+            .unwrap();
+
+        assert_eq!(
+            overlays.len(),
+            1,
+            "exactly one overlay expected when ~/.gemini/antigravity-cli exists; got {overlays:?}"
+        );
+        assert!(
+            overlays[0]
+                .container_path
+                .to_string_lossy()
+                .ends_with(".gemini/antigravity-cli"),
+            "container_path must end with .gemini/antigravity-cli; got {:?}",
+            overlays[0].container_path
+        );
+    }
+
+    #[test]
+    fn antigravity_settings_overlay_empty_when_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately do NOT create ~/.gemini/antigravity-cli/.
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("antigravity").unwrap();
+
+        let overlays = engine
+            .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+            .unwrap();
+
+        assert!(
+            overlays.is_empty(),
+            "overlay list must be empty when ~/.gemini/antigravity-cli does not exist; got {overlays:?}"
+        );
+    }
+
+    // ─── antigravity skill_overlays ───────────────────────────────────────────
+
     #[test]
     fn skill_overlays_returns_single_ro_spec_for_claude() {
         let (tmp, skills_canon) = make_home_with_skills();
@@ -790,6 +853,31 @@ mod tests {
                 .to_string_lossy()
                 .contains("/.gemini/commands"),
             "gemini container path must contain /.gemini/commands; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_overlays_returns_single_ro_spec_for_antigravity() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("antigravity").unwrap();
+
+        let specs = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
+                .unwrap()
+        });
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].host_path, skills_canon);
+        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .ends_with(".gemini/antigravity-cli/skills"),
+            "antigravity container path must end with .gemini/antigravity-cli/skills; got {:?}",
             specs[0].container_path
         );
     }

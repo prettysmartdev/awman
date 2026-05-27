@@ -72,9 +72,20 @@ fn field_scope(name: &str) -> Option<FieldScope> {
         .map(|(_, s)| *s)
 }
 
-/// Valid agent names for config set agent=<value>.
+/// Valid agent names for config set agent=<value>. Must stay in sync with
+/// `engine::agent::agent_matrix::SUPPORTED_AGENTS` — the matrix is authoritative;
+/// this list is checked at config-write time so unsupported values are rejected
+/// before they reach the engine.
 const VALID_AGENT_VALUES: &[&str] = &[
-    "claude", "codex", "gemini", "opencode", "crush", "cline", "copilot", "maki",
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "crush",
+    "cline",
+    "copilot",
+    "maki",
+    "antigravity",
 ];
 
 /// Validate and coerce a string value into the appropriate JSON type for the

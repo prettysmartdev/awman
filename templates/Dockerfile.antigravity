@@ -38,7 +38,7 @@ RUN rm -rf /var/lib/apt/lists/* \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g --prefix=/usr/local @google/gemini-cli
+RUN npm install -g --prefix=/usr/local @google/antigravity-cli
 
 # ── amux user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -57,4 +57,4 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
-RUN test -x "$(command -v gemini)"
+RUN test -x "$(command -v agy)"
