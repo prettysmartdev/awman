@@ -1,0 +1,60 @@
+{
+  "schema_version": 3,
+  "workflow_name": "Dependency Upgrade",
+  "workflow_hash": "e4ac7af6d39a410073bc00121782a779c07278fec41e5411bba7ccbb3548102d",
+  "work_item": null,
+  "step_states": {
+    "security-audit": "Succeeded",
+    "version-audit": "Skipped"
+  },
+  "completed_steps": [
+    "version-audit",
+    "security-audit"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-05-28T14:42:22.766833Z",
+  "updated_at": "2026-05-28T14:54:21.503168Z",
+  "steps": [
+    {
+      "name": "security-audit",
+      "depends_on": []
+    },
+    {
+      "name": "version-audit",
+      "depends_on": [
+        "security-audit"
+      ]
+    }
+  ],
+  "current_phase": "Teardown",
+  "setup_completed": true,
+  "teardown_completed": false,
+  "setup_step_states": [
+    {
+      "description": "run_shell: git status",
+      "status": "Succeeded"
+    }
+  ],
+  "teardown_step_states": [
+    {
+      "description": "run_shell: make test",
+      "status": {
+        "Failed": {
+          "error": "warning: function `awman` is never used\n  --> tests/binary_smoke/antigravity_0083.rs:14:4\n   |\n14 | fn awman() -> Command {\n   |    ^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nawman: immediate\nawman: immediate again\nawman: msg\nawman: queued message\nawman warning: another\nawman: immediate\nerror: test failed, to rerun pass `--lib`\nmake: *** [Makefile:18: test] Error 101\n"
+        }
+      }
+    },
+    {
+      "description": "commit_changes: Update all available dependencies",
+      "status": "Running"
+    },
+    {
+      "description": "push_branch",
+      "status": "Pending"
+    },
+    {
+      "description": "create_pull_request: Security and Dependency Upgrades",
+      "status": "Pending"
+    }
+  ]
+}
