@@ -1,6 +1,6 @@
 //! Engine-level workflow state persistence — Layer 0.
 //!
-//! Persists `WorkflowState` snapshots under `<git-root>/.amux/workflows/`.
+//! Persists `WorkflowState` snapshots under `<git-root>/.awman/workflows/`.
 //! The filename pattern matches old-amux: `<repohash8>-[<wi>-]<name>.json`,
 //! where `repohash8` is the first 8 hex characters of SHA-256(git_root path).
 
@@ -11,14 +11,14 @@ use crate::data::fs::workflow_state::sha256_hex;
 use crate::data::session::Session;
 use crate::data::workflow_state::WorkflowState;
 
-/// Persists engine-level `WorkflowState` to `<git_root>/.amux/workflows/`.
+/// Persists engine-level `WorkflowState` to `<git_root>/.awman/workflows/`.
 #[derive(Debug, Clone)]
 pub struct WorkflowStateStore {
     git_root: PathBuf,
 }
 
 impl WorkflowStateStore {
-    /// Construct a store rooted at `<git_root>/.amux/workflows/`.
+    /// Construct a store rooted at `<git_root>/.awman/workflows/`.
     pub fn new(session: &Session) -> Self {
         Self {
             git_root: session.git_root().to_path_buf(),
@@ -35,7 +35,7 @@ impl WorkflowStateStore {
 
     /// Directory in which state files live.
     pub fn dir(&self) -> PathBuf {
-        self.git_root.join(".amux").join("workflows")
+        self.git_root.join(".awman").join("workflows")
     }
 
     fn filename_for(&self, work_item: Option<u32>, workflow_name: &str) -> PathBuf {
@@ -154,8 +154,8 @@ mod tests {
         let parent = path.parent().unwrap();
         assert_eq!(
             parent,
-            tmp.path().join(".amux").join("workflows"),
-            "state must be stored in .amux/workflows/, not a subdirectory"
+            tmp.path().join(".awman").join("workflows"),
+            "state must be stored in .awman/workflows/, not a subdirectory"
         );
     }
 

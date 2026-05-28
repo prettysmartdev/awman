@@ -1,7 +1,7 @@
 //! Per-agent Dockerfile download helper.
 //!
 //! Downloads `Dockerfile.<agent>` from the canonical GitHub raw URL into
-//! `<git_root>/.amux/Dockerfile.<agent>`. Falls back to the bundled template
+//! `<git_root>/.awman/Dockerfile.<agent>`. Falls back to the bundled template
 //! at `src/data/templates/Dockerfile.<agent>` when the network is unavailable
 //! and a bundled copy is shipped in the binary.
 
@@ -9,9 +9,9 @@ use std::path::Path;
 
 use crate::engine::error::EngineError;
 
-/// GitHub raw URL prefix for amux-shipped Dockerfiles.
+/// GitHub raw URL prefix for awman-shipped Dockerfiles.
 pub const DOCKERFILE_RAW_URL_PREFIX: &str =
-    "https://raw.githubusercontent.com/prettysmartdev/amux/main/templates";
+    "https://raw.githubusercontent.com/prettysmartdev/awman/main/templates";
 
 /// Construct the canonical raw URL for an agent Dockerfile.
 pub fn dockerfile_url_for(agent: &str) -> String {
@@ -35,7 +35,7 @@ fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> {
 /// agent). Returns `EngineError::AgentDockerfileDownloadFailed` only when no
 /// bundled fallback is available.
 ///
-/// `project_base_tag` is substituted for `{{AMUX_BASE_IMAGE}}` in the
+/// `project_base_tag` is substituted for `{{AWMAN_BASE_IMAGE}}` in the
 /// downloaded (or bundled) Dockerfile content.
 pub async fn download_agent_dockerfile(
     agent: &str,
@@ -44,7 +44,7 @@ pub async fn download_agent_dockerfile(
 ) -> Result<(), EngineError> {
     let url = dockerfile_url_for(agent);
     let client_result = reqwest::Client::builder()
-        .user_agent("amux")
+        .user_agent("awman")
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))
         .build();
@@ -69,13 +69,13 @@ pub async fn download_agent_dockerfile(
     match download_attempt {
         Ok(body) => {
             let body_str = String::from_utf8_lossy(&body);
-            let substituted = body_str.replace("{{AMUX_BASE_IMAGE}}", project_base_tag);
+            let substituted = body_str.replace("{{AWMAN_BASE_IMAGE}}", project_base_tag);
             atomic_write(dest, substituted.as_bytes())
         }
         Err(network_error) => {
             // Fall back to bundled template when one exists.
             if let Some(bundled) = crate::data::templates::agent_dockerfile_for(agent) {
-                let substituted = bundled.replace("{{AMUX_BASE_IMAGE}}", project_base_tag);
+                let substituted = bundled.replace("{{AWMAN_BASE_IMAGE}}", project_base_tag);
                 atomic_write(dest, substituted.as_bytes())
             } else {
                 Err(EngineError::AgentDockerfileDownloadFailed {

@@ -1,5 +1,5 @@
 //! `CommandCatalogue` — the canonical, single-source-of-truth enumeration of
-//! every amux command, subcommand, argument, and flag.
+//! every awman command, subcommand, argument, and flag.
 //!
 //! Frontends never hard-code command names or flag names; they ask the
 //! catalogue (or its projections) for what's available. The catalogue MUST
@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 /// Visibility of a command/flag across frontends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendVisibility {
-    /// Visible to every frontend (CLI, TUI, headless).
+    /// Visible to every frontend (CLI, TUI, API).
     All,
-    /// CLI-only (e.g. headless server start).
+    /// CLI-only (e.g. API server start).
     CliOnly,
     /// TUI-only (e.g. tab annotations).
     TuiOnly,
@@ -96,6 +96,14 @@ pub struct ArgumentSpec {
     pub optional: bool,
 }
 
+/// Which frontend kinds are allowed to invoke a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontendKind {
+    Cli,
+    Tui,
+    Api,
+}
+
 /// Spec for one command (or subcommand) in the catalogue.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandSpec {
@@ -107,6 +115,9 @@ pub struct CommandSpec {
     pub arguments: &'static [ArgumentSpec],
     pub flags: &'static [FlagSpec],
     pub subcommands: &'static [&'static CommandSpec],
+    /// Whether this command can be invoked via the API frontend.
+    /// Only `exec workflow` and `exec prompt` have this set to `true`.
+    pub api_allowed: bool,
 }
 
 impl CommandSpec {
@@ -161,10 +172,74 @@ impl CommandCatalogue {
         Some(current)
     }
 
+    /// Returns `true` if the given command path is allowed for the given
+    /// frontend kind. Session management routes are always allowed; only
+    /// command execution routes are restricted.
+    pub fn is_allowed_for_frontend(&self, frontend: FrontendKind, path: &[&str]) -> bool {
+        match frontend {
+            FrontendKind::Cli | FrontendKind::Tui => true,
+            FrontendKind::Api => {
+                let canonical = self.canonical_path(path);
+                if let Some(spec) = self.lookup(&canonical) {
+                    spec.api_allowed
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     /// Same as `lookup`, but first applies any registered path alias rewrites.
     pub fn lookup_with_aliases(&self, path: &[&str]) -> Option<&'static CommandSpec> {
         let canonical = self.canonical_path(path);
         self.lookup(&canonical)
+    }
+
+    /// Validate that a command path is reachable by the given frontend,
+    /// returning `Err(CommandError::NotAvailableForFrontend)` when blocked.
+    pub fn validate_for_frontend(
+        &self,
+        frontend: FrontendKind,
+        path: &[&str],
+    ) -> Result<(), crate::command::error::CommandError> {
+        if self.is_allowed_for_frontend(frontend, path) {
+            Ok(())
+        } else {
+            let command = path.join(" ");
+            let frontend_name = match frontend {
+                FrontendKind::Cli => "cli",
+                FrontendKind::Tui => "tui",
+                FrontendKind::Api => "api",
+            };
+            Err(
+                crate::command::error::CommandError::NotAvailableForFrontend {
+                    command,
+                    frontend: frontend_name.to_string(),
+                },
+            )
+        }
+    }
+
+    /// Return all command paths where `api_allowed == true` as
+    /// (parent_name, subcommand_name) pairs. Only immediate (leaf)
+    /// api-allowed specs are returned; the root is never included.
+    pub fn api_allowed_commands(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        self.collect_api_allowed_rec(self.root, &mut out);
+        out
+    }
+
+    fn collect_api_allowed_rec(
+        &self,
+        node: &'static CommandSpec,
+        out: &mut Vec<(&'static str, &'static str)>,
+    ) {
+        for sub in node.subcommands {
+            if sub.api_allowed {
+                out.push((node.name, sub.name));
+            }
+            self.collect_api_allowed_rec(sub, out);
+        }
     }
 
     /// Apply path-alias rewrites to a user-supplied path. Returns the
@@ -202,11 +277,12 @@ impl CommandCatalogue {
 // ─── Static catalogue data ───────────────────────────────────────────────────
 
 const ROOT: CommandSpec = CommandSpec {
-    name: "amux",
+    name: "awman",
     aliases: &[],
-    help: "amux — containerized code agent manager",
+    help: "awman — containerized code agent manager",
     long_help: None,
     arguments: &[],
+    api_allowed: false,
     flags: &[
         FlagSpec {
             long: "build",
@@ -243,7 +319,16 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT, &READY, &CHAT, &SPECS, &STATUS, &CONFIG, &EXEC, &HEADLESS, &REMOTE, &NEW,
+        &INIT,
+        &READY,
+        &CHAT,
+        &SPECS,
+        &STATUS,
+        &CONFIG,
+        &EXEC,
+        &API_SERVER,
+        &REMOTE,
+        &NEW,
     ],
 };
 
@@ -252,13 +337,21 @@ const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
 // ── init ─────────────────────────────────────────────────────────────────────
 
 const AGENT_VALUES: &[&str] = &[
-    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline",
+    "claude",
+    "codex",
+    "opencode",
+    "maki",
+    "gemini",
+    "copilot",
+    "crush",
+    "cline",
+    "antigravity",
 ];
 
 const INIT: CommandSpec = CommandSpec {
     name: "init",
     aliases: &[],
-    help: "Initialize the current Git repo for use with amux.",
+    help: "Initialize the current Git repo for use with awman.",
     long_help: None,
     arguments: &[],
     flags: &[
@@ -285,6 +378,7 @@ const INIT: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -364,6 +458,7 @@ const READY: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -376,6 +471,7 @@ const CHAT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &AGENT_RUN_FLAGS_NO_WORKTREE,
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -388,6 +484,7 @@ const SPECS: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[&SPECS_AMEND],
 };
 
@@ -426,6 +523,7 @@ const SPECS_AMEND: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -448,6 +546,7 @@ const STATUS: CommandSpec = CommandSpec {
         implies: &[],
         optional: true,
     }],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -460,6 +559,7 @@ const CONFIG: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[&CONFIG_SHOW, &CONFIG_GET, &CONFIG_SET],
 };
 
@@ -470,6 +570,7 @@ const CONFIG_SHOW: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -485,6 +586,7 @@ const CONFIG_GET: CommandSpec = CommandSpec {
         optional: false,
     }],
     flags: &[],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -518,6 +620,7 @@ const CONFIG_SET: CommandSpec = CommandSpec {
         implies: &[],
         optional: true,
     }],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -530,6 +633,7 @@ const EXEC: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[&EXEC_PROMPT, &EXEC_WORKFLOW],
 };
 
@@ -545,6 +649,7 @@ const EXEC_PROMPT: CommandSpec = CommandSpec {
         optional: false,
     }],
     flags: &AGENT_RUN_FLAGS_NO_WORKTREE,
+    api_allowed: true,
     subcommands: &[],
 };
 
@@ -560,30 +665,32 @@ const EXEC_WORKFLOW: CommandSpec = CommandSpec {
         optional: false,
     }],
     flags: &EXEC_WORKFLOW_FLAGS,
+    api_allowed: true,
     subcommands: &[],
 };
 
-// ── headless ────────────────────────────────────────────────────────────────
+// ── api ────────────────────────────────────────────────────────────────
 
-const HEADLESS: CommandSpec = CommandSpec {
-    name: "headless",
+const API_SERVER: CommandSpec = CommandSpec {
+    name: "api",
     aliases: &[],
-    help: "Run amux as a headless HTTP server for remote/automated access.",
+    help: "Run awman as an API HTTP server for remote/automated access.",
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[
-        &HEADLESS_START,
-        &HEADLESS_KILL,
-        &HEADLESS_LOGS,
-        &HEADLESS_STATUS,
+        &API_SERVER_START,
+        &API_SERVER_KILL,
+        &API_SERVER_LOGS,
+        &API_SERVER_STATUS,
     ],
 };
 
-const HEADLESS_START: CommandSpec = CommandSpec {
+const API_SERVER_START: CommandSpec = CommandSpec {
     name: "start",
     aliases: &[],
-    help: "Start the headless HTTP server.",
+    help: "Start the API HTTP server.",
     long_help: None,
     arguments: &[],
     flags: &[
@@ -642,37 +749,52 @@ const HEADLESS_START: CommandSpec = CommandSpec {
             implies: &[],
             optional: true,
         },
+        FlagSpec {
+            long: "dangerously-skip-tls",
+            short: None,
+            help: "Serve plain HTTP instead of HTTPS. Intended for localhost/test only.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
-const HEADLESS_KILL: CommandSpec = CommandSpec {
+const API_SERVER_KILL: CommandSpec = CommandSpec {
     name: "kill",
     aliases: &[],
-    help: "Stop the background headless server.",
+    help: "Stop the background API server.",
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[],
 };
 
-const HEADLESS_LOGS: CommandSpec = CommandSpec {
+const API_SERVER_LOGS: CommandSpec = CommandSpec {
     name: "logs",
     aliases: &[],
     help: "Stream the background server log file to stdout.",
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[],
 };
 
-const HEADLESS_STATUS: CommandSpec = CommandSpec {
+const API_SERVER_STATUS: CommandSpec = CommandSpec {
     name: "status",
     aliases: &[],
-    help: "Show headless server status.",
+    help: "Show API server status.",
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -681,33 +803,77 @@ const HEADLESS_STATUS: CommandSpec = CommandSpec {
 const REMOTE: CommandSpec = CommandSpec {
     name: "remote",
     aliases: &[],
-    help: "Connect to a remote headless amux instance and execute commands.",
+    help: "Connect to a remote awman API instance and execute commands.",
     long_help: None,
     arguments: &[],
     flags: &[],
-    subcommands: &[&REMOTE_RUN, &REMOTE_SESSION],
+    api_allowed: false,
+    subcommands: &[&REMOTE_SESSION, &REMOTE_EXEC],
 };
 
-const REMOTE_RUN: CommandSpec = CommandSpec {
-    name: "run",
+// ── remote exec ─────────────────────────────────────────────────────────────
+
+const REMOTE_EXEC: CommandSpec = CommandSpec {
+    name: "exec",
     aliases: &[],
-    help: "Execute a command on the remote headless amux host.",
+    help: "Execute a command on the remote awman API host.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    subcommands: &[&REMOTE_EXEC_WORKFLOW, &REMOTE_EXEC_PROMPT],
+};
+
+const REMOTE_EXEC_WORKFLOW: CommandSpec = CommandSpec {
+    name: "workflow",
+    aliases: &["wf"],
+    help: "Submit a workflow for execution on the remote host.",
     long_help: None,
     arguments: &[ArgumentSpec {
-        name: "command",
-        help: "The amux subcommand and arguments to execute on the remote host.",
-        kind: ArgumentKind::TrailingVarArgs,
+        name: "workflow",
+        help: "Path to the workflow file.",
+        kind: ArgumentKind::Path,
         optional: false,
     }],
-    flags: REMOTE_RUN_FLAGS,
+    flags: &REMOTE_EXEC_WORKFLOW_FLAGS,
+    api_allowed: false,
     subcommands: &[],
 };
 
-const REMOTE_RUN_FLAGS: &[FlagSpec] = &[
+const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
+    name: "prompt",
+    aliases: &[],
+    help: "Send a one-shot prompt to the remote host.",
+    long_help: None,
+    arguments: &[ArgumentSpec {
+        name: "prompt",
+        help: "The prompt text to send to the agent.",
+        kind: ArgumentKind::String,
+        optional: false,
+    }],
+    flags: &REMOTE_EXEC_PROMPT_FLAGS,
+    api_allowed: false,
+    subcommands: &[],
+};
+
+// ─── Programmatic derivation of remote exec flag sets ────────────────────────
+//
+// Per the work item: `remote exec workflow` accepts the same flags as the
+// local `exec workflow`, minus flags that make no sense remotely (`--workdir`
+// is implicit, `--worktree` is a server-side concern). Plus remote-transport
+// flags (--remote-addr, --session, --api-key, --follow).
+//
+// The flag list is built at compile time by const fn so that any future
+// addition to AGENT_RUN_FLAGS_NO_WORKTREE / EXEC_WORKFLOW_FLAGS is picked up
+// automatically — no manual list maintenance.
+
+const REMOTE_EXEC_EXCLUDED_FLAG_NAMES: &[&str] = &["workdir", "worktree"];
+
+const REMOTE_TRANSPORT_FLAGS: [FlagSpec; 4] = [
     FlagSpec {
         long: "remote-addr",
         short: None,
-        help: "Address of the remote headless amux host.",
+        help: "Address of the remote awman API host.",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
@@ -718,7 +884,18 @@ const REMOTE_RUN_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         long: "session",
         short: None,
-        help: "Session ID to run the command in.",
+        help: "Session ID to use on the remote host.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "api-key",
+        short: None,
+        help: "API key for the remote awman API host.",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
@@ -729,7 +906,7 @@ const REMOTE_RUN_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         long: "follow",
         short: Some('f'),
-        help: "Stream logs from the remote host until the command completes.",
+        help: "Stream logs via SSE until the command completes.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
@@ -737,34 +914,118 @@ const REMOTE_RUN_FLAGS: &[FlagSpec] = &[
         implies: &[],
         optional: true,
     },
-    FlagSpec {
-        long: "api-key",
-        short: None,
-        help: "API key for the remote headless amux host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
 ];
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn const_str_in_list(needle: &str, haystack: &[&str]) -> bool {
+    let mut i = 0;
+    while i < haystack.len() {
+        if const_str_eq(haystack[i], needle) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+const fn count_kept(base: &[FlagSpec], excluded: &[&str]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < base.len() {
+        if !const_str_in_list(base[i].long, excluded) {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+const REMOTE_EXEC_WORKFLOW_KEPT: usize =
+    count_kept(&EXEC_WORKFLOW_FLAGS, REMOTE_EXEC_EXCLUDED_FLAG_NAMES);
+const REMOTE_EXEC_WORKFLOW_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_WORKFLOW_KEPT;
+
+const REMOTE_EXEC_PROMPT_KEPT: usize = count_kept(
+    &AGENT_RUN_FLAGS_NO_WORKTREE,
+    REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
+);
+const REMOTE_EXEC_PROMPT_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_PROMPT_KEPT;
+
+const fn build_remote_flags<const N: usize>(base: &[FlagSpec], excluded: &[&str]) -> [FlagSpec; N] {
+    let mut out: [FlagSpec; N] = [REMOTE_TRANSPORT_FLAGS[0]; N];
+    let mut idx = 0;
+    let mut i = 0;
+    while i < REMOTE_TRANSPORT_FLAGS.len() {
+        out[idx] = REMOTE_TRANSPORT_FLAGS[i];
+        idx += 1;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < base.len() {
+        if !const_str_in_list(base[j].long, excluded) {
+            out[idx] = base[j];
+            idx += 1;
+        }
+        j += 1;
+    }
+    out
+}
+
+const REMOTE_EXEC_WORKFLOW_FLAGS: [FlagSpec; REMOTE_EXEC_WORKFLOW_TOTAL] =
+    build_remote_flags::<REMOTE_EXEC_WORKFLOW_TOTAL>(
+        &EXEC_WORKFLOW_FLAGS,
+        REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
+    );
+
+const REMOTE_EXEC_PROMPT_FLAGS: [FlagSpec; REMOTE_EXEC_PROMPT_TOTAL] =
+    build_remote_flags::<REMOTE_EXEC_PROMPT_TOTAL>(
+        &AGENT_RUN_FLAGS_NO_WORKTREE,
+        REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
+    );
+
+// ── remote session ──────────────────────────────────────────────────────────
 
 const REMOTE_SESSION: CommandSpec = CommandSpec {
     name: "session",
     aliases: &[],
-    help: "Manage sessions on the remote headless amux host.",
+    help: "Manage sessions on the remote awman API host.",
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[&REMOTE_SESSION_START, &REMOTE_SESSION_KILL],
 };
 
-const REMOTE_SESSION_FLAGS: &[FlagSpec] = &[
+const REMOTE_SESSION_START: CommandSpec = CommandSpec {
+    name: "start",
+    aliases: &[],
+    help: "Start a new session on the remote host.",
+    long_help: None,
+    arguments: &[],
+    flags: &REMOTE_SESSION_START_FLAGS,
+    api_allowed: false,
+    subcommands: &[],
+};
+
+const REMOTE_SESSION_START_FLAGS: [FlagSpec; 6] = [
     FlagSpec {
         long: "remote-addr",
         short: None,
-        help: "Address of the remote headless amux host.",
+        help: "Address of the remote awman API host.",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
@@ -775,7 +1036,51 @@ const REMOTE_SESSION_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         long: "api-key",
         short: None,
-        help: "API key for the remote headless amux host.",
+        help: "API key for the remote awman API host.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "type",
+        short: None,
+        help: "Session type: 'local' or 'remote'.",
+        kind: FlagKind::Enum(&["local", "remote"]),
+        default: FlagDefault::Str("local"),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "workdir",
+        short: None,
+        help: "Working directory (required for --type local).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "repo-url",
+        short: None,
+        help: "Repository URL (required for --type remote).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "branch",
+        short: None,
+        help: "Branch name (optional, for --type remote).",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
@@ -784,21 +1089,6 @@ const REMOTE_SESSION_FLAGS: &[FlagSpec] = &[
         optional: true,
     },
 ];
-
-const REMOTE_SESSION_START: CommandSpec = CommandSpec {
-    name: "start",
-    aliases: &[],
-    help: "Start a new session on the remote host for the given directory.",
-    long_help: None,
-    arguments: &[ArgumentSpec {
-        name: "dir",
-        help: "Working directory to use for the new session.",
-        kind: ArgumentKind::OptionalString,
-        optional: true,
-    }],
-    flags: REMOTE_SESSION_FLAGS,
-    subcommands: &[],
-};
 
 const REMOTE_SESSION_KILL: CommandSpec = CommandSpec {
     name: "kill",
@@ -811,19 +1101,46 @@ const REMOTE_SESSION_KILL: CommandSpec = CommandSpec {
         kind: ArgumentKind::OptionalString,
         optional: true,
     }],
-    flags: REMOTE_SESSION_FLAGS,
+    flags: &REMOTE_SESSION_KILL_FLAGS,
+    api_allowed: false,
     subcommands: &[],
 };
+
+const REMOTE_SESSION_KILL_FLAGS: [FlagSpec; 2] = [
+    FlagSpec {
+        long: "remote-addr",
+        short: None,
+        help: "Address of the remote awman API host.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "api-key",
+        short: None,
+        help: "API key for the remote awman API host.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+];
 
 // ── new ─────────────────────────────────────────────────────────────────────
 
 const NEW: CommandSpec = CommandSpec {
     name: "new",
     aliases: &[],
-    help: "Create a new amux artefact (spec, workflow, or skill).",
+    help: "Create a new awman artefact (spec, workflow, or skill).",
     long_help: None,
     arguments: &[],
     flags: &[],
+    api_allowed: false,
     subcommands: &[&NEW_SPEC, &NEW_WORKFLOW, &NEW_SKILL],
 };
 
@@ -857,10 +1174,11 @@ const NEW_SPEC: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
-const WORKFLOW_FORMAT_VALUES: &[&str] = &["toml", "yaml", "md"];
+const WORKFLOW_FORMAT_VALUES: &[&str] = &["toml", "yaml"];
 
 const NEW_WORKFLOW: CommandSpec = CommandSpec {
     name: "workflow",
@@ -894,7 +1212,7 @@ const NEW_WORKFLOW: CommandSpec = CommandSpec {
         FlagSpec {
             long: "global",
             short: None,
-            help: "Write to ~/.amux/workflows/<name> instead of the current repo.",
+            help: "Write to ~/.awman/workflows/<name> instead of the current repo.",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -914,6 +1232,7 @@ const NEW_WORKFLOW: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -949,7 +1268,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
         FlagSpec {
             long: "global",
             short: None,
-            help: "Write to ~/.amux/skills/<name>/ instead of the current repo.",
+            help: "Write to ~/.awman/skills/<name>/ instead of the current repo.",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -958,6 +1277,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
+    api_allowed: false,
     subcommands: &[],
 };
 
@@ -966,7 +1286,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
 /// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
 /// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
 /// exclusive.
-const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
+const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 8] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -1001,17 +1321,6 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
         optional: true,
     },
     FlagSpec {
-        long: "mount-ssh",
-        short: None,
-        help: "Mount host ~/.ssh read-only into the agent container.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
         long: "yolo",
         short: None,
         help: "Enable fully autonomous mode.",
@@ -1036,7 +1345,7 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
     FlagSpec {
         long: "agent",
         short: None,
-        help: "Agent to use (overrides .amux/config.json).",
+        help: "Agent to use (overrides .awman/config.json).",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
@@ -1068,7 +1377,7 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
     },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 10] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -1116,18 +1425,7 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
     FlagSpec {
         long: "worktree",
         short: None,
-        help: "Run in an isolated Git worktree under ~/.amux/worktrees/.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "mount-ssh",
-        short: None,
-        help: "Mount host ~/.ssh read-only into the agent container.",
+        help: "Run in an isolated Git worktree under ~/.awman/worktrees/.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
@@ -1264,22 +1562,28 @@ mod tests {
     fn every_top_level_command_is_present() {
         let cat = CommandCatalogue::get();
         for name in [
-            "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote",
-            "new",
+            "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
         ] {
             assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
         }
     }
 
     #[test]
-    fn remote_run_has_trailing_var_args_argument() {
+    fn remote_exec_workflow_has_workflow_argument() {
         let cat = CommandCatalogue::get();
-        let run = cat.lookup(&["remote", "run"]).unwrap();
-        assert_eq!(run.arguments.len(), 1);
-        assert!(matches!(
-            run.arguments[0].kind,
-            ArgumentKind::TrailingVarArgs
-        ));
+        let wf = cat.lookup(&["remote", "exec", "workflow"]).unwrap();
+        assert_eq!(wf.arguments.len(), 1);
+        assert_eq!(wf.arguments[0].name, "workflow");
+        assert!(matches!(wf.arguments[0].kind, ArgumentKind::Path));
+    }
+
+    #[test]
+    fn remote_exec_prompt_has_prompt_argument() {
+        let cat = CommandCatalogue::get();
+        let prompt = cat.lookup(&["remote", "exec", "prompt"]).unwrap();
+        assert_eq!(prompt.arguments.len(), 1);
+        assert_eq!(prompt.arguments[0].name, "prompt");
+        assert!(matches!(prompt.arguments[0].kind, ArgumentKind::String));
     }
 
     // ─── Data-table tests ─────────────────────────────────────────────────────
@@ -1375,12 +1679,6 @@ mod tests {
         },
         FlagCheck {
             path: &["chat"],
-            flag: "mount-ssh",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["chat"],
             flag: "agent",
             is_bool: false,
             is_optional: true,
@@ -1452,49 +1750,55 @@ mod tests {
             is_optional: true,
         },
         FlagCheck {
-            path: &["headless", "start"],
+            path: &["api", "start"],
             flag: "port",
             is_bool: false,
             is_optional: true,
         },
         FlagCheck {
-            path: &["headless", "start"],
+            path: &["api", "start"],
             flag: "workdirs",
             is_bool: false,
             is_optional: true,
         },
         FlagCheck {
-            path: &["headless", "start"],
+            path: &["api", "start"],
             flag: "background",
             is_bool: true,
             is_optional: true,
         },
         FlagCheck {
-            path: &["headless", "start"],
+            path: &["api", "start"],
             flag: "refresh-key",
             is_bool: true,
             is_optional: true,
         },
         FlagCheck {
-            path: &["headless", "start"],
+            path: &["api", "start"],
             flag: "dangerously-skip-auth",
             is_bool: true,
             is_optional: true,
         },
         FlagCheck {
-            path: &["remote", "run"],
+            path: &["api", "start"],
+            flag: "dangerously-skip-tls",
+            is_bool: true,
+            is_optional: true,
+        },
+        FlagCheck {
+            path: &["remote", "exec", "workflow"],
             flag: "follow",
             is_bool: true,
             is_optional: true,
         },
         FlagCheck {
-            path: &["remote", "run"],
+            path: &["remote", "exec", "workflow"],
             flag: "api-key",
             is_bool: false,
             is_optional: true,
         },
         FlagCheck {
-            path: &["remote", "run"],
+            path: &["remote", "exec", "workflow"],
             flag: "remote-addr",
             is_bool: false,
             is_optional: true,
@@ -1596,12 +1900,14 @@ mod tests {
             (&["config"], "set"),
             (&["exec"], "prompt"),
             (&["exec"], "workflow"),
-            (&["headless"], "start"),
-            (&["headless"], "kill"),
-            (&["headless"], "logs"),
-            (&["headless"], "status"),
-            (&["remote"], "run"),
+            (&["api"], "start"),
+            (&["api"], "kill"),
+            (&["api"], "logs"),
+            (&["api"], "status"),
+            (&["remote"], "exec"),
             (&["remote"], "session"),
+            (&["remote", "exec"], "workflow"),
+            (&["remote", "exec"], "prompt"),
             (&["remote", "session"], "start"),
             (&["remote", "session"], "kill"),
             (&["new"], "spec"),
@@ -1636,13 +1942,13 @@ mod tests {
     }
 
     #[test]
-    fn headless_start_flags_are_cli_only() {
+    fn api_start_flags_are_cli_only() {
         let cat = CommandCatalogue::get();
-        let start = cat.lookup(&["headless", "start"]).unwrap();
+        let start = cat.lookup(&["api", "start"]).unwrap();
         for flag in start.flags {
             assert!(
                 matches!(flag.frontends, FrontendVisibility::CliOnly),
-                "headless start flag '{}' must be CliOnly, got {:?}",
+                "api start flag '{}' must be CliOnly, got {:?}",
                 flag.long,
                 flag.frontends
             );

@@ -1,0 +1,258 @@
+<svg width="100%" viewBox="0 0 1100 620" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bgGrad" cx="50%" cy="42%" r="62%">
+      <stop offset="0%" stop-color="#081525"/>
+      <stop offset="100%" stop-color="#040b15"/>
+    </radialGradient>
+    <radialGradient id="glowCenter" cx="42%" cy="40%" r="55%">
+      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.13"/>
+      <stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="screenGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00ffea" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#00ffea" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="eyeGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="35%" stop-color="#80ffff"/>
+      <stop offset="100%" stop-color="#00aadd" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ghostGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00e5ff"/>
+      <stop offset="50%" stop-color="#4060dd"/>
+      <stop offset="100%" stop-color="#00b4d8"/>
+    </linearGradient>
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a2238"/>
+      <stop offset="100%" stop-color="#061320"/>
+    </linearGradient>
+    <linearGradient id="screenFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#04221f"/>
+      <stop offset="100%" stop-color="#02110f"/>
+    </linearGradient>
+    <linearGradient id="deskGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0c2034"/>
+      <stop offset="100%" stop-color="#05101c"/>
+    </linearGradient>
+    <filter id="neonBlur" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="textGlowOuter" x="-25%" y="-120%" width="150%" height="340%">
+      <feGaussianBlur stdDeviation="9" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="textGlowInner" x="-10%" y="-60%" width="120%" height="220%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <mask id="textGaps" maskUnits="userSpaceOnUse">
+      <rect x="0" y="0" width="1100" height="620" fill="white"/>
+      <rect x="300" y="516" width="500" height="92" fill="black"/>
+    </mask>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="620" fill="url(#bgGrad)"/>
+
+  <!-- Blueprint grid -->
+  <g stroke="#1e4d78" stroke-width="0.6" opacity="0.75">
+    <line x1="0" y1="62" x2="1100" y2="62"/>
+    <line x1="0" y1="124" x2="1100" y2="124"/>
+    <line x1="0" y1="186" x2="1100" y2="186"/>
+    <line x1="0" y1="248" x2="1100" y2="248"/>
+    <line x1="0" y1="310" x2="1100" y2="310"/>
+    <line x1="0" y1="372" x2="1100" y2="372"/>
+    <line x1="0" y1="434" x2="1100" y2="434"/>
+    <line x1="0" y1="496" x2="1100" y2="496" mask="url(#textGaps)"/>
+    <line x1="0" y1="558" x2="1100" y2="558" mask="url(#textGaps)"/>
+    <line x1="62" y1="0" x2="62" y2="620"/>
+    <line x1="124" y1="0" x2="124" y2="620"/>
+    <line x1="186" y1="0" x2="186" y2="620"/>
+    <line x1="248" y1="0" x2="248" y2="620"/>
+    <line x1="310" y1="0" x2="310" y2="620" mask="url(#textGaps)"/>
+    <line x1="372" y1="0" x2="372" y2="620" mask="url(#textGaps)"/>
+    <line x1="434" y1="0" x2="434" y2="620" mask="url(#textGaps)"/>
+    <line x1="496" y1="0" x2="496" y2="620" mask="url(#textGaps)"/>
+    <line x1="558" y1="0" x2="558" y2="620" mask="url(#textGaps)"/>
+    <line x1="620" y1="0" x2="620" y2="620" mask="url(#textGaps)"/>
+    <line x1="682" y1="0" x2="682" y2="620" mask="url(#textGaps)"/>
+    <line x1="744" y1="0" x2="744" y2="620" mask="url(#textGaps)"/>
+    <line x1="806" y1="0" x2="806" y2="620"/>
+    <line x1="868" y1="0" x2="868" y2="620"/>
+    <line x1="930" y1="0" x2="930" y2="620"/>
+    <line x1="992" y1="0" x2="992" y2="620"/>
+    <line x1="1054" y1="0" x2="1054" y2="620"/>
+  </g>
+  <!-- Fine sub-grid -->
+  <g stroke="#163a5e" stroke-width="0.35" opacity="0.45">
+    <line x1="0" y1="31" x2="1100" y2="31"/>
+    <line x1="0" y1="93" x2="1100" y2="93"/>
+    <line x1="0" y1="155" x2="1100" y2="155"/>
+    <line x1="0" y1="217" x2="1100" y2="217"/>
+    <line x1="0" y1="279" x2="1100" y2="279"/>
+    <line x1="0" y1="341" x2="1100" y2="341"/>
+    <line x1="0" y1="403" x2="1100" y2="403"/>
+    <line x1="0" y1="465" x2="1100" y2="465"/>
+    <line x1="31" y1="0" x2="31" y2="620"/>
+    <line x1="93" y1="0" x2="93" y2="620"/>
+    <line x1="155" y1="0" x2="155" y2="620"/>
+    <line x1="217" y1="0" x2="217" y2="620"/>
+    <line x1="279" y1="0" x2="279" y2="620"/>
+    <line x1="341" y1="0" x2="341" y2="620"/>
+    <line x1="403" y1="0" x2="403" y2="620"/>
+    <line x1="837" y1="0" x2="837" y2="620"/>
+    <line x1="899" y1="0" x2="899" y2="620"/>
+    <line x1="961" y1="0" x2="961" y2="620"/>
+    <line x1="1023" y1="0" x2="1023" y2="620"/>
+  </g>
+
+  <!-- Center glow -->
+  <rect width="1100" height="620" fill="url(#glowCenter)"/>
+
+  <!-- Floating data dots -->
+  <g fill="#4080cc">
+    <circle cx="160" cy="120" r="2" opacity="0.4"/>
+    <circle cx="940" cy="150" r="2.2" opacity="0.35"/>
+    <circle cx="880" cy="320" r="1.8" opacity="0.4"/>
+    <circle cx="120" cy="360" r="1.8" opacity="0.35"/>
+    <circle cx="1010" cy="240" r="2" opacity="0.3"/>
+    <circle cx="240" cy="220" r="1.6" opacity="0.35"/>
+  </g>
+
+
+
+  <!-- ===================== DESK — SIDE VIEW, RIGHT HALF ONLY =====================
+       Viewed from the desk's side: a thin tabletop slab + a side panel/leg. Occupies x ~560..1010. -->
+
+  <!-- Tabletop slab (seen edge-on) -->
+  <rect x="560" y="438" width="450" height="22" rx="4" fill="url(#deskGrad)" stroke="#0b6e8c" stroke-width="1.5"/>
+  <rect x="560" y="438" width="450" height="4" rx="2" fill="#1ad4e8" opacity="0.5"/>
+  <!-- Side panel of the desk (the end we're looking at) -->
+  <rect x="572" y="460" width="20" height="62" fill="#08182a" stroke="#0b5870" stroke-width="1.4"/>
+  <rect x="978" y="460" width="20" height="62" fill="#08182a" stroke="#0b5870" stroke-width="1.4"/>
+  <!-- Modesty panel between legs -->
+  <rect x="592" y="468" width="386" height="14" fill="#06121f" stroke="#0a3d52" stroke-width="1" opacity="0.8"/>
+  <!-- Front edge highlight -->
+  <line x1="566" y1="460" x2="1004" y2="460" stroke="#0a3d52" stroke-width="2" opacity="0.8"/>
+
+  <!-- ===================== CRT MONITOR — SIDE PROFILE (on the desk, facing left) ===================== -->
+  <!-- Tube body: bulbous casing tapering from screen front (left) to neck (right) -->
+  <path d="M 690 244
+           C 690 224, 706 214, 728 214
+           L 860 214
+           C 884 214, 900 230, 900 256
+           L 900 360
+           C 900 386, 884 402, 860 402
+           L 728 402
+           C 706 402, 690 392, 690 372
+           Z"
+        fill="#0a2236" stroke="url(#ghostGrad)" stroke-width="3"/>
+  <!-- Casing seam lines (depth) -->
+  <path d="M 742 218 C 726 240, 726 376, 742 398" fill="none" stroke="#0b6e8c" stroke-width="1.4" opacity="0.7"/>
+  <path d="M 800 216 C 788 240, 788 376, 800 400" fill="none" stroke="#0b5870" stroke-width="1.1" opacity="0.5"/>
+  <!-- Vent slits on the casing side -->
+  <g stroke="#0b5870" stroke-width="3" opacity="0.7" stroke-linecap="round">
+    <line x1="828" y1="244" x2="828" y2="282"/>
+    <line x1="844" y1="244" x2="844" y2="282"/>
+    <line x1="860" y1="246" x2="860" y2="280"/>
+  </g>
+  <!-- Screen front edge — curved glass seen edge-on -->
+  <path d="M 690 248
+           C 678 264, 678 352, 690 368
+           C 700 360, 700 256, 690 248 Z"
+        fill="url(#screenFill)" stroke="#00ffd5" stroke-width="2.5" filter="url(#neonBlur)"/>
+  <!-- Glow spilling toward the ghost -->
+  <ellipse cx="660" cy="308" rx="90" ry="92" fill="url(#screenGlow)"/>
+  <!-- Bright screen-edge highlight -->
+  <path d="M 686 256 C 680 270, 680 346, 686 360" fill="none" stroke="#aaffff" stroke-width="2.5" opacity="0.85" filter="url(#softGlow)"/>
+  <!-- Neck of the tube -->
+  <rect x="894" y="296" width="34" height="28" rx="4" fill="#0a2236" stroke="#0b6e8c" stroke-width="1.6"/>
+  <!-- Monitor base / pedestal on the desk -->
+  <ellipse cx="800" cy="430" rx="96" ry="14" fill="#0a2236" stroke="#0b6e8c" stroke-width="1.6"/>
+  <rect x="772" y="402" width="56" height="22" rx="5" fill="#08182a" stroke="#0b5870" stroke-width="1.4"/>
+  <!-- Power LED -->
+  <circle cx="712" cy="388" r="3.5" fill="#00ffd5" filter="url(#softGlow)"/>
+
+  <!-- Keyboard on the desk, moved closer to the monitor -->
+  <rect x="556" y="418" width="140" height="18" rx="4" fill="#0a2236" stroke="#0b6e8c" stroke-width="1.5"/>
+  <g fill="#06121f">
+    <rect x="563" y="422" width="14" height="7" rx="1.5"/>
+    <rect x="581" y="422" width="14" height="7" rx="1.5"/>
+    <rect x="599" y="422" width="14" height="7" rx="1.5"/>
+    <rect x="617" y="422" width="14" height="7" rx="1.5"/>
+    <rect x="635" y="422" width="14" height="7" rx="1.5"/>
+    <rect x="653" y="422" width="14" height="7" rx="1.5"/>
+    <rect x="671" y="422" width="18" height="7" rx="1.5"/>
+  </g>
+
+  <!-- Light beam from screen edge fanning toward the ghost -->
+  <path d="M 684 290 L 430 200 L 430 272 Z" fill="url(#screenGlow)" opacity="0.4"/>
+
+  <!-- ===================== GHOST/ROBOT HYBRID — FLOATING IN FRONT OF THE DESK =====================
+       Drawn last so it overlaps the desk. Side profile, facing right toward the monitor.
+       Full wavy ghost tail restored — it floats, hovering above the floor. -->
+
+  <!-- Ghost body with full wavy tail -->
+  <path d="M 252 254
+           C 252 200, 298 160, 350 160
+           C 402 160, 448 200, 448 254
+           L 448 470
+           C 448 474, 444 478, 440 474
+           L 424 458 L 408 476 L 390 458 L 372 476
+           L 354 458 L 336 476 L 318 458 L 300 476
+           L 284 458 L 268 474 C 264 478, 260 474, 260 470
+           Z"
+        fill="url(#bodyGrad)" stroke="url(#ghostGrad)" stroke-width="3"/>
+
+  <!-- Chest panel -->
+  <rect x="314" y="300" width="78" height="60" rx="8" fill="#06121f" stroke="#0b6e8c" stroke-width="1.6" opacity="0.95"/>
+  <circle cx="334" cy="318" r="4" fill="#00ffd5" filter="url(#softGlow)"/>
+  <circle cx="352" cy="318" r="4" fill="#4cf0ff" opacity="0.7"/>
+  <rect x="326" y="332" width="52" height="6" rx="3" fill="#0a3d52"/>
+  <rect x="326" y="344" width="38" height="6" rx="3" fill="#0a3d52"/>
+
+  <!-- Robotic arm reaching forward, hand hovering over the middle of the keyboard -->
+  <path d="M 426 316 C 500 320, 580 360, 626 398"
+        fill="none" stroke="url(#ghostGrad)" stroke-width="14" stroke-linecap="round"/>
+  <path d="M 426 316 C 500 320, 580 360, 626 398"
+        fill="none" stroke="#06121f" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="520" cy="342" r="11" fill="#0a2236" stroke="#00ccee" stroke-width="2.4"/>
+  <!-- Hand hovering above keyboard -->
+  <circle cx="630" cy="398" r="13" fill="#0a2236" stroke="url(#ghostGrad)" stroke-width="2.6"/>
+  <rect x="624" y="406" width="4" height="9" rx="2" fill="#00ccee"/>
+  <rect x="631" y="406" width="4" height="9" rx="2" fill="#00ccee"/>
+  <rect x="638" y="405" width="4" height="9" rx="2" fill="#00ccee"/>
+
+  <!-- Head: robotic dome, side profile facing right -->
+  <ellipse cx="350" cy="226" rx="94" ry="86" fill="url(#bodyGrad)" stroke="url(#ghostGrad)" stroke-width="3"/>
+  <!-- Antenna -->
+  <line x1="350" y1="140" x2="350" y2="114" stroke="#00ccee" stroke-width="3"/>
+  <circle cx="350" cy="108" r="7" fill="#aaffff" filter="url(#softGlow)"/>
+  <!-- Single forward eye, focused on screen -->
+  <circle cx="396" cy="214" r="26" fill="#040e1c" stroke="#00ccee" stroke-width="2.5"/>
+  <circle cx="396" cy="214" r="17" fill="#071828" stroke="#00aadd" stroke-width="1.8"/>
+  <circle cx="396" cy="214" r="10" fill="url(#eyeGlow)" filter="url(#softGlow)"/>
+  <circle cx="396" cy="214" r="5" fill="#ffffff" opacity="0.92"/>
+  <circle cx="398" cy="212" r="2" fill="#aaffff"/>
+  <!-- Mouth slot -->
+  <rect x="378" y="256" width="34" height="10" rx="5" fill="#071828" stroke="#006699" stroke-width="1.5"/>
+
+  <!-- Hover glow beneath the floating ghost -->
+  <ellipse cx="350" cy="492" rx="110" ry="16" fill="url(#screenGlow)" opacity="0.5"/>
+  <!-- ===================== TEXT: AWMAN ===================== -->
+  <line x1="150" y1="574" x2="950" y2="574" stroke="#5528bb" stroke-width="1.5" opacity="0.8" mask="url(#textGaps)"/>
+
+  <!-- Wide purple outer glow -->
+  <text x="550" y="576" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="104" font-weight="900" letter-spacing="12" fill="none" stroke="#7040ff" stroke-width="18" stroke-linejoin="round" filter="url(#textGlowOuter)" opacity="0.5">AWMAN</text>
+  <!-- Dark fill -->
+  <text x="550" y="576" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="104" font-weight="900" letter-spacing="12" fill="#07111f" stroke="#07111f" stroke-width="2">AWMAN</text>
+  <!-- Purple outline -->
+  <text x="550" y="576" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="104" font-weight="900" letter-spacing="12" fill="none" stroke="#5028bb" stroke-width="9" stroke-linejoin="round">AWMAN</text>
+  <!-- Cyan inner outline -->
+  <text x="550" y="576" text-anchor="middle" font-family="'Arial Black', Impact, sans-serif" font-size="104" font-weight="900" letter-spacing="12" fill="none" stroke="#00ddee" stroke-width="3.5" stroke-linejoin="round" filter="url(#textGlowInner)">AWMAN</text>
+</svg>

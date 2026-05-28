@@ -18,7 +18,7 @@ use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
     SharedActiveWorktreePath, SharedContainerName, SharedEngineTx, SharedPtyResetFlag,
-    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedTuiContext,
+    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender, SharedTuiContext,
     SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
@@ -61,8 +61,11 @@ pub struct TuiCommandFrontend {
         std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>>>,
     /// Shared slot for the engine sender. The engine publishes the
     /// sender here via `set_engine_sender`; the TUI event loop reads
-    /// it to send Ctrl-W, StepStuck, and StepUnstuck requests.
+    /// it to send Ctrl-W requests.
     pub(crate) engine_tx_shared: SharedEngineTx,
+    /// Shared stuck sender. The engine publishes the container's stuck
+    /// broadcast sender here; the TUI subscribes for tab coloring.
+    pub(crate) stuck_sender_shared: SharedStuckSender,
     /// Shared active-worktree path. The worktree-lifecycle frontend sets
     /// this when a worktree is created/resumed and clears it on cleanup;
     /// the renderer reads it for the bottom-bar context line.
@@ -92,6 +95,7 @@ impl TuiCommandFrontend {
         stdin_tx_shared: SharedStdinTx,
         resize_tx_shared: SharedResizeTx,
         engine_tx_shared: SharedEngineTx,
+        stuck_sender_shared: SharedStuckSender,
         active_worktree_path: SharedActiveWorktreePath,
         status_dashboard: SharedStatusDashboard,
         tui_context_shared: SharedTuiContext,
@@ -114,6 +118,7 @@ impl TuiCommandFrontend {
             stdin_tx_shared,
             resize_tx_shared,
             engine_tx_shared,
+            stuck_sender_shared,
             active_worktree_path,
             status_dashboard,
             tui_context_shared,
@@ -144,10 +149,11 @@ impl TuiCommandFrontend {
 
         self.container_io = Some(ContainerIo {
             stdout: self.stdout_tx.clone(),
+            stderr: self.stdout_tx.clone(),
             stdin_tx: stdin_tx_for_engine,
             stdin_rx,
-            resize: resize_rx,
-            initial_size,
+            resize: Some(resize_rx),
+            initial_size: Some(initial_size),
         });
     }
 

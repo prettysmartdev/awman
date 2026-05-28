@@ -4,7 +4,7 @@
 //! This file verifies the catalogue itself (path lookup, alias resolution,
 //! flag enumeration) which is a pure in-memory check.
 
-use amux::command::dispatch::catalogue::CommandCatalogue;
+use awman::command::dispatch::catalogue::CommandCatalogue;
 
 // ─── Top-level command coverage ──────────────────────────────────────────────
 
@@ -53,8 +53,8 @@ fn catalogue_has_exec_command() {
 }
 
 #[test]
-fn catalogue_has_headless_command() {
-    assert!(top_level_names().contains(&"headless"));
+fn catalogue_has_api_command() {
+    assert!(top_level_names().contains(&"api"));
 }
 
 #[test]
@@ -101,8 +101,8 @@ fn exec_has_prompt_and_workflow_subcommands() {
 }
 
 #[test]
-fn headless_has_start_kill_logs_status_subcommands() {
-    let names = subcommand_names("headless");
+fn api_has_start_kill_logs_status_subcommands() {
+    let names = subcommand_names("api");
     assert!(names.contains(&"start"));
     assert!(names.contains(&"kill"));
     assert!(names.contains(&"logs"));
@@ -110,9 +110,9 @@ fn headless_has_start_kill_logs_status_subcommands() {
 }
 
 #[test]
-fn remote_has_run_and_session_subcommands() {
+fn remote_has_exec_and_session_subcommands() {
     let names = subcommand_names("remote");
-    assert!(names.contains(&"run"));
+    assert!(names.contains(&"exec"));
     assert!(names.contains(&"session"));
 }
 
@@ -148,13 +148,21 @@ fn init_has_agent_flag() {
 
 #[test]
 fn init_agent_flag_accepts_known_agents() {
-    use amux::command::dispatch::catalogue::FlagKind;
+    use awman::command::dispatch::catalogue::FlagKind;
     let cat = CommandCatalogue::get();
     let init = cat.lookup(&["init"]).unwrap();
     let flag = init.find_flag("agent").unwrap();
     if let FlagKind::Enum(values) = flag.kind {
         for agent in &[
-            "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline",
+            "claude",
+            "codex",
+            "opencode",
+            "maki",
+            "gemini",
+            "copilot",
+            "crush",
+            "cline",
+            "antigravity",
         ] {
             assert!(
                 values.contains(agent),
@@ -208,30 +216,30 @@ fn exec_workflow_has_wf_alias() {
 }
 
 #[test]
-fn headless_start_has_port_flag() {
+fn api_start_has_port_flag() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["headless", "start"]).unwrap();
+    let start = cat.lookup(&["api", "start"]).unwrap();
     assert!(start.find_flag("port").is_some());
 }
 
 #[test]
-fn headless_start_has_background_flag() {
+fn api_start_has_background_flag() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["headless", "start"]).unwrap();
+    let start = cat.lookup(&["api", "start"]).unwrap();
     assert!(start.find_flag("background").is_some());
 }
 
 #[test]
-fn headless_start_has_refresh_key_flag() {
+fn api_start_has_refresh_key_flag() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["headless", "start"]).unwrap();
+    let start = cat.lookup(&["api", "start"]).unwrap();
     assert!(start.find_flag("refresh-key").is_some());
 }
 
 #[test]
-fn headless_start_has_dangerously_skip_auth_flag() {
+fn api_start_has_dangerously_skip_auth_flag() {
     let cat = CommandCatalogue::get();
-    let start = cat.lookup(&["headless", "start"]).unwrap();
+    let start = cat.lookup(&["api", "start"]).unwrap();
     assert!(start.find_flag("dangerously-skip-auth").is_some());
 }
 

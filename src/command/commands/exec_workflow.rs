@@ -12,7 +12,9 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
+use crate::command::commands::{
+    collect_all_overlay_specs, parse_overlay_list, warn_legacy_config, TypedOverlay,
+};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
@@ -40,7 +42,6 @@ pub struct ExecWorkflowCommandFlags {
     pub plan: bool,
     pub allow_docker: bool,
     pub worktree: bool,
-    pub mount_ssh: bool,
     pub yolo: bool,
     pub auto: bool,
     pub agent: Option<String>,
@@ -210,6 +211,41 @@ impl WorkflowFrontend for WorkflowProxy {
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         self.0.lock().unwrap().set_engine_sender(tx);
     }
+
+    fn on_setup_step_started(&mut self, description: &str) {
+        self.0.lock().unwrap().on_setup_step_started(description);
+    }
+    fn on_setup_step_output(&mut self, line: &str) {
+        self.0.lock().unwrap().on_setup_step_output(line);
+    }
+    fn on_setup_step_completed(&mut self, description: &str) {
+        self.0.lock().unwrap().on_setup_step_completed(description);
+    }
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .on_setup_step_failed(description, exit_code, stderr);
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        self.0.lock().unwrap().on_teardown_step_started(description);
+    }
+    fn on_teardown_step_output(&mut self, line: &str) {
+        self.0.lock().unwrap().on_teardown_step_output(line);
+    }
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .on_teardown_step_completed(description);
+    }
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .on_teardown_step_failed(description, exit_code, stderr);
+    }
 }
 
 // ─── ContainerFrontendProxy ──────────────────────────────────────────────────
@@ -221,39 +257,6 @@ struct ContainerFrontendProxy(Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>);
 
 #[async_trait]
 impl ContainerFrontend for ContainerFrontendProxy {
-    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        self.0.lock().unwrap().write_stdout(bytes)
-    }
-
-    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        self.0.lock().unwrap().write_stderr(bytes)
-    }
-
-    async fn read_stdin(&mut self, buf: &mut [u8]) -> Result<usize, EngineError> {
-        // Inherit-stdio mode owns the host TTY directly during the container
-        // run; this proxy is only consulted when the backend explicitly pipes
-        // stdin through us. Read from the host's stdin via spawn_blocking so
-        // we don't block the async runtime.
-        let len = buf.len();
-        let bytes = tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut local = vec![0u8; len];
-            match std::io::stdin().read(&mut local) {
-                Ok(n) => {
-                    local.truncate(n);
-                    Ok::<Vec<u8>, std::io::Error>(local)
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(|e| EngineError::Container(format!("stdin task: {e}")))?
-        .map_err(|e| EngineError::Container(format!("read stdin: {e}")))?;
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
-    }
-
     fn report_status(&mut self, status: crate::engine::container::frontend::ContainerStatus) {
         self.0.lock().unwrap().report_status(status);
     }
@@ -262,12 +265,16 @@ impl ContainerFrontend for ContainerFrontendProxy {
         self.0.lock().unwrap().report_progress(progress);
     }
 
-    fn resize_pty(&mut self, cols: u16, rows: u16) {
-        self.0.lock().unwrap().resize_pty(cols, rows);
+    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+        self.0.lock().unwrap().take_container_io()
     }
 
-    fn take_container_io(&mut self) -> Option<crate::engine::container::frontend::ContainerIo> {
-        self.0.lock().unwrap().take_container_io()
+    fn grace_timeout(&self) -> std::time::Duration {
+        self.0.lock().unwrap().grace_timeout()
+    }
+
+    fn stuck_timeout(&self) -> std::time::Duration {
+        self.0.lock().unwrap().stuck_timeout()
     }
 }
 
@@ -291,8 +298,7 @@ struct CommandLayerFactory {
     shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
     engines: Engines,
     flags: Arc<ExecWorkflowCommandFlags>,
-    directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
-    include_skills: bool,
+    cli_typed_overlays: Vec<TypedOverlay>,
     work_item_context: Option<WorkItemContext>,
     /// The original repository git root (not the worktree). Used for image tag
     /// derivation so worktree-based runs use the correct project image.
@@ -310,6 +316,14 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         let substitution =
             substitute_prompt(&step.prompt_template, self.work_item_context.as_ref());
 
+        // Compute per-step overlays by merging config/env/CLI with step-level overlays.
+        let collected = collect_all_overlay_specs(
+            session,
+            self.cli_typed_overlays.clone(),
+            step.overlays.as_deref(),
+        )
+        .map_err(|e| EngineError::Other(format!("overlay collection failed: {e}")))?;
+
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
@@ -318,12 +332,16 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             disallowed_tools: vec![],
             initial_prompt: Some(substitution.rendered),
             allow_docker: self.flags.allow_docker,
-            mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
-            env_passthrough: Some(session.effective_config().env_passthrough()),
-            directory_overlays: self.directory_overlays.clone(),
-            include_skills: self.include_skills,
+            env_passthrough: if collected.env_passthrough.is_empty() {
+                None
+            } else {
+                Some(collected.env_passthrough)
+            },
+            directory_overlays: collected.directories,
+            include_all_skills: collected.include_all_skills,
+            named_skills: collected.named_skills,
         };
         let mut options =
             self.engines
@@ -402,12 +420,23 @@ impl Command for ExecWorkflowCommand {
     ) -> Result<Self::Outcome, CommandError> {
         // Resolve the workflow path relative to the session's working
         // directory so that relative paths work regardless of where the
-        // amux process was originally launched.
+        // awman process was originally launched.
         let workflow_path = if self.flags.workflow.is_absolute() {
             self.flags.workflow.clone()
         } else {
             self.session.working_dir().join(&self.flags.workflow)
         };
+
+        // Track whether the gemini deprecation warning has already been emitted
+        // so we never fire it twice (early CLI check + post-load TOML scan).
+        let mut gemini_warning_emitted = false;
+        if self.flags.agent.as_deref() == Some("gemini") {
+            emit_gemini_deprecation_warning(frontend.as_mut());
+            gemini_warning_emitted = true;
+        }
+
+        // Emit deprecation warnings for legacy config fields.
+        warn_legacy_config(&self.session, frontend.as_mut());
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
@@ -442,10 +471,20 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
+        // After load: scan the workflow's per-step and workflow-level agents,
+        // plus the session default (used when neither step nor workflow set an
+        // agent). Per-step resolution mirrors WorkflowEngine::resolve_agent so
+        // the warning fires for the same agent the engine will actually launch.
+        if !gemini_warning_emitted && workflow_resolves_to_gemini(&workflow, &self.session) {
+            emit_gemini_deprecation_warning(frontend.as_mut());
+            gemini_warning_emitted = true;
+        }
+        let _ = gemini_warning_emitted;
+
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
         let git_root_for_scope = self.session.git_root().to_path_buf();
-        let _mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
+        let mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
             Ok(p) => p,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -495,8 +534,16 @@ impl Command for ExecWorkflowCommand {
         // 4. Worktree prepare (if --worktree is set).
         // When a worktree is used, capture its path so the session below is
         // rooted at the worktree checkout rather than the main repo.
+        if self.flags.worktree && self.session.session_type().is_remote() {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "Skipping worktree creation for remote session — repo is already isolated."
+                    .into(),
+            });
+        }
         let mut worktree_path: Option<PathBuf> = None;
-        let worktree_lifecycle = if self.flags.worktree {
+        let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote()
+        {
             let git_root = match self.engines.git_engine.resolve_root(&cwd) {
                 Ok(r) => r,
                 Err(e) => {
@@ -567,6 +614,25 @@ impl Command for ExecWorkflowCommand {
         } else {
             None
         };
+
+        // 4b. Override mount path when a worktree is active so setup/teardown
+        // containers bind to the worktree checkout, not the main repo.
+        let mount_path = if let Some(ref wt) = worktree_path {
+            wt.clone()
+        } else {
+            mount_path
+        };
+
+        // 4c. When running in a worktree, compute an extra overlay that mounts
+        // the main repo's `.git` directory into setup/teardown containers.
+        // Without this, the worktree's `.git` pointer file references a host
+        // path that doesn't exist inside the container, breaking all git ops.
+        let worktree_git_mount: Option<crate::engine::container::options::OverlaySpec> =
+            if worktree_path.is_some() {
+                worktree_git_overlay(&mount_path)?
+            } else {
+                None
+            };
 
         // 5. Parse CLI overlay specs early so errors surface before PTY is activated.
         let cli_typed = {
@@ -699,28 +765,44 @@ impl Command for ExecWorkflowCommand {
             self.session
         };
 
-        // Merge CLI overlays with config/env sources now that session is available.
-        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
-
-        // 9. Run the engine. The engine block is scoped so proxy + factory are
-        //    dropped before we reclaim the frontend via Arc::try_unwrap.
+        // 9. Run the engine with three-phase coordination.
+        // The engine block is scoped so proxy + factory are dropped before we
+        // reclaim the frontend via Arc::try_unwrap.
         let yolo = self.flags.yolo;
-        let work_item_number = work_item_context.as_ref().map(|ctx| ctx.number);
+        let setup_steps: Vec<crate::data::workflow_definition::SetupStep> =
+            workflow.setup.iter().map(|e| e.step.clone()).collect();
+        let teardown_steps: Vec<crate::data::workflow_definition::TeardownStep> =
+            workflow.teardown.iter().map(|e| e.step.clone()).collect();
+        let setup_entry_overlays: Vec<Option<Vec<String>>> =
+            workflow.setup.iter().map(|e| e.overlays.clone()).collect();
+        let setup_abort_flags: Vec<bool> =
+            workflow.setup.iter().map(|e| e.abort_on_failure).collect();
+        let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
+            .teardown
+            .iter()
+            .map(|e| e.overlays.clone())
+            .collect();
+        let teardown_abort_flags: Vec<bool> = workflow
+            .teardown
+            .iter()
+            .map(|e| e.abort_on_failure)
+            .collect();
+        let teardown_on_failure = workflow.teardown_on_failure;
+        let engine_work_item_context = work_item_context.clone();
         let (engine_result, step_counts) = {
             let proxy = WorkflowProxy(Arc::clone(&shared));
             let factory = CommandLayerFactory {
                 shared: Arc::clone(&shared),
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
-                directory_overlays,
-                include_skills: skills_enabled,
+                cli_typed_overlays: cli_typed.clone(),
                 work_item_context,
                 image_git_root: git_root_for_scope.clone(),
             };
             let mut engine = match WorkflowEngine::resume(
                 &session,
                 workflow,
-                work_item_number,
+                engine_work_item_context,
                 Box::new(proxy),
                 Box::new(factory),
                 Arc::clone(&self.engines.git_engine),
@@ -739,7 +821,211 @@ impl Command for ExecWorkflowCommand {
                 }
             };
             engine.set_yolo(yolo);
-            let result = engine.run_to_completion().await;
+
+            // Warn if the workflow will commit but git identity is not configured.
+            if teardown_steps.iter().any(|s| {
+                matches!(
+                    s,
+                    crate::data::workflow_definition::TeardownStep::CommitChanges { .. }
+                )
+            }) {
+                let name_ok = std::process::Command::new("git")
+                    .args(["config", "user.name"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let email_ok = std::process::Command::new("git")
+                    .args(["config", "user.email"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !name_ok || !email_ok {
+                    let missing: Vec<&str> = [
+                        if !name_ok { Some("user.name") } else { None },
+                        if !email_ok { Some("user.email") } else { None },
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "workflow has a commit_changes teardown step but git {} not set; \
+                             set them locally (git config {0}) or use a dir() overlay to mount \
+                             your global ~/.gitconfig into the agent container",
+                            missing.join(" and "),
+                        ),
+                    });
+                }
+            }
+
+            // === SETUP PHASE ===
+            //
+            // Each setup entry runs in its own container built from THAT
+            // entry's overlays only (WI-0082): per-step isolation matters
+            // because, e.g. an entry asking for `env(GITHUB_TOKEN)` must not
+            // leak that token into a sibling entry that only asked for
+            // `ssh()`. Container start/stop cost is amortized acceptably by
+            // the small number of setup steps in real workflows.
+            let mut setup_failed = false;
+            if !setup_steps.is_empty() && !engine.state().setup_completed {
+                let base_image = resolve_base_image(&session, &git_root_for_scope);
+                let resolved = resolve_phase_overlays(
+                    &self.engines,
+                    &session,
+                    &cli_typed,
+                    &setup_entry_overlays,
+                    worktree_git_mount.as_ref(),
+                );
+
+                // A bad overlay on ANY entry aborts the whole phase before
+                // any container starts — otherwise earlier steps would have
+                // already mutated the workspace.
+                if let Some(e) = resolved.iter().find_map(|r| r.as_ref().err()) {
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec workflow: {e}"),
+                    });
+                    setup_failed = true;
+                }
+
+                if !setup_failed {
+                    let runtime = Arc::clone(&self.engines.runtime);
+                    let mount = mount_path.clone();
+                    let base = base_image.clone();
+                    let shared_for_factory = Arc::clone(&shared);
+                    let setup_result = tokio::task::block_in_place(|| {
+                        let factory = |idx: usize| -> Result<
+                            Box<dyn crate::engine::container::ContainerExec>,
+                            EngineError,
+                        > {
+                            let (overlays, env) = resolved
+                                .get(idx)
+                                .ok_or_else(|| {
+                                    EngineError::Other(format!(
+                                        "internal: missing pre-resolved overlays for setup step {idx}",
+                                    ))
+                                })?
+                                .as_ref()
+                                .map_err(|e| EngineError::Other(e.to_string()))?;
+                            let container =
+                                runtime.start_background(&base, &mount, env, overlays)?;
+                            Ok(Box::new(container))
+                        };
+                        let r = engine.run_setup(&setup_steps, &setup_abort_flags, factory);
+                        if let Err(e) = &r {
+                            shared_for_factory
+                                .lock()
+                                .unwrap()
+                                .write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!("exec workflow: setup phase failed: {e}"),
+                                });
+                        }
+                        r
+                    });
+                    if setup_result.is_err() {
+                        setup_failed = true;
+                    }
+                }
+            }
+
+            // === MAIN PHASE ===
+            let result = if setup_failed {
+                Err(crate::engine::error::EngineError::Container(
+                    "setup phase failed; main workflow not started".into(),
+                ))
+            } else {
+                engine.run_to_completion().await
+            };
+
+            let workflow_succeeded = matches!(
+                result,
+                Ok(WorkflowOutcome::Completed) | Ok(WorkflowOutcome::CompletedTeardownFailed)
+            );
+
+            // === TEARDOWN PHASE ===
+            //
+            // Same per-entry container pattern as setup: overlays are
+            // pre-resolved via `resolve_phase_overlays` and the factory
+            // indexes into the results. Unlike setup, no upfront abort
+            // gate — per-entry overlay errors flow through the factory and
+            // `run_teardown` handles them as per-step failures (best-effort).
+            //
+            // If the setup or main phase triggered abort_on_failure,
+            // teardown is skipped regardless of teardown_on_failure.
+            let mut teardown_aborted = false;
+            let mut any_teardown_failed = false;
+            if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
+                let should_run = teardown_on_failure || workflow_succeeded;
+                if should_run {
+                    let base_image = resolve_base_image(&session, &git_root_for_scope);
+                    let resolved = resolve_phase_overlays(
+                        &self.engines,
+                        &session,
+                        &cli_typed,
+                        &teardown_entry_overlays,
+                        worktree_git_mount.as_ref(),
+                    );
+                    let runtime = Arc::clone(&self.engines.runtime);
+                    let mount = mount_path.clone();
+                    (teardown_aborted, any_teardown_failed) = tokio::task::block_in_place(|| {
+                        let factory = |idx: usize| -> Result<
+                            Box<dyn crate::engine::container::ContainerExec>,
+                            EngineError,
+                        > {
+                            let (overlays, env) = resolved
+                                .get(idx)
+                                .ok_or_else(|| {
+                                    EngineError::Other(format!(
+                                        "internal: missing pre-resolved overlays for teardown step {idx}",
+                                    ))
+                                })?
+                                .as_ref()
+                                .map_err(|e| EngineError::Other(e.to_string()))?;
+                            let container =
+                                runtime.start_background(&base_image, &mount, env, overlays)?;
+                            Ok(Box::new(container))
+                        };
+                        engine
+                            .run_teardown(
+                                &teardown_steps,
+                                &teardown_abort_flags,
+                                workflow_succeeded,
+                                teardown_on_failure,
+                                factory,
+                            )
+                            .unwrap_or((false, false))
+                    });
+                }
+            }
+
+            // If any teardown step failed, promote the result to
+            // CompletedTeardownFailed so post-workflow flows know.
+            let result = if (teardown_aborted || any_teardown_failed) && workflow_succeeded {
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: "Workflow completed but one or more teardown steps failed".into(),
+                });
+                Ok(WorkflowOutcome::CompletedTeardownFailed)
+            } else {
+                result
+            };
+
+            // If teardown didn't run (no teardown steps, or skipped on failure)
+            // the engine's current_phase still reads Main — promote it to Done
+            // so persisted state reflects completion.
+            if !matches!(
+                engine.state().current_phase,
+                crate::data::workflow_state::WorkflowPhase::Done
+            ) {
+                let _ = engine.mark_done();
+            }
+
             let mut completed = 0usize;
             let mut failed = 0usize;
             for state in engine.state().step_states.values() {
@@ -766,13 +1052,29 @@ impl Command for ExecWorkflowCommand {
         // 10. Determine whether the workflow ended with an error.
         let had_error = matches!(
             engine_result,
-            Err(_) | Ok(WorkflowOutcome::Failed { .. }) | Ok(WorkflowOutcome::Aborted)
+            Err(_)
+                | Ok(WorkflowOutcome::Failed { .. })
+                | Ok(WorkflowOutcome::Aborted)
+                | Ok(WorkflowOutcome::CompletedTeardownFailed)
         );
 
         // 11. Report summary.
+        //
+        // `exit_code` is the unambiguous overall outcome:
+        //   Some(0) — workflow completed successfully
+        //   Some(N) — a step failed (Failed → failing step's exit code;
+        //             Aborted → 1, since the user/engine bailed after a failure)
+        //   None    — workflow paused; no terminal status yet
+        //
+        // Callers (CLI, TUI, API queue worker) inspect this to determine the
+        // final success/failure of the run.
         let exit_code = match &engine_result {
+            Ok(WorkflowOutcome::Completed) => Some(0),
+            Ok(WorkflowOutcome::CompletedTeardownFailed) => Some(1),
             Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
-            _ => None,
+            Ok(WorkflowOutcome::Aborted) => Some(1),
+            Ok(WorkflowOutcome::Paused) => None,
+            Err(_) => Some(1),
         };
         frontend.report_workflow_summary(&WorkflowSummary {
             steps_completed: step_counts.0,
@@ -809,6 +1111,140 @@ impl Command for ExecWorkflowCommand {
     }
 }
 
+/// Emit the gemini → antigravity deprecation warning. Centralised so the wording
+/// stays in sync across the early CLI-flag check and the post-load workflow scan.
+fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
+    sink.write_message(UserMessage {
+        level: MessageLevel::Warning,
+        text: "The 'gemini' agent is deprecated by Google. \
+               Migrate to 'antigravity' — run 'awman chat antigravity' \
+               (or 'awman config set agent antigravity' to change your default)."
+            .to_string(),
+    });
+}
+
+/// True if any step in the workflow will resolve to the `gemini` agent under
+/// the same precedence the workflow engine uses (`step.agent` >
+/// `workflow.agent` > session default).
+fn workflow_resolves_to_gemini(workflow: &Workflow, session: &Session) -> bool {
+    let workflow_default = workflow.agent.as_deref();
+    let session_default = session.default_agent().map(|a| a.as_str().to_string());
+    for step in &workflow.steps {
+        let resolved = step
+            .agent
+            .as_deref()
+            .or(workflow_default)
+            .or(session_default.as_deref());
+        if resolved == Some("gemini") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve the base image tag for setup/teardown containers.
+/// Checks effective config, falls back to the project image tag convention.
+fn resolve_base_image(session: &Session, git_root: &std::path::Path) -> String {
+    if let Some(configured) = session.effective_config().base_image() {
+        return configured;
+    }
+    crate::data::image_tags::project_image_tag(git_root)
+}
+
+/// Collect overlay specs and env vars for a single setup or teardown entry.
+///
+/// Merges the entry's own overlays with the global / repo / `AWMAN_OVERLAYS`
+/// / `--overlay` flag sources, then resolves directories via the overlay
+/// engine and captures env vars from the host process environment.
+///
+/// One call per entry — that's the whole point post-WI-0082: each step's
+/// container sees only the entry's own overlays plus the standing sources,
+/// not the union of all phase entries' overlays.
+fn collect_single_entry_overlays(
+    engines: &Engines,
+    session: &Session,
+    cli_typed: &[TypedOverlay],
+    entry_overlays: Option<&[String]>,
+) -> Result<
+    (
+        Vec<crate::engine::container::options::OverlaySpec>,
+        std::collections::HashMap<String, String>,
+    ),
+    CommandError,
+> {
+    let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), entry_overlays)?;
+
+    let container_home = crate::engine::overlay::detect_home_from_dockerfile(
+        &session.git_root().join("Dockerfile.dev"),
+    );
+    let request = crate::engine::overlay::OverlayRequest {
+        directories: collected.directories,
+        include_all_skills: false,
+        named_skills: Vec::new(),
+        agent: None,
+        yolo: false,
+        container_home,
+    };
+    let overlay_specs = engines
+        .overlay_engine
+        .build_overlays(session, &request)
+        .map_err(|e| {
+            CommandError::Other(format!(
+                "failed to resolve overlays for setup/teardown container: {e}",
+            ))
+        })?;
+
+    let mut env = std::collections::HashMap::new();
+    for var_name in &collected.env_passthrough {
+        if let Ok(val) = std::env::var(var_name) {
+            env.insert(var_name.clone(), val);
+        }
+    }
+
+    Ok((overlay_specs, env))
+}
+
+/// Pre-resolve overlay specs and env vars for every entry in a setup or
+/// teardown phase.
+///
+/// Each entry is resolved independently via [`collect_single_entry_overlays`]
+/// (per-step overlay isolation, WI-0082). When `worktree_git_mount` is
+/// `Some`, the backing `.git` directory overlay is appended to every
+/// successful entry so git operations work inside worktree-mounted
+/// containers.
+///
+/// Returns one `Result` per entry. The caller decides error policy:
+/// - **Setup** aborts the entire phase on the first `Err`.
+/// - **Teardown** passes errors through to the factory; `run_teardown`
+///   handles per-step failures gracefully.
+type PhaseOverlayResult = Result<
+    (
+        Vec<crate::engine::container::options::OverlaySpec>,
+        std::collections::HashMap<String, String>,
+    ),
+    CommandError,
+>;
+
+fn resolve_phase_overlays(
+    engines: &Engines,
+    session: &Session,
+    cli_typed: &[TypedOverlay],
+    entries: &[Option<Vec<String>>],
+    worktree_git_mount: Option<&crate::engine::container::options::OverlaySpec>,
+) -> Vec<PhaseOverlayResult> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (mut overlays, env) =
+                collect_single_entry_overlays(engines, session, cli_typed, entry.as_deref())?;
+            if let Some(wt) = worktree_git_mount {
+                overlays.push(wt.clone());
+            }
+            Ok((overlays, env))
+        })
+        .collect()
+}
+
 /// Extract a numeric work item number from strings like "0069", "69", "WI-69",
 /// etc. Returns the first run of decimal digits found in `s`, parsed as `u32`.
 fn parse_work_item_number(s: &str) -> Option<u32> {
@@ -840,6 +1276,30 @@ fn find_work_item_file(git_root: &std::path::Path, number: u32) -> Option<std::p
                 .map(|n| n.starts_with(&prefix))
                 .unwrap_or(false)
         })
+}
+
+/// Build an [`OverlaySpec`] that mounts the main repo's `.git` directory into
+/// a container so git operations work inside a worktree checkout.
+///
+/// A worktree's `.git` is a pointer file referencing an absolute path inside
+/// the main repo's `.git/worktrees/<name>/` directory. When only the worktree
+/// is bind-mounted, that pointer dangles and every git command fails. This
+/// overlay mounts the main `.git` directory at its host-absolute path so the
+/// pointer resolves identically inside the container.
+///
+/// Returns `Ok(None)` when `worktree_path` is a regular repo or has no `.git`.
+fn worktree_git_overlay(
+    worktree_path: &std::path::Path,
+) -> Result<Option<crate::engine::container::options::OverlaySpec>, EngineError> {
+    let main_git_dir = match crate::engine::git::resolve_worktree_git_dir(worktree_path)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    Ok(Some(crate::engine::container::options::OverlaySpec {
+        host_path: main_git_dir.clone(),
+        container_path: main_git_dir,
+        permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+    }))
 }
 
 #[cfg(test)]
@@ -901,18 +1361,21 @@ mod tests {
 
     #[async_trait]
     impl ContainerFrontend for FakeExecWorkflowFrontend {
-        fn write_stdout(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn write_stderr(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-            Err(EngineError::NotImplemented("test read_stdin"))
-        }
         fn report_status(&mut self, _status: ContainerStatus) {}
         fn report_progress(&mut self, _progress: ContainerProgress) {}
-        fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+            let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::engine::container::frontend::ContainerIo {
+                stdout: stdout_tx,
+                stderr: stderr_tx,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
     }
 
     impl WorkflowFrontend for FakeExecWorkflowFrontend {
@@ -1071,7 +1534,7 @@ prompt = "do something"
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -1148,7 +1611,7 @@ prompt = "do something"
             plan: false,
             allow_docker: false,
             worktree: false,
-            mount_ssh: false,
+
             yolo: false,
             auto: false,
             agent: None,
@@ -1208,7 +1671,7 @@ prompt = "do something"
             plan: false,
             allow_docker: false,
             worktree: false,
-            mount_ssh: false,
+
             yolo: false,
             auto: false,
             agent: None,
@@ -1230,7 +1693,7 @@ prompt = "do something"
             plan: false,
             allow_docker: false,
             worktree: true,
-            mount_ssh: false,
+
             yolo: true,
             auto: false,
             agent: None,
@@ -1249,5 +1712,174 @@ prompt = "do something"
         };
         assert_eq!(s.steps_failed, 0);
         assert_eq!(s.steps_completed, 3);
+    }
+
+    // ─── Per-entry overlay isolation (WI-0082 §1 review fix) ─────────────────
+
+    /// `collect_single_entry_overlays` must scope env passthrough to the
+    /// caller-supplied entry + standing sources only. The orchestrator calls
+    /// it once per setup/teardown entry; if it leaked information across
+    /// calls, sibling steps would inherit each other's overlays.
+    #[test]
+    fn collect_single_entry_overlays_isolates_env_per_entry() {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let engines = make_engines();
+
+        // Set both env vars on the host so passthrough can capture them.
+        std::env::set_var("WI0082_REVIEW_TOKEN_A", "value-a");
+        std::env::set_var("WI0082_REVIEW_TOKEN_B", "value-b");
+
+        let entry_a = vec!["env(WI0082_REVIEW_TOKEN_A)".to_string()];
+        let entry_b = vec!["env(WI0082_REVIEW_TOKEN_B)".to_string()];
+
+        let (_, env_a) =
+            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_a)).unwrap();
+        let (_, env_b) =
+            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_b)).unwrap();
+
+        std::env::remove_var("WI0082_REVIEW_TOKEN_A");
+        std::env::remove_var("WI0082_REVIEW_TOKEN_B");
+
+        assert!(
+            env_a.contains_key("WI0082_REVIEW_TOKEN_A"),
+            "entry A's env must contain its own var; got: {env_a:?}"
+        );
+        assert!(
+            !env_a.contains_key("WI0082_REVIEW_TOKEN_B"),
+            "entry A's env must NOT include entry B's var (no cross-step leak); got: {env_a:?}"
+        );
+        assert!(
+            env_b.contains_key("WI0082_REVIEW_TOKEN_B"),
+            "entry B's env must contain its own var; got: {env_b:?}"
+        );
+        assert!(
+            !env_b.contains_key("WI0082_REVIEW_TOKEN_A"),
+            "entry B's env must NOT include entry A's var (no cross-step leak); got: {env_b:?}"
+        );
+    }
+
+    // ─── Gemini deprecation: workflow-level scan (WI-0083 review fix) ────────
+
+    fn make_session_with_default_agent(
+        tmp: &tempfile::TempDir,
+        default_agent: Option<&str>,
+    ) -> Session {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+
+        if let Some(agent) = default_agent {
+            let cfg_dir = tmp.path().join(".awman");
+            std::fs::create_dir_all(&cfg_dir).unwrap();
+            std::fs::write(
+                cfg_dir.join("config.json"),
+                format!(r#"{{"agent": "{agent}"}}"#),
+            )
+            .unwrap();
+        }
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn make_workflow(workflow_agent: Option<&str>, step_agents: &[Option<&str>]) -> Workflow {
+        Workflow {
+            title: None,
+            steps: step_agents
+                .iter()
+                .enumerate()
+                .map(|(i, a)| WorkflowStep {
+                    name: format!("step{i}"),
+                    depends_on: vec![],
+                    prompt_template: "x".into(),
+                    agent: a.map(|s| s.to_string()),
+                    model: None,
+                    overlays: None,
+                    abort_on_failure: false,
+                })
+                .collect(),
+            agent: workflow_agent.map(|s| s.to_string()),
+            model: None,
+            setup: vec![],
+            teardown: vec![],
+            teardown_on_failure: false,
+        }
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_true_when_step_uses_gemini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, None);
+        let wf = make_workflow(None, &[Some("claude"), Some("gemini")]);
+        assert!(
+            workflow_resolves_to_gemini(&wf, &session),
+            "must detect gemini in a step's agent field"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_true_when_workflow_default_is_gemini_and_step_has_no_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, None);
+        let wf = make_workflow(Some("gemini"), &[None]);
+        assert!(
+            workflow_resolves_to_gemini(&wf, &session),
+            "must detect workflow-level agent=gemini when step omits agent"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_true_when_session_default_is_gemini_and_step_has_no_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, Some("gemini"));
+        let wf = make_workflow(None, &[None]);
+        assert!(
+            workflow_resolves_to_gemini(&wf, &session),
+            "must detect session default agent=gemini when neither step nor workflow set agent"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_false_when_step_overrides_gemini_with_other_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, Some("gemini"));
+        // step.agent (claude) wins over workflow.agent (gemini) and session default.
+        let wf = make_workflow(Some("gemini"), &[Some("claude")]);
+        assert!(
+            !workflow_resolves_to_gemini(&wf, &session),
+            "step-level agent override must win over workflow and session defaults"
+        );
+    }
+
+    #[test]
+    fn workflow_resolves_to_gemini_false_when_no_path_resolves_to_gemini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_default_agent(&tmp, Some("claude"));
+        let wf = make_workflow(Some("codex"), &[Some("claude"), None]);
+        assert!(
+            !workflow_resolves_to_gemini(&wf, &session),
+            "must return false when neither step, workflow, nor session resolves to gemini"
+        );
     }
 }

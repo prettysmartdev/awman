@@ -1,0 +1,33 @@
+{
+  "schema_version": 3,
+  "workflow_name": "Dependency Upgrade",
+  "workflow_hash": "473771118ac1bcd8e0725b8d378b8caa33be01e0a0a6b178711560666beba6e9",
+  "work_item": null,
+  "step_states": {
+    "version-audit": "Pending",
+    "security-audit": "Succeeded"
+  },
+  "completed_steps": [
+    "security-audit"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-05-25T00:07:37.564565Z",
+  "updated_at": "2026-05-25T00:34:57.688055Z",
+  "steps": [
+    {
+      "name": "security-audit",
+      "depends_on": []
+    },
+    {
+      "name": "version-audit",
+      "depends_on": [
+        "security-audit"
+      ]
+    }
+  ],
+  "current_phase": "Main",
+  "setup_completed": false,
+  "teardown_completed": false,
+  "setup_step_states": [],
+  "teardown_step_states": []
+}

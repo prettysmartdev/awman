@@ -3,17 +3,22 @@
 //! Holds a `Box<dyn ContainerBackend>` chosen by `detect`. The concrete
 //! backend is invisible outside this module.
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
 use crate::data::config::global::GlobalConfig;
 use crate::data::session::{ContainerHandle, Session};
 use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
 use crate::engine::container::instance::{ContainerInstance, ContainerStats};
-use crate::engine::container::options::{ContainerOption, ResolvedContainerOptions};
+use crate::engine::container::options::{ContainerOption, OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
 pub struct ContainerRuntime {
-    backend: Box<dyn ContainerBackend>,
+    backend: Arc<dyn ContainerBackend>,
 }
 
 impl ContainerRuntime {
@@ -38,16 +43,13 @@ impl ContainerRuntime {
                 }
             }
             Some(other) => {
-                eprintln!(
-                    "amux: warning: unknown runtime '{}', falling back to Docker",
-                    other
-                );
+                tracing::warn!(runtime = other, "unknown runtime, falling back to Docker");
                 Backend::Docker
             }
         };
-        let backend: Box<dyn ContainerBackend> = match chosen {
-            Backend::Docker => Box::new(DockerBackend::new()),
-            Backend::Apple => Box::new(AppleBackend::new()),
+        let backend: Arc<dyn ContainerBackend> = match chosen {
+            Backend::Docker => Arc::new(DockerBackend::new()),
+            Backend::Apple => Arc::new(AppleBackend::new()),
         };
         Ok(Self { backend })
     }
@@ -56,7 +58,7 @@ impl ContainerRuntime {
     /// and code paths that have already resolved the backend).
     pub fn docker() -> Self {
         Self {
-            backend: Box::new(DockerBackend::new()),
+            backend: Arc::new(DockerBackend::new()),
         }
     }
 
@@ -179,7 +181,7 @@ impl ContainerRuntime {
         }
     }
 
-    /// List all running amux containers without requiring a session.
+    /// List all running awman containers without requiring a session.
     /// Used by the TUI event loop for stats polling.
     pub fn list_running_sync(&self) -> Result<Vec<ContainerHandle>, EngineError> {
         self.backend.list_running_all()
@@ -212,6 +214,30 @@ impl ContainerRuntime {
             "apple-containers" => "container",
             _ => "docker",
         }
+    }
+
+    /// Start a background container for setup/teardown execution.
+    ///
+    /// Delegates to the backend's `start_background` (default impl in
+    /// `ContainerBackend` shells out to the runtime's CLI). The returned
+    /// `BackgroundContainer` retains a shared reference to the backend so
+    /// later `exec` and `kill` calls flow through the same trait.
+    pub fn start_background(
+        &self,
+        image: &str,
+        workdir: &Path,
+        env: &HashMap<String, String>,
+        overlays: &[OverlaySpec],
+    ) -> Result<BackgroundContainer, EngineError> {
+        let container_id = self
+            .backend
+            .start_background(image, workdir, env, overlays)?;
+        let workdir_str = workdir.display().to_string();
+        Ok(BackgroundContainer::new(
+            container_id,
+            Arc::clone(&self.backend),
+            workdir_str,
+        ))
     }
 
     /// Best-effort check whether the container runtime daemon is reachable.

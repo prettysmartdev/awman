@@ -7,16 +7,16 @@
 //!
 //! The per-command modules in this directory carry the impls for the
 //! richer traits — `Init`, `Ready`, `Chat`, `ExecPrompt`,
-//! `ExecWorkflow`, `Headless` — which require additional Q&A,
+//! `ExecWorkflow`, `Api` — which require additional Q&A,
 //! reporting, or container-frontend hooks.
 
 pub(crate) mod helpers;
 pub(crate) mod render;
 
+mod api_server;
 mod chat;
 mod exec_prompt;
 mod exec_workflow;
-mod headless;
 mod init;
 mod ready;
 

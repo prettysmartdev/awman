@@ -5,8 +5,15 @@
 
 use std::io;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_tui_active() -> bool {
+    TUI_ACTIVE.load(Ordering::Relaxed)
+}
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -91,10 +98,29 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
     match run_event_loop(&mut app) {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
-            eprintln!("amux: TUI error: {e}");
+            eprintln!("awman: TUI error: {e}");
             ExitCode::from(1)
         }
     }
+}
+
+/// Restore the terminal to a clean state. Idempotent and best-effort: each
+/// step is attempted independently so a failure in one doesn't leave later
+/// steps un-run. Called from both the normal teardown path and the panic
+/// hook so an unexpected panic doesn't leave the shell in raw mode with the
+/// kitty keyboard protocol still active.
+fn restore_terminal(keyboard_enhanced: bool) {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    if keyboard_enhanced {
+        let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::cursor::Show,
+    );
 }
 
 /// Set up the terminal, run the main loop, and restore on exit.
@@ -121,24 +147,28 @@ fn run_event_loop(app: &mut App) -> io::Result<()> {
         crossterm::event::EnableMouseCapture
     )?;
 
+    // Install a panic hook that restores the terminal before the default
+    // hook prints the panic message — without this, a panic inside the
+    // event loop would leave the shell in raw mode with the kitty
+    // keyboard protocol pushed, so every keystroke (arrows, Ctrl-C, …)
+    // would appear as a literal escape sequence in the user's prompt.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        TUI_ACTIVE.store(false, Ordering::Relaxed);
+        restore_terminal(keyboard_enhanced);
+        original_hook(info);
+    }));
+
+    TUI_ACTIVE.store(true, Ordering::Relaxed);
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = main_loop(&mut terminal, app);
 
-    disable_raw_mode()?;
-    if keyboard_enhanced {
-        execute!(
-            terminal.backend_mut(),
-            crossterm::event::PopKeyboardEnhancementFlags
-        )?;
-    }
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    TUI_ACTIVE.store(false, Ordering::Relaxed);
+    restore_terminal(keyboard_enhanced);
+    let _ = std::panic::take_hook();
 
     result
 }
@@ -191,10 +221,6 @@ fn command_box_locked(app: &App) -> bool {
 
 /// Determine focus context and dispatch the key event through the keymap.
 fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
-    // Any key counts as user activity. Suppresses stuck detection on the
-    // active tab and keeps `last_user_activity_time` fresh.
-    app.active_tab_mut().record_user_activity();
-
     let ctx = if app.active_dialog.is_some() {
         FocusContext::Dialog
     } else if app.active_tab().container_window_state == ContainerWindowState::Maximized
@@ -233,7 +259,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 if app.tabs.len() > 1 {
                     // Clear user-activity so the departing tab stays "stuck"
                     // and doesn't send a false StepUnstuck on switch-back.
-                    app.active_tab_mut().last_user_activity_time = None;
                     app.active_dialog = None;
                     if key.code == KeyCode::Char('a') {
                         app.switch_to_prev_tab();
@@ -466,10 +491,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                     .yolo_cancel_flag
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 app.active_dialog = None;
-                // Clear user-activity so the tab stays "stuck" without
-                // cycling through unstuck→stuck (which would re-send
-                // StepStuck and restart the yolo countdown).
-                app.active_tab_mut().last_user_activity_time = None;
                 return;
             }
             dismiss_dialog(app);
@@ -583,9 +604,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 // ─── Mouse ───────────────────────────────────────────────────────────────────
 
 fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
-    // Mouse events count as user activity for the stuck-detection clock.
-    app.active_tab_mut().record_user_activity();
-
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             // Workflow strip scroll.
@@ -1387,7 +1405,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -1464,10 +1482,10 @@ mod tests {
     #[test]
     fn bare_invocation_has_no_subcommand() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["amux"]).unwrap();
+        let m = cmd.try_get_matches_from(["awman"]).unwrap();
         assert!(
             m.subcommand_name().is_none(),
-            "bare `amux` must have no subcommand — main.rs uses this to route to TUI"
+            "bare `awman` must have no subcommand — main.rs uses this to route to TUI"
         );
     }
 
@@ -1475,9 +1493,9 @@ mod tests {
     fn subcommand_presence_routes_away_from_tui() {
         let cmd = CommandCatalogue::get().build_clap_command();
         for argv in [
-            vec!["amux", "status"],
-            vec!["amux", "ready"],
-            vec!["amux", "chat"],
+            vec!["awman", "status"],
+            vec!["awman", "ready"],
+            vec!["awman", "chat"],
         ] {
             let m = cmd.clone().try_get_matches_from(&argv).unwrap();
             assert!(
@@ -2403,7 +2421,7 @@ mod tests {
             crate::frontend::tui::tabs::ContainerWindowState::Maximized;
         while resize_rx.try_recv().is_ok() {}
         press_key(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
-        // Minimized ≠ Hidden so resize is attempted (may fail in headless env).
+        // Minimized ≠ Hidden so resize is attempted (may fail in CI env).
         // The key assertion: cycling from Hidden should not send resize even if Hidden
         // is explicitly set.
         app.active_tab_mut().container_window_state =

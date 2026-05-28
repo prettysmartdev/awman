@@ -3,10 +3,9 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::Command;
+use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::data::session::AgentName;
 use crate::engine::message::{MessageLevel, UserMessage};
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
 use crate::engine::step_status::StepStatus;
@@ -30,7 +29,6 @@ pub struct ReadyOutcome {
     pub local_agent: StepStatus,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
-    pub legacy_migration: StepStatus,
     /// Per non-default agent image status.
     pub non_default_agent_images: Vec<(String, StepStatus)>,
     /// `true` when `--json` was passed; controls how the CLI renders the outcome.
@@ -51,7 +49,6 @@ impl From<ReadySummary> for ReadyOutcome {
             local_agent: s.local_agent,
             audit: s.audit,
             image_rebuild: s.image_rebuild,
-            legacy_migration: s.legacy_migration,
             non_default_agent_images: s.non_default_agent_images,
             json_requested: false,
             refresh_requested: false,
@@ -60,7 +57,7 @@ impl From<ReadySummary> for ReadyOutcome {
 }
 
 impl ReadyOutcome {
-    /// Render the outcome in the legacy `amux ready --json` schema:
+    /// Render the outcome in the legacy `awman ready --json` schema:
     ///
     /// ```json
     /// { "ready": <bool>,
@@ -167,18 +164,21 @@ impl Command for ReadyCommand {
             text: "ready: checking environment…".into(),
         });
 
-        let agent = match AgentName::new("claude") {
+        let session = self.session;
+        // Resolve the agent from .awman/config.json (or global default), so
+        // the per-agent Dockerfile lookup and image-tag computation match
+        // whatever the user actually configured. Falls back to "claude" only
+        // when no config sets the default.
+        let agent = match resolve_agent(&None, &session) {
             Ok(a) => a,
             Err(e) => {
-                let cmd_err = CommandError::from(e);
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("ready: failed to resolve agent name: {cmd_err}"),
+                    text: format!("ready: failed to resolve agent name: {e}"),
                 });
-                return Err(cmd_err);
+                return Err(e);
             }
         };
-        let session = self.session;
         let options = ReadyEngineOptions {
             agent,
             refresh: self.flags.refresh,

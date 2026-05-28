@@ -17,6 +17,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use crate::data::workflow_state::{PhaseStepStatus, StepState, WorkflowState};
 use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
 
 /// Compute the rows needed for the workflow strip given a view state.
@@ -139,6 +140,85 @@ pub fn render_workflow_strip(
         }
 
         col_x += this_col_w + 1;
+    }
+}
+
+/// Convert a `WorkflowState` (Layer 0 data) to a `WorkflowViewState` (TUI).
+///
+/// Prepends pseudo-steps from `setup_step_states`, maps main steps from
+/// `steps` + `step_states`, and appends pseudo-steps from
+/// `teardown_step_states`.
+pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState {
+    let mut steps: Vec<WorkflowStepView> = Vec::new();
+
+    for ps in &state.setup_step_states {
+        steps.push(WorkflowStepView {
+            name: format!("[setup] {}", ps.description),
+            status: phase_step_status_to_str(&ps.status).to_string(),
+            agent: None,
+            model: None,
+            depends_on: Vec::new(),
+        });
+    }
+
+    for info in &state.steps {
+        let status = state
+            .step_states
+            .get(&info.name)
+            .map(step_state_to_str)
+            .unwrap_or("pending")
+            .to_string();
+        steps.push(WorkflowStepView {
+            name: info.name.clone(),
+            status,
+            agent: info.agent.clone(),
+            model: info.model.clone(),
+            depends_on: info.depends_on.clone(),
+        });
+    }
+
+    for ps in &state.teardown_step_states {
+        steps.push(WorkflowStepView {
+            name: format!("[teardown] {}", ps.description),
+            status: phase_step_status_to_str(&ps.status).to_string(),
+            agent: None,
+            model: None,
+            depends_on: Vec::new(),
+        });
+    }
+
+    let current_step = state.current_step_index.and_then(|idx| {
+        let setup_len = state.setup_step_states.len();
+        state
+            .steps
+            .get(idx)
+            .map(|s| s.name.clone())
+            .or_else(|| steps.get(idx + setup_len).map(|s| s.name.clone()))
+    });
+
+    WorkflowViewState {
+        steps,
+        current_step,
+    }
+}
+
+fn step_state_to_str(state: &StepState) -> &'static str {
+    match state {
+        StepState::Pending => "pending",
+        StepState::Running { .. } => "running",
+        StepState::Succeeded => "done",
+        StepState::Failed { .. } => "error",
+        StepState::Cancelled => "cancelled",
+        StepState::Skipped => "skipped",
+    }
+}
+
+fn phase_step_status_to_str(status: &PhaseStepStatus) -> &'static str {
+    match status {
+        PhaseStepStatus::Pending => "pending",
+        PhaseStepStatus::Running => "running",
+        PhaseStepStatus::Succeeded => "done",
+        PhaseStepStatus::Failed { .. } => "error",
     }
 }
 

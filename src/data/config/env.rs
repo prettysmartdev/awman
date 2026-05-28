@@ -1,4 +1,4 @@
-//! Typed reads of every environment variable amux honours.
+//! Typed reads of every environment variable awman honours.
 //!
 //! Reads are funnelled through `Env` so that no scattered `std::env::var(…)`
 //! calls leak elsewhere in the data layer.
@@ -6,25 +6,25 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// `AMUX_CONFIG_HOME` — overrides the global config home directory.
-pub const AMUX_CONFIG_HOME: &str = "AMUX_CONFIG_HOME";
+/// `AWMAN_CONFIG_HOME` — overrides the global config home directory.
+pub const AWMAN_CONFIG_HOME: &str = "AWMAN_CONFIG_HOME";
 
-/// `AMUX_HEADLESS_ROOT` — overrides the headless storage root directory.
-pub const AMUX_HEADLESS_ROOT: &str = "AMUX_HEADLESS_ROOT";
+/// `AWMAN_API_ROOT` — overrides the API storage root directory.
+pub const AWMAN_API_ROOT: &str = "AWMAN_API_ROOT";
 
-/// `AMUX_OVERLAYS` — comma-separated list of overlay specs.
-pub const AMUX_OVERLAYS: &str = "AMUX_OVERLAYS";
+/// `AWMAN_OVERLAYS` — comma-separated list of overlay specs.
+pub const AWMAN_OVERLAYS: &str = "AWMAN_OVERLAYS";
 
-/// `AMUX_REMOTE_ADDR` — overrides remote server address.
-pub const AMUX_REMOTE_ADDR: &str = "AMUX_REMOTE_ADDR";
+/// `AWMAN_REMOTE_ADDR` — overrides remote server address.
+pub const AWMAN_REMOTE_ADDR: &str = "AWMAN_REMOTE_ADDR";
 
-/// `AMUX_REMOTE_SESSION` — sticky session id for remote operations.
-pub const AMUX_REMOTE_SESSION: &str = "AMUX_REMOTE_SESSION";
+/// `AWMAN_REMOTE_SESSION` — sticky session id for remote operations.
+pub const AWMAN_REMOTE_SESSION: &str = "AWMAN_REMOTE_SESSION";
 
-/// `AMUX_API_KEY` — API key for the remote headless server.
-pub const AMUX_API_KEY: &str = "AMUX_API_KEY";
+/// `AWMAN_API_KEY` — API key for the remote API server.
+pub const AWMAN_API_KEY: &str = "AWMAN_API_KEY";
 
-/// Frozen snapshot of every env var amux reads.
+/// Frozen snapshot of every env var awman reads.
 ///
 /// `EnvSnapshot::from_process()` captures the current process's environment
 /// once. Tests construct snapshots directly via `EnvSnapshot::default()` or
@@ -61,34 +61,34 @@ impl EnvSnapshot {
         self.values.get(key).map(|s| s.as_str())
     }
 
-    /// `AMUX_CONFIG_HOME` as a `PathBuf` if set.
+    /// `AWMAN_CONFIG_HOME` as a `PathBuf` if set.
     pub fn config_home(&self) -> Option<PathBuf> {
-        self.get(AMUX_CONFIG_HOME).map(PathBuf::from)
+        self.get(AWMAN_CONFIG_HOME).map(PathBuf::from)
     }
 
-    /// `AMUX_HEADLESS_ROOT` as a `PathBuf` if set.
-    pub fn headless_root(&self) -> Option<PathBuf> {
-        self.get(AMUX_HEADLESS_ROOT).map(PathBuf::from)
+    /// `AWMAN_API_ROOT` as a `PathBuf` if set.
+    pub fn api_root(&self) -> Option<PathBuf> {
+        self.get(AWMAN_API_ROOT).map(PathBuf::from)
     }
 
-    /// `AMUX_OVERLAYS` raw string if set.
+    /// `AWMAN_OVERLAYS` raw string if set.
     pub fn overlays(&self) -> Option<&str> {
-        self.get(AMUX_OVERLAYS)
+        self.get(AWMAN_OVERLAYS)
     }
 
-    /// `AMUX_REMOTE_ADDR` if set.
+    /// `AWMAN_REMOTE_ADDR` if set.
     pub fn remote_addr(&self) -> Option<&str> {
-        self.get(AMUX_REMOTE_ADDR)
+        self.get(AWMAN_REMOTE_ADDR)
     }
 
-    /// `AMUX_REMOTE_SESSION` if set.
+    /// `AWMAN_REMOTE_SESSION` if set.
     pub fn remote_session(&self) -> Option<&str> {
-        self.get(AMUX_REMOTE_SESSION)
+        self.get(AWMAN_REMOTE_SESSION)
     }
 
-    /// `AMUX_API_KEY` if set.
+    /// `AWMAN_API_KEY` if set.
     pub fn api_key(&self) -> Option<&str> {
-        self.get(AMUX_API_KEY)
+        self.get(AWMAN_API_KEY)
     }
 }
 
@@ -96,18 +96,18 @@ impl EnvSnapshot {
 pub struct Env;
 
 impl Env {
-    /// Capture every amux-relevant env var from the current process.
+    /// Capture every awman-relevant env var from the current process.
     ///
     /// Reads are limited to the known constants above so that the snapshot
     /// is deterministic and minimal.
     pub fn from_process() -> EnvSnapshot {
         let keys = [
-            AMUX_CONFIG_HOME,
-            AMUX_HEADLESS_ROOT,
-            AMUX_OVERLAYS,
-            AMUX_REMOTE_ADDR,
-            AMUX_REMOTE_SESSION,
-            AMUX_API_KEY,
+            AWMAN_CONFIG_HOME,
+            AWMAN_API_ROOT,
+            AWMAN_OVERLAYS,
+            AWMAN_REMOTE_ADDR,
+            AWMAN_REMOTE_SESSION,
+            AWMAN_API_KEY,
         ];
         let mut values = HashMap::new();
         for k in keys {

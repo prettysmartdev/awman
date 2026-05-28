@@ -1,0 +1,32 @@
+title = "Dependency Upgrade"
+
+[[setup]]
+type = "run_shell"
+command = "git status"
+
+[[step]]
+name = "security-audit"
+prompt = "Using the package manager or language toolchain appropriate for this project, check if any of the project's dependencies have any security issues (cargo/npm audit etc). If any security issues exist, upgrade the affected dependencies even if it requires a significant change to the codebase. Do not stop until all dependency security issues are dealt with."
+
+[[step]]
+name = "version-audit"
+depends_on = ["security-audit"]
+prompt = "Now that security-sensitive dependency upgrades are complete, review the project dependencies for available updates. Perform minor/simple updates via the language toolchain and run tests to ensure nothing breaks. If any major/breaking updates are available, make each one sequentially, modifying the minimum amount of project code to achieve the same functionality using the latest available version of the package, running tests after each one to confirm nothing broke. If updated project code will substantially change the behaviour of the application due to changed dependency, skip that specific dependency and write a note in the work items folder about any skipped packages and why each was skipped."
+
+[[teardown]]
+type = "run_shell"
+command = "make test"
+
+[[teardown]]
+type = "commit_changes"
+message = "Update all available dependencies"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+overlays = ["ssh()"]
+
+[[teardown]]
+type = "create_pull_request"
+title = "Security and Dependency Upgrades"
+overlays = ["env(GITHUB_TOKEN)"]

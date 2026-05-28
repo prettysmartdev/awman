@@ -30,8 +30,6 @@ pub struct FlagConfig {
     pub non_interactive: Option<bool>,
     /// `--yolo-disallowed-tool` / `--yolo-disallowed-tools`: tool denylist for yolo mode.
     pub yolo_disallowed_tools: Option<Vec<String>>,
-    /// `--env-passthrough`: env var names to forward into containers.
-    pub env_passthrough: Option<Vec<String>>,
     /// `--overlay <…>`: raw overlay specifications (parsed in higher layers).
     pub overlays_raw: Option<Vec<String>>,
     /// `--remote-addr <addr>`.

@@ -1,5 +1,5 @@
 //! `engine::auth` — `AuthEngine`. Consolidates host-side agent credential
-//! resolution and headless server authentication (API key generation,
+//! resolution and API server authentication (API key generation,
 //! hashing, comparison, persistence, refresh, TLS material).
 
 use std::net::IpAddr;
@@ -9,8 +9,8 @@ use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 
+use crate::data::fs::api_paths::ApiPaths;
 use crate::data::fs::auth_paths::AuthPathResolver;
-use crate::data::fs::headless_paths::HeadlessPaths;
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
@@ -75,28 +75,28 @@ pub struct TlsMaterial {
 #[derive(Debug, Clone)]
 pub struct AuthEngine {
     auth_paths: AuthPathResolver,
-    headless_paths: HeadlessPaths,
+    api_paths: ApiPaths,
 }
 
 impl AuthEngine {
     pub fn new(_session: &Session) -> Result<Self, EngineError> {
         let auth_paths = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
-        let headless_paths = HeadlessPaths::from_process_env().map_err(EngineError::Data)?;
+        let api_paths = ApiPaths::from_process_env().map_err(EngineError::Data)?;
         Ok(Self {
             auth_paths,
-            headless_paths,
+            api_paths,
         })
     }
 
-    pub fn with_paths(auth_paths: AuthPathResolver, headless_paths: HeadlessPaths) -> Self {
+    pub fn with_paths(auth_paths: AuthPathResolver, api_paths: ApiPaths) -> Self {
         Self {
             auth_paths,
-            headless_paths,
+            api_paths,
         }
     }
 
-    pub fn headless_paths(&self) -> &HeadlessPaths {
-        &self.headless_paths
+    pub fn api_paths(&self) -> &ApiPaths {
+        &self.api_paths
     }
 
     // ── Agent credential discovery ──────────────────────────────────────────
@@ -150,7 +150,7 @@ impl AuthEngine {
         self.agent_keychain_credentials(agent)
     }
 
-    // ── Headless API-key lifecycle ─────────────────────────────────────────
+    // ── API-key lifecycle ──────────────────────────────────────────────────
 
     /// Generate a fresh 32-byte API key, hex-encoded (64 chars). Matches
     /// the old-amux wire format so existing scripts/regex/docs keep working.
@@ -168,9 +168,9 @@ impl AuthEngine {
         ApiKeyHash(hex_encode(h.as_ref()))
     }
 
-    /// Persist the hash to `<headless-root>/api_key.hash` with mode 0o600 on Unix.
+    /// Persist the hash to `<api-root>/api_key.hash` with mode 0o600 on Unix.
     pub fn write_api_key_hash(&self, hash: &ApiKeyHash) -> Result<(), EngineError> {
-        let path = self.headless_paths.api_key_hash_file();
+        let path = self.api_paths.api_key_hash_file();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
         }
@@ -180,7 +180,7 @@ impl AuthEngine {
 
     /// Read the persisted hash, or `None` when absent.
     pub fn read_api_key_hash(&self) -> Result<Option<ApiKeyHash>, EngineError> {
-        let path = self.headless_paths.api_key_hash_file();
+        let path = self.api_paths.api_key_hash_file();
         match std::fs::read_to_string(&path) {
             Ok(s) => Ok(Some(ApiKeyHash(s.trim().to_string()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -235,17 +235,22 @@ impl AuthEngine {
         &self,
         bind_ip: IpAddr,
     ) -> Result<(TlsMaterial, bool), EngineError> {
-        let tls_dir = self.headless_paths.tls_dir();
-        let cert_path = self.headless_paths.tls_cert_file();
-        let key_path = self.headless_paths.tls_key_file();
-        let bind_ip_path = self.headless_paths.tls_bind_ip_file();
+        let tls_dir = self.api_paths.tls_dir();
+        let cert_path = self.api_paths.tls_cert_file();
+        let key_path = self.api_paths.tls_key_file();
+        let bind_ip_path = self.api_paths.tls_bind_ip_file();
+        let fingerprint_path = self.api_paths.tls_fingerprint_file();
 
         if cert_path.exists() && key_path.exists() {
             let stored_ip = std::fs::read_to_string(&bind_ip_path)
                 .ok()
                 .map(|s| s.trim().to_string());
             if stored_ip.as_deref() == Some(&bind_ip.to_string()) {
-                let material = self.load_tls_from_paths(&cert_path, &key_path)?;
+                let material = self.load_tls_from_paths_with_fingerprint(
+                    &cert_path,
+                    &key_path,
+                    &fingerprint_path,
+                )?;
                 return Ok((material, false));
             }
         }
@@ -264,7 +269,7 @@ impl AuthEngine {
         params.distinguished_name = rcgen::DistinguishedName::new();
         params.distinguished_name.push(
             rcgen::DnType::CommonName,
-            format!("amux-headless-{ip_short_hash}"),
+            format!("awman-api-{ip_short_hash}"),
         );
 
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
@@ -291,6 +296,13 @@ impl AuthEngine {
             hex_encode(h.as_ref())
         };
 
+        // Cache the fingerprint to a sidecar file so subsequent loads do not
+        // need to re-parse PEM/DER. This is the canonical authoritative
+        // record going forward; the file is informational only (not used for
+        // auth decisions).
+        std::fs::write(&fingerprint_path, fingerprint.as_bytes())
+            .map_err(|e| EngineError::io(&fingerprint_path, e))?;
+
         Ok((
             TlsMaterial {
                 cert_pem,
@@ -301,24 +313,53 @@ impl AuthEngine {
         ))
     }
 
-    /// Load TLS material from explicit paths.
-    pub fn load_tls_from_paths(&self, cert: &Path, key: &Path) -> Result<TlsMaterial, EngineError> {
+    /// Load TLS material from explicit paths, reading the cached fingerprint
+    /// from the sidecar file rather than re-deriving it from PEM. Falls back
+    /// to recomputing-and-caching the fingerprint over the cert's DER bytes
+    /// when the sidecar is missing (e.g. legacy installs that predate the
+    /// sidecar). We rely on `rcgen` re-parsing of the PEM rather than a
+    /// hand-rolled base64 decoder.
+    fn load_tls_from_paths_with_fingerprint(
+        &self,
+        cert: &Path,
+        key: &Path,
+        fingerprint_sidecar: &Path,
+    ) -> Result<TlsMaterial, EngineError> {
         let cert_pem = std::fs::read_to_string(cert).map_err(|e| EngineError::io(cert, e))?;
         let key_pem = std::fs::read_to_string(key).map_err(|e| EngineError::io(key, e))?;
-        // Hash the DER bytes (decoded from PEM) to match the fingerprint computed in
-        // `ensure_self_signed_tls` which also hashes the DER bytes.
-        let fingerprint = if let Some(der) = pem_to_der(&cert_pem) {
-            let h = digest::digest(&digest::SHA256, &der);
-            hex_encode(h.as_ref())
-        } else {
-            // Fallback: hash the PEM string if DER decoding fails.
-            let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
-            hex_encode(h.as_ref())
+
+        let fingerprint = match std::fs::read_to_string(fingerprint_sidecar) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Recompute over the PEM string itself; this is stable enough
+                // for an informational identifier and avoids pulling in a
+                // PEM/base64 dependency. Persist for next time.
+                let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
+                let f = hex_encode(h.as_ref());
+                let _ = std::fs::write(fingerprint_sidecar, f.as_bytes());
+                f
+            }
+            Err(e) => return Err(EngineError::io(fingerprint_sidecar, e)),
         };
+
         Ok(TlsMaterial {
             cert_pem,
             key_pem,
             fingerprint_sha256_hex: fingerprint,
+        })
+    }
+
+    /// Legacy path-based loader retained for callers that did not write a
+    /// fingerprint sidecar. Hashes the PEM bytes directly (not DER) for
+    /// informational use.
+    pub fn load_tls_from_paths(&self, cert: &Path, key: &Path) -> Result<TlsMaterial, EngineError> {
+        let cert_pem = std::fs::read_to_string(cert).map_err(|e| EngineError::io(cert, e))?;
+        let key_pem = std::fs::read_to_string(key).map_err(|e| EngineError::io(key, e))?;
+        let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
+        Ok(TlsMaterial {
+            cert_pem,
+            key_pem,
+            fingerprint_sha256_hex: hex_encode(h.as_ref()),
         })
     }
 }
@@ -326,63 +367,6 @@ impl AuthEngine {
 /// Sentinel hash used by `verify_api_key` when no on-disk hash exists.
 /// 64 hex zeros.
 const SENTINEL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Decode PEM (stripping header/footer and base64-decoding) into DER bytes.
-fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        let l = line.trim();
-        if l.starts_with("-----") {
-            continue;
-        }
-        b64.push_str(l);
-    }
-    base64_decode(&b64)
-}
-
-/// Minimal base64 decoder (no padding variants needed for standard PEM).
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 256] = &{
-        let mut t = [255u8; 256];
-        let mut i = 0u8;
-        while i < 26 {
-            t[(b'A' + i) as usize] = i;
-            t[(b'a' + i) as usize] = i + 26;
-            i += 1;
-        }
-        let mut i = 0u8;
-        while i < 10 {
-            t[(b'0' + i) as usize] = 52 + i;
-            i += 1;
-        }
-        t[b'+' as usize] = 62;
-        t[b'/' as usize] = 63;
-        t[b'=' as usize] = 0; // padding
-        t
-    };
-
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        let a = TABLE[bytes[i] as usize];
-        let b = TABLE[bytes[i + 1] as usize];
-        let c = TABLE[bytes[i + 2] as usize];
-        let d = TABLE[bytes[i + 3] as usize];
-        if a == 255 || b == 255 || c == 255 || d == 255 {
-            return None;
-        }
-        out.push((a << 2) | (b >> 4));
-        if bytes[i + 2] != b'=' {
-            out.push((b << 4) | (c >> 2));
-        }
-        if bytes[i + 3] != b'=' {
-            out.push((c << 6) | d);
-        }
-        i += 4;
-    }
-    Some(out)
-}
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -416,14 +400,11 @@ fn write_file_secure(path: &Path, content: &[u8]) -> Result<PathBuf, EngineError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::fs::api_paths::ApiPaths;
     use crate::data::fs::auth_paths::AuthPathResolver;
-    use crate::data::fs::headless_paths::HeadlessPaths;
 
-    fn engine_with(home: &Path, headless_root: &Path) -> AuthEngine {
-        AuthEngine::with_paths(
-            AuthPathResolver::at_home(home),
-            HeadlessPaths::at_root(headless_root),
-        )
+    fn engine_with(home: &Path, api_root: &Path) -> AuthEngine {
+        AuthEngine::with_paths(AuthPathResolver::at_home(home), ApiPaths::at_root(api_root))
     }
 
     #[test]
@@ -464,7 +445,7 @@ mod tests {
     #[test]
     fn read_api_key_hash_returns_none_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         let e = engine_with(tmp.path(), &head);
         assert!(e.read_api_key_hash().unwrap().is_none());
     }
@@ -524,7 +505,7 @@ mod tests {
     #[test]
     fn ensure_self_signed_tls_generates_cert_and_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 
@@ -568,7 +549,7 @@ mod tests {
     #[test]
     fn ensure_self_signed_tls_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 
@@ -591,7 +572,7 @@ mod tests {
     #[test]
     fn ensure_self_signed_tls_regenerates_on_bind_ip_change() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 
@@ -616,7 +597,7 @@ mod tests {
     #[test]
     fn refresh_api_key_writes_hash_and_returns_plaintext() {
         let tmp = tempfile::tempdir().unwrap();
-        let head = tmp.path().join("headless");
+        let head = tmp.path().join("api");
         std::fs::create_dir_all(&head).unwrap();
         let e = engine_with(tmp.path(), &head);
 

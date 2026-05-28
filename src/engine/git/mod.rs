@@ -1,4 +1,4 @@
-//! `engine::git` — `GitEngine`. Consolidates every git operation amux performs.
+//! `engine::git` — `GitEngine`. Consolidates every git operation awman performs.
 //!
 //! Replaces the free `pub fn`s in `oldsrc/git.rs` with a typed object whose
 //! methods are the only public surface. Implements Layer 0's
@@ -135,24 +135,24 @@ impl GitEngine {
             .collect())
     }
 
-    /// `~/.amux/worktrees/<repo-name>/<NNNN>/` for a work-item.
+    /// `~/.awman/worktrees/<repo-name>/<NNNN>/` for a work-item.
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError> {
         let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
         Ok(p.for_work_item(git_root, work_item))
     }
 
-    /// `~/.amux/worktrees/<repo-name>/wf-<name>/` for a named workflow.
+    /// `~/.awman/worktrees/<repo-name>/wf-<name>/` for a named workflow.
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError> {
         let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
         Ok(p.for_workflow(git_root, name))
     }
 
-    /// Branch name for a work-item (`amux/work-item-NNNN`).
+    /// Branch name for a work-item (`awman/work-item-NNNN`).
     pub fn branch_name_for_work_item(&self, work_item: u32) -> String {
         worktree_branch_name(work_item)
     }
 
-    /// Branch name for a named workflow (`amux/workflow-<name>`).
+    /// Branch name for a named workflow (`awman/workflow-<name>`).
     pub fn branch_name_for_workflow(&self, name: &str) -> String {
         worktree_branch_name_for_workflow(name)
     }
@@ -291,6 +291,90 @@ impl GitEngine {
         Ok(())
     }
 
+    /// `git clone [-b <branch>] <url> <dest>`.
+    /// When `branch` is `None`, clones the repository's default branch.
+    pub fn clone_repo(
+        &self,
+        url: &str,
+        branch: Option<&str>,
+        dest: &Path,
+    ) -> Result<(), EngineError> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
+        }
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| EngineError::Git("clone dest path not UTF-8".into()))?;
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(b) = branch {
+            args.push("-b");
+            args.push(b);
+        }
+        args.push(url);
+        args.push(dest_str);
+        let output = Command::new("git")
+            .args(&args)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git clone`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check out `branch` if it already exists locally or on a remote;
+    /// otherwise create it from HEAD. Returns the disposition:
+    /// `"checked-out"` for an existing branch (local or remote-tracking) or
+    /// `"created"` for a new one. Errors propagate as `EngineError::Git`.
+    pub fn checkout_or_create_branch(
+        &self,
+        path: &Path,
+        branch: &str,
+    ) -> Result<&'static str, EngineError> {
+        // Plain `git checkout <branch>` succeeds when (a) the local branch
+        // exists or (b) exactly one remote has the branch (git auto-creates
+        // a tracking branch). Try this first so we don't need a separate
+        // remote-branch probe.
+        let output = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(path)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git checkout`: {e}")))?;
+        if output.status.success() {
+            return Ok("checked-out");
+        }
+
+        // Fall back: branch exists neither locally nor on any remote — create
+        // it from the current HEAD.
+        let output = Command::new("git")
+            .args(["checkout", "-b", branch])
+            .current_dir(path)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git checkout -b`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git checkout -b {branch} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok("created")
+    }
+
+    /// Recursively delete a directory, ignoring missing paths. Used to clean up
+    /// a cloned repo when remote-session setup fails.
+    pub fn delete_directory(&self, path: &Path) -> Result<(), EngineError> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(EngineError::io(path, e)),
+        }
+    }
+
     pub fn branch_exists(&self, git_root: &Path, branch: &str) -> bool {
         Command::new("git")
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
@@ -338,7 +422,7 @@ impl GitEngine {
     // These methods mirror the unlogged methods above but push every git
     // command and its output to a `UserMessageSink`. Used from the
     // `WorktreeLifecycle` command layer so the user can see exactly what
-    // amux is doing.
+    // awman is doing.
 
     pub fn uncommitted_files_logged(
         &self,
@@ -487,6 +571,72 @@ impl GitEngine {
         }
         Ok(())
     }
+
+    /// Logged variant of [`clone_repo`]. Streams the command line and combined
+    /// stdout/stderr through `sink`. Used by the API server's session-setup
+    /// path so a remote-clone failure is captured in the server log file.
+    pub fn clone_repo_logged(
+        &self,
+        url: &str,
+        branch: Option<&str>,
+        dest: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
+        }
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| EngineError::Git("clone dest path not UTF-8".into()))?;
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(b) = branch {
+            args.push("-b");
+            args.push(b);
+        }
+        args.push(url);
+        args.push(dest_str);
+        // `git clone` doesn't care about cwd (dest is absolute); pick a path
+        // that's guaranteed to exist so `Command::current_dir` doesn't fail.
+        let cwd = dest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let output = run_git_logged(&args, &cwd, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Logged variant of [`checkout_or_create_branch`]. Forwards every git
+    /// invocation and its output to `sink`. The first `git checkout <branch>`
+    /// failure is expected (it's how we detect "branch doesn't exist yet") so
+    /// its noise is downgraded by [`run_git_logged`] to a warning rather than
+    /// surfacing as an error.
+    pub fn checkout_or_create_branch_logged(
+        &self,
+        path: &Path,
+        branch: &str,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<&'static str, EngineError> {
+        let output = run_git_logged(&["checkout", branch], path, sink)?;
+        if output.status.success() {
+            return Ok("checked-out");
+        }
+        let output = run_git_logged(&["checkout", "-b", branch], path, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git checkout -b {branch} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok("created")
+    }
 }
 
 impl GitRootResolver for GitEngine {
@@ -502,6 +652,43 @@ impl GitRootResolver for GitEngine {
     }
 }
 
+/// Resolve the main `.git` directory backing a worktree checkout.
+///
+/// A worktree's `.git` entry is a *file* containing `gitdir: <path>` where
+/// `<path>` points to `.git/worktrees/<name>/` in the main repository.
+/// This function reads that pointer and returns the main `.git/` directory
+/// (two levels up from the worktree entry).
+///
+/// Returns `Ok(None)` when `worktree_path/.git` is a directory (regular
+/// repo) or does not exist.
+pub fn resolve_worktree_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, EngineError> {
+    let dot_git = worktree_path.join(".git");
+    if !dot_git.exists() || dot_git.is_dir() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&dot_git).map_err(|e| EngineError::io(&dot_git, e))?;
+    let gitdir_line = content.trim().strip_prefix("gitdir: ").ok_or_else(|| {
+        EngineError::Git(format!(
+            "unexpected .git file format at {}: {}",
+            dot_git.display(),
+            content.trim(),
+        ))
+    })?;
+    let gitdir = if Path::new(gitdir_line).is_absolute() {
+        PathBuf::from(gitdir_line)
+    } else {
+        worktree_path.join(gitdir_line)
+    };
+    // gitdir → .git/worktrees/<name>  →  parent .git/worktrees/  →  parent .git/
+    let main_git_dir = gitdir.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        EngineError::Git(format!(
+            "cannot derive main .git dir from worktree gitdir: {}",
+            gitdir.display(),
+        ))
+    })?;
+    Ok(Some(main_git_dir.to_path_buf()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,13 +696,13 @@ mod tests {
     #[test]
     fn branch_name_for_work_item_format() {
         let g = GitEngine::new();
-        assert_eq!(g.branch_name_for_work_item(7), "amux/work-item-0007");
+        assert_eq!(g.branch_name_for_work_item(7), "awman/work-item-0007");
     }
 
     #[test]
     fn branch_name_for_workflow_format() {
         let g = GitEngine::new();
-        assert_eq!(g.branch_name_for_workflow("x"), "amux/workflow-x");
+        assert_eq!(g.branch_name_for_workflow("x"), "awman/workflow-x");
     }
 
     fn init_repo(dir: &std::path::Path) {
@@ -527,14 +714,14 @@ mod tests {
             .status()
             .unwrap();
         Command::new("git")
-            .args(["config", "user.email", "test@amux.test"])
+            .args(["config", "user.email", "test@awman.test"])
             .current_dir(dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
         Command::new("git")
-            .args(["config", "user.name", "amux-test"])
+            .args(["config", "user.name", "awman-test"])
             .current_dir(dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -632,7 +819,7 @@ mod tests {
         init_repo(repo_tmp.path());
         let g = GitEngine::new();
         let wt_path = wt_tmp.path().join("my-worktree");
-        let branch = "amux/test-wt-branch";
+        let branch = "awman/test-wt-branch";
 
         g.create_worktree(repo_tmp.path(), &wt_path, branch)
             .expect("create_worktree should succeed");
@@ -641,5 +828,41 @@ mod tests {
         g.remove_worktree(repo_tmp.path(), &wt_path)
             .expect("remove_worktree should succeed");
         assert!(!wt_path.exists(), "worktree directory must be gone");
+    }
+
+    #[test]
+    fn resolve_worktree_git_dir_returns_none_for_regular_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let result = resolve_worktree_git_dir(tmp.path()).unwrap();
+        assert!(result.is_none(), "regular repo should return None");
+    }
+
+    #[test]
+    fn resolve_worktree_git_dir_returns_none_for_non_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_worktree_git_dir(tmp.path()).unwrap();
+        assert!(result.is_none(), "non-git dir should return None");
+    }
+
+    #[test]
+    fn resolve_worktree_git_dir_finds_main_git_dir() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        init_repo(repo_tmp.path());
+        let g = GitEngine::new();
+        let wt_path = wt_tmp.path().join("my-worktree");
+        g.create_worktree(repo_tmp.path(), &wt_path, "awman/test-resolve")
+            .expect("create_worktree should succeed");
+
+        let result = resolve_worktree_git_dir(&wt_path)
+            .expect("should not error")
+            .expect("worktree should resolve to Some");
+
+        let expected = repo_tmp.path().join(".git").canonicalize().unwrap();
+        let actual = result.canonicalize().unwrap();
+        assert_eq!(actual, expected, "should resolve to main repo .git dir");
+
+        g.remove_worktree(repo_tmp.path(), &wt_path).unwrap();
     }
 }

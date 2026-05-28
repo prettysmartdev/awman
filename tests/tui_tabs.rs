@@ -2,7 +2,7 @@
 ///
 /// Verifies that the `App` multi-tab manager correctly creates, switches,
 /// closes, and isolates state between `TabState` instances.
-use amux::tui::state::{App, ContainerWindowState, ExecutionPhase, STUCK_TIMEOUT};
+use awman::tui::state::{App, ContainerWindowState, ExecutionPhase, STUCK_TIMEOUT};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -108,14 +108,14 @@ fn tabs_have_independent_input() {
 #[test]
 fn tab_color_idle_is_dark_gray() {
     use ratatui::style::Color;
-    let tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::DarkGray);
 }
 
 #[test]
 fn tab_color_running_no_container_is_blue() {
     use ratatui::style::Color;
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Running { command: "ready".into() };
     assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Blue);
 }
@@ -123,7 +123,7 @@ fn tab_color_running_no_container_is_blue() {
 #[test]
 fn tab_color_running_with_container_is_green() {
     use ratatui::style::Color;
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec workflow deploy.toml".into() };
     tab.container_window = ContainerWindowState::Maximized;
     assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Green);
@@ -132,7 +132,7 @@ fn tab_color_running_with_container_is_green() {
 #[test]
 fn tab_color_error_is_red() {
     use ratatui::style::Color;
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
     assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Red);
 }
@@ -144,13 +144,13 @@ fn tab_color_error_is_red() {
 
 #[test]
 fn tab_display_name_idle_shows_project() {
-    let tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/home/user/myproject"));
+    let tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/home/user/myproject"));
     assert_eq!(tab.tab_display_name(), "myproject");
 }
 
 #[test]
 fn tab_display_name_running_shows_first_word_of_command() {
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/home/user/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/home/user/proj"));
     tab.phase = ExecutionPhase::Running { command: "chat".into() };
     // "proj | chat" = 11 chars, fits within 14-char limit
     assert_eq!(tab.tab_display_name(), "proj | chat");
@@ -158,7 +158,7 @@ fn tab_display_name_running_shows_first_word_of_command() {
 
 #[test]
 fn tab_display_name_truncates_long_names() {
-    let tab = amux::tui::state::TabState::new(
+    let tab = awman::tui::state::TabState::new(
         std::path::PathBuf::from("/home/user/a-very-long-project-name")
     );
     let name = tab.tab_display_name();
@@ -172,26 +172,26 @@ fn tab_display_name_truncates_long_names() {
 
 #[test]
 fn tab_project_name_idle() {
-    let tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/home/user/myproject"));
+    let tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/home/user/myproject"));
     assert_eq!(tab.tab_project_name(), "myproject");
 }
 
 #[test]
 fn tab_subcommand_label_idle_is_empty() {
-    let tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/home/user/myproject"));
+    let tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/home/user/myproject"));
     assert_eq!(tab.tab_subcommand_label(20, true, STUCK_TIMEOUT), "");
 }
 
 #[test]
 fn tab_subcommand_label_running_full_command() {
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/home/user/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/home/user/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec prompt".into() };
     assert_eq!(tab.tab_subcommand_label(20, true, STUCK_TIMEOUT), "exec prompt");
 }
 
 #[test]
 fn tab_subcommand_label_truncates_long_command() {
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/home/user/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/home/user/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec workflow --some-very-long-flag".into() };
     // tab_width=20, max_chars=16; command is 33 chars so it must be truncated
     let label = tab.tab_subcommand_label(20, true, STUCK_TIMEOUT);
@@ -206,7 +206,7 @@ fn tab_subcommand_label_truncates_long_command() {
 #[test]
 fn tab_color_stuck_container_is_yellow() {
     use ratatui::style::Color;
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec workflow deploy.toml".into() };
     tab.container_window = ContainerWindowState::Maximized;
     // Simulate 61 seconds of silence.
@@ -217,7 +217,7 @@ fn tab_color_stuck_container_is_yellow() {
 #[test]
 fn tab_color_reverts_to_green_after_acknowledge() {
     use ratatui::style::Color;
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec workflow deploy.toml".into() };
     tab.container_window = ContainerWindowState::Maximized;
     tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
@@ -230,7 +230,7 @@ fn tab_color_reverts_to_green_after_acknowledge() {
 
 #[test]
 fn tab_subcommand_label_shows_warning_when_stuck() {
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec workflow deploy.toml".into() };
     tab.container_window = ContainerWindowState::Maximized;
     tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
@@ -245,7 +245,7 @@ fn tab_subcommand_label_shows_warning_when_stuck() {
 
 #[test]
 fn tab_subcommand_label_clears_warning_after_acknowledge() {
-    let mut tab = amux::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
+    let mut tab = awman::tui::state::TabState::new(std::path::PathBuf::from("/tmp/proj"));
     tab.phase = ExecutionPhase::Running { command: "exec workflow deploy.toml".into() };
     tab.container_window = ContainerWindowState::Maximized;
     tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));

@@ -19,9 +19,9 @@ use super::helpers::{render_summary_box, step_status_label, yes_no};
 impl InitFrontend for CliFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
         eprintln!();
-        eprintln!("amux: The aspec/ folder contains your project specification files —");
-        eprintln!("amux: architecture docs, design decisions, and work item templates.");
-        eprintln!("amux: Replacing it will overwrite any customisations you've made.");
+        eprintln!("awman: The aspec/ folder contains your project specification files —");
+        eprintln!("awman: architecture docs, design decisions, and work item templates.");
+        eprintln!("awman: Replacing it will overwrite any customisations you've made.");
         eprintln!();
         Ok(yes_no(
             "An aspec/ folder already exists. Replace it with fresh templates?",
@@ -31,10 +31,10 @@ impl InitFrontend for CliFrontend {
 
     fn ask_run_audit(&mut self) -> Result<bool, EngineError> {
         eprintln!();
-        eprintln!("amux: The agent audit scans your repository and tailors the");
-        eprintln!("amux: Dockerfile.dev for your project's language, build tools,");
-        eprintln!("amux: and dependencies. It runs inside a container and does not");
-        eprintln!("amux: modify your repository — only the generated Dockerfile.");
+        eprintln!("awman: The agent audit scans your repository and tailors the");
+        eprintln!("awman: Dockerfile.dev for your project's language, build tools,");
+        eprintln!("awman: and dependencies. It runs inside a container and does not");
+        eprintln!("awman: modify your repository — only the generated Dockerfile.");
         eprintln!();
         Ok(yes_no(
             "Run the agent audit container to scan and customise the Dockerfile?",
@@ -47,7 +47,7 @@ impl InitFrontend for CliFrontend {
             return Ok(None);
         }
         eprintln!(
-            "amux: Configure a work items directory? (path relative to repo root, empty to skip)"
+            "awman: Configure a work items directory? (path relative to repo root, empty to skip)"
         );
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
@@ -57,7 +57,7 @@ impl InitFrontend for CliFrontend {
         if dir.is_empty() {
             return Ok(None);
         }
-        eprintln!("amux: Work item template path (empty for none):");
+        eprintln!("awman: Work item template path (empty for none):");
         let mut buf2 = String::new();
         let _ = std::io::stdin().read_line(&mut buf2);
         let template_str = buf2.trim();
@@ -102,7 +102,7 @@ impl InitFrontend for CliFrontend {
             ("Work items", &summary.work_items_setup),
         ];
         let box_str = render_summary_box("Init Summary", &rows);
-        let footer = "\nWhat's Next?\n  Run `amux` to launch the interactive TUI.\n\n  Available commands:\n    amux chat          — Start a freeform chat session with the agent\n    amux new spec      — Create a new work item from the aspec template\n    amux exec workflow — Run a workflow inside a container\n";
+        let footer = "\nWhat's Next?\n  Run `awman` to launch the interactive TUI.\n\n  Available commands:\n    awman chat          — Start a freeform chat session with the agent\n    awman new spec      — Create a new work item from the aspec template\n    awman exec workflow — Run a workflow inside a container\n";
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
             format!("\n{box_str}{footer}").as_bytes(),

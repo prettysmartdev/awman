@@ -1,6 +1,6 @@
-# Getting Started with amux
+# Getting Started with awman
 
-`amux` is a terminal multiplexer for AI code agents. Every agent action runs inside a Docker container — never directly on your machine. This makes agent sessions reproducible, isolated, and safe to run autonomously.
+`awman` is a terminal multiplexer for AI code agents. Every agent action runs inside a Docker container — never directly on your machine. This makes agent sessions reproducible, isolated, and safe to run autonomously.
 
 This guide walks you through the core concepts and gets you to your first working agent session.
 
@@ -8,23 +8,23 @@ This guide walks you through the core concepts and gets you to your first workin
 
 ## Core concepts
 
-Before running a single command, it helps to understand what amux is actually doing.
+Before running a single command, it helps to understand what awman is actually doing.
 
 ### Why containers?
 
 When a code agent runs on your machine directly, it has access to your home directory, SSH keys, credentials, environment variables, and everything else your user account can touch. A bug in the agent — or a poorly-scoped task — can cause unintended side effects.
 
-amux solves this by running agents inside containers. The container only sees your project directory (mounted read-only by default). Your credentials are injected as environment variables, not mounted as files. Your SSH keys are never exposed unless you explicitly opt in. The container is thrown away when the session ends.
+awman solves this by running agents inside containers. The container only sees your project directory (mounted read-only by default). Your credentials are injected as environment variables, not mounted as files. Your SSH keys are never exposed unless you explicitly opt in. The container is thrown away when the session ends.
 
 ### Container image setup
 
-amux uses a two-layer image system that separates your project's build environment from the AI agent tooling.
+awman uses a two-layer image system that separates your project's build environment from the AI agent tooling.
 
-**`Dockerfile.dev`** (at the Git root) is the _project base image_. It defines the OS, language runtimes, build tools, and test dependencies specific to your project — nothing agent-specific. It produces the image `amux-{project}:latest`.
+**`Dockerfile.dev`** (at the Git root) is the _project base image_. It defines the OS, language runtimes, build tools, and test dependencies specific to your project — nothing agent-specific. It produces the image `awman-{project}:latest`.
 
-**`.amux/Dockerfile.{agent}`** (in the `.amux/` directory) is the _agent image_. It extends the project base (`FROM amux-{project}:latest`) and installs the AI agent tooling for whichever agent you are using (Claude Code, Codex, OpenCode, Maki, Gemini, GitHub Copilot CLI, Crush, or Cline). It produces `amux-{project}-{agent}:latest` — the image that actually runs your agent sessions.
+**`.awman/Dockerfile.{agent}`** (in the `.awman/` directory) is the _agent image_. It extends the project base (`FROM awman-{project}:latest`) and installs the AI agent tooling for whichever agent you are using (Claude Code, Codex, OpenCode, Maki, Gemini, GitHub Copilot CLI, Crush, or Cline). It produces `awman-{project}-{agent}:latest` — the image that actually runs your agent sessions.
 
-amux ships templates for both files. The **agent audit** (run via `amux ready --refresh` or during `amux init`) launches an agent to inspect your codebase and updates `Dockerfile.dev` with the exact tools your project needs. Agent dockerfiles are generated from templates maintained by amux and rarely need manual edits.
+awman ships templates for both files. The **agent audit** (run via `awman ready --refresh` or during `awman init`) launches an agent to inspect your codebase and updates `Dockerfile.dev` with the exact tools your project needs. Agent dockerfiles are generated from templates maintained by awman and rarely need manual edits.
 
 Keeping these two files separate means you can update project tooling without touching the agent setup, and switch between or update agents without rebuilding your entire project environment.
 
@@ -51,13 +51,13 @@ The spec folder typically contains:
 
 A work item is a Markdown file that describes a specific piece of work: a feature, bug fix, enhancement, or task. Work items follow a numbered naming convention (`0001-add-auth.md`, `0002-fix-crash.md`) and contain everything the agent needs to implement, test, and document the change.
 
-By default, amux looks for work items in `aspec/work-items/`. If your repo uses a different folder structure, you can configure the path:
+By default, awman looks for work items in `aspec/work-items/`. If your repo uses a different folder structure, you can configure the path:
 
 ```sh
-amux config set work_items.dir docs/work-items
+awman config set work_items.dir docs/work-items
 ```
 
-Work items can be executed via workflows using `amux exec workflow`. See the [Workflows](04-workflows.md) and [Agent Sessions](02-agent-sessions.md) guides for more details.
+Work items can be executed via workflows using `awman exec workflow`. See the [Workflows](04-workflows.md) and [Agent Sessions](02-agent-sessions.md) guides for more details.
 
 ---
 
@@ -74,10 +74,10 @@ Work items can be executed via workflows using `amux exec workflow`. See the [Wo
 ## Installation
 
 ```sh
-curl -s https://prettysmart.dev/install/amux.sh | sh
+curl -s https://prettysmart.dev/install/awman.sh | sh
 ```
 
-The installer detects your platform and installs `amux` to `/usr/local/bin`.
+The installer detects your platform and installs `awman` to `/usr/local/bin`.
 
 <details>
 <summary>Other installation options</summary>
@@ -85,32 +85,32 @@ The installer detects your platform and installs `amux` to `/usr/local/bin`.
 **With mise** — using the [GitHub backend](https://mise.jdx.dev/dev-tools/backends/github.html):
 
 ```sh
-mise use -g github:prettysmartdev/amux
+mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/amux@0.8.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.8.0`
 
-**From GitHub Releases** — download the binary for your platform from the [Releases page](https://github.com/prettysmartdev/amux/releases), make it executable, and move it onto your `PATH`:
+**From GitHub Releases** — download the binary for your platform from the [Releases page](https://github.com/prettysmartdev/awman/releases), make it executable, and move it onto your `PATH`:
 
 | Platform | Asset |
 |----------|-------|
-| Linux (x86_64) | `amux-linux-amd64` |
-| Linux (ARM64) | `amux-linux-arm64` |
-| macOS (Intel) | `amux-macos-amd64` |
-| macOS (Apple Silicon) | `amux-macos-arm64` |
-| Windows (x86_64) | `amux-windows-amd64.exe` |
+| Linux (x86_64) | `awman-linux-amd64` |
+| Linux (ARM64) | `awman-linux-arm64` |
+| macOS (Intel) | `awman-macos-amd64` |
+| macOS (Apple Silicon) | `awman-macos-arm64` |
+| Windows (x86_64) | `awman-windows-amd64.exe` |
 
 ```sh
-chmod +x amux-*
-mv amux-* /usr/local/bin/amux
+chmod +x awman-*
+mv awman-* /usr/local/bin/awman
 ```
 
 **From source** — requires Rust 1.94+ and `make`:
 
 ```sh
-git clone https://github.com/prettysmartdev/amux.git
-cd amux
-make install    # builds and installs to /usr/local/bin/amux
+git clone https://github.com/prettysmartdev/awman.git
+cd awman
+make install    # builds and installs to /usr/local/bin/awman
 ```
 
 </details>
@@ -122,10 +122,10 @@ make install    # builds and installs to /usr/local/bin/amux
 Navigate to your project's Git root and run:
 
 ```sh
-amux init
+awman init
 ```
 
-This sets up your project for use with amux. The process is interactive and walks you through each phase:
+This sets up your project for use with awman. The process is interactive and walks you through each phase:
 
 ### Phase 1: Agent selection
 
@@ -133,14 +133,14 @@ This sets up your project for use with amux. The process is interactive and walk
 Which agent would you like to use? [claude/codex/opencode/maki/gemini]:
 ```
 
-Choose your preferred code agent. This becomes the default for all future `amux` commands in this repo. You can change it later with `amux config set agent codex` or pick a different agent for a specific command with the `--agent` flag.
+Choose your preferred code agent. This becomes the default for all future `awman` commands in this repo. You can change it later with `awman config set agent codex` or pick a different agent for a specific command with the `--agent` flag.
 
 ### Phase 2: Dockerfile setup
 
-amux creates two Dockerfile templates:
+awman creates two Dockerfile templates:
 
 - **`Dockerfile.dev`** at the Git root (your project's build environment)
-- **`.amux/Dockerfile.{agent}`** in the `.amux/` directory (agent-specific tooling)
+- **`.awman/Dockerfile.{agent}`** in the `.awman/` directory (agent-specific tooling)
 
 Both are created from templates and should be committed to source control so teammates get identical environments.
 
@@ -156,28 +156,28 @@ If you decline, `Dockerfile.dev` will be a minimal debian base, and you'll need 
 
 ### Phase 4: Work items setup (if needed)
 
-If you didn't pass `--aspec` and no `aspec/` folder already exists, amux offers to set up work item handling:
+If you didn't pass `--aspec` and no `aspec/` folder already exists, awman offers to set up work item handling:
 
 ```
 Set up work items? You can configure a custom work items directory or use the bundled aspec/ template. [y/N]:
 ```
 
-**Accept:** amux walks you through two options:
+**Accept:** awman walks you through two options:
 
 1. **Download the bundled `aspec/` template** — gives you spec templates and work item scaffolding matching the `aspec/` standard layout.
-2. **Configure a custom directory** — point amux to an existing `docs/specs/`, `workitems/`, or other directory where you keep work item files.
+2. **Configure a custom directory** — point awman to an existing `docs/specs/`, `workitems/`, or other directory where you keep work item files.
 
-Either way, amux writes the configuration so that `new spec` and workflow commands can find your work item files without extra flags.
+Either way, awman writes the configuration so that `new spec` and workflow commands can find your work item files without extra flags.
 
-**Decline:** You can set this up later with `amux init --aspec` or `amux config set work_items.dir docs/specs`.
+**Decline:** You can set this up later with `awman init --aspec` or `awman config set work_items.dir docs/specs`.
 
 ### Phase 5: Image building
 
-amux builds the project base image and agent image. This may take a few minutes on first run, depending on your `Dockerfile.dev` and network speed.
+awman builds the project base image and agent image. This may take a few minutes on first run, depending on your `Dockerfile.dev` and network speed.
 
 ### Init summary
 
-When complete, amux shows a summary table:
+When complete, awman shows a summary table:
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -201,7 +201,7 @@ Each row indicates whether that phase was skipped (`–`), succeeded (`✓`), or
 To also download the `aspec/` folder with spec templates and work item scaffolding:
 
 ```sh
-amux init --aspec
+awman init --aspec
 ```
 
 This flag is only needed if you want the full `aspec/` folder — the work items setup prompt (Phase 4 above) already offers to download it interactively.
@@ -213,13 +213,13 @@ This flag is only needed if you want the full `aspec/` folder — the work items
 After init, run:
 
 ```sh
-amux ready
+awman ready
 ```
 
 This checks:
 
 1. That your container runtime (Docker or Apple Containers) is available and running
-2. That `Dockerfile.dev` and `.amux/Dockerfile.{agent}` exist and are configured
+2. That `Dockerfile.dev` and `.awman/Dockerfile.{agent}` exist and are configured
 3. That your agent (e.g. Claude Code) is installed and authenticated — it sends a test greeting and shows the response
 4. That both the project base image and the agent image have been built
 
@@ -230,17 +230,17 @@ If everything is green, you're ready to run agents.
 If your project's toolchain has changed (you added a new language, test framework, or dependency), update your `Dockerfile.dev` by re-running the audit:
 
 ```sh
-amux ready --refresh
+awman ready --refresh
 ```
 
-This launches the audit agent, updates `Dockerfile.dev` (the project base), and rebuilds both images. The agent dockerfile is not modified — it is managed by amux templates and contains only agent tooling. You should commit the updated `Dockerfile.dev` to source control.
+This launches the audit agent, updates `Dockerfile.dev` (the project base), and rebuilds both images. The agent dockerfile is not modified — it is managed by awman templates and contains only agent tooling. You should commit the updated `Dockerfile.dev` to source control.
 
 ---
 
 ## Opening the TUI
 
 ```sh
-amux
+awman
 ```
 
 This opens the interactive TUI. You'll see:
@@ -249,7 +249,7 @@ This opens the interactive TUI. You'll see:
 - An **execution window** in the middle (shows command output)
 - A **command input box** at the bottom
 
-Type any amux subcommand (like `chat`) and press **Enter** to run it. The TUI supports autocomplete — start typing and suggestions appear below the input.
+Type any awman subcommand (like `chat`) and press **Enter** to run it. The TUI supports autocomplete — start typing and suggestions appear below the input.
 
 ---
 
@@ -261,7 +261,7 @@ Type any amux subcommand (like `chat`) and press **Enter** to run it. The TUI su
 chat
 ```
 
-(Type this in the TUI command box and press Enter, or run `amux chat` from your terminal.)
+(Type this in the TUI command box and press Enter, or run `awman chat` from your terminal.)
 
 This launches an agent session in a container against your project. A **container window** opens over the execution window — this is a full terminal emulator connected to the agent. You can type directly to the agent, ask questions, request changes, and see output in real time.
 
@@ -269,12 +269,12 @@ Press **Ctrl-M** to toggle the container window between maximized and minimized 
 
 ### Implementing a work item
 
-To execute a work item, create a workflow that references it, then run the workflow with `amux exec workflow`. See the [Workflows](04-workflows.md) guide for how to create and run workflows.
+To execute a work item, create a workflow that references it, then run the workflow with `awman exec workflow`. See the [Workflows](04-workflows.md) guide for how to create and run workflows.
 
-For example, to run a workflow bundled with amux:
+For example, to run a workflow bundled with awman:
 
 ```sh
-amux exec workflow aspec/workflows/implement-feature.md --work-item 0001
+awman exec workflow aspec/workflows/implement-feature.md --work-item 0001
 ```
 
 The agent reads the work item spec, writes code, runs tests, and reports back — all inside a container.
@@ -290,10 +290,10 @@ new spec --interview   # creates the skeleton, then opens an agent to help fill 
 
 Four work item types are available: Feature, Bug, Task, and Enhancement.
 
-Work items are created in the configured work items directory (defaulting to `aspec/work-items/`). If you haven't run `amux init --aspec` and haven't configured `work_items.dir`, amux will prompt you to auto-discover a template or create the file with a minimal stub. You can configure a custom directory at any time:
+Work items are created in the configured work items directory (defaulting to `aspec/work-items/`). If you haven't run `awman init --aspec` and haven't configured `work_items.dir`, awman will prompt you to auto-discover a template or create the file with a minimal stub. You can configure a custom directory at any time:
 
 ```sh
-amux config set work_items.dir docs/work-items
+awman config set work_items.dir docs/work-items
 ```
 
 With `--interview`, after you provide a brief summary, the agent asks clarifying questions and writes out the full spec (user stories, implementation plan, edge cases, test plan) before any implementation starts.
@@ -306,7 +306,7 @@ specs amend 0001
 
 ## Creating workflows and skills
 
-The `new` subcommand is a unified entry point for creating amux artefacts:
+The `new` subcommand is a unified entry point for creating awman artefacts:
 
 ```sh
 new spec                # prompts for type and title, creates a work item file
@@ -316,7 +316,7 @@ new skill               # interactively create a Claude Code skill file
 new skill --interview   # let an agent write the skill body from a summary
 ```
 
-Both `new workflow` and `new skill` accept `--global` to write to `~/.amux/` instead of the current repo, building a personal library that travels across projects. See [Workflows](04-workflows.md#creating-a-workflow-file) and [Creating skills](02-agent-sessions.md#creating-skills) for full details.
+Both `new workflow` and `new skill` accept `--global` to write to `~/.awman/` instead of the current repo, building a personal library that travels across projects. See [Workflows](04-workflows.md#creating-a-workflow-file) and [Creating skills](02-agent-sessions.md#creating-skills) for full details.
 
 ---
 

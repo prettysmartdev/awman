@@ -1,8 +1,7 @@
-//! `engine::ready` — `ReadyEngine`. Multi-phase state machine for `amux ready`.
+//! `engine::ready` — `ReadyEngine`. Multi-phase state machine for `awman ready`.
 
 use std::sync::Arc;
 
-use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::AgentEngine;
 use crate::engine::container::ContainerRuntime;
@@ -161,28 +160,20 @@ impl ReadyEngine {
                     self.summary.aspec_folder = StepStatus::Warn("aspec/ folder not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
-                        text: "aspec/ folder not found in git root; run `amux init` to create it."
+                        text: "aspec/ folder not found in git root; run `awman init` to create it."
                             .to_string(),
                     });
                 }
-                // Modern repo config: .amux/config.json
-                let modern_config = git_root.join(".amux").join("config.json");
-                // Legacy path: only warn if it EXISTS (user should migrate)
-                let legacy_config = git_root.join("aspec").join(".amux.json");
-                if modern_config.exists() {
+                // Repo config: .awman/config.json
+                let repo_config = git_root.join(".awman").join("config.json");
+                if repo_config.exists() {
                     self.summary.work_items_config = StepStatus::Done;
-                    if legacy_config.exists() {
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
-                            text: "Legacy aspec/.amux.json found alongside .amux/config.json; consider removing the legacy file.".to_string(),
-                        });
-                    }
                 } else {
                     self.summary.work_items_config =
-                        StepStatus::Warn(".amux/config.json not found".into());
+                        StepStatus::Warn(".awman/config.json not found".into());
                     frontend.write_message(crate::engine::message::UserMessage {
                         level: crate::engine::message::MessageLevel::Warning,
-                        text: ".amux/config.json not found; run `amux init` to create it."
+                        text: ".awman/config.json not found; run `awman init` to create it."
                             .to_string(),
                     });
                 }
@@ -191,7 +182,7 @@ impl ReadyEngine {
                 if dockerfile_path.exists() {
                     self.summary.dockerfile = StepStatus::Done;
                     frontend.report_step_status("Check Dockerfile.dev", StepStatus::Done);
-                    self.next_phase_after_dockerfile_present()
+                    ReadyPhase::BuildingBaseImage
                 } else {
                     ReadyPhase::AwaitingDockerfileDecision
                 }
@@ -213,37 +204,6 @@ impl ReadyEngine {
                     .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
                 self.summary.dockerfile = StepStatus::Done;
                 frontend.report_step_status("Create Dockerfile.dev", StepStatus::Done);
-                ReadyPhase::AwaitingLegacyMigrationDecision
-            }
-            ReadyPhase::AwaitingLegacyMigrationDecision => {
-                if frontend.ask_migrate_legacy_layout(&self.options.agent)? {
-                    ReadyPhase::MigratingLegacyLayout
-                } else {
-                    self.summary.legacy_migration = StepStatus::Skipped;
-                    ReadyPhase::BuildingBaseImage
-                }
-            }
-            ReadyPhase::MigratingLegacyLayout => {
-                let dockerfile_path = git_root.join("Dockerfile.dev");
-                let backup_path = git_root.join("Dockerfile.dev.bak");
-                if dockerfile_path.exists() {
-                    std::fs::copy(&dockerfile_path, &backup_path)
-                        .map_err(|e| EngineError::io(backup_path.clone(), e))?;
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Info,
-                        text: format!(
-                            "Backed up existing Dockerfile.dev to {}.",
-                            backup_path.display()
-                        ),
-                    });
-                }
-                std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
-                    .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
-                frontend.write_message(crate::engine::message::UserMessage {
-                    level: crate::engine::message::MessageLevel::Info,
-                    text: "Dockerfile.dev recreated with project base template.".to_string(),
-                });
-                self.summary.legacy_migration = StepStatus::Done;
                 ReadyPhase::BuildingBaseImage
             }
             ReadyPhase::BuildingBaseImage => {
@@ -253,16 +213,18 @@ impl ReadyEngine {
                     let msg = "Docker daemon is not running. Install Docker and retry.".to_string();
                     self.summary.base_image = StepStatus::Failed(msg.clone());
                     frontend.report_step_status("Build base image", StepStatus::Failed(msg));
-                    return Ok(ReadyPhase::BuildingAgentImage);
+                    // Bypass the `self.phase = next` assignment below to short-
+                    // circuit straight to the next phase, but DO advance self.phase
+                    // first — otherwise `run_to_completion` re-enters this branch
+                    // forever (the docker-unavailable case is otherwise infinite).
+                    self.phase = ReadyPhase::BuildingAgentImage;
+                    return Ok(self.phase.clone());
                 }
 
                 let tag = project_image_tag(&git_root);
-                // Legacy gate: rebuild when --build was passed, when the base
-                // image is missing, or when the legacy migration just rewrote
-                // Dockerfile.dev. Otherwise skip (`amux ready` is idempotent).
-                let needs_build = self.options.build
-                    || matches!(self.summary.legacy_migration, StepStatus::Done)
-                    || !self.container_runtime.image_exists(&tag);
+                // Rebuild when --build was passed or when the base image is
+                // missing. Otherwise skip (`awman ready` is idempotent).
+                let needs_build = self.options.build || !self.container_runtime.image_exists(&tag);
                 if !needs_build {
                     self.summary.base_image = StepStatus::Done;
                     frontend.report_step_status("Build base image", StepStatus::Done);
@@ -296,12 +258,24 @@ impl ReadyEngine {
                 }
             }
             ReadyPhase::BuildingAgentImage => {
+                // Issue 22 (extended for WI 0078): if Docker isn't available
+                // there's no point attempting to download an agent Dockerfile
+                // from the network — the build would fail anyway. Mark as
+                // failed and continue, so the setup task exits promptly in
+                // sandboxed test environments.
+                if !self.container_runtime.is_available() {
+                    let msg = "Docker daemon is not running.".to_string();
+                    self.summary.agent_image = StepStatus::Failed(msg.clone());
+                    frontend.report_step_status("Build agent image", StepStatus::Failed(msg));
+                    return Ok({
+                        self.phase = ReadyPhase::CheckingNonDefaultAgents;
+                        self.phase.clone()
+                    });
+                }
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 let tag = agent_image_tag(&git_root, self.options.agent.as_str());
-                let needs_build = self.options.build
-                    || matches!(self.summary.legacy_migration, StepStatus::Done)
-                    || !self.container_runtime.image_exists(&tag);
+                let needs_build = self.options.build || !self.container_runtime.image_exists(&tag);
                 if !needs_build {
                     self.summary.agent_image = StepStatus::Done;
                     frontend.report_step_status("Build agent image", StepStatus::Done);
@@ -428,24 +402,22 @@ impl ReadyEngine {
                             .non_default_agent_images
                             .push(("Other agents".to_string(), StepStatus::Done));
                     } else {
-                        // Report only the missing agents individually as warnings.
-                        for (name, tag) in &missing_agents {
-                            let status = StepStatus::Warn(format!("image missing: {tag}"));
-                            frontend.report_step_status(&format!("Agent: {name}"), status.clone());
-                            self.summary
-                                .non_default_agent_images
-                                .push((name.clone(), status));
-                        }
+                        // One consolidated "Missing images" row listing the
+                        // affected agents — easier to scan than one row per
+                        // agent in CLI/TUI/API output.
+                        let names_csv = missing_agents
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let status = StepStatus::Warn(names_csv.clone());
+                        frontend.report_step_status("Missing images", status.clone());
+                        self.summary
+                            .non_default_agent_images
+                            .push(("Missing images".to_string(), status));
                         frontend.write_message(crate::engine::message::UserMessage {
                             level: crate::engine::message::MessageLevel::Warning,
-                            text: format!(
-                                "Missing agent images: {}",
-                                missing_agents
-                                    .iter()
-                                    .map(|(n, _)| n.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
+                            text: format!("Missing agent images: {names_csv}"),
                         });
                     }
                 }
@@ -550,12 +522,12 @@ impl ReadyEngine {
                         disallowed_tools: vec![],
                         initial_prompt: Some(ready_audit_prompt().to_string()),
                         allow_docker: self.options.allow_docker,
-                        mount_ssh: false,
                         non_interactive: self.options.non_interactive,
                         model: None,
                         env_passthrough: self.options.env_passthrough.clone(),
                         directory_overlays: vec![],
-                        include_skills: false,
+                        include_all_skills: false,
+                        named_skills: vec![],
                     };
                     match self.agent_engine.build_options(
                         &self.session,
@@ -642,9 +614,9 @@ impl ReadyEngine {
                         }
 
                         // Issue 9: Also rebuild agent images that layer FROM the project base.
-                        let amux_dir = git_root.join(".amux");
-                        if amux_dir.exists() {
-                            if let Ok(entries) = std::fs::read_dir(&amux_dir) {
+                        let awman_dir = git_root.join(".awman");
+                        if awman_dir.exists() {
+                            if let Ok(entries) = std::fs::read_dir(&awman_dir) {
                                 for entry in entries.flatten() {
                                     let name = entry.file_name();
                                     let name_str = name.to_string_lossy().to_string();
@@ -687,24 +659,6 @@ impl ReadyEngine {
             frontend.report_summary(&self.summary);
         }
         Ok(next)
-    }
-
-    /// Decide which phase to enter when `Dockerfile.dev` is already on disk.
-    ///
-    /// Matches old-amux `is_legacy_layout` semantics: the "migrate to modular
-    /// layout?" question is only meaningful when `Dockerfile.dev` exists AND
-    /// no per-agent `.amux/Dockerfile.<agent>` file has been written yet. If
-    /// the per-agent file is already present, the project is on the modular
-    /// layout — skip the migration phases entirely.
-    fn next_phase_after_dockerfile_present(&mut self) -> ReadyPhase {
-        let paths = RepoDockerfilePaths::new(self.session.git_root());
-        let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
-        if agent_dockerfile.exists() {
-            self.summary.legacy_migration = StepStatus::Skipped;
-            ReadyPhase::BuildingBaseImage
-        } else {
-            ReadyPhase::AwaitingLegacyMigrationDecision
-        }
     }
 
     /// Drive to completion: advance phases in a loop until terminal.
@@ -751,7 +705,6 @@ mod tests {
     struct FakeReadyFrontend {
         create_dockerfile: bool,
         run_audit: bool,
-        migrate_legacy: bool,
         phases: Vec<ReadyPhase>,
         statuses: Vec<(String, StepStatus)>,
     }
@@ -761,7 +714,6 @@ mod tests {
             Self {
                 create_dockerfile: true,
                 run_audit: true,
-                migrate_legacy: true,
                 phases: Vec::new(),
                 statuses: Vec::new(),
             }
@@ -777,18 +729,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContainerFrontend for FakeContainerFrontend {
-        fn write_stdout(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn write_stderr(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-            Ok(0)
-        }
         fn report_status(&mut self, _status: ContainerStatus) {}
         fn report_progress(&mut self, _progress: ContainerProgress) {}
-        fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+            let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::engine::container::frontend::ContainerIo {
+                stdout: stdout_tx,
+                stderr: stderr_tx,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
     }
 
     impl UserMessageSink for FakeReadyFrontend {
@@ -803,10 +758,6 @@ mod tests {
 
         fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
             Ok(self.run_audit)
-        }
-
-        fn ask_migrate_legacy_layout(&mut self, _agent: &AgentName) -> Result<bool, EngineError> {
-            Ok(self.migrate_legacy)
         }
 
         fn report_phase(&mut self, phase: &ReadyPhase) {
@@ -831,11 +782,11 @@ mod tests {
         run_audit: bool,
     ) -> (ReadyEngine, FakeReadyFrontend, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        // Pre-create .amux/Dockerfile.claude so the ready engine does not
+        // Pre-create .awman/Dockerfile.claude so the ready engine does not
         // attempt a network download during tests.
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Arc::new(
             crate::data::session::Session::open(
@@ -873,7 +824,6 @@ mod tests {
         let frontend = FakeReadyFrontend {
             create_dockerfile,
             run_audit,
-            migrate_legacy: true,
             phases: Vec::new(),
             statuses: Vec::new(),
         };
@@ -950,7 +900,7 @@ mod tests {
         engine2.step(&mut frontend).await.unwrap(); // Preflight → AwaitingDockerfileDecision
         engine2.step(&mut frontend).await.unwrap(); // AwaitingDockerfileDecision → CreatingDockerfile
                                                     // Execute CreatingDockerfile phase.
-        engine2.step(&mut frontend).await.unwrap(); // CreatingDockerfile → AwaitingLegacyMigrationDecision
+        engine2.step(&mut frontend).await.unwrap(); // CreatingDockerfile → BuildingBaseImage
         let dockerfile = tmp.path().join("Dockerfile.dev");
         assert!(
             dockerfile.exists(),
@@ -960,77 +910,6 @@ mod tests {
         assert!(
             !content.is_empty(),
             "Dockerfile.dev must contain the template content"
-        );
-    }
-
-    #[tokio::test]
-    async fn migrating_legacy_layout_creates_backup() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Write an existing Dockerfile.dev (simulates legacy layout).
-        let dockerfile = tmp.path().join("Dockerfile.dev");
-        std::fs::write(&dockerfile, "FROM legacy\n").unwrap();
-
-        let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
-        let session = Arc::new(
-            crate::data::session::Session::open(
-                tmp.path().to_path_buf(),
-                &resolver,
-                crate::data::session::SessionOpenOptions::default(),
-            )
-            .unwrap(),
-        );
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
-        ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let options = ReadyEngineOptions {
-            agent: AgentName::new("claude").unwrap(),
-            refresh: false,
-            build: false,
-            no_cache: false,
-            allow_docker: false,
-            non_interactive: false,
-            env_passthrough: None,
-        };
-        let mut engine = ReadyEngine::new(
-            session,
-            Arc::new(GitEngine::new()),
-            overlay,
-            runtime,
-            agent_engine,
-            options,
-        );
-        // Frontend that accepts migration.
-        let mut frontend = FakeReadyFrontend {
-            create_dockerfile: true,
-            run_audit: false,
-            migrate_legacy: true,
-            phases: Vec::new(),
-            statuses: Vec::new(),
-        };
-        // Dockerfile already exists → skips AwaitingDockerfileDecision.
-        engine.step(&mut frontend).await.unwrap(); // Preflight → AwaitingLegacyMigrationDecision
-        engine.step(&mut frontend).await.unwrap(); // AwaitingLegacyMigrationDecision → MigratingLegacyLayout
-        engine.step(&mut frontend).await.unwrap(); // MigratingLegacyLayout → BuildingBaseImage
-
-        let backup = tmp.path().join("Dockerfile.dev.bak");
-        assert!(
-            backup.exists(),
-            "MigratingLegacyLayout must create a .bak backup"
-        );
-        let backup_content = std::fs::read_to_string(&backup).unwrap();
-        assert_eq!(
-            backup_content, "FROM legacy\n",
-            "backup must contain original content"
-        );
-        let new_content = std::fs::read_to_string(&dockerfile).unwrap();
-        assert_ne!(
-            new_content, "FROM legacy\n",
-            "Dockerfile.dev must be overwritten"
         );
     }
 }

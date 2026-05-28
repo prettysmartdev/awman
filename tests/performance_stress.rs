@@ -4,7 +4,7 @@
 //! realistic load — 20+ simultaneous PTY streams and many tabs open at once.
 //! They are not micro-benchmarks; they assert correctness and bound degradation.
 
-use amux::tui::{render, state::App, state::TabState};
+use awman::tui::{render, state::App, state::TabState};
 use ratatui::{backend::TestBackend, Terminal};
 use std::path::PathBuf;
 use std::sync::Arc;

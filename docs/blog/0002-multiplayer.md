@@ -42,7 +42,7 @@ The security model doesn't change — every agent session is still containerized
 
 ## Getting Started with 0.2
 
-Install it: [`docs/getting-started.md`](../getting-started.md) covers initialization, multiplayer, the spec workflow, and your first claw agent.
+Install it: [`docs/00-getting-started.md`](../00-getting-started.md) covers initialization, multiplayer, the spec workflow, and your first claw agent.
 
 ---
 

@@ -3,7 +3,7 @@
 //! Confirms that every command documented in `aspec/uxui/cli.md` is present in
 //! `CommandCatalogue` and that flag implications / conflicts are registered.
 
-use amux::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
+use awman::command::dispatch::catalogue::{CommandCatalogue, FlagKind};
 
 fn cat() -> &'static CommandCatalogue {
     CommandCatalogue::get()
@@ -15,7 +15,7 @@ fn cat() -> &'static CommandCatalogue {
 fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
-        "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote", "new",
+        "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
     ] {
         assert!(
             names.contains(expected),
@@ -74,42 +74,50 @@ fn chat_has_non_interactive_short_flag() {
     assert_eq!(flag.unwrap().short, Some('n'));
 }
 
-// ─── headless start ──────────────────────────────────────────────────────────
+// ─── api start ──────────────────────────────────────────────────────────
 
 #[test]
-fn headless_start_has_workdirs_flag() {
-    let cmd = cat().lookup(&["headless", "start"]).unwrap();
+fn api_start_has_workdirs_flag() {
+    let cmd = cat().lookup(&["api", "start"]).unwrap();
     assert!(cmd.find_flag("workdirs").is_some());
 }
 
-// ─── remote run ──────────────────────────────────────────────────────────────
+// ─── remote exec ─────────────────────────────────────────────────────────────
 
 #[test]
-fn remote_run_has_follow_flag() {
-    let cmd = cat().lookup(&["remote", "run"]).unwrap();
+fn remote_exec_workflow_has_follow_flag() {
+    let cmd = cat().lookup(&["remote", "exec", "workflow"]).unwrap();
     assert!(cmd.find_flag("follow").is_some());
 }
 
 #[test]
-fn remote_run_has_trailing_args_argument() {
-    let cmd = cat().lookup(&["remote", "run"]).unwrap();
-    let trailing = cmd
-        .arguments
-        .iter()
-        .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs));
-    assert!(trailing, "remote run must accept trailing var-args");
+fn remote_exec_workflow_has_workflow_argument() {
+    let cmd = cat().lookup(&["remote", "exec", "workflow"]).unwrap();
+    assert!(
+        cmd.arguments.iter().any(|a| a.name == "workflow"),
+        "remote exec workflow must accept a workflow argument"
+    );
+}
+
+#[test]
+fn remote_exec_prompt_has_prompt_argument() {
+    let cmd = cat().lookup(&["remote", "exec", "prompt"]).unwrap();
+    assert!(
+        cmd.arguments.iter().any(|a| a.name == "prompt"),
+        "remote exec prompt must accept a prompt argument"
+    );
 }
 
 // ─── new workflow format values ───────────────────────────────────────────────
 
 #[test]
-fn new_workflow_format_accepts_toml_yaml_md() {
+fn new_workflow_format_accepts_toml_yaml() {
     let cmd = cat().lookup(&["new", "workflow"]).unwrap();
     let flag = cmd.find_flag("format").expect("--format flag");
     if let FlagKind::Enum(values) = flag.kind {
         assert!(values.contains(&"toml"));
         assert!(values.contains(&"yaml"));
-        assert!(values.contains(&"md"));
+        assert!(!values.contains(&"md"), "md format no longer supported");
     } else {
         panic!("--format should be Enum kind");
     }

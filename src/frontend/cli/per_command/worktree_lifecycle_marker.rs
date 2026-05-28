@@ -32,7 +32,10 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(PreWorktreeDecision::UseLastCommit);
         }
-        eprintln!("amux: {} uncommitted file(s) in working tree:", files.len());
+        eprintln!(
+            "awman: {} uncommitted file(s) in working tree:",
+            files.len()
+        );
         for f in files.iter().take(10) {
             eprintln!("  {f}");
         }
@@ -42,7 +45,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         eprintln!("  [c]ommit / [u]se last commit / [a]bort");
         match read_line_or_default('u') {
             'c' | 'C' => {
-                eprintln!("amux: commit message (default \"{suggested_message}\"):");
+                eprintln!("awman: commit message (default \"{suggested_message}\"):");
                 let mut buf = String::new();
                 let _ = std::io::stdin().read_line(&mut buf);
                 let trimmed = buf.trim();
@@ -67,7 +70,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
             return Ok(ExistingWorktreeDecision::Resume);
         }
         eprintln!(
-            "amux: worktree {} already exists for branch {branch}. [r]esume / [R]ecreate?",
+            "awman: worktree {} already exists for branch {branch}. [r]esume / [R]ecreate?",
             path.display()
         );
         let ch = read_line_or_default('r');
@@ -93,7 +96,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(PostWorkflowWorktreeAction::Keep);
         }
-        eprintln!("amux: {}", prompt.body.replace('\n', " "));
+        eprintln!("awman: {}", prompt.body.replace('\n', " "));
         eprintln!(
             "  [m] {} / [d] {} / [k] {}",
             prompt.merge_label, prompt.discard_label, prompt.keep_label,
@@ -115,7 +118,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
             return Ok(None);
         }
         eprintln!(
-            "amux: {} uncommitted file(s) in worktree {branch}:",
+            "awman: {} uncommitted file(s) in worktree {branch}:",
             files.len()
         );
         for f in files.iter().take(10) {
@@ -124,7 +127,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         if files.len() > 10 {
             eprintln!("  ... and {} more", files.len() - 10);
         }
-        eprintln!("amux: commit message (default \"{suggested_message}\", empty to skip):");
+        eprintln!("awman: commit message (default \"{suggested_message}\", empty to skip):");
         let mut buf = String::new();
         if std::io::stdin().read_line(&mut buf).is_err() {
             return Ok(None);
@@ -141,7 +144,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(false);
         }
-        eprintln!("amux: squash-merge {branch} into HEAD? [y/n]");
+        eprintln!("awman: squash-merge {branch} into HEAD? [y/n]");
         let ch = read_line_or_default('n');
         Ok(matches!(ch, 'y' | 'Y'))
     }
@@ -155,7 +158,7 @@ impl WorktreeLifecycleFrontend for CliFrontend {
             return Ok(false);
         }
         eprintln!(
-            "amux: delete worktree {} (branch {branch})? [y/n]",
+            "awman: delete worktree {} (branch {branch})? [y/n]",
             path.display()
         );
         let ch = read_line_or_default('n');
@@ -208,7 +211,7 @@ mod tests {
     fn make_frontend() -> CliFrontend {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "exec", "workflow", "deploy.toml"])
+            .try_get_matches_from(["awman", "exec", "workflow", "deploy.toml"])
             .unwrap();
         CliFrontend::new(m)
     }

@@ -176,6 +176,10 @@ impl WorkflowFrontend for TuiCommandFrontend {
         }
         match outcome {
             WorkflowOutcome::Completed => self.messages.success("Workflow completed successfully"),
+            WorkflowOutcome::CompletedTeardownFailed => {
+                self.messages
+                    .warning("Workflow completed but teardown failed");
+            }
             WorkflowOutcome::Paused => self.messages.info("Workflow paused"),
             WorkflowOutcome::Aborted => self.messages.warning("Workflow aborted"),
             WorkflowOutcome::Failed {
@@ -280,9 +284,62 @@ impl WorkflowFrontend for TuiCommandFrontend {
         })
     }
 
+    fn on_setup_step_started(&mut self, description: &str) {
+        self.messages.info(format!("setup: {description}"));
+    }
+
+    fn on_setup_step_output(&mut self, line: &str) {
+        self.messages.info(format!("  {line}"));
+    }
+
+    fn on_setup_step_completed(&mut self, description: &str) {
+        self.messages.success(format!("setup: {description}"));
+    }
+
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        let msg = if stderr.is_empty() {
+            format!("setup failed: {description} (exit {exit_code})")
+        } else {
+            format!("setup failed: {description} (exit {exit_code}): {stderr}")
+        };
+        self.messages.error_msg(msg);
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        self.messages.info(format!("teardown: {description}"));
+    }
+
+    fn on_teardown_step_output(&mut self, line: &str) {
+        self.messages.info(format!("  {line}"));
+    }
+
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        self.messages.success(format!("teardown: {description}"));
+    }
+
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        let msg = if stderr.is_empty() {
+            format!("teardown failed: {description} (exit {exit_code})")
+        } else {
+            format!("teardown failed: {description} (exit {exit_code}): {stderr}")
+        };
+        self.messages.error_msg(msg);
+    }
+
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         if let Ok(mut guard) = self.engine_tx_shared.lock() {
             *guard = Some(tx);
+        }
+    }
+
+    fn set_stuck_sender(
+        &mut self,
+        sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>,
+        >,
+    ) {
+        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
+            *guard = Some(sender);
         }
     }
 }
@@ -339,12 +396,14 @@ mod tests {
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let container_io = crate::engine::container::frontend::ContainerIo {
             stdout: stdout_tx,
+            stderr: stderr_tx,
             stdin_tx,
             stdin_rx,
-            resize: resize_rx,
-            initial_size: (80, 24),
+            resize: Some(resize_rx),
+            initial_size: Some((80, 24)),
         };
         let status_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
@@ -359,6 +418,7 @@ mod tests {
         let stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let engine_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stuck_sender_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -373,6 +433,7 @@ mod tests {
             stdin_tx_shared,
             resize_tx_shared,
             engine_tx_shared,
+            stuck_sender_shared,
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(
@@ -389,6 +450,8 @@ mod tests {
             prompt_template: "do the thing".into(),
             agent: None,
             model: None,
+            overlays: None,
+            abort_on_failure: false,
         }
     }
 
@@ -516,6 +579,8 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
+                    abort_on_failure: false,
                 },
                 WorkflowStep {
                     name: "test".into(),
@@ -523,6 +588,8 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
+                    abort_on_failure: false,
                 },
             ],
             "hash".into(),
@@ -541,6 +608,8 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
+                    abort_on_failure: false,
                 },
                 WorkflowStep {
                     name: "test-a".into(),
@@ -548,6 +617,8 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
+                    abort_on_failure: false,
                 },
                 WorkflowStep {
                     name: "test-b".into(),
@@ -555,6 +626,8 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
+                    abort_on_failure: false,
                 },
             ],
             "hash".into(),

@@ -2,7 +2,7 @@
 //!
 //! The CLI uses `SessionManager::in_memory()` and creates exactly one session
 //! per invocation. The TUI uses `SessionManager::in_memory()` and creates one
-//! session per tab. The headless server uses `SessionManager::with_persistence(...)`
+//! session per tab. The API server uses `SessionManager::with_persistence(...)`
 //! and one session per API session.
 
 use std::collections::HashMap;
@@ -167,14 +167,14 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AMUX_CONFIG_HOME};
-    use crate::data::fs::headless_db::SqliteSessionStore;
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::fs::api_db::SqliteSessionStore;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
 
     // ─── helpers ──────────────────────────────────────────────────────────────
 
     fn make_session(git_root: &std::path::Path, home_dir: &std::path::Path) -> Session {
-        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, home_dir.to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_dir.to_str().unwrap())]);
         let resolver = StaticGitRootResolver::new(git_root);
         let opts = SessionOpenOptions {
             env: Some(env),

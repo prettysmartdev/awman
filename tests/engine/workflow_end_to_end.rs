@@ -8,11 +8,13 @@
 
 use std::collections::HashSet;
 
-use amux::data::error::DataError;
-use amux::data::workflow_dag::WorkflowDag;
-use amux::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
-use amux::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
-use amux::data::EngineWorkflowStateStore;
+use awman::data::error::DataError;
+use awman::data::workflow_dag::WorkflowDag;
+use awman::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
+use awman::data::workflow_state::{
+    StepState, WorkflowPhase, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION,
+};
+use awman::data::EngineWorkflowStateStore;
 
 // ─── Workflow parsing parity across formats ───────────────────────────────────
 
@@ -61,14 +63,6 @@ fn step_deps<'a>(wf: &'a Workflow, name: &str) -> Vec<&'a str> {
 }
 
 #[test]
-fn workflow_markdown_parses_steps_and_title() {
-    let wf = Workflow::parse(CANONICAL_WORKFLOW, WorkflowFormat::Markdown).unwrap();
-    assert_eq!(wf.title.as_deref(), Some("Test Workflow"));
-    assert_eq!(step_names(&wf), vec!["alpha", "beta"]);
-    assert_eq!(step_deps(&wf, "beta"), vec!["alpha"]);
-}
-
-#[test]
 fn workflow_toml_parses_correctly() {
     let wf = Workflow::parse(CANONICAL_TOML, WorkflowFormat::Toml).unwrap();
     assert_eq!(step_names(&wf), vec!["alpha", "beta"]);
@@ -83,28 +77,23 @@ fn workflow_yaml_parses_correctly() {
 }
 
 #[test]
-fn workflow_md_toml_yaml_produce_equivalent_structure() {
-    let md = Workflow::parse(CANONICAL_WORKFLOW, WorkflowFormat::Markdown).unwrap();
+fn workflow_toml_yaml_produce_equivalent_structure() {
     let toml = Workflow::parse(CANONICAL_TOML, WorkflowFormat::Toml).unwrap();
     let yaml = Workflow::parse(CANONICAL_YAML, WorkflowFormat::Yaml).unwrap();
 
-    for (a, b) in md.steps.iter().zip(toml.steps.iter()) {
-        assert_eq!(a.name, b.name, "name mismatch md vs toml");
-        assert_eq!(a.depends_on, b.depends_on, "deps mismatch md vs toml");
-    }
-    for (a, b) in md.steps.iter().zip(yaml.steps.iter()) {
-        assert_eq!(a.name, b.name, "name mismatch md vs yaml");
-        assert_eq!(a.depends_on, b.depends_on, "deps mismatch md vs yaml");
+    for (a, b) in toml.steps.iter().zip(yaml.steps.iter()) {
+        assert_eq!(a.name, b.name, "name mismatch toml vs yaml");
+        assert_eq!(a.depends_on, b.depends_on, "deps mismatch toml vs yaml");
     }
 }
 
 #[test]
-fn workflow_load_from_disk_md() {
+fn workflow_load_from_disk_md_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("test.md");
     std::fs::write(&path, CANONICAL_WORKFLOW).unwrap();
-    let wf = Workflow::load(&path).unwrap();
-    assert_eq!(step_names(&wf), vec!["alpha", "beta"]);
+    let err = Workflow::load(&path).unwrap_err();
+    assert!(matches!(err, DataError::MarkdownNoLongerSupported { .. }));
 }
 
 #[test]
@@ -143,6 +132,8 @@ fn make_step(name: &str, deps: &[&str]) -> WorkflowStep {
         prompt_template: format!("Run {name}"),
         agent: None,
         model: None,
+        overlays: None,
+        abort_on_failure: false,
     }
 }
 
@@ -345,6 +336,44 @@ fn workflow_state_v1_fixture_deserializes_cleanly() {
     assert_eq!(state.step_states["beta"], StepState::Pending);
     assert!(state.completed_steps.is_empty());
     assert!(state.current_step_index.is_none());
+}
+
+/// `WorkflowState` JSON that lacks the phase fields added in WI 0080 must
+/// deserialize successfully, with `current_phase` defaulting to `Main` and
+/// both step-state vecs defaulting to empty. This mirrors the schema-v1
+/// on-disk format produced by earlier releases.
+#[test]
+fn workflow_state_backward_compat_missing_phase_fields() {
+    let json = r#"{
+        "schema_version": 2,
+        "workflow_name": "legacy-run",
+        "workflow_hash": "deadbeef",
+        "work_item": null,
+        "step_states": {"a": "Pending"},
+        "completed_steps": [],
+        "current_step_index": null,
+        "started_at": "2025-01-01T00:00:00Z",
+        "updated_at": "2025-01-01T00:00:00Z"
+    }"#;
+
+    let state: WorkflowState =
+        serde_json::from_str(json).expect("legacy state without phase fields must deserialize");
+
+    assert_eq!(
+        state.current_phase,
+        WorkflowPhase::Main,
+        "current_phase must default to Main for pre-0080 state files"
+    );
+    assert!(
+        state.setup_step_states.is_empty(),
+        "setup_step_states must default to empty"
+    );
+    assert!(
+        state.teardown_step_states.is_empty(),
+        "teardown_step_states must default to empty"
+    );
+    assert!(!state.setup_completed);
+    assert!(!state.teardown_completed);
 }
 
 #[test]

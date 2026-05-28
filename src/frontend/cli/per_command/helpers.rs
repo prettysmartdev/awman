@@ -11,7 +11,7 @@ pub fn yes_no(prompt: &str, default_yes: bool) -> bool {
         return default_yes;
     }
     let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    eprintln!("amux: {prompt} {suffix}");
+    eprintln!("awman: {prompt} {suffix}");
     let mut buf = String::new();
     if std::io::stdin().read_line(&mut buf).is_err() {
         return default_yes;
@@ -30,7 +30,7 @@ pub fn read_line(prompt: &str) -> Option<String> {
     if !stdin_is_tty() {
         return None;
     }
-    eprintln!("amux: {prompt}");
+    eprintln!("awman: {prompt}");
     let mut buf = String::new();
     if std::io::stdin().read_line(&mut buf).is_err() {
         return None;
@@ -46,8 +46,8 @@ pub fn read_multiline(prompt: &str) -> Option<String> {
     if !stdin_is_tty() {
         return None;
     }
-    eprintln!("amux: {prompt}");
-    eprintln!("amux: (enter a blank line or press Ctrl+D when done)");
+    eprintln!("awman: {prompt}");
+    eprintln!("awman: (enter a blank line or press Ctrl+D when done)");
     let stdin = std::io::stdin();
     let mut lines: Vec<String> = Vec::new();
     for line in stdin.lock().lines() {
@@ -60,90 +60,16 @@ pub fn read_multiline(prompt: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Render a [`StepStatus`] as a short human label suitable for inline progress
-/// lines (e.g. `Build base image: running`).
 pub fn step_status_label(status: &StepStatus) -> String {
-    match status {
-        StepStatus::Pending => "pending".to_string(),
-        StepStatus::Running => "running".to_string(),
-        StepStatus::Done => "done".to_string(),
-        StepStatus::Skipped => "skipped".to_string(),
-        StepStatus::Warn(msg) if msg.is_empty() => "warn".to_string(),
-        StepStatus::Warn(msg) => format!("warn: {msg}"),
-        StepStatus::Failed(reason) if reason.is_empty() => "failed".to_string(),
-        StepStatus::Failed(reason) => format!("failed: {reason}"),
-    }
+    status.label()
 }
 
-/// Render a [`StepStatus`] as a single glyph for summary tables.
-/// `-` Pending, `…` Running, `✓` Done, `–` Skipped, `⚠` Warn, `✗` Failed.
 pub fn step_status_glyph(status: &StepStatus) -> &'static str {
-    match status {
-        StepStatus::Pending => "-",
-        StepStatus::Running => "…",
-        StepStatus::Done => "✓",
-        StepStatus::Skipped => "–",
-        StepStatus::Warn(_) => "⚠",
-        StepStatus::Failed(_) => "✗",
-    }
+    status.glyph()
 }
 
-/// Build an ASCII summary box with a title and label/status rows. Mirrors the
-/// `Init Summary` / `Ready Summary` boxes from the legacy CLI.
 pub fn render_summary_box(title: &str, rows: &[(&str, &StepStatus)]) -> String {
-    let label_w = rows
-        .iter()
-        .map(|(label, _)| label.chars().count())
-        .max()
-        .unwrap_or(8)
-        .max(16);
-    // Value column carries glyph + space + label.
-    let value_w = rows
-        .iter()
-        .map(|(_, s)| step_status_label(s).chars().count() + 2)
-        .max()
-        .unwrap_or(10)
-        .max(12);
-    let table_inner = label_w + value_w + 5; // " label │ value " + borders
-    let title_inner = title.chars().count() + 2; // " title "
-    let inner = table_inner.max(title_inner);
-    let value_w = if inner > table_inner {
-        value_w + (inner - table_inner)
-    } else {
-        value_w
-    };
-
-    let mut out = String::new();
-    out.push_str(&format!("┌{}┐\n", "─".repeat(inner)));
-    let title_pad = inner.saturating_sub(title.chars().count() + 2);
-    out.push_str(&format!("│ {}{} │\n", title, " ".repeat(title_pad)));
-    out.push_str(&format!(
-        "├{}┬{}┤\n",
-        "─".repeat(label_w + 2),
-        "─".repeat(value_w + 2)
-    ));
-    for (label, status) in rows {
-        let label_pad = label_w.saturating_sub(label.chars().count());
-        let value = format!(
-            "{} {}",
-            step_status_glyph(status),
-            step_status_label(status)
-        );
-        let value_pad = value_w.saturating_sub(value.chars().count());
-        out.push_str(&format!(
-            "│ {}{} │ {}{} │\n",
-            label,
-            " ".repeat(label_pad),
-            value,
-            " ".repeat(value_pad)
-        ));
-    }
-    out.push_str(&format!(
-        "└{}┴{}┘\n",
-        "─".repeat(label_w + 2),
-        "─".repeat(value_w + 2)
-    ));
-    out
+    crate::data::step_status::render_summary_box(title, rows)
 }
 
 #[cfg(test)]

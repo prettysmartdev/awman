@@ -4,17 +4,10 @@
 //! Builds a `docker run` argv from `ResolvedContainerOptions`, spawns the
 //! subprocess, and captures the exit code.
 //!
-//! Interactive runs open `/dev/tty` directly as the stdin passed to the
-//! container runtime rather than inheriting fd 0. After CLI prompts have
-//! consumed stdin (e.g. kind/title/summary questions before an interview
-//! agent launches), fd 0 may be in a state that causes Docker Desktop and
-//! Apple Containers to fail with ENOTTY when they call ioctl(TIOCGWINSZ)
-//! on it during PTY setup. `/dev/tty` always refers to the process's
-//! controlling terminal and is unaffected by prior buffered reads on fd 0.
-//!
-//! For non-interactive captured output (or when a seeded prompt must be
-//! piped before user stdin), this module pipes stdin/stdout/stderr through
-//! the supplied `ContainerFrontend`.
+//! All container I/O is mediated through the `ContainerIo` channels
+//! provided by the frontend. When the frontend provides PTY fields
+//! (`initial_size`/`resize` are `Some`), the engine opens a PTY via
+//! `portable-pty`. Otherwise it uses `Stdio::piped()`.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -30,7 +23,7 @@ use crate::engine::error::EngineError;
 
 /// Docker label applied to every amux-spawned container so `list_running`
 /// can filter to ours.
-const AMUX_LABEL: &str = "amux=true";
+const AWMAN_LABEL: &str = "awman=true";
 
 #[derive(Debug, Default)]
 pub(super) struct DockerBackend;
@@ -85,8 +78,8 @@ impl ContainerBackend for DockerBackend {
         // deduplicated by container ID.
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
-            &["ps", "--filter", "label=amux=true", "--format", format],
-            &["ps", "--filter", "name=amux-", "--format", format],
+            &["ps", "--filter", "label=awman=true", "--format", format],
+            &["ps", "--filter", "name=awman-", "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -137,8 +130,8 @@ impl ContainerBackend for DockerBackend {
     fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
-            &["ps", "--filter", "label=amux=true", "--format", format],
-            &["ps", "--filter", "name=amux-", "--format", format],
+            &["ps", "--filter", "label=awman=true", "--format", format],
+            &["ps", "--filter", "name=awman-", "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -279,119 +272,75 @@ impl ContainerInstance for DockerContainerInstance {
     ) -> Result<ContainerExecution, EngineError> {
         let argv = build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
-        let interactive = self.options.interactive;
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
 
-        // Decide between PTY-bridged and inherit-stdio paths.
-        //
-        // - If the frontend exposes a `ContainerIo` AND the container is
-        //   interactive, we spawn `docker run -it` via `portable-pty` and
-        //   bridge the PTY master to the frontend's channels. This is the
-        //   correct path for the TUI: it puts the container's terminal
-        //   output into the frontend's vt100 parser instead of fighting
-        //   ratatui for the host's alternate screen.
-        // - Otherwise we keep the existing inherit-stdio path (correct for
-        //   the bare CLI, for non-interactive runs, and for build/pull
-        //   probes that should stream into the user's terminal).
         frontend.report_status(
             crate::engine::container::frontend::ContainerStatus::Running {
                 container_name: self.name.0.clone(),
             },
         );
 
-        let pty_io = if interactive {
-            frontend.take_container_io()
-        } else {
-            None
-        };
+        // Read per-frontend timeouts before draining `take_container_io`,
+        // which leaves the frontend in a state where any further calls are
+        // implementation-defined.
+        let grace_timeout = frontend.grace_timeout();
+        let stuck_timeout = frontend.stuck_timeout();
+        let io = frontend.take_container_io();
 
-        if let Some(io) = pty_io {
-            return spawn_pty_bridged_docker(self, frontend, io, argv, started_at, handle);
+        let bridge_cfg = bridge_config_for(&self.name, grace_timeout, stuck_timeout);
+
+        // PTY path: frontend requested interactive PTY bridging.
+        if io.initial_size.is_some() {
+            return spawn_pty_bridged_docker(
+                self, io, argv, seeded, started_at, handle, bridge_cfg,
+            );
         }
 
-        let mut cmd = Command::new("docker");
-        cmd.args(&argv);
-        if interactive {
-            // Interactive (no PTY bridge): open /dev/tty directly so the
-            // container runtime gets a fresh, unmodified terminal fd for PTY
-            // setup. Inheriting fd 0 can fail with ENOTTY after buffered CLI
-            // reads.
-            #[cfg(unix)]
-            {
-                let tty_stdin = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open("/dev/tty")
-                    .map(std::process::Stdio::from)
-                    .unwrap_or_else(|_| Stdio::inherit());
-                cmd.stdin(tty_stdin);
-            }
-            #[cfg(not(unix))]
-            cmd.stdin(Stdio::inherit());
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-        } else if seeded.is_some() {
-            cmd.stdin(Stdio::piped());
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-        } else {
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
-        }
+        // Piped path: non-interactive or no PTY.
+        spawn_piped_docker(self, io, argv, seeded, started_at, handle, bridge_cfg)
+    }
+}
 
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                EngineError::ContainerRuntimeUnavailable {
-                    binary: "docker".into(),
-                }
-            } else {
-                EngineError::Container(format!("spawn docker: {e}"))
-            }
-        })?;
-
-        if let Some(prompt) = seeded {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(prompt.as_bytes());
-                let _ = stdin.write_all(b"\n");
-                drop(stdin);
-            }
-        }
-
-        let backend = DockerExecution {
-            child: Some(child),
-            pty_child: None,
-            pty_master: None,
-            stdin_injector: None,
-            container_name: self.name.0.clone(),
-            started_at,
-        };
-        Ok(ContainerExecution::new(handle, Box::new(backend)))
+/// Build a `BridgeConfig` for this container, including a cancel callback
+/// that runs `docker stop <name>` so the startup-grace detector can kill a
+/// container that never produced output. We construct the same `docker stop`
+/// invocation the backend's `cancel_handle` would issue.
+fn bridge_config_for(
+    name: &ContainerName,
+    grace_timeout: std::time::Duration,
+    stuck_timeout: std::time::Duration,
+) -> crate::engine::container::io_bridge::BridgeConfig {
+    let container_name = name.0.clone();
+    let cancel: crate::engine::container::io_bridge::CancelFn = std::sync::Arc::new(move || {
+        let _ = Command::new("docker")
+            .args(["stop", &container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+    crate::engine::container::io_bridge::BridgeConfig {
+        grace_timeout,
+        stuck_timeout,
+        container_start_delay: std::time::Duration::ZERO,
+        cancel_on_grace_expired: Some(cancel),
     }
 }
 
 /// Spawn `docker run -it` via `portable-pty` and bridge the PTY master to
-/// the frontend's `ContainerIo` channels.
-///
-/// - Reader thread: PTY master → `io.stdout` (frontend's vt100 parser).
-/// - Writer task:   `io.stdin` → PTY master (user keystrokes).
-/// - Resize task:   `io.resize` → `master.resize()` (terminal resize forwarding).
-///
-/// The returned `DockerExecution` owns the master and child so cancel/wait
-/// keep working and the bridge tasks tear themselves down on EOF.
+/// the frontend's `ContainerIo` channels via the shared I/O bridge.
 fn spawn_pty_bridged_docker(
     instance: Box<DockerContainerInstance>,
-    _frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
     io: crate::engine::container::frontend::ContainerIo,
     argv: Vec<String>,
+    _seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::ContainerHandle,
+    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<ContainerExecution, EngineError> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-    let (cols, rows) = io.initial_size;
+    let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -412,84 +361,89 @@ fn spawn_pty_bridged_docker(
         .spawn_command(cmd)
         .map_err(|e| EngineError::Container(format!("spawn docker via pty: {e}")))?;
 
-    // Master-side I/O handles. Reader and writer are taken before we hand
-    // the master to the execution backend (which keeps it alive for resize).
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+    // Interactive PTY runs pass the seeded prompt as a CLI positional arg
+    // (appended by `build_run_argv`), so it must NOT also be written to stdin.
+    // Writing it here would cause the PTY to echo the prompt text into the
+    // terminal output, painting it over the TUI before the agent starts.
 
-    // Reader thread: PTY → frontend stdout channel.
-    let stdout_tx = io.stdout;
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if stdout_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // Writer task: stdin channel → PTY. The same channel is fed by the
-    // frontend's keystrokes AND by `inject_prompt` (workflow continue-in-current).
-    let mut stdin_rx = io.stdin_rx;
-    tokio::spawn(async move {
-        use std::io::Write;
-        while let Some(bytes) = stdin_rx.recv().await {
-            if writer.write_all(&bytes).is_err() {
-                break;
-            }
-            if writer.flush().is_err() {
-                break;
-            }
-        }
-    });
-
-    // Resize task: forward terminal resizes to the PTY master.
-    //
-    // `MasterPty` is not `Clone`, so we wrap it in `Arc<Mutex>` and share
-    // between the resize task and the execution backend (which needs it for
-    // cleanup). Resize calls are rare and brief, so lock contention is fine.
-    let master_arc = std::sync::Arc::new(std::sync::Mutex::new(pair.master));
-
-    let master_for_resize = std::sync::Arc::clone(&master_arc);
-    let mut resize_rx = io.resize;
-    tokio::spawn(async move {
-        while let Some((cols, rows)) = resize_rx.recv().await {
-            if let Ok(master) = master_for_resize.lock() {
-                let _ = master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            }
-        }
-    });
+    let (master_arc, bridge) =
+        crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;
 
     let backend = DockerExecution {
         child: None,
         pty_child: Some(child),
         pty_master: Some(master_arc),
-        stdin_injector: Some(io.stdin_tx),
+        stdin_injector: Some(bridge.stdin_injector),
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(handle, Box::new(backend)))
+    Ok(ContainerExecution::new(
+        handle,
+        Box::new(backend),
+        bridge.stuck_tx,
+    ))
+}
+
+/// Spawn `docker run` with piped stdio and bridge through `ContainerIo`.
+fn spawn_piped_docker(
+    instance: Box<DockerContainerInstance>,
+    io: crate::engine::container::frontend::ContainerIo,
+    argv: Vec<String>,
+    seeded: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    handle: crate::data::session::ContainerHandle,
+    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
+) -> Result<ContainerExecution, EngineError> {
+    let mut cmd = Command::new("docker");
+    cmd.args(&argv);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            EngineError::ContainerRuntimeUnavailable {
+                binary: "docker".into(),
+            }
+        } else {
+            EngineError::Container(format!("spawn docker: {e}"))
+        }
+    })?;
+
+    // Write seeded prompt into stdin channel before the writer task starts.
+    if let Some(prompt) = seeded {
+        let _ = io.stdin_tx.send(prompt.into_bytes());
+        let _ = io.stdin_tx.send(b"\n".to_vec());
+    }
+
+    let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
+
+    // Non-interactive (piped) path: drop the engine's stdin_injector so the
+    // writer task sees EOF after draining the seeded prompt and closes the
+    // child's stdin pipe. Without this, an agent that probes stdin for EOF
+    // would hang waiting for input that will never come.
+    // `try_inject_stdin` falls back to launching a fresh container — which
+    // is the correct behaviour for a non-interactive run that has already
+    // consumed its single prompt.
+    drop(bridge.stdin_injector);
+
+    let backend = DockerExecution {
+        child: Some(child),
+        pty_child: None,
+        pty_master: None,
+        stdin_injector: None,
+        container_name: instance.name.0.clone(),
+        started_at,
+    };
+    Ok(ContainerExecution::new(
+        handle,
+        Box::new(backend),
+        bridge.stuck_tx,
+    ))
 }
 
 struct DockerExecution {
-    /// Set when running with inherit-stdio (CLI / non-interactive).
+    /// Set when running with piped stdio.
     child: Option<std::process::Child>,
     /// Set when running PTY-bridged. `portable_pty::Child` has its own wait
     /// API and cannot be unified with `std::process::Child`.
@@ -524,7 +478,7 @@ impl ExecutionBackend for DockerExecution {
             });
         }
 
-        // Inherit-stdio path: wait on std::process::Child.
+        // Piped path: wait on std::process::Child.
         let mut child = self
             .child
             .take()
@@ -556,14 +510,11 @@ impl ExecutionBackend for DockerExecution {
     }
 
     fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
-        // PTY-bridged path: push into the writer task's input channel.
         if let Some(tx) = &self.stdin_injector {
             tx.send(bytes.to_vec())
                 .map_err(|e| EngineError::Container(format!("inject stdin: {e}")))?;
             return Ok(true);
         }
-        // Inherit-stdio path: no channel back to the host TTY — engine will
-        // fall back to a fresh container.
         Ok(false)
     }
 
@@ -627,16 +578,16 @@ pub(super) fn build_run_argv(
     args.push("--name".into());
     args.push(name.0.clone());
 
-    // Standard amux label so `list_running` can filter.
+    // Standard awman label so `list_running` can filter.
     args.push("--label".into());
-    args.push(AMUX_LABEL.into());
+    args.push(AWMAN_LABEL.into());
 
     // Session-scoped label — emitted when the option-builder threaded the
     // session id through. Lets `list_running` attribute containers to a
-    // specific amux session.
+    // specific awman session.
     if let Some(session_id) = &options.session_label {
         args.push("--label".into());
-        args.push(format!("amux.session={session_id}"));
+        args.push(format!("awman.session={session_id}"));
     }
 
     // Working dir.
@@ -698,17 +649,6 @@ pub(super) fn build_run_argv(
                 args.push(gid.to_string());
             }
         }
-    }
-
-    // SSH directory mount (read-only).
-    if let Some(ssh) = &options.mount_ssh {
-        let target = options
-            .dockerfile_user
-            .as_deref()
-            .map(|u| format!("/home/{u}/.ssh"))
-            .unwrap_or_else(|| "/root/.ssh".to_string());
-        args.push("-v".into());
-        args.push(format!("{}:{}:ro", ssh.display(), target));
     }
 
     // Container CPU/memory limits.
@@ -782,7 +722,7 @@ pub(super) fn build_run_argv(
 }
 
 fn parse_stats_line(line: &str, fallback_name: &str) -> Result<ContainerStats, EngineError> {
-    // Format: "name|cpu%|memUsage" e.g. "amux-x|2.31%|123MiB / 4GiB"
+    // Format: "name|cpu%|memUsage" e.g. "awman-x|2.31%|123MiB / 4GiB"
     let parts: Vec<&str> = line.splitn(3, '|').collect();
     if parts.len() < 3 {
         return Err(EngineError::Container(format!(
@@ -866,20 +806,18 @@ fn host_docker_group_gid() -> Option<u32> {
 #[cfg(unix)]
 fn clear_stdio_nonblocking() {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    use std::os::unix::io::AsRawFd;
-    for fd in [
-        std::io::stdin().as_raw_fd(),
-        std::io::stdout().as_raw_fd(),
-        std::io::stderr().as_raw_fd(),
-    ] {
-        if let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) {
+    fn clear_fd(fd: impl std::os::fd::AsFd) {
+        if let Ok(flags) = fcntl(&fd, FcntlArg::F_GETFL) {
             let mut o = OFlag::from_bits_truncate(flags);
             if o.contains(OFlag::O_NONBLOCK) {
                 o.remove(OFlag::O_NONBLOCK);
-                let _ = fcntl(fd, FcntlArg::F_SETFL(o));
+                let _ = fcntl(&fd, FcntlArg::F_SETFL(o));
             }
         }
     }
+    clear_fd(std::io::stdin());
+    clear_fd(std::io::stdout());
+    clear_fd(std::io::stderr());
 }
 
 #[cfg(test)]
@@ -905,7 +843,7 @@ mod tests {
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"--rm".to_string()));
         assert!(argv.contains(&"--label".to_string()));
-        assert!(argv.contains(&AMUX_LABEL.to_string()));
+        assert!(argv.contains(&AWMAN_LABEL.to_string()));
         // Image is the final positional arg.
         assert_eq!(argv.last().map(String::as_str), Some("img:latest"));
     }
@@ -932,22 +870,22 @@ mod tests {
 
     #[test]
     fn build_run_argv_env_passthrough_only_when_set() {
-        std::env::set_var("AMUX_TEST_ENV_DOCKER", "v1");
+        std::env::set_var("AWMAN_TEST_ENV_DOCKER", "v1");
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar("AMUX_TEST_ENV_DOCKER".into())),
-            ContainerOption::EnvPassthrough(EnvVar("AMUX_TEST_NEVER_SET_DOCKER".into())),
+            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_ENV_DOCKER".into())),
+            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_NEVER_SET_DOCKER".into())),
         ]);
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
         );
-        assert!(argv.contains(&"AMUX_TEST_ENV_DOCKER=v1".to_string()));
+        assert!(argv.contains(&"AWMAN_TEST_ENV_DOCKER=v1".to_string()));
         assert!(!argv
             .iter()
-            .any(|a| a.contains("AMUX_TEST_NEVER_SET_DOCKER")));
-        std::env::remove_var("AMUX_TEST_ENV_DOCKER");
+            .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")));
+        std::env::remove_var("AWMAN_TEST_ENV_DOCKER");
     }
 
     #[test]
@@ -1128,35 +1066,6 @@ mod tests {
             argv.windows(2)
                 .any(|w| w[0] == "--name" && w[1] == "my-container"),
             "container name must appear as --name <name>"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_mount_ssh_adds_ro_volume() {
-        let ssh_src = PathBuf::from("/home/user/.ssh");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::MountSsh {
-                source: ssh_src.clone(),
-            },
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        );
-        let ssh_vol = argv
-            .windows(2)
-            .find(|w| w[0] == "-v" && w[1].contains(".ssh"))
-            .map(|w| w[1].clone())
-            .expect("SSH mount volume must be present");
-        assert!(
-            ssh_vol.ends_with(":ro"),
-            "SSH mount must be read-only: {ssh_vol}"
-        );
-        assert!(
-            ssh_vol.starts_with("/home/user/.ssh:"),
-            "SSH host path must match: {ssh_vol}"
         );
     }
 

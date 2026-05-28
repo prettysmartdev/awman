@@ -24,3 +24,5 @@ target
 .claude/worktrees
 .amux/workflows
 .cargo
+.antigravitycli
+

@@ -52,11 +52,20 @@ impl UserMessageSink for CliUserMessageQueue {
 }
 
 fn write_to_stderr(msg: &UserMessage) {
+    // Multi-line messages (e.g. the API-key ASCII-art banner) are emitted
+    // verbatim: a single-line prefix on a multi-line body misaligns the rest
+    // of the lines, breaking box-drawing characters and other layout.
+    if msg.text.contains('\n') {
+        let _ = writeln!(std::io::stderr(), "{}", msg.text);
+        let _ = std::io::stderr().flush();
+        return;
+    }
+
     let prefix = match msg.level {
-        MessageLevel::Info => "amux:",
-        MessageLevel::Warning => "amux warning:",
-        MessageLevel::Error => "amux error:",
-        MessageLevel::Success => "amux:",
+        MessageLevel::Info => "awman:",
+        MessageLevel::Warning => "awman warning:",
+        MessageLevel::Error => "awman error:",
+        MessageLevel::Success => "awman:",
     };
     let _ = writeln!(std::io::stderr(), "{prefix} {}", msg.text);
     let _ = std::io::stderr().flush();

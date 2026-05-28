@@ -2,7 +2,9 @@
 
 A workflow breaks a large implementation task into discrete phases — for example: plan → implement → review → docs. Each phase runs as its own agent session. You review the output between phases and decide whether to advance, retry, or redirect.
 
-Workflows are files you write and commit to your repo — in Markdown, TOML, or YAML. amux parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input.
+Workflows are files you write and commit to your repo — in TOML or YAML format. awman parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input. Optional `setup` and `teardown` sections allow you to prepare the environment before the first step (e.g., installing dependencies, checking out branches) and perform post-workflow actions (e.g., running tests, creating pull requests).
+
+**Migration from Markdown:** Markdown workflow files (`.md`) are no longer supported as of this release. If you have existing Markdown workflows, convert them to TOML or YAML using the format examples below. The conversion is straightforward — all step definitions map directly to TOML/YAML syntax.
 
 ---
 
@@ -21,16 +23,16 @@ Workflows are useful when:
 
 ```sh
 # Run a workflow file
-amux exec workflow aspec/workflows/implement-feature.md
+awman exec workflow aspec/workflows/implement-hard.toml
 
 # Run a workflow and associate a work item for template variable substitution
-amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 
 # Run a workflow without a work item
-amux exec workflow aspec/workflows/review.md
+awman exec workflow aspec/workflows/dependency-upgrade.toml
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [Headless Mode](08-headless-mode.md#amux-exec-workflow-path--amux-exec-wf-path) for usage in CI and scripting contexts.
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [API Mode](09-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts.
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -38,13 +40,13 @@ The TUI shows a **workflow status strip** between the execution window and the c
 
 ## Creating a workflow file
 
-Use `amux new workflow` to create a workflow file interactively without having to remember the schema by hand.
+Use `awman new workflow` to create a workflow file interactively without having to remember the schema by hand.
 
 ### Interactive step entry
 
 ```sh
 # CLI
-amux new workflow
+awman new workflow
 
 # TUI command box
 new workflow
@@ -61,7 +63,7 @@ Both modes prompt for:
    - Depends-on (optional — comma-separated step names, press Enter to skip)
    - Prompt text — enter multiple lines and end with a line containing only `.`
 
-After each step you are asked whether to add another. When finished, amux writes the file and prints its path.
+After each step you are asked whether to add another. When finished, awman writes the file and prints its path.
 
 **TUI key bindings** (workflow dialog):
 
@@ -72,17 +74,16 @@ After each step you are asked whether to add another. When finished, amux writes
 | **Ctrl-Enter** | Finish — write the file and close the dialog |
 | **Esc** | Cancel without writing |
 
-By default amux writes to `aspec/workflows/<name>.toml` inside the current repo. Pass `--format` to choose a different format:
+By default awman writes to `aspec/workflows/<name>.toml` inside the current repo. Pass `--format` to choose a different format:
 
 ```sh
-amux new workflow --format yaml   # writes aspec/workflows/<name>.yaml
-amux new workflow --format md     # writes aspec/workflows/<name>.md
+awman new workflow --format yaml   # writes aspec/workflows/<name>.yaml
 ```
 
 ### Interview mode
 
 ```sh
-amux new workflow --interview
+awman new workflow --interview
 ```
 
 Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `new spec --interview` writes a work item.
@@ -92,53 +93,55 @@ In the TUI, the dialog switches to a two-field layout: workflow name and summary
 ### Global workflows
 
 ```sh
-amux new workflow --global
+awman new workflow --global
 ```
 
-Writes to `~/.amux/workflows/<name>.<ext>` instead of the current repo. Use this to build a personal library of reusable workflows that travel with you across projects.
+Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use this to build a personal library of reusable workflows that travel with you across projects.
 
-`--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.amux/workflows/` directory — not the whole repo or home directory — so your other files stay safe. This still requires being inside a git repository (for agent image lookup).
+`--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.awman/workflows/` directory — not the whole repo or home directory — so your other files stay safe. This still requires being inside a git repository (for agent image lookup).
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
 | `--interview` | Let a code agent complete the workflow from a short summary |
-| `--global` | Write to `~/.amux/workflows/` instead of the current repo |
-| `--format <fmt>` | Output format: `toml` (default), `yaml`, or `md` |
+| `--global` | Write to `~/.awman/workflows/` instead of the current repo |
+| `--format <fmt>` | Output format: `toml` (default) or `yaml`. Markdown is not supported |
 
 ### Edge cases
 
 | Situation | Behaviour |
 |-----------|-----------|
 | Name contains spaces or path separators | Rejected immediately with a descriptive error |
-| Workflow file already exists | Error with the existing path; amux does not overwrite silently |
-| Not inside a git repo (non-global) | Error: run with `--global` to write to `~/.amux/` |
+| Workflow file already exists | Error with the existing path; awman does not overwrite silently |
+| Not inside a git repo (non-global) | Error: run with `--global` to write to `~/.awman/` |
 | `--global --interview` outside a git repo | Error: agent image lookup requires a git repo |
 | Empty step name in TUI | Inline error; dialog stays open |
 | No steps added before Ctrl-Enter (TUI) | Inline error: "At least one step is required" |
 | Step prompt is empty (CLI) | Warning logged; empty prompt written to file |
 | `depends_on` names non-existent steps | Warning logged; file is still written (steps may be added later) |
+| Load a `.md` workflow file | Error: "Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml). See docs/04-workflows.md for the current format." |
 
 ---
 
 ## Workflow file formats
 
-amux supports three workflow file formats: **Markdown** (`.md`), **TOML** (`.toml`), and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. All three formats produce identical execution behaviour — you can pass any of them to `--workflow` interchangeably.
+awman supports two workflow file formats: **TOML** (`.toml`) and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. Both formats produce identical execution behaviour — you can pass either to `--workflow` interchangeably.
 
 | Extension | Format |
 |-----------|--------|
-| `.md` | Markdown |
 | `.toml` | TOML |
 | `.yml` or `.yaml` | YAML |
 
 Any other extension is rejected with:
 
 ```
-unsupported workflow format: expected .md, .toml, .yml, or .yaml
+unsupported workflow format: expected .toml, .yml, or .yaml
 ```
 
-All three formats support the same step fields:
+### Step fields
+
+All steps support the same fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -148,45 +151,7 @@ All three formats support the same step fields:
 | `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `maki`, `gemini` |
 | `model` | string | no | Run this step with a specific model. Overrides any `--model` flag |
 
-Field names in TOML and YAML are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
-
-### Markdown (`.md`)
-
-The original format. amux looks for:
-
-| Element | Description |
-|---------|-------------|
-| `# Title` | Optional heading used for display only |
-| `## Step: <name>` | Defines a step; names must be unique within the file |
-| `Depends-on: <step>[, <step>…]` | Declares upstream dependencies (omit for root steps) |
-| `Agent: <name>` | Optional. Run this step with a specific agent instead of the default |
-| `Model: <name>` | Optional. Run this step with a specific model |
-| `Prompt:` | Everything after this keyword (until the next heading) is the step's prompt template |
-
-```markdown
-# Implement Feature Workflow
-
-## Step: plan
-Prompt: Read the following work item and produce an implementation plan.
-
-{{work_item_content}}
-
-## Step: implement
-Depends-on: plan
-Prompt: Implement work item {{work_item_number}} according to the plan.
-
-Follow the spec: {{work_item_section:[Implementation Details]}}
-
-## Step: review
-Depends-on: implement
-Prompt: Review the changes from the implement step for correctness and style.
-
-## Step: docs
-Depends-on: implement
-Prompt: Write documentation for work item {{work_item_number}}.
-```
-
-In this example, `review` and `docs` both depend on `implement` — they form a **parallel group** and are executed sequentially in file order. In the TUI they are rendered stacked vertically with slight indentation.
+Field names are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
 
 ### TOML (`.toml`)
 
@@ -263,52 +228,339 @@ steps:
 
 Use YAML literal blocks (`|`) for multiline prompts. `depends_on` must be a YAML sequence — not a bare string. Newlines and `{{template_vars}}` are preserved exactly.
 
-### Prompt template variables
+---
 
-All three formats support the same template variables in the `prompt` field:
+## Setup and teardown phases
+
+Workflows can include optional `setup` and `teardown` sections to prepare the environment before the main steps and perform post-workflow actions.
+
+**Setup phase** runs before the first main step and is intended for:
+- Checking out or creating a Git branch
+- Pulling latest changes
+- Installing dependencies
+- Running build or configuration scripts
+- Cloning additional repositories needed by the workflow
+
+**Teardown phase** runs after all main steps complete (or on failure, if `teardown_on_failure` is enabled) and is intended for:
+- Running tests
+- Committing changes
+- Creating pull requests
+- Pushing branches to a remote
+- Cleanup operations
+
+All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. No shell commands are ever executed directly on the host. Each phase uses its own container instance: a setup container runs all setup steps, then is killed; later, a teardown container is started for all teardown steps.
+
+### Setup step types
+
+Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each step has a `type` field and type-specific fields:
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
+| `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. |
+| `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
+| `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
+| `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
+
+Example TOML setup:
+
+```toml
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/my-feature"
+base = "main"
+
+[[setup]]
+type = "run_shell"
+command = "npm install"
+
+[[setup]]
+type = "run_shell"
+command = "npm run build"
+```
+
+Example YAML setup:
+
+```yaml
+setup:
+  - type: checkout_create_branch
+    branch: feature/my-feature
+    base: main
+  - type: run_shell
+    command: npm install
+  - type: run_shell
+    command: npm run build
+```
+
+### Teardown step types
+
+Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) array. Each step has a `type` field and type-specific fields:
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. |
+| `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file. |
+| `commit_changes` | `message` (string, required), `add_all` (boolean, optional) | Commit staged changes. If `add_all` is `true`, runs `git add -A` first. |
+| `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote. Omit both to use `git push` with defaults. |
+| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. |
+
+Example TOML teardown:
+
+```toml
+[[teardown]]
+type = "run_shell"
+command = "npm test"
+
+[[teardown]]
+type = "commit_changes"
+message = "automated changes"
+add_all = true
+
+[[teardown]]
+type = "create_pull_request"
+title = "feat: automated implementation"
+body = "This PR was created automatically by an awman workflow."
+base = "main"
+```
+
+Example YAML teardown:
+
+```yaml
+teardown:
+  - type: run_shell
+    command: npm test
+  - type: commit_changes
+    message: "automated changes"
+    add_all: true
+  - type: create_pull_request
+    title: "feat: automated implementation"
+    body: "This PR was created automatically by an awman workflow."
+    base: main
+```
+
+### Teardown on failure
+
+By default, teardown steps are skipped if the workflow fails. To run teardown even on failure (e.g., to clean up partial artifacts), set `teardown_on_failure = true` at the top level:
+
+```toml
+name = "implement-feature"
+teardown_on_failure = true
+
+# steps, setup, teardown defined below...
+```
+
+If any teardown step fails, the error is logged and execution continues to the next teardown step (best-effort cleanup). Teardown failure does not retroactively change the workflow's success/failure status.
+
+### Container execution model
+
+**Setup container lifecycle:**
+1. Before setup runs, awman starts a background container from the base image with the session workdir mounted
+2. Each setup step is executed via `exec` into the running container
+3. After all setup steps complete (or if any step fails), the setup container is killed
+4. If setup fails, the main workflow steps do not run
+
+**Teardown container lifecycle:**
+1. After all main steps complete, awman starts a fresh teardown container (separate from the setup container)
+2. Each teardown step is executed via `exec` into the teardown container
+3. After all teardown steps complete, the teardown container is killed
+4. If `teardown_on_failure = false` and the workflow failed, teardown is skipped entirely
+
+All environment variables configured for the project (via overlays, config, or per-step `env` fields) are inherited by both setup and teardown containers, just as they are for main workflow steps.
+
+### Remote sessions and setup/teardown
+
+For `type: remote` API sessions, the repository is already cloned and the branch is checked out by awman at session creation time — the session's working directory points to a fresh clone before any setup steps begin. A `clone_repo` setup step is therefore redundant for provisioning the primary repo and should not be used for that purpose. It remains valid for cloning *additional* repositories needed by the workflow into subdirectories.
+
+### Idempotency
+
+If a workflow is interrupted mid-setup or mid-teardown and then resumed, the full setup or teardown phase is re-run from the beginning. Setup steps should be written to be idempotent — i.e., they should succeed whether or not they have been run before:
+
+- Use `git clone <url> || true` if the directory might already exist
+- Use `checkout_create_branch` instead of raw `git checkout -b` (it handles existing branches automatically)
+- Ensure package manager commands (`npm install`, `pip install`) are idempotent
+- For custom scripts, make them idempotent by checking preconditions
+
+### Base image and `gh` CLI
+
+If your teardown includes a `create_pull_request` step, the base container image **must have the GitHub CLI (`gh`) installed**. By default, the base image is the project's `Dockerfile.dev`. If `gh` is not available, the step will fail with a clear error. Update your `Dockerfile.dev` to include `gh` if you intend to use `create_pull_request` steps.
+
+### Complete example: setup + steps + teardown
+
+This example shows a full workflow that creates a branch, installs dependencies, runs implementation and review steps, then commits, pushes, and opens a PR:
+
+```toml
+title = "Implement and Ship"
+teardown_on_failure = false
+
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/{{work_item_number}}"
+base = "main"
+
+[[setup]]
+type = "run_shell"
+command = "cargo fetch"
+
+[[step]]
+name = "implement"
+model = "claude-opus-4-6"
+prompt = """
+Implement work item {{work_item_number}} according to the spec.
+"""
+
+[[step]]
+name = "review"
+depends_on = ["implement"]
+prompt = """
+Review the changes for correctness and style.
+"""
+
+[[teardown]]
+type = "run_shell"
+command = "make test"
+
+[[teardown]]
+type = "commit_changes"
+message = "Implement {{work_item_number}}"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+
+[[teardown]]
+type = "create_pull_request"
+title = "Implement {{work_item_number}}"
+body = "Automated PR from awman workflow."
+base = "main"
+```
+
+The equivalent YAML:
+
+```yaml
+title: Implement and Ship
+teardown_on_failure: false
+
+setup:
+  - type: checkout_create_branch
+    branch: "feature/{{work_item_number}}"
+    base: main
+  - type: run_shell
+    command: cargo fetch
+
+steps:
+  - name: implement
+    model: claude-opus-4-6
+    prompt: |
+      Implement work item {{work_item_number}} according to the spec.
+  - name: review
+    depends_on: [implement]
+    prompt: |
+      Review the changes for correctness and style.
+
+teardown:
+  - type: run_shell
+    command: make test
+  - type: commit_changes
+    message: "Implement {{work_item_number}}"
+    add_all: true
+  - type: push_branch
+  - type: create_pull_request
+    title: "Implement {{work_item_number}}"
+    body: Automated PR from awman workflow.
+    base: main
+```
+
+### Template variables
+
+Template variables are available in **all workflow fields** — step `prompt` values, setup step fields, and teardown step fields. The only field that does not support substitution is `type` (which selects the step kind).
 
 | Variable | Replaced with |
 |----------|--------------|
 | `{{work_item_number}}` | Zero-padded four-digit work item number (e.g. `0027`) |
+| `{{work_item}}` | Bare numeric work item number (e.g. `27`) |
 | `{{work_item_content}}` | Full text of the work item Markdown file |
-| `{{work_item_section:[Name]}}` | Content of the named section from the work item file (case-insensitive) |
+| `{{work_item_section:[Name]}}` | Content of the named `## Name` section from the work item file (case-insensitive heading match, trailing colons stripped) |
+
+All variables require `--work-item` to be passed when running the workflow. If `--work-item` is omitted, `{{work_item_*}}` placeholders are replaced with empty strings and a warning is emitted.
 
 Unknown variables or missing sections are left in place with a warning.
+
+**Examples across workflow phases:**
+
+```toml
+# Setup — branch name derived from work item
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/{{work_item_number}}"
+
+# Step — prompt references work item content
+[[step]]
+name = "implement"
+prompt = "Implement {{work_item_number}}: {{work_item_section:[Summary]}}"
+
+# Teardown — commit message and PR title include work item number
+[[teardown]]
+type = "commit_changes"
+message = "Implement {{work_item_number}}"
+add_all = true
+
+[[teardown]]
+type = "create_pull_request"
+title = "feat: {{work_item_number}}"
+body = "{{work_item_section:[Summary]}}"
+```
 
 ---
 
 ## Multi-agent workflows
 
-Each step in a workflow can run in a different agent's container. In Markdown, add an `Agent:` line to the step header block — between `Depends-on:` and `Prompt:`. In TOML and YAML, add an `agent` key to the step object.
+Each step in a workflow can run in a different agent's container by adding an `agent` key to the step.
 
-```markdown
-## Step: plan
-Prompt: Produce an implementation plan.
+```toml
+[[step]]
+name = "plan"
+prompt = "Produce an implementation plan."
 
-## Step: implement
-Depends-on: plan
-Agent: codex
-Prompt: Implement the plan from the previous step.
+[[step]]
+name = "implement"
+depends_on = ["plan"]
+agent = "codex"
+prompt = "Implement the plan from the previous step."
 
-## Step: review
-Depends-on: implement
-Agent: claude
-Prompt: Review the implementation for correctness and style.
+[[step]]
+name = "review"
+depends_on = ["implement"]
+agent = "claude"
+prompt = "Review the implementation for correctness and style."
 ```
 
-Steps without an `Agent:` field use the workflow default agent — the value from repo config (or global config), overridden by the `--agent` flag if one was passed at the command line. The `--agent` flag sets the **default** for steps that do not name an agent; it does **not** override steps that explicitly specify one.
+```yaml
+steps:
+  - name: plan
+    prompt: Produce an implementation plan.
+  - name: implement
+    depends_on: [plan]
+    agent: codex
+    prompt: Implement the plan from the previous step.
+  - name: review
+    depends_on: [implement]
+    agent: claude
+    prompt: Review the implementation for correctness and style.
+```
+
+Steps without an `agent` field use the workflow default agent — the value from repo config (or global config), overridden by the `--agent` flag if one was passed at the command line. The `--agent` flag sets the **default** for steps that do not name an agent; it does **not** override steps that explicitly specify one.
 
 ### Agent pre-flight check
 
-Before the first step runs, amux collects every distinct agent name required across all steps and checks that the corresponding image exists. If an image is missing, amux prompts:
+Before the first step runs, awman collects every distinct agent name required across all steps and checks that the corresponding image exists. If an image is missing, awman prompts:
 
 ```
 Agent 'codex' has no Dockerfile. Download and build it? [y/N]:
 ```
 
-**Accept** — amux downloads the agent Dockerfile template, builds the project base image (if needed), then builds the agent image. If your repo has multiple agents to set up, each is prompted in turn before the workflow begins.
+**Accept** — awman downloads the agent Dockerfile template, builds the project base image (if needed), then builds the agent image. If your repo has multiple agents to set up, each is prompted in turn before the workflow begins.
 
-**Decline** — amux asks whether to substitute the default agent for that step instead:
+**Decline** — awman asks whether to substitute the default agent for that step instead:
 
 ```
 Use the default agent (claude) for steps that specify 'codex'? [y/N]:
@@ -319,62 +571,75 @@ Use the default agent (claude) for steps that specify 'codex'? [y/N]:
 
 If all required images are already available, the pre-flight check completes silently and the first step launches immediately.
 
-### Field placement
+### Unknown agents
 
-`Agent:` must appear in the step header block — after any `Depends-on:` line and before the `Prompt:` line. An `Agent:` that appears after `Prompt:` is treated as prompt text, not as a directive.
-
-An unknown agent name in an `Agent:` field is caught at parse time, before any container runs, and exits with a list of valid options.
+An unknown agent name in an `agent` field is caught at parse time, before any container runs, and exits with a list of valid options.
 
 ### Resuming workflows with per-step agents
 
-When resuming a saved workflow, the per-step agent assignments from the original run are preserved in the state file. If you pass a different `--agent` flag on resume, amux warns you; the persisted assignments still take precedence.
+When resuming a saved workflow, the per-step agent assignments from the original run are preserved in the state file. If you pass a different `--agent` flag on resume, awman warns you; the persisted assignments still take precedence.
 
 ---
 
 ## Per-step model overrides
 
-Each step in a workflow can run against a different model. In Markdown, add a `Model:` line to the step header block — between any `Agent:` line and the `Prompt:` line. In TOML and YAML, add a `model` key to the step object.
+Each step in a workflow can run against a different model by adding a `model` key to the step.
 
-```markdown
-## Step: plan
-Agent: claude
-Model: claude-opus-4-6
-Prompt: Produce a detailed implementation plan.
+```toml
+[[step]]
+name = "plan"
+agent = "claude"
+model = "claude-opus-4-6"
+prompt = "Produce a detailed implementation plan."
 
-## Step: implement
-Depends-on: plan
-Agent: claude
-Model: claude-haiku-4-5
-Prompt: Implement the plan from the previous step.
+[[step]]
+name = "implement"
+depends_on = ["plan"]
+agent = "claude"
+model = "claude-haiku-4-5"
+prompt = "Implement the plan from the previous step."
 
-## Step: review
-Depends-on: implement
-Prompt: Review the implementation for correctness and style.
+[[step]]
+name = "review"
+depends_on = ["implement"]
+prompt = "Review the implementation for correctness and style."
+```
+
+```yaml
+steps:
+  - name: plan
+    agent: claude
+    model: claude-opus-4-6
+    prompt: Produce a detailed implementation plan.
+  - name: implement
+    depends_on: [plan]
+    agent: claude
+    model: claude-haiku-4-5
+    prompt: Implement the plan from the previous step.
+  - name: review
+    depends_on: [implement]
+    prompt: Review the implementation for correctness and style.
 ```
 
 In this example, `plan` uses a large model for deep reasoning, `implement` uses a smaller model for routine code generation, and `review` inherits whatever model is in effect from the `--model` flag (or the agent's built-in default if no flag was passed).
 
 ### Model resolution order
 
-For each step, amux resolves the effective model using this priority:
+For each step, awman resolves the effective model using this priority:
 
 | Priority | Source | Applies when |
 |----------|--------|-------------|
-| 1 (highest) | Step's `Model:` field | The step explicitly declares a model |
-| 2 | `--model` flag on the command line | The step has no `Model:` field |
+| 1 (highest) | Step's `model` field | The step explicitly declares a model |
+| 2 | `--model` flag on the command line | The step has no `model` field |
 | 3 (lowest) | Agent built-in default | Neither a step field nor a flag was provided |
 
-The `--model` flag acts as the **default** for all steps without a `Model:` field; it does **not** override steps that declare their own model.
+The `--model` flag acts as the **default** for all steps without a `model` field; it does **not** override steps that declare their own model.
 
-### Field placement
-
-`Model:` must appear in the step header block — after any `Depends-on:` and `Agent:` lines and before the `Prompt:` line. A `Model:` that appears after `Prompt:` is treated as prompt text, not as a directive. A `Model:` line with no value is treated as absent — it does not pass an empty string to the agent.
-
-`Agent:` and `Model:` are independent overrides. A step can specify one, both, or neither. When both are present, amux resolves the agent first (using the same logic as without `Model:`), then resolves the model.
+`agent` and `model` are independent overrides. A step can specify one, both, or neither. When both are present, awman resolves the agent first, then resolves the model.
 
 ### Workflow resume and model persistence
 
-Per-step model values from `Model:` fields are persisted in the workflow state file. On resume, the persisted model is used, not any `--model` flag passed on the resumed invocation. This matches the existing behaviour for `Agent:` fields and ensures the resumed run is identical to the original.
+Per-step `model` values are persisted in the workflow state file. On resume, the persisted model is used, not any `--model` flag passed on the resumed invocation. This matches the existing behaviour for `agent` fields and ensures the resumed run is identical to the original.
 
 ---
 
@@ -383,7 +648,7 @@ Per-step model values from `Model:` fields are persisted in the workflow state f
 ### In the TUI
 
 ```
-exec workflow aspec/workflows/implement-feature.md --work-item 0027
+exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 ```
 
 A **workflow status strip** appears, showing each step as a coloured box:
@@ -401,10 +666,10 @@ When a step completes, a confirmation dialog appears. Press **Enter** or **y** t
 ### In command mode
 
 ```sh
-amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 ```
 
-Between steps, amux prints the step summary and prompts:
+Between steps, awman prints the step summary and prompts:
 
 ```
 Step 'plan' completed.
@@ -425,8 +690,8 @@ Press [r] to retry, or any other key to abort:
 
 | Flag | Description |
 |------|-------------|
-| `--agent=<name>` | Default agent for steps that do not specify an `Agent:` field. Does not override steps with an explicit `Agent:` directive |
-| `--model=<NAME>` | Default model for steps that do not specify a `Model:` field. Does not override steps with an explicit `Model:` directive |
+| `--agent=<name>` | Default agent for steps that do not specify an `agent` field. Does not override steps with an explicit `agent` value |
+| `--model=<NAME>` | Default model for steps that do not specify a `model` field. Does not override steps with an explicit `model` value |
 | `--non-interactive` | Run each step's agent in print/batch mode |
 | `--plan` | Run each step in read-only mode |
 | `--allow-docker` | Mount Docker socket into each step's container |
@@ -444,7 +709,7 @@ There are two variants of the control board:
 
 ### Lightweight step confirmation (between steps)
 
-When a step completes and the next step is ready, amux shows a compact confirmation dialog:
+When a step completes and the next step is ready, awman shows a compact confirmation dialog:
 
 ```
 ╭─ Step 'implement' done. Advance to 'test'? ─╮
@@ -502,28 +767,7 @@ The dialog title shows `Workflow Control (step running)` when opened mid-step. A
 
 ### Next step: same container
 
-The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, amux falls back to a new container and shows a status message.
-
-If the next step requires a **different agent** than the current step, the **↓** option is unavailable. In the TUI it renders greyed out with the message:
-
-```
-Next step uses agent 'codex'; cannot reuse current 'claude' container.
-```
-
-In command mode, the "same container" prompt is skipped entirely and the explanation is printed instead. Use **→** (new container) to advance, which always works regardless of agent.
-
-### Manual vs. automatic opening
-
-Ctrl+W works:
-- Between steps (always available)
-- **During a running step** (new) — does not kill the container unless you select a destructive action
-- When no other dialog is open
-
----
-
-### Next step: same container
-
-The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, amux falls back to a new container and shows a status message.
+The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, awman falls back to a new container and shows a status message.
 
 If the next step requires a **different agent** than the current step, the **↓** option is unavailable. In the TUI it renders greyed out with the message:
 
@@ -572,7 +816,7 @@ Steps that share the same dependencies form a **parallel group** and execute seq
 
 ### Viewing the full control board
 
-When a step completes, amux shows the lightweight confirmation dialog. To see all available actions and options, press **Ctrl+W** to open the full control board. Pressing **Esc** on the lightweight dialog pauses the workflow for manual input.
+When a step completes, awman shows the lightweight confirmation dialog. To see all available actions and options, press **Ctrl+W** to open the full control board. Pressing **Esc** on the lightweight dialog pauses the workflow for manual input.
 
 ---
 
@@ -591,17 +835,17 @@ Stuck detection fires independently per tab — background tabs detect and repor
 
 ## Workflow state persistence
 
-amux saves workflow state to:
+awman saves workflow state to:
 
 ```
-$GITROOT/.amux/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
+$GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 ```
 
 The file records the status of every step, the container ID used for each step, and a SHA-256 hash of the workflow file.
 
 ### Resuming
 
-If a saved state file exists when you run `exec workflow`, amux offers to resume:
+If a saved state file exists when you run `exec workflow`, awman offers to resume:
 
 ```
 Found a saved workflow state for 'implement-feature' (work item 0027).
@@ -612,7 +856,7 @@ Found a saved workflow state for 'implement-feature' (work item 0027).
 
 ### Workflow file changed
 
-If the workflow file has been modified since the state was saved, amux warns you:
+If the workflow file has been modified since the state was saved, awman warns you:
 
 ```
 WARNING: The workflow file has changed since the last run.
@@ -621,11 +865,11 @@ WARNING: The workflow file has changed since the last run.
   [1/2]:
 ```
 
-If you choose `2`, amux verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
+If you choose `2`, awman verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
 
 ### Interrupted steps
 
-If a step was running when amux last exited:
+If a step was running when awman last exited:
 
 ```
 Step 'implement' was running when the previous session ended.
@@ -636,21 +880,20 @@ Start it over (s) or skip to next step (n)? [s/n]:
 
 ## Parallel groups
 
-Steps that share the same `Depends-on` set form a **parallel group**. amux executes them sequentially in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically. If a group has more than two steps, the third box shows `+ N more…`.
+Steps that share the same `Depends-on` set form a **parallel group**. awman executes them sequentially in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically. If a group has more than two steps, the third box shows `+ N more…`.
 
 ---
 
 ## Bundled examples
 
-`aspec/workflows/` contains ready-to-use example workflows in all three supported formats:
+`aspec/workflows/` contains ready-to-use workflow files:
 
-| File | Format | Description |
-|------|--------|-------------|
-| `implement-preplanned.md` | Markdown | Four-step implement → tests + docs → review workflow |
-| `implement-preplanned.toml` | TOML | Identical workflow in TOML format |
-| `implement-preplanned.yaml` | YAML | Identical workflow in YAML format |
-
-All three files define the same four steps (`implement`, `tests`, `docs`, `review`) with the same prompts, dependencies, and agent assignments. Use whichever format best fits your tooling — for example, TOML or YAML if you generate or lint workflow files programmatically.
+| File | Description |
+|------|-------------|
+| `implement-hard.toml` | Four-step workflow: implement → tests + docs (parallel) → review. Uses Opus for implementation, Haiku for docs, and a final interactive review step |
+| `implement-pr.toml` | Same four steps as `implement-hard.toml`, plus teardown steps that run tests, commit changes, push the branch, and create a pull request |
+| `hard-parity-local.toml` | Five-step workflow: implement → parity check → tests + docs (parallel) → review. Uses a local model via OpenCode for parity checking, tests, and docs |
+| `dependency-upgrade.toml` | Two-step workflow: security audit → version audit. Upgrades vulnerable dependencies first, then reviews available version updates |
 
 ---
 
@@ -658,19 +901,17 @@ All three files define the same four steps (`implement`, `tests`, `docs`, `revie
 
 | Situation | Behaviour |
 |-----------|-----------|
-| Cycle in `Depends-on` graph | Error before any agent runs |
-| Unknown `Depends-on` step name | Error at parse time |
-| Unknown agent name in `Agent:` field | Error at parse time, before any containers run |
-| `Agent:` field placed after `Prompt:` | Treated as prompt text, not a directive |
+| Cycle in `depends_on` graph | Error before any agent runs |
+| Unknown `depends_on` step name | Error at parse time |
+| Unknown agent name in `agent` field | Error at parse time, before any containers run |
 | Missing agent image at workflow start | Pre-flight prompt: build it, fall back to default, or abort |
 | Agent Dockerfile download fails during pre-flight | Error surfaced; workflow does not start |
 | Agent image build fails during pre-flight | Error surfaced; partial Dockerfile removed; workflow does not start |
-| `--agent` flag + step with explicit `Agent:` field | Step's `Agent:` directive wins; `--agent` is only the default for unspecified steps |
-| `--model` flag + step with explicit `Model:` field | Step's `Model:` directive wins; `--model` is only the default for steps without a `Model:` field |
-| `Model:` combined with `Agent:` in the same step | Independent overrides; agent resolved first, then model |
-| `Model:` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
-| `Model:` appearing after `Prompt:` | Treated as prompt text, not a directive |
-| Invalid model name in `Model:` field | Passed verbatim to the agent; the agent surfaces its own error |
+| `--agent` flag + step with explicit `agent` field | Step's `agent` value wins; `--agent` is only the default for unspecified steps |
+| `--model` flag + step with explicit `model` field | Step's `model` value wins; `--model` is only the default for steps without a `model` field |
+| `model` combined with `agent` in the same step | Independent overrides; agent resolved first, then model |
+| `model` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
+| Invalid model name in `model` field | Passed verbatim to the agent; the agent surfaces its own error |
 | Resume with a different `--model` flag | Persisted per-step model values take precedence; `--model` applies only to steps with no persisted model |
 | All steps specify non-default agents | Pre-flight still runs for each; default fallback offered only if setup is declined |
 | Parallel steps with different agents | Each step runs in its own container — no cross-step sharing |
@@ -678,13 +919,22 @@ All three files define the same four steps (`implement`, `tests`, `docs`, `revie
 | Current step and next step use the same agent | "Same container" (**↓**) option available as usual |
 | Current step and next step use different agents | "Same container" option greyed out (TUI) or skipped (CLI) with explanation |
 | Empty workflow file | Rejected with a helpful message |
-| Unsupported file extension (e.g. `.json`) | Error: `unsupported workflow format: expected .md, .toml, .yml, or .yaml` |
+| Unsupported file extension (e.g. `.json`) | Error: `unsupported workflow format: expected .toml, .yml, or .yaml` |
+| Markdown workflow file (`.md`) | Error: `Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml).` |
 | TOML/YAML step missing `name` field | Parse error including the step index |
 | TOML/YAML step missing `prompt` field | Parse error including the step name (or index if unnamed) |
-| Empty `[[step]]` / `steps:` array | Error matching the Markdown `"workflow file contains no steps"` behaviour |
+| Empty `[[step]]` / `steps:` array | Error: `"workflow file contains no steps"` |
 | `depends_on` as bare YAML string instead of sequence | Parse error; must be a YAML sequence |
 | Unknown field in TOML/YAML step (e.g. `dependson`) | Parse error; typos are not silently dropped |
 | Uppercase field name in TOML/YAML (e.g. `Name:`) | Parse error; field names must be lowercase |
+| Setup step with invalid type | Parse error; type must be one of the supported step types |
+| Teardown step with invalid type | Parse error; type must be one of the supported step types |
+| `create_pull_request` step but `gh` not in base image | Step fails at execution time with "command not found: gh" |
+| Setup failure | Main workflow steps do not run; go directly to teardown (if `teardown_on_failure = true`) or exit |
+| Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort) |
+| `checkout_create_branch` with no remote configured | Falls back to local branch creation from HEAD or specified `base` |
+| `run_script` step with non-existent path | Step fails with file-not-found error |
+| Setup interrupted and resumed | Full setup phase re-runs from the beginning; steps should be idempotent |
 | Work item file not found | Error before loading the workflow |
 | Workflow file not found / unreadable | Clear error with the file path |
 | Agent failure mid-workflow | Step marked Error; user prompted to retry or abort |

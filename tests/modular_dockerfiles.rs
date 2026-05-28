@@ -5,12 +5,12 @@
 //!   no Docker daemon required.
 //! - End-to-end tests: invoke the compiled `amux` binary with a temporary git repo;
 //!   require a running Docker daemon and are skipped when Docker is unavailable.
-use amux::cli::Agent;
-use amux::commands::init_flow::{
+use awman::cli::Agent;
+use awman::commands::init_flow::{
     dockerfile_for_agent_embedded, project_dockerfile_embedded, write_agent_dockerfile,
     write_project_dockerfile,
 };
-use amux::commands::output::OutputSink;
+use awman::commands::output::OutputSink;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
@@ -19,7 +19,7 @@ use tokio::sync::mpsc::unbounded_channel;
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 fn amux_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_amux"))
+    Command::new(env!("CARGO_BIN_EXE_awman"))
 }
 
 fn docker_available() -> bool {
@@ -88,11 +88,11 @@ async fn write_agent_dockerfile_creates_file_at_expected_path() {
 }
 
 /// The embedded agent template for "testproject" produces `FROM amux-testproject:latest`
-/// once `{{AMUX_BASE_IMAGE}}` is substituted.  Tests the substitution logic directly
+/// once `{{AWMAN_BASE_IMAGE}}` is substituted.  Tests the substitution logic directly
 /// without a network call so the assertion is not affected by the remote template version.
 #[test]
 fn embedded_agent_template_substitution_produces_correct_from_line() {
-    use amux::runtime::project_image_tag;
+    use awman::runtime::project_image_tag;
     use std::path::Path;
 
     let base_tag = project_image_tag(Path::new("/repos/testproject"));
@@ -100,18 +100,18 @@ fn embedded_agent_template_substitution_produces_correct_from_line() {
 
     let template = dockerfile_for_agent_embedded(&Agent::Claude);
     assert!(
-        template.contains("{{AMUX_BASE_IMAGE}}"),
-        "embedded claude template must contain {{AMUX_BASE_IMAGE}} placeholder"
+        template.contains("{{AWMAN_BASE_IMAGE}}"),
+        "embedded claude template must contain {{AWMAN_BASE_IMAGE}} placeholder"
     );
 
-    let content = template.replace("{{AMUX_BASE_IMAGE}}", &base_tag);
+    let content = template.replace("{{AWMAN_BASE_IMAGE}}", &base_tag);
     assert!(
         content.contains("FROM amux-testproject:latest"),
         "substituted template must have FROM amux-testproject:latest; got:\n{}",
         content
     );
     assert!(
-        !content.contains("{{AMUX_BASE_IMAGE}}"),
+        !content.contains("{{AWMAN_BASE_IMAGE}}"),
         "placeholder must not appear after substitution"
     );
 }
@@ -202,7 +202,7 @@ fn e2e_ready_creates_both_docker_images() {
     std::fs::write(project_dir.join("Dockerfile.dev"), &project_content).unwrap();
     std::fs::create_dir_all(project_dir.join(".amux")).unwrap();
     let agent_template = dockerfile_for_agent_embedded(&Agent::Claude);
-    let agent_content = agent_template.replace("{{AMUX_BASE_IMAGE}}", project_tag);
+    let agent_content = agent_template.replace("{{AWMAN_BASE_IMAGE}}", project_tag);
     std::fs::write(
         project_dir.join(".amux").join("Dockerfile.claude"),
         &agent_content,
@@ -279,7 +279,7 @@ fn e2e_ready_build_flag_rebuilds_both_images() {
     std::fs::write(project_dir.join("Dockerfile.dev"), &project_content).unwrap();
     std::fs::create_dir_all(project_dir.join(".amux")).unwrap();
     let agent_template = dockerfile_for_agent_embedded(&Agent::Claude);
-    let agent_content = agent_template.replace("{{AMUX_BASE_IMAGE}}", project_tag);
+    let agent_content = agent_template.replace("{{AWMAN_BASE_IMAGE}}", project_tag);
     std::fs::write(
         project_dir.join(".amux").join("Dockerfile.claude"),
         &agent_content,
@@ -352,7 +352,7 @@ fn e2e_ready_build_rebuilds_all_agent_dockerfiles() {
     std::fs::create_dir_all(project_dir.join(".amux")).unwrap();
 
     let claude_template = dockerfile_for_agent_embedded(&Agent::Claude);
-    let claude_content = claude_template.replace("{{AMUX_BASE_IMAGE}}", project_tag);
+    let claude_content = claude_template.replace("{{AWMAN_BASE_IMAGE}}", project_tag);
     std::fs::write(
         project_dir.join(".amux").join("Dockerfile.claude"),
         &claude_content,
@@ -360,7 +360,7 @@ fn e2e_ready_build_rebuilds_all_agent_dockerfiles() {
     .unwrap();
 
     let codex_template = dockerfile_for_agent_embedded(&Agent::Codex);
-    let codex_content = codex_template.replace("{{AMUX_BASE_IMAGE}}", project_tag);
+    let codex_content = codex_template.replace("{{AWMAN_BASE_IMAGE}}", project_tag);
     std::fs::write(
         project_dir.join(".amux").join("Dockerfile.codex"),
         &codex_content,
@@ -609,7 +609,7 @@ fn e2e_agent_image_built_on_demand_when_dockerfile_exists() {
     std::fs::write(project_dir.join("Dockerfile.dev"), &project_content).unwrap();
     std::fs::create_dir_all(project_dir.join(".amux")).unwrap();
     let agent_template = dockerfile_for_agent_embedded(&Agent::Claude);
-    let agent_content = agent_template.replace("{{AMUX_BASE_IMAGE}}", project_tag);
+    let agent_content = agent_template.replace("{{AWMAN_BASE_IMAGE}}", project_tag);
     std::fs::write(project_dir.join(".amux").join("Dockerfile.claude"), &agent_content).unwrap();
 
     // Ensure neither image exists before the test.

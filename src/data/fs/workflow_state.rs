@@ -11,7 +11,7 @@ use crate::data::session::{WorkflowInvocation, WorkflowStepRecord};
 
 use super::workflow_dirs::WorkflowDirs;
 
-/// Subdirectory under `<git_root>/.amux/` holding per-workflow state files.
+/// Subdirectory under `<git_root>/.awman/` holding per-workflow state files.
 pub const WORKFLOW_STATE_SUBDIR: &str = "workflows";
 
 /// Persists workflow state files under a git root.
@@ -21,7 +21,7 @@ pub struct WorkflowStateStore {
 }
 
 impl WorkflowStateStore {
-    /// Construct a store rooted at `<git_root>/.amux/workflows`.
+    /// Construct a store rooted at `<git_root>/.awman/workflows`.
     pub fn at_git_root(git_root: impl Into<PathBuf>) -> Self {
         Self {
             git_root: git_root.into(),

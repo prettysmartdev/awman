@@ -15,6 +15,18 @@ impl HasContainerFrontend for CliFrontend {
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
         Box::new(super::container_frontend_marker::CliContainerProxy)
     }
+
+    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+        if self.non_interactive {
+            return self.container_frontend();
+        }
+        let io = self.take_interactive_io();
+        Box::new(
+            super::container_frontend_marker::CliInteractiveContainerProxy {
+                container_io: Some(io),
+            },
+        )
+    }
 }
 
 impl ChatCommandFrontend for CliFrontend {

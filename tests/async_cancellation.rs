@@ -17,7 +17,7 @@
 //! sessions). A future improvement would be to store the `JoinHandle` and abort it on
 //! tab close.
 
-use amux::tui::state::{App, TabState};
+use awman::tui::state::{App, TabState};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

@@ -1,10 +1,10 @@
 # Project Foundation
 
-Name: amux
+Name: awman
 Type: CLI
-Purpose: A containerized code and claw agent manager.
+Purpose: A containerized code agent manager.
 
-amux is organized as a **four-layer architecture** to ensure clean separation between data persistence, business logic, command dispatch, and presentation frontends (CLI, TUI, Headless). See `aspec/architecture/design.md` for details.
+awman is organized as a **four-layer architecture** to ensure clean separation between data persistence, business logic, command dispatch, and presentation frontends (CLI, TUI, API). See `aspec/architecture/design.md` for details.
 
 # Technical Foundation
 
@@ -14,8 +14,8 @@ amux is organized as a **four-layer architecture** to ensure clean separation be
 Language: Rust
 Frameworks: Ratatui
 Guidance:
-- The `amux` CLI should compile to a single, statically linked binary for macOS, Linux, and Windows.
-- Every function of the CLI should be accessible either in "interactive" mode (i.e. running `amux` with no arguments launches a TUI to interact with its features) or "command" mode, where `amux` is run with one or more arguments, executes a single function, and then exits, printing its output to stdout and stderr.
+- The `awman` CLI should compile to a single, statically linked binary for macOS, Linux, and Windows.
+- Every function of the CLI should be accessible either in "interactive" mode (i.e. running `awman` with no arguments launches a TUI to interact with its features) or "command" mode, where `awman` is run with one or more arguments, executes a single function, and then exits, printing its output to stdout and stderr.
 - Idiomatic, async Rust code
 - Small, easily understood modules and crates
 - Prefer simplicity (understandable by an intermediate Rust programmer) over complex code that is concise.
@@ -29,10 +29,10 @@ Guidance:
 
 ### Persona 1:
 Name: user
-Purpose: user of the `amux` CLI tool in their macOS, linux, or Windows terminal.
+Purpose: user of the `awman` CLI tool in their macOS, linux, or Windows terminal.
 Use-cases:
-- executing `amux` interactive mode for ongoing sessions
-- executing `amux <>` command mode for single-use commands
+- executing `awman` interactive mode for ongoing sessions
+- executing `awman <>` command mode for single-use commands
 RBAC:
 - allowed: all
 - disallowed: none

@@ -131,8 +131,7 @@ mod tests {
             .map(|c| c.get_name().to_string())
             .collect();
         for n in [
-            "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote",
-            "new",
+            "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
         ] {
             assert!(
                 names.iter().any(|x| x == n),

@@ -17,7 +17,8 @@ use crate::data::workflow_dag::WorkflowDag;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
-use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo};
+use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo, StuckEvent};
+use crate::engine::container::ContainerExec;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -31,6 +32,7 @@ use crate::engine::workflow::frontend::WorkflowFrontend;
 pub mod actions;
 pub mod factory;
 pub mod frontend;
+pub mod step_commands;
 pub mod timing;
 
 /// Result of a mid-step yolo countdown (step is still running while
@@ -108,8 +110,9 @@ pub struct WorkflowEngine {
     current_step_name: Option<String>,
     current_step_agent: Option<AgentName>,
     current_step_model: Option<String>,
-    work_item: Option<u32>,
+    work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     yolo: bool,
+    abort_on_failure_triggered: bool,
     last_exit_info: Option<ContainerExitInfo>,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
 }
@@ -140,7 +143,7 @@ impl WorkflowEngine {
     pub fn new(
         session: &Session,
         workflow: Workflow,
-        work_item: Option<u32>,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         container_factory: Box<dyn ContainerExecutionFactory>,
         git_engine: Arc<GitEngine>,
@@ -148,11 +151,12 @@ impl WorkflowEngine {
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_hash = compute_workflow_hash(&workflow);
+        let work_item_number = work_item_context.as_ref().map(|c| c.number);
         let state = WorkflowState::new(
             workflow_name_for(&workflow),
             &workflow.steps,
             workflow_hash,
-            work_item,
+            work_item_number,
         );
         let state_store = WorkflowStateStore::new(session);
         let effective_config = session.effective_config();
@@ -173,11 +177,16 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
-            work_item,
+            work_item_context,
             yolo: false,
+            abort_on_failure_triggered: false,
             last_exit_info: None,
             engine_rx: Some(rx),
         })
+    }
+
+    pub fn abort_on_failure_triggered(&self) -> bool {
+        self.abort_on_failure_triggered
     }
 
     pub fn set_yolo(&mut self, yolo: bool) {
@@ -189,7 +198,7 @@ impl WorkflowEngine {
     pub async fn resume(
         session: &Session,
         workflow: Workflow,
-        work_item: Option<u32>,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         container_factory: Box<dyn ContainerExecutionFactory>,
         git_engine: Arc<GitEngine>,
@@ -198,7 +207,8 @@ impl WorkflowEngine {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let store = WorkflowStateStore::new(session);
         let workflow_name = workflow_name_for(&workflow);
-        let saved = store.load(work_item, &workflow_name)?;
+        let work_item_number = work_item_context.as_ref().map(|c| c.number);
+        let saved = store.load(work_item_number, &workflow_name)?;
 
         let workflow_hash = compute_workflow_hash(&workflow);
         let mut state = match saved {
@@ -224,7 +234,12 @@ impl WorkflowEngine {
                 }
                 saved
             }
-            None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash, work_item),
+            None => WorkflowState::new(
+                workflow_name,
+                &workflow.steps,
+                workflow_hash,
+                work_item_number,
+            ),
         };
 
         let interrupted = state.interrupted_running_steps();
@@ -259,8 +274,9 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
-            work_item,
+            work_item_context,
             yolo: false,
+            abort_on_failure_triggered: false,
             last_exit_info: None,
             engine_rx: Some(rx),
         })
@@ -315,6 +331,24 @@ impl WorkflowEngine {
                 self.frontend.report_workflow_progress(&progress);
 
                 let step = self.find_step(&outcome.step_name)?;
+
+                if step.abort_on_failure {
+                    self.msg_warning(format!(
+                        "Step '{}' failed (abort_on_failure); aborting workflow",
+                        outcome.step_name,
+                    ));
+                    self.abort_on_failure_triggered = true;
+                    for s in &self.workflow.steps {
+                        if !self.state.completed_steps.contains(&s.name) {
+                            self.state.set_status(&s.name, StepState::Cancelled);
+                        }
+                    }
+                    self.persist()?;
+                    let aborted = WorkflowOutcome::Aborted;
+                    self.frontend.report_workflow_completed(&aborted);
+                    return Ok(aborted);
+                }
+
                 let exit_info = self
                     .last_exit_info
                     .clone()
@@ -521,8 +555,8 @@ impl WorkflowEngine {
         })
     }
 
-    /// Like `step_once`, but processes `EngineRequest` messages (Ctrl-W,
-    /// StepStuck, StepUnstuck) while the step container runs.
+    /// Like `step_once`, but processes `EngineRequest` messages (Ctrl-W)
+    /// and container stuck events while the step container runs.
     async fn step_once_interruptible(&mut self) -> Result<InterruptibleStepResult, EngineError> {
         let step_name = self.launch_step().await?;
 
@@ -530,6 +564,14 @@ impl WorkflowEngine {
             .current_execution
             .as_ref()
             .and_then(|e| e.cancel_handle());
+
+        // Subscribe to stuck/unstuck events from the container's io_bridge.
+        let mut stuck_rx = self.current_execution.as_ref().map(|e| e.subscribe_stuck());
+
+        // Publish the stuck sender to the frontend (TUI uses it for tab coloring).
+        if let Some(exec) = self.current_execution.as_ref() {
+            self.frontend.set_stuck_sender(exec.stuck_sender());
+        }
 
         let mut exec = self
             .current_execution
@@ -555,6 +597,36 @@ impl WorkflowEngine {
                         self.finalize_step(&step_name, exit_result?)?
                     ));
                 }
+                Some(event) = Self::recv_stuck(&mut stuck_rx) => {
+                    match event {
+                        StuckEvent::Stuck => {
+                            let result = self.handle_step_stuck(
+                                &step_name,
+                                &cancel_handle,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                            ).await?;
+                            match result {
+                                None => continue,
+                                Some(r) => return Ok(r),
+                            }
+                        }
+                        StuckEvent::Unstuck => {
+                            // Not inside a yolo countdown — nothing to cancel.
+                        }
+                        StuckEvent::StartupGraceExpired => {
+                            // Container produced no output during its grace
+                            // window. The bridge already invoked the cancel
+                            // callback to kill it; surface a warning and let
+                            // wait_rx resolve naturally so finalize_step
+                            // records the failure.
+                            self.msg_warning(format!(
+                                "Step '{}' produced no output before its startup grace expired; killing container",
+                                step_name,
+                            ));
+                        }
+                    }
+                }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     match req {
                         EngineRequest::OpenControlBoard => {
@@ -577,88 +649,15 @@ impl WorkflowEngine {
                             }
                         }
                         EngineRequest::StepStuck => {
-                            self.msg_warning(format!(
-                                "Step '{}' appears stuck (no output)",
-                                step_name,
-                            ));
-                            if self.yolo && !self.is_last_step() {
-                                let yolo_result = self.run_mid_step_yolo_countdown(
-                                    &step_name,
-                                    &cancel_handle,
-                                    &mut wait_rx,
-                                ).await?;
-                                match yolo_result {
-                                    MidStepYoloResult::StepCompleted(o) => {
-                                        return Ok(InterruptibleStepResult::StepCompleted(o));
-                                    }
-                                    MidStepYoloResult::ShowControlBoard => {
-                                        let mid = self.handle_mid_step_control_board(
-                                            &step_name,
-                                            &cancel_handle,
-                                            &mut wait_rx,
-                                        )?;
-                                        match mid {
-                                            MidStepOutcome::Continue => continue,
-                                            MidStepOutcome::StepCompleted(o) => {
-                                                return Ok(InterruptibleStepResult::StepCompleted(o));
-                                            }
-                                            MidStepOutcome::WorkflowEnded(wo) => {
-                                                return Ok(InterruptibleStepResult::WorkflowEnded(wo));
-                                            }
-                                            MidStepOutcome::LoopContinue => {
-                                                return Ok(InterruptibleStepResult::LoopContinue);
-                                            }
-                                        }
-                                    }
-                                    MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => {
-                                        continue;
-                                    }
-                                    MidStepYoloResult::Advanced => {
-                                        self.msg_info(format!(
-                                            "Yolo auto-advancing past step '{}'",
-                                            step_name,
-                                        ));
-                                        if let Some(ch) = &cancel_handle {
-                                            let _ = ch.cancel();
-                                        }
-                                        self.state.set_status(&step_name, StepState::Succeeded);
-                                        self.persist()?;
-                                        let step = self.find_step(&step_name)?;
-                                        self.frontend.report_step_status(
-                                            &step,
-                                            WorkflowStepStatus::Succeeded,
-                                        );
-                                        let progress = self.workflow_progress_info();
-                                        self.frontend.report_workflow_progress(&progress);
-
-                                        if self.is_last_step() {
-                                            let available = self.compute_available_actions()?;
-                                            let action = self.frontend
-                                                .show_workflow_control_board(&self.state, &available)?;
-                                            return self.execute_top_level_action(action);
-                                        }
-
-                                        return Ok(InterruptibleStepResult::LoopContinue);
-                                    }
-                                }
-                            } else {
-                                let mid = self.handle_mid_step_control_board(
-                                    &step_name,
-                                    &cancel_handle,
-                                    &mut wait_rx,
-                                )?;
-                                match mid {
-                                    MidStepOutcome::Continue => continue,
-                                    MidStepOutcome::StepCompleted(o) => {
-                                        return Ok(InterruptibleStepResult::StepCompleted(o));
-                                    }
-                                    MidStepOutcome::WorkflowEnded(wo) => {
-                                        return Ok(InterruptibleStepResult::WorkflowEnded(wo));
-                                    }
-                                    MidStepOutcome::LoopContinue => {
-                                        return Ok(InterruptibleStepResult::LoopContinue);
-                                    }
-                                }
+                            let result = self.handle_step_stuck(
+                                &step_name,
+                                &cancel_handle,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                            ).await?;
+                            match result {
+                                None => continue,
+                                Some(r) => return Ok(r),
                             }
                         }
                         EngineRequest::StepUnstuck => {
@@ -676,6 +675,16 @@ impl WorkflowEngine {
     ) -> Option<EngineRequest> {
         match rx {
             Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Receive from the stuck broadcast channel, or pend forever if None.
+    async fn recv_stuck(
+        rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Option<StuckEvent> {
+        match rx {
+            Some(rx) => rx.recv().await.ok(),
             None => std::future::pending().await,
         }
     }
@@ -809,6 +818,79 @@ impl WorkflowEngine {
         }
     }
 
+    /// Handle a stuck event (from broadcast channel or EngineRequest).
+    /// Returns `None` to continue the select loop, or `Some(result)` to return.
+    async fn handle_step_stuck(
+        &mut self,
+        step_name: &str,
+        cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<(
+            ContainerExecution,
+            Result<ContainerExitInfo, EngineError>,
+        )>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Result<Option<InterruptibleStepResult>, EngineError> {
+        self.msg_warning(format!("Step '{}' appears stuck (no output)", step_name,));
+        if self.yolo && !self.is_last_step() {
+            let yolo_result = self
+                .run_mid_step_yolo_countdown(step_name, cancel_handle, wait_rx, stuck_rx)
+                .await?;
+            match yolo_result {
+                MidStepYoloResult::StepCompleted(o) => {
+                    Ok(Some(InterruptibleStepResult::StepCompleted(o)))
+                }
+                MidStepYoloResult::ShowControlBoard => {
+                    let mid =
+                        self.handle_mid_step_control_board(step_name, cancel_handle, wait_rx)?;
+                    Ok(match mid {
+                        MidStepOutcome::Continue => None,
+                        MidStepOutcome::StepCompleted(o) => {
+                            Some(InterruptibleStepResult::StepCompleted(o))
+                        }
+                        MidStepOutcome::WorkflowEnded(wo) => {
+                            Some(InterruptibleStepResult::WorkflowEnded(wo))
+                        }
+                        MidStepOutcome::LoopContinue => Some(InterruptibleStepResult::LoopContinue),
+                    })
+                }
+                MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => Ok(None),
+                MidStepYoloResult::Advanced => {
+                    self.msg_info(format!("Yolo auto-advancing past step '{}'", step_name,));
+                    if let Some(ch) = cancel_handle {
+                        let _ = ch.cancel();
+                    }
+                    self.state.set_status(step_name, StepState::Succeeded);
+                    self.persist()?;
+                    let step = self.find_step(step_name)?;
+                    self.frontend
+                        .report_step_status(&step, WorkflowStepStatus::Succeeded);
+                    let progress = self.workflow_progress_info();
+                    self.frontend.report_workflow_progress(&progress);
+
+                    if self.is_last_step() {
+                        let available = self.compute_available_actions()?;
+                        let action = self
+                            .frontend
+                            .show_workflow_control_board(&self.state, &available)?;
+                        return Ok(Some(self.execute_top_level_action(action)?));
+                    }
+
+                    Ok(Some(InterruptibleStepResult::LoopContinue))
+                }
+            }
+        } else {
+            let mid = self.handle_mid_step_control_board(step_name, cancel_handle, wait_rx)?;
+            Ok(match mid {
+                MidStepOutcome::Continue => None,
+                MidStepOutcome::StepCompleted(o) => Some(InterruptibleStepResult::StepCompleted(o)),
+                MidStepOutcome::WorkflowEnded(wo) => {
+                    Some(InterruptibleStepResult::WorkflowEnded(wo))
+                }
+                MidStepOutcome::LoopContinue => Some(InterruptibleStepResult::LoopContinue),
+            })
+        }
+    }
+
     /// Run a mid-step yolo countdown. The step container keeps running while
     /// the countdown ticks. The engine calls `yolo_countdown_started` at the
     /// beginning and `yolo_countdown_finished` before returning.
@@ -820,6 +902,7 @@ impl WorkflowEngine {
             ContainerExecution,
             Result<ContainerExitInfo, EngineError>,
         )>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<MidStepYoloResult, EngineError> {
         self.msg_info(format!(
             "Starting yolo countdown for step '{}' ({}s)",
@@ -831,6 +914,42 @@ impl WorkflowEngine {
         let start = std::time::Instant::now();
 
         loop {
+            // Drain any pending stuck events first. Without this, an `Unstuck`
+            // event that lands at almost the same instant as countdown expiry
+            // can be passed over by the `remaining.is_zero()` check below —
+            // the loop would return `Advanced` (and mark the step Succeeded)
+            // even though the container just produced fresh output. Draining
+            // here guarantees Unstuck wins the race.
+            if let Some(rx) = stuck_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(StuckEvent::Unstuck) => {
+                            self.msg_info(format!(
+                                "Step '{}' recovered, cancelling countdown (timers reset)",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                        Ok(StuckEvent::StartupGraceExpired) => {
+                            self.msg_warning(format!(
+                                "Step '{}' produced no output before its startup grace expired; cancelling countdown",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                        Ok(StuckEvent::Stuck) => continue,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                        // Lagged: a message was dropped because the channel
+                        // buffer (16) was exceeded. Loop again so we keep
+                        // draining whatever's still in the queue.
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    }
+                }
+            }
+
             let elapsed = start.elapsed();
             let remaining = if elapsed >= total {
                 std::time::Duration::ZERO
@@ -870,6 +989,34 @@ impl WorkflowEngine {
                         self.finalize_step(step_name, exit_result?)?
                     ));
                 }
+                Some(event) = Self::recv_stuck(stuck_rx) => {
+                    match event {
+                        StuckEvent::Unstuck => {
+                            self.msg_info(format!(
+                                "Step '{}' recovered, cancelling countdown (timers reset)",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                        StuckEvent::Stuck => {
+                            // Already counting down; ignore duplicate.
+                        }
+                        StuckEvent::StartupGraceExpired => {
+                            // The container never produced its first byte
+                            // before grace ran out, so the bridge already
+                            // killed it. Tear down the countdown; wait_rx
+                            // will resolve and finalize_step records the
+                            // failure.
+                            self.msg_warning(format!(
+                                "Step '{}' produced no output before its startup grace expired; cancelling countdown",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                    }
+                }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     match req {
                         EngineRequest::OpenControlBoard => {
@@ -878,7 +1025,7 @@ impl WorkflowEngine {
                         }
                         EngineRequest::StepUnstuck => {
                             self.msg_info(format!(
-                                "Step '{}' recovered, cancelling countdown",
+                                "Step '{}' recovered (engine request), cancelling countdown",
                                 step_name,
                             ));
                             self.frontend.yolo_countdown_finished(step_name);
@@ -1214,6 +1361,210 @@ impl WorkflowEngine {
             .map_err(EngineError::Data)?;
         Ok(())
     }
+
+    /// Run setup phase steps inside the provided background container.
+    /// Returns `Ok(())` on success, `Err` if any step fails (remaining steps
+    /// are skipped).
+    /// Run the setup phase, asking the caller for a fresh container per step.
+    ///
+    /// `container_for_step(idx)` is invoked once per step and must return a
+    /// container with that step's overlays/env applied — and only that step's.
+    /// The returned container is dropped when the step finishes, which kills
+    /// the container via `BackgroundContainer::drop`. This is what gives each
+    /// step its own isolated resource set (WI-0082): two teardown entries
+    /// declaring `overlays = ["ssh()"]` and `overlays = ["env(GITHUB_TOKEN)"]`
+    /// must NOT each see both.
+    pub fn run_setup<F>(
+        &mut self,
+        steps: &[crate::data::workflow_definition::SetupStep],
+        abort_flags: &[bool],
+        mut container_for_step: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
+        use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
+        use crate::engine::workflow::step_commands::{
+            setup_step_description, setup_step_to_shell, substitute_setup_step,
+        };
+
+        let wi_ctx = self.work_item_context.as_ref();
+        let steps: Vec<_> = steps
+            .iter()
+            .map(|s| substitute_setup_step(s, wi_ctx))
+            .collect();
+
+        self.state.current_phase = WorkflowPhase::Setup;
+        self.state.setup_step_states = steps
+            .iter()
+            .map(|s| PhaseStepState {
+                description: setup_step_description(s),
+                status: PhaseStepStatus::Pending,
+            })
+            .collect();
+        self.persist()?;
+
+        for (idx, step) in steps.iter().enumerate() {
+            let desc = setup_step_description(step);
+            let (command, env) = setup_step_to_shell(step);
+            let abort = abort_flags.get(idx).copied().unwrap_or(false);
+
+            self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
+            self.persist()?;
+
+            self.frontend.on_setup_step_started(&desc);
+
+            let container = container_for_step(idx)?;
+            let result = container.exec_streaming(&command, env.as_ref(), &mut |line| {
+                self.frontend.on_setup_step_output(line)
+            })?;
+
+            if result.exit_code != 0 {
+                self.state.setup_step_states[idx].status = PhaseStepStatus::Failed {
+                    error: result.stderr.clone(),
+                };
+                self.persist()?;
+                self.frontend
+                    .on_setup_step_failed(&desc, result.exit_code, &result.stderr);
+                if abort {
+                    self.abort_on_failure_triggered = true;
+                    return Err(EngineError::Container(format!(
+                        "setup step '{}' failed with exit code {} (abort_on_failure)",
+                        desc, result.exit_code
+                    )));
+                }
+                continue;
+            }
+
+            self.state.setup_step_states[idx].status = PhaseStepStatus::Succeeded;
+            self.persist()?;
+            self.frontend.on_setup_step_completed(&desc);
+            // `container` drops here, killing the per-step BackgroundContainer.
+        }
+
+        self.state.setup_completed = true;
+        self.state.current_phase = WorkflowPhase::Main;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Run teardown phase steps, asking the caller for a fresh container per step.
+    ///
+    /// Skips all steps and returns `Ok(())` if `!teardown_on_failure && !workflow_succeeded`.
+    /// Failing teardown steps are logged but do not abort the remaining steps (best-effort).
+    /// See [`run_setup`] for the rationale behind per-step containers.
+    ///
+    /// When the per-step container factory itself fails (e.g. an overlay won't
+    /// resolve, or the runtime can't start the container), the engine records
+    /// that step as `Failed`, surfaces the error to the frontend, and proceeds
+    /// to the next step — matching the best-effort semantics already used for
+    /// non-zero exit codes.
+    /// Returns `(teardown_aborted, any_step_failed)`:
+    /// - `teardown_aborted`: true if an `abort_on_failure` step failed
+    /// - `any_step_failed`: true if any teardown step failed (regardless of abort flag)
+    pub fn run_teardown<F>(
+        &mut self,
+        steps: &[crate::data::workflow_definition::TeardownStep],
+        abort_flags: &[bool],
+        workflow_succeeded: bool,
+        teardown_on_failure: bool,
+        mut container_for_step: F,
+    ) -> Result<(bool, bool), EngineError>
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
+        use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
+        use crate::engine::workflow::step_commands::{
+            substitute_teardown_step, teardown_step_description, teardown_step_to_shell,
+        };
+
+        if !teardown_on_failure && !workflow_succeeded {
+            return Ok((false, false));
+        }
+
+        let wi_ctx = self.work_item_context.as_ref();
+        let steps: Vec<_> = steps
+            .iter()
+            .map(|s| substitute_teardown_step(s, wi_ctx))
+            .collect();
+
+        self.state.current_phase = WorkflowPhase::Teardown;
+        self.state.teardown_step_states = steps
+            .iter()
+            .map(|s| PhaseStepState {
+                description: teardown_step_description(s),
+                status: PhaseStepStatus::Pending,
+            })
+            .collect();
+        self.persist()?;
+
+        let mut teardown_aborted = false;
+        let mut any_step_failed = false;
+        for (idx, step) in steps.iter().enumerate() {
+            let desc = teardown_step_description(step);
+            let (command, env) = teardown_step_to_shell(step);
+            let abort = abort_flags.get(idx).copied().unwrap_or(false);
+
+            self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
+            self.persist()?;
+
+            self.frontend.on_teardown_step_started(&desc);
+
+            let container = match container_for_step(idx) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.state.teardown_step_states[idx].status =
+                        PhaseStepStatus::Failed { error: msg.clone() };
+                    self.persist()?;
+                    self.frontend.on_teardown_step_failed(&desc, 1, &msg);
+                    any_step_failed = true;
+                    if abort {
+                        teardown_aborted = true;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let result = container.exec_streaming(&command, env.as_ref(), &mut |line| {
+                self.frontend.on_teardown_step_output(line)
+            })?;
+
+            if result.exit_code != 0 {
+                self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
+                    error: result.stderr.clone(),
+                };
+                self.persist()?;
+                self.frontend
+                    .on_teardown_step_failed(&desc, result.exit_code, &result.stderr);
+                any_step_failed = true;
+                if abort {
+                    teardown_aborted = true;
+                    break;
+                }
+            } else {
+                self.state.teardown_step_states[idx].status = PhaseStepStatus::Succeeded;
+                self.persist()?;
+                self.frontend.on_teardown_step_completed(&desc);
+            }
+            // `container` drops here, killing the per-step BackgroundContainer.
+        }
+
+        self.state.teardown_completed = true;
+        self.state.current_phase = WorkflowPhase::Done;
+        self.persist()?;
+        Ok((teardown_aborted, any_step_failed))
+    }
+
+    /// Mark the workflow as fully finished. Called by the orchestrator after
+    /// the main phase completes when no teardown phase will run (so the state
+    /// reflects completion rather than lingering in `Main`).
+    pub fn mark_done(&mut self) -> Result<(), EngineError> {
+        use crate::data::workflow_state::WorkflowPhase;
+        self.state.current_phase = WorkflowPhase::Done;
+        self.persist()?;
+        Ok(())
+    }
 }
 
 /// Hash a workflow's steps + title to detect drift.
@@ -1422,6 +1773,8 @@ mod tests {
             prompt_template: "do something".to_string(),
             agent: agent.map(|s| s.to_string()),
             model: None,
+            overlays: None,
+            abort_on_failure: false,
         }
     }
 
@@ -1435,6 +1788,9 @@ mod tests {
             steps,
             agent: wf_agent.map(|s| s.to_string()),
             model: None,
+            setup: Vec::new(),
+            teardown: Vec::new(),
+            teardown_on_failure: false,
         }
     }
 
@@ -1963,7 +2319,12 @@ mod tests {
                     name: "blocking-container".into(),
                     started_at: now,
                 };
-                Ok(ContainerExecution::new(handle, backend))
+                let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+                Ok(ContainerExecution::new(
+                    handle,
+                    backend,
+                    std::sync::Arc::new(stuck_tx),
+                ))
             } else {
                 let now = Utc::now();
                 let info = ContainerExitInfo {
@@ -2412,6 +2773,133 @@ mod tests {
         assert_eq!(result, WorkflowOutcome::Completed);
     }
 
+    /// Sending `StepUnstuck` during an active yolo countdown must cancel the
+    /// countdown and leave the step running — it must NOT mark the step
+    /// Succeeded or advance to the next step. The container keeps running
+    /// until it actually exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unstuck-mid-countdown"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+
+        let (cancel_flag_a, completion_a) = make_blocking_entry();
+        let (_cancel_flag_b, completion_b) = make_blocking_entry();
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+
+        // Frontend whose tick returns Continue so the countdown actually runs
+        // (lets us send StepUnstuck mid-countdown). Captures step transitions
+        // so the test can assert "a" was never marked Succeeded prematurely.
+        struct UnstuckTestFrontend {
+            actions: Mutex<VecDeque<NextAction>>,
+            engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+            step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
+        }
+        impl crate::engine::message::UserMessageSink for UnstuckTestFrontend {
+            fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        impl WorkflowFrontend for UnstuckTestFrontend {
+            fn show_workflow_control_board(
+                &mut self,
+                _: &WorkflowState,
+                _: &AvailableActions,
+            ) -> Result<NextAction, EngineError> {
+                Ok(self
+                    .actions
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(NextAction::Pause))
+            }
+            fn yolo_countdown_tick(
+                &mut self,
+                _: &str,
+                _: Duration,
+                _: Duration,
+            ) -> Result<YoloTickOutcome, EngineError> {
+                Ok(YoloTickOutcome::Continue)
+            }
+            fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
+                Ok(true)
+            }
+            fn user_choose_after_step_failure(
+                &mut self,
+                _: &WorkflowStep,
+                _: &ContainerExitInfo,
+            ) -> Result<StepFailureChoice, EngineError> {
+                Ok(StepFailureChoice::Abort)
+            }
+            fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
+                self.step_statuses
+                    .lock()
+                    .unwrap()
+                    .push((step.name.clone(), status));
+            }
+            fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
+            fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
+                *self.engine_tx.lock().unwrap() = Some(tx);
+            }
+        }
+        let frontend = UnstuckTestFrontend {
+            actions: Mutex::new(VecDeque::from([NextAction::FinishWorkflow])),
+            engine_tx: engine_tx.clone(),
+            step_statuses: Mutex::new(Vec::new()),
+        };
+
+        let factory = BlockingFactory::new([
+            (cancel_flag_a.clone(), completion_a.clone()),
+            (_cancel_flag_b.clone(), completion_b.clone()),
+        ]);
+        let overlay = OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+        );
+        let mut engine = WorkflowEngine::new(
+            &session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            Arc::new(GitEngine::new()),
+            Arc::new(overlay),
+        )
+        .unwrap();
+        engine.set_yolo(true);
+
+        let tx = engine_tx.lock().unwrap().clone().unwrap();
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        // Let the step launch.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Kick off the yolo countdown.
+        tx.send(EngineRequest::StepStuck).unwrap();
+        // Let the countdown run a tick or two without expiring.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Container produced output again — recovery signal.
+        tx.send(EngineRequest::StepUnstuck).unwrap();
+        // Wait long enough that, if the engine were mistakenly advancing the
+        // step on Unstuck, step "b" would have launched. Cancel-flag-a must
+        // still be false (step "a" still running, NOT cancelled by Advanced).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !cancel_flag_a.load(Ordering::Relaxed),
+            "StepUnstuck during countdown must NOT cancel step 'a' — it must keep running"
+        );
+
+        // Now complete step "a" normally; workflow proceeds.
+        signal_completion(&completion_a, 0);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        signal_completion(&completion_b, 0);
+
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn step_unstuck_outside_countdown_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2446,5 +2934,567 @@ mod tests {
         signal_completion(&completion, 0);
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    // ── MockBackgroundContainer ───────────────────────────────────────────────
+
+    struct MockBackgroundContainer {
+        /// Pre-programmed results: (stdout, stderr, exit_code).
+        results: Mutex<VecDeque<(String, String, i32)>>,
+        /// Recorded commands (in call order).
+        calls: Mutex<Vec<String>>,
+        /// Number of times a fresh container was handed out — exercised by
+        /// per-step-container assertions (WI-0082).
+        container_handouts: Mutex<usize>,
+    }
+
+    impl MockBackgroundContainer {
+        /// All execs succeed with empty output.
+        fn always_success() -> Self {
+            Self {
+                results: Mutex::new(VecDeque::new()),
+                calls: Mutex::new(Vec::new()),
+                container_handouts: Mutex::new(0),
+            }
+        }
+
+        /// Provide an explicit sequence of (stdout, stderr, exit_code) results.
+        fn with_results(results: impl IntoIterator<Item = (String, String, i32)>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+                container_handouts: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn handouts(&self) -> usize {
+            *self.container_handouts.lock().unwrap()
+        }
+
+        /// Build a factory closure for `WorkflowEngine::run_setup` /
+        /// `run_teardown` that records one container handout per step and
+        /// delegates exec calls back to this mock. Tests that previously
+        /// passed `&mock` directly can now pass `mock.factory()`.
+        fn factory<'a>(
+            self: &'a Arc<Self>,
+        ) -> impl FnMut(usize) -> Result<Box<dyn crate::engine::container::ContainerExec>, EngineError>
+               + 'a {
+            move |_idx| {
+                *self.container_handouts.lock().unwrap() += 1;
+                Ok(Box::new(SharedMockExec(Arc::clone(self))))
+            }
+        }
+    }
+
+    /// Trampoline that lets the test factory hand out fresh `Box<dyn
+    /// ContainerExec>` values while keeping all recorded state in the single
+    /// shared `MockBackgroundContainer`.
+    struct SharedMockExec(Arc<MockBackgroundContainer>);
+
+    impl crate::engine::container::ContainerExec for SharedMockExec {
+        fn exec(
+            &self,
+            command: &str,
+            env: Option<&std::collections::HashMap<String, String>>,
+        ) -> Result<crate::engine::container::ExecOutput, crate::engine::error::EngineError>
+        {
+            self.0.exec(command, env)
+        }
+    }
+
+    impl crate::engine::container::ContainerExec for MockBackgroundContainer {
+        fn exec(
+            &self,
+            command: &str,
+            _env: Option<&std::collections::HashMap<String, String>>,
+        ) -> Result<crate::engine::container::ExecOutput, crate::engine::error::EngineError>
+        {
+            self.calls.lock().unwrap().push(command.to_string());
+            let (stdout, stderr, exit_code) = self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| ("".into(), "".into(), 0));
+            Ok(crate::engine::container::ExecOutput {
+                stdout,
+                stderr,
+                exit_code,
+            })
+        }
+    }
+
+    // ── run_setup / run_teardown unit tests ──────────────────────────────────
+
+    fn setup_steps_sample() -> Vec<crate::data::workflow_definition::SetupStep> {
+        use crate::data::workflow_definition::SetupStep;
+        vec![
+            SetupStep::CloneRepo {
+                url: "https://example.com/repo".into(),
+                branch: None,
+                into: None,
+            },
+            SetupStep::PullBranch {
+                remote: None,
+                branch: None,
+            },
+            SetupStep::RunShell {
+                command: "cargo build".into(),
+                env: None,
+            },
+        ]
+    }
+
+    fn teardown_steps_sample() -> Vec<crate::data::workflow_definition::TeardownStep> {
+        use crate::data::workflow_definition::TeardownStep;
+        vec![
+            TeardownStep::RunShell {
+                command: "cargo test".into(),
+                env: None,
+            },
+            TeardownStep::CommitChanges {
+                message: "auto: results".into(),
+                add_all: true,
+            },
+        ]
+    }
+
+    fn make_minimal_engine(tmp: &tempfile::TempDir) -> WorkflowEngine {
+        let session = make_session(tmp);
+        let workflow = make_workflow(
+            Some("test-wf"),
+            Some("claude"),
+            vec![make_step("step-a", &[], None)],
+        );
+        make_engine(
+            &session,
+            workflow,
+            FakeContainerExecutionFactory::always_success(),
+            [],
+        )
+    }
+
+    #[test]
+    fn run_setup_executes_steps_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].contains("git clone"));
+        assert_eq!(calls[1], "git pull");
+        assert_eq!(calls[2], "cargo build");
+    }
+
+    #[test]
+    fn run_setup_uses_one_fresh_container_per_step() {
+        // WI-0082 invariant: each phase step gets its own container so per-step
+        // overlays do not leak across step boundaries.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample(); // 3 steps
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+
+        assert_eq!(
+            mock.handouts(),
+            3,
+            "the factory must be invoked once per step (one container per step)",
+        );
+    }
+
+    #[test]
+    fn run_teardown_uses_one_fresh_container_per_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample(); // 2 steps
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        let (aborted, any_failed) = engine
+            .run_teardown(&steps, &[], true, false, mock.factory())
+            .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
+
+        assert_eq!(
+            mock.handouts(),
+            2,
+            "teardown must request one container per step",
+        );
+    }
+
+    #[test]
+    fn run_setup_continues_on_failure_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample(); // 3 steps
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "".into(), 0),            // step 1 succeeds
+            ("".into(), "build error".into(), 1), // step 2 fails
+            ("".into(), "".into(), 0),            // step 3 still runs
+        ]));
+
+        let result = engine.run_setup(&steps, &[], mock.factory());
+
+        assert!(
+            result.is_ok(),
+            "run_setup continues past failures when abort_on_failure=false"
+        );
+        assert_eq!(mock.calls().len(), 3, "all steps must be exec'd");
+    }
+
+    #[test]
+    fn run_setup_aborts_on_abort_on_failure_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample(); // 3 steps
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "".into(), 0),            // step 1 succeeds
+            ("".into(), "build error".into(), 1), // step 2 fails
+            ("".into(), "".into(), 0),            // step 3 (never reached)
+        ]));
+        let abort_flags = vec![false, true, false]; // step 2 has abort_on_failure
+
+        let result = engine.run_setup(&steps, &abort_flags, mock.factory());
+
+        assert!(
+            result.is_err(),
+            "run_setup must return Err when abort_on_failure step fails"
+        );
+        assert_eq!(mock.calls().len(), 2, "third step must not be exec'd");
+        assert!(engine.abort_on_failure_triggered());
+    }
+
+    #[test]
+    fn run_teardown_skips_when_not_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        // teardown_on_failure = false, workflow_succeeded = false → skip all
+        let (aborted, any_failed) = engine
+            .run_teardown(&steps, &[], false, false, mock.factory())
+            .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
+
+        assert_eq!(mock.calls().len(), 0, "no exec calls should be made");
+        assert_eq!(
+            mock.handouts(),
+            0,
+            "no containers should be requested when teardown is skipped",
+        );
+    }
+
+    #[test]
+    fn run_teardown_runs_when_succeeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        let (aborted, any_failed) = engine
+            .run_teardown(&steps, &[], true, false, mock.factory())
+            .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
+
+        assert_eq!(mock.calls().len(), 2, "both teardown steps must exec");
+    }
+
+    #[test]
+    fn run_teardown_continues_after_step_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "test failure".into(), 1), // step 1 fails
+            ("".into(), "".into(), 0),             // step 2 succeeds
+        ]));
+
+        // Teardown is best-effort: returns Ok even if a step fails.
+        let result = engine.run_teardown(&steps, &[], true, false, mock.factory());
+        assert!(
+            result.is_ok(),
+            "run_teardown must return Ok despite step failure"
+        );
+        let (aborted, any_failed) = result.unwrap();
+        assert!(!aborted, "no abort_on_failure steps were set");
+        assert!(
+            any_failed,
+            "any_step_failed must be true when a step exits non-zero"
+        );
+        assert_eq!(mock.calls().len(), 2, "both steps must be exec'd");
+    }
+
+    #[test]
+    fn run_teardown_aborts_on_abort_on_failure_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "fatal".into(), 1), // step 0 fails
+            ("".into(), "".into(), 0),      // step 1 would succeed
+        ]));
+
+        // abort_on_failure = true for step 0
+        let result = engine.run_teardown(&steps, &[true, false], true, false, mock.factory());
+        assert!(result.is_ok());
+        let (aborted, any_failed) = result.unwrap();
+        assert!(
+            aborted,
+            "run_teardown must set aborted when abort_on_failure step fails"
+        );
+        assert!(any_failed, "any_step_failed must also be true");
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "step 1 must be skipped after abort_on_failure step 0 fails"
+        );
+    }
+
+    #[test]
+    fn run_teardown_continues_after_per_step_container_factory_failure() {
+        // Per-step container build failure must not abort teardown; it should
+        // record the step as Failed and proceed to the next one.
+        use crate::data::workflow_definition::TeardownStep;
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = vec![
+            TeardownStep::RunShell {
+                command: "first".into(),
+                env: None,
+            },
+            TeardownStep::RunShell {
+                command: "second".into(),
+                env: None,
+            },
+        ];
+
+        // Factory fails on step 0 (returns Err), succeeds on step 1.
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+        let mock_for_factory = Arc::clone(&mock);
+        let factory = move |idx: usize| -> Result<
+            Box<dyn crate::engine::container::ContainerExec>,
+            EngineError,
+        > {
+            if idx == 0 {
+                Err(EngineError::Other(
+                    "simulated overlay resolve failure".into(),
+                ))
+            } else {
+                *mock_for_factory.container_handouts.lock().unwrap() += 1;
+                Ok(Box::new(SharedMockExec(Arc::clone(&mock_for_factory))))
+            }
+        };
+
+        let result = engine.run_teardown(&steps, &[], true, false, factory);
+        assert!(result.is_ok(), "factory failure must not abort teardown");
+        let (_aborted, any_failed) = result.unwrap();
+        assert!(
+            any_failed,
+            "any_step_failed must be true when factory fails"
+        );
+
+        let states = &engine.state().teardown_step_states;
+        assert!(
+            matches!(&states[0].status, PhaseStepStatus::Failed { error } if error.contains("simulated overlay resolve failure")),
+            "step 0 must be recorded as Failed with the factory error: {:?}",
+            states[0].status,
+        );
+        assert_eq!(
+            states[1].status,
+            PhaseStepStatus::Succeeded,
+            "step 1 must still execute after step 0's factory failure",
+        );
+        assert_eq!(mock.calls().len(), 1, "only step 1 reaches exec");
+    }
+
+    #[test]
+    fn run_setup_transitions_phase_to_main_on_success() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+
+        assert_eq!(
+            engine.state().current_phase,
+            WorkflowPhase::Main,
+            "phase must be Main after successful setup"
+        );
+        assert!(
+            engine.state().setup_completed,
+            "setup_completed must be true after successful setup"
+        );
+    }
+
+    #[test]
+    fn run_setup_state_tracking() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::SetupStep;
+        let steps = vec![
+            SetupStep::RunShell {
+                command: "step1".into(),
+                env: None,
+            },
+            SetupStep::RunShell {
+                command: "step2".into(),
+                env: None,
+            },
+        ];
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+
+        let states = &engine.state().setup_step_states;
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+    }
+
+    #[test]
+    fn run_teardown_state_tracking() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::TeardownStep;
+        let steps = vec![
+            TeardownStep::RunShell {
+                command: "td1".into(),
+                env: None,
+            },
+            TeardownStep::RunShell {
+                command: "td2".into(),
+                env: None,
+            },
+        ];
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        let (aborted, any_failed) = engine
+            .run_teardown(&steps, &[], true, false, mock.factory())
+            .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
+
+        let states = &engine.state().teardown_step_states;
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+    }
+
+    #[test]
+    fn run_setup_failure_records_failed_state() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::SetupStep;
+        let steps = vec![
+            SetupStep::RunShell {
+                command: "ok-step".into(),
+                env: None,
+            },
+            SetupStep::RunShell {
+                command: "bad-step".into(),
+                env: None,
+            },
+        ];
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "".into(), 0),
+            ("".into(), "stderr content".into(), 1),
+        ]));
+
+        let result = engine.run_setup(&steps, &[], mock.factory());
+        assert!(
+            result.is_ok(),
+            "setup continues past failures when abort_on_failure=false"
+        );
+
+        let states = &engine.state().setup_step_states;
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert!(
+            matches!(&states[1].status, PhaseStepStatus::Failed { error } if error == "stderr content"),
+            "failed state must capture stderr: {:?}",
+            states[1].status
+        );
+    }
+
+    #[test]
+    fn run_teardown_transitions_phase_to_done() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        let (_aborted, _any_failed) = engine
+            .run_teardown(&steps, &[], true, false, mock.factory())
+            .unwrap();
+
+        assert_eq!(
+            engine.state().current_phase,
+            WorkflowPhase::Done,
+            "phase must be Done after teardown completes"
+        );
+        assert!(engine.state().teardown_completed);
+    }
+
+    #[test]
+    fn mark_done_sets_phase_to_done() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        assert_eq!(engine.state().current_phase, WorkflowPhase::Main);
+
+        engine.mark_done().unwrap();
+        assert_eq!(engine.state().current_phase, WorkflowPhase::Done);
+    }
+
+    #[test]
+    fn run_setup_phase_persistence_verified_from_store() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::SetupStep;
+        let steps = vec![SetupStep::RunShell {
+            command: "go".into(),
+            env: None,
+        }];
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+
+        // Verify the on-disk state was persisted with the correct phase fields.
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let saved = store.load(None, "test-wf").unwrap().unwrap();
+        assert_eq!(saved.current_phase, WorkflowPhase::Main);
+        assert!(saved.setup_completed);
     }
 }

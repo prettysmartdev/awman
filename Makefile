@@ -1,4 +1,4 @@
-BINARY     := amux
+BINARY     := awman
 INSTALL_PATH ?= /usr/local/bin
 # Honour CARGO_TARGET_DIR if set in the environment. Falls back to the cargo
 # default of `target`.

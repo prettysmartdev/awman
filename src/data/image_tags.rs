@@ -18,24 +18,24 @@ pub fn repo_hash(git_root: &Path) -> String {
     sha256_hex(&canon).chars().take(8).collect()
 }
 
-/// Project (base) image tag: `amux-<repo-folder>:latest`.
+/// Project (base) image tag: `awman-<repo-folder>:latest`.
 ///
-/// Falls back to `amux-repo:latest` when the git-root has no file_name() (root `/`).
+/// Falls back to `awman-repo:latest` when the git-root has no file_name() (root `/`).
 pub fn project_image_tag(git_root: &Path) -> String {
     let folder = git_root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("repo");
-    format!("amux-{folder}:latest")
+    format!("awman-{folder}:latest")
 }
 
-/// Per-agent image tag: `amux-<repo-folder>-<agent>:latest`.
+/// Per-agent image tag: `awman-<repo-folder>-<agent>:latest`.
 pub fn agent_image_tag(git_root: &Path, agent: &str) -> String {
     let folder = git_root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("repo");
-    format!("amux-{folder}-{agent}:latest")
+    format!("awman-{folder}-{agent}:latest")
 }
 
 #[cfg(test)]
@@ -46,13 +46,13 @@ mod tests {
     #[test]
     fn project_image_tag_uses_folder_name() {
         let p = PathBuf::from("/tmp/myproj");
-        assert_eq!(project_image_tag(&p), "amux-myproj:latest");
+        assert_eq!(project_image_tag(&p), "awman-myproj:latest");
     }
 
     #[test]
     fn agent_image_tag_includes_agent() {
         let p = PathBuf::from("/tmp/myproj");
-        assert_eq!(agent_image_tag(&p, "claude"), "amux-myproj-claude:latest");
+        assert_eq!(agent_image_tag(&p, "claude"), "awman-myproj-claude:latest");
     }
 
     #[test]

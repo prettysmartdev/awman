@@ -8,12 +8,12 @@
 /// 4. Regression guards: `ask_work_items_setup` is offered in both paths, declining it
 ///    does not panic or leave a missing summary row, and audit is executed inline (not
 ///    deferred via the old `pending_init_run_audit` / `check_init_continuation` mechanism).
-use amux::cli::Agent;
-use amux::commands::init_flow::{self, CliInitQa, InitContainerLauncher, InitParams, InitQa};
-use amux::commands::output::OutputSink;
-use amux::commands::ready::StepStatus;
-use amux::config::WorkItemsConfig;
-use amux::runtime::AgentRuntime;
+use awman::cli::Agent;
+use awman::commands::init_flow::{self, CliInitQa, InitContainerLauncher, InitParams, InitQa};
+use awman::commands::output::OutputSink;
+use awman::commands::ready::StepStatus;
+use awman::config::WorkItemsConfig;
+use awman::runtime::AgentRuntime;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -67,7 +67,7 @@ impl AgentRuntime for MockRuntime {
         _host_path: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
         _ssh_dir: Option<&Path>,
@@ -80,7 +80,7 @@ impl AgentRuntime for MockRuntime {
         _host_path: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
         _ssh_dir: Option<&Path>,
@@ -95,7 +95,7 @@ impl AgentRuntime for MockRuntime {
         _working_dir: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -109,7 +109,7 @@ impl AgentRuntime for MockRuntime {
         _working_dir: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
     ) -> anyhow::Result<(String, String)> {
         Ok((String::new(), String::new()))
@@ -123,7 +123,7 @@ impl AgentRuntime for MockRuntime {
         _container_name: Option<&str>,
         _env_vars: Vec<(String, String)>,
         _allow_docker: bool,
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
     ) -> anyhow::Result<String> {
         Ok(String::new())
     }
@@ -143,7 +143,7 @@ impl AgentRuntime for MockRuntime {
         &self,
         _name: &str,
         _image: &str,
-    ) -> Option<amux::runtime::StoppedContainerInfo> {
+    ) -> Option<awman::runtime::StoppedContainerInfo> {
         None
     }
     fn list_running_containers_by_prefix(&self, _prefix: &str) -> Vec<String> {
@@ -155,7 +155,7 @@ impl AgentRuntime for MockRuntime {
     fn get_container_workspace_mount(&self, _container_name: &str) -> Option<String> {
         None
     }
-    fn query_container_stats(&self, _name: &str) -> Option<amux::runtime::ContainerStats> {
+    fn query_container_stats(&self, _name: &str) -> Option<awman::runtime::ContainerStats> {
         None
     }
     fn build_run_args_pty(
@@ -164,7 +164,7 @@ impl AgentRuntime for MockRuntime {
         _host_path: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
         _ssh_dir: Option<&Path>,
@@ -177,7 +177,7 @@ impl AgentRuntime for MockRuntime {
         _host_path: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
         _ssh_dir: Option<&Path>,
@@ -192,7 +192,7 @@ impl AgentRuntime for MockRuntime {
         _working_dir: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
     ) -> Vec<String> {
@@ -213,7 +213,7 @@ impl AgentRuntime for MockRuntime {
         _host_path: &str,
         _entrypoint: &[&str],
         _env_vars: &[(String, String)],
-        _host_settings: Option<&amux::runtime::HostSettings>,
+        _host_settings: Option<&awman::runtime::HostSettings>,
         _allow_docker: bool,
         _container_name: Option<&str>,
         _ssh_dir: Option<&Path>,
@@ -321,12 +321,12 @@ async fn cli_init_full_path_writes_config_and_dockerfiles() {
         "Dockerfile.dev must be created"
     );
     assert!(
-        root.join(".amux").join("Dockerfile.claude").exists(),
-        ".amux/Dockerfile.claude must be created"
+        root.join(".awman").join("Dockerfile.claude").exists(),
+        ".awman/Dockerfile.claude must be created"
     );
     assert!(
-        root.join(".amux").join("config.json").exists(),
-        ".amux/config.json must be created"
+        root.join(".awman").join("config.json").exists(),
+        ".awman/config.json must be created"
     );
     assert!(
         matches!(summary.config, StepStatus::Ok(_)),
@@ -394,7 +394,7 @@ async fn cli_init_full_path_work_items_not_configured_leaves_config_unchanged() 
         .await
         .unwrap();
 
-    let loaded = amux::config::load_repo_config(root).unwrap();
+    let loaded = awman::config::load_repo_config(root).unwrap();
     assert!(
         loaded.work_items.as_ref().and_then(|w| w.dir.as_ref()).is_none(),
         "work_items.dir must remain absent when the offer was declined"
@@ -435,12 +435,12 @@ async fn tui_equiv_init_full_path_writes_config_and_dockerfiles() {
         "Dockerfile.dev must be created by TUI-equivalent path"
     );
     assert!(
-        root.join(".amux").join("Dockerfile.claude").exists(),
-        ".amux/Dockerfile.claude must be created by TUI-equivalent path"
+        root.join(".awman").join("Dockerfile.claude").exists(),
+        ".awman/Dockerfile.claude must be created by TUI-equivalent path"
     );
     assert!(
-        root.join(".amux").join("config.json").exists(),
-        ".amux/config.json must be created by TUI-equivalent path"
+        root.join(".awman").join("config.json").exists(),
+        ".awman/config.json must be created by TUI-equivalent path"
     );
     assert!(
         matches!(summary.config, StepStatus::Ok(_)),
@@ -476,7 +476,7 @@ async fn tui_equiv_init_full_path_work_items_written_to_config() {
         .await
         .unwrap();
 
-    let loaded = amux::config::load_repo_config(root).unwrap();
+    let loaded = awman::config::load_repo_config(root).unwrap();
     assert_eq!(
         loaded.work_items.as_ref().and_then(|w| w.dir.as_deref()),
         Some("tasks"),
@@ -541,7 +541,7 @@ async fn cli_and_tui_paths_produce_identical_file_outcomes() {
     .unwrap();
 
     // Both must produce the same files.
-    for file in &["Dockerfile.dev", ".amux/config.json", ".amux/Dockerfile.claude"] {
+    for file in &["Dockerfile.dev", ".awman/config.json", ".awman/Dockerfile.claude"] {
         assert!(
             cli_root.join(file).exists(),
             "CLI path must produce {file}"

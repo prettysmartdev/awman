@@ -1,5 +1,6 @@
 //! `ContainerInstance` trait + `ContainerExecution` type.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -39,6 +40,25 @@ pub struct ContainerExitInfo {
     pub ended_at: DateTime<Utc>,
 }
 
+/// Stuck/unstuck transition published by the container engine's stuck
+/// detector task.
+///
+/// Lifecycle: the detector first runs in *grace* mode — it watches for the
+/// container's first byte of output. If grace expires before that byte
+/// arrives, `StartupGraceExpired` is published once and the detector
+/// kills the container via its cancel callback, exiting. After the first
+/// byte arrives, grace is discarded and the detector switches to the
+/// regular `Stuck`/`Unstuck` loop driven by `stuck_timeout`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StuckEvent {
+    Stuck,
+    Unstuck,
+    /// The container never produced output before its grace window
+    /// elapsed. The detector has invoked the cancel callback; subscribers
+    /// should treat the step / prompt as failed.
+    StartupGraceExpired,
+}
+
 /// Fully-built but not-yet-running container handle. Trait so `Box<dyn>` keeps
 /// the backend type opaque to callers outside `src/engine/container/`.
 pub trait ContainerInstance: Send + Sync {
@@ -59,6 +79,7 @@ pub trait ContainerInstance: Send + Sync {
 pub struct ContainerExecution {
     handle: ContainerHandle,
     inner: ExecutionState,
+    stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
 }
 
 enum ExecutionState {
@@ -107,24 +128,43 @@ pub(crate) trait ExecutionBackend: Send {
 }
 
 impl ContainerExecution {
-    pub(crate) fn new(handle: ContainerHandle, backend: Box<dyn ExecutionBackend>) -> Self {
+    pub(crate) fn new(
+        handle: ContainerHandle,
+        backend: Box<dyn ExecutionBackend>,
+        stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    ) -> Self {
         Self {
             handle,
             inner: ExecutionState::Running(backend),
+            stuck_tx,
         }
     }
 
     /// Construct a pre-finished execution (used by the inert backend below
     /// and by tests).
     pub(crate) fn finished(handle: ContainerHandle, info: ContainerExitInfo) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(4);
         Self {
             handle,
             inner: ExecutionState::Finished(info),
+            stuck_tx: Arc::new(tx),
         }
     }
 
     pub fn handle(&self) -> &ContainerHandle {
         &self.handle
+    }
+
+    /// Subscribe to stuck/unstuck transitions for this container's output.
+    /// Multiple subscribers are supported (broadcast semantics).
+    pub fn subscribe_stuck(&self) -> tokio::sync::broadcast::Receiver<StuckEvent> {
+        self.stuck_tx.subscribe()
+    }
+
+    /// Return the stuck broadcast sender so external parties (e.g. TUI) can
+    /// subscribe independently.
+    pub fn stuck_sender(&self) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
+        self.stuck_tx.clone()
     }
 
     /// Block until the container exits. Transitions the execution to `Finished`
@@ -186,7 +226,7 @@ impl ContainerExecution {
     }
 
     /// Hand ownership of the running container back to the caller without
-    /// joining. Useful for headless background mode.
+    /// joining. Useful for API background mode.
     pub fn detach(mut self) -> ContainerHandle {
         self.inner = ExecutionState::Detached;
         self.handle
@@ -265,5 +305,59 @@ mod tests {
         let execution = ContainerExecution::finished(handle, info);
         let returned_handle = execution.detach();
         assert_eq!(returned_handle.id, original_id);
+    }
+
+    #[tokio::test]
+    async fn subscribe_stuck_receives_events() {
+        let handle = make_handle();
+        let info = make_exit_info(0);
+        let execution = ContainerExecution::finished(handle, info);
+        let mut rx = execution.subscribe_stuck();
+        let _ = execution.stuck_tx.send(StuckEvent::Stuck);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event, StuckEvent::Stuck);
+    }
+
+    /// Two independent receivers from the same `ContainerExecution` both
+    /// receive every Stuck/Unstuck event (broadcast semantics).
+    #[tokio::test]
+    async fn subscribe_stuck_two_receivers_both_get_same_events() {
+        let handle = make_handle();
+        let info = make_exit_info(0);
+        let execution = ContainerExecution::finished(handle, info);
+
+        let mut rx1 = execution.subscribe_stuck();
+        let mut rx2 = execution.subscribe_stuck();
+
+        // Publish two events via the stored sender.
+        let _ = execution.stuck_tx.send(StuckEvent::Stuck);
+        let _ = execution.stuck_tx.send(StuckEvent::Unstuck);
+
+        // Both receivers must see both events in order.
+        let (a1, a2) = (rx1.recv().await.unwrap(), rx1.recv().await.unwrap());
+        let (b1, b2) = (rx2.recv().await.unwrap(), rx2.recv().await.unwrap());
+
+        assert_eq!(a1, StuckEvent::Stuck, "rx1 first event must be Stuck");
+        assert_eq!(a2, StuckEvent::Unstuck, "rx1 second event must be Unstuck");
+        assert_eq!(b1, StuckEvent::Stuck, "rx2 first event must be Stuck");
+        assert_eq!(b2, StuckEvent::Unstuck, "rx2 second event must be Unstuck");
+    }
+
+    /// `stuck_sender()` returns the same underlying channel so its subscribers
+    /// also receive events sent through the stored `stuck_tx`.
+    #[tokio::test]
+    async fn stuck_sender_shares_channel_with_subscribe_stuck() {
+        let handle = make_handle();
+        let info = make_exit_info(0);
+        let execution = ContainerExecution::finished(handle, info);
+
+        let sender = execution.stuck_sender();
+        let mut rx_a = execution.subscribe_stuck();
+        let mut rx_b = sender.subscribe();
+
+        let _ = sender.send(StuckEvent::Stuck);
+
+        assert_eq!(rx_a.recv().await.unwrap(), StuckEvent::Stuck);
+        assert_eq!(rx_b.recv().await.unwrap(), StuckEvent::Stuck);
     }
 }

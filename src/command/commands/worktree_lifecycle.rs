@@ -40,10 +40,10 @@ pub enum PostWorkflowWorktreeAction {
 /// branch and decides on the human-readable labels) and consumed by every
 /// frontend. Frontends should NOT compose these strings themselves — that
 /// keeps the prompt copy testable in one place and avoids divergence
-/// between CLI/TUI/headless wording.
+/// between CLI/TUI/API wording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostWorkflowWorktreePrompt {
-    /// Worktree branch name (e.g. `amux/work-item-0072`).
+    /// Worktree branch name (e.g. `awman/work-item-0072`).
     pub branch: String,
     /// Branch that a Merge action would target — the parent repo's HEAD
     /// branch. Resolved via `GitEngine::current_branch`; falls back to
@@ -450,14 +450,14 @@ mod tests {
             .status()
             .unwrap();
         SysCmd::new("git")
-            .args(["config", "user.email", "test@amux.test"])
+            .args(["config", "user.email", "test@awman.test"])
             .current_dir(dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
         SysCmd::new("git")
-            .args(["config", "user.name", "amux-test"])
+            .args(["config", "user.name", "awman-test"])
             .current_dir(dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -506,7 +506,7 @@ mod tests {
             engine,
             git_root,
             wt_path.clone(),
-            "amux/test-happy".to_string(),
+            "awman/test-happy".to_string(),
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         let result = lifecycle.prepare(&mut fe).await;
@@ -515,7 +515,7 @@ mod tests {
         assert!(wt_path.exists(), "worktree directory must be created");
         assert_eq!(fe.worktree_created_calls.len(), 1);
         assert_eq!(fe.worktree_created_calls[0].0, wt_path);
-        assert_eq!(fe.worktree_created_calls[0].1, "amux/test-happy");
+        assert_eq!(fe.worktree_created_calls[0].1, "awman/test-happy");
     }
 
     #[tokio::test]
@@ -531,7 +531,7 @@ mod tests {
             engine,
             git_root.clone(),
             wt_path.clone(),
-            "amux/test-commit".to_string(),
+            "awman/test-commit".to_string(),
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.pre_uncommitted_response = PreWorktreeDecision::Commit {
@@ -559,7 +559,7 @@ mod tests {
             engine,
             git_root.clone(),
             wt_path.clone(),
-            "amux/test-uselast".to_string(),
+            "awman/test-uselast".to_string(),
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.pre_uncommitted_response = PreWorktreeDecision::UseLastCommit;
@@ -585,7 +585,7 @@ mod tests {
             engine,
             git_root,
             wt_path.clone(),
-            "amux/test-abort".to_string(),
+            "awman/test-abort".to_string(),
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.pre_uncommitted_response = PreWorktreeDecision::Abort;
@@ -605,7 +605,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/test-resume";
+        let branch = "awman/test-resume";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         // Write a sentinel that must survive Resume (no recreation).
@@ -635,7 +635,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/test-recreate";
+        let branch = "awman/test-recreate";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         std::fs::write(wt_path.join("sentinel.txt"), "original").unwrap();
@@ -665,7 +665,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/test-recreate-dirty";
+        let branch = "awman/test-recreate-dirty";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         // Make the main branch dirty AFTER the worktree already exists.
@@ -705,7 +705,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/test-recreate-abort";
+        let branch = "awman/test-recreate-abort";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
@@ -750,7 +750,7 @@ mod tests {
             engine,
             git_root,
             wt_path,
-            "amux/detach-test".to_string(),
+            "awman/detach-test".to_string(),
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         let _ = lifecycle.prepare(&mut fe).await;
@@ -784,7 +784,7 @@ mod tests {
             engine,
             git_root,
             wt_path.clone(),
-            "amux/keep-branch".to_string(),
+            "awman/keep-branch".to_string(),
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Keep;
@@ -803,7 +803,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/discard-branch";
+        let branch = "awman/discard-branch";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         assert!(wt_path.exists());
@@ -840,7 +840,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/merge-ok-branch";
+        let branch = "awman/merge-ok-branch";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         // Add a commit in the worktree so there is something to merge.
@@ -880,7 +880,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/merge-precommit-branch";
+        let branch = "awman/merge-precommit-branch";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
         // Leave an uncommitted file in the worktree.
@@ -980,7 +980,7 @@ mod tests {
             engine,
             git_root,
             wt_path,
-            "amux/had-error-branch".to_string(),
+            "awman/had-error-branch".to_string(),
         );
         let mut fe = ErrorRecordingFrontend {
             inner: {
@@ -1006,7 +1006,7 @@ mod tests {
         init_repo(repo.path());
         let git_root = repo.path().to_path_buf();
         let wt_path = wt_dir.path().join("wt");
-        let branch = "amux/conflict-branch";
+        let branch = "awman/conflict-branch";
         let engine = Arc::new(GitEngine::new());
         engine.create_worktree(&git_root, &wt_path, branch).unwrap();
 

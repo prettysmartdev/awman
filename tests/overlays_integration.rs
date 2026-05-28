@@ -11,7 +11,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn amux() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_amux"))
+    Command::new(env!("CARGO_BIN_EXE_awman"))
 }
 
 /// Initialise a fresh git repo in a temp directory and return the TempDir.
@@ -181,63 +181,63 @@ fn valid_overlay_with_missing_host_path_does_not_cause_parse_error() {
     );
 }
 
-// ─── AMUX_OVERLAYS env var ────────────────────────────────────────────────────
+// ─── AWMAN_OVERLAYS env var ────────────────────────────────────────────────────
 
 #[test]
 fn malformed_amux_overlays_env_var_does_not_prevent_help() {
-    // AMUX_OVERLAYS is only parsed when a command actually launches an agent.
+    // AWMAN_OVERLAYS is only parsed when a command actually launches an agent.
     // The --help flag causes clap to exit before any overlay parsing happens,
     // so even a completely garbled env var must not prevent help from succeeding.
     let output = amux()
-        .env("AMUX_OVERLAYS", "###not-an-overlay###")
+        .env("AWMAN_OVERLAYS", "###not-an-overlay###")
         .args(["chat", "--help"])
         .output()
         .expect("failed to run amux chat --help");
     assert!(
         output.status.success(),
-        "amux chat --help must exit 0 regardless of AMUX_OVERLAYS content; stderr: {}",
+        "amux chat --help must exit 0 regardless of AWMAN_OVERLAYS content; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
 fn valid_amux_overlays_env_var_does_not_prevent_help() {
-    // A well-formed AMUX_OVERLAYS also must not interfere with help.
+    // A well-formed AWMAN_OVERLAYS also must not interfere with help.
     let output = amux()
-        .env("AMUX_OVERLAYS", "dir(/tmp:/mnt/tmp:ro)")
+        .env("AWMAN_OVERLAYS", "dir(/tmp:/mnt/tmp:ro)")
         .args(["chat", "--help"])
         .output()
         .expect("failed to run amux chat --help");
     assert!(
         output.status.success(),
-        "amux chat --help must exit 0 with a valid AMUX_OVERLAYS; stderr: {}",
+        "amux chat --help must exit 0 with a valid AWMAN_OVERLAYS; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
-// ─── malformed AMUX_OVERLAYS is now a fatal error (binary-level) ─────────────
+// ─── malformed AWMAN_OVERLAYS is now a fatal error (binary-level) ─────────────
 
 #[test]
 fn malformed_amux_overlays_env_var_causes_fatal_exit_on_command_run() {
-    // Previously AMUX_OVERLAYS parse errors were silently dropped (warning only).
+    // Previously AWMAN_OVERLAYS parse errors were silently dropped (warning only).
     // Now they must be fatal: the command must exit non-zero and the error message
-    // must mention AMUX_OVERLAYS so the user knows what to fix.
+    // must mention AWMAN_OVERLAYS so the user knows what to fix.
     let repo = make_git_repo();
     let output = amux()
         .current_dir(repo.path())
-        .env("AMUX_OVERLAYS", "###not-an-overlay###")
+        .env("AWMAN_OVERLAYS", "###not-an-overlay###")
         .args(["chat", "--non-interactive"])
         .output()
         .expect("failed to run amux");
 
     assert!(
         !output.status.success(),
-        "malformed AMUX_OVERLAYS must cause a non-zero exit when running a command"
+        "malformed AWMAN_OVERLAYS must cause a non-zero exit when running a command"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("AMUX_OVERLAYS"),
-        "error message must mention AMUX_OVERLAYS; got: {stderr}"
+        stderr.contains("AWMAN_OVERLAYS"),
+        "error message must mention AWMAN_OVERLAYS; got: {stderr}"
     );
 }
 
@@ -265,9 +265,9 @@ fn exec_wf_alias_help_shows_overlay_flag() {
 // require a live Docker daemon because they call `build_run_args_pty` (which
 // assembles the argument list without executing anything).
 mod docker_args {
-    use amux::config::{save_repo_config, DirectoryOverlayConfig, OverlaysConfig, RepoConfig};
-    use amux::overlays::resolve_overlays;
-    use amux::runtime::{AgentRuntime, DockerRuntime, HostSettings};
+    use awman::config::{save_repo_config, DirectoryOverlayConfig, OverlaysConfig, RepoConfig};
+    use awman::overlays::resolve_overlays;
+    use awman::runtime::{AgentRuntime, DockerRuntime, HostSettings};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -286,16 +286,16 @@ mod docker_args {
         let host_dir = TempDir::new().unwrap(); // must exist so resolve_overlays keeps it
 
         let fake_home = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AMUX_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
-        let prev_env = std::env::var("AMUX_OVERLAYS").ok();
-        unsafe { std::env::remove_var("AMUX_OVERLAYS") };
+        unsafe { std::env::set_var("AWMAN_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
+        let prev_env = std::env::var("AWMAN_OVERLAYS").ok();
+        unsafe { std::env::remove_var("AWMAN_OVERLAYS") };
 
         let flag = format!("dir({}:/mnt/test:ro)", host_dir.path().display());
         let overlays = resolve_overlays(repo.path(), &[flag]).unwrap();
 
-        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+        unsafe { std::env::remove_var("AWMAN_CONFIG_HOME") };
         if let Some(v) = prev_env {
-            unsafe { std::env::set_var("AMUX_OVERLAYS", v) };
+            unsafe { std::env::set_var("AWMAN_OVERLAYS", v) };
         }
 
         assert_eq!(overlays.len(), 1, "expected 1 overlay; got {overlays:?}");
@@ -314,7 +314,7 @@ mod docker_args {
         );
     }
 
-    /// `AMUX_OVERLAYS` env var resolves and appears as `-v` in docker run args.
+    /// `AWMAN_OVERLAYS` env var resolves and appears as `-v` in docker run args.
     #[test]
     fn amux_overlays_env_var_produces_v_flag_in_docker_run_args() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -322,16 +322,16 @@ mod docker_args {
         let host_dir = TempDir::new().unwrap();
 
         let fake_home = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AMUX_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
+        unsafe { std::env::set_var("AWMAN_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
         let env_val = format!("dir({}:/mnt/env:ro)", host_dir.path().display());
-        unsafe { std::env::set_var("AMUX_OVERLAYS", &env_val) };
+        unsafe { std::env::set_var("AWMAN_OVERLAYS", &env_val) };
 
         let overlays = resolve_overlays(repo.path(), &[]).unwrap();
 
-        unsafe { std::env::remove_var("AMUX_OVERLAYS") };
-        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+        unsafe { std::env::remove_var("AWMAN_OVERLAYS") };
+        unsafe { std::env::remove_var("AWMAN_CONFIG_HOME") };
 
-        assert_eq!(overlays.len(), 1, "expected 1 overlay from AMUX_OVERLAYS; got {overlays:?}");
+        assert_eq!(overlays.len(), 1, "expected 1 overlay from AWMAN_OVERLAYS; got {overlays:?}");
 
         let mut settings = HostSettings::from_paths(
             PathBuf::from("/fake/claude.json"),
@@ -343,7 +343,7 @@ mod docker_args {
         let expected = format!("{}:/mnt/env:ro", host_dir.path().display());
         assert!(
             args.windows(2).any(|w| w[0] == "-v" && w[1] == expected),
-            "expected -v {expected} in docker args from AMUX_OVERLAYS; got {args:?}"
+            "expected -v {expected} in docker args from AWMAN_OVERLAYS; got {args:?}"
         );
     }
 
@@ -356,9 +356,9 @@ mod docker_args {
         let host_dir = TempDir::new().unwrap();
 
         let fake_home = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AMUX_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
-        let prev_env = std::env::var("AMUX_OVERLAYS").ok();
-        unsafe { std::env::remove_var("AMUX_OVERLAYS") };
+        unsafe { std::env::set_var("AWMAN_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
+        let prev_env = std::env::var("AWMAN_OVERLAYS").ok();
+        unsafe { std::env::remove_var("AWMAN_OVERLAYS") };
 
         // Project config maps host_dir → /mnt/from-config
         let config = RepoConfig {
@@ -377,9 +377,9 @@ mod docker_args {
         let flag = format!("dir({}:/mnt/from-flag:ro)", host_dir.path().display());
         let overlays = resolve_overlays(repo.path(), &[flag]).unwrap();
 
-        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+        unsafe { std::env::remove_var("AWMAN_CONFIG_HOME") };
         if let Some(v) = prev_env {
-            unsafe { std::env::set_var("AMUX_OVERLAYS", v) };
+            unsafe { std::env::set_var("AWMAN_OVERLAYS", v) };
         }
 
         assert_eq!(overlays.len(), 1, "same host path must deduplicate; got {overlays:?}");
@@ -416,16 +416,16 @@ mod docker_args {
         let repo = TempDir::new().unwrap();
 
         let fake_home = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AMUX_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
-        let prev_env = std::env::var("AMUX_OVERLAYS").ok();
-        unsafe { std::env::remove_var("AMUX_OVERLAYS") };
+        unsafe { std::env::set_var("AWMAN_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
+        let prev_env = std::env::var("AWMAN_OVERLAYS").ok();
+        unsafe { std::env::remove_var("AWMAN_OVERLAYS") };
 
         let flags = vec!["dir(/nonexistent-amux-path-xyz:/mnt/x:ro)".to_string()];
         let overlays = resolve_overlays(repo.path(), &flags).unwrap();
 
-        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+        unsafe { std::env::remove_var("AWMAN_CONFIG_HOME") };
         if let Some(v) = prev_env {
-            unsafe { std::env::set_var("AMUX_OVERLAYS", v) };
+            unsafe { std::env::set_var("AWMAN_OVERLAYS", v) };
         }
 
         assert!(overlays.is_empty(), "non-existent host path must be dropped; got {overlays:?}");
@@ -442,26 +442,26 @@ mod docker_args {
         );
     }
 
-    /// Malformed `AMUX_OVERLAYS` is a fatal error (not silently dropped).
+    /// Malformed `AWMAN_OVERLAYS` is a fatal error (not silently dropped).
     #[test]
     fn malformed_amux_overlays_env_var_is_fatal_error() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let repo = TempDir::new().unwrap();
 
         let fake_home = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AMUX_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
-        unsafe { std::env::set_var("AMUX_OVERLAYS", "###not-an-overlay###") };
+        unsafe { std::env::set_var("AWMAN_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
+        unsafe { std::env::set_var("AWMAN_OVERLAYS", "###not-an-overlay###") };
 
         let result = resolve_overlays(repo.path(), &[]);
 
-        unsafe { std::env::remove_var("AMUX_OVERLAYS") };
-        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+        unsafe { std::env::remove_var("AWMAN_OVERLAYS") };
+        unsafe { std::env::remove_var("AWMAN_CONFIG_HOME") };
 
-        assert!(result.is_err(), "malformed AMUX_OVERLAYS must be a fatal error; got Ok");
+        assert!(result.is_err(), "malformed AWMAN_OVERLAYS must be a fatal error; got Ok");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("AMUX_OVERLAYS"),
-            "error must mention AMUX_OVERLAYS; got: {msg}"
+            msg.contains("AWMAN_OVERLAYS"),
+            "error must mention AWMAN_OVERLAYS; got: {msg}"
         );
     }
 
@@ -473,9 +473,9 @@ mod docker_args {
         let host_dir = TempDir::new().unwrap();
 
         let fake_home = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AMUX_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
-        let prev_env = std::env::var("AMUX_OVERLAYS").ok();
-        unsafe { std::env::remove_var("AMUX_OVERLAYS") };
+        unsafe { std::env::set_var("AWMAN_CONFIG_HOME", fake_home.path().to_str().unwrap()) };
+        let prev_env = std::env::var("AWMAN_OVERLAYS").ok();
+        unsafe { std::env::remove_var("AWMAN_OVERLAYS") };
 
         let config = RepoConfig {
             overlays: Some(OverlaysConfig {
@@ -491,9 +491,9 @@ mod docker_args {
 
         let result = resolve_overlays(repo.path(), &[]);
 
-        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+        unsafe { std::env::remove_var("AWMAN_CONFIG_HOME") };
         if let Some(v) = prev_env {
-            unsafe { std::env::set_var("AMUX_OVERLAYS", v) };
+            unsafe { std::env::set_var("AWMAN_OVERLAYS", v) };
         }
 
         assert!(

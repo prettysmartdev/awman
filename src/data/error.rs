@@ -63,6 +63,9 @@ pub enum DataError {
     #[error("workflow state error: {0}")]
     WorkflowState(String),
 
+    #[error("Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml). See docs/04-workflows.md for the current format. File: {}", path.display())]
+    MarkdownNoLongerSupported { path: std::path::PathBuf },
+
     #[error("workflow resume incompatible: {0}")]
     WorkflowResumeIncompatible(String),
 

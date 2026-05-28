@@ -4,7 +4,7 @@
 //! a tab is closed or a new command starts, preventing unbounded heap growth
 //! during long-running sessions.
 
-use amux::tui::state::{App, ContainerWindowState, ExecutionPhase, TabState};
+use awman::tui::state::{App, ContainerWindowState, ExecutionPhase, TabState};
 use std::path::PathBuf;
 
 // ─── VT100 scrollback is bounded ─────────────────────────────────────────────
@@ -248,7 +248,7 @@ fn new_tab_has_no_vt100_parser() {
 /// enforced and memory cannot grow without bound.
 #[test]
 fn vt100_10k_scrollback_within_memory_threshold() {
-    use amux::tui::state::TabState;
+    use awman::tui::state::TabState;
 
     let cols: u16 = 80;
     let rows: u16 = 24;
@@ -290,7 +290,7 @@ fn vt100_10k_scrollback_within_memory_threshold() {
 /// This test opens three tabs and verifies their parsers are distinct.
 #[test]
 fn multiple_tabs_have_independent_scrollback_buffers() {
-    use amux::tui::state::App;
+    use awman::tui::state::App;
 
     let mut app = App::new(PathBuf::from("/tmp/multi-tab-a"));
     app.create_tab(PathBuf::from("/tmp/multi-tab-b"));

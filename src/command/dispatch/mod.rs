@@ -1,7 +1,7 @@
 //! `Dispatch` — Layer 2's gateway from frontends into typed `*Command` values.
 //!
 //! Frontends construct a `Dispatch` with a frontend-specific
-//! [`CommandFrontend`] implementation (CLI, TUI, headless). Dispatch reads
+//! [`CommandFrontend`] implementation (CLI, TUI, API). Dispatch reads
 //! flag values from the frontend, applies catalogue-driven validation
 //! (mutually-exclusive flags, type errors, implications), and returns a typed
 //! [`BuiltCommand`] enum containing the constructed `*Command` struct.
@@ -11,6 +11,10 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::command::commands::api_server::{
+    ApiServerCommand, ApiServerCommandFrontend, ApiServerKillFlags, ApiServerLogsFlags,
+    ApiServerStartFlags, ApiServerStatusFlags, ApiServerSubcommand,
+};
 use crate::command::commands::auth::{AuthCommand, AuthCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFlags, ChatCommandFrontend};
 use crate::command::commands::config::{
@@ -24,18 +28,14 @@ use crate::command::commands::exec_prompt::{
 use crate::command::commands::exec_workflow::{
     ExecWorkflowCommand, ExecWorkflowCommandFlags, ExecWorkflowCommandFrontend,
 };
-use crate::command::commands::headless::{
-    HeadlessCommand, HeadlessCommandFrontend, HeadlessKillFlags, HeadlessLogsFlags,
-    HeadlessStartFlags, HeadlessStatusFlags, HeadlessSubcommand,
-};
 use crate::command::commands::init::{InitCommand, InitCommandFlags, InitCommandFrontend};
 use crate::command::commands::new::{
     NewCommand, NewCommandFrontend, NewSkillFlags, NewSpecFlags, NewSubcommand, NewWorkflowFlags,
 };
 use crate::command::commands::ready::{ReadyCommand, ReadyCommandFlags, ReadyCommandFrontend};
 use crate::command::commands::remote::{
-    RemoteCommand, RemoteCommandFrontend, RemoteRunFlags, RemoteSessionKillFlags,
-    RemoteSessionStartFlags, RemoteSubcommand,
+    RemoteCommand, RemoteCommandFrontend, RemoteExecPromptFlags, RemoteExecWorkflowFlags,
+    RemoteSessionKillFlags, RemoteSessionStartFlags, RemoteSubcommand,
 };
 use crate::command::commands::specs::{
     SpecsAmendFlags, SpecsCommand, SpecsCommandFrontend, SpecsSubcommand,
@@ -104,7 +104,7 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
 // ─── Frontend supertrait ────────────────────────────────────────────────────
 
 /// Frontend type accepted by [`Dispatch::run_command`]. A single concrete
-/// frontend (CLI, TUI, or headless) implements every per-command frontend
+/// frontend (CLI, TUI, or API) implements every per-command frontend
 /// trait via this supertrait so that dispatch can move the frontend value
 /// into the matching `Box<dyn *CommandFrontend>` for whichever variant
 /// `build_command` returned. Layer 3 frontends typically derive this
@@ -119,7 +119,7 @@ pub trait DispatchFrontend:
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
-    + HeadlessCommandFrontend
+    + ApiServerCommandFrontend
     + RemoteCommandFrontend
     + NewCommandFrontend
     + AuthCommandFrontend
@@ -138,7 +138,7 @@ impl<T> DispatchFrontend for T where
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
-        + HeadlessCommandFrontend
+        + ApiServerCommandFrontend
         + RemoteCommandFrontend
         + NewCommandFrontend
         + AuthCommandFrontend
@@ -162,7 +162,7 @@ pub enum CommandOutcome {
     Config(crate::command::commands::config::ConfigOutcome),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
-    Headless(crate::command::commands::headless::HeadlessOutcome),
+    ApiServer(crate::command::commands::api_server::ApiServerOutcome),
     Remote(crate::command::commands::remote::RemoteOutcome),
     New(crate::command::commands::new::NewOutcome),
     Specs(crate::command::commands::specs::SpecsOutcome),
@@ -183,7 +183,7 @@ pub enum BuiltCommand {
     Config(ConfigCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
-    Headless(HeadlessCommand),
+    ApiServer(ApiServerCommand),
     Remote(RemoteCommand),
     New(NewCommand),
     Auth(AuthCommand),
@@ -397,7 +397,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                     session.clone(),
                 )))
             }
-            ["headless", "start"] => {
+            ["api", "start"] => {
                 let port = self
                     .frontend
                     .flag_u16(&canonical_refs, "port")?
@@ -415,56 +415,101 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "dangerously-skip-auth")?
                     .unwrap_or(false);
-                Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                    HeadlessSubcommand::Start(HeadlessStartFlags {
+                let dangerously_skip_tls = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "dangerously-skip-tls")?
+                    .unwrap_or(false);
+                Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                    ApiServerSubcommand::Start(ApiServerStartFlags {
                         port,
                         workdirs,
                         background,
                         refresh_key,
                         dangerously_skip_auth,
+                        dangerously_skip_tls,
                     }),
                     self.engines.clone(),
                 )))
             }
-            ["headless", "kill"] => Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                HeadlessSubcommand::Kill(HeadlessKillFlags {}),
+            ["api", "kill"] => Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                ApiServerSubcommand::Kill(ApiServerKillFlags {}),
                 self.engines.clone(),
             ))),
-            ["headless", "logs"] => Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                HeadlessSubcommand::Logs(HeadlessLogsFlags {}),
+            ["api", "logs"] => Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                ApiServerSubcommand::Logs(ApiServerLogsFlags {}),
                 self.engines.clone(),
             ))),
-            ["headless", "status"] => Ok(BuiltCommand::Headless(HeadlessCommand::new(
-                HeadlessSubcommand::Status(HeadlessStatusFlags {}),
+            ["api", "status"] => Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
+                ApiServerSubcommand::Status(ApiServerStatusFlags {}),
                 self.engines.clone(),
             ))),
-            ["remote", "run"] => {
-                let command = self.frontend.arguments(&canonical_refs, "command")?;
-                let flags = RemoteRunFlags {
-                    command,
-                    remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
-                    session: self.frontend.flag_string(&canonical_refs, "session")?,
-                    follow: self
-                        .frontend
-                        .flag_bool(&canonical_refs, "follow")?
-                        .unwrap_or(false),
-                    api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
-                };
+            ["remote", "exec", "workflow"] => {
+                let workflow = self
+                    .frontend
+                    .flag_path(&canonical_refs, "workflow")?
+                    .or_else(|| {
+                        self.frontend
+                            .argument(&canonical_refs, "workflow")
+                            .ok()
+                            .flatten()
+                            .map(PathBuf::from)
+                    })
+                    .ok_or_else(|| {
+                        CommandError::missing_required_argument(&canonical_refs, "workflow")
+                    })?;
                 Ok(BuiltCommand::Remote(RemoteCommand::new(
-                    RemoteSubcommand::Run(flags),
+                    RemoteSubcommand::ExecWorkflow(RemoteExecWorkflowFlags {
+                        workflow,
+                        work_item: self.frontend.flag_string(&canonical_refs, "work-item")?,
+                        agent: self.frontend.flag_string(&canonical_refs, "agent")?,
+                        remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
+                        session: self.frontend.flag_string(&canonical_refs, "session")?,
+                        follow: self
+                            .frontend
+                            .flag_bool(&canonical_refs, "follow")?
+                            .unwrap_or(false),
+                        api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
+                    }),
+                    self.engines.clone(),
+                    session.clone(),
+                )))
+            }
+            ["remote", "exec", "prompt"] => {
+                let prompt = self
+                    .frontend
+                    .argument(&canonical_refs, "prompt")?
+                    .ok_or_else(|| {
+                        CommandError::missing_required_argument(&canonical_refs, "prompt")
+                    })?;
+                Ok(BuiltCommand::Remote(RemoteCommand::new(
+                    RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
+                        prompt,
+                        agent: self.frontend.flag_string(&canonical_refs, "agent")?,
+                        remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
+                        session: self.frontend.flag_string(&canonical_refs, "session")?,
+                        follow: self
+                            .frontend
+                            .flag_bool(&canonical_refs, "follow")?
+                            .unwrap_or(false),
+                        api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
+                    }),
                     self.engines.clone(),
                     session.clone(),
                 )))
             }
             ["remote", "session", "start"] => {
-                let dir = self.frontend.argument(&canonical_refs, "dir")?;
-                let remote_addr = self.frontend.flag_string(&canonical_refs, "remote-addr")?;
-                let api_key = self.frontend.flag_string(&canonical_refs, "api-key")?;
+                let session_type = self
+                    .frontend
+                    .flag_enum(&canonical_refs, "type")?
+                    .unwrap_or_else(|| "local".to_string());
                 Ok(BuiltCommand::Remote(RemoteCommand::new(
                     RemoteSubcommand::SessionStart(RemoteSessionStartFlags {
-                        dir,
-                        remote_addr,
-                        api_key,
+                        session_type,
+                        workdir: self.frontend.flag_string(&canonical_refs, "workdir")?,
+                        repo_url: self.frontend.flag_string(&canonical_refs, "repo-url")?,
+                        branch: self.frontend.flag_string(&canonical_refs, "branch")?,
+                        remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
+                        api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
                     }),
                     self.engines.clone(),
                     session.clone(),
@@ -616,11 +661,11 @@ impl<F: DispatchFrontend> Dispatch<F> {
                     .await
                     .map(CommandOutcome::ExecWorkflow)
             }
-            BuiltCommand::Headless(cmd) => {
-                let boxed: Box<dyn HeadlessCommandFrontend> = Box::new(frontend);
+            BuiltCommand::ApiServer(cmd) => {
+                let boxed: Box<dyn ApiServerCommandFrontend> = Box::new(frontend);
                 cmd.run_with_frontend(boxed)
                     .await
-                    .map(CommandOutcome::Headless)
+                    .map(CommandOutcome::ApiServer)
             }
             BuiltCommand::Remote(cmd) => {
                 let boxed: Box<dyn RemoteCommandFrontend> = Box::new(frontend);
@@ -708,7 +753,6 @@ fn read_chat_flags<F: CommandFrontend>(
         non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
         plan: f.flag_bool(p, "plan")?.unwrap_or(false),
         allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
-        mount_ssh: f.flag_bool(p, "mount-ssh")?.unwrap_or(false),
         yolo: f.flag_bool(p, "yolo")?.unwrap_or(false),
         auto: f.flag_bool(p, "auto")?.unwrap_or(false),
         agent: f.flag_string(p, "agent")?,
@@ -727,7 +771,6 @@ fn read_exec_prompt_flags<F: CommandFrontend>(
         non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
         plan: f.flag_bool(p, "plan")?.unwrap_or(false),
         allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
-        mount_ssh: f.flag_bool(p, "mount-ssh")?.unwrap_or(false),
         yolo: f.flag_bool(p, "yolo")?.unwrap_or(false),
         auto: f.flag_bool(p, "auto")?.unwrap_or(false),
         agent: f.flag_string(p, "agent")?,
@@ -753,7 +796,6 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
         plan: f.flag_bool(p, "plan")?.unwrap_or(false),
         allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
         worktree,
-        mount_ssh: f.flag_bool(p, "mount-ssh")?.unwrap_or(false),
         yolo,
         auto: f.flag_bool(p, "auto")?.unwrap_or(false),
         agent: f.flag_string(p, "agent")?,
@@ -839,7 +881,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -1011,12 +1053,12 @@ mod tests {
     }
 
     #[test]
-    fn build_headless_start_with_port() {
+    fn build_api_start_with_port() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.u16s.insert("port".into(), 1234);
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-        let built = dispatch.build_command(&["headless", "start"]).unwrap();
-        assert!(matches!(built, BuiltCommand::Headless(_)));
+        let built = dispatch.build_command(&["api", "start"]).unwrap();
+        assert!(matches!(built, BuiltCommand::ApiServer(_)));
     }
 
     #[test]
@@ -1033,14 +1075,26 @@ mod tests {
     }
 
     #[test]
-    fn build_remote_run_with_command_args() {
+    fn build_remote_exec_workflow_with_workflow_argument() {
         let mut frontend = FakeCommandFrontend::new();
-        frontend.args_vec.insert(
-            "command".into(),
-            vec!["exec".into(), "prompt".into(), "hello".into()],
-        );
+        frontend
+            .paths
+            .insert("workflow".into(), std::path::PathBuf::from("/tmp/wf.toml"));
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-        let built = dispatch.build_command(&["remote", "run"]).unwrap();
+        let built = dispatch
+            .build_command(&["remote", "exec", "workflow"])
+            .unwrap();
+        assert!(matches!(built, BuiltCommand::Remote(_)));
+    }
+
+    #[test]
+    fn build_remote_exec_prompt_with_prompt_argument() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.args.insert("prompt".into(), "hello".into());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let built = dispatch
+            .build_command(&["remote", "exec", "prompt"])
+            .unwrap();
         assert!(matches!(built, BuiltCommand::Remote(_)));
     }
 
@@ -1131,20 +1185,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_box_input_remote_run_trailing_var_args() {
+    fn parse_command_box_input_remote_exec_workflow() {
         let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input(
-            r#"remote run -- exec prompt "hello world""#,
+            "remote exec workflow my-workflow.toml --follow",
         )
         .unwrap();
-        assert_eq!(parsed.path, vec!["remote", "run"]);
-        match parsed.arguments.get("command") {
-            Some(parsed_input::ArgValue::Multi(items)) => {
-                assert!(items.iter().any(|i| i == "exec"));
-                assert!(items.iter().any(|i| i == "prompt"));
-                assert!(items.iter().any(|i| i == "hello world"));
+        assert_eq!(parsed.path, vec!["remote", "exec", "workflow"]);
+        match parsed.arguments.get("workflow") {
+            Some(parsed_input::ArgValue::Single(s)) => {
+                assert_eq!(s, "my-workflow.toml");
             }
-            other => panic!("expected Multi command args, got: {other:?}"),
+            other => panic!("expected Single workflow argument, got: {other:?}"),
         }
+        assert!(matches!(
+            parsed.flags.get("follow"),
+            Some(parsed_input::FlagValue::Bool(true))
+        ));
     }
 
     #[test]

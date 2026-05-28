@@ -17,7 +17,7 @@ fn docker_available() -> bool {
 }
 
 /// Build the project base image and return its tag. The base image is used to
-/// substitute the `{{AMUX_BASE_IMAGE}}` placeholder in agent templates.
+/// substitute the `{{AWMAN_BASE_IMAGE}}` placeholder in agent templates.
 fn build_base_image() -> String {
     let tag = "amux-test-base:latest";
     let status = Command::new("docker")
@@ -46,11 +46,11 @@ fn build_template(template_path: &str, tag: &str) {
 
     let base_tag = build_base_image();
 
-    // Read the template and substitute the {{AMUX_BASE_IMAGE}} placeholder so
+    // Read the template and substitute the {{AWMAN_BASE_IMAGE}} placeholder so
     // Docker receives a valid image reference in the FROM directive.
     let template_content =
         std::fs::read_to_string(template_path).expect("failed to read template file");
-    let dockerfile_content = template_content.replace("{{AMUX_BASE_IMAGE}}", &base_tag);
+    let dockerfile_content = template_content.replace("{{AWMAN_BASE_IMAGE}}", &base_tag);
 
     // Write the substituted content to a temporary file.
     let mut tmp = tempfile::NamedTempFile::new().expect("failed to create temp Dockerfile");

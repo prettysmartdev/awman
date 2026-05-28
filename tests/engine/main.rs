@@ -8,6 +8,8 @@
 mod helpers;
 
 mod container_docker;
+mod container_io;
 mod git_engine;
 mod overlay_engine;
+mod stuck_event_wiring;
 mod workflow_end_to_end;

@@ -1,4 +1,4 @@
-FROM {{AMUX_BASE_IMAGE}}
+FROM {{AWMAN_BASE_IMAGE}}
 
 # Force root for installation: a base image may have switched to a non-root
 # user, and apt/cp/install need write access to /usr/local, /etc, /root.

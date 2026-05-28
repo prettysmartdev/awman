@@ -1,0 +1,92 @@
+{
+  "schema_version": 3,
+  "workflow_name": "Implement Feature and Create PR Workflow",
+  "workflow_hash": "199d2e01f2514675980bf539cc08818b10ed134850867da63afe028ffba580f3",
+  "work_item": 83,
+  "step_states": {
+    "tests": "Succeeded",
+    "docs": "Succeeded",
+    "implement": "Succeeded",
+    "review": "Succeeded"
+  },
+  "completed_steps": [
+    "docs",
+    "review",
+    "implement",
+    "tests"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-05-27T20:45:31.614454Z",
+  "updated_at": "2026-05-27T22:07:20.902185Z",
+  "steps": [
+    {
+      "name": "implement",
+      "depends_on": [],
+      "model": "claude-opus-4-6"
+    },
+    {
+      "name": "tests",
+      "depends_on": [
+        "implement"
+      ]
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "implement"
+      ],
+      "model": "claude-haiku-4-5"
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "docs",
+        "tests"
+      ],
+      "model": "claude-opus-4-7"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": true,
+  "teardown_completed": true,
+  "setup_step_states": [
+    {
+      "description": "run_shell: echo hello",
+      "status": "Succeeded"
+    }
+  ],
+  "teardown_step_states": [
+    {
+      "description": "run_shell: make test",
+      "status": {
+        "Failed": {
+          "error": "awman: immediate\nawman: immediate again\nawman: msg\nawman: queued message\nawman warning: another\nawman: immediate\nerror: test failed, to rerun pass `--lib`\nmake: *** [Makefile:18: test] Error 101\n"
+        }
+      }
+    },
+    {
+      "description": "commit_changes: Implement 0083",
+      "status": {
+        "Failed": {
+          "error": "Author identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email \"you@example.com\"\n  git config --global user.name \"Your Name\"\n\nto set your account's default identity.\nOmit --global to set the identity only in this repository.\n\nfatal: unable to auto-detect email address (got 'awman@awman-80244-398688000.(none)')\n"
+        }
+      }
+    },
+    {
+      "description": "push_branch",
+      "status": {
+        "Failed": {
+          "error": "error: cannot run ssh: No such file or directory\nfatal: unable to fork\n"
+        }
+      }
+    },
+    {
+      "description": "create_pull_request: Implement 0083",
+      "status": {
+        "Failed": {
+          "error": "must provide `--title` and `--body` (or `--fill` or `fill-first` or `--fillverbose`) when not running interactively\n\nUsage:  gh pr create [flags]\n\nFlags:\n  -a, --assignee login       Assign people by their login. Use \"@me\" to self-assign.\n  -B, --base branch          The branch into which you want your code merged\n  -b, --body string          Body for the pull request\n  -F, --body-file file       Read body text from file (use \"-\" to read from standard input)\n  -d, --draft                Mark pull request as a draft\n      --dry-run              Print details instead of creating the PR. May still push git changes.\n  -e, --editor               Skip prompts and open the text editor to write the title and body in. The first line is the title and the remaining text is the body.\n  -f, --fill                 Use commit info for title and body\n      --fill-first           Use first commit info for title and body\n      --fill-verbose         Use commits msg+body for description\n  -H, --head branch          The branch that contains commits for your pull request (default [current branch])\n  -l, --label name           Add labels by name\n  -m, --milestone name       Add the pull request to a milestone by name\n      --no-maintainer-edit   Disable maintainer's ability to modify pull request\n  -p, --project title        Add the pull request to projects by title\n      --recover string       Recover input from a failed run of create\n  -r, --reviewer handle      Request reviews from people or teams by their handle\n  -T, --template file        Template file to use as starting body text\n  -t, --title string         Title for the pull request\n  -w, --web                  Open the web browser to create a pull request\n  \n"
+        }
+      }
+    }
+  ]
+}

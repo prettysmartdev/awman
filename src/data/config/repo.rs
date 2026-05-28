@@ -1,4 +1,4 @@
-//! Per-repository configuration: `<git_root>/.amux/config.json`.
+//! Per-repository configuration: `<git_root>/.awman/config.json`.
 //!
 //! Schema parity with the legacy `RepoConfig` (`oldsrc/config/mod.rs`) is
 //! preserved for forward and backward compatibility — users upgrading from a
@@ -10,17 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
 
-/// Subdirectory under the git root in which amux stores per-repo state.
-pub const REPO_CONFIG_SUBDIR: &str = ".amux";
+/// Subdirectory under the git root in which awman stores per-repo state.
+pub const REPO_CONFIG_SUBDIR: &str = ".awman";
 
 /// Filename of the per-repo config inside `REPO_CONFIG_SUBDIR`.
 pub const REPO_CONFIG_FILENAME: &str = "config.json";
-
-/// Legacy subdirectory used before the move to `.amux/`.
-const LEGACY_REPO_CONFIG_SUBDIR: &str = "aspec";
-
-/// Legacy filename used before the move to `config.json`.
-const LEGACY_REPO_CONFIG_FILENAME: &str = ".amux.json";
 
 /// Remote-mode configuration nested inside `GlobalConfig`.
 ///
@@ -36,9 +30,9 @@ pub struct RemoteConfig {
     pub default_api_key: Option<String>,
 }
 
-/// Headless server configuration nested inside `GlobalConfig`.
+/// API server configuration nested inside `GlobalConfig`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HeadlessConfig {
+pub struct ApiConfig {
     #[serde(rename = "workDirs", skip_serializing_if = "Option::is_none")]
     pub work_dirs: Option<Vec<String>>,
     #[serde(
@@ -46,28 +40,6 @@ pub struct HeadlessConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub always_non_interactive: Option<bool>,
-}
-
-/// Overlay configuration for mounting host resources into agent containers.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OverlaysConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub directories: Option<Vec<DirectoryOverlayConfig>>,
-    /// When true, mount the global amux skills dir into the agent container.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skills: Option<bool>,
-}
-
-/// A single directory overlay entry as stored in JSON config.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectoryOverlayConfig {
-    /// Host path (absolute or `~`-expanded).
-    pub host: String,
-    /// Container path (absolute).
-    pub container: String,
-    /// Mount permission: `"ro"` or `"rw"`. Defaults to `"ro"` when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission: Option<String>,
 }
 
 /// Work-items configuration nested within `RepoConfig`.
@@ -81,7 +53,7 @@ pub struct WorkItemsConfig {
     pub template: Option<String>,
 }
 
-/// Per-repository configuration stored at `<git_root>/.amux/config.json`.
+/// Per-repository configuration stored at `<git_root>/.awman/config.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,27 +67,22 @@ pub struct RepoConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub yolo_disallowed_tools: Option<Vec<String>>,
-    #[serde(rename = "envPassthrough", skip_serializing_if = "Option::is_none")]
-    pub env_passthrough: Option<Vec<String>>,
+    #[serde(rename = "envPassthrough", default, skip_serializing)]
+    pub legacy_env_passthrough: Option<Vec<String>>,
     #[serde(rename = "workItems", skip_serializing_if = "Option::is_none")]
     pub work_items: Option<WorkItemsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub overlays: Option<OverlaysConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlays: Option<Vec<String>>,
     #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
     pub agent_stuck_timeout_secs: Option<u64>,
+    #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
 }
 
 impl RepoConfig {
     /// Path to the per-repo config under a git root.
     pub fn path(git_root: &Path) -> PathBuf {
         git_root.join(REPO_CONFIG_SUBDIR).join(REPO_CONFIG_FILENAME)
-    }
-
-    /// Path to the pre-`.amux/` legacy config under a git root.
-    pub fn legacy_path(git_root: &Path) -> PathBuf {
-        git_root
-            .join(LEGACY_REPO_CONFIG_SUBDIR)
-            .join(LEGACY_REPO_CONFIG_FILENAME)
     }
 
     /// Load the repo config from disk.
@@ -140,24 +107,6 @@ impl RepoConfig {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
         std::fs::write(&path, content).map_err(|e| DataError::io(&path, e))
-    }
-
-    /// Migrate a legacy `aspec/.amux.json` to `.amux/config.json` if and only
-    /// if the legacy file exists and the new path does not. Removes the legacy
-    /// file on success. Returns `true` when a migration was performed.
-    pub fn migrate_legacy(git_root: &Path) -> Result<bool, DataError> {
-        let legacy = Self::legacy_path(git_root);
-        let current = Self::path(git_root);
-        if !legacy.exists() || current.exists() {
-            return Ok(false);
-        }
-        let content = std::fs::read_to_string(&legacy).map_err(|e| DataError::io(&legacy, e))?;
-        if let Some(parent) = current.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
-        }
-        std::fs::write(&current, &content).map_err(|e| DataError::io(&current, e))?;
-        std::fs::remove_file(&legacy).map_err(|e| DataError::io(&legacy, e))?;
-        Ok(true)
     }
 
     /// Resolve the configured work items directory relative to `git_root`.
@@ -233,7 +182,6 @@ mod tests {
             agent: Some("claude".to_string()),
             terminal_scrollback_lines: Some(5000),
             yolo_disallowed_tools: Some(vec!["bash".to_string(), "python".to_string()]),
-            env_passthrough: Some(vec!["HOME".to_string(), "PATH".to_string()]),
             agent_stuck_timeout_secs: Some(60),
             ..Default::default()
         };
@@ -245,62 +193,15 @@ mod tests {
     #[test]
     fn load_malformed_json_returns_config_parse_error() {
         let tmp = make_git_root();
-        let amux_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join(REPO_CONFIG_FILENAME), b"{not valid json").unwrap();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join(REPO_CONFIG_FILENAME), b"{not valid json").unwrap();
 
         let err = RepoConfig::load(tmp.path()).unwrap_err();
         assert!(
             matches!(err, DataError::ConfigParse { .. }),
             "expected ConfigParse, got {err:?}"
         );
-    }
-
-    #[test]
-    fn migrate_legacy_moves_file_and_removes_old() {
-        let tmp = make_git_root();
-        let legacy_dir = tmp.path().join("aspec");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        let legacy_content = r#"{"agent":"claude"}"#;
-        std::fs::write(legacy_dir.join(".amux.json"), legacy_content).unwrap();
-
-        let migrated = RepoConfig::migrate_legacy(tmp.path()).unwrap();
-        assert!(migrated, "expected migration to be performed");
-
-        // Legacy file must be gone.
-        assert!(!RepoConfig::legacy_path(tmp.path()).exists());
-        // New file must exist and be readable.
-        assert!(RepoConfig::path(tmp.path()).exists());
-        let loaded = RepoConfig::load(tmp.path()).unwrap();
-        assert_eq!(loaded.agent.as_deref(), Some("claude"));
-    }
-
-    #[test]
-    fn migrate_legacy_no_op_when_both_files_exist() {
-        let tmp = make_git_root();
-        // Write both legacy and new config.
-        let legacy_dir = tmp.path().join("aspec");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join(".amux.json"), r#"{"agent":"old"}"#).unwrap();
-
-        let new_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
-        std::fs::create_dir_all(&new_dir).unwrap();
-        std::fs::write(new_dir.join(REPO_CONFIG_FILENAME), r#"{"agent":"new"}"#).unwrap();
-
-        let migrated = RepoConfig::migrate_legacy(tmp.path()).unwrap();
-        assert!(
-            !migrated,
-            "migration should be a no-op when new file already exists"
-        );
-        // Legacy file should still be there.
-        assert!(RepoConfig::legacy_path(tmp.path()).exists());
-    }
-
-    #[test]
-    fn migrate_legacy_no_op_when_neither_file_exists() {
-        let tmp = make_git_root();
-        let migrated = RepoConfig::migrate_legacy(tmp.path()).unwrap();
-        assert!(!migrated);
     }
 
     #[test]
@@ -339,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn path_is_inside_amux_subdir() {
+    fn path_is_inside_awman_subdir() {
         let tmp = make_git_root();
         let p = RepoConfig::path(tmp.path());
         assert_eq!(
@@ -350,65 +251,113 @@ mod tests {
         );
     }
 
+    // ─── Overlay field deserialization ───────────────────────────────────────
+
     #[test]
-    fn legacy_path_is_inside_aspec_dir() {
+    fn overlays_new_flat_format_deserializes_correctly() {
         let tmp = make_git_root();
-        let p = RepoConfig::legacy_path(tmp.path());
-        assert_eq!(p, tmp.path().join("aspec").join(".amux.json"));
-    }
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"overlays": ["skill(*)", "env(X)"]}"#,
+        )
+        .unwrap();
 
-    // ─── OverlaysConfig / skills deserialization ──────────────────────────────
-
-    #[test]
-    fn overlays_config_skills_true_deserializes() {
-        let json = r#"{"overlays": {"skills": true}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(
-            overlays.skills,
-            Some(true),
-            "skills: true must deserialize to Some(true)"
+            cfg.overlays,
+            Some(vec!["skill(*)".to_string(), "env(X)".to_string()]),
+            "new flat overlays array must deserialize correctly"
         );
-        assert!(overlays.directories.is_none(), "directories must be None");
+        assert!(cfg.legacy_env_passthrough.is_none());
     }
 
     #[test]
-    fn overlays_config_skills_false_deserializes() {
-        let json = r#"{"overlays": {"skills": false}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
-        assert_eq!(
-            overlays.skills,
-            Some(false),
-            "skills: false must deserialize to Some(false)"
-        );
-    }
+    fn overlays_old_object_format_fails_to_deserialize() {
+        // Old format: {"overlays": {"directories": [...], "skills": true}}
+        // Must not silently migrate — must surface a config parse error.
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"overlays": {"directories": [], "skills": true}}"#,
+        )
+        .unwrap();
 
-    #[test]
-    fn overlays_config_missing_skills_key_deserializes_to_none() {
-        let json = r#"{"overlays": {}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
+        let result = RepoConfig::load(tmp.path());
         assert!(
-            overlays.skills.is_none(),
-            "missing 'skills' key must deserialize to None; got {:?}",
-            overlays.skills
+            result.is_err(),
+            "old object-format overlays must fail to deserialize (no auto-migration); got Ok"
+        );
+        assert!(
+            matches!(result.unwrap_err(), DataError::ConfigParse { .. }),
+            "error must be ConfigParse"
         );
     }
 
     #[test]
-    fn overlays_config_only_directories_deserializes_without_error() {
-        let json = r#"{"overlays": {"directories": [{"host": "/h", "container": "/c", "permission": "ro"}]}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
-        assert!(
-            overlays.skills.is_none(),
-            "skills must be None when not in JSON"
-        );
+    fn legacy_env_passthrough_deserializes_with_overlays_absent() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"envPassthrough": ["MY_VAR", "OTHER_VAR"]}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(
-            overlays.directories.as_ref().map(|d| d.len()),
-            Some(1),
-            "directories must have 1 entry"
+            cfg.legacy_env_passthrough,
+            Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
+            "legacy envPassthrough must deserialize into legacy_env_passthrough"
+        );
+        assert!(
+            cfg.overlays.is_none(),
+            "overlays must be absent when only envPassthrough is present"
+        );
+    }
+
+    #[test]
+    fn overlays_round_trip_with_dir_and_env_expressions() {
+        let tmp = make_git_root();
+        let original = RepoConfig {
+            overlays: Some(vec![
+                "dir(~/data:/workspace:ro)".to_string(),
+                "env(TOKEN)".to_string(),
+            ]),
+            ..Default::default()
+        };
+        original.save(tmp.path()).unwrap();
+        let reloaded = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            original.overlays, reloaded.overlays,
+            "overlays with dir() and env() expressions must round-trip correctly"
+        );
+    }
+
+    #[test]
+    fn legacy_env_passthrough_is_not_serialized_in_save() {
+        // legacy_env_passthrough has skip_serializing — it must not appear in the
+        // JSON written by save(), so it doesn't persist across a load/save cycle.
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"envPassthrough": ["VAR"]}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        cfg.save(tmp.path()).unwrap();
+
+        let written = std::fs::read_to_string(RepoConfig::path(tmp.path())).unwrap();
+        assert!(
+            !written.contains("envPassthrough"),
+            "legacy envPassthrough must not be re-serialized by save(); got: {written}"
         );
     }
 }

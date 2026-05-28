@@ -1,8 +1,8 @@
-//! `Session` and `SessionState` — the ruling Layer 0 types for amux operations.
+//! `Session` and `SessionState` — the ruling Layer 0 types for awman operations.
 //!
 //! A `Session` ties together a working directory, a git root, the loaded
 //! configurations, and the in-flight runtime state. The CLI runs a single
-//! session per invocation; the TUI runs one per tab; the headless server runs
+//! session per invocation; the TUI runs one per tab; the API server runs
 //! one per API session.
 
 use std::path::{Path, PathBuf};
@@ -241,7 +241,7 @@ pub trait GitRootResolver: Send + Sync {
 }
 
 /// Resolver that always returns the same git root regardless of input.
-/// Used by Layer-0-internal tests and the headless server's session restore.
+/// Used by Layer-0-internal tests and the API server's session restore.
 #[derive(Debug, Clone)]
 pub struct StaticGitRootResolver {
     root: PathBuf,
@@ -259,11 +259,46 @@ impl GitRootResolver for StaticGitRootResolver {
     }
 }
 
+/// Whether this session targets a local working directory or a remote
+/// repository that was cloned automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionType {
+    Local {
+        workdir: PathBuf,
+    },
+    Remote {
+        repo_url: String,
+        branch: String,
+        cloned_path: PathBuf,
+    },
+}
+
+impl SessionType {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, SessionType::Remote { .. })
+    }
+
+    pub fn cloned_path(&self) -> Option<&Path> {
+        match self {
+            SessionType::Remote { cloned_path, .. } => Some(cloned_path),
+            SessionType::Local { .. } => None,
+        }
+    }
+
+    pub fn working_dir(&self) -> &Path {
+        match self {
+            SessionType::Local { workdir } => workdir,
+            SessionType::Remote { cloned_path, .. } => cloned_path,
+        }
+    }
+}
+
 /// The ruling Layer 0 type that every command and workflow invocation hangs off.
 #[derive(Debug, Clone)]
 pub struct Session {
     id: SessionId,
-    working_dir: PathBuf,
+    session_type: SessionType,
     git_root: PathBuf,
     repo_config: RepoConfig,
     global_config: GlobalConfig,
@@ -338,7 +373,9 @@ impl Session {
 
         Ok(Self {
             id: SessionId::new(),
-            working_dir,
+            session_type: SessionType::Local {
+                workdir: working_dir,
+            },
             git_root,
             repo_config,
             global_config,
@@ -358,7 +395,15 @@ impl Session {
     }
 
     pub fn working_dir(&self) -> &Path {
-        &self.working_dir
+        self.session_type.working_dir()
+    }
+
+    pub fn session_type(&self) -> &SessionType {
+        &self.session_type
+    }
+
+    pub fn set_session_type(&mut self, session_type: SessionType) {
+        self.session_type = session_type;
     }
 
     pub fn git_root(&self) -> &Path {
@@ -462,7 +507,7 @@ fn resolve_default_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AMUX_CONFIG_HOME};
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
     use crate::data::config::repo::REPO_CONFIG_SUBDIR;
 
     // ─── helpers ─────────────────────────────────────────────────────────────
@@ -482,7 +527,7 @@ mod tests {
 
         fn env(&self) -> EnvSnapshot {
             EnvSnapshot::with_overrides([(
-                AMUX_CONFIG_HOME,
+                AWMAN_CONFIG_HOME,
                 self.home_dir.path().to_str().unwrap(),
             )])
         }
@@ -636,9 +681,9 @@ mod tests {
     fn session_with_malformed_repo_config_returns_config_parse_error() {
         let setup = IsolatedSetup::new();
         // Write broken JSON to the repo config file.
-        let amux_dir = setup.git_root.path().join(REPO_CONFIG_SUBDIR);
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join("config.json"), b"{this is not json}").unwrap();
+        let awman_dir = setup.git_root.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("config.json"), b"{this is not json}").unwrap();
 
         let resolver = StaticGitRootResolver::new(setup.git_root.path());
         let opts = SessionOpenOptions {
@@ -674,10 +719,10 @@ mod tests {
         let home_tmp = tempfile::tempdir().unwrap();
 
         // Write repo config: sets agent and scrollback.
-        let amux_dir = git_tmp.path().join(REPO_CONFIG_SUBDIR);
-        std::fs::create_dir_all(&amux_dir).unwrap();
+        let awman_dir = git_tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
         std::fs::write(
-            amux_dir.join("config.json"),
+            awman_dir.join("config.json"),
             r#"{"agent":"codex","terminal_scrollback_lines":7777}"#,
         )
         .unwrap();
@@ -690,7 +735,7 @@ mod tests {
         .unwrap();
 
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, home_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_tmp.path().to_str().unwrap())]);
         let resolver = StaticGitRootResolver::new(git_tmp.path());
         let opts = SessionOpenOptions {
             env: Some(env),

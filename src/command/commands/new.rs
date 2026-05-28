@@ -3,11 +3,10 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::prompt_templates::{
     render_skill_interview_prompt, render_workflow_interview_prompt,
 };
-use crate::command::commands::Command;
+use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::fs::{SkillDirs, WorkflowDirs};
@@ -186,21 +185,6 @@ fn serialize_workflow_yaml(title: &str, steps: &[WorkflowStepInput]) -> String {
     serde_yaml::to_string(&file).unwrap_or_else(|_| format!("title: \"{title}\"\nsteps: []\n"))
 }
 
-fn serialize_workflow_md(title: &str, steps: &[WorkflowStepInput]) -> String {
-    let mut out = format!("# {title}\n");
-    for step in steps {
-        out.push_str(&format!("\n## Step: {}\n", step.name));
-        if let Some(agent) = &step.agent {
-            out.push_str(&format!("Agent: {agent}\n"));
-        }
-        if let Some(model) = &step.model {
-            out.push_str(&format!("Model: {model}\n"));
-        }
-        out.push_str(&format!("Prompt: {}\n", step.prompt));
-    }
-    out
-}
-
 /// Subdirectory under the git root for user-authored workflow definitions.
 const REPO_WORKFLOW_DEFINITIONS_DIR: &str = "aspec/workflows";
 
@@ -273,7 +257,6 @@ impl Command for NewCommand {
                 let extension = match f.format.as_str() {
                     "yaml" => "yaml",
                     "yml" => "yml",
-                    "md" | "markdown" => "md",
                     _ => "toml",
                 };
                 let session = if !f.global || f.interview {
@@ -313,7 +296,6 @@ impl Command for NewCommand {
                     // to fill it in.
                     let skeleton = match extension {
                         "yaml" | "yml" => format!("title: \"{name}\"\nsteps: []\n"),
-                        "md" => format!("# {name}\n"),
                         _ => format!("title = \"{name}\"\n"),
                     };
                     let _ = std::fs::write(&path, skeleton);
@@ -360,7 +342,7 @@ impl Command for NewCommand {
                     let run_opts = AgentRunOptions {
                         initial_prompt: Some(prompt),
                         non_interactive: f.non_interactive,
-                        env_passthrough: Some(session.effective_config().env_passthrough()),
+                        env_passthrough: None,
                         ..Default::default()
                     };
                     let mut options = match self
@@ -460,7 +442,6 @@ impl Command for NewCommand {
 
                     let body = match extension {
                         "yaml" | "yml" => serialize_workflow_yaml(&title, &steps),
-                        "md" => serialize_workflow_md(&title, &steps),
                         _ => serialize_workflow_toml(&title, &steps),
                     };
                     let _ = std::fs::write(&path, body);
@@ -543,7 +524,7 @@ impl Command for NewCommand {
                     let run_opts = AgentRunOptions {
                         initial_prompt: Some(prompt),
                         non_interactive: f.non_interactive,
-                        env_passthrough: Some(session.effective_config().env_passthrough()),
+                        env_passthrough: None,
                         ..Default::default()
                     };
                     let mut options = match self
@@ -793,8 +774,8 @@ mod tests {
     }
 
     fn make_engines(root: &std::path::Path) -> Engines {
+        use crate::data::fs::api_paths::ApiPaths;
         use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::data::fs::headless_paths::HeadlessPaths;
         use crate::engine::container::ContainerRuntime;
         use crate::engine::overlay::OverlayEngine;
         use std::sync::Arc;
@@ -808,7 +789,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             AuthPathResolver::at_home(root),
-            HeadlessPaths::at_root(root),
+            ApiPaths::at_root(root),
         ));
         Engines {
             runtime,
@@ -932,7 +913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_workflow_md_writes_file() {
+    async fn new_workflow_toml_writes_file() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
         let session = make_session(tmp.path());
@@ -941,7 +922,7 @@ mod tests {
                 interview: false,
                 non_interactive: false,
                 global: false,
-                format: "md".into(),
+                format: "toml".into(),
             }),
             engines,
             session,
@@ -953,8 +934,8 @@ mod tests {
         if let NewOutcome::Workflow(w) = outcome {
             let path_str = w.path.expect("path must be Some");
             assert!(
-                path_str.ends_with(".md"),
-                "path must have .md extension: {path_str}"
+                path_str.ends_with(".toml"),
+                "path must have .toml extension: {path_str}"
             );
             assert!(
                 path_str.contains("aspec/workflows/"),
@@ -962,8 +943,8 @@ mod tests {
             );
             let content = std::fs::read_to_string(&path_str).unwrap();
             assert!(
-                content.contains("## Step:"),
-                "Markdown workflow must contain ## Step: heading: {content}"
+                content.contains("[[step]]"),
+                "TOML workflow must contain [[step]]: {content}"
             );
         } else {
             panic!("unexpected outcome variant");

@@ -5,10 +5,9 @@ use serde::Serialize;
 
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::mount_scope::MountScopeFrontend;
 use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
-use crate::command::commands::Command;
+use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::engine::agent::AgentRunOptions;
@@ -118,25 +117,25 @@ impl crate::engine::message::UserMessageSink for NoopContainerFrontend {
 
 #[async_trait]
 impl ContainerFrontend for NoopContainerFrontend {
-    fn write_stdout(&mut self, _bytes: &[u8]) -> Result<(), crate::engine::error::EngineError> {
-        Ok(())
-    }
-    fn write_stderr(&mut self, _bytes: &[u8]) -> Result<(), crate::engine::error::EngineError> {
-        Ok(())
-    }
-    async fn read_stdin(
-        &mut self,
-        _buf: &mut [u8],
-    ) -> Result<usize, crate::engine::error::EngineError> {
-        Ok(0)
-    }
     fn report_status(&mut self, _status: crate::engine::container::frontend::ContainerStatus) {}
     fn report_progress(
         &mut self,
         _progress: crate::engine::container::frontend::ContainerProgress,
     ) {
     }
-    fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
+    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+        let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::engine::container::frontend::ContainerIo {
+            stdout: stdout_tx,
+            stderr: stderr_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
 }
 
 pub struct SpecsCommand {
@@ -407,7 +406,7 @@ pub(crate) async fn create_new_spec(
         let run_opts = AgentRunOptions {
             initial_prompt: Some(prompt),
             non_interactive,
-            env_passthrough: Some(session.effective_config().env_passthrough()),
+            env_passthrough: None,
             ..Default::default()
         };
         let mut options = match engines
@@ -638,8 +637,8 @@ mod tests {
     }
 
     fn make_engines_with_root(root: &std::path::Path) -> crate::command::dispatch::Engines {
+        use crate::data::fs::api_paths::ApiPaths;
         use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::data::fs::headless_paths::HeadlessPaths;
         use crate::engine::container::ContainerRuntime;
         use crate::engine::overlay::OverlayEngine;
         use std::sync::Arc;
@@ -653,7 +652,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             AuthPathResolver::at_home(root),
-            HeadlessPaths::at_root(root),
+            ApiPaths::at_root(root),
         ));
         crate::command::dispatch::Engines {
             runtime,

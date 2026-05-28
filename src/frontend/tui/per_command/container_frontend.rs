@@ -4,15 +4,13 @@
 //!
 //! For TUI mode, the engine's container backend takes ownership of the byte
 //! channels via `take_container_io` and bridges them directly to the
-//! container's PTY master — so `write_stdout`/`read_stdin`/`resize_pty` are
-//! no-ops on `TuiCommandFrontend`.
+//! container's PTY master or piped stdio.
 
 use async_trait::async_trait;
 
 use crate::engine::container::frontend::{
     ContainerFrontend, ContainerIo, ContainerProgress, ContainerStatus,
 };
-use crate::engine::error::EngineError;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::user_message::{SharedStatusLog, StatusLogEntry};
@@ -21,23 +19,6 @@ use crate::frontend::tui::user_message::{SharedStatusLog, StatusLogEntry};
 
 #[async_trait]
 impl ContainerFrontend for TuiCommandFrontend {
-    fn write_stdout(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-        // No-op: the engine bridges the PTY directly via the channels taken
-        // through `take_container_io`. This method is unused for TUI mode.
-        Ok(())
-    }
-
-    fn write_stderr(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
-        Ok(())
-    }
-
-    async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        // The engine reads stdin directly off the channel taken in
-        // `take_container_io`. Return EOF here so any backend that calls this
-        // legacy path stops cleanly.
-        Ok(0)
-    }
-
     fn report_status(&mut self, status: ContainerStatus) {
         if let ContainerStatus::Running { ref container_name } = status {
             if let Ok(mut name) = self.container_name_shared.lock() {
@@ -52,12 +33,10 @@ impl ContainerFrontend for TuiCommandFrontend {
             .info(format!("{}: {}", progress.stage, progress.message));
     }
 
-    fn resize_pty(&mut self, _cols: u16, _rows: u16) {
-        // No-op: handled via the resize channel taken through take_container_io.
-    }
-
-    fn take_container_io(&mut self) -> Option<ContainerIo> {
-        self.container_io.take()
+    fn take_container_io(&mut self) -> ContainerIo {
+        self.container_io
+            .take()
+            .expect("TuiCommandFrontend::take_container_io called but no ContainerIo available")
     }
 }
 
@@ -67,8 +46,8 @@ impl ContainerFrontend for TuiCommandFrontend {
 /// trait impls.
 ///
 /// Two modes:
-/// - **Without `ContainerIo`** (`new`): routes stdout/stderr line-by-line into
-///   the shared status log. Used by non-PTY text commands like `ready`/`init`.
+/// - **Without `ContainerIo`** (`new`): creates a non-interactive ContainerIo
+///   that routes stdout/stderr into the shared status log.
 /// - **With `ContainerIo`** (`with_io`): hands the byte channels to the
 ///   engine's container backend so it can bridge a real PTY directly. Used by
 ///   PTY commands like `chat` so their output renders inside the TUI's
@@ -81,10 +60,63 @@ pub struct TuiContainerProxy {
 
 impl TuiContainerProxy {
     /// Construct a status-log-only proxy (no PTY bridging).
+    /// Creates non-interactive ContainerIo channels that route to the status log.
     pub fn new(log: SharedStatusLog) -> Self {
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Non-interactive: engine owns the single stdin_tx and drops it
+        // after seeding so the child sees EOF (see `spawn_piped_docker`).
+
+        // Spawn drain tasks that route stdout/stderr into the status log.
+        let log_for_stdout = log.clone();
+        let mut stdout_rx = stdout_rx;
+        tokio::spawn(async move {
+            while let Some(bytes) = stdout_rx.recv().await {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines() {
+                    if !line.trim().is_empty() {
+                        if let Ok(mut log) = log_for_stdout.lock() {
+                            log.push(StatusLogEntry {
+                                level: MessageLevel::Info,
+                                text: line.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        let log_for_stderr = log.clone();
+        let mut stderr_rx = stderr_rx;
+        tokio::spawn(async move {
+            while let Some(bytes) = stderr_rx.recv().await {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines() {
+                    if !line.trim().is_empty() {
+                        if let Ok(mut log) = log_for_stderr.lock() {
+                            log.push(StatusLogEntry {
+                                level: MessageLevel::Warning,
+                                text: line.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        let io = ContainerIo {
+            stdout: stdout_tx,
+            stderr: stderr_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        };
+
         Self {
             log,
-            container_io: None,
+            container_io: Some(io),
             container_name_shared: None,
         }
     }
@@ -120,40 +152,6 @@ impl UserMessageSink for TuiContainerProxy {
 
 #[async_trait]
 impl ContainerFrontend for TuiContainerProxy {
-    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        for line in text.lines() {
-            if !line.trim().is_empty() {
-                if let Ok(mut log) = self.log.lock() {
-                    log.push(StatusLogEntry {
-                        level: MessageLevel::Info,
-                        text: line.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        let text = String::from_utf8_lossy(bytes);
-        for line in text.lines() {
-            if !line.trim().is_empty() {
-                if let Ok(mut log) = self.log.lock() {
-                    log.push(StatusLogEntry {
-                        level: MessageLevel::Warning,
-                        text: line.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        Ok(0) // Text commands don't need stdin
-    }
-
     fn report_status(&mut self, status: ContainerStatus) {
         if let ContainerStatus::Running { ref container_name } = status {
             if let Some(ref shared) = self.container_name_shared {
@@ -166,9 +164,9 @@ impl ContainerFrontend for TuiContainerProxy {
 
     fn report_progress(&mut self, _progress: ContainerProgress) {}
 
-    fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
-
-    fn take_container_io(&mut self) -> Option<ContainerIo> {
-        self.container_io.take()
+    fn take_container_io(&mut self) -> ContainerIo {
+        self.container_io
+            .take()
+            .expect("TuiContainerProxy::take_container_io called but no ContainerIo available")
     }
 }

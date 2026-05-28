@@ -85,21 +85,6 @@ impl EffectiveConfig {
         self.global.default_agent.clone()
     }
 
-    /// Effective env-passthrough list. Replace semantics: the highest source that
-    /// sets the field wins outright.
-    pub fn env_passthrough(&self) -> Vec<String> {
-        if let Some(values) = self.flags.env_passthrough.as_ref() {
-            return values.clone();
-        }
-        if let Some(values) = self.repo.env_passthrough.as_ref() {
-            return values.clone();
-        }
-        if let Some(values) = self.global.env_passthrough.as_ref() {
-            return values.clone();
-        }
-        Vec::new()
-    }
-
     /// Effective `yoloDisallowedTools` list.
     pub fn yolo_disallowed_tools(&self) -> Vec<String> {
         if let Some(values) = self.flags.yolo_disallowed_tools.as_ref() {
@@ -142,10 +127,10 @@ impl EffectiveConfig {
         Duration::from_secs(DEFAULT_AGENT_STUCK_TIMEOUT_SECS)
     }
 
-    /// Effective headless work-dirs allowlist.
-    pub fn headless_work_dirs(&self) -> Vec<String> {
-        if let Some(headless) = self.global.headless.as_ref() {
-            if let Some(dirs) = headless.work_dirs.as_ref() {
+    /// Effective API work-dirs allowlist.
+    pub fn api_work_dirs(&self) -> Vec<String> {
+        if let Some(api_cfg) = self.global.api.as_ref() {
+            if let Some(dirs) = api_cfg.work_dirs.as_ref() {
                 return dirs.clone();
             }
         }
@@ -158,7 +143,7 @@ impl EffectiveConfig {
             return value;
         }
         self.global
-            .headless
+            .api
             .as_ref()
             .and_then(|h| h.always_non_interactive)
             .unwrap_or(false)
@@ -213,15 +198,23 @@ impl EffectiveConfig {
     pub fn runtime(&self) -> Option<String> {
         self.global.runtime.clone()
     }
+
+    /// Effective base image tag for setup/teardown containers (repo > global > None).
+    pub fn base_image(&self) -> Option<String> {
+        if let Some(v) = self.repo.base_image.as_deref() {
+            return Some(v.to_string());
+        }
+        self.global.base_image.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::config::env::{
-        EnvSnapshot, AMUX_API_KEY, AMUX_REMOTE_ADDR, AMUX_REMOTE_SESSION,
+        EnvSnapshot, AWMAN_API_KEY, AWMAN_REMOTE_ADDR, AWMAN_REMOTE_SESSION,
     };
-    use crate::data::config::repo::{HeadlessConfig, RemoteConfig};
+    use crate::data::config::repo::{ApiConfig, RemoteConfig};
     use std::time::Duration;
 
     fn make_effective(
@@ -418,51 +411,6 @@ mod tests {
         assert_eq!(ec.agent_stuck_timeout(), Duration::from_secs(30));
     }
 
-    // ─── env_passthrough ─────────────────────────────────────────────────────
-
-    #[test]
-    fn env_passthrough_flag_beats_repo_and_global() {
-        let flags = FlagConfig {
-            env_passthrough: Some(vec!["FLAG_VAR".to_string()]),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            env_passthrough: Some(vec!["REPO_VAR".to_string()]),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            env_passthrough: Some(vec!["GLOBAL_VAR".to_string()]),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.env_passthrough(), vec!["FLAG_VAR"]);
-    }
-
-    #[test]
-    fn env_passthrough_repo_beats_global() {
-        let repo = RepoConfig {
-            env_passthrough: Some(vec!["REPO_VAR".to_string()]),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            env_passthrough: Some(vec!["GLOBAL_VAR".to_string()]),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.env_passthrough(), vec!["REPO_VAR"]);
-    }
-
-    #[test]
-    fn env_passthrough_empty_when_all_unset() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert!(ec.env_passthrough().is_empty());
-    }
-
     // ─── yolo_disallowed_tools ────────────────────────────────────────────────
 
     #[test]
@@ -512,7 +460,7 @@ mod tests {
             remote_addr: Some("flag-addr".to_string()),
             ..Default::default()
         };
-        let env = EnvSnapshot::with_overrides([(AMUX_REMOTE_ADDR, "env-addr")]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_ADDR, "env-addr")]);
         let global = GlobalConfig {
             remote: Some(RemoteConfig {
                 default_addr: Some("global-addr".to_string()),
@@ -526,7 +474,7 @@ mod tests {
 
     #[test]
     fn remote_addr_env_beats_global() {
-        let env = EnvSnapshot::with_overrides([(AMUX_REMOTE_ADDR, "env-addr")]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_ADDR, "env-addr")]);
         let global = GlobalConfig {
             remote: Some(RemoteConfig {
                 default_addr: Some("global-addr".to_string()),
@@ -575,14 +523,14 @@ mod tests {
             api_key: Some("flag-key".to_string()),
             ..Default::default()
         };
-        let env = EnvSnapshot::with_overrides([(AMUX_API_KEY, "env-key")]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_API_KEY, "env-key")]);
         let ec = make_effective(flags, env, RepoConfig::default(), GlobalConfig::default());
         assert_eq!(ec.remote_default_api_key().as_deref(), Some("flag-key"));
     }
 
     #[test]
     fn remote_api_key_env_beats_global() {
-        let env = EnvSnapshot::with_overrides([(AMUX_API_KEY, "env-key")]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_API_KEY, "env-key")]);
         let global = GlobalConfig {
             remote: Some(RemoteConfig {
                 default_api_key: Some("global-key".to_string()),
@@ -602,14 +550,14 @@ mod tests {
             remote_session: Some("flag-session".to_string()),
             ..Default::default()
         };
-        let env = EnvSnapshot::with_overrides([(AMUX_REMOTE_SESSION, "env-session")]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_SESSION, "env-session")]);
         let ec = make_effective(flags, env, RepoConfig::default(), GlobalConfig::default());
         assert_eq!(ec.remote_session().as_deref(), Some("flag-session"));
     }
 
     #[test]
     fn remote_session_from_env_when_flag_unset() {
-        let env = EnvSnapshot::with_overrides([(AMUX_REMOTE_SESSION, "env-session")]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_REMOTE_SESSION, "env-session")]);
         let ec = make_effective(
             FlagConfig::default(),
             env,
@@ -639,7 +587,7 @@ mod tests {
             ..Default::default()
         };
         let global = GlobalConfig {
-            headless: Some(HeadlessConfig {
+            api: Some(ApiConfig {
                 always_non_interactive: Some(false),
                 ..Default::default()
             }),
@@ -652,7 +600,7 @@ mod tests {
     #[test]
     fn always_non_interactive_from_global_when_flag_unset() {
         let global = GlobalConfig {
-            headless: Some(HeadlessConfig {
+            api: Some(ApiConfig {
                 always_non_interactive: Some(true),
                 ..Default::default()
             }),
@@ -678,12 +626,12 @@ mod tests {
         assert!(!ec.always_non_interactive());
     }
 
-    // ─── headless_work_dirs ───────────────────────────────────────────────────
+    // ─── api_work_dirs ───────────────────────────────────────────────────
 
     #[test]
-    fn headless_work_dirs_from_global() {
+    fn api_work_dirs_from_global() {
         let global = GlobalConfig {
-            headless: Some(HeadlessConfig {
+            api: Some(ApiConfig {
                 work_dirs: Some(vec!["/data".to_string(), "/work".to_string()]),
                 ..Default::default()
             }),
@@ -695,18 +643,18 @@ mod tests {
             RepoConfig::default(),
             global,
         );
-        assert_eq!(ec.headless_work_dirs(), vec!["/data", "/work"]);
+        assert_eq!(ec.api_work_dirs(), vec!["/data", "/work"]);
     }
 
     #[test]
-    fn headless_work_dirs_empty_when_not_set() {
+    fn api_work_dirs_empty_when_not_set() {
         let ec = make_effective(
             FlagConfig::default(),
             EnvSnapshot::empty(),
             RepoConfig::default(),
             GlobalConfig::default(),
         );
-        assert!(ec.headless_work_dirs().is_empty());
+        assert!(ec.api_work_dirs().is_empty());
     }
 
     // ─── runtime ─────────────────────────────────────────────────────────────

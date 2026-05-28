@@ -1,6 +1,6 @@
 # Four-Layer Architecture — Quick Reference
 
-**TL;DR**: amux is organized in four layers where lower layers never import from higher layers.
+**TL;DR**: awman is organized in four layers where lower layers never import from higher layers.
 
 ---
 
@@ -9,7 +9,7 @@
 ```
 ┌──────────────────────────────────────────┐
 │ Layer 3: Frontend                        │  src/frontend/
-│ CLI (clap), TUI (Ratatui), Headless HTTP │
+│ CLI (clap), TUI (Ratatui), API HTTP │
 │ RULE: Presentation-only, no business logic
 ├──────────────────────────────────────────┤
 │ Layer 2: Command                         │  src/command/
@@ -65,12 +65,12 @@
 - All business logic (agent selection, defaults, error handling)
 - Calls Layer 1 engines, reads/writes Layer 0
 - Receives frontend traits to delegate user input
-- **All logic shared by CLI, TUI, Headless.**
+- **All logic shared by CLI, TUI, API.**
 
 ### Layer 3: Frontend (`src/frontend/`)
 - CLI: clap-based CLI wrapper
 - TUI: Ratatui-based interactive terminal UI
-- Headless: HTTP API server
+- API: HTTP API server
 - **No business logic. Implement frontend traits. Call Dispatch.**
 
 ---
@@ -119,7 +119,7 @@ pub async fn run_command(
 1. **Data** (Layer 0): Define new types/config fields
 2. **Engine** (Layer 1): Implement runtime primitives if needed
 3. **Command** (Layer 2): Implement business logic, add to Dispatch
-4. **Frontend** (Layer 3): Implement frontend traits, wire CLI/TUI/Headless
+4. **Frontend** (Layer 3): Implement frontend traits, wire CLI/TUI/API
 5. **Test**: Layer 0 (hermetic), Layer 1 (real systems), Layer 2 (integration), Layer 3 (parity)
 
 ---
@@ -152,7 +152,7 @@ cargo clippy -- -D warnings # No warnings
 
 ---
 
-## Example: Adding `amux foo` Command
+## Example: Adding `awman foo` Command
 
 ```rust
 // 1. Layer 0: Define data
@@ -195,7 +195,7 @@ impl FooFrontend for TuiApp {
     fn ask_user(...) -> Result<UserChoice> { ... }
 }
 
-impl FooFrontend for HeadlessApp {
+impl FooFrontend for ApiApp {
     fn ask_user(...) -> Result<UserChoice> { ... }
 }
 ```

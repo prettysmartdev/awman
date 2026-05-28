@@ -1,9 +1,9 @@
 [package]
-name = "amux"
+name = "awman"
 version = "0.8.0"
 edition = "2021"
 rust-version = "1.94.0"
-description = "A containerized code and claw agent manager"
+description = "A containerized code agent manager"
 # Top-level tests/ targets reference the old (oldsrc) library API; they are
 # rebuilt from scratch in work item 0072 alongside the deletion of oldsrc/.
 # Suppress auto-discovery so `cargo test` only runs Layer 0–3 unit tests
@@ -12,11 +12,11 @@ autotests = false
 autobenches = false
 
 [[bin]]
-name = "amux"
+name = "awman"
 path = "src/main.rs"
 
 [lib]
-name = "amux"
+name = "awman"
 path = "src/lib.rs"
 
 [dependencies]
@@ -29,12 +29,13 @@ portable-pty = "0.9"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 strip-ansi-escapes = "0.2"
 strsim = "0.11"
 tempfile = "3"
 vt100 = { package = "vt100-ctt", version = "0.17", default-features = false }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "json", "stream"], default-features = false }
 tokio-stream = "0.1"
 unicode-width = "0.2"
 flate2 = "1"
@@ -42,29 +43,29 @@ tar = "0.4"
 sha2 = "0.10"
 arboard = "3"
 shell-words = "1"
-toml = "0.8"
-serde_yaml = "0.9"
-axum = "0.7"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+toml = "1"
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace"] }
 chrono = { version = "0.4", features = ["serde"] }
 rcgen = "0.13"
 ring = "0.17"
 subtle = "2"
-thiserror = "1"
+thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process", "fs"] }
+nix = { version = "0.31", features = ["signal", "process", "fs", "poll"] }
 libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 wiremock = "0.6"
 
 # `benches/performance.rs` references the legacy oldsrc TUI API and is
@@ -93,8 +94,8 @@ name = "cli_parity"
 path = "tests/cli_parity/main.rs"
 
 [[test]]
-name = "headless_parity"
-path = "tests/headless_parity/main.rs"
+name = "api_parity"
+path = "tests/api_parity/main.rs"
 
 [[test]]
 name = "binary_smoke"

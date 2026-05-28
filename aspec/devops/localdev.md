@@ -94,9 +94,9 @@ On Linux, use `heaptrack` to measure heap allocations:
 # Install heaptrack (Ubuntu/Debian)
 sudo apt install heaptrack
 
-# Profile amux
-heaptrack ./target/release/amux implement 0001 --non-interactive
-heaptrack_gui heaptrack.amux.*.zst
+# Profile awman
+heaptrack ./target/release/awman implement 0001 --non-interactive
+heaptrack_gui heaptrack.awman.*.zst
 ```
 
 On macOS, use `dhat` (compile-time heap profiler) by enabling the `dhat-heap` dev-dependency (see `Cargo.toml`).

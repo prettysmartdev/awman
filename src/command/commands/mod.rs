@@ -1,4 +1,4 @@
-//! `src/command/commands/` — one struct per amux command.
+//! `src/command/commands/` — one struct per awman command.
 //!
 //! Each module contains the `*Command` struct (owning every flag value and
 //! engine reference it needs), its `*CommandFrontend` trait (defining the
@@ -8,6 +8,7 @@
 
 pub mod agent_auth;
 pub mod agent_setup;
+pub mod api_server;
 pub mod auth;
 pub mod chat;
 pub mod command_trait;
@@ -15,14 +16,13 @@ pub mod config;
 pub mod download;
 pub mod exec_prompt;
 pub mod exec_workflow;
-pub mod headless;
 pub mod init;
 pub mod mount_scope;
 pub mod new;
 pub mod prompt_templates;
 pub mod ready;
 pub mod remote;
-pub(super) mod remote_client;
+pub(crate) mod remote_client;
 pub mod specs;
 pub mod status;
 pub mod status_tips;
@@ -30,11 +30,52 @@ pub mod worktree_lifecycle;
 
 pub use command_trait::Command;
 
-/// A parsed overlay expression: either a directory mount or a skills overlay.
+/// Resolve the agent name to use for a command, in precedence order:
+///   1. explicit CLI flag (`flag`)
+///   2. `session.default_agent()` (which itself resolves flag > repo > global)
+///   3. fallback to `"claude"` so a fresh repo with no config still works.
+///
+/// Frontends (CLI / TUI / API session-setup) must funnel through this helper
+/// so the agent choice is uniformly driven by `.awman/config.json`, with the
+/// hard-coded fallback only used as a last resort.
+pub fn resolve_agent(
+    flag: &Option<String>,
+    session: &crate::data::session::Session,
+) -> Result<crate::data::session::AgentName, crate::command::error::CommandError> {
+    use crate::command::error::CommandError;
+    use crate::data::session::AgentName;
+
+    if let Some(name) = flag.as_deref() {
+        return AgentName::new(name).map_err(CommandError::from);
+    }
+    if let Some(name) = session.default_agent() {
+        return Ok(name.clone());
+    }
+    AgentName::new("claude").map_err(CommandError::from)
+}
+
+/// Specification for a skill overlay: all skills or a named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillSpec {
+    All,
+    Named(String),
+}
+
+/// A parsed overlay expression: directory mount, skill, or env passthrough.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedOverlay {
     Directory(crate::engine::overlay::DirectorySpec),
-    Skill,
+    Skill(SkillSpec),
+    Env(String),
+}
+
+/// Aggregated overlay information after collecting from all sources.
+#[derive(Debug)]
+pub struct CollectedOverlays {
+    pub directories: Vec<crate::engine::overlay::DirectorySpec>,
+    pub include_all_skills: bool,
+    pub named_skills: Vec<String>,
+    pub env_passthrough: Vec<String>,
 }
 
 /// Parse a user-supplied overlay spec string in the form
@@ -79,7 +120,7 @@ pub fn parse_overlay_spec(spec: &str) -> Result<crate::engine::overlay::Director
 }
 
 /// Parse a comma-separated list of typed overlay expressions from the
-/// `AMUX_OVERLAYS` env var or config arrays.
+/// `AWMAN_OVERLAYS` env var or config arrays.
 ///
 /// Grammar: `dir(host:container[:perm])` or `skill()` expressions separated
 /// by commas. Bare `host:container[:perm]` strings (no type tag) are accepted
@@ -144,15 +185,44 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
     match tag {
         "dir" => parse_dir_overlay_args(args, expr).map(TypedOverlay::Directory),
         "skill" => {
-            if !args.is_empty() {
-                return Err(format!(
-                    "'skill()' takes no arguments, got '{args}' in '{expr}'"
-                ));
+            if args.is_empty() {
+                return Err("skill() requires an argument; use skill(*) to mount all skills or skill(name) for a specific named skill".to_string());
             }
-            Ok(TypedOverlay::Skill)
+            if args.contains(',') {
+                return Err("skill() takes one argument; use separate skill() calls for multiple named skills".to_string());
+            }
+            if args == "*" {
+                Ok(TypedOverlay::Skill(SkillSpec::All))
+            } else {
+                Ok(TypedOverlay::Skill(SkillSpec::Named(args.to_string())))
+            }
+        }
+        "skills" => {
+            Err("skills() has been removed; use skill(*) to mount all skills or skill(name) for a specific named skill".to_string())
+        }
+        "ssh" => {
+            if !args.is_empty() {
+                return Err("ssh() takes no arguments".to_string());
+            }
+            let home = dirs::home_dir().unwrap_or_default();
+            let ssh_host = home.join(".ssh").to_string_lossy().into_owned();
+            Ok(TypedOverlay::Directory(crate::engine::overlay::DirectorySpec {
+                host: ssh_host,
+                container: "~/.ssh".to_string(),
+                permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+            }))
+        }
+        "env" => {
+            if args.is_empty() {
+                return Err("env() requires an argument".to_string());
+            }
+            if args.contains(',') {
+                return Err("env() takes one argument; use separate env() calls for multiple vars".to_string());
+            }
+            Ok(TypedOverlay::Env(args.to_string()))
         }
         _ => Err(format!(
-            "unknown overlay type '{tag}' in '{expr}'; supported types: dir, skill"
+            "unknown overlay type '{tag}' in '{expr}'; supported types: dir, skill, ssh, env"
         )),
     }
 }
@@ -208,82 +278,124 @@ fn parse_dir_overlay_args(
     })
 }
 
-/// Convert a `DirectoryOverlayConfig` from JSON config into a `DirectorySpec`.
-pub fn config_overlay_to_spec(
-    cfg: &crate::data::config::repo::DirectoryOverlayConfig,
-) -> crate::engine::overlay::DirectorySpec {
-    use crate::engine::container::options::OverlayPermission;
-    use crate::engine::overlay::DirectorySpec;
-
-    let permission = match cfg.permission.as_deref() {
-        Some("rw") => OverlayPermission::ReadWrite,
-        _ => OverlayPermission::ReadOnly,
-    };
-    DirectorySpec {
-        host: cfg.host.clone(),
-        container: cfg.container.clone(),
-        permission,
-    }
-}
-
-/// Collect all directory overlays from effective config sources (global config,
-/// repo config, AMUX_OVERLAYS env var) and merge with CLI flag overlays.
-///
-/// Returns `(directory_specs, skills_enabled)` where `skills_enabled` is true
-/// when any source (config, env var, or CLI) requests the skills overlay.
+/// Collect all overlay specs from config sources (global, repo, env var, CLI flags)
+/// and optional per-step overlays. Returns a `CollectedOverlays` with directories,
+/// skill settings, and env passthrough vars.
 pub fn collect_all_overlay_specs(
     session: &crate::data::session::Session,
     cli_typed_overlays: Vec<TypedOverlay>,
-) -> (Vec<crate::engine::overlay::DirectorySpec>, bool) {
+    step_overlays: Option<&[String]>,
+) -> Result<CollectedOverlays, crate::command::error::CommandError> {
     let ec = session.effective_config();
-    let mut specs = Vec::new();
-    let mut skills_enabled = false;
+    let mut dirs = Vec::new();
+    let mut include_all_skills = false;
+    let mut named_skills: Vec<String> = Vec::new();
+    let mut env_passthrough: Vec<String> = Vec::new();
 
-    // 1. Global config overlays (lowest priority).
-    if let Some(overlays) = ec.global().overlays.as_ref() {
-        if let Some(dirs) = overlays.directories.as_ref() {
-            for d in dirs {
-                specs.push(config_overlay_to_spec(d));
+    let mut process_typed = |typed: TypedOverlay| match typed {
+        TypedOverlay::Directory(spec) => dirs.push(spec),
+        TypedOverlay::Skill(SkillSpec::All) => include_all_skills = true,
+        TypedOverlay::Skill(SkillSpec::Named(name)) => {
+            if !named_skills.contains(&name) {
+                named_skills.push(name);
             }
         }
-        if overlays.skills == Some(true) {
-            skills_enabled = true;
+        TypedOverlay::Env(var) => {
+            if !env_passthrough.contains(&var) {
+                env_passthrough.push(var);
+            }
+        }
+    };
+
+    // 1. Global config overlays (lowest priority).
+    if let Some(overlay_strs) = ec.global().overlays.as_ref() {
+        for s in overlay_strs {
+            let parsed = parse_overlay_list(s).map_err(|reason| {
+                crate::command::error::CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                }
+            })?;
+            for typed in parsed {
+                process_typed(typed);
+            }
         }
     }
 
     // 2. Repo config overlays.
-    if let Some(overlays) = ec.repo().overlays.as_ref() {
-        if let Some(dirs) = overlays.directories.as_ref() {
-            for d in dirs {
-                specs.push(config_overlay_to_spec(d));
+    if let Some(overlay_strs) = ec.repo().overlays.as_ref() {
+        for s in overlay_strs {
+            let parsed = parse_overlay_list(s).map_err(|reason| {
+                crate::command::error::CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                }
+            })?;
+            for typed in parsed {
+                process_typed(typed);
             }
-        }
-        if overlays.skills == Some(true) {
-            skills_enabled = true;
         }
     }
 
-    // 3. AMUX_OVERLAYS env var.
+    // 3. AWMAN_OVERLAYS env var.
     if let Some(env_str) = ec.env().overlays() {
-        if let Ok(parsed) = parse_overlay_list(env_str) {
-            for typed in parsed {
-                match typed {
-                    TypedOverlay::Directory(spec) => specs.push(spec),
-                    TypedOverlay::Skill => skills_enabled = true,
-                }
+        let parsed = parse_overlay_list(env_str).map_err(|reason| {
+            crate::command::error::CommandError::InvalidOverlaySpec {
+                spec: format!("AWMAN_OVERLAYS: {env_str}"),
+                reason,
             }
+        })?;
+        for typed in parsed {
+            process_typed(typed);
         }
     }
 
     // 4. CLI flag overlays (highest priority).
     for typed in cli_typed_overlays {
-        match typed {
-            TypedOverlay::Directory(spec) => specs.push(spec),
-            TypedOverlay::Skill => skills_enabled = true,
+        process_typed(typed);
+    }
+
+    // 5. Per-step overlays (highest priority).
+    if let Some(step_strs) = step_overlays {
+        for s in step_strs {
+            let parsed = parse_overlay_list(s).map_err(|reason| {
+                crate::command::error::CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                }
+            })?;
+            for typed in parsed {
+                process_typed(typed);
+            }
         }
     }
 
-    (specs, skills_enabled)
+    Ok(CollectedOverlays {
+        directories: dirs,
+        include_all_skills,
+        named_skills,
+        env_passthrough,
+    })
+}
+
+/// Emit deprecation warnings for legacy `envPassthrough` config fields.
+pub fn warn_legacy_config(
+    session: &crate::data::session::Session,
+    sink: &mut dyn crate::engine::message::UserMessageSink,
+) {
+    let ec = session.effective_config();
+    if ec.repo().legacy_env_passthrough.is_some() {
+        sink.write_message(crate::engine::message::UserMessage {
+            level: crate::engine::message::MessageLevel::Warning,
+            text: "'.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
+        });
+    }
+    if ec.global().legacy_env_passthrough.is_some() {
+        sink.write_message(crate::engine::message::UserMessage {
+            level: crate::engine::message::MessageLevel::Warning,
+            text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -291,27 +403,36 @@ mod skill_parser_tests {
     use super::*;
 
     #[test]
-    fn skill_empty_parses_to_skill_variant() {
-        let result = parse_overlay_list("skill()").unwrap();
-        assert_eq!(result, vec![TypedOverlay::Skill]);
+    fn skill_empty_returns_error() {
+        let err = parse_overlay_list("skill()").unwrap_err();
+        assert!(
+            err.contains("requires an argument"),
+            "error must mention 'requires an argument'; got: {err}"
+        );
     }
 
     #[test]
-    fn skill_with_args_returns_error_takes_no_arguments() {
-        let err = parse_overlay_list("skill(anything)").unwrap_err();
-        assert!(
-            err.contains("takes no arguments"),
-            "error must mention 'takes no arguments'; got: {err}"
+    fn skill_star_parses_to_skill_all() {
+        let result = parse_overlay_list("skill(*)").unwrap();
+        assert_eq!(result, vec![TypedOverlay::Skill(SkillSpec::All)]);
+    }
+
+    #[test]
+    fn skill_named_parses_to_skill_named() {
+        let result = parse_overlay_list("skill(myskill)").unwrap();
+        assert_eq!(
+            result,
+            vec![TypedOverlay::Skill(SkillSpec::Named("myskill".to_string()))]
         );
     }
 
     #[test]
     fn skill_and_dir_in_comma_list_produces_both_variants() {
-        let result = parse_overlay_list("skill(),dir(/host:/container:ro)").unwrap();
+        let result = parse_overlay_list("skill(*),dir(/host:/container:ro)").unwrap();
         assert_eq!(result.len(), 2, "expected 2 overlays; got {result:?}");
         assert!(
-            matches!(result[0], TypedOverlay::Skill),
-            "first entry must be Skill; got {result:?}"
+            matches!(result[0], TypedOverlay::Skill(SkillSpec::All)),
+            "first entry must be Skill(All); got {result:?}"
         );
         assert!(
             matches!(result[1], TypedOverlay::Directory(_)),
@@ -320,7 +441,7 @@ mod skill_parser_tests {
     }
 
     #[test]
-    fn unknown_tag_error_lists_dir_and_skill_as_valid_types() {
+    fn unknown_tag_error_lists_supported_types() {
         let err = parse_overlay_list("foobar(/x:/y)").unwrap_err();
         assert!(
             err.contains("dir"),
@@ -330,15 +451,139 @@ mod skill_parser_tests {
             err.contains("skill"),
             "error must mention 'skill' as a supported type; got: {err}"
         );
+        assert!(
+            err.contains("ssh"),
+            "error must mention 'ssh' as a supported type; got: {err}"
+        );
+        assert!(
+            err.contains("env"),
+            "error must mention 'env' as a supported type; got: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_parses_to_directory_overlay() {
+        let result = parse_overlay_list("ssh()").unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            TypedOverlay::Directory(spec) => {
+                assert!(
+                    spec.host.ends_with(".ssh"),
+                    "host must end with .ssh; got: {}",
+                    spec.host
+                );
+                assert_eq!(spec.container, "~/.ssh");
+            }
+            other => panic!("expected Directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_parses_to_env_variant() {
+        let result = parse_overlay_list("env(MY_VAR)").unwrap();
+        assert_eq!(result, vec![TypedOverlay::Env("MY_VAR".to_string())]);
+    }
+
+    #[test]
+    fn env_empty_returns_error() {
+        let err = parse_overlay_list("env()").unwrap_err();
+        assert!(
+            err.contains("requires an argument"),
+            "error must mention 'requires an argument'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_with_arguments_returns_error() {
+        let err = parse_overlay_list("ssh(foo)").unwrap_err();
+        assert!(
+            err.contains("ssh()") || err.contains("no arguments"),
+            "error must explain ssh() takes no arguments; got: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_overlay_has_read_only_permission() {
+        use crate::engine::container::options::OverlayPermission;
+        let result = parse_overlay_list("ssh()").unwrap();
+        match &result[0] {
+            TypedOverlay::Directory(spec) => {
+                assert_eq!(
+                    spec.permission,
+                    OverlayPermission::ReadOnly,
+                    "ssh() must produce a ReadOnly mount; got: {:?}",
+                    spec.permission
+                );
+                assert_eq!(spec.container, "~/.ssh", "container path must be ~/.ssh");
+            }
+            other => panic!("expected Directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_multiple_args_returns_error() {
+        let err = parse_overlay_list("skill(foo, bar)").unwrap_err();
+        assert!(
+            err.contains("separate skill()") || err.contains("one argument"),
+            "error must direct user to separate skill() calls; got: {err}"
+        );
+    }
+
+    #[test]
+    fn skills_plural_named_returns_error_with_migration_hint() {
+        let err = parse_overlay_list("skills(foo)").unwrap_err();
+        assert!(
+            err.contains("removed") || err.contains("skill("),
+            "error must mention the removed form and replacement; got: {err}"
+        );
+    }
+
+    #[test]
+    fn skills_plural_star_returns_error_with_migration_hint() {
+        let err = parse_overlay_list("skills(*)").unwrap_err();
+        assert!(
+            err.contains("skill(*)") || err.contains("removed"),
+            "error must mention skill(*) replacement; got: {err}"
+        );
+    }
+
+    #[test]
+    fn skills_plural_empty_returns_error_with_migration_hint() {
+        let err = parse_overlay_list("skills()").unwrap_err();
+        assert!(
+            err.contains("skill(*)") || err.contains("removed"),
+            "error must mention skill(*) or removed form; got: {err}"
+        );
+    }
+
+    #[test]
+    fn env_multiple_args_returns_error() {
+        let err = parse_overlay_list("env(A, B)").unwrap_err();
+        assert!(
+            err.contains("separate env()") || err.contains("one argument"),
+            "error must direct user to use separate env() calls; got: {err}"
+        );
+    }
+
+    #[test]
+    fn env_list_produces_two_separate_env_overlays() {
+        let result = parse_overlay_list("env(A), env(B)").unwrap();
+        assert_eq!(
+            result.len(),
+            2,
+            "two env() expressions must produce two overlays; got {result:?}"
+        );
+        assert_eq!(result[0], TypedOverlay::Env("A".to_string()));
+        assert_eq!(result[1], TypedOverlay::Env("B".to_string()));
     }
 }
 
 #[cfg(test)]
 mod collect_overlay_specs_tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AMUX_CONFIG_HOME, AMUX_OVERLAYS};
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, AWMAN_OVERLAYS};
     use crate::data::config::global::GlobalConfig;
-    use crate::data::config::repo::{OverlaysConfig, RepoConfig};
+    use crate::data::config::repo::RepoConfig;
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 
     fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
@@ -352,110 +597,435 @@ mod collect_overlay_specs_tests {
     }
 
     #[test]
-    fn skills_enabled_when_repo_config_has_skills_true() {
+    fn skills_enabled_when_repo_config_has_skill_star() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let repo_config = RepoConfig {
-            overlays: Some(OverlaysConfig {
-                skills: Some(true),
-                directories: None,
-            }),
+            overlays: Some(vec!["skill(*)".to_string()]),
             ..Default::default()
         };
         repo_config.save(git_tmp.path()).unwrap();
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
-        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
-        assert!(skills_enabled, "skills must be enabled from repo config");
+        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        assert!(
+            collected.include_all_skills,
+            "skills must be enabled from repo config"
+        );
     }
 
     #[test]
-    fn skills_enabled_when_global_config_has_skills_true() {
+    fn skills_enabled_when_global_config_has_skill_star() {
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let global_config = GlobalConfig {
-            overlays: Some(OverlaysConfig {
-                skills: Some(true),
-                directories: None,
-            }),
+            overlays: Some(vec!["skill(*)".to_string()]),
             ..Default::default()
         };
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         global_config.save_with(&env).unwrap();
         let session = open_session(git_tmp.path(), env);
 
-        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
-        assert!(skills_enabled, "skills must be enabled from global config");
+        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        assert!(
+            collected.include_all_skills,
+            "skills must be enabled from global config"
+        );
     }
 
     #[test]
-    fn skills_enabled_when_amux_overlays_env_contains_skill() {
+    fn skills_enabled_when_awman_overlays_env_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([
-            (AMUX_CONFIG_HOME, tmp.path().to_str().unwrap()),
-            (AMUX_OVERLAYS, "skill()"),
+            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_OVERLAYS, "skill(*)"),
         ]);
         let session = open_session(tmp.path(), env);
 
-        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
         assert!(
-            skills_enabled,
-            "skills must be enabled when AMUX_OVERLAYS contains skill()"
+            collected.include_all_skills,
+            "skills must be enabled when AWMAN_OVERLAYS contains skill(*)"
         );
     }
 
     #[test]
     fn skills_enabled_when_cli_typed_overlays_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
-        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![TypedOverlay::Skill]);
+        let collected =
+            collect_all_overlay_specs(&session, vec![TypedOverlay::Skill(SkillSpec::All)], None)
+                .unwrap();
         assert!(
-            skills_enabled,
-            "skills must be enabled from CLI TypedOverlay::Skill"
+            collected.include_all_skills,
+            "skills must be enabled from CLI TypedOverlay::Skill(All)"
         );
     }
 
     #[test]
     fn skills_disabled_when_no_source_enables_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
-        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
         assert!(
-            !skills_enabled,
+            !collected.include_all_skills,
             "skills must be disabled when no source sets it"
         );
     }
 
     #[test]
     fn skills_enabled_is_additive_or_single_source_sufficient() {
-        // Only global config has skills=true; repo config and CLI do not.
-        // skills_enabled must still be true — OR semantics, not AND.
+        // Only global config has skill(*); repo config and CLI do not.
+        // include_all_skills must still be true — OR semantics, not AND.
         let git_tmp = tempfile::tempdir().unwrap();
         let cfg_tmp = tempfile::tempdir().unwrap();
         let global_config = GlobalConfig {
-            overlays: Some(OverlaysConfig {
-                skills: Some(true),
-                directories: None,
-            }),
+            overlays: Some(vec!["skill(*)".to_string()]),
             ..Default::default()
         };
         let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         global_config.save_with(&env).unwrap();
         // Repo config has no overlays; no CLI TypedOverlay::Skill.
         let session = open_session(git_tmp.path(), env);
 
-        let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
+        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
         assert!(
-            skills_enabled,
+            collected.include_all_skills,
             "a single source (global config) must be sufficient to enable skills (additive OR)"
+        );
+    }
+
+    #[test]
+    fn env_passthrough_collected_from_overlay_expressions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_OVERLAYS, "env(GH_TOKEN),env(AWS_PROFILE)"),
+        ]);
+        let session = open_session(tmp.path(), env);
+
+        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        assert_eq!(collected.env_passthrough, vec!["GH_TOKEN", "AWS_PROFILE"]);
+    }
+
+    // ─── New tests for WI-0082 ────────────────────────────────────────────────
+
+    #[test]
+    fn malformed_awman_overlays_env_var_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_OVERLAYS, "###not-an-overlay###"),
+        ]);
+        let session = open_session(tmp.path(), env);
+
+        let result = collect_all_overlay_specs(&session, vec![], None);
+        assert!(result.is_err(), "malformed AWMAN_OVERLAYS must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("###not-an-overlay###") || msg.contains("invalid overlay"),
+            "error must identify the bad spec; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn skill_star_in_flag_and_named_in_step_union_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let cli_overlays = vec![TypedOverlay::Skill(SkillSpec::All)];
+        let step_overlays = vec!["skill(foo)".to_string()];
+        let collected =
+            collect_all_overlay_specs(&session, cli_overlays, Some(&step_overlays)).unwrap();
+
+        assert!(
+            collected.include_all_skills,
+            "skill(*) in CLI flags must set include_all_skills to true"
+        );
+        assert!(
+            collected.named_skills.contains(&"foo".to_string()),
+            "skill(foo) from step must accumulate in named_skills; got {:?}",
+            collected.named_skills
+        );
+    }
+
+    #[test]
+    fn skill_named_in_repo_and_step_both_accumulate() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let repo_config = RepoConfig {
+            overlays: Some(vec!["skill(foo)".to_string()]),
+            ..Default::default()
+        };
+        repo_config.save(git_tmp.path()).unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let step_overlays = vec!["skill(bar)".to_string()];
+        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+
+        assert!(
+            !collected.include_all_skills,
+            "no skill(*) source; include_all_skills must be false"
+        );
+        assert!(
+            collected.named_skills.contains(&"foo".to_string()),
+            "skill(foo) from repo config must be in named_skills; got {:?}",
+            collected.named_skills
+        );
+        assert!(
+            collected.named_skills.contains(&"bar".to_string()),
+            "skill(bar) from step must be in named_skills; got {:?}",
+            collected.named_skills
+        );
+    }
+
+    #[test]
+    fn skills_plural_in_repo_config_returns_err_with_migration_message() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let repo_config = RepoConfig {
+            overlays: Some(vec!["skills()".to_string()]),
+            ..Default::default()
+        };
+        repo_config.save(git_tmp.path()).unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let result = collect_all_overlay_specs(&session, vec![], None);
+        assert!(result.is_err(), "skills() in repo config must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("skill(") || msg.contains("removed"),
+            "error must contain migration guidance; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn skills_plural_named_in_env_var_returns_err_with_migration_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap()),
+            (AWMAN_OVERLAYS, "skills(foo)"),
+        ]);
+        let session = open_session(tmp.path(), env);
+
+        let result = collect_all_overlay_specs(&session, vec![], None);
+        assert!(
+            result.is_err(),
+            "skills(foo) in AWMAN_OVERLAYS must return Err"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("skill(") || msg.contains("removed"),
+            "error must contain migration guidance; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ssh_from_flag_and_step_both_resolve_to_same_host_path() {
+        // ssh() from any source expands to the same ~/.ssh host path.
+        // After passing through OverlayEngine::build_overlays, there must be
+        // exactly one mount for that path (insert_or_merge deduplication).
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let ssh_typed = parse_overlay_list("ssh()").unwrap().remove(0);
+        let step_overlays = vec!["ssh()".to_string()];
+        let collected =
+            collect_all_overlay_specs(&session, vec![ssh_typed], Some(&step_overlays)).unwrap();
+
+        let ssh_entries: Vec<_> = collected
+            .directories
+            .iter()
+            .filter(|d| d.host.ends_with(".ssh"))
+            .collect();
+        assert!(
+            !ssh_entries.is_empty(),
+            "at least one ssh() overlay must appear in directories"
+        );
+        let unique_hosts: std::collections::HashSet<_> =
+            ssh_entries.iter().map(|d| d.host.as_str()).collect();
+        assert_eq!(
+            unique_hosts.len(),
+            1,
+            "all ssh() expansions from any source must resolve to the same host path; \
+             got unique hosts: {unique_hosts:?}"
+        );
+    }
+
+    #[test]
+    fn env_from_two_sources_deduplicates_to_one_entry() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let repo_config = RepoConfig {
+            overlays: Some(vec!["env(MY_TOKEN)".to_string()]),
+            ..Default::default()
+        };
+        repo_config.save(git_tmp.path()).unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let step_overlays = vec!["env(MY_TOKEN)".to_string()];
+        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+
+        let count = collected
+            .env_passthrough
+            .iter()
+            .filter(|v| *v == "MY_TOKEN")
+            .count();
+        assert_eq!(
+            count, 1,
+            "MY_TOKEN from two sources must appear exactly once in env_passthrough; \
+             got {:?}",
+            collected.env_passthrough
+        );
+    }
+
+    #[test]
+    fn env_from_repo_config_and_step_both_present_in_passthrough() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let repo_config = RepoConfig {
+            overlays: Some(vec!["env(REPO_VAR)".to_string()]),
+            ..Default::default()
+        };
+        repo_config.save(git_tmp.path()).unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let step_overlays = vec!["env(STEP_VAR)".to_string()];
+        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+
+        assert!(
+            collected.env_passthrough.contains(&"REPO_VAR".to_string()),
+            "env(REPO_VAR) from repo config must be in env_passthrough; got {:?}",
+            collected.env_passthrough
+        );
+        assert!(
+            collected.env_passthrough.contains(&"STEP_VAR".to_string()),
+            "env(STEP_VAR) from step overlays must be in env_passthrough; got {:?}",
+            collected.env_passthrough
+        );
+    }
+}
+
+#[cfg(test)]
+mod warn_legacy_config_tests {
+    use super::*;
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+    use crate::engine::message::{MessageLevel, RecordingMessageSink};
+
+    fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
+        let resolver = StaticGitRootResolver::new(git_root);
+        let opts = SessionOpenOptions {
+            flags: Default::default(),
+            env: Some(env),
+            available_agents: None,
+        };
+        Session::open(git_root.to_path_buf(), &resolver, opts).unwrap()
+    }
+
+    #[test]
+    fn repo_legacy_env_passthrough_triggers_warning_mentioning_config_path() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+
+        // Write a repo config with the legacy envPassthrough field.
+        let awman_dir = git_tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("config.json"),
+            r#"{"envPassthrough": ["MY_VAR"]}"#,
+        )
+        .unwrap();
+
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let mut sink = RecordingMessageSink::new();
+        warn_legacy_config(&session, &mut sink);
+
+        let warnings: Vec<_> = sink
+            .queued()
+            .iter()
+            .filter(|m| m.level == MessageLevel::Warning)
+            .collect();
+        assert!(
+            !warnings.is_empty(),
+            "must emit at least one warning for legacy envPassthrough in repo config"
+        );
+        let text = &warnings[0].text;
+        assert!(
+            text.contains(".awman/config.json"),
+            "warning must mention .awman/config.json to identify the source file; got: {text}"
+        );
+    }
+
+    #[test]
+    fn global_legacy_env_passthrough_triggers_warning_mentioning_global_config_path() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+
+        // Write a global config with the legacy envPassthrough field.
+        std::fs::write(
+            cfg_tmp.path().join("config.json"),
+            r#"{"envPassthrough": ["GLOBAL_VAR"]}"#,
+        )
+        .unwrap();
+
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let mut sink = RecordingMessageSink::new();
+        warn_legacy_config(&session, &mut sink);
+
+        let warnings: Vec<_> = sink
+            .queued()
+            .iter()
+            .filter(|m| m.level == MessageLevel::Warning)
+            .collect();
+        assert!(
+            !warnings.is_empty(),
+            "must emit at least one warning for legacy envPassthrough in global config"
+        );
+        let text = &warnings[0].text;
+        assert!(
+            text.contains("~/.awman/config.json"),
+            "warning must mention ~/.awman/config.json to identify the source file; got: {text}"
+        );
+    }
+
+    #[test]
+    fn no_legacy_fields_produces_no_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let mut sink = RecordingMessageSink::new();
+        warn_legacy_config(&session, &mut sink);
+
+        assert!(
+            sink.queued().is_empty(),
+            "no warning must be emitted when no legacy fields are present; got {:?}",
+            sink.queued()
         );
     }
 }

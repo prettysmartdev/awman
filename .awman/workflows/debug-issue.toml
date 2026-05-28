@@ -1,0 +1,4 @@
+[[step]]
+name = "step-1"
+agent = "claude"
+prompt = "do something"

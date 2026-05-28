@@ -196,11 +196,12 @@ impl App {
         };
 
         let container_io = crate::engine::container::frontend::ContainerIo {
-            stdout: stdout_tx,
+            stdout: stdout_tx.clone(),
+            stderr: stdout_tx,
             stdin_tx: stdin_tx_for_engine,
             stdin_rx,
-            resize: resize_rx,
-            initial_size,
+            resize: Some(resize_rx),
+            initial_size: Some(initial_size),
         };
 
         // Build the TUI frontend. Workflow + yolo overlays share the same
@@ -224,6 +225,7 @@ impl App {
             tab.stdin_tx_shared.clone(),
             tab.resize_tx_shared.clone(),
             tab.engine_tx_shared.clone(),
+            tab.stuck_sender_shared.clone(),
             tab.active_worktree_path.clone(),
             tab.status_dashboard.clone(),
             tab.tui_context_shared.clone(),
@@ -343,15 +345,10 @@ impl App {
     /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
         let active = self.active_tab;
-        let mut stuck_transitions: Vec<(usize, bool, bool)> = Vec::new();
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
+        for tab in self.tabs.iter_mut() {
             tab.drain_container_output();
             tab.poll_command_completion();
-            let was_stuck = tab.stuck;
-            tab.recompute_stuck(i == active);
-            if tab.stuck != was_stuck {
-                stuck_transitions.push((i, was_stuck, tab.stuck));
-            }
+            tab.drain_stuck_events();
 
             // TUI-4: Sync the vt100 parser size with the actual rendered
             // container overlay dimensions. The overlay size varies with
@@ -511,37 +508,6 @@ impl App {
             }
         }
 
-        // ENG-1: Stuck-container → notify the engine.
-        //
-        // Transitions were captured in the first loop above. Send StepStuck
-        // when a tab becomes stuck; StepUnstuck when it recovers.
-        for (tab_idx, was_stuck, is_stuck) in stuck_transitions {
-            let tab = &self.tabs[tab_idx];
-            let has_workflow_step = tab
-                .workflow_state
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|ws| ws.current_step.clone()))
-                .is_some();
-            if !has_workflow_step {
-                continue;
-            }
-
-            if is_stuck && !was_stuck {
-                if let Ok(guard) = tab.engine_tx_shared.lock() {
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(crate::engine::workflow::EngineRequest::StepStuck);
-                    }
-                }
-            } else if !is_stuck && was_stuck {
-                if let Ok(guard) = tab.engine_tx_shared.lock() {
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(crate::engine::workflow::EngineRequest::StepUnstuck);
-                    }
-                }
-            }
-        }
-
         // Engine-driven yolo countdown: the engine sets yolo_state via the
         // frontend trait; the TUI renders it as a non-modal overlay dialog.
         let yolo_snapshot = self.tabs[active]
@@ -687,7 +653,7 @@ mod tests {
         ));
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
             crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
@@ -814,7 +780,7 @@ mod tests {
         };
         tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
             agent_display_name: "Claude".into(),
-            container_name: "amux-test-1234".into(),
+            container_name: "awman-test-1234".into(),
             start_time: std::time::Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
@@ -829,7 +795,7 @@ mod tests {
 
         // Simulate a stats result arriving on the channel.
         let stats = crate::engine::container::instance::ContainerStats {
-            name: "amux-test-1234".into(),
+            name: "awman-test-1234".into(),
             cpu_percent: 42.5,
             memory_mb: 256.0,
         };
@@ -846,7 +812,7 @@ mod tests {
         let s = info.latest_stats.as_ref().unwrap();
         assert_eq!(s.cpu_percent, 42.5);
         assert_eq!(s.memory_mb, 256.0);
-        assert_eq!(s.name, "amux-test-1234");
+        assert_eq!(s.name, "awman-test-1234");
         assert_eq!(info.stats_history.len(), 1);
     }
 
@@ -867,13 +833,13 @@ mod tests {
 
         // Simulate the engine reporting the container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
-            *guard = Some("amux-new-container".into());
+            *guard = Some("awman-new-container".into());
         }
 
         app.tick_all_tabs();
 
         let info = app.active_tab().container_info.as_ref().unwrap();
-        assert_eq!(info.container_name, "amux-new-container");
+        assert_eq!(info.container_name, "awman-new-container");
     }
 
     #[test]
@@ -885,10 +851,10 @@ mod tests {
         };
         tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
             agent_display_name: "Claude".into(),
-            container_name: "amux-old-container".into(),
+            container_name: "awman-old-container".into(),
             start_time: std::time::Instant::now(),
             latest_stats: Some(crate::engine::container::instance::ContainerStats {
-                name: "amux-old-container".into(),
+                name: "awman-old-container".into(),
                 cpu_percent: 10.0,
                 memory_mb: 100.0,
             }),
@@ -897,13 +863,13 @@ mod tests {
 
         // Simulate a workflow step transition reporting a new container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
-            *guard = Some("amux-step2-container".into());
+            *guard = Some("awman-step2-container".into());
         }
 
         app.tick_all_tabs();
 
         let info = app.active_tab().container_info.as_ref().unwrap();
-        assert_eq!(info.container_name, "amux-step2-container");
+        assert_eq!(info.container_name, "awman-step2-container");
         assert!(
             info.latest_stats.is_none(),
             "latest_stats must be cleared when a new container name arrives"
@@ -919,10 +885,10 @@ mod tests {
         let tab = app.active_tab_mut();
         tab.container_info = Some(ContainerInfo {
             agent_display_name: "Claude".into(),
-            container_name: "amux-test".into(),
+            container_name: "awman-test".into(),
             start_time: std::time::Instant::now(),
             latest_stats: Some(ContainerStats {
-                name: "amux-test".into(),
+                name: "awman-test".into(),
                 cpu_percent: 42.5,
                 memory_mb: 256.0,
             }),
@@ -936,7 +902,7 @@ mod tests {
             "title must contain memory: {title}"
         );
         assert!(
-            title.contains("amux-test"),
+            title.contains("awman-test"),
             "title must contain name: {title}"
         );
     }

@@ -1,0 +1,29 @@
+{
+  "schema_version": 3,
+  "workflow_name": "workflow",
+  "workflow_hash": "cc77a8246aba493ab4951db5f394c560df0adf36ef480143a7d557e6b2374e14",
+  "work_item": null,
+  "step_states": {
+    "test": {
+      "Running": {
+        "container_id": null
+      }
+    }
+  },
+  "completed_steps": [],
+  "current_step_index": null,
+  "started_at": "2026-05-27T21:24:54.883447139Z",
+  "updated_at": "2026-05-27T21:24:54.883886347Z",
+  "steps": [
+    {
+      "name": "test",
+      "depends_on": [],
+      "agent": "gemini"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": false,
+  "teardown_completed": false,
+  "setup_step_states": [],
+  "teardown_step_states": []
+}

@@ -36,6 +36,9 @@ pub enum EngineError {
     #[error("container backend error: {0}")]
     Container(String),
 
+    #[error("image not found: '{image}'. Run `make build` or build the base image manually.")]
+    ContainerImageNotFound { image: String },
+
     #[error("conflicting container options: {0}")]
     ConflictingOptions(String),
 

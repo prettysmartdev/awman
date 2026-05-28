@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::container::instance::StuckEvent;
 use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
 use crate::engine::workflow::actions::{
@@ -19,7 +20,7 @@ use crate::engine::workflow::EngineRequest;
 
 /// Per-workflow frontend the engine uses for every Q&A and status report.
 ///
-/// The engine treats CLI, TUI, and headless implementations identically; the
+/// The engine treats CLI, TUI, and API implementations identically; the
 /// engine never knows which is on the other side.
 pub trait WorkflowFrontend: UserMessageSink + Send {
     // === Engine-driven display commands (blocking) ===
@@ -89,6 +90,27 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
 
     /// Called by the engine after creating its EngineRequest channel.
     /// The frontend stores the sender so the TUI event loop can route
-    /// Ctrl-W and stuck notifications to this specific engine instance.
+    /// Ctrl-W requests to this specific engine instance.
     fn set_engine_sender(&mut self, _tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {}
+
+    /// Called by the engine after launching a step's container. The stuck
+    /// sender is the broadcast channel from the container's stuck detector;
+    /// the TUI subscribes to it for tab-coloring. CLI/API frontends ignore it.
+    fn set_stuck_sender(
+        &mut self,
+        _sender: std::sync::Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    ) {
+    }
+
+    // === Setup/Teardown phase output (fire-and-forget, default no-ops) ===
+
+    fn on_setup_step_started(&mut self, _description: &str) {}
+    fn on_setup_step_output(&mut self, _line: &str) {}
+    fn on_setup_step_completed(&mut self, _description: &str) {}
+    fn on_setup_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
+
+    fn on_teardown_step_started(&mut self, _description: &str) {}
+    fn on_teardown_step_output(&mut self, _line: &str) {}
+    fn on_teardown_step_completed(&mut self, _description: &str) {}
+    fn on_teardown_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
 }

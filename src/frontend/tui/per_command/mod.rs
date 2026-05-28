@@ -6,6 +6,7 @@
 
 mod agent_auth;
 mod agent_setup;
+mod api_server;
 mod auth;
 mod chat;
 mod config;
@@ -13,7 +14,6 @@ mod container_frontend;
 mod download;
 mod exec_prompt;
 mod exec_workflow;
-mod headless;
 mod init;
 mod mount_scope;
 mod new;

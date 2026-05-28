@@ -86,7 +86,7 @@ impl Command for InitCommand {
     ) -> Result<Self::Outcome, CommandError> {
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "init: initializing amux for this repository".into(),
+            text: "init: initializing awman for this repository".into(),
         });
         let agent_name = match AgentName::new(self.flags.agent.clone()) {
             Ok(n) => n,

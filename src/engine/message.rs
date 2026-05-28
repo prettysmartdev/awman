@@ -3,7 +3,7 @@
 //! All engines write status messages to the user through a `UserMessageSink`.
 //! Layer 3 implements one sink per concrete frontend type. The CLI sink queues
 //! while a PTY-bound container owns the terminal and replays after the
-//! container releases it; TUI and headless sinks render live and treat
+//! container releases it; TUI and API sinks render live and treat
 //! `replay_queued` as a no-op.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub enum MessageLevel {
     Success,
 }
 
-/// A sink for amux-authored status messages displayed in the amux UI, NOT
+/// A sink for awman-authored status messages displayed in the awman UI, NOT
 /// inside a container's terminal window. Defined by Layer 1; implemented by
 /// Layer 3.
 pub trait UserMessageSink: Send + Sync {

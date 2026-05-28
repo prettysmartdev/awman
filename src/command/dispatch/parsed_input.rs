@@ -230,24 +230,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_remote_run_with_trailing_args() {
+    fn parse_remote_exec_workflow_with_argument() {
         let cat = CommandCatalogue::get();
-        let parsed = parse(r#"remote run -- exec prompt --yolo "hello""#, cat).unwrap();
-        assert_eq!(parsed.path, vec!["remote", "run"]);
-        match parsed.arguments.get("command").unwrap() {
-            ArgValue::Multi(items) => {
-                assert_eq!(
-                    items,
-                    &vec![
-                        "exec".to_string(),
-                        "prompt".to_string(),
-                        "--yolo".to_string(),
-                        "hello".to_string(),
-                    ]
-                );
-            }
-            _ => panic!("expected Multi"),
-        }
+        let parsed = parse("remote exec workflow my-workflow.toml", cat).unwrap();
+        assert_eq!(parsed.path, vec!["remote", "exec", "workflow"]);
+        assert!(matches!(
+            parsed.arguments.get("workflow"),
+            Some(ArgValue::Single(s)) if s == "my-workflow.toml"
+        ));
+    }
+
+    #[test]
+    fn parse_remote_exec_prompt_with_argument() {
+        let cat = CommandCatalogue::get();
+        let parsed = parse(r#"remote exec prompt "hello world""#, cat).unwrap();
+        assert_eq!(parsed.path, vec!["remote", "exec", "prompt"]);
+        assert!(matches!(
+            parsed.arguments.get("prompt"),
+            Some(ArgValue::Single(s)) if s == "hello world"
+        ));
     }
 
     #[test]

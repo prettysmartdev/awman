@@ -3,26 +3,26 @@
 //! Tests that need Docker have "docker" in their name and are skipped by
 //! `make test-fast`. All other tests run under `make test-fast`.
 
-use amux::data::fs::auth_paths::AuthPathResolver;
-use amux::data::session::AgentName;
-use amux::engine::container::options::OverlayPermission;
-use amux::engine::overlay::{DirectorySpec, OverlayEngine, OverlayRequest, CLAUDE_DENYLIST};
+use awman::data::fs::auth_paths::AuthPathResolver;
+use awman::data::session::AgentName;
+use awman::engine::container::options::OverlayPermission;
+use awman::engine::overlay::{DirectorySpec, OverlayEngine, OverlayRequest, CLAUDE_DENYLIST};
 
-/// Serialises tests that write to `AMUX_CONFIG_HOME` (a process-global env var).
+/// Serialises tests that write to `AWMAN_CONFIG_HOME` (a process-global env var).
 static AMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Set `AMUX_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
+/// Set `AWMAN_CONFIG_HOME` to `home`, run `f`, then restore the previous value.
 fn with_amux_config_home<F, R>(home: &std::path::Path, f: F) -> R
 where
     F: FnOnce() -> R,
 {
     let _g = AMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("AMUX_CONFIG_HOME").ok();
-    std::env::set_var("AMUX_CONFIG_HOME", home.to_str().unwrap());
+    let prev = std::env::var("AWMAN_CONFIG_HOME").ok();
+    std::env::set_var("AWMAN_CONFIG_HOME", home.to_str().unwrap());
     let result = f();
     match prev {
-        Some(v) => std::env::set_var("AMUX_CONFIG_HOME", v),
-        None => std::env::remove_var("AMUX_CONFIG_HOME"),
+        Some(v) => std::env::set_var("AWMAN_CONFIG_HOME", v),
+        None => std::env::remove_var("AWMAN_CONFIG_HOME"),
     }
     result
 }
@@ -107,7 +107,7 @@ fn skill_overlays_claude_ro_mount_when_skills_dir_exists() {
 
     let specs = with_amux_config_home(tmp.path(), || {
         engine
-            .skill_overlays(&agent, &None, std::path::Path::new("/"))
+            .skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
             .unwrap()
     });
 
@@ -140,7 +140,7 @@ fn skill_overlays_empty_when_global_skills_dir_absent() {
 
     let specs = with_amux_config_home(tmp.path(), || {
         engine
-            .skill_overlays(&agent, &None, std::path::Path::new("/"))
+            .skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
             .unwrap()
     });
 
@@ -160,7 +160,7 @@ fn skill_overlays_empty_for_maki_agent_no_error() {
 
     // Must return Ok(vec![]) — not an error — even though maki has no known skills dir.
     let result = with_amux_config_home(tmp.path(), || {
-        engine.skill_overlays(&agent, &None, std::path::Path::new("/"))
+        engine.skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
     });
 
     assert!(
@@ -180,7 +180,7 @@ fn build_overlays_includes_skills_mount_when_include_skills_true() {
     let engine = make_engine(tmp.path());
     let session_tmp = tempfile::tempdir().unwrap();
     let session = {
-        use amux::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+        use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
         let resolver = StaticGitRootResolver::new(session_tmp.path());
         Session::open(
             session_tmp.path().to_path_buf(),
@@ -190,7 +190,7 @@ fn build_overlays_includes_skills_mount_when_include_skills_true() {
         .unwrap()
     };
     let request = OverlayRequest {
-        include_skills: true,
+        include_all_skills: true,
         agent: Some(AgentName::new("claude").unwrap()),
         ..Default::default()
     };
@@ -225,7 +225,7 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
     let engine = make_engine(tmp.path());
     let session_tmp = tempfile::tempdir().unwrap();
     let session = {
-        use amux::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+        use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
         let resolver = StaticGitRootResolver::new(session_tmp.path());
         Session::open(
             session_tmp.path().to_path_buf(),
@@ -235,7 +235,7 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
         .unwrap()
     };
     let request = OverlayRequest {
-        include_skills: true,
+        include_all_skills: true,
         agent: Some(AgentName::new("claude").unwrap()),
         directories: vec![DirectorySpec {
             host: host_dir.path().to_string_lossy().into_owned(),

@@ -39,7 +39,6 @@ pub struct AgentRunOptions {
     pub disallowed_tools: Vec<String>,
     pub initial_prompt: Option<String>,
     pub allow_docker: bool,
-    pub mount_ssh: bool,
     pub non_interactive: bool,
     /// Optional explicit model name; if `None`, the engine emits no model flag.
     pub model: Option<String>,
@@ -48,9 +47,10 @@ pub struct AgentRunOptions {
     pub env_passthrough: Option<Vec<String>>,
     /// User-supplied directory overlays.
     pub directory_overlays: Vec<DirectorySpec>,
-    /// When true, mount the global amux skills directory into the agent's
-    /// native skills path inside the container.
-    pub include_skills: bool,
+    /// When true, mount all skill directories.
+    pub include_all_skills: bool,
+    /// Named skills to mount (when `include_all_skills` is false).
+    pub named_skills: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -198,14 +198,6 @@ impl AgentEngine {
             ContainerOption::SessionLabel(session.id().to_string()),
         ];
 
-        if run.mount_ssh {
-            if let Some(home) = dirs::home_dir() {
-                options.push(ContainerOption::MountSsh {
-                    source: home.join(".ssh"),
-                });
-            }
-        }
-
         // Mode flags.
         if let Some(y) = run.yolo {
             options.push(ContainerOption::Yolo(y));
@@ -302,12 +294,18 @@ impl AgentEngine {
         ));
 
         // Overlays — agent settings + user-supplied dirs + skills.
+        // Detect non-root container user for overlay path expansion.
+        let container_home = {
+            let home = dirs::home_dir().unwrap_or_default();
+            crate::engine::overlay::detect_container_home(&home, agent.as_str(), session.git_root())
+        };
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
-            include_skills: run.include_skills,
+            include_all_skills: run.include_all_skills,
+            named_skills: run.named_skills.clone(),
             agent: Some(agent.clone()),
             yolo: matches!(run.yolo, Some(YoloMode::Enabled)),
-            container_home: None,
+            container_home,
         };
         for spec in self.overlay_engine.build_overlays(session, &request)? {
             options.push(ContainerOption::Overlay(spec));
@@ -506,6 +504,136 @@ mod tests {
     }
 
     #[test]
+    fn build_options_antigravity_entrypoint_is_agy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let opts = engine
+            .build_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap();
+        let entrypoint = opts
+            .iter()
+            .find_map(|o| {
+                if let ContainerOption::Entrypoint(e) = o {
+                    Some(e.0.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("Entrypoint option must be present");
+        assert_eq!(
+            entrypoint,
+            vec!["agy".to_string()],
+            "antigravity interactive entrypoint must be [\"agy\"]"
+        );
+    }
+
+    #[test]
+    fn build_options_antigravity_yolo_non_interactive_includes_print_and_skip_permissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            non_interactive: true,
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        // --print must appear in the entrypoint (non_interactive=true appends it).
+        let entrypoint = opts
+            .iter()
+            .find_map(|o| {
+                if let ContainerOption::Entrypoint(e) = o {
+                    Some(e.0.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("Entrypoint option must be present");
+        assert!(
+            entrypoint.contains(&"--print".to_string()),
+            "entrypoint must contain --print for non_interactive antigravity; got {entrypoint:?}"
+        );
+
+        // NonInteractivePrintFlag must also be set.
+        let has_print_flag = opts
+            .iter()
+            .any(|o| matches!(o, ContainerOption::NonInteractivePrintFlag(f) if f == "--print"));
+        assert!(
+            has_print_flag,
+            "NonInteractivePrintFlag(--print) must be present for non_interactive antigravity"
+        );
+
+        // AgentModeFlags must contain --dangerously-skip-permissions.
+        let mode_flags: Vec<String> = opts
+            .iter()
+            .filter_map(|o| {
+                if let ContainerOption::AgentModeFlags(flags) = o {
+                    Some(flags.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        assert!(
+            mode_flags.contains(&"--dangerously-skip-permissions".to_string()),
+            "AgentModeFlags must contain --dangerously-skip-permissions for antigravity yolo; got {mode_flags:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_antigravity_plan_returns_plan_unsupported_error() {
+        // agy has no `--approval-mode=plan` CLI flag (verified against
+        // `agy --help`; plan/auto modes live only in settings.json's
+        // `toolPermission` field or interactive slash commands). Asking for
+        // plan mode on antigravity must surface as `PlanModeUnsupported`
+        // rather than silently emitting a flag agy treats as garbage.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            plan: Some(PlanMode::Enabled),
+            non_interactive: true,
+            ..Default::default()
+        };
+        let err = engine
+            .build_options(&session, &agent, &run)
+            .expect_err("plan mode on antigravity must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("antigravity") && msg.to_lowercase().contains("plan"),
+            "error must call out plan-mode for antigravity; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_options_antigravity_model_flag_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            model: Some("gemini-3.5-flash".to_string()),
+            ..Default::default()
+        };
+        let result = engine.build_options(&session, &agent, &run);
+        assert!(
+            result.is_err(),
+            "build_options with model for antigravity must return Err; got {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("antigravity"),
+            "error must name the agent 'antigravity'; got: {msg}"
+        );
+        assert!(
+            msg.contains("does not support a model flag"),
+            "error must say 'does not support a model flag'; got: {msg}"
+        );
+    }
+
+    #[test]
     fn build_options_non_interactive_false_no_print_flag() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
@@ -551,18 +679,21 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl crate::engine::container::frontend::ContainerFrontend for FakeContainerFrontend {
-        fn write_stdout(&mut self, _: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn write_stderr(&mut self, _: &[u8]) -> Result<(), EngineError> {
-            Ok(())
-        }
-        async fn read_stdin(&mut self, _: &mut [u8]) -> Result<usize, EngineError> {
-            Ok(0)
-        }
         fn report_status(&mut self, _: crate::engine::container::frontend::ContainerStatus) {}
         fn report_progress(&mut self, _: crate::engine::container::frontend::ContainerProgress) {}
-        fn resize_pty(&mut self, _: u16, _: u16) {}
+        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+            let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::engine::container::frontend::ContainerIo {
+                stdout: stdout_tx,
+                stderr: stderr_tx,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
     }
 
     impl AgentFrontend for FakeAgentFrontend {

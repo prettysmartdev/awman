@@ -64,6 +64,11 @@ impl AuthPathResolver {
                 config_file: None,
                 settings_dir: Some(self.home.join(".gemini")),
             },
+            "antigravity" => AgentAuthPaths {
+                agent: agent.to_string(),
+                config_file: None,
+                settings_dir: Some(self.home.join(".gemini")),
+            },
             "opencode" => AgentAuthPaths {
                 agent: agent.to_string(),
                 config_file: None,
@@ -135,6 +140,28 @@ mod tests {
         assert_eq!(
             paths.settings_dir,
             Some(Path::new("/home/testuser/.config/opencode").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_settings_dir_is_gemini() {
+        let r = resolver();
+        let paths = r.resolve("antigravity");
+        assert_eq!(paths.agent, "antigravity");
+        assert_eq!(paths.config_file, None);
+        assert_eq!(
+            paths.settings_dir,
+            Some(Path::new("/home/testuser/.gemini").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_antigravity_config_file_is_none() {
+        let r = resolver();
+        let paths = r.resolve("antigravity");
+        assert_eq!(
+            paths.config_file, None,
+            "antigravity must have no config_file"
         );
     }
 
