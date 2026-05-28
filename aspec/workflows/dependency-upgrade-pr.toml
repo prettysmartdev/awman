@@ -2,7 +2,7 @@ title = "Dependency Upgrade"
 
 [[setup]]
 type = "run_shell"
-command = "git branch"
+command = "git status"
 
 [[step]]
 name = "security-audit"
