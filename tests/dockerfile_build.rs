@@ -19,7 +19,7 @@ fn docker_available() -> bool {
 /// Build the project base image and return its tag. The base image is used to
 /// substitute the `{{AWMAN_BASE_IMAGE}}` placeholder in agent templates.
 fn build_base_image() -> String {
-    let tag = "amux-test-base:latest";
+    let tag = "awman-test-base:latest";
     let status = Command::new("docker")
         .args([
             "build",
@@ -88,15 +88,15 @@ fn build_template(template_path: &str, tag: &str) {
 
 #[test]
 fn build_claude_template() {
-    build_template("templates/Dockerfile.claude", "amux-test-claude:latest");
+    build_template("templates/Dockerfile.claude", "awman-test-claude:latest");
 }
 
 #[test]
 fn build_codex_template() {
-    build_template("templates/Dockerfile.codex", "amux-test-codex:latest");
+    build_template("templates/Dockerfile.codex", "awman-test-codex:latest");
 }
 
 #[test]
 fn build_opencode_template() {
-    build_template("templates/Dockerfile.opencode", "amux-test-opencode:latest");
+    build_template("templates/Dockerfile.opencode", "awman-test-opencode:latest");
 }

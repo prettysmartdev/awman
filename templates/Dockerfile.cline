@@ -40,18 +40,18 @@ RUN rm -rf /var/lib/apt/lists/* \
 
 RUN npm install -g --prefix=/usr/local cline
 
-# ── amux user + workspace (idempotent against a base that already created it) ─
+# ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
 # avoiding the `A || B && C && D` precedence trap that would otherwise skip
 # `mkdir`/`chown` whenever the user already exists.
-RUN { id -u amux >/dev/null 2>&1 \
-       || useradd -m -s /bin/bash -d /home/amux amux 2>/dev/null \
-       || useradd -s /bin/bash -d /home/amux amux ; } \
-    && mkdir -p /workspace /home/amux \
-    && chown -R amux:amux /workspace /home/amux
+RUN { id -u awman >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/awman awman 2>/dev/null \
+       || useradd -s /bin/bash -d /home/awman awman ; } \
+    && mkdir -p /workspace /home/awman \
+    && chown -R awman:awman /workspace /home/awman
 
-USER amux
-ENV HOME=/home/amux \
+USER awman
+ENV HOME=/home/awman \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 WORKDIR /workspace
 

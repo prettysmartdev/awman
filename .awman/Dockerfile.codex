@@ -1,4 +1,4 @@
-FROM awman-amux:latest
+FROM awman-awman:latest
 
 # Force root for installation: a base image may have switched to a non-root
 # user, and apt/cp/install need write access to /usr/local, /etc, /root.
@@ -39,18 +39,18 @@ RUN case "$(uname -m)" in \
     && install -m 0755 "/tmp/codex-${CODEX_ARCH}" /usr/local/bin/codex \
     && rm -f "/tmp/codex-${CODEX_ARCH}"
 
-# ── amux user + workspace (idempotent against a base that already created it) ─
+# ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
 # avoiding the `A || B && C && D` precedence trap that would otherwise skip
 # `mkdir`/`chown` whenever the user already exists.
-RUN { id -u amux >/dev/null 2>&1 \
-       || useradd -m -s /bin/bash -d /home/amux amux 2>/dev/null \
-       || useradd -s /bin/bash -d /home/amux amux ; } \
-    && mkdir -p /workspace /home/amux \
-    && chown -R amux:amux /workspace /home/amux
+RUN { id -u awman >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/awman awman 2>/dev/null \
+       || useradd -s /bin/bash -d /home/awman awman ; } \
+    && mkdir -p /workspace /home/awman \
+    && chown -R awman:awman /workspace /home/awman
 
-USER amux
-ENV HOME=/home/amux \
+USER awman
+ENV HOME=/home/awman \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 WORKDIR /workspace
 

@@ -1,4 +1,4 @@
-# amux
+# awman
 
 ## Source of Truth
 
@@ -21,12 +21,12 @@ All decisions — architecture, behavior, security, UX, and implementation — a
 - **Language**: Rust (idiomatic, async)
 - **TUI framework**: Ratatui
 - **Build tools**: `make`, `cargo`, `docker`
-- **Output**: single statically-linked binary (`amux`)
+- **Output**: single statically-linked binary (`awman`)
 
 ## Build & Test Commands
 
 ```
-make all      # build the amux binary
+make all      # build the awman binary
 make install  # build + install to /usr/local/bin/
 make test     # run all tests
 ```
@@ -55,9 +55,9 @@ make test     # run all tests
 ## Configuration
 
 - Per-repo config: `GITROOT/.awman/config.json`
-- Global config: `$HOME/.amux/config.json`
+- Global config: `$HOME/.awman/config.json`
 - Binary install path: `/usr/local/bin/`
-- Data/storage: `$HOME/.amux/`
+- Data/storage: `$HOME/.awman/`
 
 ## Work Items
 
