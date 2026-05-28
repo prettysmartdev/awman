@@ -102,7 +102,12 @@ pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<St
                 (Some(r), Some(b)) => format!("git push {} {}", sh_quote(r), sh_quote(b)),
                 _ => "git push".to_string(),
             };
-            (cmd, None)
+            let mut env = HashMap::new();
+            env.insert(
+                "GIT_SSH_COMMAND".to_string(),
+                "ssh -o StrictHostKeyChecking=accept-new".to_string(),
+            );
+            (cmd, Some(env))
         }
     }
 }
@@ -376,8 +381,13 @@ mod tests {
             remote: Some("origin".to_string()),
             branch: Some("feature/x".to_string()),
         };
-        let (cmd, _) = teardown_step_to_shell(&step);
+        let (cmd, env) = teardown_step_to_shell(&step);
         assert_eq!(cmd, "git push 'origin' 'feature/x'");
+        let env = env.expect("push_branch must set GIT_SSH_COMMAND env");
+        assert_eq!(
+            env.get("GIT_SSH_COMMAND").unwrap(),
+            "ssh -o StrictHostKeyChecking=accept-new",
+        );
     }
 
     #[test]
@@ -386,8 +396,13 @@ mod tests {
             remote: None,
             branch: None,
         };
-        let (cmd, _) = teardown_step_to_shell(&step);
+        let (cmd, env) = teardown_step_to_shell(&step);
         assert_eq!(cmd, "git push");
+        let env = env.expect("push_branch must set GIT_SSH_COMMAND env");
+        assert_eq!(
+            env.get("GIT_SSH_COMMAND").unwrap(),
+            "ssh -o StrictHostKeyChecking=accept-new",
+        );
     }
 
     #[test]

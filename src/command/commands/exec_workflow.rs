@@ -611,6 +611,14 @@ impl Command for ExecWorkflowCommand {
             None
         };
 
+        // 4b. Override mount path when a worktree is active so setup/teardown
+        // containers bind to the worktree checkout, not the main repo.
+        let mount_path = if let Some(ref wt) = worktree_path {
+            wt.clone()
+        } else {
+            mount_path
+        };
+
         // 5. Parse CLI overlay specs early so errors surface before PTY is activated.
         let cli_typed = {
             let mut all = Vec::new();
@@ -937,6 +945,7 @@ impl Command for ExecWorkflowCommand {
             // If the setup or main phase triggered abort_on_failure,
             // teardown is skipped regardless of teardown_on_failure.
             let mut teardown_aborted = false;
+            let mut any_teardown_failed = false;
             if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
                 let should_run = teardown_on_failure || workflow_succeeded;
                 if should_run {
@@ -947,7 +956,7 @@ impl Command for ExecWorkflowCommand {
                     let engines_for_factory = self.engines.clone();
                     let session_for_factory = session.clone();
                     let cli_typed_for_factory = cli_typed.clone();
-                    teardown_aborted = tokio::task::block_in_place(|| {
+                    (teardown_aborted, any_teardown_failed) = tokio::task::block_in_place(|| {
                         let factory = |idx: usize| -> Result<
                             Box<dyn crate::engine::container::ContainerExec>,
                             EngineError,
@@ -972,14 +981,18 @@ impl Command for ExecWorkflowCommand {
                                 teardown_on_failure,
                                 factory,
                             )
-                            .unwrap_or(false)
+                            .unwrap_or((false, false))
                     });
                 }
             }
 
-            // If a teardown step with abort_on_failure triggered, promote the
-            // result to CompletedTeardownFailed so post-workflow flows know.
-            let result = if teardown_aborted && workflow_succeeded {
+            // If any teardown step failed, promote the result to
+            // CompletedTeardownFailed so post-workflow flows know.
+            let result = if (teardown_aborted || any_teardown_failed) && workflow_succeeded {
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: "Workflow completed but one or more teardown steps failed".into(),
+                });
                 Ok(WorkflowOutcome::CompletedTeardownFailed)
             } else {
                 result

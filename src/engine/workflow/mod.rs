@@ -1481,7 +1481,9 @@ impl WorkflowEngine {
     /// that step as `Failed`, surfaces the error to the frontend, and proceeds
     /// to the next step — matching the best-effort semantics already used for
     /// non-zero exit codes.
-    /// Returns `true` if teardown was aborted by an `abort_on_failure` step.
+    /// Returns `(teardown_aborted, any_step_failed)`:
+    /// - `teardown_aborted`: true if an `abort_on_failure` step failed
+    /// - `any_step_failed`: true if any teardown step failed (regardless of abort flag)
     pub fn run_teardown<F>(
         &mut self,
         steps: &[crate::data::workflow_definition::TeardownStep],
@@ -1489,7 +1491,7 @@ impl WorkflowEngine {
         workflow_succeeded: bool,
         teardown_on_failure: bool,
         mut container_for_step: F,
-    ) -> Result<bool, EngineError>
+    ) -> Result<(bool, bool), EngineError>
     where
         F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
     {
@@ -1499,7 +1501,7 @@ impl WorkflowEngine {
         };
 
         if !teardown_on_failure && !workflow_succeeded {
-            return Ok(false);
+            return Ok((false, false));
         }
 
         let wi_ctx = self.work_item_context.as_ref();
@@ -1516,6 +1518,7 @@ impl WorkflowEngine {
         self.persist()?;
 
         let mut teardown_aborted = false;
+        let mut any_step_failed = false;
         for (idx, step) in steps.iter().enumerate() {
             let desc = teardown_step_description(step);
             let (command, env) = teardown_step_to_shell(step);
@@ -1535,6 +1538,7 @@ impl WorkflowEngine {
                     };
                     self.persist()?;
                     self.frontend.on_teardown_step_failed(&desc, 1, &msg);
+                    any_step_failed = true;
                     if abort {
                         teardown_aborted = true;
                         break;
@@ -1555,6 +1559,7 @@ impl WorkflowEngine {
                 self.persist()?;
                 self.frontend
                     .on_teardown_step_failed(&desc, result.exit_code, &result.stderr);
+                any_step_failed = true;
                 if abort {
                     teardown_aborted = true;
                     break;
@@ -1570,7 +1575,7 @@ impl WorkflowEngine {
         self.state.teardown_completed = true;
         self.state.current_phase = WorkflowPhase::Done;
         self.persist()?;
-        Ok(teardown_aborted)
+        Ok((teardown_aborted, any_step_failed))
     }
 
     /// Mark the workflow as fully finished. Called by the orchestrator after
@@ -3133,9 +3138,11 @@ mod tests {
         let steps = teardown_steps_sample(); // 2 steps
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine
+        let (aborted, any_failed) = engine
             .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
 
         assert_eq!(
             mock.handouts(),
@@ -3188,9 +3195,11 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         // teardown_on_failure = false, workflow_succeeded = false → skip all
-        engine
+        let (aborted, any_failed) = engine
             .run_teardown(&steps, &[], false, false, mock.factory())
             .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
 
         assert_eq!(mock.calls().len(), 0, "no exec calls should be made");
         assert_eq!(
@@ -3207,9 +3216,11 @@ mod tests {
         let steps = teardown_steps_sample();
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine
+        let (aborted, any_failed) = engine
             .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
 
         assert_eq!(mock.calls().len(), 2, "both teardown steps must exec");
     }
@@ -3227,6 +3238,9 @@ mod tests {
         // Teardown is best-effort: returns Ok even if a step fails.
         let result = engine.run_teardown(&steps, &[], true, false, mock.factory());
         assert!(result.is_ok(), "run_teardown must return Ok despite step failure");
+        let (aborted, any_failed) = result.unwrap();
+        assert!(!aborted, "no abort_on_failure steps were set");
+        assert!(any_failed, "any_step_failed must be true when a step exits non-zero");
         assert_eq!(mock.calls().len(), 2, "both steps must be exec'd");
     }
 
@@ -3243,10 +3257,12 @@ mod tests {
         // abort_on_failure = true for step 0
         let result = engine.run_teardown(&steps, &[true, false], true, false, mock.factory());
         assert!(result.is_ok());
+        let (aborted, any_failed) = result.unwrap();
         assert!(
-            result.unwrap(),
-            "run_teardown must return true when abort_on_failure step fails"
+            aborted,
+            "run_teardown must set aborted when abort_on_failure step fails"
         );
+        assert!(any_failed, "any_step_failed must also be true");
         assert_eq!(
             mock.calls().len(),
             1,
@@ -3285,6 +3301,8 @@ mod tests {
 
         let result = engine.run_teardown(&steps, &[], true, false, factory);
         assert!(result.is_ok(), "factory failure must not abort teardown");
+        let (_aborted, any_failed) = result.unwrap();
+        assert!(any_failed, "any_step_failed must be true when factory fails");
 
         let states = &engine.state().teardown_step_states;
         assert!(
@@ -3358,9 +3376,11 @@ mod tests {
         ];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine
+        let (aborted, any_failed) = engine
             .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
+        assert!(!aborted);
+        assert!(!any_failed);
 
         let states = &engine.state().teardown_step_states;
         assert_eq!(states.len(), 2);
@@ -3406,7 +3426,7 @@ mod tests {
         let steps = teardown_steps_sample();
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine
+        let (_aborted, _any_failed) = engine
             .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
 

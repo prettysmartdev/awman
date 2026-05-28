@@ -1,5 +1,9 @@
 title = "Dependency Upgrade"
 
+[[setup]]
+type = "run_shell"
+command = "git branch"
+
 [[step]]
 name = "security-audit"
 prompt = "Using the package manager or language toolchain appropriate for this project, check if any of the project's dependencies have any security issues (cargo/npm audit etc). If any security issues exist, upgrade the affected dependencies even if it requires a significant change to the codebase. Do not stop until all dependency security issues are dealt with."
