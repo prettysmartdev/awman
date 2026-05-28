@@ -769,6 +769,30 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Parse a Dockerfile for the last non-root `USER` directive and return
+/// `/home/<name>`. Returns `None` when the file doesn't exist, can't be read,
+/// or only uses root.
+pub(crate) fn detect_home_from_dockerfile(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut result: Option<String> = None;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_uppercase();
+        if let Some(rest) = upper.strip_prefix("USER ") {
+            let name = rest.split_whitespace().next().unwrap_or("").trim();
+            if !name.is_empty() && name != "ROOT" && name != "0" {
+                let orig_rest = &trimmed[5..]; // skip "USER "
+                let orig_name = orig_rest.split_whitespace().next().unwrap_or("root");
+                result = Some(format!("/home/{orig_name}"));
+            } else {
+                // Switched back to root — reset.
+                result = None;
+            }
+        }
+    }
+    result
+}
+
 /// Detect the container home directory by inspecting `Dockerfile.<agent>`.
 ///
 /// Looks for a `USER <name>` directive (where `<name>` is not "root" or "0")
@@ -782,24 +806,8 @@ pub(crate) fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -
 
     for dir in &search_dirs {
         let path = dir.join(&dockerfile_name);
-        if !path.exists() {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                // Look for "USER <name>" (case-insensitive directive).
-                let upper = trimmed.to_uppercase();
-                if let Some(rest) = upper.strip_prefix("USER ") {
-                    let name = rest.split_whitespace().next().unwrap_or("").trim();
-                    if !name.is_empty() && name != "ROOT" && name != "0" {
-                        // Use original case from the line.
-                        let orig_rest = &trimmed[5..]; // skip "USER "
-                        let orig_name = orig_rest.split_whitespace().next().unwrap_or("root");
-                        return Some(format!("/home/{orig_name}"));
-                    }
-                }
-            }
+        if let Some(home) = detect_home_from_dockerfile(&path) {
+            return Some(home);
         }
     }
     None
@@ -1626,6 +1634,52 @@ mod tests {
             result.is_none(),
             "detect_container_home must return None when USER is 0"
         );
+    }
+
+    // ─── detect_home_from_dockerfile ──────────────────────────────────────────
+
+    #[test]
+    fn detect_home_from_dockerfile_finds_non_root_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let df = tmp.path().join("Dockerfile.dev");
+        std::fs::write(&df, "FROM debian:bookworm\nUSER awman\nWORKDIR /workspace\n").unwrap();
+        assert_eq!(
+            detect_home_from_dockerfile(&df),
+            Some("/home/awman".to_string()),
+        );
+    }
+
+    #[test]
+    fn detect_home_from_dockerfile_returns_none_for_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let df = tmp.path().join("Dockerfile.dev");
+        std::fs::write(&df, "FROM debian:bookworm\nUSER root\n").unwrap();
+        assert!(detect_home_from_dockerfile(&df).is_none());
+    }
+
+    #[test]
+    fn detect_home_from_dockerfile_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(detect_home_from_dockerfile(&tmp.path().join("nonexistent")).is_none());
+    }
+
+    #[test]
+    fn detect_home_from_dockerfile_uses_last_non_root_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let df = tmp.path().join("Dockerfile");
+        std::fs::write(&df, "FROM debian\nUSER builder\nRUN make\nUSER runner\n").unwrap();
+        assert_eq!(
+            detect_home_from_dockerfile(&df),
+            Some("/home/runner".to_string()),
+        );
+    }
+
+    #[test]
+    fn detect_home_from_dockerfile_resets_on_root_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let df = tmp.path().join("Dockerfile");
+        std::fs::write(&df, "FROM debian\nUSER builder\nRUN make\nUSER root\n").unwrap();
+        assert!(detect_home_from_dockerfile(&df).is_none());
     }
 
     // ─── resolve_user_overlay missing-host fail-fast ─────────────────────────

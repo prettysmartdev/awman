@@ -1160,13 +1160,16 @@ fn collect_single_entry_overlays(
 > {
     let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), entry_overlays)?;
 
+    let container_home = crate::engine::overlay::detect_home_from_dockerfile(
+        &session.git_root().join("Dockerfile.dev"),
+    );
     let request = crate::engine::overlay::OverlayRequest {
         directories: collected.directories,
         include_all_skills: false,
         named_skills: Vec::new(),
         agent: None,
         yolo: false,
-        container_home: None,
+        container_home,
     };
     let overlay_specs = engines
         .overlay_engine
