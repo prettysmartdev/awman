@@ -13,11 +13,11 @@
 
 `awman` (Agent Workflow Manager) is a developer tool that adds structure and automation to the entire agentic software development lifecycle: from issue to merged PR. 
 
-**4 stages of agentic software development with awman**
+**4 stages of improved agentic software development with awman**
 1. Isolate your code agents with containers and worktrees 🛑
 2. Run multiple agents in parallel with the TUI. 🔄
-3. Create structured workflows for your personalized software development workflow. 📈
-4. Fan out multiple workflows to your homelab or cloud with API mode. 🤝
+3. Create structured workflows for your project's software development lifecycle. 📈
+4. Fan out multiple workflows to your homelab or cluster with API mode. 🤝
 
 ![awman workflows](./docs/blog/images/tui-workflow.png)
 
