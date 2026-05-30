@@ -1,6 +1,6 @@
 <p align="center">
   <strong>Run and coordinate AI code agents from your terminal.</strong> <br>
-  Parallel sessions, multi-step workflows, full container isolation.<br>
+  Go from issue to PR with repeatable container-isolated workflows.<br>
   <br>
   <img src="./docs/awman_logo.svg" width="620" alt="awman">
 </p>
@@ -11,9 +11,15 @@
 
 ---
 
-`awman` (Agentic Workflow Manager) is a developer tool that adds structure and automation to the entire agentic software development lifecycle, from issue to merged PR. Run multiple agent sessions in parallel, execute structured multi-step workflows, run agents on a fleet of remote machines, and keep everything safe — every agent runs inside a container, never on the host.
+`awman` (Agent Workflow Manager) is a developer tool that adds structure and automation to the entire agentic software development lifecycle: from issue to merged PR. 
 
-![awman TUI](./docs/blog/images/tui-screenshot.png)
+**4 stages of agentic software development with awman**
+1. Isolate your code agents with containers and worktrees 🛑
+2. Run multiple agents in parallel with the TUI. 🔄
+3. Create structured workflows for your personalized software development workflow. 📈
+4. Fan out multiple workflows to your homelab or cloud with API mode. 🤝
+
+![awman workflows](./docs/blog/images/tui-workflow.png)
 
 ---
 
@@ -56,7 +62,7 @@ sudo make install
 
 </details>
 
-> **Upgrading from amux?** The tool was previously named `amux`. After installing `awman`, remove any old `amux` binary, symlinks, or shell aliases — invoking `amux` will no longer work. Existing `~/.amux/` and `<git-root>/.amux/` directories are migrated automatically on first run; any `AMUX_*` environment variables you have set will print a one-time deprecation warning naming their `AWMAN_*` replacement (the old names are ignored).
+> **Upgrading from amux?** This tool was previously named `amux`. The install script will offer to clean it up, but if you use another method, delete old copies of `amux`. All config will migrate automatically. Change your `AMUX_*` env vars to `AWMAN_*` and you're done.
 
 ---
 
@@ -72,7 +78,7 @@ awman
 # 3. Start an agent session
 chat
 
-# 4. Run the Dockerfile.dev refresh agent to
+# 4. Optionally run the Dockerfile.dev refresh agent to
 #    ensure all your project's tools get installed
 ready --refresh
 ```
@@ -81,7 +87,7 @@ See the [Getting Started Guide](docs/00-getting-started.md) for a full walkthrou
 
 ---
 
-## What you can do
+## What you can do with `awman`
 
 ### Run multiple agents at once
 
@@ -89,9 +95,9 @@ From the `awman` TUI, Open new tabs with **Ctrl+T**. Each tab is independent —
 
 If a running agent gets stuck or completes its task, its tab turns yellow so you know to check in.
 
-### Run structured workflows
+![awman TUI](./docs/blog/images/tui-screenshot.png)
 
-![awman workflows](./docs/blog/images/tui-workflow.png)
+### Run structured workflows
 
 A workflow breaks complex work into phases — for example, plan → implement → review → docs. Each phase is a separate agent session. You review the output between phases and decide whether to continue, retry, or redirect.
 
@@ -144,7 +150,7 @@ awman exec workflow ./aspec/workflows/implement-pr.toml --work-item 0027
 Workflows can optionally be passed a specific work item — a spec you've written — to work on new features, fix bugs, etc.
 
 
-### Use different agents per step
+### Combine multiple agents in a single workflow
 
 Each workflow step can specify which agent runs it, and each step can have its own overlays for SSH access, environment variables, or skills:
 
@@ -163,7 +169,7 @@ prompt = "Review for correctness and style."
 overlays = ["skill(review)"]
 ```
 
-Supported agents: `claude`, `codex`, `opencode`, `maki`, `antigravity`, `copilot`, `crush`, `cline`. Steps without an `agent` field use your configured default.
+Supported agents: `claude`, `codex`, `opencode`, `maki`, `antigravity`, `copilot`, `crush`, `cline`. Steps without an `agent` field use your project's default.
 
 
 ### Hand off to the agent workflow completely (yolo mode)
@@ -225,16 +231,16 @@ See [API Mode](docs/09-api-mode.md) and [Remote Mode](docs/10-remote-mode.md) fo
 
 ---
 
-## Security
+## Security and Isolation
 
-Every agent runs inside a Docker container built from `Dockerfile.dev` — agent-generated code never executes on your host machine.
+Every agent runs inside a container built from `Dockerfile.dev` — agents can never directly access your host machine.
 
-- Only the current Git repository is mounted into the container
+- Only the current Git repository is mounted into the container by default
 - Credentials are passed as environment variables and masked in all displayed commands — never written to files inside containers
-- `awman ready --refresh` scans your project and updates `Dockerfile.dev` with exactly the tools your workflow needs
+- Overlays allow optionally providing access to ssh keys, env vars, additional directories, and your personal skills library
 - awman itself is a statically compiled Rust binary — it cannot be modified by anything running inside a container
 
-Apple Containers (macOS 26+) is also supported as an alternative to Docker Desktop.
+Apple Containers (macOS 26+) and Docker are supported container runtimes.
 
 ![awman TUI status](./docs/blog/images/tui-status.png)
 
@@ -263,7 +269,7 @@ awman remote session start <dir>       # create a session on a remote server
 awman remote session kill <id>         # close a session on a remote server
 ```
 
-All commands work in both TUI mode (without the `awman` prefix) and CLI mode.
+All commands work in both TUI mode (without the `awman` prefix) and CLI mode. API mode supports `exec prompt` and `exec workflow`.
 
 ---
 
