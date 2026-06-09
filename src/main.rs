@@ -37,7 +37,7 @@ async fn main() -> Result<ExitCode> {
         eprintln!(
             "error: --mount-ssh has been removed. Pass `--overlay ssh()` instead \
              (or set `overlays = [\"ssh()\"]` in a per-step workflow entry). \
-             See `docs/08-overlays.md`."
+             See `docs/09-overlays.md`."
         );
         return Ok(ExitCode::from(2));
     }
@@ -56,8 +56,29 @@ async fn main() -> Result<ExitCode> {
     }
 
     let global_config = GlobalConfig::load().unwrap_or_default();
-    let detected =
-        agent_runtime::detect(&global_config).context("failed to detect agent runtime")?;
+    let detected = match agent_runtime::detect(&global_config) {
+        Ok(d) => d,
+        Err(e) => {
+            // A `runtime:` config string this host can't construct (e.g.
+            // `apple-containers` on Linux) must not lock the user out of
+            // `awman config` — the documented way to switch the runtime
+            // back. The catalogue decides which commands need a runtime;
+            // for the rest, warn and continue on the default Docker
+            // runtime, which config commands never touch.
+            let path = cli::command_path_from_matches(&matches);
+            let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            if CommandCatalogue::get().requires_runtime(&path_refs) {
+                return Err(anyhow::Error::new(e).context("failed to detect agent runtime"));
+            }
+            eprintln!(
+                "warning: configured runtime is unavailable on this host ({e}); \
+                 continuing with the default Docker runtime so `awman config` \
+                 can update the setting"
+            );
+            agent_runtime::detect(&GlobalConfig::default())
+                .context("failed to detect agent runtime")?
+        }
+    };
     let runtime = detected.engine();
     let container_runtime = detected.container_runtime();
     let sandbox_runtime = detected.sandbox_runtime();

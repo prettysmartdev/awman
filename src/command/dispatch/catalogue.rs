@@ -195,6 +195,17 @@ impl CommandCatalogue {
         self.lookup(&canonical)
     }
 
+    /// Whether a command path needs a successfully-detected agent runtime to
+    /// run. `config` is the recovery path when `GlobalConfig::runtime` names
+    /// a runtime that cannot be constructed on this host (e.g.
+    /// `apple-containers` on Linux): it only reads/writes config files, so it
+    /// must stay reachable to let the user switch the runtime back. Every
+    /// other command — and the bare-TUI invocation — conservatively requires
+    /// the runtime.
+    pub fn requires_runtime(&self, path: &[&str]) -> bool {
+        !matches!(path.first(), Some(&"config"))
+    }
+
     /// Validate that a command path is reachable by the given frontend,
     /// returning `Err(CommandError::NotAvailableForFrontend)` when blocked.
     pub fn validate_for_frontend(
@@ -2048,6 +2059,35 @@ mod tests {
                 subcmd_name,
                 parent_path
             );
+        }
+    }
+
+    #[test]
+    fn config_commands_do_not_require_runtime() {
+        let cat = CommandCatalogue::get();
+        for path in [
+            &["config"][..],
+            &["config", "show"],
+            &["config", "get"],
+            &["config", "set"],
+        ] {
+            assert!(
+                !cat.requires_runtime(path),
+                "{path:?} must not require a runtime — it is the recovery \
+                 path for a broken runtime config"
+            );
+        }
+        // Everything else — and the bare TUI invocation (empty path) —
+        // conservatively requires a detected runtime.
+        for path in [
+            &["chat"][..],
+            &["ready"],
+            &["init"],
+            &["status"],
+            &["exec", "workflow"],
+            &[],
+        ] {
+            assert!(cat.requires_runtime(path), "{path:?} must require runtime");
         }
     }
 
