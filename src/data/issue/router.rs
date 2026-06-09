@@ -72,8 +72,9 @@ mod tests {
     #[test]
     fn router_routes_github_url_to_github() {
         let router = IssueSourceRouter::default();
-        let source =
-            router.route("https://github.com/owner/repo/issues/42").unwrap();
+        let source = router
+            .route("https://github.com/owner/repo/issues/42")
+            .unwrap();
         assert_eq!(source.provider_name(), "GitHub");
     }
 

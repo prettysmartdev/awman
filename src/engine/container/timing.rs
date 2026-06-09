@@ -1,7 +1,7 @@
 //! Container-layer timing constants.
 //!
 //! Each frontend chooses its own grace + stuck timeouts via the
-//! `ContainerFrontend` trait; the constants here are the defaults baked into
+//! `AgentFrontend` trait; the constants here are the defaults baked into
 //! that trait. CLI/TUI accept the defaults (30s/30s); API overrides to
 //! 15min grace so a long image pull or model warm-up doesn't kill the run.
 

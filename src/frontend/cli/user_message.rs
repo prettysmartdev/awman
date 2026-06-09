@@ -4,7 +4,7 @@
 //! While a PTY-bound container owns the terminal, the frontend MUST NOT
 //! splash status messages into the user's view. Instead the queue collects
 //! them and `replay_queued` flushes once the container releases the
-//! terminal (after `ContainerExecution::wait` and after
+//! terminal (after `AgentExecution::wait` and after
 //! `WorktreeLifecycle::finalize`).
 
 use std::io::Write;

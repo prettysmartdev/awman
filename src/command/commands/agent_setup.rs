@@ -3,7 +3,7 @@
 
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::engine::step_status::StepStatus;
 
@@ -27,15 +27,15 @@ pub trait AgentSetupFrontend: UserMessageSink + Send + Sync {
 }
 
 /// Marker trait implemented by every per-command frontend that needs to
-/// hand a `ContainerFrontend` down to Layer-1 engines. Lets the
+/// hand a `AgentFrontend` down to Layer-1 engines. Lets the
 /// `AgentFrontendAdapter` below stay generic without each per-command frontend
 /// trait having to be its own bound.
-pub trait HasContainerFrontend: UserMessageSink + Send {
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+pub trait HasAgentFrontend: UserMessageSink + Send {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend>;
 
     /// Like `container_frontend`, but the returned frontend is allowed to
     /// surrender its byte-stream I/O channels to the engine for direct PTY
-    /// bridging via `ContainerFrontend::take_container_io`.
+    /// bridging via `AgentFrontend::take_io`.
     ///
     /// Commands that intend to launch an *interactive* PTY container (chat,
     /// exec prompt) call this variant so the container's PTY is wired
@@ -45,27 +45,27 @@ pub trait HasContainerFrontend: UserMessageSink + Send {
     ///
     /// Default impl falls back to `container_frontend` — appropriate for CLI
     /// frontends that already inherit a real host terminal.
-    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
         self.container_frontend()
     }
 }
 
 /// Adapter that wraps any per-command frontend implementing
-/// [`HasContainerFrontend`] and exposes the engine's `AgentFrontend` trait.
+/// [`HasAgentFrontend`] and exposes the engine's `AgentFrontend` trait.
 /// Used by `chat`, `exec prompt`, etc. to call `AgentEngine::ensure_available`
 /// without each per-command frontend trait having to implement
 /// `report_step_status` itself.
-pub struct AgentFrontendAdapter<'a, F: ?Sized + HasContainerFrontend> {
+pub struct AgentFrontendAdapter<'a, F: ?Sized + HasAgentFrontend> {
     inner: &'a mut F,
 }
 
-impl<'a, F: ?Sized + HasContainerFrontend> AgentFrontendAdapter<'a, F> {
+impl<'a, F: ?Sized + HasAgentFrontend> AgentFrontendAdapter<'a, F> {
     pub fn new(inner: &'a mut F) -> Self {
         Self { inner }
     }
 }
 
-impl<F: ?Sized + HasContainerFrontend> UserMessageSink for AgentFrontendAdapter<'_, F> {
+impl<F: ?Sized + HasAgentFrontend> UserMessageSink for AgentFrontendAdapter<'_, F> {
     fn write_message(&mut self, msg: UserMessage) {
         self.inner.write_message(msg);
     }
@@ -74,7 +74,7 @@ impl<F: ?Sized + HasContainerFrontend> UserMessageSink for AgentFrontendAdapter<
     }
 }
 
-impl<F: ?Sized + HasContainerFrontend> crate::engine::agent::AgentFrontend
+impl<F: ?Sized + HasAgentFrontend> crate::engine::agent::AgentFrontend
     for AgentFrontendAdapter<'_, F>
 {
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
@@ -94,7 +94,7 @@ impl<F: ?Sized + HasContainerFrontend> crate::engine::agent::AgentFrontend
         self.inner.write_message(UserMessage { level, text });
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         self.inner.container_frontend()
     }
 }

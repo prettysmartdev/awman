@@ -347,6 +347,10 @@ impl Command for NewCommand {
                         env_passthrough: None,
                         ..Default::default()
                     };
+                    // Sandbox-class runtimes: agent spawn lands in WI 0090.
+                    self.engines
+                        .require_container_runtime()
+                        .map_err(CommandError::from)?;
                     let mut options = match self
                         .engines
                         .agent_engine
@@ -366,16 +370,19 @@ impl Command for NewCommand {
                             env_vars: credentials.env_vars,
                         });
                     }
-                    let instance = match self.engines.runtime.build(options) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new workflow: failed to build container: {e}"),
-                            });
-                            return Err(CommandError::from(e));
-                        }
-                    };
+                    let instance =
+                        match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
+                            .and_then(|o| self.engines.runtime.build(o))
+                        {
+                            Ok(i) => i,
+                            Err(e) => {
+                                frontend.write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!("new workflow: failed to build container: {e}"),
+                                });
+                                return Err(CommandError::from(e));
+                            }
+                        };
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Info,
                         text: "Launching agent container…".into(),
@@ -529,6 +536,10 @@ impl Command for NewCommand {
                         env_passthrough: None,
                         ..Default::default()
                     };
+                    // Sandbox-class runtimes: agent spawn lands in WI 0090.
+                    self.engines
+                        .require_container_runtime()
+                        .map_err(CommandError::from)?;
                     let mut options = match self
                         .engines
                         .agent_engine
@@ -548,16 +559,19 @@ impl Command for NewCommand {
                             env_vars: credentials.env_vars,
                         });
                     }
-                    let instance = match self.engines.runtime.build(options) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new skill: failed to build container: {e}"),
-                            });
-                            return Err(CommandError::from(e));
-                        }
-                    };
+                    let instance =
+                        match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
+                            .and_then(|o| self.engines.runtime.build(o))
+                        {
+                            Ok(i) => i,
+                            Err(e) => {
+                                frontend.write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!("new skill: failed to build container: {e}"),
+                                });
+                                return Err(CommandError::from(e));
+                            }
+                        };
                     frontend.set_pty_active(true);
                     let cf = frontend.container_frontend_for_pty();
                     let mut execution = match instance.run_with_frontend(cf) {
@@ -794,7 +808,9 @@ mod tests {
             ApiPaths::at_root(root),
         ));
         Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine: Arc::new(crate::engine::git::GitEngine::new()),
             overlay_engine: overlay,
             auth_engine,

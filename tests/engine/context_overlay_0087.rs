@@ -10,9 +10,7 @@ use awman::data::fs::ContextDirResolver;
 use awman::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
 use awman::engine::agent::{AgentEngine, AgentRunOptions};
 use awman::engine::container::options::{ContainerOption, OverlayPermission};
-use awman::engine::context_prompt::{
-    ContextPromptBuilder, WorkflowStepInfo, WorkflowStepState,
-};
+use awman::engine::context_prompt::{ContextPromptBuilder, WorkflowStepInfo, WorkflowStepState};
 use awman::engine::overlay::{ContextOverlay, ContextScope as EngineContextScope, OverlayEngine};
 
 use std::path::PathBuf;
@@ -57,8 +55,7 @@ fn exec_prompt_context_global_emits_overlay_at_awman_context_global() {
     };
 
     let session_tmp = tempfile::tempdir().unwrap();
-    let env =
-        EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
     let session = open_session_with_env(session_tmp.path(), env);
     let engine = make_agent_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
@@ -133,8 +130,14 @@ fn workflow_top_level_context_repo_and_step_context_global_produce_two_specs() {
         .iter()
         .any(|c| c.scope == ContextScope::Global);
 
-    assert!(has_repo, "Repo scope must be present from workflow-level overlays");
-    assert!(has_global, "Global scope must be present from step-level overlays");
+    assert!(
+        has_repo,
+        "Repo scope must be present from workflow-level overlays"
+    );
+    assert!(
+        has_global,
+        "Global scope must be present from step-level overlays"
+    );
 }
 
 #[test]
@@ -177,10 +180,7 @@ fn workflow_dynamic_prompt_second_step_shows_first_completed_second_in_progress(
                 "prepare-environment".to_string(),
                 WorkflowStepState::Completed,
             ),
-            (
-                "build-and-test".to_string(),
-                WorkflowStepState::InProgress,
-            ),
+            ("build-and-test".to_string(), WorkflowStepState::InProgress),
         ],
         work_item_number: None,
         work_item_title: None,

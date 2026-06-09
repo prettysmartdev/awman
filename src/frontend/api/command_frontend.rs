@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend};
 use crate::command::commands::agent_setup::{
-    AgentSetupDecision, AgentSetupFrontend, HasContainerFrontend,
+    AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
 use crate::command::commands::api_server::ApiServeConfig;
 use crate::command::commands::api_server::ApiServerCommandFrontend;
@@ -46,8 +46,8 @@ use crate::command::error::CommandError;
 use crate::data::config::repo::WorkItemsConfig;
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
-use crate::engine::container::frontend::{ContainerFrontend, ContainerProgress, ContainerStatus};
-use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::agent_runtime::execution::AgentExitInfo;
+use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::InitFrontend;
 use crate::engine::init::phase::InitPhase;
@@ -404,21 +404,21 @@ impl CommandFrontend for ApiDispatchFrontend {
     }
 }
 
-// ─── ContainerFrontend ──────────────────────────────────────────────────────
+// ─── AgentFrontend ──────────────────────────────────────────────────────
 
 #[async_trait]
-impl ContainerFrontend for ApiDispatchFrontend {
-    fn report_status(&mut self, status: ContainerStatus) {
+impl AgentFrontend for ApiDispatchFrontend {
+    fn report_status(&mut self, status: AgentStatus) {
         let message = match &status {
-            ContainerStatus::Building => "Building container image...".to_string(),
-            ContainerStatus::Pulling => "Pulling container image...".to_string(),
-            ContainerStatus::Starting => "Starting container...".to_string(),
-            ContainerStatus::Running { container_name } => {
+            AgentStatus::Building => "Building container image...".to_string(),
+            AgentStatus::Pulling => "Pulling container image...".to_string(),
+            AgentStatus::Starting => "Starting container...".to_string(),
+            AgentStatus::Running { container_name } => {
                 format!("Container running: {container_name}")
             }
-            ContainerStatus::Stopping => "Stopping container...".to_string(),
-            ContainerStatus::Exited(code) => format!("Container exited with code {code}"),
-            ContainerStatus::Failed(reason) => format!("Container failed: {reason}"),
+            AgentStatus::Stopping => "Stopping container...".to_string(),
+            AgentStatus::Exited(code) => format!("Container exited with code {code}"),
+            AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
@@ -426,14 +426,14 @@ impl ContainerFrontend for ApiDispatchFrontend {
         });
     }
 
-    fn report_progress(&mut self, progress: ContainerProgress) {
+    fn report_progress(&mut self, progress: AgentProgress) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: progress.stage,
             message: progress.message,
         });
     }
 
-    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         let event_bus_stdout = self.event_bus.clone();
         let event_bus_stderr = self.event_bus.clone();
 
@@ -478,7 +478,7 @@ impl ContainerFrontend for ApiDispatchFrontend {
             }
         });
 
-        crate::engine::container::frontend::ContainerIo {
+        crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -497,10 +497,10 @@ impl ContainerFrontend for ApiDispatchFrontend {
     }
 }
 
-// ─── HasContainerFrontend ───────────────────────────────────────────────────
+// ─── HasAgentFrontend ───────────────────────────────────────────────────
 
-impl HasContainerFrontend for ApiDispatchFrontend {
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+impl HasAgentFrontend for ApiDispatchFrontend {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
             line_buffer_stdout: String::new(),
@@ -533,32 +533,32 @@ impl UserMessageSink for ApiContainerSink {
 }
 
 #[async_trait]
-impl ContainerFrontend for ApiContainerSink {
-    fn report_status(&mut self, status: ContainerStatus) {
+impl AgentFrontend for ApiContainerSink {
+    fn report_status(&mut self, status: AgentStatus) {
         let message = match &status {
-            ContainerStatus::Building => "Building container image...".to_string(),
-            ContainerStatus::Pulling => "Pulling container image...".to_string(),
-            ContainerStatus::Starting => "Starting container...".to_string(),
-            ContainerStatus::Running { container_name } => {
+            AgentStatus::Building => "Building container image...".to_string(),
+            AgentStatus::Pulling => "Pulling container image...".to_string(),
+            AgentStatus::Starting => "Starting container...".to_string(),
+            AgentStatus::Running { container_name } => {
                 format!("Container running: {container_name}")
             }
-            ContainerStatus::Stopping => "Stopping container...".to_string(),
-            ContainerStatus::Exited(code) => format!("Container exited with code {code}"),
-            ContainerStatus::Failed(reason) => format!("Container failed: {reason}"),
+            AgentStatus::Stopping => "Stopping container...".to_string(),
+            AgentStatus::Exited(code) => format!("Container exited with code {code}"),
+            AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
             message,
         });
     }
-    fn report_progress(&mut self, progress: ContainerProgress) {
+    fn report_progress(&mut self, progress: AgentProgress) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: progress.stage,
             message: progress.message,
         });
     }
 
-    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         let event_bus_stdout = self.event_bus.clone();
         let event_bus_stderr = self.event_bus.clone();
 
@@ -600,7 +600,7 @@ impl ContainerFrontend for ApiContainerSink {
 
         // Engine owns the single stdin_tx and drops it after seeding so EOF
         // arrives at the container's stdin pipe (see `spawn_piped_docker`).
-        crate::engine::container::frontend::ContainerIo {
+        crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -757,7 +757,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     fn user_choose_after_step_failure(
         &mut self,
         _step: &WorkflowStep,
-        _exit: &ContainerExitInfo,
+        _exit: &AgentExitInfo,
     ) -> Result<StepFailureChoice, EngineError> {
         Ok(StepFailureChoice::Abort)
     }
@@ -987,7 +987,7 @@ impl InitFrontend for ApiDispatchFrontend {
             message: format!("Init step '{step}': {status:?}"),
         });
     }
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
             line_buffer_stdout: String::new(),
@@ -1021,7 +1021,7 @@ impl ReadyFrontend for ApiDispatchFrontend {
             message: format!("Ready step '{step}': {status:?}"),
         });
     }
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
             line_buffer_stdout: String::new(),
@@ -1211,11 +1211,11 @@ mod tests {
 
     #[tokio::test]
     async fn drop_emits_done_sentinel_when_emit_done_was_not_called() {
-        use crate::engine::container::frontend::ContainerFrontend;
+        use crate::engine::agent_runtime::frontend::AgentFrontend;
         let bus = crate::frontend::api::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = fe.take_container_io();
+        let io = fe.take_io();
         io.stdout.send(b"a line\n".to_vec()).unwrap();
         drop(io);
         // Give the drain task a moment to process.
@@ -1234,11 +1234,11 @@ mod tests {
 
     #[tokio::test]
     async fn drop_flushes_partial_stdout_line_before_done() {
-        use crate::engine::container::frontend::ContainerFrontend;
+        use crate::engine::agent_runtime::frontend::AgentFrontend;
         let bus = crate::frontend::api::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = fe.take_container_io();
+        let io = fe.take_io();
         // No trailing newline — the line lives in the drain task buffer until
         // the sender is dropped and the drain flushes.
         io.stdout.send(b"trailing partial".to_vec()).unwrap();
@@ -1259,11 +1259,11 @@ mod tests {
 
     #[tokio::test]
     async fn drop_flushes_partial_stderr_line_before_done() {
-        use crate::engine::container::frontend::ContainerFrontend;
+        use crate::engine::agent_runtime::frontend::AgentFrontend;
         let bus = crate::frontend::api::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = fe.take_container_io();
+        let io = fe.take_io();
         io.stderr.send(b"err partial".to_vec()).unwrap();
         drop(io);
         // Give the drain task a moment to process and flush.

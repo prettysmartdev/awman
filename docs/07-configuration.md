@@ -83,7 +83,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 |-------|------|---------|-------------|
 | `default_agent` | string | `"claude"` | Default agent when no per-repo agent is configured: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, or `cline` |
 | `terminal_scrollback_lines` | integer | `10000` | Default scrollback lines for all repos unless overridden |
-| `runtime` | string | `"docker"` | Container runtime: `"docker"` or `"apple-containers"` (macOS 26+ only) |
+| `runtime` | string | `"docker"` | Agent runtime environment: `"docker"` (container), `"apple-containers"` (microVM, macOS 26+ only), or `"docker-sbx-experimental"` (Docker Sandbox, experimental). See [Runtimes](#runtimes) |
 | `base_image` | string | (from `make build`) | Default container image tag for workflow setup/teardown phases. Overridden by per-repo `base_image` if set. Only override if you have a custom base image. See [Workflows — Setup and Teardown](04-workflows.md#setup-and-teardown-phases) |
 | `yoloDisallowedTools` | string array | `[]` | Global fallback list of tools forbidden when `--yolo` is active |
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. See [`envPassthrough`](#envpassthrough) |
@@ -97,6 +97,66 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `remote.savedDirs` | string array | `[]` | Absolute paths (on the remote host) shown in the TUI saved-dir picker for `remote session start`. See [Remote Mode](10-remote-mode.md#configuration) |
 
 **Note:** `runtime` is a global (machine-level) setting only. It is not available in the per-repo config — container runtime is a property of the machine, not the project.
+
+---
+
+## Runtimes
+
+awman supports two classes of agent runtime environments: **container-class** (fast, traditional container orchestration) and **sandbox-class** (persistent microVMs with declarative kit templates).
+
+### Container-class runtimes
+
+**`docker` (default)**
+
+Standard Docker. Agents run in ephemeral Docker containers. Each agent session pulls an image from your project's Dockerfile, spins up a container with bind-mounts and environment variables, and tears down the container when the session ends.
+
+- **Availability:** Linux, macOS (Intel and Apple Silicon), Windows
+- **Performance:** Fast startup and teardown; suited for short-lived exploration
+- **Lifecycle:** Containers are cleaned up immediately after the agent exits
+- **Configuration:** `"runtime": "docker"`
+
+**`apple-containers` (macOS only)**
+
+macOS native container runtime for macOS 26+. Agents run in isolated containers managed by macOS's native virtualization APIs.
+
+- **Availability:** macOS 26+
+- **Performance:** Native to macOS; minimal overhead vs. Docker Desktop
+- **Lifecycle:** Containers are cleaned up immediately after the agent exits
+- **Platform requirement:** arm64 (Apple Silicon) or Intel x86_64
+- **Configuration:** `"runtime": "apple-containers"`
+
+### Sandbox-class runtimes
+
+Sandbox runtimes use persistent microVMs with declarative configuration. Each sandbox is defined by a kit (a collection of pre-installed languages, tools, and agent configurations). Sandboxes persist across sessions and can be restarted, allowing for more sophisticated stateful workflows.
+
+**`docker-sbx-experimental` (Experimental)**
+
+Docker Sandboxes (experimental) — persistent microVM runtime using Docker's sandbox technology.
+
+- **Availability:** Linux (x86_64), macOS (arm64 only)
+- **Status:** **Experimental — not yet fully functional**. Configuration is recognized but operations will return "not implemented" errors while core infrastructure is in development. Set this in advance to verify your environment is ready; full functionality is coming in a future release.
+- **Lifecycle:** VMs persist across sessions until explicitly removed; can be restarted or paused
+- **Kit-based:** Agents are configured via declarative kit templates rather than Dockerfiles
+- **Configuration:** `"runtime": "docker-sbx-experimental"`
+- **Host requirements:** Docker Sandbox binary installed and authenticated
+
+If you set `runtime: "docker-sbx-experimental"` but the implementation is not yet available, any agent operation will fail with a clear error message naming the feature as experimental and pointing to future releases.
+
+### Switching runtimes
+
+To change your runtime, update the global config:
+
+```sh
+awman config set --global runtime docker           # Switch to Docker
+awman config set --global runtime apple-containers # Switch to Apple Containers (macOS only)
+awman config set --global runtime docker-sbx-experimental  # Try Docker Sandboxes (experimental)
+```
+
+View the current runtime:
+
+```sh
+awman config get runtime
+```
 
 ---
 

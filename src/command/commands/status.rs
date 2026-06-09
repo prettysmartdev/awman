@@ -165,7 +165,7 @@ impl Command for StatusCommand {
         let mut tick: u32 = 0;
 
         loop {
-            let handles = match self.engines.runtime.list_running_sync() {
+            let handles = match self.engines.runtime.list_running_all() {
                 Ok(h) => h,
                 Err(e) => {
                     let err = CommandError::from(e);

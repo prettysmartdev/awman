@@ -13,7 +13,7 @@ use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind};
 use crate::command::dispatch::parsed_input::{ArgValue, FlagValue, ParsedCommandBoxInput};
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
-use crate::engine::container::frontend::ContainerIo;
+use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
@@ -31,7 +31,7 @@ use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 /// blocking strategy.
 ///
 /// Container I/O channels (stdout/stdin/resize) are bundled into a
-/// `ContainerIo` and detached lazily by the engine via `take_container_io`.
+/// `AgentIo` and detached lazily by the engine via `take_io`.
 /// The TUI populates these channels from `App::spawn_command`; the engine's
 /// container backend drains them against a real PTY master.
 pub struct TuiCommandFrontend {
@@ -40,7 +40,7 @@ pub struct TuiCommandFrontend {
     pub(crate) pty_active: bool,
     pub(crate) dialog_tx: std::sync::mpsc::Sender<DialogRequest>,
     pub(crate) dialog_rx: Mutex<std::sync::mpsc::Receiver<DialogResponse>>,
-    pub(crate) container_io: Option<ContainerIo>,
+    pub(crate) container_io: Option<AgentIo>,
     pub(crate) status_log: SharedStatusLog,
     pub(crate) workflow_view: SharedWorkflowViewState,
     pub(crate) yolo_state: SharedYoloState,
@@ -48,7 +48,7 @@ pub struct TuiCommandFrontend {
     pub(crate) pty_reset_flag: SharedPtyResetFlag,
     pub(crate) container_name_shared: SharedContainerName,
     /// Persistent stdout sender — kept alive across workflow steps so each
-    /// new `ContainerIo` can send output to the same TUI event loop receiver.
+    /// new `AgentIo` can send output to the same TUI event loop receiver.
     pub(crate) stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Shared slot for the stdin sender. When a new workflow step creates
     /// fresh stdin channels, the new sender is placed here so the TUI event
@@ -86,7 +86,7 @@ impl TuiCommandFrontend {
         status_log: SharedStatusLog,
         dialog_tx: std::sync::mpsc::Sender<DialogRequest>,
         dialog_rx: std::sync::mpsc::Receiver<DialogResponse>,
-        container_io: ContainerIo,
+        container_io: AgentIo,
         workflow_view: SharedWorkflowViewState,
         yolo_state: SharedYoloState,
         yolo_cancel_flag: SharedYoloCancelFlag,
@@ -125,7 +125,7 @@ impl TuiCommandFrontend {
         }
     }
 
-    /// Recreate `ContainerIo` channels for a new workflow step. The stdout
+    /// Recreate `AgentIo` channels for a new workflow step. The stdout
     /// sender is reused (same TUI event loop receiver), but stdin and resize
     /// get fresh channels. The new senders are published via shared slots so
     /// the TUI event loop can swap to them.
@@ -147,7 +147,7 @@ impl TuiCommandFrontend {
             *guard = Some(resize_tx);
         }
 
-        self.container_io = Some(ContainerIo {
+        self.container_io = Some(AgentIo {
             stdout: self.stdout_tx.clone(),
             stderr: self.stdout_tx.clone(),
             stdin_tx: stdin_tx_for_engine,

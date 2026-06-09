@@ -465,7 +465,10 @@ pub fn resolve_context_overlays(
     workflow_invocation_id: Option<uuid::Uuid>,
     workflow_step_info: Option<&crate::engine::context_prompt::WorkflowStepInfo>,
     sink: &mut dyn crate::engine::message::UserMessageSink,
-) -> Result<(Vec<crate::engine::overlay::ContextOverlay>, Option<String>), crate::command::error::CommandError> {
+) -> Result<
+    (Vec<crate::engine::overlay::ContextOverlay>, Option<String>),
+    crate::command::error::CommandError,
+> {
     use crate::data::fs::ContextDirResolver;
     use crate::engine::agent::agent_matrix::{matrix_for, SystemPromptMode};
     use crate::engine::context_prompt::ContextPromptBuilder;
@@ -476,8 +479,9 @@ pub fn resolve_context_overlays(
         return Ok((vec![], None));
     }
 
-    let resolver = ContextDirResolver::from_process_env()
-        .map_err(|e| crate::command::error::CommandError::Other(format!("context dir resolver: {e}")))?;
+    let resolver = ContextDirResolver::from_process_env().map_err(|e| {
+        crate::command::error::CommandError::Other(format!("context dir resolver: {e}"))
+    })?;
 
     let mut overlays = Vec::new();
     let mut builder = ContextPromptBuilder::new();
@@ -501,8 +505,7 @@ pub fn resolve_context_overlays(
                 (p, std::path::PathBuf::from("/awman/context/repo"))
             }
             ContextScope::Workflow => {
-                let uuid = workflow_invocation_id
-                    .unwrap_or_else(|| session.id().as_uuid());
+                let uuid = workflow_invocation_id.unwrap_or_else(|| session.id().as_uuid());
                 let p = resolver.workflow_dir(uuid);
                 (p, std::path::PathBuf::from("/awman/context/workflow"))
             }
@@ -511,7 +514,10 @@ pub fn resolve_context_overlays(
         if let Err(e) = ContextDirResolver::ensure_exists(&host_path) {
             sink.write_message(UserMessage {
                 level: MessageLevel::Warning,
-                text: format!("context overlay: failed to create directory {}: {e}", host_path.display()),
+                text: format!(
+                    "context overlay: failed to create directory {}: {e}",
+                    host_path.display()
+                ),
             });
             continue;
         }
@@ -870,9 +876,13 @@ mod collect_overlay_specs_tests {
         let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
-        let collected =
-            collect_all_overlay_specs(&session, vec![TypedOverlay::Skill(SkillSpec::All)], None, None)
-                .unwrap();
+        let collected = collect_all_overlay_specs(
+            &session,
+            vec![TypedOverlay::Skill(SkillSpec::All)],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             collected.include_all_skills,
             "skills must be enabled from CLI TypedOverlay::Skill(All)"
@@ -984,7 +994,8 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["skill(bar)".to_string()];
-        let collected = collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
+        let collected =
+            collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
 
         assert!(
             !collected.include_all_skills,
@@ -1057,7 +1068,8 @@ mod collect_overlay_specs_tests {
         let ssh_typed = parse_overlay_list("ssh()").unwrap().remove(0);
         let step_overlays = vec!["ssh()".to_string()];
         let collected =
-            collect_all_overlay_specs(&session, vec![ssh_typed], None, Some(&step_overlays)).unwrap();
+            collect_all_overlay_specs(&session, vec![ssh_typed], None, Some(&step_overlays))
+                .unwrap();
 
         let ssh_entries: Vec<_> = collected
             .directories
@@ -1092,7 +1104,8 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(MY_TOKEN)".to_string()];
-        let collected = collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
+        let collected =
+            collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
 
         let count = collected
             .env_passthrough
@@ -1121,7 +1134,8 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(STEP_VAR)".to_string()];
-        let collected = collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
+        let collected =
+            collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
 
         assert!(
             collected.env_passthrough.contains(&"REPO_VAR".to_string()),
@@ -1302,7 +1316,11 @@ mod context_parser_tests {
 
     fn parse_context(input: &str) -> Result<(ContextScope, OverlayPermission), String> {
         let result = parse_overlay_list(input)?;
-        assert_eq!(result.len(), 1, "expected exactly 1 overlay; got {result:?}");
+        assert_eq!(
+            result.len(),
+            1,
+            "expected exactly 1 overlay; got {result:?}"
+        );
         match &result[0] {
             TypedOverlay::Context(spec) => Ok((spec.scope, spec.permission)),
             other => Err(format!("expected TypedOverlay::Context, got {other:?}")),

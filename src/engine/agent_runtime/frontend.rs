@@ -1,4 +1,8 @@
-//! `ContainerFrontend` trait — defined by Layer 1, implemented by Layer 3.
+//! `AgentFrontend` trait — defined by Layer 1, implemented by Layer 3.
+//!
+//! Shared by both runtime tiers (container-class and sandbox-class): the
+//! engine calls back into the frontend for PTY size, stdin, and status
+//! reporting regardless of the underlying isolation paradigm.
 
 use std::time::Duration;
 
@@ -7,9 +11,9 @@ use async_trait::async_trait;
 use crate::engine::container::timing::{DEFAULT_GRACE_TIMEOUT, DEFAULT_STUCK_TIMEOUT};
 use crate::engine::message::UserMessageSink;
 
-/// What stage a container execution is in.
+/// What stage an agent execution is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContainerStatus {
+pub enum AgentStatus {
     Building,
     Pulling,
     Starting,
@@ -19,10 +23,10 @@ pub enum ContainerStatus {
     Failed(String),
 }
 
-/// A unit of progress reported during a long-running container action
+/// A unit of progress reported during a long-running runtime action
 /// (image pull, build step, layer extract).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerProgress {
+pub struct AgentProgress {
     pub stage: String,
     pub message: String,
     pub current: Option<u64>,
@@ -30,25 +34,25 @@ pub struct ContainerProgress {
 }
 
 /// Byte-stream I/O channels detached from a frontend so the engine can
-/// bridge them to the container process.
+/// bridge them to the agent process.
 ///
-/// Every frontend must provide a `ContainerIo` via `take_container_io()`.
-/// The engine uses these channels exclusively for all container I/O:
+/// Every frontend must provide an `AgentIo` via `take_io()`.
+/// The engine uses these channels exclusively for all agent I/O:
 ///
 /// - **PTY path** (`resize`/`initial_size` are `Some`): the engine opens a
 ///   PTY via `portable-pty` and bridges it through these channels.
 /// - **Piped path** (`resize`/`initial_size` are `None`): the engine spawns
-///   the container with `Stdio::piped()` and bridges through these channels.
+///   the agent with `Stdio::piped()` and bridges through these channels.
 ///
 /// The stdin direction has both ends because the frontend needs a sender
 /// (for keystrokes) and the engine retains its own sender clone — used by
-/// `ContainerExecution::try_inject_stdin` to send a fresh prompt into a
-/// still-running container during workflow `ContinueInCurrentContainer`
+/// `AgentExecution::try_inject_stdin` to send a fresh prompt into a
+/// still-running agent during workflow `ContinueInCurrentContainer`
 /// advances.
-pub struct ContainerIo {
-    /// Engine sends container stdout bytes here.
+pub struct AgentIo {
+    /// Engine sends agent stdout bytes here.
     pub stdout: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// Engine sends container stderr bytes here.
+    /// Engine sends agent stderr bytes here.
     pub stderr: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Sender side of the stdin channel — engine retains a clone for
     /// `try_inject_stdin`; frontend also keeps its own clone for keystrokes.
@@ -60,7 +64,7 @@ pub struct ContainerIo {
     /// PTY resize requests from the frontend. `Some` for interactive
     /// frontends (TUI, CLI with TTY), `None` for non-interactive (CLI
     /// `--non-interactive`, API). When `None`, the engine uses
-    /// `Stdio::piped()` for the container process.
+    /// `Stdio::piped()` for the agent process.
     pub resize: Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>>,
     /// Initial PTY size at spawn time. `Some` for interactive frontends,
     /// `None` for non-interactive. When `None`, the engine uses
@@ -68,23 +72,23 @@ pub struct ContainerIo {
     pub initial_size: Option<(u16, u16)>,
 }
 
-/// Abstract container-side I/O. Implementations live in Layer 3 (CLI binds
+/// Abstract agent-side I/O. Implementations live in Layer 3 (CLI binds
 /// stdio, TUI binds a PTY, API binds an SSE/WebSocket stream).
 ///
-/// The engine exclusively uses the channels from `take_container_io()` for
-/// all container I/O — stdout, stderr, and stdin.
+/// The engine exclusively uses the channels from `take_io()` for
+/// all agent I/O — stdout, stderr, and stdin.
 #[async_trait]
-pub trait ContainerFrontend: UserMessageSink + Send {
-    fn report_status(&mut self, status: ContainerStatus);
-    fn report_progress(&mut self, progress: ContainerProgress);
+pub trait AgentFrontend: UserMessageSink + Send {
+    fn report_status(&mut self, status: AgentStatus);
+    fn report_progress(&mut self, progress: AgentProgress);
 
     /// Detach the byte-stream I/O channels for engine bridging.
     ///
     /// The engine takes ownership of these channels in `run_with_frontend`
     /// and spawns reader/writer tasks. Every frontend must implement this.
-    fn take_container_io(&mut self) -> ContainerIo;
+    fn take_io(&mut self) -> AgentIo;
 
-    /// Startup-grace timeout: how long the container has to emit its first
+    /// Startup-grace timeout: how long the agent has to emit its first
     /// byte of output before it is considered failed-to-start and killed.
     /// The regular stuck timer does not begin until the first byte is seen
     /// and the grace timer has been discarded.
@@ -96,7 +100,7 @@ pub trait ContainerFrontend: UserMessageSink + Send {
         DEFAULT_GRACE_TIMEOUT
     }
 
-    /// Stuck timeout: how long the container can go without producing any
+    /// Stuck timeout: how long the agent can go without producing any
     /// further output (after its first byte) before the engine publishes
     /// `StuckEvent::Stuck`. CLI, TUI, and API all use 30s; only the
     /// grace timeout differs between modes.

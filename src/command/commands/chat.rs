@@ -41,7 +41,7 @@ pub trait ChatCommandFrontend:
     + MountScopeFrontend
     + AgentSetupFrontend
     + AgentAuthFrontend
-    + crate::command::commands::agent_setup::HasContainerFrontend
+    + crate::command::commands::agent_setup::HasAgentFrontend
     + Send
     + Sync
 {
@@ -89,6 +89,13 @@ impl Command for ChatCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        // Agent execution under a sandbox-class runtime lands in WI 0090;
+        // until then the stub surfaces NotImplemented instead of panicking
+        // or silently falling back to Docker.
+        self.engines
+            .require_container_runtime()
+            .map_err(CommandError::from)?;
+
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
         let session = self.session;
         let agent = match resolve_agent(&self.flags.agent, &session) {
@@ -260,7 +267,9 @@ impl Command for ChatCommand {
         let _ = &mut run_opts; // silence unused-mut lint when no fields mutate later
 
         // 7. Build the container instance.
-        let instance = match self.engines.runtime.build(options) {
+        let instance = match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
+            .and_then(|o| self.engines.runtime.build(o))
+        {
             Ok(i) => i,
             Err(e) => {
                 frontend.write_message(UserMessage {

@@ -145,9 +145,7 @@ fn exec_prompt_context_unknown_scope_rejected_with_parse_error() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("notascope")
-            || stderr.contains("unknown")
-            || stderr.contains("scope"),
+        stderr.contains("notascope") || stderr.contains("unknown") || stderr.contains("scope"),
         "rejection must name the bad scope or say 'unknown'; stderr: {stderr}"
     );
 }

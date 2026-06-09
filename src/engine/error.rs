@@ -36,6 +36,15 @@ pub enum EngineError {
     #[error("container backend error: {0}")]
     Container(String),
 
+    #[error("sandbox backend error: {0}")]
+    Sandbox(String),
+
+    #[error(
+        "runtime '{runtime}' was given {got}-paradigm options; \
+         this indicates a Layer 2 dispatch bug"
+    )]
+    OptionVariantMismatch { runtime: String, got: &'static str },
+
     #[error("image not found: '{image}'. Run `make build` or build the base image manually.")]
     ContainerImageNotFound { image: String },
 

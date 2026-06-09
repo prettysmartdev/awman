@@ -26,7 +26,7 @@ use crate::command::commands::{
 use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::message::{UserMessage, UserMessageSink};
 
 use super::user_message::CliUserMessageQueue;
@@ -416,7 +416,7 @@ impl SpecsCommandFrontend for CliFrontend {
         require_multiline_input("spec description?")
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(super::per_command::CliContainerProxy)
     }
 

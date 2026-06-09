@@ -1,11 +1,11 @@
-//! `AgentSetupFrontend` and `HasContainerFrontend` impls for the TUI.
+//! `AgentSetupFrontend` and `HasAgentFrontend` impls for the TUI.
 
 use crate::command::commands::agent_setup::{
-    AgentSetupDecision, AgentSetupFrontend, HasContainerFrontend,
+    AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::message::UserMessageSink;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{AgentSetupState, DialogRequest, DialogResponse};
@@ -42,12 +42,12 @@ impl AgentSetupFrontend for TuiCommandFrontend {
     }
 }
 
-impl HasContainerFrontend for TuiCommandFrontend {
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+impl HasAgentFrontend for TuiCommandFrontend {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(super::TuiContainerProxy::new(self.status_log.clone()))
     }
 
-    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
         // Hand the PTY-bridge channels to the engine so the container's PTY
         // master is wired directly to the TUI's vt100 parser. After this the
         // engine drives all stdout/stdin/resize traffic; the TuiCommandFrontend

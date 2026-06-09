@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use awman::engine::container::instance::StuckEvent;
+use awman::engine::agent_runtime::execution::StuckEvent;
 
 /// Subscribers picked up via the engine's `set_stuck_sender` pattern see
 /// both `Stuck` and `Unstuck` events sent on the broadcast channel. This
@@ -77,7 +77,7 @@ async fn broadcast_sender_fans_out_to_workflow_engine_and_tui() {
 }
 
 /// When the only `Arc<Sender>` is dropped — which models the engine releasing
-/// `ContainerExecution` after a step ends — `recv()` on existing subscribers
+/// `AgentExecution` after a step ends — `recv()` on existing subscribers
 /// returns `Err(Closed)`. The workflow engine's `select!` arm interprets this
 /// as a no-op (see `WorkflowEngine::recv_stuck`).
 #[tokio::test]

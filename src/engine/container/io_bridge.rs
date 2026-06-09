@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::container::frontend::ContainerIo;
-use crate::engine::container::instance::StuckEvent;
+use crate::engine::agent_runtime::execution::StuckEvent;
+use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 
 /// Shared last-activity timestamp. Updated by reader threads on every byte
@@ -48,7 +48,7 @@ pub(crate) struct BridgeConfig {
 pub(crate) struct BridgeResult {
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// Broadcast sender for stuck events — stored in `ContainerExecution`.
+    /// Broadcast sender for stuck events — stored in `AgentExecution`.
     pub stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
 }
 
@@ -60,10 +60,10 @@ fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
 }
 
 /// Spawn the stuck detector task. Returns the broadcast sender (caller
-/// stores it in `ContainerExecution`).
+/// stores it in `AgentExecution`).
 ///
 /// The task holds only a `Weak` to the sender so it can detect when its
-/// owning `ContainerExecution` is dropped: the next `upgrade()` returns
+/// owning `AgentExecution` is dropped: the next `upgrade()` returns
 /// `None` and the task exits. Without this the task would leak for the
 /// lifetime of the process. Transient `SendError` (no subscribers right
 /// now) is ignored — broadcast semantics allow a subscriber to appear
@@ -157,7 +157,7 @@ fn spawn_stuck_detector(
     stuck_tx
 }
 
-/// Bridge a PTY master to the `ContainerIo` channels.
+/// Bridge a PTY master to the `AgentIo` channels.
 ///
 /// Spawns:
 /// - Reader thread: PTY master → `io.stdout` (activity tracked)
@@ -169,7 +169,7 @@ fn spawn_stuck_detector(
 type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
 
 pub(crate) fn bridge_pty(
-    io: ContainerIo,
+    io: AgentIo,
     pair: portable_pty::PtyPair,
     config: BridgeConfig,
 ) -> Result<(PtyMaster, BridgeResult), EngineError> {
@@ -263,7 +263,7 @@ pub(crate) fn bridge_pty(
     ))
 }
 
-/// Bridge a piped child process to the `ContainerIo` channels.
+/// Bridge a piped child process to the `AgentIo` channels.
 ///
 /// Spawns:
 /// - Reader thread for child stdout → `io.stdout` (activity tracked)
@@ -272,7 +272,7 @@ pub(crate) fn bridge_pty(
 ///
 /// The child's stdout/stderr/stdin pipes are taken from the `Child`.
 pub(crate) fn bridge_piped(
-    io: ContainerIo,
+    io: AgentIo,
     child: &mut std::process::Child,
     config: BridgeConfig,
 ) -> BridgeResult {
@@ -668,14 +668,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bridge_piped_stdout_bytes_reach_frontend_sink() {
-        use crate::engine::container::frontend::ContainerIo;
+        use crate::engine::agent_runtime::frontend::AgentIo;
         use std::process::{Command, Stdio};
 
         let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let io = ContainerIo {
+        let io = AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -724,14 +724,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bridge_piped_stderr_bytes_reach_frontend_stderr_sink() {
-        use crate::engine::container::frontend::ContainerIo;
+        use crate::engine::agent_runtime::frontend::AgentIo;
         use std::process::{Command, Stdio};
 
         let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let io = ContainerIo {
+        let io = AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -776,7 +776,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bridge_piped_stdin_writes_reach_child() {
-        use crate::engine::container::frontend::ContainerIo;
+        use crate::engine::agent_runtime::frontend::AgentIo;
         use std::process::{Command, Stdio};
 
         let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -787,7 +787,7 @@ mod tests {
         // see these bytes on its first `recv().await`.
         stdin_tx.send(b"round-trip payload\n".to_vec()).unwrap();
 
-        let io = ContainerIo {
+        let io = AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -849,7 +849,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bridge_piped_keeps_draining_after_stdout_sink_drops() {
-        use crate::engine::container::frontend::ContainerIo;
+        use crate::engine::agent_runtime::frontend::AgentIo;
         use std::process::{Command, Stdio};
 
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -859,7 +859,7 @@ mod tests {
         // Drop the receiver immediately — every send will return SendError.
         drop(stdout_rx);
 
-        let io = ContainerIo {
+        let io = AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,

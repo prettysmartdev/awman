@@ -203,10 +203,7 @@ impl ReadyEngine {
                 } else {
                     ReadyPhase::Failed(ReadyFailure {
                         phase: "AwaitingDockerfileDecision".into(),
-                        message: format!(
-                            "user declined to create {}",
-                            configured_path.display()
-                        ),
+                        message: format!("user declined to create {}", configured_path.display()),
                     })
                 }
             }
@@ -229,8 +226,9 @@ impl ReadyEngine {
                 // run_to_completion to surface a summary rather than aborting.
                 if !self.container_runtime.is_available() {
                     let runtime = self.container_runtime.display_name();
-                    let msg =
-                        format!("{runtime} is not available. Ensure {runtime} is running and retry.");
+                    let msg = format!(
+                        "{runtime} is not available. Ensure {runtime} is running and retry."
+                    );
                     self.summary.base_image = StepStatus::Failed(msg.clone());
                     frontend.report_step_status("Build base image", StepStatus::Failed(msg));
                     // Bypass the `self.phase = next` assignment below to short-
@@ -287,7 +285,10 @@ impl ReadyEngine {
                 // failed and continue, so the setup task exits promptly in
                 // sandboxed test environments.
                 if !self.container_runtime.is_available() {
-                    let msg = format!("{} is not available.", self.container_runtime.display_name());
+                    let msg = format!(
+                        "{} is not available.",
+                        self.container_runtime.display_name()
+                    );
                     self.summary.agent_image = StepStatus::Failed(msg.clone());
                     frontend.report_step_status("Build agent image", StepStatus::Failed(msg));
                     return Ok({
@@ -563,7 +564,10 @@ impl ReadyEngine {
                         Err(e) => {
                             self.summary.audit = StepStatus::Failed(e.to_string());
                         }
-                        Ok(options) => match self.container_runtime.build(options) {
+                        Ok(options) => match crate::engine::container::options::ResolvedContainerOptions::resolve(options)
+                            .map_err(crate::engine::error::EngineError::from)
+                            .and_then(|o| self.container_runtime.build(o))
+                        {
                             Err(e) => {
                                 self.summary.audit = StepStatus::Failed(e.to_string());
                             }
@@ -720,9 +724,7 @@ mod tests {
 
     use super::*;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
-    use crate::engine::container::frontend::{
-        ContainerFrontend, ContainerProgress, ContainerStatus,
-    };
+    use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
     use crate::engine::error::EngineError;
     use crate::engine::message::{UserMessage, UserMessageSink};
     use crate::engine::overlay::OverlayEngine;
@@ -751,22 +753,22 @@ mod tests {
         }
     }
 
-    struct FakeContainerFrontend;
+    struct FakeRuntimeFrontend;
 
-    impl UserMessageSink for FakeContainerFrontend {
+    impl UserMessageSink for FakeRuntimeFrontend {
         fn write_message(&mut self, _msg: UserMessage) {}
         fn replay_queued(&mut self) {}
     }
 
     #[async_trait::async_trait]
-    impl ContainerFrontend for FakeContainerFrontend {
-        fn report_status(&mut self, _status: ContainerStatus) {}
-        fn report_progress(&mut self, _progress: ContainerProgress) {}
-        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    impl AgentFrontend for FakeRuntimeFrontend {
+        fn report_status(&mut self, _status: AgentStatus) {}
+        fn report_progress(&mut self, _progress: AgentProgress) {}
+        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
             let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            crate::engine::container::frontend::ContainerIo {
+            crate::engine::agent_runtime::frontend::AgentIo {
                 stdout: stdout_tx,
                 stderr: stderr_tx,
                 stdin_tx,
@@ -803,8 +805,8 @@ mod tests {
             self.statuses.push((step.to_string(), status));
         }
 
-        fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-            Box::new(FakeContainerFrontend)
+        fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+            Box::new(FakeRuntimeFrontend)
         }
 
         fn report_summary(&mut self, _summary: &ReadySummary) {}

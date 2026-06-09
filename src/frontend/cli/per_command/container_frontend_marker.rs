@@ -1,25 +1,23 @@
-//! `ContainerFrontend` impl for the CLI.
+//! `AgentFrontend` impl for the CLI.
 //!
-//! All container I/O flows through `ContainerIo` channels. The CLI
+//! All container I/O flows through `AgentIo` channels. The CLI
 //! constructs either interactive (PTY with raw mode) or non-interactive
 //! (piped, no PTY) channels depending on `self.non_interactive`.
 
 use async_trait::async_trait;
 use std::io::Write;
 
-use crate::engine::container::frontend::{
-    ContainerFrontend, ContainerIo, ContainerProgress, ContainerStatus,
-};
+use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 use crate::engine::message::{UserMessage, UserMessageSink};
 
 use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
 
 #[async_trait]
-impl ContainerFrontend for CliFrontend {
-    fn report_status(&mut self, _status: ContainerStatus) {}
-    fn report_progress(&mut self, _progress: ContainerProgress) {}
+impl AgentFrontend for CliFrontend {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
 
-    fn take_container_io(&mut self) -> ContainerIo {
+    fn take_io(&mut self) -> AgentIo {
         if self.non_interactive {
             self.take_non_interactive_io()
         } else {
@@ -31,10 +29,10 @@ impl ContainerFrontend for CliFrontend {
 impl CliFrontend {
     /// Non-interactive: piped stdout/stderr; the frontend keeps no stdin
     /// sender. The engine owns the single `stdin_tx` returned in
-    /// `ContainerIo`, writes the seeded prompt through it, then drops it so
+    /// `AgentIo`, writes the seeded prompt through it, then drops it so
     /// the writer task sees EOF (see `spawn_piped_docker` /
     /// `spawn_piped_apple`).
-    fn take_non_interactive_io(&mut self) -> ContainerIo {
+    fn take_non_interactive_io(&mut self) -> AgentIo {
         let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -55,7 +53,7 @@ impl CliFrontend {
             }
         });
 
-        ContainerIo {
+        AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -67,7 +65,7 @@ impl CliFrontend {
 
     /// Interactive: raw mode, PTY-bridged stdout/stderr, raw stdin reader,
     /// SIGWINCH-driven resize channel.
-    pub(crate) fn take_interactive_io(&mut self) -> ContainerIo {
+    pub(crate) fn take_interactive_io(&mut self) -> AgentIo {
         let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -128,7 +126,7 @@ impl CliFrontend {
             });
         }
 
-        ContainerIo {
+        AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -267,16 +265,16 @@ fn spawn_unix_stdin_reader(
 
 // ─── Standalone proxies used by InitFrontend / ReadyFrontend ────────────────
 
-/// Stand-alone `ContainerFrontend` returned by engines that need a
-/// `Box<dyn ContainerFrontend>` for a single container's lifetime
+/// Stand-alone `AgentFrontend` returned by engines that need a
+/// `Box<dyn AgentFrontend>` for a single container's lifetime
 /// (`InitFrontend::container_frontend`, etc.). Streams to host stdio.
 pub(crate) struct CliContainerProxy;
 
-/// Interactive variant: wraps a pre-built `ContainerIo` (with `initial_size`,
+/// Interactive variant: wraps a pre-built `AgentIo` (with `initial_size`,
 /// resize channel, and raw-mode stdin reader already wired) so the engine's
 /// container backend takes the PTY-bridged path instead of piped stdio.
 pub(crate) struct CliInteractiveContainerProxy {
-    pub(crate) container_io: Option<ContainerIo>,
+    pub(crate) container_io: Option<AgentIo>,
 }
 
 impl UserMessageSink for CliContainerProxy {
@@ -293,11 +291,11 @@ impl UserMessageSink for CliContainerProxy {
 }
 
 #[async_trait]
-impl ContainerFrontend for CliContainerProxy {
-    fn report_status(&mut self, _status: ContainerStatus) {}
-    fn report_progress(&mut self, _progress: ContainerProgress) {}
+impl AgentFrontend for CliContainerProxy {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
 
-    fn take_container_io(&mut self) -> ContainerIo {
+    fn take_io(&mut self) -> AgentIo {
         let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -320,7 +318,7 @@ impl ContainerFrontend for CliContainerProxy {
 
         // Engine owns the single `stdin_tx`; piped paths drop it after
         // seeding so the child sees stdin EOF.
-        ContainerIo {
+        AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -347,13 +345,13 @@ impl UserMessageSink for CliInteractiveContainerProxy {
 }
 
 #[async_trait]
-impl ContainerFrontend for CliInteractiveContainerProxy {
-    fn report_status(&mut self, _status: ContainerStatus) {}
-    fn report_progress(&mut self, _progress: ContainerProgress) {}
+impl AgentFrontend for CliInteractiveContainerProxy {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
 
-    fn take_container_io(&mut self) -> ContainerIo {
-        self.container_io.take().expect(
-            "CliInteractiveContainerProxy::take_container_io called but no ContainerIo available",
-        )
+    fn take_io(&mut self) -> AgentIo {
+        self.container_io
+            .take()
+            .expect("CliInteractiveContainerProxy::take_io called but no AgentIo available")
     }
 }

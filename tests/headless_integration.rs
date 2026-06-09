@@ -10,7 +10,7 @@ use awman::commands::headless::auth;
 use awman::commands::headless::db;
 use awman::commands::headless::server::{AppState, AuthMode, build_router};
 use awman::runtime::{
-    AgentRuntime, ContainerStats, HostSettings, StoppedContainerInfo,
+    AgentRuntime, AgentStats, HostSettings, StoppedContainerInfo,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -131,7 +131,7 @@ impl AgentRuntime for MockRuntime {
     fn get_container_workspace_mount(&self, _container_name: &str) -> Option<String> {
         None
     }
-    fn query_container_stats(&self, _name: &str) -> Option<ContainerStats> {
+    fn query_container_stats(&self, _name: &str) -> Option<AgentStats> {
         None
     }
     fn build_run_args_pty(

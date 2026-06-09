@@ -1,64 +1,63 @@
-//! `ContainerRuntime` — the typed factory for `ContainerInstance` builds.
+//! `ContainerRuntime` — the container-class `AgentRuntimeEngine` impl.
 //!
-//! Holds a `Box<dyn ContainerBackend>` chosen by `detect`. The concrete
-//! backend is invisible outside this module.
+//! Holds a `Box<dyn ContainerBackend>` chosen by the `docker()` / `apple()`
+//! constructors (selection between runtimes happens in
+//! `agent_runtime::detect`). The concrete backend is invisible outside this
+//! module.
+//!
+//! Container-paradigm-specific operations — `build_image`, `image_exists`,
+//! `image_home_dir`, `start_background` — are inherent methods only; they
+//! deliberately do NOT appear on the `AgentRuntimeEngine` trait. Code that
+//! needs them must hold a typed `Arc<ContainerRuntime>`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::data::config::global::GlobalConfig;
-use crate::data::session::{ContainerHandle, Session};
+use crate::data::session::{AgentHandle, Session};
+use crate::engine::agent_runtime::{
+    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ResolvedAgentOptions,
+};
 use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
-use crate::engine::container::instance::{ContainerInstance, ContainerStats};
-use crate::engine::container::options::{ContainerOption, OverlaySpec, ResolvedContainerOptions};
+use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
+
+/// Capabilities shared by container-class backends (Docker, Apple
+/// Containers): image-based, ephemeral, arbitrary mounts/env, label-based
+/// session attribution.
+static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
+    arbitrary_env_vars: true,
+    arbitrary_host_mounts: true,
+    cpu_limits: true,
+    per_resource_stats: true,
+    persistent_lifecycle: false,
+    kit_declarative: false,
+    dind: DindSupport::OnRequest,
+    host_paths_visible: true,
+    session_label_supported: true,
+};
 
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
 }
 
 impl ContainerRuntime {
-    /// Inspect `global_config` and the host environment to select the correct
-    /// backend (Docker by default, Apple Containers when configured + macOS).
-    pub fn detect(global_config: &GlobalConfig) -> Result<Self, EngineError> {
-        let runtime_name = global_config
-            .runtime
-            .as_deref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
-        let chosen = match runtime_name {
-            Some("docker") | None => Backend::Docker,
-            Some("apple-containers") => {
-                if cfg!(target_os = "macos") {
-                    Backend::Apple
-                } else {
-                    return Err(EngineError::BackendUnsupportedOnPlatform {
-                        backend: "apple-containers".into(),
-                        platform: std::env::consts::OS.into(),
-                    });
-                }
-            }
-            Some(other) => {
-                tracing::warn!(runtime = other, "unknown runtime, falling back to Docker");
-                Backend::Docker
-            }
-        };
-        let backend: Arc<dyn ContainerBackend> = match chosen {
-            Backend::Docker => Arc::new(DockerBackend::new()),
-            Backend::Apple => Arc::new(AppleBackend::new()),
-        };
-        Ok(Self { backend })
-    }
-
-    /// Construct directly with a Docker backend (escape hatch for tests
-    /// and code paths that have already resolved the backend).
+    /// Construct with the Docker backend.
     pub fn docker() -> Self {
         Self {
             backend: Arc::new(DockerBackend::new()),
+        }
+    }
+
+    /// Construct with the Apple Containers backend. The macOS platform guard
+    /// lives in `agent_runtime::detect`; constructing this directly on a
+    /// non-mac host yields a runtime whose probes simply fail.
+    pub fn apple() -> Self {
+        Self {
+            backend: Arc::new(AppleBackend::new()),
         }
     }
 
@@ -76,20 +75,20 @@ impl ContainerRuntime {
         }
     }
 
-    /// Build a fully-configured `ContainerInstance` from the given options.
-    pub fn build(
-        &self,
-        options: impl IntoIterator<Item = ContainerOption>,
-    ) -> Result<Box<dyn ContainerInstance>, EngineError> {
-        let resolved = ResolvedContainerOptions::resolve(options).map_err(|e| match e {
-            crate::engine::container::options::ResolveError::Conflict(msg) => {
-                EngineError::ConflictingOptions(msg)
-            }
-        })?;
-        self.backend.build(resolved)
+    /// Static description of what container-class runtimes can do.
+    pub fn capabilities(&self) -> &Capabilities {
+        &CONTAINER_CAPABILITIES
     }
 
-    pub fn list_running(&self, session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
+    /// Build a fully-configured `AgentInstance` from pre-resolved options.
+    pub fn build(
+        &self,
+        options: ResolvedContainerOptions,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.backend.build(options)
+    }
+
+    pub fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
         self.backend.list_running(session)
     }
 
@@ -203,15 +202,15 @@ impl ContainerRuntime {
 
     /// List all running awman containers without requiring a session.
     /// Used by the TUI event loop for stats polling.
-    pub fn list_running_sync(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+    pub fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
         self.backend.list_running_all()
     }
 
-    pub fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
+    pub fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         self.backend.stats(handle)
     }
 
-    pub fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError> {
+    pub fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         self.backend.stop(handle)
     }
 
@@ -282,15 +281,68 @@ impl ContainerRuntime {
     }
 }
 
-enum Backend {
-    Docker,
-    Apple,
+impl AgentRuntimeEngine for ContainerRuntime {
+    fn runtime_name(&self) -> &'static str {
+        ContainerRuntime::runtime_name(self)
+    }
+
+    fn display_name(&self) -> &'static str {
+        ContainerRuntime::display_name(self)
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        ContainerRuntime::capabilities(self)
+    }
+
+    fn is_available(&self) -> bool {
+        ContainerRuntime::is_available(self)
+    }
+
+    fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
+        match options {
+            ResolvedAgentOptions::Container(opts) => ContainerRuntime::build(self, opts),
+            other => Err(EngineError::OptionVariantMismatch {
+                runtime: self.runtime_name().to_string(),
+                got: other.paradigm(),
+            }),
+        }
+    }
+
+    fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
+        ContainerRuntime::list_running(self, session)
+    }
+
+    fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        ContainerRuntime::list_running_all(self)
+    }
+
+    fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
+        ContainerRuntime::stats(self, handle)
+    }
+
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        ContainerRuntime::stop(self, handle)
+    }
+
+    fn exec_args(
+        &self,
+        agent_id: &str,
+        working_dir: &str,
+        entrypoint: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> Vec<String> {
+        ContainerRuntime::exec_args(self, agent_id, working_dir, entrypoint, env_vars)
+    }
+
+    fn cli_binary(&self) -> &'static str {
+        ContainerRuntime::cli_binary(self)
+    }
 }
 
 /// Wait for a child process with a timeout. Kills the process and returns
 /// `None` if the deadline elapses. Prevents unit tests and readiness checks
 /// from hanging indefinitely when the Docker daemon is unresponsive.
-pub(super) fn wait_with_timeout(
+pub(crate) fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
 ) -> Option<std::process::ExitStatus> {
@@ -314,52 +366,54 @@ pub(super) fn wait_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detect_default_picks_docker() {
-        let cfg = GlobalConfig::default();
-        let rt = ContainerRuntime::detect(&cfg).unwrap();
-        assert_eq!(rt.runtime_name(), "docker");
-    }
-
-    #[test]
-    fn detect_apple_on_non_mac_errors() {
-        let cfg = GlobalConfig {
-            runtime: Some("apple-containers".into()),
-            ..Default::default()
-        };
-        let res = ContainerRuntime::detect(&cfg);
-        if cfg!(target_os = "macos") {
-            assert!(res.is_ok());
-        } else {
-            match res {
-                Err(EngineError::BackendUnsupportedOnPlatform { .. }) => {}
-                Err(e) => panic!("expected BackendUnsupportedOnPlatform, got: {e:?}"),
-                Ok(_) => panic!("expected error on non-macOS"),
-            }
-        }
-    }
-
-    #[test]
-    fn detect_unknown_runtime_falls_back_to_docker() {
-        let cfg = GlobalConfig {
-            runtime: Some("blarg".into()),
-            ..Default::default()
-        };
-        // Unknown runtime should fall back to Docker with a warning, not error.
-        let rt = ContainerRuntime::detect(&cfg).unwrap();
-        assert_eq!(rt.runtime_name(), "docker");
-    }
+    use crate::engine::agent_runtime::ResolvedAgentOptions;
+    use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
     #[test]
     fn build_requires_image_option() {
         let rt = ContainerRuntime::docker();
-        match rt.build([]) {
+        let resolved = ResolvedContainerOptions::resolve([]).unwrap();
+        match rt.build(resolved) {
             Err(EngineError::MissingRequiredOption(opt)) => {
                 assert_eq!(opt, "Image");
             }
             Err(e) => panic!("expected MissingRequiredOption, got: {e:?}"),
             Ok(_) => panic!("expected error from missing Image option"),
+        }
+    }
+
+    /// The `AgentRuntimeEngine` trait impl must reject sandbox-paradigm options
+    /// with a clear `OptionVariantMismatch` error — never silently fall back
+    /// or panic.
+    #[test]
+    fn container_runtime_via_trait_rejects_sandbox_options() {
+        use crate::engine::agent_runtime::AgentRuntimeEngine;
+
+        let rt = ContainerRuntime::docker();
+        let opts = ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::default());
+        match <ContainerRuntime as AgentRuntimeEngine>::build(&rt, opts) {
+            Err(EngineError::OptionVariantMismatch { runtime, got }) => {
+                assert_eq!(runtime, "docker");
+                assert_eq!(got, "sandbox");
+            }
+            Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn apple_runtime_via_trait_rejects_sandbox_options() {
+        use crate::engine::agent_runtime::AgentRuntimeEngine;
+
+        let rt = ContainerRuntime::apple();
+        let opts = ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::default());
+        match <ContainerRuntime as AgentRuntimeEngine>::build(&rt, opts) {
+            Err(EngineError::OptionVariantMismatch { runtime, got }) => {
+                assert_eq!(runtime, "apple-containers");
+                assert_eq!(got, "sandbox");
+            }
+            Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 }

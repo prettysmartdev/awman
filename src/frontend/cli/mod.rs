@@ -217,6 +217,12 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             crate::engine::error::EngineError::ConflictingOptions(msg) => {
                 format!("conflicting container options: {msg}")
             }
+            crate::engine::error::EngineError::Sandbox(msg) => {
+                format!("sandbox backend error: {msg}")
+            }
+            crate::engine::error::EngineError::OptionVariantMismatch { runtime, got } => format!(
+                "runtime {runtime} was given {got}-paradigm options; this indicates a Layer 2 dispatch bug"
+            ),
             crate::engine::error::EngineError::MissingRequiredOption(opt) => {
                 format!("missing required container option: {opt}")
             }

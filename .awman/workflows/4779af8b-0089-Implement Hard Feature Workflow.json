@@ -1,0 +1,59 @@
+{
+  "schema_version": 4,
+  "invocation_id": "6faa949f-eb1c-4c0b-ad9e-2de7ceb9def2",
+  "workflow_name": "Implement Hard Feature Workflow",
+  "workflow_hash": "2df002df01268c92ace8c791b1b62e4da6cd2b90bb800fddd7674c0a6fe608f9",
+  "work_item": 89,
+  "step_states": {
+    "review": {
+      "Failed": {
+        "exit_code": 2,
+        "error_message": null
+      }
+    },
+    "implement": "Succeeded",
+    "tests": "Succeeded",
+    "docs": "Succeeded"
+  },
+  "completed_steps": [
+    "tests",
+    "implement",
+    "docs"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-06-09T17:45:01.875069Z",
+  "updated_at": "2026-06-09T18:57:10.655818Z",
+  "steps": [
+    {
+      "name": "implement",
+      "depends_on": [],
+      "model": "claude-fable-5"
+    },
+    {
+      "name": "tests",
+      "depends_on": [
+        "implement"
+      ]
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "implement"
+      ],
+      "model": "claude-haiku-4-5"
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "docs",
+        "tests"
+      ],
+      "agent": "codex"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": false,
+  "teardown_completed": false,
+  "setup_step_states": [],
+  "teardown_step_states": []
+}

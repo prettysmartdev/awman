@@ -21,16 +21,16 @@ fn make_issue(source_id: &str, title: &str) -> Issue {
 #[test]
 fn issue_overlay_temp_filename_format() {
     // Verifies: awman-issue-{pid}-{slug}.md
-    let issue = make_issue(
-        "https://github.com/owner/repo/issues/84",
-        "Test Title",
-    );
+    let issue = make_issue("https://github.com/owner/repo/issues/84", "Test Title");
     let slug = GithubIssueSource.title_slug(&issue);
     let pid = std::process::id();
     let filename = format!("awman-issue-{pid}-{slug}.md");
 
     // Check structure
-    assert!(filename.starts_with("awman-issue-"), "must start with 'awman-issue-'");
+    assert!(
+        filename.starts_with("awman-issue-"),
+        "must start with 'awman-issue-'"
+    );
     assert!(filename.ends_with(".md"), "must end with '.md'");
     assert!(filename.contains(&slug), "must contain the slug");
     // slug must be safe for filenames
@@ -45,10 +45,7 @@ fn issue_overlay_temp_filename_format() {
 #[test]
 fn issue_overlay_container_filename_format() {
     // Verifies: {NNNN}-{slug}.md where NNNN = numeric_id() zero-padded to 4 digits.
-    let issue = make_issue(
-        "https://github.com/owner/repo/issues/84",
-        "Test Title",
-    );
+    let issue = make_issue("https://github.com/owner/repo/issues/84", "Test Title");
     let slug = GithubIssueSource.title_slug(&issue);
     let number = issue.numeric_id().unwrap_or(0);
     let filename = format!("{number:04}-{slug}.md");
@@ -63,10 +60,7 @@ fn issue_overlay_container_filename_format() {
 #[test]
 fn issue_overlay_container_path_derivation() {
     // Container path = /workspace + relative_work_items_dir + container_filename.
-    let issue = make_issue(
-        "https://github.com/owner/repo/issues/84",
-        "Test Title",
-    );
+    let issue = make_issue("https://github.com/owner/repo/issues/84", "Test Title");
     let slug = GithubIssueSource.title_slug(&issue);
     let number = issue.numeric_id().unwrap_or(0);
     let container_filename = format!("{number:04}-{slug}.md");
@@ -104,7 +98,9 @@ fn issue_worktree_branch_name_uses_title_slug() {
     );
     // Branch must be git-ref-safe: only alphanumerics, hyphens, and forward slash.
     assert!(
-        branch.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/'),
+        branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '/'),
         "branch name must be git-ref-safe: {branch}"
     );
 }
@@ -118,7 +114,11 @@ fn issue_numeric_id_none_produces_work_item_number_zero() {
         "https://github.com/owner/repo/issues/not-a-number",
         "Some Title",
     );
-    assert_eq!(issue.numeric_id(), None, "non-numeric last segment must return None");
+    assert_eq!(
+        issue.numeric_id(),
+        None,
+        "non-numeric last segment must return None"
+    );
 
     let slug = GithubIssueSource.title_slug(&issue);
     let filename = format!("{:04}-{slug}.md", issue.numeric_id().unwrap_or(0));
@@ -135,10 +135,7 @@ fn issue_temp_file_write_and_cleanup() {
     // Simulates the exec workflow temp file lifecycle:
     // write → verify exists → delete → verify gone.
     let tmp = tempfile::tempdir().unwrap();
-    let issue = make_issue(
-        "https://github.com/owner/repo/issues/84",
-        "Test Title",
-    );
+    let issue = make_issue("https://github.com/owner/repo/issues/84", "Test Title");
     let slug = GithubIssueSource.title_slug(&issue);
     let pid = std::process::id();
     let temp_path = tmp.path().join(format!("awman-issue-{pid}-{slug}.md"));
@@ -148,8 +145,14 @@ fn issue_temp_file_write_and_cleanup() {
     assert!(temp_path.exists(), "temp file must exist after write");
 
     let read_back = std::fs::read_to_string(&temp_path).expect("read temp file");
-    assert_eq!(read_back, content, "read-back content must match written content");
+    assert_eq!(
+        read_back, content,
+        "read-back content must match written content"
+    );
 
     std::fs::remove_file(&temp_path).expect("delete temp file");
-    assert!(!temp_path.exists(), "temp file must not exist after deletion");
+    assert!(
+        !temp_path.exists(),
+        "temp file must not exist after deletion"
+    );
 }

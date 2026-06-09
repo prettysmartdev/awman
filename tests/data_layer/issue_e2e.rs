@@ -48,7 +48,11 @@ fn e2e_github_fetch_by_bare_integer_real_network() {
     assert!(
         result.is_ok(),
         "bare integer fetch failed: {}",
-        result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+        result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
     );
     let (issue, _) = result.unwrap();
     assert!(!issue.title.is_empty(), "issue title must not be empty");
@@ -71,13 +75,20 @@ fn e2e_github_fetch_by_short_form_real_network() {
     assert!(
         result.is_ok(),
         "short form fetch failed: {}",
-        result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+        result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
     );
     let (issue, source) = result.unwrap();
     assert!(!issue.title.is_empty(), "issue title must not be empty");
     assert_eq!(issue.provider, "GitHub");
     let slug = source.title_slug(&issue);
-    assert!(slug.starts_with("ghb"), "slug must start with GitHub provider prefix 'ghb'");
+    assert!(
+        slug.starts_with("ghb"),
+        "slug must start with GitHub provider prefix 'ghb'"
+    );
     assert!(slug.contains(&format!("{TEST_ISSUE_NUMBER}")));
     assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     let filename = format!("{:04}-{slug}.md", issue.numeric_id().unwrap_or(0));
@@ -95,10 +106,17 @@ fn e2e_github_fetch_by_full_url_real_network() {
     assert!(
         result.is_ok(),
         "full URL fetch failed: {}",
-        result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+        result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
     );
     let (issue, _) = result.unwrap();
-    assert_eq!(issue.source_id, TEST_ISSUE_URL, "source_id must be canonical URL");
+    assert_eq!(
+        issue.source_id, TEST_ISSUE_URL,
+        "source_id must be canonical URL"
+    );
 }
 
 #[test]

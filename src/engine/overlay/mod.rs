@@ -2006,9 +2006,9 @@ mod tests {
         };
 
         let specs = engine.build_overlays(&session, &request).unwrap();
-        let ctx_spec = specs.iter().find(|s| {
-            s.container_path == std::path::Path::new("/awman/context/global")
-        });
+        let ctx_spec = specs
+            .iter()
+            .find(|s| s.container_path == std::path::Path::new("/awman/context/global"));
         assert!(
             ctx_spec.is_some(),
             "build_overlays must produce an OverlaySpec with container path \
@@ -2027,7 +2027,12 @@ mod tests {
         let session_tmp = tempfile::tempdir().unwrap();
         let session = make_session(session_tmp.path());
 
-        let ctx_host = tmp.path().join("context").join("repo").join("org").join("myrepo");
+        let ctx_host = tmp
+            .path()
+            .join("context")
+            .join("repo")
+            .join("org")
+            .join("myrepo");
 
         let request = OverlayRequest {
             context_overlays: vec![ContextOverlay {

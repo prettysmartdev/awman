@@ -17,8 +17,8 @@ use crate::data::workflow_dag::WorkflowDag;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
-use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo, StuckEvent};
-use crate::engine::container::ContainerExec;
+use crate::engine::agent_runtime::background::AgentExec;
+use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo, StuckEvent};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -107,14 +107,14 @@ pub struct WorkflowEngine {
     container_factory: Box<dyn ContainerExecutionFactory>,
     git_engine: Arc<GitEngine>,
     overlay_engine: Arc<OverlayEngine>,
-    current_execution: Option<ContainerExecution>,
+    current_execution: Option<AgentExecution>,
     current_step_name: Option<String>,
     current_step_agent: Option<AgentName>,
     current_step_model: Option<String>,
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     yolo: bool,
     abort_on_failure_triggered: bool,
-    last_exit_info: Option<ContainerExitInfo>,
+    last_exit_info: Option<AgentExitInfo>,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
 }
 
@@ -353,7 +353,7 @@ impl WorkflowEngine {
                 let exit_info = self
                     .last_exit_info
                     .clone()
-                    .unwrap_or_else(|| ContainerExitInfo {
+                    .unwrap_or_else(|| AgentExitInfo {
                         exit_code,
                         signal: None,
                         started_at: chrono::Utc::now(),
@@ -524,7 +524,7 @@ impl WorkflowEngine {
     fn finalize_step(
         &mut self,
         step_name: &str,
-        exit: ContainerExitInfo,
+        exit: AgentExitInfo,
     ) -> Result<StepOutcome, EngineError> {
         self.last_exit_info = Some(exit.clone());
 
@@ -581,10 +581,8 @@ impl WorkflowEngine {
             .current_execution
             .take()
             .expect("launch_step stored execution");
-        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel::<(
-            ContainerExecution,
-            Result<ContainerExitInfo, EngineError>,
-        )>();
+        let (wait_tx, mut wait_rx) =
+            tokio::sync::oneshot::channel::<(AgentExecution, Result<AgentExitInfo, EngineError>)>();
         tokio::spawn(async move {
             let result = exec.wait().await;
             let _ = wait_tx.send((exec, result));
@@ -696,10 +694,10 @@ impl WorkflowEngine {
     fn handle_mid_step_control_board(
         &mut self,
         step_name: &str,
-        cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
+        cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
         wait_rx: &mut tokio::sync::oneshot::Receiver<(
-            ContainerExecution,
-            Result<ContainerExitInfo, EngineError>,
+            AgentExecution,
+            Result<AgentExitInfo, EngineError>,
         )>,
     ) -> Result<MidStepOutcome, EngineError> {
         let available = self.compute_available_actions()?;
@@ -827,10 +825,10 @@ impl WorkflowEngine {
     async fn handle_step_stuck(
         &mut self,
         step_name: &str,
-        cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
+        cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
         wait_rx: &mut tokio::sync::oneshot::Receiver<(
-            ContainerExecution,
-            Result<ContainerExitInfo, EngineError>,
+            AgentExecution,
+            Result<AgentExitInfo, EngineError>,
         )>,
         stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<Option<InterruptibleStepResult>, EngineError> {
@@ -901,10 +899,10 @@ impl WorkflowEngine {
     async fn run_mid_step_yolo_countdown(
         &mut self,
         step_name: &str,
-        _cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
+        _cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
         wait_rx: &mut tokio::sync::oneshot::Receiver<(
-            ContainerExecution,
-            Result<ContainerExitInfo, EngineError>,
+            AgentExecution,
+            Result<AgentExitInfo, EngineError>,
         )>,
         stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<MidStepYoloResult, EngineError> {
@@ -1389,9 +1387,10 @@ impl WorkflowEngine {
         }
 
         let work_item_number = self.work_item_context.as_ref().map(|c| c.number);
-        let work_item_title = self.work_item_context.as_ref().and_then(|c| {
-            c.content.lines().next().map(|l| l.trim().to_string())
-        });
+        let work_item_title = self
+            .work_item_context
+            .as_ref()
+            .and_then(|c| c.content.lines().next().map(|l| l.trim().to_string()));
 
         Some(CtxStepInfo {
             workflow_title: title,
@@ -1431,7 +1430,7 @@ impl WorkflowEngine {
         mut container_for_step: F,
     ) -> Result<(), EngineError>
     where
-        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
@@ -1525,7 +1524,7 @@ impl WorkflowEngine {
         mut container_for_step: F,
     ) -> Result<(bool, bool), EngineError>
     where
-        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
@@ -1604,7 +1603,7 @@ impl WorkflowEngine {
     /// Returns `true` if the step failed, `false` if succeeded.
     fn run_shell_phase_step(
         &mut self,
-        container: &dyn ContainerExec,
+        container: &dyn AgentExec,
         command: &str,
         env: Option<&std::collections::HashMap<String, String>>,
         phase: &str,
@@ -1677,24 +1676,18 @@ impl WorkflowEngine {
         idx: usize,
     ) -> bool {
         let git_root = self.session.git_root().to_path_buf();
-        let result = poll_ci::run_poll_ci_loop(
-            &git_root,
-            interval_secs,
-            max_retries,
-            |level, msg| {
+        let result =
+            poll_ci::run_poll_ci_loop(&git_root, interval_secs, max_retries, |level, msg| {
                 let ml = match level {
                     poll_ci::PollMessage::Info => crate::engine::message::MessageLevel::Info,
-                    poll_ci::PollMessage::Warning => {
-                        crate::engine::message::MessageLevel::Warning
-                    }
+                    poll_ci::PollMessage::Warning => crate::engine::message::MessageLevel::Warning,
                 };
                 self.frontend
                     .write_message(crate::engine::message::UserMessage {
                         level: ml,
                         text: msg,
                     });
-            },
-        );
+            });
 
         if let Err(e) = result {
             let error = e.to_string();
@@ -1713,12 +1706,16 @@ impl WorkflowEngine {
         container_for_step: &mut F,
     ) -> bool
     where
-        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_definition::SetupStep;
         use crate::engine::workflow::step_commands::setup_step_to_shell;
 
-        if let SetupStep::PollCi { interval_secs, max_retries } = step {
+        if let SetupStep::PollCi {
+            interval_secs,
+            max_retries,
+        } = step
+        {
             return self.run_poll_ci_phase_step(
                 interval_secs.unwrap_or(30),
                 max_retries.unwrap_or(10),
@@ -1745,12 +1742,16 @@ impl WorkflowEngine {
         container_for_step: &mut F,
     ) -> bool
     where
-        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_definition::TeardownStep;
         use crate::engine::workflow::step_commands::teardown_step_to_shell;
 
-        if let TeardownStep::PollCi { interval_secs, max_retries } = step {
+        if let TeardownStep::PollCi {
+            interval_secs,
+            max_retries,
+        } = step
+        {
             return self.run_poll_ci_phase_step(
                 interval_secs.unwrap_or(30),
                 max_retries.unwrap_or(10),
@@ -1778,7 +1779,7 @@ impl WorkflowEngine {
         container_for_step: &mut F,
     ) -> bool
     where
-        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_state::PhaseStepStatus;
 
@@ -1830,7 +1831,7 @@ impl WorkflowEngine {
         container_for_step: &mut F,
     ) -> bool
     where
-        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_state::PhaseStepStatus;
 
@@ -1983,10 +1984,10 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::data::session::{ContainerHandle, SessionOpenOptions, StaticGitRootResolver};
+    use crate::data::session::{AgentHandle, SessionOpenOptions, StaticGitRootResolver};
     use crate::data::workflow_definition::{Workflow, WorkflowStep};
     use crate::data::workflow_state_store::WorkflowStateStore;
-    use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo};
+    use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
     use crate::engine::overlay::OverlayEngine;
 
     // ── Fake implementations ─────────────────────────────────────────────────
@@ -2051,7 +2052,7 @@ mod tests {
         fn user_choose_after_step_failure(
             &mut self,
             _step: &WorkflowStep,
-            _exit: &ContainerExitInfo,
+            _exit: &AgentExitInfo,
         ) -> Result<StepFailureChoice, EngineError> {
             Ok(self.failure_choice.clone())
         }
@@ -2114,29 +2115,29 @@ mod tests {
             _step: &WorkflowStep,
             _session: &Session,
             runtime: &WorkflowRuntimeContext,
-        ) -> Result<ContainerExecution, EngineError> {
+        ) -> Result<AgentExecution, EngineError> {
             self.execution_call_count.fetch_add(1, Ordering::Relaxed);
             self.recorded_contexts.lock().unwrap().push(runtime.clone());
             let code = self.exit_codes.lock().unwrap().pop_front().unwrap_or(0);
             let now = Utc::now();
-            let info = ContainerExitInfo {
+            let info = AgentExitInfo {
                 exit_code: code,
                 signal: None,
                 started_at: now,
                 ended_at: now,
             };
-            let handle = ContainerHandle {
+            let handle = AgentHandle {
                 id: format!("fake-{}", self.execution_call_count.load(Ordering::Relaxed)),
                 image_tag: "fake-image:latest".into(),
                 name: "fake-container".into(),
                 started_at: now,
             };
-            Ok(ContainerExecution::finished(handle, info))
+            Ok(AgentExecution::finished(handle, info))
         }
 
         fn inject_prompt(
             &self,
-            _execution: &ContainerExecution,
+            _execution: &AgentExecution,
             _prompt: &str,
         ) -> Result<Option<()>, EngineError> {
             self.inject_call_count.fetch_add(1, Ordering::Relaxed);
@@ -2526,12 +2527,12 @@ mod tests {
                 step: &WorkflowStep,
                 session: &Session,
                 runtime: &WorkflowRuntimeContext,
-            ) -> Result<ContainerExecution, EngineError> {
+            ) -> Result<AgentExecution, EngineError> {
                 self.0.execution_for_step(step, session, runtime)
             }
             fn inject_prompt(
                 &self,
-                e: &ContainerExecution,
+                e: &AgentExecution,
                 p: &str,
             ) -> Result<Option<()>, EngineError> {
                 self.0.inject_prompt(e, p)
@@ -2610,13 +2611,13 @@ mod tests {
         completion: CompletionArc,
     }
 
-    impl crate::engine::container::instance::ExecutionBackend for BlockingBackend {
-        fn wait_blocking(self: Box<Self>) -> Result<ContainerExitInfo, EngineError> {
+    impl crate::engine::agent_runtime::execution::ExecutionBackend for BlockingBackend {
+        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
             let (lock, cvar) = &*self.completion;
             loop {
                 if self.cancel_flag.load(Ordering::Relaxed) {
                     let now = Utc::now();
-                    return Ok(ContainerExitInfo {
+                    return Ok(AgentExitInfo {
                         exit_code: -1,
                         signal: None,
                         started_at: now,
@@ -2627,7 +2628,7 @@ mod tests {
                 let (guard, _) = cvar.wait_timeout(guard, Duration::from_millis(20)).unwrap();
                 if let Some(code) = *guard {
                     let now = Utc::now();
-                    return Ok(ContainerExitInfo {
+                    return Ok(AgentExitInfo {
                         exit_code: code,
                         signal: None,
                         started_at: now,
@@ -2644,10 +2645,10 @@ mod tests {
             Ok(())
         }
 
-        fn cancel_handle(&self) -> Option<crate::engine::container::instance::CancelHandle> {
+        fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
             let flag = self.cancel_flag.clone();
             let completion = self.completion.clone();
-            Some(crate::engine::container::instance::CancelHandle::new(
+            Some(crate::engine::agent_runtime::execution::CancelHandle::new(
                 move || {
                     flag.store(true, Ordering::Relaxed);
                     let (_, cvar) = &*completion;
@@ -2695,7 +2696,7 @@ mod tests {
             _step: &WorkflowStep,
             _session: &Session,
             _runtime: &WorkflowRuntimeContext,
-        ) -> Result<ContainerExecution, EngineError> {
+        ) -> Result<AgentExecution, EngineError> {
             let idx = self.execution_count.fetch_add(1, Ordering::Relaxed);
             let slot = self.blocking_slots.lock().unwrap().pop_front();
             if let Some((cancel_flag, completion)) = slot {
@@ -2704,39 +2705,39 @@ mod tests {
                     completion,
                 });
                 let now = Utc::now();
-                let handle = ContainerHandle {
+                let handle = AgentHandle {
                     id: format!("blocking-{idx}"),
                     image_tag: "test:latest".into(),
                     name: "blocking-container".into(),
                     started_at: now,
                 };
                 let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
-                Ok(ContainerExecution::new(
+                Ok(AgentExecution::new(
                     handle,
                     backend,
                     std::sync::Arc::new(stuck_tx),
                 ))
             } else {
                 let now = Utc::now();
-                let info = ContainerExitInfo {
+                let info = AgentExitInfo {
                     exit_code: 0,
                     signal: None,
                     started_at: now,
                     ended_at: now,
                 };
-                let handle = ContainerHandle {
+                let handle = AgentHandle {
                     id: format!("instant-{idx}"),
                     image_tag: "test:latest".into(),
                     name: "instant-container".into(),
                     started_at: now,
                 };
-                Ok(ContainerExecution::finished(handle, info))
+                Ok(AgentExecution::finished(handle, info))
             }
         }
 
         fn inject_prompt(
             &self,
-            _execution: &ContainerExecution,
+            _execution: &AgentExecution,
             _prompt: &str,
         ) -> Result<Option<()>, EngineError> {
             self.inject_count.fetch_add(1, Ordering::Relaxed);
@@ -2795,7 +2796,7 @@ mod tests {
         fn user_choose_after_step_failure(
             &mut self,
             _step: &WorkflowStep,
-            _exit: &ContainerExitInfo,
+            _exit: &AgentExitInfo,
         ) -> Result<StepFailureChoice, EngineError> {
             Ok(StepFailureChoice::Abort)
         }
@@ -3067,7 +3068,7 @@ mod tests {
             fn user_choose_after_step_failure(
                 &mut self,
                 _: &WorkflowStep,
-                _: &ContainerExitInfo,
+                _: &AgentExitInfo,
             ) -> Result<StepFailureChoice, EngineError> {
                 Ok(StepFailureChoice::Abort)
             }
@@ -3221,7 +3222,7 @@ mod tests {
             fn user_choose_after_step_failure(
                 &mut self,
                 _: &WorkflowStep,
-                _: &ContainerExitInfo,
+                _: &AgentExitInfo,
             ) -> Result<StepFailureChoice, EngineError> {
                 Ok(StepFailureChoice::Abort)
             }
@@ -3372,8 +3373,12 @@ mod tests {
         /// passed `&mock` directly can now pass `mock.factory()`.
         fn factory<'a>(
             self: &'a Arc<Self>,
-        ) -> impl FnMut(usize) -> Result<Box<dyn crate::engine::container::ContainerExec>, EngineError>
-               + 'a {
+        ) -> impl FnMut(
+            usize,
+        ) -> Result<
+            Box<dyn crate::engine::agent_runtime::background::AgentExec>,
+            EngineError,
+        > + 'a {
             move |_idx| {
                 *self.container_handouts.lock().unwrap() += 1;
                 Ok(Box::new(SharedMockExec(Arc::clone(self))))
@@ -3382,28 +3387,32 @@ mod tests {
     }
 
     /// Trampoline that lets the test factory hand out fresh `Box<dyn
-    /// ContainerExec>` values while keeping all recorded state in the single
+    /// AgentExec>` values while keeping all recorded state in the single
     /// shared `MockBackgroundContainer`.
     struct SharedMockExec(Arc<MockBackgroundContainer>);
 
-    impl crate::engine::container::ContainerExec for SharedMockExec {
+    impl crate::engine::agent_runtime::background::AgentExec for SharedMockExec {
         fn exec(
             &self,
             command: &str,
             env: Option<&std::collections::HashMap<String, String>>,
-        ) -> Result<crate::engine::container::ExecOutput, crate::engine::error::EngineError>
-        {
+        ) -> Result<
+            crate::engine::agent_runtime::background::ExecOutput,
+            crate::engine::error::EngineError,
+        > {
             self.0.exec(command, env)
         }
     }
 
-    impl crate::engine::container::ContainerExec for MockBackgroundContainer {
+    impl crate::engine::agent_runtime::background::AgentExec for MockBackgroundContainer {
         fn exec(
             &self,
             command: &str,
             _env: Option<&std::collections::HashMap<String, String>>,
-        ) -> Result<crate::engine::container::ExecOutput, crate::engine::error::EngineError>
-        {
+        ) -> Result<
+            crate::engine::agent_runtime::background::ExecOutput,
+            crate::engine::error::EngineError,
+        > {
             self.calls.lock().unwrap().push(command.to_string());
             let (stdout, stderr, exit_code) = self
                 .results
@@ -3411,7 +3420,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| ("".into(), "".into(), 0));
-            Ok(crate::engine::container::ExecOutput {
+            Ok(crate::engine::agent_runtime::background::ExecOutput {
                 stdout,
                 stderr,
                 exit_code,
@@ -3678,7 +3687,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
         let mock_for_factory = Arc::clone(&mock);
         let factory = move |idx: usize| -> Result<
-            Box<dyn crate::engine::container::ContainerExec>,
+            Box<dyn crate::engine::agent_runtime::background::AgentExec>,
             EngineError,
         > {
             if idx == 0 {
@@ -3906,7 +3915,12 @@ mod tests {
     impl MessageCapturingFrontend {
         fn new() -> (Self, Arc<Mutex<Vec<crate::engine::message::UserMessage>>>) {
             let store = Arc::new(Mutex::new(Vec::new()));
-            (Self { messages: Arc::clone(&store) }, store)
+            (
+                Self {
+                    messages: Arc::clone(&store),
+                },
+                store,
+            )
         }
     }
 
@@ -3931,7 +3945,7 @@ mod tests {
         fn user_choose_after_step_failure(
             &mut self,
             _step: &WorkflowStep,
-            _exit: &ContainerExitInfo,
+            _exit: &AgentExitInfo,
         ) -> Result<StepFailureChoice, EngineError> {
             Ok(StepFailureChoice::Abort)
         }
@@ -3968,7 +3982,9 @@ mod tests {
         .unwrap()
     }
 
-    fn remediation_config(max_attempts: u32) -> crate::data::workflow_definition::RemediationConfig {
+    fn remediation_config(
+        max_attempts: u32,
+    ) -> crate::data::workflow_definition::RemediationConfig {
         crate::data::workflow_definition::RemediationConfig {
             prompt: "Fix the broken step.".into(),
             agent: None,
@@ -4043,10 +4059,12 @@ mod tests {
             ]));
             let on_failure_configs = vec![Some(remediation_config(2))];
 
-            let result =
-                engine.run_setup(&steps, &[false], &on_failure_configs, mock.factory());
+            let result = engine.run_setup(&steps, &[false], &on_failure_configs, mock.factory());
 
-            assert!(result.is_ok(), "setup must succeed when retry succeeds: {result:?}");
+            assert!(
+                result.is_ok(),
+                "setup must succeed when retry succeeds: {result:?}"
+            );
             assert_eq!(
                 engine.state().setup_step_states[0].status,
                 PhaseStepStatus::Succeeded,
@@ -4088,7 +4106,11 @@ mod tests {
 
             // Only 2 exec calls: initial fail + one successful retry.
             let calls = mock.calls();
-            assert_eq!(calls.len(), 2, "must stop after first successful retry: {calls:?}");
+            assert_eq!(
+                calls.len(),
+                2,
+                "must stop after first successful retry: {calls:?}"
+            );
         })
         .await
         .unwrap();
@@ -4165,8 +4187,7 @@ mod tests {
             ]));
             let on_failure_configs = vec![Some(remediation_config(2))];
 
-            let result =
-                engine.run_setup(&steps, &[false], &on_failure_configs, mock.factory());
+            let result = engine.run_setup(&steps, &[false], &on_failure_configs, mock.factory());
 
             assert!(
                 result.is_ok(),
@@ -4281,9 +4302,7 @@ mod tests {
     async fn on_failure_emits_launch_and_success_messages() {
         use crate::engine::message::MessageLevel;
 
-        let msg_store = Arc::new(Mutex::new(
-            Vec::<crate::engine::message::UserMessage>::new(),
-        ));
+        let msg_store = Arc::new(Mutex::new(Vec::<crate::engine::message::UserMessage>::new()));
         let msg_store_clone = Arc::clone(&msg_store);
 
         tokio::task::spawn_blocking(move || {
@@ -4318,7 +4337,9 @@ mod tests {
 
         // Must see the "launching on_failure agent" message.
         assert!(
-            texts.iter().any(|t| t.contains("on_failure agent") && t.contains("attempt 1")),
+            texts
+                .iter()
+                .any(|t| t.contains("on_failure agent") && t.contains("attempt 1")),
             "must emit 'on_failure agent' launch message: {texts:?}"
         );
         // Must see the "remediation succeeded" message.
@@ -4341,9 +4362,7 @@ mod tests {
     async fn on_failure_exhausted_emits_warning_message() {
         use crate::engine::message::MessageLevel;
 
-        let msg_store = Arc::new(Mutex::new(
-            Vec::<crate::engine::message::UserMessage>::new(),
-        ));
+        let msg_store = Arc::new(Mutex::new(Vec::<crate::engine::message::UserMessage>::new()));
         let msg_store_clone = Arc::clone(&msg_store);
 
         tokio::task::spawn_blocking(move || {
@@ -4417,7 +4436,14 @@ mod tests {
             let on_failure_configs = vec![Some(remediation_config(1)), None];
 
             let (aborted, any_failed) = engine
-                .run_teardown(&steps, &[false, false], &on_failure_configs, true, false, mock.factory())
+                .run_teardown(
+                    &steps,
+                    &[false, false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
                 .unwrap();
 
             assert!(!aborted, "teardown must not abort when retry succeeds");
@@ -4464,11 +4490,21 @@ mod tests {
             let on_failure_configs = vec![Some(remediation_config(1)), None];
 
             let (aborted, any_failed) = engine
-                .run_teardown(&steps, &[false, false], &on_failure_configs, true, false, mock.factory())
+                .run_teardown(
+                    &steps,
+                    &[false, false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
                 .unwrap();
 
             assert!(!aborted);
-            assert!(any_failed, "any_failed must be true when on_failure is exhausted");
+            assert!(
+                any_failed,
+                "any_failed must be true when on_failure is exhausted"
+            );
             assert!(
                 matches!(
                     &engine.state().teardown_step_states[0].status,

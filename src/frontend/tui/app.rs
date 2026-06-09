@@ -61,11 +61,11 @@ pub struct App {
     pub runtime_handle: tokio::runtime::Handle,
     /// Receiver for asynchronous container stats results.
     pub stats_rx: Option<
-        std::sync::mpsc::Receiver<(usize, crate::engine::container::instance::ContainerStats)>,
+        std::sync::mpsc::Receiver<(usize, crate::engine::agent_runtime::execution::AgentStats)>,
     >,
     /// Sender cloned per stats query — kept alive so the channel stays open.
     pub stats_tx:
-        std::sync::mpsc::Sender<(usize, crate::engine::container::instance::ContainerStats)>,
+        std::sync::mpsc::Sender<(usize, crate::engine::agent_runtime::execution::AgentStats)>,
     /// Tracks when the last stats query was dispatched so we don't spam.
     pub last_stats_poll: std::time::Instant,
 }
@@ -198,7 +198,7 @@ impl App {
             Err(_) => (80u16, 24u16),
         };
 
-        let container_io = crate::engine::container::frontend::ContainerIo {
+        let container_io = crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx.clone(),
             stderr: stdout_tx,
             stdin_tx: stdin_tx_for_engine,
@@ -488,7 +488,7 @@ impl App {
                 self.runtime_handle.spawn_blocking(move || {
                     if !container_name.is_empty() {
                         // Fast path: name is known, query stats directly.
-                        let handle = crate::data::session::ContainerHandle {
+                        let handle = crate::data::session::AgentHandle {
                             id: container_name.clone(),
                             name: container_name,
                             image_tag: String::new(),
@@ -499,7 +499,7 @@ impl App {
                         }
                     } else {
                         // Slow path: name unknown, list containers and pick the first.
-                        if let Ok(handles) = runtime.list_running_sync() {
+                        if let Ok(handles) = runtime.list_running_all() {
                             if let Some(handle) = handles.first() {
                                 if let Ok(stats) = runtime.stats(handle) {
                                     let _ = tx.send((tab_idx, stats));
@@ -665,7 +665,9 @@ mod tests {
             ))
         };
         crate::command::dispatch::Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine: overlay,
             auth_engine,
@@ -797,7 +799,7 @@ mod tests {
             .is_none());
 
         // Simulate a stats result arriving on the channel.
-        let stats = crate::engine::container::instance::ContainerStats {
+        let stats = crate::engine::agent_runtime::execution::AgentStats {
             name: "awman-test-1234".into(),
             cpu_percent: 42.5,
             memory_mb: 256.0,
@@ -856,7 +858,7 @@ mod tests {
             agent_display_name: "Claude".into(),
             container_name: "awman-old-container".into(),
             start_time: std::time::Instant::now(),
-            latest_stats: Some(crate::engine::container::instance::ContainerStats {
+            latest_stats: Some(crate::engine::agent_runtime::execution::AgentStats {
                 name: "awman-old-container".into(),
                 cpu_percent: 10.0,
                 memory_mb: 100.0,
@@ -881,7 +883,7 @@ mod tests {
 
     #[test]
     fn stats_title_shows_values_when_stats_present() {
-        use crate::engine::container::instance::ContainerStats;
+        use crate::engine::agent_runtime::execution::AgentStats;
         use crate::frontend::tui::tabs::ContainerInfo;
 
         let mut app = make_app();
@@ -890,7 +892,7 @@ mod tests {
             agent_display_name: "Claude".into(),
             container_name: "awman-test".into(),
             start_time: std::time::Instant::now(),
-            latest_stats: Some(ContainerStats {
+            latest_stats: Some(AgentStats {
                 name: "awman-test".into(),
                 cpu_percent: 42.5,
                 memory_mb: 256.0,

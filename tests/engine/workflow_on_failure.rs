@@ -11,8 +11,8 @@ use awman::data::workflow_definition::{
     RemediationConfig, SetupStep, TeardownStep, Workflow, WorkflowStep,
 };
 use awman::data::workflow_state::PhaseStepStatus;
-use awman::engine::container::instance::ContainerExitInfo;
-use awman::engine::container::{ContainerExec, ExecOutput};
+use awman::engine::agent_runtime::background::{AgentExec, ExecOutput};
+use awman::engine::agent_runtime::execution::AgentExitInfo;
 use awman::engine::error::EngineError;
 use awman::engine::overlay::OverlayEngine;
 use awman::engine::workflow::actions::{
@@ -58,14 +58,14 @@ fn minimal_workflow() -> Workflow {
     }
 }
 
-/// A mock `ContainerExec` that returns pre-programmed (stdout, stderr, exit_code)
+/// A mock `AgentExec` that returns pre-programmed (stdout, stderr, exit_code)
 /// results in order, defaulting to success when the queue is exhausted.
-struct MockContainerExec {
+struct MockAgentExec {
     results: Mutex<VecDeque<(String, String, i32)>>,
     calls: Mutex<Vec<String>>,
 }
 
-impl MockContainerExec {
+impl MockAgentExec {
     fn always_success() -> Self {
         Self {
             results: Mutex::new(VecDeque::new()),
@@ -85,7 +85,7 @@ impl MockContainerExec {
     }
 }
 
-impl ContainerExec for MockContainerExec {
+impl AgentExec for MockAgentExec {
     fn exec(
         &self,
         command: &str,
@@ -108,7 +108,7 @@ impl ContainerExec for MockContainerExec {
 
 /// A `ContainerExecutionFactory` for on_failure agent launches in integration tests.
 ///
-/// `ContainerExecution::finished` is `pub(crate)` so we can't construct a finished
+/// `AgentExecution::finished` is `pub(crate)` so we can't construct a finished
 /// execution from an external test crate.  Returning `Err` causes
 /// `launch_on_failure_agent` to log a warning and return — the remediation loop
 /// still iterates and re-runs the step via the `container_for_step` closure, which
@@ -127,7 +127,7 @@ impl ContainerExecutionFactory for FinishedFactory {
         _step: &WorkflowStep,
         _session: &Session,
         _runtime: &WorkflowRuntimeContext,
-    ) -> Result<awman::engine::container::instance::ContainerExecution, EngineError> {
+    ) -> Result<awman::engine::agent_runtime::execution::AgentExecution, EngineError> {
         Err(EngineError::Other(
             "on_failure agent launch skipped in integration test (no container runtime)".into(),
         ))
@@ -135,7 +135,7 @@ impl ContainerExecutionFactory for FinishedFactory {
 
     fn inject_prompt(
         &self,
-        _execution: &awman::engine::container::instance::ContainerExecution,
+        _execution: &awman::engine::agent_runtime::execution::AgentExecution,
         _prompt: &str,
     ) -> Result<Option<()>, EngineError> {
         Ok(None)
@@ -150,7 +150,12 @@ struct RecordingFrontend {
 impl RecordingFrontend {
     fn new() -> (Self, Arc<Mutex<Vec<awman::engine::message::UserMessage>>>) {
         let store = Arc::new(Mutex::new(Vec::new()));
-        (Self { messages: Arc::clone(&store) }, store)
+        (
+            Self {
+                messages: Arc::clone(&store),
+            },
+            store,
+        )
     }
 }
 
@@ -175,7 +180,7 @@ impl Frontend for RecordingFrontend {
     fn user_choose_after_step_failure(
         &mut self,
         _step: &WorkflowStep,
-        _exit: &ContainerExitInfo,
+        _exit: &AgentExitInfo,
     ) -> Result<StepFailureChoice, EngineError> {
         Ok(StepFailureChoice::Abort)
     }
@@ -220,16 +225,18 @@ fn remediation(max_attempts: u32) -> RemediationConfig {
     }
 }
 
-fn make_mock_factory(mock: Arc<MockContainerExec>) -> impl FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError> {
+fn make_mock_factory(
+    mock: Arc<MockAgentExec>,
+) -> impl FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError> {
     let mock = Arc::clone(&mock);
     move |_idx| Ok(Box::new(SharedMockExec(Arc::clone(&mock))))
 }
 
-/// Trampoline so the factory closure can produce a fresh `Box<dyn ContainerExec>`
-/// while sharing state with a single `MockContainerExec`.
-struct SharedMockExec(Arc<MockContainerExec>);
+/// Trampoline so the factory closure can produce a fresh `Box<dyn AgentExec>`
+/// while sharing state with a single `MockAgentExec`.
+struct SharedMockExec(Arc<MockAgentExec>);
 
-impl ContainerExec for SharedMockExec {
+impl AgentExec for SharedMockExec {
     fn exec(
         &self,
         command: &str,
@@ -262,22 +269,33 @@ async fn integration_run_shell_on_failure_retry_succeeds() {
             command: "cargo test".into(),
             env: None,
         }];
-        let mock = Arc::new(MockContainerExec::with_results([
+        let mock = Arc::new(MockAgentExec::with_results([
             ("".into(), "test failed".into(), 1), // initial attempt fails
-            ("".into(), "".into(), 0),             // retry succeeds
+            ("".into(), "".into(), 0),            // retry succeeds
         ]));
         let on_failure_configs = vec![Some(remediation(2))];
 
-        let result =
-            engine.run_setup(&steps, &[false], &on_failure_configs, make_mock_factory(Arc::clone(&mock)));
+        let result = engine.run_setup(
+            &steps,
+            &[false],
+            &on_failure_configs,
+            make_mock_factory(Arc::clone(&mock)),
+        );
 
-        assert!(result.is_ok(), "setup must succeed when retry succeeds: {result:?}");
+        assert!(
+            result.is_ok(),
+            "setup must succeed when retry succeeds: {result:?}"
+        );
         assert_eq!(
             engine.state().setup_step_states[0].status,
             PhaseStepStatus::Succeeded,
             "step must end as Succeeded"
         );
-        assert_eq!(mock.calls().len(), 2, "exactly 2 execs: initial fail + retry");
+        assert_eq!(
+            mock.calls().len(),
+            2,
+            "exactly 2 execs: initial fail + retry"
+        );
     })
     .await
     .unwrap();
@@ -285,7 +303,9 @@ async fn integration_run_shell_on_failure_retry_succeeds() {
     let messages = msg_store.lock().unwrap().clone();
     let texts: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
     assert!(
-        texts.iter().any(|t| t.contains("on_failure agent") || t.contains("launching")),
+        texts
+            .iter()
+            .any(|t| t.contains("on_failure agent") || t.contains("launching")),
         "must emit on_failure launch message: {texts:?}"
     );
     assert!(
@@ -316,7 +336,7 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
             env: None,
         }];
         // Every exec fails.
-        let mock = Arc::new(MockContainerExec::with_results([
+        let mock = Arc::new(MockAgentExec::with_results([
             ("".into(), "err".into(), 1),
             ("".into(), "err".into(), 1),
             ("".into(), "err".into(), 1),
@@ -324,7 +344,12 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
         let on_failure_configs = vec![Some(remediation(2))];
 
         engine
-            .run_setup(&steps, &[false], &on_failure_configs, make_mock_factory(Arc::clone(&mock)))
+            .run_setup(
+                &steps,
+                &[false],
+                &on_failure_configs,
+                make_mock_factory(Arc::clone(&mock)),
+            )
             .unwrap();
 
         assert!(
@@ -336,7 +361,11 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
             engine.state().setup_step_states[0].status
         );
         // Initial attempt + 2 retries.
-        assert_eq!(mock.calls().len(), 3, "3 execs: initial + max_attempts retries");
+        assert_eq!(
+            mock.calls().len(),
+            3,
+            "3 execs: initial + max_attempts retries"
+        );
     })
     .await
     .unwrap();
@@ -374,7 +403,7 @@ async fn integration_teardown_on_failure_retry_succeeds_remaining_steps_run() {
             },
         ];
         // First step: fails initially, retry succeeds. Second step: succeeds.
-        let mock = Arc::new(MockContainerExec::with_results([
+        let mock = Arc::new(MockAgentExec::with_results([
             ("".into(), "err".into(), 1),
             ("".into(), "".into(), 0),
             ("".into(), "".into(), 0),
@@ -393,7 +422,10 @@ async fn integration_teardown_on_failure_retry_succeeds_remaining_steps_run() {
             .unwrap();
 
         assert!(!aborted, "teardown must not abort when retry succeeds");
-        assert!(!any_failed, "any_failed must be false when all retries succeed");
+        assert!(
+            !any_failed,
+            "any_failed must be false when all retries succeed"
+        );
         assert_eq!(
             engine.state().teardown_step_states[0].status,
             PhaseStepStatus::Succeeded
@@ -428,7 +460,7 @@ async fn integration_teardown_on_failure_exhausted_best_effort_continues() {
                 env: None,
             },
         ];
-        let mock = Arc::new(MockContainerExec::with_results([
+        let mock = Arc::new(MockAgentExec::with_results([
             ("".into(), "err".into(), 1), // initial
             ("".into(), "err".into(), 1), // retry
             ("".into(), "".into(), 0),    // second step
@@ -447,7 +479,10 @@ async fn integration_teardown_on_failure_exhausted_best_effort_continues() {
             .unwrap();
 
         assert!(!aborted, "teardown must not abort (best-effort)");
-        assert!(any_failed, "any_failed must be true when a step exhausts remediation");
+        assert!(
+            any_failed,
+            "any_failed must be true when a step exhausts remediation"
+        );
         assert!(
             matches!(
                 engine.state().teardown_step_states[0].status,
@@ -485,13 +520,16 @@ async fn integration_poll_ci_setup_step_fails_when_not_a_git_repo() {
             max_retries: Some(1),
         }];
         // PollCi bypasses the container factory, so the factory is never called.
-        let empty_factory = |_idx: usize| -> Result<Box<dyn ContainerExec>, EngineError> {
+        let empty_factory = |_idx: usize| -> Result<Box<dyn AgentExec>, EngineError> {
             Err(EngineError::Other("should not be called for PollCi".into()))
         };
 
         // run_setup continues past non-aborting failures.
         let result = engine.run_setup(&steps, &[false], &[], empty_factory);
-        assert!(result.is_ok(), "non-aborting PollCi failure must not bubble: {result:?}");
+        assert!(
+            result.is_ok(),
+            "non-aborting PollCi failure must not bubble: {result:?}"
+        );
 
         assert!(
             matches!(
@@ -536,7 +574,7 @@ async fn integration_poll_ci_teardown_with_on_failure_exhausts_and_continues() {
                 env: None,
             },
         ];
-        let mock = Arc::new(MockContainerExec::always_success()); // for the RunShell step only
+        let mock = Arc::new(MockAgentExec::always_success()); // for the RunShell step only
         let on_failure_configs = vec![Some(remediation(1)), None];
 
         let (aborted, any_failed) = engine
@@ -571,7 +609,9 @@ async fn integration_poll_ci_teardown_with_on_failure_exhausts_and_continues() {
     let messages = msg_store.lock().unwrap().clone();
     let texts: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
     assert!(
-        texts.iter().any(|t| t.contains("on_failure agent") || t.contains("launching")),
+        texts
+            .iter()
+            .any(|t| t.contains("on_failure agent") || t.contains("launching")),
         "must emit on_failure agent launch message for the poll_ci step: {texts:?}"
     );
 }
@@ -597,10 +637,12 @@ async fn integration_poll_ci_emits_polling_attempt_message_before_error() {
             interval_secs: Some(0),
             max_retries: Some(3),
         }];
-        let empty_factory = |_idx: usize| -> Result<Box<dyn ContainerExec>, EngineError> {
+        let empty_factory = |_idx: usize| -> Result<Box<dyn AgentExec>, EngineError> {
             Err(EngineError::Other("unreachable".into()))
         };
-        engine.run_setup(&steps, &[false], &[], empty_factory).unwrap();
+        engine
+            .run_setup(&steps, &[false], &[], empty_factory)
+            .unwrap();
     })
     .await
     .unwrap();
@@ -689,7 +731,7 @@ command = "cargo test"
             wf.setup.iter().map(|e| e.on_failure.clone()).collect();
 
         // Build fails twice (initial + 1 retry), then succeeds on second retry.
-        let mock = Arc::new(MockContainerExec::with_results([
+        let mock = Arc::new(MockAgentExec::with_results([
             ("".into(), "build error".into(), 1),
             ("".into(), "build error".into(), 1),
             ("".into(), "".into(), 0),
@@ -702,7 +744,10 @@ command = "cargo test"
             make_mock_factory(Arc::clone(&mock)),
         );
 
-        assert!(result.is_ok(), "setup must succeed on second retry: {result:?}");
+        assert!(
+            result.is_ok(),
+            "setup must succeed on second retry: {result:?}"
+        );
         assert_eq!(
             engine.state().setup_step_states[0].status,
             PhaseStepStatus::Succeeded

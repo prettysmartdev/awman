@@ -5,34 +5,34 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::data::session::{ContainerHandle, Session};
-use crate::engine::container::background::ExecOutput;
-use crate::engine::container::instance::{ContainerInstance, ContainerStats};
+use crate::data::session::{AgentHandle, Session};
+use crate::engine::agent_runtime::background::ExecOutput;
+use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
 /// What every container backend must support. The concrete type is hidden
 /// behind `Box<dyn ContainerBackend>` and never escapes this module.
 pub(super) trait ContainerBackend: Send + Sync {
-    /// Build a `ContainerInstance` from resolved options. The image is NOT
+    /// Build an `AgentInstance` from resolved options. The image is NOT
     /// pulled or built here — that's a separate concern handled by
     /// higher-level engines (e.g. `AgentEngine::ensure_available`).
     fn build(
         &self,
         options: ResolvedContainerOptions,
-    ) -> Result<Box<dyn ContainerInstance>, EngineError>;
+    ) -> Result<Box<dyn AgentInstance>, EngineError>;
 
-    fn list_running(&self, session: &Session) -> Result<Vec<ContainerHandle>, EngineError>;
+    fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError>;
 
     /// List all running awman containers without requiring a session.
     /// Default falls back to an empty list.
-    fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+    fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
         Ok(Vec::new())
     }
 
-    fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError>;
+    fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError>;
 
-    fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError>;
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
     /// Build the CLI arguments for `docker exec -it` (or equivalent) into a
     /// running container. Used by TUI re-attach.

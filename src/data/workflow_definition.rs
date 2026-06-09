@@ -1001,9 +1001,6 @@ prompt = "fix"
 max_attempts = 1
 "#;
         let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
-        assert_eq!(
-            wf.teardown[0].on_failure.as_ref().unwrap().max_attempts,
-            1
-        );
+        assert_eq!(wf.teardown[0].on_failure.as_ref().unwrap().max_attempts, 1);
     }
 }

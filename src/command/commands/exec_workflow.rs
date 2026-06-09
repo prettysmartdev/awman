@@ -22,8 +22,8 @@ use crate::data::session::Session;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_prompt_template::{substitute_prompt, WorkItemContext};
 use crate::engine::agent::AgentRunOptions;
-use crate::engine::container::frontend::ContainerFrontend;
-use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::agent_runtime::execution::AgentExitInfo;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 use crate::engine::error::EngineError;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -69,7 +69,7 @@ pub struct WorkflowSummary {
 #[async_trait]
 pub trait ExecWorkflowCommandFrontend:
     UserMessageSink
-    + ContainerFrontend
+    + AgentFrontend
     + WorkflowFrontend
     + MountScopeFrontend
     + AgentSetupFrontend
@@ -202,7 +202,7 @@ impl WorkflowFrontend for WorkflowProxy {
     fn user_choose_after_step_failure(
         &mut self,
         step: &WorkflowStep,
-        exit: &ContainerExitInfo,
+        exit: &AgentExitInfo,
     ) -> Result<StepFailureChoice, EngineError> {
         self.0
             .lock()
@@ -250,25 +250,25 @@ impl WorkflowFrontend for WorkflowProxy {
     }
 }
 
-// ─── ContainerFrontendProxy ──────────────────────────────────────────────────
+// ─── AgentFrontendProxy ──────────────────────────────────────────────────
 //
-// Passed to `ContainerInstance::run_with_frontend`. The current Docker backend
+// Passed to `AgentInstance::run_with_frontend`. The current Docker backend
 // discards it; a future PTY-wiring backend will use it.
 
-struct ContainerFrontendProxy(Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>);
+struct AgentFrontendProxy(Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>);
 
 #[async_trait]
-impl ContainerFrontend for ContainerFrontendProxy {
-    fn report_status(&mut self, status: crate::engine::container::frontend::ContainerStatus) {
+impl AgentFrontend for AgentFrontendProxy {
+    fn report_status(&mut self, status: crate::engine::agent_runtime::frontend::AgentStatus) {
         self.0.lock().unwrap().report_status(status);
     }
 
-    fn report_progress(&mut self, progress: crate::engine::container::frontend::ContainerProgress) {
+    fn report_progress(&mut self, progress: crate::engine::agent_runtime::frontend::AgentProgress) {
         self.0.lock().unwrap().report_progress(progress);
     }
 
-    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
-        self.0.lock().unwrap().take_container_io()
+    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
+        self.0.lock().unwrap().take_io()
     }
 
     fn grace_timeout(&self) -> std::time::Duration {
@@ -280,7 +280,7 @@ impl ContainerFrontend for ContainerFrontendProxy {
     }
 }
 
-impl UserMessageSink for ContainerFrontendProxy {
+impl UserMessageSink for AgentFrontendProxy {
     fn write_message(&mut self, msg: UserMessage) {
         self.0.lock().unwrap().write_message(msg);
     }
@@ -294,7 +294,7 @@ impl UserMessageSink for ContainerFrontendProxy {
 //
 // Implements `ContainerExecutionFactory` for the workflow engine. Builds a
 // container instance from per-step parameters + command flags, then binds a
-// `ContainerFrontendProxy` to it via `run_with_frontend`.
+// `AgentFrontendProxy` to it via `run_with_frontend`.
 
 struct CommandLayerFactory {
     shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
@@ -315,7 +315,7 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         step: &WorkflowStep,
         session: &Session,
         runtime: &WorkflowRuntimeContext,
-    ) -> Result<crate::engine::container::instance::ContainerExecution, EngineError> {
+    ) -> Result<crate::engine::agent_runtime::execution::AgentExecution, EngineError> {
         // Substitute work item template tokens in the step prompt.
         let substitution =
             substitute_prompt(&step.prompt_template, self.work_item_context.as_ref());
@@ -393,14 +393,15 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             }
         }
 
+        let options = crate::engine::agent_runtime::ResolvedAgentOptions::container(options)?;
         let instance = self.engines.runtime.build(options)?;
-        let proxy = ContainerFrontendProxy(Arc::clone(&self.shared));
+        let proxy = AgentFrontendProxy(Arc::clone(&self.shared));
         instance.run_with_frontend(Box::new(proxy))
     }
 
     fn inject_prompt(
         &self,
-        execution: &crate::engine::container::instance::ContainerExecution,
+        execution: &crate::engine::agent_runtime::execution::AgentExecution,
         prompt: &str,
     ) -> Result<Option<()>, EngineError> {
         // Mirror old amux's `launch_next_workflow_step_in_current_container`:
@@ -430,6 +431,13 @@ impl Command for ExecWorkflowCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        // Agent execution under a sandbox-class runtime lands in WI 0090;
+        // until then the stub surfaces NotImplemented instead of panicking
+        // or silently falling back to Docker.
+        self.engines
+            .require_container_runtime()
+            .map_err(CommandError::from)?;
+
         // Resolve the workflow path relative to the session's working
         // directory so that relative paths work regardless of where the
         // awman process was originally launched.
@@ -906,15 +914,25 @@ impl Command for ExecWorkflowCommand {
             workflow.setup.iter().map(|e| e.overlays.clone()).collect();
         let setup_abort_flags: Vec<bool> =
             workflow.setup.iter().map(|e| e.abort_on_failure).collect();
-        let setup_on_failure_configs: Vec<Option<crate::data::workflow_definition::RemediationConfig>> =
-            workflow.setup.iter().map(|e| e.on_failure.clone()).collect();
+        let setup_on_failure_configs: Vec<
+            Option<crate::data::workflow_definition::RemediationConfig>,
+        > = workflow
+            .setup
+            .iter()
+            .map(|e| e.on_failure.clone())
+            .collect();
         let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
             .teardown
             .iter()
             .map(|e| e.overlays.clone())
             .collect();
-        let teardown_on_failure_configs: Vec<Option<crate::data::workflow_definition::RemediationConfig>> =
-            workflow.teardown.iter().map(|e| e.on_failure.clone()).collect();
+        let teardown_on_failure_configs: Vec<
+            Option<crate::data::workflow_definition::RemediationConfig>,
+        > = workflow
+            .teardown
+            .iter()
+            .map(|e| e.on_failure.clone())
+            .collect();
         let teardown_abort_flags: Vec<bool> = workflow
             .teardown
             .iter()
@@ -1029,13 +1047,17 @@ impl Command for ExecWorkflowCommand {
                 }
 
                 if !setup_failed {
-                    let runtime = Arc::clone(&self.engines.runtime);
+                    let runtime = Arc::clone(
+                        self.engines
+                            .require_container_runtime()
+                            .map_err(CommandError::from)?,
+                    );
                     let mount = mount_path.clone();
                     let base = base_image.clone();
                     let shared_for_factory = Arc::clone(&shared);
                     let setup_result = tokio::task::block_in_place(|| {
                         let factory = |idx: usize| -> Result<
-                            Box<dyn crate::engine::container::ContainerExec>,
+                            Box<dyn crate::engine::agent_runtime::background::AgentExec>,
                             EngineError,
                         > {
                             let (overlays, env) = resolved
@@ -1051,7 +1073,12 @@ impl Command for ExecWorkflowCommand {
                                 runtime.start_background(&base, &mount, env, overlays)?;
                             Ok(Box::new(container))
                         };
-                        let r = engine.run_setup(&setup_steps, &setup_abort_flags, &setup_on_failure_configs, factory);
+                        let r = engine.run_setup(
+                            &setup_steps,
+                            &setup_abort_flags,
+                            &setup_on_failure_configs,
+                            factory,
+                        );
                         if let Err(e) = &r {
                             shared_for_factory
                                 .lock()
@@ -1107,11 +1134,15 @@ impl Command for ExecWorkflowCommand {
                         worktree_git_mount.as_ref(),
                         &base_image,
                     );
-                    let runtime = Arc::clone(&self.engines.runtime);
+                    let runtime = Arc::clone(
+                        self.engines
+                            .require_container_runtime()
+                            .map_err(CommandError::from)?,
+                    );
                     let mount = mount_path.clone();
                     (teardown_aborted, any_teardown_failed) = tokio::task::block_in_place(|| {
                         let factory = |idx: usize| -> Result<
-                            Box<dyn crate::engine::container::ContainerExec>,
+                            Box<dyn crate::engine::agent_runtime::background::AgentExec>,
                             EngineError,
                         > {
                             let (overlays, env) = resolved
@@ -1270,8 +1301,7 @@ fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
 fn warn_context_workflow_in_phase(workflow: &Workflow, sink: &mut dyn UserMessageSink) {
     fn mentions_context_workflow(overlay: &str) -> bool {
         let t = overlay.trim();
-        t.starts_with("context(workflow")
-            && t[..t.len().min(20)].contains("workflow")
+        t.starts_with("context(workflow") && t[..t.len().min(20)].contains("workflow")
     }
     for (i, entry) in workflow.setup.iter().enumerate() {
         if let Some(overlays) = &entry.overlays {
@@ -1379,10 +1409,13 @@ fn collect_single_entry_overlays(
         );
     }
     let container_home = image_tag
-        .and_then(|tag| engines.runtime.image_home_dir(tag))
-        .or_else(|| {
-            crate::engine::overlay::detect_home_from_dockerfile(&dockerfile_path)
-        });
+        .and_then(|tag| {
+            engines
+                .container_runtime
+                .as_ref()
+                .and_then(|rt| rt.image_home_dir(tag))
+        })
+        .or_else(|| crate::engine::overlay::detect_home_from_dockerfile(&dockerfile_path));
     let request = crate::engine::overlay::OverlayRequest {
         directories: collected.directories,
         include_all_skills: false,
@@ -1613,8 +1646,8 @@ mod tests {
     };
     use crate::data::session::AgentName;
     use crate::data::workflow_state::WorkflowState;
-    use crate::engine::container::frontend::{ContainerProgress, ContainerStatus};
-    use crate::engine::container::instance::ContainerExitInfo;
+    use crate::engine::agent_runtime::execution::AgentExitInfo;
+    use crate::engine::agent_runtime::frontend::{AgentProgress, AgentStatus};
     use crate::engine::message::UserMessage;
     use crate::engine::workflow::actions::{
         AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput,
@@ -1653,14 +1686,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl ContainerFrontend for FakeExecWorkflowFrontend {
-        fn report_status(&mut self, _status: ContainerStatus) {}
-        fn report_progress(&mut self, _progress: ContainerProgress) {}
-        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    impl AgentFrontend for FakeExecWorkflowFrontend {
+        fn report_status(&mut self, _status: AgentStatus) {}
+        fn report_progress(&mut self, _progress: AgentProgress) {}
+        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
             let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            crate::engine::container::frontend::ContainerIo {
+            crate::engine::agent_runtime::frontend::AgentIo {
                 stdout: stdout_tx,
                 stderr: stderr_tx,
                 stdin_tx,
@@ -1696,7 +1729,7 @@ mod tests {
         fn user_choose_after_step_failure(
             &mut self,
             _step: &WorkflowStep,
-            _exit: &ContainerExitInfo,
+            _exit: &AgentExitInfo,
         ) -> Result<StepFailureChoice, EngineError> {
             Ok(StepFailureChoice::Abort)
         }
@@ -1836,7 +1869,9 @@ prompt = "do something"
             ))
         };
         Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine: overlay,
             auth_engine,
@@ -2098,8 +2133,7 @@ prompt = "do something"
         )
         .unwrap();
 
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Session::open(
             tmp.path().to_path_buf(),
@@ -2261,19 +2295,10 @@ prompt = "do something"
         let tmp = tempfile::tempdir().unwrap();
         let git_root = tmp.path();
         let work_items_dir = git_root.join("aspec").join("work-items");
-        let issue = make_issue(
-            "https://github.com/owner/repo/issues/84",
-            "Test",
-            "body",
-        );
+        let issue = make_issue("https://github.com/owner/repo/issues/84", "Test", "body");
 
-        let build = issue_source_overlay(
-            &GithubIssueSource,
-            &issue,
-            git_root,
-            &work_items_dir,
-        )
-        .expect("overlay build must succeed");
+        let build = issue_source_overlay(&GithubIssueSource, &issue, git_root, &work_items_dir)
+            .expect("overlay build must succeed");
 
         // Temp file exists and has the expected contents.
         assert!(build.temp_file.path().exists(), "temp file must exist");
@@ -2282,7 +2307,11 @@ prompt = "do something"
 
         // Slug + number derive from the issue.
         assert_eq!(build.number, 84);
-        assert!(build.slug.starts_with("ghb84"), "slug must start with 'ghb84', got: {}", build.slug);
+        assert!(
+            build.slug.starts_with("ghb84"),
+            "slug must start with 'ghb84', got: {}",
+            build.slug
+        );
 
         // Overlay is a ReadOnly Directory mapping the temp file to the
         // container-side work-items path.
@@ -2329,19 +2358,10 @@ prompt = "do something"
         let tmp = tempfile::tempdir().unwrap();
         let git_root = tmp.path();
         let work_items_dir = git_root.join("aspec").join("work-items");
-        let issue = make_issue(
-            "https://github.com/owner/repo/issues/7",
-            "Some Title",
-            "",
-        );
+        let issue = make_issue("https://github.com/owner/repo/issues/7", "Some Title", "");
 
-        let build = issue_source_overlay(
-            &GithubIssueSource,
-            &issue,
-            git_root,
-            &work_items_dir,
-        )
-        .unwrap();
+        let build =
+            issue_source_overlay(&GithubIssueSource, &issue, git_root, &work_items_dir).unwrap();
 
         let pid = std::process::id();
         let file_name = build

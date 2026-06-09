@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
 use crate::engine::workflow::actions::{
@@ -257,7 +257,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     fn user_choose_after_step_failure(
         &mut self,
         step: &WorkflowStep,
-        exit: &ContainerExitInfo,
+        exit: &AgentExitInfo,
     ) -> Result<StepFailureChoice, EngineError> {
         let mut error_lines = Vec::new();
         if let Some(sig) = exit.signal {
@@ -335,7 +335,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     fn set_stuck_sender(
         &mut self,
         sender: std::sync::Arc<
-            tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>,
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::execution::StuckEvent>,
         >,
     ) {
         if let Ok(mut guard) = self.stuck_sender_shared.lock() {
@@ -380,7 +380,7 @@ fn workflow_status_str(status: &WorkflowStepStatus) -> &'static str {
 mod tests {
     use std::time::Duration;
 
-    use crate::engine::container::instance::ContainerExitInfo;
+    use crate::engine::agent_runtime::execution::AgentExitInfo;
     use crate::engine::workflow::actions::StepFailureChoice;
     use crate::engine::workflow::frontend::WorkflowFrontend;
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;
@@ -397,7 +397,7 @@ mod tests {
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
         let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let container_io = crate::engine::container::frontend::ContainerIo {
+        let container_io = crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -455,8 +455,8 @@ mod tests {
         }
     }
 
-    fn dummy_exit_info() -> ContainerExitInfo {
-        ContainerExitInfo {
+    fn dummy_exit_info() -> AgentExitInfo {
+        AgentExitInfo {
             exit_code: 1,
             signal: None,
             started_at: chrono::Utc::now(),

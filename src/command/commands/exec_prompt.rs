@@ -42,7 +42,7 @@ pub trait ExecPromptCommandFrontend:
     + MountScopeFrontend
     + AgentSetupFrontend
     + AgentAuthFrontend
-    + crate::command::commands::agent_setup::HasContainerFrontend
+    + crate::command::commands::agent_setup::HasAgentFrontend
     + Send
     + Sync
 {
@@ -128,6 +128,13 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        // Agent execution under a sandbox-class runtime lands in WI 0090;
+        // until then the stub surfaces NotImplemented instead of panicking
+        // or silently falling back to Docker.
+        self.engines
+            .require_container_runtime()
+            .map_err(CommandError::from)?;
+
         let session = self.session;
 
         // Validate that at least one of prompt and --issue is provided.
@@ -163,11 +170,9 @@ impl Command for ExecPromptCommand {
 
         // Construct the final prompt string. The earlier validation above
         // guarantees at least one input is present, so this cannot be None.
-        let final_prompt = build_prompt_string(
-            self.flags.prompt.as_deref(),
-            issue_markdown.as_deref(),
-        )
-        .expect("validated above: at least one of prompt or --issue must be present");
+        let final_prompt =
+            build_prompt_string(self.flags.prompt.as_deref(), issue_markdown.as_deref())
+                .expect("validated above: at least one of prompt or --issue must be present");
 
         let agent = match resolve_agent(&self.flags.agent, &session) {
             Ok(a) => a,
@@ -309,7 +314,9 @@ impl Command for ExecPromptCommand {
             );
         }
 
-        let instance = match self.engines.runtime.build(options) {
+        let instance = match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
+            .and_then(|o| self.engines.runtime.build(o))
+        {
             Ok(i) => i,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -393,10 +400,18 @@ mod tests {
 
         struct FakeSource;
         impl IssueSource for FakeSource {
-            fn provider_name(&self) -> &str { "Test" }
-            fn provider_prefix(&self) -> &str { "tst" }
-            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
-            fn can_handle(&self, _: &str) -> bool { false }
+            fn provider_name(&self) -> &str {
+                "Test"
+            }
+            fn provider_prefix(&self) -> &str {
+                "tst"
+            }
+            fn issue_identifier(&self, _: &Issue) -> String {
+                "0".into()
+            }
+            fn can_handle(&self, _: &str) -> bool {
+                false
+            }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
