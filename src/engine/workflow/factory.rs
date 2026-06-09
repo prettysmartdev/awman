@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::data::session::{AgentName, Session, SessionId};
 use crate::data::workflow_definition::WorkflowStep;
-use crate::engine::container::instance::ContainerExecution;
+use crate::engine::agent_runtime::execution::AgentExecution;
 use crate::engine::context_prompt::WorkflowStepInfo;
 use crate::engine::error::EngineError;
 
@@ -24,7 +24,7 @@ pub struct WorkflowRuntimeContext {
     pub workflow_step_info: Option<WorkflowStepInfo>,
 }
 
-/// Trait implemented by Layer 2: produce a fresh `ContainerExecution` for a
+/// Trait implemented by Layer 2: produce a fresh `AgentExecution` for a
 /// step, or inject a prompt into an already-running container.
 pub trait ContainerExecutionFactory: Send + Sync {
     fn execution_for_step(
@@ -32,7 +32,7 @@ pub trait ContainerExecutionFactory: Send + Sync {
         step: &WorkflowStep,
         session: &Session,
         runtime: &WorkflowRuntimeContext,
-    ) -> Result<ContainerExecution, EngineError>;
+    ) -> Result<AgentExecution, EngineError>;
 
     /// Inject an additional prompt into a running container rather than
     /// launching a new one. Returns `Ok(None)` when the runtime backend does
@@ -40,7 +40,7 @@ pub trait ContainerExecutionFactory: Send + Sync {
     /// container).
     fn inject_prompt(
         &self,
-        execution: &ContainerExecution,
+        execution: &AgentExecution,
         prompt: &str,
     ) -> Result<Option<()>, EngineError>;
 }

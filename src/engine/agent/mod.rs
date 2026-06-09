@@ -829,20 +829,20 @@ mod tests {
         fn replay_queued(&mut self) {}
     }
 
-    struct FakeContainerFrontend;
-    impl crate::engine::message::UserMessageSink for FakeContainerFrontend {
+    struct FakeRuntimeFrontend;
+    impl crate::engine::message::UserMessageSink for FakeRuntimeFrontend {
         fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
     #[async_trait::async_trait]
-    impl crate::engine::container::frontend::ContainerFrontend for FakeContainerFrontend {
-        fn report_status(&mut self, _: crate::engine::container::frontend::ContainerStatus) {}
-        fn report_progress(&mut self, _: crate::engine::container::frontend::ContainerProgress) {}
-        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    impl crate::engine::agent_runtime::frontend::AgentFrontend for FakeRuntimeFrontend {
+        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
+        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
+        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
             let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            crate::engine::container::frontend::ContainerIo {
+            crate::engine::agent_runtime::frontend::AgentIo {
                 stdout: stdout_tx,
                 stderr: stderr_tx,
                 stdin_tx,
@@ -859,9 +859,9 @@ mod tests {
         }
         fn container_frontend(
             &mut self,
-        ) -> Box<dyn crate::engine::container::frontend::ContainerFrontend> {
+        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
             self.container_call_count += 1;
-            Box::new(FakeContainerFrontend)
+            Box::new(FakeRuntimeFrontend)
         }
     }
 
@@ -1057,9 +1057,9 @@ mod tests {
 
         let opts = engine.build_options(&session, &agent, &run).unwrap();
 
-        let prompt_file_opt = opts.iter().find(|o| {
-            matches!(o, ContainerOption::SystemPromptFile { .. })
-        });
+        let prompt_file_opt = opts
+            .iter()
+            .find(|o| matches!(o, ContainerOption::SystemPromptFile { .. }));
         assert!(
             prompt_file_opt.is_some(),
             "build_options must emit ContainerOption::SystemPromptFile for claude; \

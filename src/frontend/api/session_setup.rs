@@ -145,7 +145,7 @@ impl SessionSetupBusSender {
 use async_trait::async_trait;
 
 use crate::data::execution_event::EventPayload;
-use crate::engine::container::frontend::{ContainerFrontend, ContainerProgress, ContainerStatus};
+use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::ready::frontend::ReadyFrontend;
@@ -275,7 +275,7 @@ impl ReadyFrontend for SetupReadyFrontend {
         });
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(SetupContainerSink {
             event_bus: self.event_bus.clone(),
             session_prefix: self.session_prefix.clone(),
@@ -336,18 +336,18 @@ impl UserMessageSink for SetupContainerSink {
 }
 
 #[async_trait]
-impl ContainerFrontend for SetupContainerSink {
-    fn report_status(&mut self, status: ContainerStatus) {
+impl AgentFrontend for SetupContainerSink {
+    fn report_status(&mut self, status: AgentStatus) {
         let message = match &status {
-            ContainerStatus::Building => "Building container image...".to_string(),
-            ContainerStatus::Pulling => "Pulling container image...".to_string(),
-            ContainerStatus::Starting => "Starting container...".to_string(),
-            ContainerStatus::Running { container_name } => {
+            AgentStatus::Building => "Building container image...".to_string(),
+            AgentStatus::Pulling => "Pulling container image...".to_string(),
+            AgentStatus::Starting => "Starting container...".to_string(),
+            AgentStatus::Running { container_name } => {
                 format!("Container running: {container_name}")
             }
-            ContainerStatus::Stopping => "Stopping container...".to_string(),
-            ContainerStatus::Exited(code) => format!("Container exited with code {code}"),
-            ContainerStatus::Failed(reason) => format!("Container failed: {reason}"),
+            AgentStatus::Stopping => "Stopping container...".to_string(),
+            AgentStatus::Exited(code) => format!("Container exited with code {code}"),
+            AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
         log_setup_line(&self.session_prefix, &format!("container: {message}"));
         self.event_bus.emit(EventPayload::StatusMessage {
@@ -356,7 +356,7 @@ impl ContainerFrontend for SetupContainerSink {
         });
     }
 
-    fn report_progress(&mut self, progress: ContainerProgress) {
+    fn report_progress(&mut self, progress: AgentProgress) {
         log_setup_line(
             &self.session_prefix,
             &format!("container [{}] {}", progress.stage, progress.message),
@@ -367,7 +367,7 @@ impl ContainerFrontend for SetupContainerSink {
         });
     }
 
-    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         // Drain stdout/stderr into the tracing log so the API log file mirrors
         // the byte-stream output the CLI/TUI would see for the ready container.
         // Lines are tagged with the session prefix; partial lines are buffered
@@ -386,7 +386,7 @@ impl ContainerFrontend for SetupContainerSink {
             "stderr".into(),
             stderr_rx,
         );
-        crate::engine::container::frontend::ContainerIo {
+        crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,

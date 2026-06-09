@@ -7,7 +7,7 @@
 //! Coverage (from WI 0073 §2e items 36–40):
 //!   - `ContainerRuntime::is_available` matches reality
 //!   - `image_exists(unknown)` returns false; round-trip after a pull returns true
-//!   - `list_running_sync` succeeds and returns a vector (possibly empty)
+//!   - `list_running_all` succeeds and returns a vector (possibly empty)
 //!   - End-to-end run-and-stop of the `hello-world` image via a raw `docker run`,
 //!     then verify the runtime's view of running containers stays consistent.
 
@@ -71,16 +71,16 @@ fn docker_image_exists_true_after_pull_hello_world() {
 }
 
 #[test]
-fn docker_list_running_sync_returns_ok() {
+fn docker_list_running_all_returns_ok() {
     if !docker_available() {
         eprintln!("SKIP: Docker not available");
         return;
     }
     let runtime = ContainerRuntime::docker();
-    let listed = runtime.list_running_sync();
+    let listed = runtime.list_running_all();
     assert!(
         listed.is_ok(),
-        "list_running_sync must succeed against a live daemon: {:?}",
+        "list_running_all must succeed against a live daemon: {:?}",
         listed.err()
     );
 }
@@ -300,8 +300,8 @@ fn docker_hello_world_run_does_not_appear_in_amux_listing() {
     }
 
     let before = ContainerRuntime::docker()
-        .list_running_sync()
-        .expect("list_running_sync before");
+        .list_running_all()
+        .expect("list_running_all before");
 
     let status = Command::new("docker")
         .args(["run", "--rm", "hello-world:latest"])
@@ -312,8 +312,8 @@ fn docker_hello_world_run_does_not_appear_in_amux_listing() {
     assert!(status.success(), "docker run hello-world must succeed");
 
     let after = ContainerRuntime::docker()
-        .list_running_sync()
-        .expect("list_running_sync after");
+        .list_running_all()
+        .expect("list_running_all after");
 
     // hello-world isn't amux-labeled and exits immediately; the amux listing
     // should be unchanged in size.

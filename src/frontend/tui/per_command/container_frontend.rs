@@ -1,26 +1,24 @@
-//! `ContainerFrontend` impls for the TUI — both on `TuiCommandFrontend`
+//! `AgentFrontend` impls for the TUI — both on `TuiCommandFrontend`
 //! (direct container I/O) and on a standalone `TuiContainerProxy` (used by
 //! `container_frontend()` return values in Init/Ready).
 //!
 //! For TUI mode, the engine's container backend takes ownership of the byte
-//! channels via `take_container_io` and bridges them directly to the
+//! channels via `take_io` and bridges them directly to the
 //! container's PTY master or piped stdio.
 
 use async_trait::async_trait;
 
-use crate::engine::container::frontend::{
-    ContainerFrontend, ContainerIo, ContainerProgress, ContainerStatus,
-};
+use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::user_message::{SharedStatusLog, StatusLogEntry};
 
-// ─── ContainerFrontend for TuiCommandFrontend ────────────────────────────
+// ─── AgentFrontend for TuiCommandFrontend ────────────────────────────
 
 #[async_trait]
-impl ContainerFrontend for TuiCommandFrontend {
-    fn report_status(&mut self, status: ContainerStatus) {
-        if let ContainerStatus::Running { ref container_name } = status {
+impl AgentFrontend for TuiCommandFrontend {
+    fn report_status(&mut self, status: AgentStatus) {
+        if let AgentStatus::Running { ref container_name } = status {
             if let Ok(mut name) = self.container_name_shared.lock() {
                 *name = Some(container_name.clone());
             }
@@ -28,15 +26,15 @@ impl ContainerFrontend for TuiCommandFrontend {
         self.messages.info(format!("Container: {status:?}"));
     }
 
-    fn report_progress(&mut self, progress: ContainerProgress) {
+    fn report_progress(&mut self, progress: AgentProgress) {
         self.messages
             .info(format!("{}: {}", progress.stage, progress.message));
     }
 
-    fn take_container_io(&mut self) -> ContainerIo {
+    fn take_io(&mut self) -> AgentIo {
         self.container_io
             .take()
-            .expect("TuiCommandFrontend::take_container_io called but no ContainerIo available")
+            .expect("TuiCommandFrontend::take_io called but no AgentIo available")
     }
 }
 
@@ -46,21 +44,21 @@ impl ContainerFrontend for TuiCommandFrontend {
 /// trait impls.
 ///
 /// Two modes:
-/// - **Without `ContainerIo`** (`new`): creates a non-interactive ContainerIo
+/// - **Without `AgentIo`** (`new`): creates a non-interactive AgentIo
 ///   that routes stdout/stderr into the shared status log.
-/// - **With `ContainerIo`** (`with_io`): hands the byte channels to the
+/// - **With `AgentIo`** (`with_io`): hands the byte channels to the
 ///   engine's container backend so it can bridge a real PTY directly. Used by
 ///   PTY commands like `chat` so their output renders inside the TUI's
 ///   container overlay.
 pub struct TuiContainerProxy {
     log: SharedStatusLog,
-    container_io: Option<crate::engine::container::frontend::ContainerIo>,
+    container_io: Option<crate::engine::agent_runtime::frontend::AgentIo>,
     container_name_shared: Option<crate::frontend::tui::tabs::SharedContainerName>,
 }
 
 impl TuiContainerProxy {
     /// Construct a status-log-only proxy (no PTY bridging).
-    /// Creates non-interactive ContainerIo channels that route to the status log.
+    /// Creates non-interactive AgentIo channels that route to the status log.
     pub fn new(log: SharedStatusLog) -> Self {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -105,7 +103,7 @@ impl TuiContainerProxy {
             }
         });
 
-        let io = ContainerIo {
+        let io = AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -126,7 +124,7 @@ impl TuiContainerProxy {
     /// TUI stats poller can discover the container.
     pub fn with_io(
         log: SharedStatusLog,
-        io: crate::engine::container::frontend::ContainerIo,
+        io: crate::engine::agent_runtime::frontend::AgentIo,
         container_name_shared: crate::frontend::tui::tabs::SharedContainerName,
     ) -> Self {
         Self {
@@ -151,9 +149,9 @@ impl UserMessageSink for TuiContainerProxy {
 }
 
 #[async_trait]
-impl ContainerFrontend for TuiContainerProxy {
-    fn report_status(&mut self, status: ContainerStatus) {
-        if let ContainerStatus::Running { ref container_name } = status {
+impl AgentFrontend for TuiContainerProxy {
+    fn report_status(&mut self, status: AgentStatus) {
+        if let AgentStatus::Running { ref container_name } = status {
             if let Some(ref shared) = self.container_name_shared {
                 if let Ok(mut name) = shared.lock() {
                     *name = Some(container_name.clone());
@@ -162,11 +160,11 @@ impl ContainerFrontend for TuiContainerProxy {
         }
     }
 
-    fn report_progress(&mut self, _progress: ContainerProgress) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
 
-    fn take_container_io(&mut self) -> ContainerIo {
+    fn take_io(&mut self) -> AgentIo {
         self.container_io
             .take()
-            .expect("TuiContainerProxy::take_container_io called but no ContainerIo available")
+            .expect("TuiContainerProxy::take_io called but no AgentIo available")
     }
 }

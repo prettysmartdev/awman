@@ -34,9 +34,9 @@ pub use fs::api_db::{CommandResult, WorkerId};
 pub use image_tags::{agent_image_tag, project_image_tag, repo_hash};
 pub use repo_dockerfile_paths::RepoDockerfilePaths;
 pub use session::{
-    AgentName, CommandInvocation, CommandStatus, ContainerHandle, GitRootResolver, Session,
-    SessionId, SessionLogEntry, SessionLogKind, SessionState, SessionType, StepStatus,
-    WorkflowInvocation, WorkflowStepRecord,
+    AgentHandle, AgentName, CommandInvocation, CommandStatus, GitRootResolver, Session, SessionId,
+    SessionLogEntry, SessionLogKind, SessionState, SessionType, StepStatus, WorkflowInvocation,
+    WorkflowStepRecord,
 };
 pub use session_manager::{InMemorySessionStore, SessionManager, SessionStore};
 pub use workflow_dag::{detect_cycle, validate_references, WorkflowDag};

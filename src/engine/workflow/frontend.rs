@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::container::instance::ContainerExitInfo;
-use crate::engine::container::instance::StuckEvent;
+use crate::engine::agent_runtime::execution::AgentExitInfo;
+use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
 use crate::engine::workflow::actions::{
@@ -83,7 +83,7 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     fn user_choose_after_step_failure(
         &mut self,
         step: &WorkflowStep,
-        exit: &ContainerExitInfo,
+        exit: &AgentExitInfo,
     ) -> Result<StepFailureChoice, EngineError>;
 
     // === Channel setup ===

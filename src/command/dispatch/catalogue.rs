@@ -959,10 +959,8 @@ const REMOTE_EXEC_WORKFLOW_KEPT: usize =
     count_kept(&EXEC_WORKFLOW_FLAGS, REMOTE_EXEC_EXCLUDED_FLAG_NAMES);
 const REMOTE_EXEC_WORKFLOW_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_WORKFLOW_KEPT;
 
-const REMOTE_EXEC_PROMPT_KEPT: usize = count_kept(
-    &EXEC_PROMPT_FLAGS,
-    REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
-);
+const REMOTE_EXEC_PROMPT_KEPT: usize =
+    count_kept(&EXEC_PROMPT_FLAGS, REMOTE_EXEC_EXCLUDED_FLAG_NAMES);
 const REMOTE_EXEC_PROMPT_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_PROMPT_KEPT;
 
 const fn build_remote_flags<const N: usize>(base: &[FlagSpec], excluded: &[&str]) -> [FlagSpec; N] {

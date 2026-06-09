@@ -46,11 +46,14 @@ use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind, FlagSpec};
 use crate::command::error::CommandError;
 use crate::data::session::Session;
 use crate::engine::agent::AgentEngine;
+use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::engine::auth::AuthEngine;
 use crate::engine::container::ContainerRuntime;
+use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::message::UserMessageSink;
 use crate::engine::overlay::OverlayEngine;
+use crate::engine::sandbox::SandboxRuntime;
 
 pub mod catalogue;
 pub mod parsed_input;
@@ -65,12 +68,43 @@ pub use parsed_input::ParsedCommandBoxInput;
 /// engines accept per-invocation flag values.
 #[derive(Clone)]
 pub struct Engines {
-    pub runtime: Arc<ContainerRuntime>,
+    /// Cross-paradigm trait-object handle. Used for build(), list_running(),
+    /// stats(), stop(), exec_args(), is_available(), capabilities() and
+    /// other operations that exist on both paradigms.
+    pub runtime: Arc<dyn AgentRuntimeEngine>,
+
+    /// Container-paradigm-specific handle, set when `runtime` is a
+    /// ContainerRuntime. None when the active runtime is a SandboxRuntime.
+    /// Used for image-paradigm operations (build_image, image_exists,
+    /// image_home_dir, start_background) that only exist on the container
+    /// side. Points at the same underlying object as `runtime`.
+    pub container_runtime: Option<Arc<ContainerRuntime>>,
+
+    /// Sandbox-paradigm-specific handle, mirror of `container_runtime` for
+    /// sandbox-only operations. None when running under a ContainerRuntime.
+    pub sandbox_runtime: Option<Arc<SandboxRuntime>>,
+
     pub git_engine: Arc<GitEngine>,
     pub overlay_engine: Arc<OverlayEngine>,
     pub auth_engine: Arc<AuthEngine>,
     pub agent_engine: Arc<AgentEngine>,
     pub workflow_state_store: Arc<crate::data::EngineWorkflowStateStore>,
+}
+
+impl Engines {
+    /// The container-paradigm runtime handle, or — while the active runtime
+    /// is the stubbed sandbox tier — the `NotImplemented` error WI 0090
+    /// resolves. Container-paradigm flows (agent setup, image builds,
+    /// background containers) call this instead of unwrapping
+    /// `container_runtime` so a sandbox-configured user gets an actionable
+    /// error, never a panic or a silent Docker fallback.
+    pub fn require_container_runtime(&self) -> Result<&Arc<ContainerRuntime>, EngineError> {
+        self.container_runtime
+            .as_ref()
+            .ok_or(EngineError::NotImplemented(
+                "docker-sbx-experimental is not yet implemented — track work-item 0090",
+            ))
+    }
 }
 
 // ─── CommandFrontend trait ──────────────────────────────────────────────────
@@ -892,7 +926,9 @@ mod tests {
             ))
         };
         Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine: overlay,
             auth_engine,
@@ -1117,7 +1153,10 @@ mod tests {
         frontend.args.insert("prompt".into(), "   ".into());
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
         let result = dispatch.build_command(&["exec", "prompt"]);
-        assert!(result.is_ok(), "whitespace prompt should build OK (validation deferred to runtime)");
+        assert!(
+            result.is_ok(),
+            "whitespace prompt should build OK (validation deferred to runtime)"
+        );
     }
 
     #[test]
@@ -1328,13 +1367,19 @@ mod tests {
         // When only --issue is set (no positional prompt), build_command must succeed.
         // The runtime check (at least one of prompt/issue) happens in run_with_frontend.
         let mut frontend = FakeCommandFrontend::new();
-        frontend.strings.insert("issue".into(), "owner/repo#1".into());
+        frontend
+            .strings
+            .insert("issue".into(), "owner/repo#1".into());
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
         let result = dispatch.build_command(&["exec", "prompt"]);
         assert!(
             result.is_ok(),
             "build_command must succeed when only --issue is set: {}",
-            result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
         );
         match result.unwrap() {
             BuiltCommand::ExecPrompt(cmd) => {

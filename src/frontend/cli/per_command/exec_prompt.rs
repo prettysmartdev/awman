@@ -1,6 +1,6 @@
 //! `ExecPromptCommandFrontend` impl for the CLI.
 //!
-//! `container_frontend()` comes from the blanket `HasContainerFrontend` impl
+//! `container_frontend()` comes from the blanket `HasAgentFrontend` impl
 //! on `CliFrontend` (see `per_command/chat.rs`), which is a supertrait of
 //! `ExecPromptCommandFrontend`.
 

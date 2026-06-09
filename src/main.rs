@@ -20,6 +20,7 @@ use awman::data::error::DataError;
 use awman::data::migration;
 use awman::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use awman::engine::agent::AgentEngine;
+use awman::engine::agent_runtime;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
@@ -55,9 +56,11 @@ async fn main() -> Result<ExitCode> {
     }
 
     let global_config = GlobalConfig::load().unwrap_or_default();
-    let runtime = Arc::new(
-        ContainerRuntime::detect(&global_config).context("failed to detect container runtime")?,
-    );
+    let detected =
+        agent_runtime::detect(&global_config).context("failed to detect agent runtime")?;
+    let runtime = detected.engine();
+    let container_runtime = detected.container_runtime();
+    let sandbox_runtime = detected.sandbox_runtime();
     let git_engine = Arc::new(GitEngine::new());
 
     let working_dir = std::env::current_dir().context("could not read current directory")?;
@@ -89,13 +92,25 @@ async fn main() -> Result<ExitCode> {
         Arc::new(OverlayEngine::new(&session).context("failed to construct overlay engine")?);
     let auth_engine =
         Arc::new(AuthEngine::new(&session).context("failed to construct auth engine")?);
-    let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
+    // AgentEngine is container-paradigm-specific. Under a sandbox-class
+    // runtime it receives an inert Docker handle that is never exercised:
+    // every container-paradigm flow guards via
+    // `Engines::require_container_runtime()` first (sandbox flows land in
+    // WI 0090).
+    let agent_engine = Arc::new(AgentEngine::new(
+        overlay_engine.clone(),
+        container_runtime
+            .clone()
+            .unwrap_or_else(|| Arc::new(ContainerRuntime::docker())),
+    ));
     let workflow_state_store = Arc::new(awman::data::EngineWorkflowStateStore::at_git_root(
         session.git_root().to_path_buf(),
     ));
 
     let engines = Engines {
         runtime,
+        container_runtime,
+        sandbox_runtime,
         git_engine,
         overlay_engine,
         auth_engine,

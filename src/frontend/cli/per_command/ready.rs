@@ -3,7 +3,7 @@
 //! Prompts on stdin for the Dockerfile creation decision when stdin is a TTY;
 //! otherwise returns the safe non-interactive defaults.
 
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::ready::{ReadyFrontend, ReadyPhase, ReadySummary};
@@ -54,7 +54,7 @@ impl ReadyFrontend for CliFrontend {
         });
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(super::container_frontend_marker::CliContainerProxy)
     }
 

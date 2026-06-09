@@ -23,10 +23,7 @@ impl RepoDockerfilePaths {
     /// Construct with an optional override path for the project Dockerfile.
     /// When provided, `project_dockerfile()` returns the override instead of
     /// the default `<git_root>/Dockerfile.dev`.
-    pub fn with_project_dockerfile(
-        git_root: impl Into<PathBuf>,
-        path: Option<PathBuf>,
-    ) -> Self {
+    pub fn with_project_dockerfile(git_root: impl Into<PathBuf>, path: Option<PathBuf>) -> Self {
         Self {
             git_root: git_root.into(),
             project_dockerfile_override: path,

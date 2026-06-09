@@ -160,7 +160,9 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
-            system_prompt_delivery: SystemPromptMode::EnvFile { var: "GEMINI_SYSTEM_MD" },
+            system_prompt_delivery: SystemPromptMode::EnvFile {
+                var: "GEMINI_SYSTEM_MD",
+            },
             system_prompt_flag: None,
         },
         "copilot" => AgentMatrix {
@@ -174,7 +176,9 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
-            system_prompt_delivery: SystemPromptMode::EnvFile { var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" },
+            system_prompt_delivery: SystemPromptMode::EnvFile {
+                var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS",
+            },
             system_prompt_flag: None,
         },
         "crush" => AgentMatrix {
@@ -370,7 +374,9 @@ mod tests {
         assert!(
             matches!(
                 m.system_prompt_delivery,
-                SystemPromptMode::AppendInline { key: "developer_instructions" }
+                SystemPromptMode::AppendInline {
+                    key: "developer_instructions"
+                }
             ),
             "codex must use AppendInline {{ key: developer_instructions }}; got {:?}",
             m.system_prompt_delivery
@@ -440,7 +446,10 @@ mod tests {
     fn antigravity_system_prompt_delivery_is_add_dir() {
         let m = matrix_for("antigravity").unwrap();
         assert!(
-            matches!(m.system_prompt_delivery, SystemPromptMode::AddDir { flag: "--add-dir" }),
+            matches!(
+                m.system_prompt_delivery,
+                SystemPromptMode::AddDir { flag: "--add-dir" }
+            ),
             "antigravity must use AddDir {{ flag: \"--add-dir\" }}; got {:?}",
             m.system_prompt_delivery
         );

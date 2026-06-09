@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
-use crate::engine::container::instance::{ContainerStats, StuckEvent};
+use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::user_message::SharedStatusLog;
 
@@ -94,7 +94,7 @@ pub type SharedYoloCancelFlag = Arc<AtomicBool>;
 pub type SharedPtyResetFlag = Arc<AtomicBool>;
 
 /// Shared container name. Set by the container frontend when the engine
-/// reports `ContainerStatus::Running { container_name }`. The TUI event
+/// reports `AgentStatus::Running { container_name }`. The TUI event
 /// loop reads this to populate `ContainerInfo.container_name` for stats
 /// polling.
 pub type SharedContainerName = Arc<Mutex<Option<String>>>;
@@ -160,7 +160,7 @@ pub struct ContainerInfo {
     pub agent_display_name: String,
     pub container_name: String,
     pub start_time: Instant,
-    pub latest_stats: Option<ContainerStats>,
+    pub latest_stats: Option<AgentStats>,
     /// History of `(cpu_percent, memory_mb)` samples for averaging in the
     /// post-exit summary bar.
     pub stats_history: Vec<(f64, f64)>,

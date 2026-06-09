@@ -10,17 +10,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use crate::engine::agent_runtime::background::{AgentExec, ExecOutput};
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::options::OverlaySpec;
 use crate::engine::error::EngineError;
-
-/// Output captured from a single `exec` call into a background container.
-#[derive(Debug, Clone)]
-pub struct ExecOutput {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-}
 
 /// A running background container that accepts `exec` calls.
 ///
@@ -92,35 +85,7 @@ impl Drop for BackgroundContainer {
     }
 }
 
-/// Abstraction over container exec to enable mock testing of
-/// `WorkflowEngine::run_setup` and `run_teardown` without a live container runtime.
-pub trait ContainerExec: Send + Sync {
-    fn exec(
-        &self,
-        command: &str,
-        env: Option<&HashMap<String, String>>,
-    ) -> Result<ExecOutput, EngineError>;
-
-    /// Execute a command, streaming each output line to `on_line` as it arrives.
-    /// The default falls back to `exec` and iterates the buffered output.
-    fn exec_streaming(
-        &self,
-        command: &str,
-        env: Option<&HashMap<String, String>>,
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<ExecOutput, EngineError> {
-        let output = self.exec(command, env)?;
-        for line in output.stdout.lines() {
-            on_line(line);
-        }
-        for line in output.stderr.lines() {
-            on_line(line);
-        }
-        Ok(output)
-    }
-}
-
-impl ContainerExec for BackgroundContainer {
+impl AgentExec for BackgroundContainer {
     fn exec(
         &self,
         command: &str,
@@ -383,9 +348,9 @@ pub(super) fn default_stop_and_remove(cli_bin: &str, container_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::session::{ContainerHandle, Session};
+    use crate::data::session::{AgentHandle, Session};
+    use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
     use crate::engine::container::backend::ContainerBackend;
-    use crate::engine::container::instance::{ContainerInstance, ContainerStats};
     use crate::engine::container::options::ResolvedContainerOptions;
     use std::sync::Mutex;
 
@@ -407,16 +372,16 @@ mod tests {
         fn build(
             &self,
             _options: ResolvedContainerOptions,
-        ) -> Result<Box<dyn ContainerInstance>, EngineError> {
+        ) -> Result<Box<dyn AgentInstance>, EngineError> {
             unimplemented!("not exercised by BackgroundContainer lifecycle tests")
         }
-        fn list_running(&self, _s: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
+        fn list_running(&self, _s: &Session) -> Result<Vec<AgentHandle>, EngineError> {
             Ok(Vec::new())
         }
-        fn stats(&self, _h: &ContainerHandle) -> Result<ContainerStats, EngineError> {
+        fn stats(&self, _h: &AgentHandle) -> Result<AgentStats, EngineError> {
             unimplemented!()
         }
-        fn stop(&self, _h: &ContainerHandle) -> Result<(), EngineError> {
+        fn stop(&self, _h: &AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
         fn exec_args(

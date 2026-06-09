@@ -4,13 +4,13 @@
 
 use std::process::{Command, Stdio};
 
-use crate::data::session::{ContainerHandle, Session};
+use crate::data::session::{AgentHandle, Session};
+use crate::engine::agent_runtime::execution::{
+    AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, AgentStats, ExecutionBackend,
+};
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::docker::build_run_argv;
-use crate::engine::container::instance::{
-    handle_now, ContainerExecution, ContainerExitInfo, ContainerId, ContainerInstance,
-    ContainerStats, ExecutionBackend,
-};
+use crate::engine::container::instance::{handle_now, ContainerId};
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -126,7 +126,7 @@ fn is_awman_container(name: &str) -> bool {
 
 /// Parse the JSON output of `container list --format json` into container
 /// handles, filtering for running awman containers.
-fn parse_apple_list_output(stdout: &str) -> Vec<ContainerHandle> {
+fn parse_apple_list_output(stdout: &str) -> Vec<AgentHandle> {
     let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(stdout);
     let rows: Vec<serde_json::Value> = match arr {
         Ok(v) => v,
@@ -150,7 +150,7 @@ fn parse_apple_list_output(stdout: &str) -> Vec<ContainerHandle> {
         if id.is_empty() && name.is_empty() {
             continue;
         }
-        handles.push(ContainerHandle {
+        handles.push(AgentHandle {
             id,
             image_tag,
             name,
@@ -173,7 +173,7 @@ impl ContainerBackend for AppleBackend {
     fn build(
         &self,
         options: ResolvedContainerOptions,
-    ) -> Result<Box<dyn ContainerInstance>, EngineError> {
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
         let image = options.image.clone().ok_or_else(|| {
             EngineError::ConflictingOptions("missing required Image option".into())
         })?;
@@ -188,7 +188,7 @@ impl ContainerBackend for AppleBackend {
         }))
     }
 
-    fn list_running(&self, _session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
+    fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
         let output = Command::new("container")
             .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
@@ -202,7 +202,7 @@ impl ContainerBackend for AppleBackend {
         Ok(parse_apple_list_output(&stdout))
     }
 
-    fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+    fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
         let output = Command::new("container")
             .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
@@ -216,7 +216,7 @@ impl ContainerBackend for AppleBackend {
         Ok(parse_apple_list_output(&stdout))
     }
 
-    fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
+    fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let take_sample = |name: &str| -> Result<(u64, u64), EngineError> {
             let out = Command::new("container")
                 .args(["stats", "--no-stream", "--format", "json", name])
@@ -281,14 +281,14 @@ impl ContainerBackend for AppleBackend {
         };
         let memory_mb = (mem as f64) / (1024.0 * 1024.0);
 
-        Ok(ContainerStats {
+        Ok(AgentStats {
             name: handle.name.clone(),
             cpu_percent,
             memory_mb,
         })
     }
 
-    fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError> {
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         let _ = Command::new("container")
             .args(["stop", &handle.name])
             .stdout(Stdio::null())
@@ -368,36 +368,34 @@ struct AppleContainerInstance {
     options: ResolvedContainerOptions,
 }
 
-impl ContainerInstance for AppleContainerInstance {
-    fn id(&self) -> &ContainerId {
-        &self.id
-    }
-    fn name(&self) -> &ContainerName {
-        &self.name
-    }
-    fn image(&self) -> &ImageRef {
-        &self.image
+impl AgentInstance for AppleContainerInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        AgentHandlePreview {
+            id: self.id.0.clone(),
+            name: self.name.0.clone(),
+            image: self.image.0.clone(),
+        }
     }
 
     fn run_with_frontend(
         self: Box<Self>,
-        mut frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
-    ) -> Result<ContainerExecution, EngineError> {
+        mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
         let argv = build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
 
         frontend.report_status(
-            crate::engine::container::frontend::ContainerStatus::Running {
+            crate::engine::agent_runtime::frontend::AgentStatus::Running {
                 container_name: self.name.0.clone(),
             },
         );
 
-        // Read per-frontend timeouts before draining `take_container_io`.
+        // Read per-frontend timeouts before draining `take_io`.
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
-        let io = frontend.take_container_io();
+        let io = frontend.take_io();
 
         let bridge_cfg = bridge_config_for(&self.name, grace_timeout, stuck_timeout);
 
@@ -436,17 +434,17 @@ fn bridge_config_for(
 }
 
 /// Spawn the Apple `container run -it` binary via `portable-pty` and bridge
-/// the PTY master to the frontend's `ContainerIo` channels via the shared
+/// the PTY master to the frontend's `AgentIo` channels via the shared
 /// I/O bridge.
 fn spawn_pty_bridged_apple(
     instance: Box<AppleContainerInstance>,
-    io: crate::engine::container::frontend::ContainerIo,
+    io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     _seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::ContainerHandle,
+    handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<ContainerExecution, EngineError> {
+) -> Result<AgentExecution, EngineError> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
@@ -486,23 +484,23 @@ fn spawn_pty_bridged_apple(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(
+    Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
     ))
 }
 
-/// Spawn `container run` with piped stdio and bridge through `ContainerIo`.
+/// Spawn `container run` with piped stdio and bridge through `AgentIo`.
 fn spawn_piped_apple(
     instance: Box<AppleContainerInstance>,
-    io: crate::engine::container::frontend::ContainerIo,
+    io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::ContainerHandle,
+    handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<ContainerExecution, EngineError> {
+) -> Result<AgentExecution, EngineError> {
     let mut cmd = Command::new("container");
     cmd.args(&argv);
     cmd.stdin(Stdio::piped());
@@ -540,7 +538,7 @@ fn spawn_piped_apple(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(
+    Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
@@ -562,7 +560,7 @@ struct AppleExecution {
 }
 
 impl ExecutionBackend for AppleExecution {
-    fn wait_blocking(mut self: Box<Self>) -> Result<ContainerExitInfo, EngineError> {
+    fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
         // PTY-bridged path: wait on the portable-pty child.
         if let Some(mut child) = self.pty_child.take() {
             let status = child
@@ -570,7 +568,7 @@ impl ExecutionBackend for AppleExecution {
                 .map_err(|e| EngineError::Container(format!("wait container (pty): {e}")))?;
             self.pty_master = None;
             let exit_code = status.exit_code().try_into().unwrap_or(-1);
-            return Ok(ContainerExitInfo {
+            return Ok(AgentExitInfo {
                 exit_code,
                 signal: None,
                 started_at: self.started_at,
@@ -593,7 +591,7 @@ impl ExecutionBackend for AppleExecution {
         };
         #[cfg(not(unix))]
         let signal = None;
-        Ok(ContainerExitInfo {
+        Ok(AgentExitInfo {
             exit_code,
             signal,
             started_at: self.started_at,
@@ -624,21 +622,23 @@ impl ExecutionBackend for AppleExecution {
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<super::instance::CancelHandle> {
+    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
         let name = self.container_name.clone();
-        Some(super::instance::CancelHandle::new(move || {
-            let _ = Command::new("container")
-                .args(["stop", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = Command::new("container")
-                .args(["rm", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            Ok(())
-        }))
+        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
+            move || {
+                let _ = Command::new("container")
+                    .args(["stop", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = Command::new("container")
+                    .args(["rm", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                Ok(())
+            },
+        ))
     }
 }
 

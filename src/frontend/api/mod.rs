@@ -64,21 +64,26 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     // are honored in API mode. Per-repo `.awman/config.json` is loaded later
     // per session via `Session::open_or_workdir_fallback`.
     let global_config = crate::data::config::global::GlobalConfig::load().unwrap_or_default();
-    let runtime = Arc::new(
-        crate::engine::container::ContainerRuntime::detect(&global_config)
-            .map_err(|e| CommandError::Other(format!("container runtime detect: {e}")))?,
-    );
-    tracing::info!(
-        runtime = runtime.runtime_name(),
-        "Container runtime resolved"
-    );
+    let detected = crate::engine::agent_runtime::detect(&global_config)
+        .map_err(|e| CommandError::Other(format!("agent runtime detect: {e}")))?;
+    let runtime = detected.engine();
+    let container_runtime = detected.container_runtime();
+    let sandbox_runtime = detected.sandbox_runtime();
+    tracing::info!(runtime = runtime.runtime_name(), "Agent runtime resolved");
     let git_engine = Arc::new(crate::engine::git::GitEngine::new());
     let overlay_engine = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
         auth_paths,
     ));
+    // AgentEngine is container-paradigm-specific. Under a sandbox-class
+    // runtime it receives an inert Docker handle that is never exercised:
+    // every container-paradigm flow guards via
+    // `Engines::require_container_runtime()` first (sandbox flows land in
+    // WI 0090).
     let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
         overlay_engine.clone(),
-        runtime.clone(),
+        container_runtime
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::engine::container::ContainerRuntime::docker())),
     ));
     let auth_engine_arc = Arc::new(auth_engine);
     // Use a temporary workflow state store path; each command opens its own
@@ -90,6 +95,8 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
 
     let engines = crate::command::dispatch::Engines {
         runtime,
+        container_runtime,
+        sandbox_runtime,
         git_engine,
         overlay_engine,
         auth_engine: auth_engine_arc,

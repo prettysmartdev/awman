@@ -383,42 +383,52 @@ impl InitEngine {
                             text: format!("skipping audit: {e}"),
                         });
                     }
-                    Ok(options) => match self.container_runtime.build(options) {
-                        Err(e) => {
-                            self.summary.audit = StepStatus::Skipped;
-                            frontend.write_message(crate::engine::message::UserMessage {
-                                level: crate::engine::message::MessageLevel::Warning,
-                                text: format!("skipping audit: {e}"),
-                            });
-                        }
-                        Ok(instance) => {
-                            let container_fe = frontend.container_frontend();
-                            match instance.run_with_frontend(container_fe) {
-                                Err(e) => {
-                                    self.summary.audit = StepStatus::Skipped;
-                                    frontend.write_message(crate::engine::message::UserMessage {
-                                        level: crate::engine::message::MessageLevel::Warning,
-                                        text: format!("skipping audit: {e}"),
-                                    });
-                                }
-                                Ok(mut exec) => match exec.wait().await {
+                    Ok(options) => {
+                        match crate::engine::container::options::ResolvedContainerOptions::resolve(
+                            options,
+                        )
+                        .map_err(crate::engine::error::EngineError::from)
+                        .and_then(|o| self.container_runtime.build(o))
+                        {
+                            Err(e) => {
+                                self.summary.audit = StepStatus::Skipped;
+                                frontend.write_message(crate::engine::message::UserMessage {
+                                    level: crate::engine::message::MessageLevel::Warning,
+                                    text: format!("skipping audit: {e}"),
+                                });
+                            }
+                            Ok(instance) => {
+                                let container_fe = frontend.container_frontend();
+                                match instance.run_with_frontend(container_fe) {
                                     Err(e) => {
-                                        self.summary.audit = StepStatus::Failed(e.to_string());
+                                        self.summary.audit = StepStatus::Skipped;
+                                        frontend.write_message(
+                                            crate::engine::message::UserMessage {
+                                                level:
+                                                    crate::engine::message::MessageLevel::Warning,
+                                                text: format!("skipping audit: {e}"),
+                                            },
+                                        );
                                     }
-                                    Ok(exit) => {
-                                        if exit.exit_code == 0 {
-                                            self.summary.audit = StepStatus::Done;
-                                        } else {
-                                            self.summary.audit = StepStatus::Failed(format!(
-                                                "audit exited with code {}",
-                                                exit.exit_code
-                                            ));
+                                    Ok(mut exec) => match exec.wait().await {
+                                        Err(e) => {
+                                            self.summary.audit = StepStatus::Failed(e.to_string());
                                         }
-                                    }
-                                },
+                                        Ok(exit) => {
+                                            if exit.exit_code == 0 {
+                                                self.summary.audit = StepStatus::Done;
+                                            } else {
+                                                self.summary.audit = StepStatus::Failed(format!(
+                                                    "audit exited with code {}",
+                                                    exit.exit_code
+                                                ));
+                                            }
+                                        }
+                                    },
+                                }
                             }
                         }
-                    },
+                    }
                 }
                 // Issue 12: After the audit, rebuild images if audit succeeded.
                 InitPhase::RebuildingAfterAudit
@@ -530,9 +540,7 @@ mod tests {
     use super::*;
     use crate::data::config::repo::WorkItemsConfig;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
-    use crate::engine::container::frontend::{
-        ContainerFrontend, ContainerProgress, ContainerStatus,
-    };
+    use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
     use crate::engine::message::{UserMessage, UserMessageSink};
     use crate::engine::overlay::OverlayEngine;
     use crate::engine::step_status::StepStatus;
@@ -553,26 +561,27 @@ mod tests {
                 replace_aspec: true,
                 run_audit: true,
                 work_items_config: Some(WorkItemsConfig::default()),
-                dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
+                dockerfile_decision:
+                    crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
                 phases: Vec::new(),
             }
         }
     }
 
-    struct FakeContainerFrontend;
-    impl UserMessageSink for FakeContainerFrontend {
+    struct FakeRuntimeFrontend;
+    impl UserMessageSink for FakeRuntimeFrontend {
         fn write_message(&mut self, _: UserMessage) {}
         fn replay_queued(&mut self) {}
     }
     #[async_trait::async_trait]
-    impl ContainerFrontend for FakeContainerFrontend {
-        fn report_status(&mut self, _: ContainerStatus) {}
-        fn report_progress(&mut self, _: ContainerProgress) {}
-        fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    impl AgentFrontend for FakeRuntimeFrontend {
+        fn report_status(&mut self, _: AgentStatus) {}
+        fn report_progress(&mut self, _: AgentProgress) {}
+        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
             let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
             let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            crate::engine::container::frontend::ContainerIo {
+            crate::engine::agent_runtime::frontend::AgentIo {
                 stdout: stdout_tx,
                 stderr: stderr_tx,
                 stdin_tx,
@@ -614,8 +623,8 @@ mod tests {
 
         fn report_step_status(&mut self, _step: &str, _status: StepStatus) {}
 
-        fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-            Box::new(FakeContainerFrontend)
+        fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+            Box::new(FakeRuntimeFrontend)
         }
 
         fn report_summary(&mut self, _: &InitSummary) {}
@@ -841,7 +850,9 @@ mod tests {
         engine.run_to_completion(&mut frontend).await.unwrap();
 
         assert!(
-            !frontend.phases.contains(&InitPhase::AwaitingDockerfileDecision),
+            !frontend
+                .phases
+                .contains(&InitPhase::AwaitingDockerfileDecision),
             "AwaitingDockerfileDecision must not be entered when Dockerfile.dev already exists"
         );
         assert!(
@@ -882,9 +893,10 @@ mod tests {
             replace_aspec: false,
             run_audit: false,
             work_items_config: None,
-            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
-                "docker/Dockerfile.custom".to_string(),
-            ),
+            dockerfile_decision:
+                crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
+                    "docker/Dockerfile.custom".to_string(),
+                ),
             phases: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
@@ -926,9 +938,10 @@ mod tests {
             replace_aspec: false,
             run_audit: false,
             work_items_config: None,
-            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
-                "docker/Dockerfile.custom".to_string(),
-            ),
+            dockerfile_decision:
+                crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
+                    "docker/Dockerfile.custom".to_string(),
+                ),
             phases: Vec::new(),
         };
         engine.run_to_completion(&mut frontend).await.unwrap();

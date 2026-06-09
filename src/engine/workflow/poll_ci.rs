@@ -180,11 +180,7 @@ fn gh_is_available() -> bool {
         .unwrap_or(false)
 }
 
-fn fetch_via_gh(
-    branch: &str,
-    head_sha: &str,
-    git_root: &Path,
-) -> Result<CiStatus, EngineError> {
+fn fetch_via_gh(branch: &str, head_sha: &str, git_root: &Path) -> Result<CiStatus, EngineError> {
     let output = Command::new("gh")
         .args([
             "run",
@@ -258,9 +254,9 @@ fn fetch_via_api(
 /// Parse the JSON array of runs (same shape from `gh` and from the API adapter)
 /// and determine the overall CI status.
 fn parse_run_list(json: &serde_json::Value, head_sha: &str) -> Result<CiStatus, EngineError> {
-    let runs = json.as_array().ok_or_else(|| {
-        EngineError::Other("poll_ci: expected JSON array of runs".into())
-    })?;
+    let runs = json
+        .as_array()
+        .ok_or_else(|| EngineError::Other("poll_ci: expected JSON array of runs".into()))?;
 
     if runs.is_empty() {
         return Ok(CiStatus::NotFound);
@@ -384,10 +380,7 @@ pub fn run_poll_ci_loop(
                 ));
             }
             CiStatus::Failed(detail) => {
-                on_message(
-                    PollMessage::Warning,
-                    format!("CI failed: {detail}"),
-                );
+                on_message(PollMessage::Warning, format!("CI failed: {detail}"));
                 return Err(EngineError::Container(format!(
                     "poll_ci: CI failed: {detail}"
                 )));
@@ -410,24 +403,21 @@ mod tests {
 
     #[test]
     fn parse_github_ssh_url() {
-        let (owner, repo) =
-            parse_github_owner_repo("git@github.com:acme/widgets.git").unwrap();
+        let (owner, repo) = parse_github_owner_repo("git@github.com:acme/widgets.git").unwrap();
         assert_eq!(owner, "acme");
         assert_eq!(repo, "widgets");
     }
 
     #[test]
     fn parse_github_https_url() {
-        let (owner, repo) =
-            parse_github_owner_repo("https://github.com/acme/widgets.git").unwrap();
+        let (owner, repo) = parse_github_owner_repo("https://github.com/acme/widgets.git").unwrap();
         assert_eq!(owner, "acme");
         assert_eq!(repo, "widgets");
     }
 
     #[test]
     fn parse_github_https_no_git_suffix() {
-        let (owner, repo) =
-            parse_github_owner_repo("https://github.com/acme/widgets").unwrap();
+        let (owner, repo) = parse_github_owner_repo("https://github.com/acme/widgets").unwrap();
         assert_eq!(owner, "acme");
         assert_eq!(repo, "widgets");
     }
@@ -558,7 +548,10 @@ mod tests {
         let json = serde_json::json!([
             {"status": "completed", "conclusion": "cancelled", "name": "CI", "headSha": "abc"}
         ]);
-        assert!(matches!(parse_run_list(&json, "abc").unwrap(), CiStatus::Failed(_)));
+        assert!(matches!(
+            parse_run_list(&json, "abc").unwrap(),
+            CiStatus::Failed(_)
+        ));
     }
 
     #[test]
@@ -566,7 +559,10 @@ mod tests {
         let json = serde_json::json!([
             {"status": "completed", "conclusion": "timed_out", "name": "CI", "headSha": "abc"}
         ]);
-        assert!(matches!(parse_run_list(&json, "abc").unwrap(), CiStatus::Failed(_)));
+        assert!(matches!(
+            parse_run_list(&json, "abc").unwrap(),
+            CiStatus::Failed(_)
+        ));
     }
 
     #[test]
@@ -579,7 +575,10 @@ mod tests {
                 "headSha": "abc"
             }
         ]);
-        assert!(matches!(parse_run_list(&json, "abc").unwrap(), CiStatus::Failed(_)));
+        assert!(matches!(
+            parse_run_list(&json, "abc").unwrap(),
+            CiStatus::Failed(_)
+        ));
     }
 
     #[test]
@@ -630,8 +629,14 @@ mod tests {
         let CiStatus::Failed(detail) = parse_run_list(&json, "abc").unwrap() else {
             panic!("expected Failed");
         };
-        assert!(detail.contains("my-ci-run"), "detail must include run name: {detail}");
-        assert!(detail.contains("failure"), "detail must include conclusion: {detail}");
+        assert!(
+            detail.contains("my-ci-run"),
+            "detail must include run name: {detail}"
+        );
+        assert!(
+            detail.contains("failure"),
+            "detail must include conclusion: {detail}"
+        );
     }
 
     #[test]
@@ -719,7 +724,11 @@ mod tests {
 
         assert!(result.is_err(), "must fail on a non-git directory");
         // The attempt banner is emitted before fetch_ci_status is called.
-        assert_eq!(messages.len(), 1, "exactly one message before the error propagates");
+        assert_eq!(
+            messages.len(),
+            1,
+            "exactly one message before the error propagates"
+        );
         assert!(
             messages[0].1.contains("attempt 1/5"),
             "first message must be the attempt banner: {:?}",
@@ -761,10 +770,7 @@ mod tests {
         write_executable(bin_dir.path().join("which"), "#!/bin/sh\nexit 0\n");
 
         let orig_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var(
-            "PATH",
-            format!("{}:{orig_path}", bin_dir.path().display()),
-        );
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.path().display()));
 
         let mut messages: Vec<String> = Vec::new();
         let result = run_poll_ci_loop(repo.path(), 0, 3, |_, msg| {
@@ -821,10 +827,7 @@ mod tests {
         write_executable(bin_dir.path().join("which"), "#!/bin/sh\nexit 0\n");
 
         let orig_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var(
-            "PATH",
-            format!("{}:{orig_path}", bin_dir.path().display()),
-        );
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.path().display()));
 
         let mut messages: Vec<(PollMessage, String)> = Vec::new();
         let result = run_poll_ci_loop(repo.path(), 0, 5, |level, msg| {
@@ -833,7 +836,11 @@ mod tests {
 
         std::env::set_var("PATH", orig_path);
 
-        assert!(result.is_ok(), "should succeed when CI passes: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "should succeed when CI passes: {:?}",
+            result
+        );
         assert!(
             messages.iter().any(|(_, m)| m.contains("CI passed")),
             "must emit 'CI passed' message: {messages:?}"
@@ -871,10 +878,7 @@ mod tests {
         write_executable(bin_dir.path().join("which"), "#!/bin/sh\nexit 0\n");
 
         let orig_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var(
-            "PATH",
-            format!("{}:{orig_path}", bin_dir.path().display()),
-        );
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.path().display()));
 
         let mut warnings: Vec<String> = Vec::new();
         let result = run_poll_ci_loop(repo.path(), 0, 5, |level, msg| {
@@ -887,7 +891,10 @@ mod tests {
 
         assert!(result.is_err(), "should fail when CI fails");
         let err_str = result.unwrap_err().to_string();
-        assert!(err_str.contains("CI failed"), "error must mention CI failed: {err_str}");
+        assert!(
+            err_str.contains("CI failed"),
+            "error must mention CI failed: {err_str}"
+        );
         assert!(
             warnings.iter().any(|w| w.contains("unit-tests")),
             "warning must contain run name 'unit-tests': {warnings:?}"
@@ -946,10 +953,7 @@ mod tests {
             msg.contains("GITHUB_TOKEN"),
             "error must mention GITHUB_TOKEN: {msg}"
         );
-        assert!(
-            msg.contains("gh"),
-            "error must mention gh CLI: {msg}"
-        );
+        assert!(msg.contains("gh"), "error must mention gh CLI: {msg}");
     }
 
     // ── Helpers for real-git tests ────────────────────────────────────────────

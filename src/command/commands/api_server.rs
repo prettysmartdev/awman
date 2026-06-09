@@ -596,7 +596,9 @@ mod tests {
         let workflow_state_store =
             Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(tmp));
         Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine: overlay,
             auth_engine,

@@ -193,9 +193,7 @@ impl ApiPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{
-        EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, XDG_DATA_HOME,
-    };
+    use crate::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, XDG_DATA_HOME};
 
     #[test]
     fn from_env_returns_xdg_data_home_awman_api_when_xdg_set() {

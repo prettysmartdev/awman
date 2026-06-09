@@ -1,7 +1,7 @@
 //! `InitFrontend` impl for the TUI.
 
 use crate::data::config::repo::WorkItemsConfig;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::{DockerfileSetupDecision, InitFrontend};
 use crate::engine::init::phase::InitPhase;
@@ -46,17 +46,16 @@ impl InitFrontend for TuiCommandFrontend {
         &mut self,
         git_root: &std::path::Path,
     ) -> Result<DockerfileSetupDecision, EngineError> {
-        let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root)
-            .unwrap_or_default();
-        let display_path = repo_cfg
-            .dockerfile
-            .as_deref()
-            .unwrap_or("Dockerfile.dev");
+        let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root).unwrap_or_default();
+        let display_path = repo_cfg.dockerfile.as_deref().unwrap_or("Dockerfile.dev");
         let response = self
             .ask_dialog(DialogRequest::KindSelect {
                 title: format!("No Dockerfile found at {display_path}"),
                 options: vec![
-                    ("1".into(), "Create Dockerfile.dev from the built-in template".into()),
+                    (
+                        "1".into(),
+                        "Create Dockerfile.dev from the built-in template".into(),
+                    ),
                     ("2".into(), "Use an existing Dockerfile in this repo".into()),
                     ("3".into(), "Skip for now".into()),
                 ],
@@ -91,7 +90,7 @@ impl InitFrontend for TuiCommandFrontend {
         self.messages.info(format!("  {step}: {status:?}"));
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(super::TuiContainerProxy::new(self.status_log.clone()))
     }
 
@@ -118,7 +117,7 @@ mod tests {
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
         let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let container_io = crate::engine::container::frontend::ContainerIo {
+        let container_io = crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,

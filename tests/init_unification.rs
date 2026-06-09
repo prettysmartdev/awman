@@ -155,7 +155,7 @@ impl AgentRuntime for MockRuntime {
     fn get_container_workspace_mount(&self, _container_name: &str) -> Option<String> {
         None
     }
-    fn query_container_stats(&self, _name: &str) -> Option<awman::runtime::ContainerStats> {
+    fn query_container_stats(&self, _name: &str) -> Option<awman::runtime::AgentStats> {
         None
     }
     fn build_run_args_pty(

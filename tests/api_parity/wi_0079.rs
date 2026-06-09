@@ -46,7 +46,9 @@ fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
     let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
-        runtime,
+        runtime: runtime.clone(),
+        container_runtime: Some(runtime),
+        sandbox_runtime: None,
         git_engine,
         overlay_engine,
         auth_engine,
@@ -1357,7 +1359,9 @@ async fn real_network_local_session_creation_succeeds() {
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
     let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
     let engines = Engines {
-        runtime,
+        runtime: runtime.clone(),
+        container_runtime: Some(runtime),
+        sandbox_runtime: None,
         git_engine,
         overlay_engine,
         auth_engine,

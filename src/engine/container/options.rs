@@ -125,7 +125,7 @@ pub struct AgentSettings {
     pub overlays: Vec<OverlaySpec>,
 }
 
-/// Every knob a `ContainerInstance` accepts. Adding a new option is a single
+/// Every knob a `AgentInstance` accepts. Adding a new option is a single
 /// variant and a single branch in `ResolvedContainerOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerOption {
@@ -282,16 +282,27 @@ impl ResolvedContainerOptions {
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,
-            ContainerOption::SystemPromptFile { host_path, container_path, flag } => {
+            ContainerOption::SystemPromptFile {
+                host_path,
+                container_path,
+                flag,
+            } => {
                 self.system_prompt_file = Some((host_path, container_path, flag));
             }
-            ContainerOption::SystemPromptEnvFile { env_var, host_path, container_path } => {
+            ContainerOption::SystemPromptEnvFile {
+                env_var,
+                host_path,
+                container_path,
+            } => {
                 self.system_prompt_env_file = Some((env_var, host_path, container_path));
             }
             ContainerOption::SystemPromptInline { flag, text } => {
                 self.system_prompt_inline = Some((flag, text));
             }
-            ContainerOption::AgentAddDir { flag, container_path } => {
+            ContainerOption::AgentAddDir {
+                flag,
+                container_path,
+            } => {
                 self.agent_add_dirs.push((flag, container_path));
             }
         }
@@ -314,6 +325,16 @@ impl ResolvedContainerOptions {
 pub enum ResolveError {
     #[error("conflicting container options: {0}")]
     Conflict(String),
+}
+
+impl From<ResolveError> for crate::engine::error::EngineError {
+    fn from(e: ResolveError) -> Self {
+        match e {
+            ResolveError::Conflict(msg) => {
+                crate::engine::error::EngineError::ConflictingOptions(msg)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

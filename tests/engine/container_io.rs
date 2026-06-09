@@ -1,11 +1,11 @@
-//! Integration tests for `ContainerIo` channel correctness (WI 0081).
+//! Integration tests for `AgentIo` channel correctness (WI 0081).
 //!
-//! Verifies that each frontend's `take_container_io()` returns live channels
+//! Verifies that each frontend's `take_io()` returns live channels
 //! with the correct configuration, and that bytes flow correctly between the
 //! engine-side senders/receivers and the frontend's sinks.
 
 use awman::data::execution_event::EventPayload;
-use awman::engine::container::frontend::ContainerFrontend;
+use awman::engine::agent_runtime::frontend::AgentFrontend;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
 use awman::frontend::api::event_bus::EventBus;
 use awman::frontend::cli::CliFrontend;
@@ -27,14 +27,14 @@ fn make_cli_frontend() -> CliFrontend {
     CliFrontend::new(m)
 }
 
-// ─── CLI non-interactive ContainerIo ────────────────────────────────────────
+// ─── CLI non-interactive AgentIo ────────────────────────────────────────
 
-/// `take_container_io()` on the CLI (always non-interactive in test env
+/// `take_io()` on the CLI (always non-interactive in test env
 /// because stdin is not a TTY) must return live stdout/stderr senders.
 #[tokio::test]
-async fn take_container_io_cli_non_interactive_stdout_sender_is_live() {
+async fn take_io_cli_non_interactive_stdout_sender_is_live() {
     let mut fe = make_cli_frontend();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     assert!(
         !io.stdout.is_closed(),
@@ -49,9 +49,9 @@ async fn take_container_io_cli_non_interactive_stdout_sender_is_live() {
 /// Non-interactive CLI must not provide PTY fields: resize and initial_size
 /// must both be `None` so the engine selects the `Stdio::piped()` path.
 #[tokio::test]
-async fn take_container_io_cli_non_interactive_has_no_pty_fields() {
+async fn take_io_cli_non_interactive_has_no_pty_fields() {
     let mut fe = make_cli_frontend();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     assert!(
         io.resize.is_none(),
@@ -63,13 +63,13 @@ async fn take_container_io_cli_non_interactive_has_no_pty_fields() {
     );
 }
 
-/// After dropping the `stdin_tx` clone returned in `ContainerIo`, the
+/// After dropping the `stdin_tx` clone returned in `AgentIo`, the
 /// `stdin_rx` receiver yields `None` immediately (EOF), which signals the
 /// engine's writer task to close the container's stdin.
 #[tokio::test]
-async fn take_container_io_cli_non_interactive_stdin_eof_after_drop() {
+async fn take_io_cli_non_interactive_stdin_eof_after_drop() {
     let mut fe = make_cli_frontend();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     let mut stdin_rx = io.stdin_rx;
     // Drop the returned stdin_tx clone — no more senders → EOF.
@@ -88,9 +88,9 @@ async fn take_container_io_cli_non_interactive_stdin_eof_after_drop() {
 /// Bytes sent to `stdin_tx` are available on `stdin_rx` (channels are wired
 /// correctly before EOF arrives).
 #[tokio::test]
-async fn take_container_io_cli_stdin_tx_sends_reach_stdin_rx() {
+async fn take_io_cli_stdin_tx_sends_reach_stdin_rx() {
     let mut fe = make_cli_frontend();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     let payload = b"prompt\n".to_vec();
     io.stdin_tx.send(payload.clone()).unwrap();
@@ -107,13 +107,13 @@ async fn take_container_io_cli_stdin_tx_sends_reach_stdin_rx() {
     );
 }
 
-// ─── API ContainerIo ─────────────────────────────────────────────────────────
+// ─── API AgentIo ─────────────────────────────────────────────────────────
 
-/// API `take_container_io()` returns live stdout and stderr senders.
+/// API `take_io()` returns live stdout and stderr senders.
 #[tokio::test]
-async fn take_container_io_api_stdout_and_stderr_senders_are_live() {
+async fn take_io_api_stdout_and_stderr_senders_are_live() {
     let (mut fe, _bus) = make_api_frontend("exec workflow");
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     assert!(!io.stdout.is_closed(), "API stdout sender should be live");
     assert!(!io.stderr.is_closed(), "API stderr sender should be live");
@@ -121,9 +121,9 @@ async fn take_container_io_api_stdout_and_stderr_senders_are_live() {
 
 /// API is always non-interactive: no resize channel, no initial PTY size.
 #[tokio::test]
-async fn take_container_io_api_has_no_pty_fields() {
+async fn take_io_api_has_no_pty_fields() {
     let (mut fe, _bus) = make_api_frontend("exec workflow");
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     assert!(io.resize.is_none(), "API must not have a resize channel");
     assert!(
@@ -135,10 +135,10 @@ async fn take_container_io_api_has_no_pty_fields() {
 /// Bytes sent through the API's `stdout` channel must arrive at the event bus
 /// as `StdoutLine` events (line-buffered by the drain task).
 #[tokio::test]
-async fn take_container_io_api_stdout_bytes_arrive_at_event_bus() {
+async fn take_io_api_stdout_bytes_arrive_at_event_bus() {
     let (mut fe, bus) = make_api_frontend("exec workflow");
     let mut rx = bus.subscribe();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     io.stdout.send(b"hello world\n".to_vec()).unwrap();
     // Close the channel so the drain task flushes.
@@ -160,10 +160,10 @@ async fn take_container_io_api_stdout_bytes_arrive_at_event_bus() {
 /// Bytes sent through the API's `stderr` channel must arrive at the event bus
 /// as `StderrLine` events.
 #[tokio::test]
-async fn take_container_io_api_stderr_bytes_arrive_at_event_bus() {
+async fn take_io_api_stderr_bytes_arrive_at_event_bus() {
     let (mut fe, bus) = make_api_frontend("exec workflow");
     let mut rx = bus.subscribe();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     io.stderr.send(b"error occurred\n".to_vec()).unwrap();
     drop(io.stderr);
@@ -183,10 +183,10 @@ async fn take_container_io_api_stderr_bytes_arrive_at_event_bus() {
 /// Multiple stdout lines in a single byte chunk are split and emitted as
 /// separate `StdoutLine` events.
 #[tokio::test]
-async fn take_container_io_api_multiline_stdout_split_into_separate_events() {
+async fn take_io_api_multiline_stdout_split_into_separate_events() {
     let (mut fe, bus) = make_api_frontend("exec workflow");
     let mut rx = bus.subscribe();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     io.stdout
         .send(b"line one\nline two\nline three\n".to_vec())
@@ -212,9 +212,9 @@ async fn take_container_io_api_multiline_stdout_split_into_separate_events() {
 /// API `stdin_rx` yields `None` immediately after the caller drops `stdin_tx`,
 /// because the frontend itself already dropped the original sender.
 #[tokio::test]
-async fn take_container_io_api_stdin_eof_after_drop() {
+async fn take_io_api_stdin_eof_after_drop() {
     let (mut fe, _bus) = make_api_frontend("exec workflow");
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     let mut stdin_rx = io.stdin_rx;
     // The API frontend drops the original sender; dropping the returned clone
@@ -233,7 +233,7 @@ async fn take_container_io_api_stdin_eof_after_drop() {
 
 // ─── Engine-side EOF semantics (piped path) ─────────────────────────────────
 
-/// Simulates the piped path: frontend constructs ContainerIo, engine seeds
+/// Simulates the piped path: frontend constructs AgentIo, engine seeds
 /// the prompt via `io.stdin_tx`, then drops `io.stdin_tx`. The writer task
 /// (modeled here by draining `stdin_rx`) must see the seeded bytes followed
 /// by `None` (EOF). This is the behaviour that `spawn_piped_docker` /
@@ -242,7 +242,7 @@ async fn take_container_io_api_stdin_eof_after_drop() {
 #[tokio::test]
 async fn engine_piped_path_writer_sees_eof_after_seed_drop_api() {
     let (mut fe, _bus) = make_api_frontend("exec workflow");
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     let mut stdin_rx = io.stdin_rx;
     io.stdin_tx.send(b"seeded prompt".to_vec()).unwrap();
@@ -276,7 +276,7 @@ async fn engine_piped_path_writer_sees_eof_after_seed_drop_api() {
 #[tokio::test]
 async fn engine_piped_path_writer_sees_eof_after_seed_drop_cli() {
     let mut fe = make_cli_frontend();
-    let io = fe.take_container_io();
+    let io = fe.take_io();
 
     let mut stdin_rx = io.stdin_rx;
     io.stdin_tx.send(b"prompt\n".to_vec()).unwrap();

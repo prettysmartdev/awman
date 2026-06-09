@@ -150,10 +150,7 @@ fn normalise_slug(s: &str) -> String {
 
 /// Validate that a resolved context path stays under `~/.awman/context/`.
 /// Returns `Err` if the path escapes (e.g. via `..` in a crafted slug).
-pub fn validate_context_path(
-    awman_home: &Path,
-    resolved: &Path,
-) -> Result<(), DataError> {
+pub fn validate_context_path(awman_home: &Path, resolved: &Path) -> Result<(), DataError> {
     let context_root = awman_home.join("context");
     let canonical_root = std::fs::canonicalize(&context_root).unwrap_or(context_root.clone());
     let canonical_resolved = std::fs::canonicalize(resolved).unwrap_or(resolved.to_path_buf());

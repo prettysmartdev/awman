@@ -835,6 +835,25 @@ async fn run_session_setup(
             return;
         }
     };
+    // ReadyEngine drives the container-paradigm image flow; under the
+    // (stubbed) sandbox runtime this surfaces NotImplemented instead of
+    // panicking. The sandbox ready flow lands in WI 0090.
+    let container_runtime = match state.engines.require_container_runtime() {
+        Ok(rt) => Arc::clone(rt),
+        Err(e) => {
+            drop(session_guard);
+            tracing::error!(session_id = %session_id, error = %e, "Runtime unsupported for session setup");
+            bus_sender.mark_failed("ready", &e.to_string());
+            bus_sender.emit(SetupEventPayload::SetupFailed {
+                stage: "ready".into(),
+                error: e.to_string(),
+            });
+            let _ = state.store.update_setup_status(&session_id, "failed");
+            persist_setup_state(&state, &session_id, &setup_bus).await;
+            cleanup_setup_bus(state, session_id, setup_bus).await;
+            return;
+        }
+    };
     let ready_options = ReadyEngineOptions {
         agent,
         refresh: false,
@@ -848,7 +867,7 @@ async fn run_session_setup(
         Arc::new(session_guard.clone()),
         Arc::clone(&state.engines.git_engine),
         Arc::clone(&state.engines.overlay_engine),
-        Arc::clone(&state.engines.runtime),
+        container_runtime,
         Arc::clone(&state.engines.agent_engine),
         ready_options,
     );
@@ -1940,7 +1959,9 @@ mod tests {
         let workflow_state_store =
             Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(tmp));
         let engines = Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine: overlay,
             auth_engine,

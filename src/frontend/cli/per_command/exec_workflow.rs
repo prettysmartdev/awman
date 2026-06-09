@@ -1,6 +1,6 @@
 //! `ExecWorkflowCommandFrontend` impl for the CLI.
 //!
-//! All supertraits (`UserMessageSink`, `ContainerFrontend`, `WorkflowFrontend`,
+//! All supertraits (`UserMessageSink`, `AgentFrontend`, `WorkflowFrontend`,
 //! `MountScopeFrontend`, `AgentSetupFrontend`, `AgentAuthFrontend`,
 //! `WorktreeLifecycleFrontend`) are implemented elsewhere in
 //! `src/frontend/cli/`; this file only carries the trait's two extra methods

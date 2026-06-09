@@ -117,7 +117,10 @@ impl Command for InitCommand {
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),
-            self.engines.runtime.clone(),
+            self.engines
+                .require_container_runtime()
+                .map_err(CommandError::from)?
+                .clone(),
             self.engines.agent_engine.clone(),
             options,
         );

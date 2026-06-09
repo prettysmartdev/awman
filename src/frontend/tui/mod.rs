@@ -1401,7 +1401,9 @@ mod tests {
             ))
         };
         crate::command::dispatch::Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine: overlay,
             auth_engine,
@@ -2514,7 +2516,12 @@ mod tests {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
-    fn make_mouse_event(kind: MouseEventKind, col: u16, row: u16, mods: KeyModifiers) -> MouseEvent {
+    fn make_mouse_event(
+        kind: MouseEventKind,
+        col: u16,
+        row: u16,
+        mods: KeyModifiers,
+    ) -> MouseEvent {
         MouseEvent {
             kind,
             column: col,
@@ -2525,13 +2532,10 @@ mod tests {
 
     /// Set the active tab to Maximized with a known inner area and a wired
     /// PTY stdin channel, then return the receiving end for assertions.
-    fn setup_container_tab(
-        app: &mut App,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+    fn setup_container_tab(app: &mut App) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let tab = app.active_tab_mut();
-        tab.container_window_state =
-            crate::frontend::tui::tabs::ContainerWindowState::Maximized;
+        tab.container_window_state = crate::frontend::tui::tabs::ContainerWindowState::Maximized;
         // inner area starting at (5, 3) with size 80×24
         tab.container_inner_area = Some(Rect::new(5, 3, 80, 24));
         tab.container_stdin_tx = Some(tx);
@@ -2633,7 +2637,10 @@ mod tests {
             &mut app,
             make_mouse_event(MouseEventKind::ScrollUp, 0, 10, KeyModifiers::NONE),
         );
-        assert!(rx.try_recv().is_err(), "scroll on left border must be discarded");
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll on left border must be discarded"
+        );
         assert_eq!(
             app.active_tab().container_scroll_offset,
             before_offset,
@@ -2645,7 +2652,10 @@ mod tests {
             &mut app,
             make_mouse_event(MouseEventKind::ScrollUp, 20, 0, KeyModifiers::NONE),
         );
-        assert!(rx.try_recv().is_err(), "scroll above inner area must be discarded");
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll above inner area must be discarded"
+        );
 
         // inner_area right edge is exclusive at col 5+80=85 — must be discarded
         super::handle_mouse_event(

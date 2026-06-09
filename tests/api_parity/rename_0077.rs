@@ -208,7 +208,9 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(tmp.path()));
 
     let engines = Engines {
-        runtime,
+        runtime: runtime.clone(),
+        container_runtime: Some(runtime),
+        sandbox_runtime: None,
         git_engine,
         overlay_engine,
         auth_engine,

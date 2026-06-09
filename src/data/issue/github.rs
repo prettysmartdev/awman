@@ -9,8 +9,7 @@ use super::{Issue, IssueSource, IssueSourceError};
 
 /// Hint embedded into `IssueSourceError::Unauthorized` by GitHub auth/403
 /// failures. Provider-specific text lives here, not in the trait-level enum.
-const GH_AUTH_HINT: &str =
-    "ensure gh is authenticated (`gh auth login`) or GITHUB_TOKEN is set";
+const GH_AUTH_HINT: &str = "ensure gh is authenticated (`gh auth login`) or GITHUB_TOKEN is set";
 
 pub struct GithubIssueSource;
 
@@ -83,9 +82,7 @@ impl IssueSource for GithubIssueSource {
             return Ok(issue);
         }
 
-        let api_url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/issues/{number}"
-        );
+        let api_url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}");
         sink.write_message(UserMessage {
             level: MessageLevel::Info,
             text: format!("gh CLI unavailable, falling back to REST API: GET {api_url}"),
@@ -93,7 +90,6 @@ impl IssueSource for GithubIssueSource {
 
         fetch_rest_api(&owner, &repo, number, self.provider_name())
     }
-
 }
 
 /// Parse user input into (owner, repo, number).
@@ -104,11 +100,13 @@ fn parse_input(
 ) -> Result<(String, String, u32), IssueSourceError> {
     // Bare integer — resolve from git remote
     if input.chars().all(|c| c.is_ascii_digit()) {
-        let number = input.parse::<u32>().map_err(|_| IssueSourceError::InvalidRef {
-            provider: provider.to_string(),
-            input: input.to_string(),
-            hint: "could not parse as issue number".to_string(),
-        })?;
+        let number = input
+            .parse::<u32>()
+            .map_err(|_| IssueSourceError::InvalidRef {
+                provider: provider.to_string(),
+                input: input.to_string(),
+                hint: "could not parse as issue number".to_string(),
+            })?;
         let (owner, repo) = detect_github_remote(git_root, provider)?;
         return Ok((owner, repo, number));
     }
@@ -131,11 +129,13 @@ fn parse_input(
     if let Some(hash_pos) = input.find('#') {
         let owner_repo = &input[..hash_pos];
         let number_str = &input[hash_pos + 1..];
-        let number = number_str.parse::<u32>().map_err(|_| IssueSourceError::InvalidRef {
-            provider: provider.to_string(),
-            input: input.to_string(),
-            hint: format!("could not parse issue number from '{number_str}'"),
-        })?;
+        let number = number_str
+            .parse::<u32>()
+            .map_err(|_| IssueSourceError::InvalidRef {
+                provider: provider.to_string(),
+                input: input.to_string(),
+                hint: format!("could not parse issue number from '{number_str}'"),
+            })?;
         let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(IssueSourceError::InvalidRef {
@@ -154,10 +154,7 @@ fn parse_input(
     })
 }
 
-fn parse_github_url(
-    url: &str,
-    provider: &str,
-) -> Result<(String, String, u32), IssueSourceError> {
+fn parse_github_url(url: &str, provider: &str) -> Result<(String, String, u32), IssueSourceError> {
     // Strip scheme + host
     let path = url
         .strip_prefix("https://github.com/")
@@ -166,11 +163,16 @@ fn parse_github_url(
     let segments: Vec<&str> = path.split('/').collect();
     // Expected: {owner}/{repo}/issues/{number}
     if segments.len() >= 4 && segments[2] == "issues" {
-        let number = segments[3].parse::<u32>().map_err(|_| IssueSourceError::InvalidRef {
-            provider: provider.to_string(),
-            input: url.to_string(),
-            hint: format!("could not parse issue number from URL segment '{}'", segments[3]),
-        })?;
+        let number = segments[3]
+            .parse::<u32>()
+            .map_err(|_| IssueSourceError::InvalidRef {
+                provider: provider.to_string(),
+                input: url.to_string(),
+                hint: format!(
+                    "could not parse issue number from URL segment '{}'",
+                    segments[3]
+                ),
+            })?;
         Ok((segments[0].to_string(), segments[1].to_string(), number))
     } else {
         Err(IssueSourceError::InvalidRef {
@@ -373,10 +375,12 @@ pub(crate) fn fetch_rest_api_with_base(
         }
     }
 
-    let json: serde_json::Value = response.json().map_err(|e| IssueSourceError::ProviderError {
-        provider: provider.to_string(),
-        detail: format!("failed to parse response: {e}"),
-    })?;
+    let json: serde_json::Value = response
+        .json()
+        .map_err(|e| IssueSourceError::ProviderError {
+            provider: provider.to_string(),
+            detail: format!("failed to parse response: {e}"),
+        })?;
 
     let title = json
         .get("title")
@@ -427,9 +431,11 @@ mod tests {
 
     #[test]
     fn parse_github_url_extracts_triple() {
-        let (owner, repo, num) =
-            parse_github_url("https://github.com/prettysmartdev/awman/issues/84", "GitHub")
-                .unwrap();
+        let (owner, repo, num) = parse_github_url(
+            "https://github.com/prettysmartdev/awman/issues/84",
+            "GitHub",
+        )
+        .unwrap();
         assert_eq!(owner, "prettysmartdev");
         assert_eq!(repo, "awman");
         assert_eq!(num, 84);
@@ -449,8 +455,7 @@ mod tests {
 
     #[test]
     fn parse_owner_repo_https() {
-        let (o, r) =
-            parse_owner_repo_from_remote("https://github.com/owner/repo.git").unwrap();
+        let (o, r) = parse_owner_repo_from_remote("https://github.com/owner/repo.git").unwrap();
         assert_eq!(o, "owner");
         assert_eq!(r, "repo");
     }
@@ -527,10 +532,7 @@ mod tests {
             body: String::new(),
             provider: "GitHub".into(),
         };
-        assert_eq!(
-            GithubIssueSource.title_slug(&issue),
-            "ghb1-fix-the-bug"
-        );
+        assert_eq!(GithubIssueSource.title_slug(&issue), "ghb1-fix-the-bug");
     }
 
     #[test]
@@ -620,12 +622,11 @@ mod tests {
             provider: "GitHub".into(),
         };
         let slug = GithubIssueSource.title_slug(&issue);
-        assert!(slug.starts_with("ghb1-"), "slug must start with provider prefix and id");
         assert!(
-            slug.len() <= 100,
-            "slug length {} exceeds 100",
-            slug.len()
+            slug.starts_with("ghb1-"),
+            "slug must start with provider prefix and id"
         );
+        assert!(slug.len() <= 100, "slug length {} exceeds 100", slug.len());
         assert!(!slug.ends_with('-'), "slug must not end with '-'");
     }
 
@@ -679,13 +680,7 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let result = try_gh_cli_with_cmd(
-            script.to_str().unwrap(),
-            "owner",
-            "repo",
-            42,
-            "GitHub",
-        );
+        let result = try_gh_cli_with_cmd(script.to_str().unwrap(), "owner", "repo", 42, "GitHub");
         assert!(result.is_some(), "expected Some(Issue), got None");
         let issue = result.unwrap();
         assert_eq!(issue.title, "Test Issue");
@@ -704,8 +699,7 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let result =
-            try_gh_cli_with_cmd(script.to_str().unwrap(), "owner", "repo", 1, "GitHub");
+        let result = try_gh_cli_with_cmd(script.to_str().unwrap(), "owner", "repo", 1, "GitHub");
         assert!(result.is_none(), "expected None for failing gh");
     }
 
@@ -727,12 +721,9 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let issue = try_gh_cli_with_cmd(script.to_str().unwrap(), "org", "project", 10, "GitHub")
-            .unwrap();
-        assert_eq!(
-            issue.source_id,
-            "https://github.com/org/project/issues/10"
-        );
+        let issue =
+            try_gh_cli_with_cmd(script.to_str().unwrap(), "org", "project", 10, "GitHub").unwrap();
+        assert_eq!(issue.source_id, "https://github.com/org/project/issues/10");
     }
 
     #[cfg(unix)]
@@ -753,11 +744,10 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let issue = try_gh_cli_with_cmd(script.to_str().unwrap(), "owner", "repo", 5, "GitHub")
-            .unwrap();
+        let issue =
+            try_gh_cli_with_cmd(script.to_str().unwrap(), "owner", "repo", 5, "GitHub").unwrap();
         assert_eq!(
-            issue.source_id,
-            "https://github.com/owner/repo/issues/5",
+            issue.source_id, "https://github.com/owner/repo/issues/5",
             "empty url field must fall back to constructed canonical URL"
         );
     }
@@ -928,10 +918,7 @@ exit 0
         .unwrap();
 
         let issue = result.expect("expected Ok");
-        assert_eq!(
-            issue.source_id,
-            "https://github.com/myorg/myrepo/issues/7"
-        );
+        assert_eq!(issue.source_id, "https://github.com/myorg/myrepo/issues/7");
     }
 
     #[tokio::test]
@@ -1012,7 +999,12 @@ exit 0
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["remote", "add", "origin", "https://github.com/myorg/myrepo.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/myorg/myrepo.git",
+            ])
             .current_dir(tmp.path())
             .output()
             .unwrap();
@@ -1048,7 +1040,9 @@ exit 0
             "expected at least one progress message"
         );
         assert!(
-            messages[0].text.contains("gh issue view 42 --repo myorg/myrepo"),
+            messages[0]
+                .text
+                .contains("gh issue view 42 --repo myorg/myrepo"),
             "first message should describe the gh command, got: {}",
             messages[0].text
         );

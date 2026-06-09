@@ -5,7 +5,7 @@
 //! non-interactive defaults.
 
 use crate::data::config::repo::WorkItemsConfig;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::DockerfileSetupDecision;
 use crate::engine::init::{InitFrontend, InitPhase, InitSummary};
@@ -80,12 +80,8 @@ impl InitFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(DockerfileSetupDecision::CreateNew);
         }
-        let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root)
-            .unwrap_or_default();
-        let display_path = repo_cfg
-            .dockerfile
-            .as_deref()
-            .unwrap_or("Dockerfile.dev");
+        let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root).unwrap_or_default();
+        let display_path = repo_cfg.dockerfile.as_deref().unwrap_or("Dockerfile.dev");
         let choice = pick_numbered(
             &format!("No Dockerfile found at {display_path}. How would you like to proceed?"),
             &[
@@ -127,7 +123,7 @@ impl InitFrontend for CliFrontend {
         });
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(super::container_frontend_marker::CliContainerProxy)
     }
 
@@ -189,7 +185,9 @@ mod tests {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd.try_get_matches_from(["awman", "init"]).unwrap();
         let mut frontend = CliFrontend::new(m);
-        let result = frontend.ask_dockerfile_setup(std::path::Path::new("/tmp")).unwrap();
+        let result = frontend
+            .ask_dockerfile_setup(std::path::Path::new("/tmp"))
+            .unwrap();
         assert_eq!(result, DockerfileSetupDecision::CreateNew);
     }
 
@@ -203,11 +201,7 @@ mod tests {
 
     #[test]
     fn tty_choice_2_with_path_returns_use_existing() {
-        let result = dockerfile_decision_from_input(
-            true,
-            2,
-            Some("docker/Dockerfile".to_string()),
-        );
+        let result = dockerfile_decision_from_input(true, 2, Some("docker/Dockerfile".to_string()));
         assert_eq!(
             result,
             DockerfileSetupDecision::UseExisting("docker/Dockerfile".to_string())

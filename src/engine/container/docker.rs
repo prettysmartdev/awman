@@ -4,7 +4,7 @@
 //! Builds a `docker run` argv from `ResolvedContainerOptions`, spawns the
 //! subprocess, and captures the exit code.
 //!
-//! All container I/O is mediated through the `ContainerIo` channels
+//! All container I/O is mediated through the `AgentIo` channels
 //! provided by the frontend. When the frontend provides PTY fields
 //! (`initial_size`/`resize` are `Some`), the engine opens a PTY via
 //! `portable-pty`. Otherwise it uses `Stdio::piped()`.
@@ -12,12 +12,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::data::session::{ContainerHandle, Session};
-use crate::engine::container::backend::ContainerBackend;
-use crate::engine::container::instance::{
-    handle_now, ContainerExecution, ContainerExitInfo, ContainerId, ContainerInstance,
-    ContainerStats, ExecutionBackend,
+use crate::data::session::{AgentHandle, Session};
+use crate::engine::agent_runtime::execution::{
+    AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, AgentStats, ExecutionBackend,
 };
+use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::instance::{handle_now, ContainerId};
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -56,7 +56,7 @@ impl ContainerBackend for DockerBackend {
     fn build(
         &self,
         options: ResolvedContainerOptions,
-    ) -> Result<Box<dyn ContainerInstance>, EngineError> {
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
         let image = options
             .image
             .clone()
@@ -72,7 +72,7 @@ impl ContainerBackend for DockerBackend {
         }))
     }
 
-    fn list_running(&self, _session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
+    fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
         // Query by label AND by name prefix so old-amux containers (which may
         // lack the label) are included. Results from all queries are merged and
         // deduplicated by container ID.
@@ -83,7 +83,7 @@ impl ContainerBackend for DockerBackend {
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut handles: Vec<ContainerHandle> = Vec::new();
+        let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
             let output = Command::new("docker")
@@ -115,7 +115,7 @@ impl ContainerBackend for DockerBackend {
                     chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .unwrap_or_else(|_| chrono::Utc::now());
-                handles.push(ContainerHandle {
+                handles.push(AgentHandle {
                     id,
                     image_tag,
                     name,
@@ -127,7 +127,7 @@ impl ContainerBackend for DockerBackend {
         Ok(handles)
     }
 
-    fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
+    fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
             &["ps", "--filter", "label=awman=true", "--format", format],
@@ -135,7 +135,7 @@ impl ContainerBackend for DockerBackend {
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut handles: Vec<ContainerHandle> = Vec::new();
+        let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
             let output = Command::new("docker")
@@ -167,7 +167,7 @@ impl ContainerBackend for DockerBackend {
                     chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .unwrap_or_else(|_| chrono::Utc::now());
-                handles.push(ContainerHandle {
+                handles.push(AgentHandle {
                     id,
                     image_tag,
                     name,
@@ -179,7 +179,7 @@ impl ContainerBackend for DockerBackend {
         Ok(handles)
     }
 
-    fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
+    fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let output = Command::new("docker")
             .args([
                 "stats",
@@ -210,7 +210,7 @@ impl ContainerBackend for DockerBackend {
         parse_stats_line(&line, &handle.name)
     }
 
-    fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError> {
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         // Best-effort: stop, then rm. A nonzero exit (already gone) is fine.
         let _ = Command::new("docker")
             .args(["stop", &handle.name])
@@ -285,38 +285,36 @@ struct DockerContainerInstance {
     options: ResolvedContainerOptions,
 }
 
-impl ContainerInstance for DockerContainerInstance {
-    fn id(&self) -> &ContainerId {
-        &self.id
-    }
-    fn name(&self) -> &ContainerName {
-        &self.name
-    }
-    fn image(&self) -> &ImageRef {
-        &self.image
+impl AgentInstance for DockerContainerInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        AgentHandlePreview {
+            id: self.id.0.clone(),
+            name: self.name.0.clone(),
+            image: self.image.0.clone(),
+        }
     }
 
     fn run_with_frontend(
         self: Box<Self>,
-        mut frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
-    ) -> Result<ContainerExecution, EngineError> {
+        mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
         let argv = build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
 
         frontend.report_status(
-            crate::engine::container::frontend::ContainerStatus::Running {
+            crate::engine::agent_runtime::frontend::AgentStatus::Running {
                 container_name: self.name.0.clone(),
             },
         );
 
-        // Read per-frontend timeouts before draining `take_container_io`,
+        // Read per-frontend timeouts before draining `take_io`,
         // which leaves the frontend in a state where any further calls are
         // implementation-defined.
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
-        let io = frontend.take_container_io();
+        let io = frontend.take_io();
 
         let bridge_cfg = bridge_config_for(&self.name, grace_timeout, stuck_timeout);
 
@@ -358,16 +356,16 @@ fn bridge_config_for(
 }
 
 /// Spawn `docker run -it` via `portable-pty` and bridge the PTY master to
-/// the frontend's `ContainerIo` channels via the shared I/O bridge.
+/// the frontend's `AgentIo` channels via the shared I/O bridge.
 fn spawn_pty_bridged_docker(
     instance: Box<DockerContainerInstance>,
-    io: crate::engine::container::frontend::ContainerIo,
+    io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     _seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::ContainerHandle,
+    handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<ContainerExecution, EngineError> {
+) -> Result<AgentExecution, EngineError> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
@@ -407,23 +405,23 @@ fn spawn_pty_bridged_docker(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(
+    Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
     ))
 }
 
-/// Spawn `docker run` with piped stdio and bridge through `ContainerIo`.
+/// Spawn `docker run` with piped stdio and bridge through `AgentIo`.
 fn spawn_piped_docker(
     instance: Box<DockerContainerInstance>,
-    io: crate::engine::container::frontend::ContainerIo,
+    io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
-    handle: crate::data::session::ContainerHandle,
+    handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
-) -> Result<ContainerExecution, EngineError> {
+) -> Result<AgentExecution, EngineError> {
     let mut cmd = Command::new("docker");
     cmd.args(&argv);
     cmd.stdin(Stdio::piped());
@@ -465,7 +463,7 @@ fn spawn_piped_docker(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(
+    Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
@@ -490,7 +488,7 @@ struct DockerExecution {
 }
 
 impl ExecutionBackend for DockerExecution {
-    fn wait_blocking(mut self: Box<Self>) -> Result<ContainerExitInfo, EngineError> {
+    fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
         // PTY-bridged path: wait on the portable-pty child.
         if let Some(mut child) = self.pty_child.take() {
             let status = child
@@ -500,7 +498,7 @@ impl ExecutionBackend for DockerExecution {
             // EOF cleanly.
             self.pty_master = None;
             let exit_code = status.exit_code().try_into().unwrap_or(-1);
-            return Ok(ContainerExitInfo {
+            return Ok(AgentExitInfo {
                 exit_code,
                 signal: None,
                 started_at: self.started_at,
@@ -531,7 +529,7 @@ impl ExecutionBackend for DockerExecution {
         #[cfg(not(unix))]
         let signal = None;
 
-        Ok(ContainerExitInfo {
+        Ok(AgentExitInfo {
             exit_code,
             signal,
             started_at: self.started_at,
@@ -564,21 +562,23 @@ impl ExecutionBackend for DockerExecution {
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<super::instance::CancelHandle> {
+    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
         let name = self.container_name.clone();
-        Some(super::instance::CancelHandle::new(move || {
-            let _ = Command::new("docker")
-                .args(["stop", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = Command::new("docker")
-                .args(["rm", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            Ok(())
-        }))
+        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
+            move || {
+                let _ = Command::new("docker")
+                    .args(["stop", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = Command::new("docker")
+                    .args(["rm", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                Ok(())
+            },
+        ))
     }
 }
 
@@ -791,7 +791,7 @@ pub(super) fn build_run_argv(
     args
 }
 
-fn parse_stats_line(line: &str, fallback_name: &str) -> Result<ContainerStats, EngineError> {
+fn parse_stats_line(line: &str, fallback_name: &str) -> Result<AgentStats, EngineError> {
     // Format: "name|cpu%|memUsage" e.g. "awman-x|2.31%|123MiB / 4GiB"
     let parts: Vec<&str> = line.splitn(3, '|').collect();
     if parts.len() < 3 {
@@ -806,7 +806,7 @@ fn parse_stats_line(line: &str, fallback_name: &str) -> Result<ContainerStats, E
     };
     let cpu_percent = parse_cpu_percent(parts[1]);
     let memory_mb = parse_memory_mb(parts[2]);
-    Ok(ContainerStats {
+    Ok(AgentStats {
         name,
         cpu_percent,
         memory_mb,

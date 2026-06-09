@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
@@ -291,7 +291,7 @@ impl WorkflowFrontend for CliFrontend {
     fn user_choose_after_step_failure(
         &mut self,
         step: &WorkflowStep,
-        exit: &ContainerExitInfo,
+        exit: &AgentExitInfo,
     ) -> Result<StepFailureChoice, EngineError> {
         if self.non_interactive {
             return Ok(StepFailureChoice::Pause);

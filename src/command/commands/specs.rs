@@ -11,7 +11,7 @@ use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::engine::agent::AgentRunOptions;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::container::options::ContainerOption;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
@@ -96,15 +96,15 @@ pub trait SpecsCommandFrontend:
 
     /// Hand back a container-side frontend for spawning the interview / amend
     /// agent. Default impl returns a no-op proxy; CLI / TUI override.
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-        Box::new(NoopContainerFrontend)
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+        Box::new(NoopRuntimeFrontend)
     }
 
     /// Like `container_frontend`, but yields a frontend that surrenders its
     /// PTY I/O channels for direct bridging. Interactive container launches
     /// call this so the PTY is wired to the TUI renderer.
     /// Default falls back to `container_frontend`.
-    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
         self.container_frontend()
     }
 
@@ -112,29 +112,29 @@ pub trait SpecsCommandFrontend:
     fn set_pty_active(&mut self, _active: bool) {}
 }
 
-/// A minimal `ContainerFrontend` used as a default when the per-frontend
+/// A minimal `AgentFrontend` used as a default when the per-frontend
 /// impl doesn't supply one. Suitable for non-interactive command paths and
 /// tests that don't actually run a container.
-struct NoopContainerFrontend;
+struct NoopRuntimeFrontend;
 
-impl crate::engine::message::UserMessageSink for NoopContainerFrontend {
+impl crate::engine::message::UserMessageSink for NoopRuntimeFrontend {
     fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
     fn replay_queued(&mut self) {}
 }
 
 #[async_trait]
-impl ContainerFrontend for NoopContainerFrontend {
-    fn report_status(&mut self, _status: crate::engine::container::frontend::ContainerStatus) {}
+impl AgentFrontend for NoopRuntimeFrontend {
+    fn report_status(&mut self, _status: crate::engine::agent_runtime::frontend::AgentStatus) {}
     fn report_progress(
         &mut self,
-        _progress: crate::engine::container::frontend::ContainerProgress,
+        _progress: crate::engine::agent_runtime::frontend::AgentProgress,
     ) {
     }
-    fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
+    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::engine::container::frontend::ContainerIo {
+        crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
             stdin_tx,
@@ -233,6 +233,10 @@ impl Command for SpecsCommand {
                     allow_docker: f.allow_docker,
                     ..Default::default()
                 };
+                // Sandbox-class runtimes: agent spawn lands in WI 0090.
+                self.engines
+                    .require_container_runtime()
+                    .map_err(CommandError::from)?;
                 let options = match self
                     .engines
                     .agent_engine
@@ -247,16 +251,21 @@ impl Command for SpecsCommand {
                         return Err(CommandError::from(e));
                     }
                 };
-                let instance = match self.engines.runtime.build(options) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("specs amend: failed to build container instance: {e}"),
-                        });
-                        return Err(CommandError::from(e));
-                    }
-                };
+                let instance =
+                    match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
+                        .and_then(|o| self.engines.runtime.build(o))
+                    {
+                        Ok(i) => i,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!(
+                                    "specs amend: failed to build container instance: {e}"
+                                ),
+                            });
+                            return Err(CommandError::from(e));
+                        }
+                    };
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Info,
                     text: "Launching agent container…".into(),
@@ -482,6 +491,10 @@ pub(crate) async fn create_new_spec(
             env_passthrough: None,
             ..Default::default()
         };
+        // Sandbox-class runtimes: agent spawn lands in WI 0090.
+        engines
+            .require_container_runtime()
+            .map_err(CommandError::from)?;
         let mut options = match engines
             .agent_engine
             .build_options(&session, &agent, &run_opts)
@@ -500,7 +513,9 @@ pub(crate) async fn create_new_spec(
                 env_vars: credentials.env_vars,
             });
         }
-        let instance = match engines.runtime.build(options) {
+        let instance = match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
+            .and_then(|o| engines.runtime.build(o))
+        {
             Ok(i) => i,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -728,7 +743,9 @@ mod tests {
             ApiPaths::at_root(root),
         ));
         crate::command::dispatch::Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine: Arc::new(crate::engine::git::GitEngine::new()),
             overlay_engine: overlay,
             auth_engine,

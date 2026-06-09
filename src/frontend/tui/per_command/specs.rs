@@ -2,7 +2,7 @@
 
 use crate::command::commands::specs::{SpecsCommandFrontend, WorkItemKind};
 use crate::command::error::CommandError;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
@@ -49,11 +49,11 @@ impl SpecsCommandFrontend for TuiCommandFrontend {
         })
     }
 
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(super::TuiContainerProxy::new(self.status_log.clone()))
     }
 
-    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
         match self.container_io.take() {
             Some(io) => Box::new(super::TuiContainerProxy::with_io(
                 self.status_log.clone(),

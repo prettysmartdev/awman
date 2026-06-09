@@ -1,6 +1,6 @@
 //! `ReadyFrontend` trait — defined by Layer 1, implemented by Layer 3.
 
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
 use crate::engine::ready::phase::ReadyPhase;
@@ -21,6 +21,6 @@ pub trait ReadyFrontend: UserMessageSink + Send {
 
     fn report_phase(&mut self, phase: &ReadyPhase);
     fn report_step_status(&mut self, step: &str, status: StepStatus);
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend>;
     fn report_summary(&mut self, summary: &ReadySummary);
 }

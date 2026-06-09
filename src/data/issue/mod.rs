@@ -248,10 +248,18 @@ mod tests {
     fn format_as_markdown_default_with_body() {
         struct Dummy;
         impl IssueSource for Dummy {
-            fn provider_name(&self) -> &str { "Test" }
-            fn provider_prefix(&self) -> &str { "tst" }
-            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
-            fn can_handle(&self, _: &str) -> bool { false }
+            fn provider_name(&self) -> &str {
+                "Test"
+            }
+            fn provider_prefix(&self) -> &str {
+                "tst"
+            }
+            fn issue_identifier(&self, _: &Issue) -> String {
+                "0".into()
+            }
+            fn can_handle(&self, _: &str) -> bool {
+                false
+            }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
@@ -269,10 +277,18 @@ mod tests {
     fn format_as_markdown_default_empty_body() {
         struct Dummy;
         impl IssueSource for Dummy {
-            fn provider_name(&self) -> &str { "Test" }
-            fn provider_prefix(&self) -> &str { "tst" }
-            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
-            fn can_handle(&self, _: &str) -> bool { false }
+            fn provider_name(&self) -> &str {
+                "Test"
+            }
+            fn provider_prefix(&self) -> &str {
+                "tst"
+            }
+            fn issue_identifier(&self, _: &Issue) -> String {
+                "0".into()
+            }
+            fn can_handle(&self, _: &str) -> bool {
+                false
+            }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
@@ -301,7 +317,10 @@ mod tests {
 
     #[test]
     fn slugify_truncation() {
-        assert_eq!(slugify("github-integration-part-1", 20), "github-integration");
+        assert_eq!(
+            slugify("github-integration-part-1", 20),
+            "github-integration"
+        );
         assert_eq!(slugify("abcde-fghij", 6), "abcde");
     }
 
@@ -346,10 +365,18 @@ mod tests {
     fn format_as_markdown_unicode_content() {
         struct Dummy;
         impl IssueSource for Dummy {
-            fn provider_name(&self) -> &str { "Test" }
-            fn provider_prefix(&self) -> &str { "tst" }
-            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
-            fn can_handle(&self, _: &str) -> bool { false }
+            fn provider_name(&self) -> &str {
+                "Test"
+            }
+            fn provider_prefix(&self) -> &str {
+                "tst"
+            }
+            fn issue_identifier(&self, _: &Issue) -> String {
+                "0".into()
+            }
+            fn can_handle(&self, _: &str) -> bool {
+                false
+            }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
@@ -368,10 +395,18 @@ mod tests {
     fn format_as_markdown_special_chars_in_title() {
         struct Dummy;
         impl IssueSource for Dummy {
-            fn provider_name(&self) -> &str { "Test" }
-            fn provider_prefix(&self) -> &str { "tst" }
-            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
-            fn can_handle(&self, _: &str) -> bool { false }
+            fn provider_name(&self) -> &str {
+                "Test"
+            }
+            fn provider_prefix(&self) -> &str {
+                "tst"
+            }
+            fn issue_identifier(&self, _: &Issue) -> String {
+                "0".into()
+            }
+            fn can_handle(&self, _: &str) -> bool {
+                false
+            }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
@@ -406,7 +441,10 @@ mod tests {
     fn slugify_max_len_zero_returns_empty() {
         // With max_len = 0, any non-empty input should return empty string.
         let result = slugify("hello", 0);
-        assert!(result.is_empty(), "max_len=0 must return empty string, got: {result:?}");
+        assert!(
+            result.is_empty(),
+            "max_len=0 must return empty string, got: {result:?}"
+        );
     }
 
     #[test]

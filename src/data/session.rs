@@ -106,7 +106,7 @@ impl std::fmt::Display for AgentName {
 /// Layer 0 holds only the persistable identity. The runtime object that
 /// controls a container (start/stop/wait) is a Layer 1 concern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContainerHandle {
+pub struct AgentHandle {
     pub id: String,
     pub image_tag: String,
     pub name: String,
@@ -211,7 +211,7 @@ impl SessionLogEntry {
 pub struct SessionState {
     pub current_command: Option<CommandInvocation>,
     pub current_workflow: Option<WorkflowInvocation>,
-    pub current_container: Option<ContainerHandle>,
+    pub current_container: Option<AgentHandle>,
     pub errors: Vec<SessionLogEntry>,
     pub notes: Vec<SessionLogEntry>,
 }

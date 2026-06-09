@@ -59,7 +59,9 @@ fn make_app_state_with_workdirs(
     let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
-        runtime,
+        runtime: runtime.clone(),
+        container_runtime: Some(runtime),
+        sandbox_runtime: None,
         git_engine,
         overlay_engine,
         auth_engine,
@@ -1357,18 +1359,18 @@ fn remote_exec_prompt_flags_parity_with_local() {
 
 // ─── ApiDispatchFrontend → EventBus end-to-end ────────────────────────────────
 
-/// Sending bytes through the ContainerIo stdout channel must emit
+/// Sending bytes through the AgentIo stdout channel must emit
 /// `StdoutLine` events on the bus, one per newline-terminated line.
 #[tokio::test]
 async fn api_frontend_write_stdout_emits_stdout_line_events() {
-    use awman::engine::container::frontend::ContainerFrontend;
+    use awman::engine::agent_runtime::frontend::AgentFrontend;
     use awman::frontend::api::command_frontend::ApiDispatchFrontend;
 
     let bus = EventBus::new(64);
     let mut rx = bus.subscribe();
     let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
 
-    let io = fe.take_container_io();
+    let io = fe.take_io();
     io.stdout.send(b"alpha\nbeta\n".to_vec()).unwrap();
     drop(io);
     // Give the drain task a moment to process.
@@ -1559,7 +1561,9 @@ mod remote_session_start_wait_tests {
         let git_engine = Arc::new(GitEngine::new());
         let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(root));
         Engines {
-            runtime,
+            runtime: runtime.clone(),
+            container_runtime: Some(runtime),
+            sandbox_runtime: None,
             git_engine,
             overlay_engine,
             auth_engine,

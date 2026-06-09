@@ -1,7 +1,7 @@
 //! `InitFrontend` trait — defined by Layer 1, implemented by Layer 3.
 
 use crate::data::config::repo::WorkItemsConfig;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::init::phase::InitPhase;
 use crate::engine::init::summary::InitSummary;
@@ -31,6 +31,6 @@ pub trait InitFrontend: UserMessageSink + Send {
     ) -> Result<DockerfileSetupDecision, EngineError>;
     fn report_phase(&mut self, phase: &InitPhase);
     fn report_step_status(&mut self, step: &str, status: StepStatus);
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend>;
     fn report_summary(&mut self, summary: &InitSummary);
 }
