@@ -162,9 +162,12 @@ impl App {
         tab.last_container_summary = None;
 
         // Clear previous workflow state so the strip resets for the new command.
+        // Also clear the strip hit-test rect so stale rects from a previous
+        // workflow don't intercept mouse-scroll events meant for the container.
         if let Ok(mut guard) = tab.workflow_state.lock() {
             *guard = None;
         }
+        tab.last_strip_rect = None;
         if let Ok(mut guard) = tab.yolo_state.lock() {
             *guard = None;
         }

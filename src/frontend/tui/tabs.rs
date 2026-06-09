@@ -495,7 +495,8 @@ impl Tab {
 
             let mut received_any = false;
             while let Ok(bytes) = rx.try_recv() {
-                self.vt100_parser.process(&bytes);
+                let filtered = strip_alternate_screen_sequences(&bytes);
+                self.vt100_parser.process(&filtered);
                 received_any = true;
             }
             if received_any && self.container_window_state == ContainerWindowState::Hidden {
@@ -768,6 +769,51 @@ pub fn compute_tab_bar_width(num_tabs: usize, area_width: u16, max_natural_conte
     } else {
         (area_width / n).max(12)
     }
+}
+
+/// Strip DEC Private Mode Set/Reset sequences that toggle the alternate
+/// screen buffer.  Agents running inside the container (e.g. Claude Code
+/// in TUI mode) send these, which switches the vt100 parser to an
+/// alternate grid with zero scrollback — breaking mouse-wheel scrollback.
+/// By filtering these sequences the parser stays on the primary grid and
+/// scrollback accumulates normally.
+///
+/// Recognised sequences (single-parameter forms):
+///   ESC[?1049h / ESC[?1049l   (alternate screen + save/restore cursor)
+///   ESC[?47h   / ESC[?47l     (alternate screen, legacy)
+///   ESC[?1047h / ESC[?1047l   (alternate screen, xterm)
+fn strip_alternate_screen_sequences(input: &[u8]) -> Vec<u8> {
+    const SEQS: &[&[u8]] = &[
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        b"\x1b[?47h",
+        b"\x1b[?47l",
+        b"\x1b[?1047h",
+        b"\x1b[?1047l",
+    ];
+
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b {
+            let mut matched = false;
+            for seq in SEQS {
+                if input[i..].starts_with(seq) {
+                    i += seq.len();
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                out.push(input[i]);
+                i += 1;
+            }
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1140,5 +1186,62 @@ mod tests {
             exit_code: 0,
         };
         assert_eq!(tab_color(&tab), Color::DarkGray);
+    }
+
+    // ── strip_alternate_screen_sequences ─────────────────────────────
+
+    #[test]
+    fn strip_alt_screen_removes_1049h() {
+        let input = b"hello\x1b[?1049hworld";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out, b"helloworld");
+    }
+
+    #[test]
+    fn strip_alt_screen_removes_1049l() {
+        let input = b"\x1b[?1049lafter";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out, b"after");
+    }
+
+    #[test]
+    fn strip_alt_screen_removes_47h_and_47l() {
+        let input = b"a\x1b[?47hb\x1b[?47lc";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn strip_alt_screen_removes_1047h() {
+        let input = b"\x1b[?1047hx";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out, b"x");
+    }
+
+    #[test]
+    fn strip_alt_screen_preserves_other_escapes() {
+        let input = b"\x1b[31mred\x1b[0m";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out, input.to_vec());
+    }
+
+    #[test]
+    fn strip_alt_screen_passthrough_no_sequences() {
+        let input = b"plain text without escapes";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out, input.to_vec());
+    }
+
+    #[test]
+    fn strip_alt_screen_empty_input() {
+        let out = strip_alternate_screen_sequences(b"");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn strip_alt_screen_consecutive_sequences() {
+        let input = b"\x1b[?1049h\x1b[?1049l";
+        let out = strip_alternate_screen_sequences(input);
+        assert!(out.is_empty());
     }
 }

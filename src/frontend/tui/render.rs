@@ -78,6 +78,8 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         let scroll_offset = app.active_tab().workflow_strip_scroll_offset;
         workflow_view::render_workflow_strip(&wf_state, chunks[3], frame, scroll_offset);
         app.active_tab_mut().last_strip_rect = Some(chunks[3]);
+    } else {
+        app.active_tab_mut().last_strip_rect = None;
     }
 
     render_status_bar(app, chunks[4], frame);

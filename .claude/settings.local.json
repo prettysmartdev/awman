@@ -167,7 +167,13 @@
       "Bash(awk 'NR==1 || /awman/')",
       "Bash(container inspect *)",
       "WebFetch(domain:developers.googleblog.com)",
-      "WebFetch(domain:charmbracelet-crush.mintlify.app)"
+      "WebFetch(domain:charmbracelet-crush.mintlify.app)",
+      "WebFetch(domain:docs.docker.com)",
+      "WebFetch(domain:andrewlock.net)",
+      "WebFetch(domain:rivet.dev)",
+      "WebFetch(domain:www.ajeetraina.com)",
+      "WebFetch(domain:www.infoworld.com)",
+      "WebFetch(domain:news.ycombinator.com)"
     ]
   }
 }
