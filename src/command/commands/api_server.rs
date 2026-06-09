@@ -10,8 +10,8 @@ use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::fs::api_process;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::auth::TlsMaterial;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 /// Configuration handed from the `api start` command to Layer 3's
 /// `serve_until_shutdown`. Lives in Layer 2 so the trait signature does
@@ -576,8 +576,8 @@ mod tests {
     use crate::command::dispatch::Engines;
     use crate::data::fs::api_paths::ApiPaths;
     use crate::data::fs::auth_paths::AuthPathResolver;
+    use crate::data::message::{UserMessage, UserMessageSink};
     use crate::engine::auth::AuthEngine;
-    use crate::engine::message::{UserMessage, UserMessageSink};
     use std::sync::Arc;
 
     fn make_engines(tmp: &std::path::Path) -> Engines {

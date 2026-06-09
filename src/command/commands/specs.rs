@@ -10,10 +10,10 @@ use crate::command::commands::prompt_templates::{render_amend_prompt, render_int
 use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::container::options::ContainerOption;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct SpecsAmendFlags {
@@ -117,8 +117,8 @@ pub trait SpecsCommandFrontend:
 /// tests that don't actually run a container.
 struct NoopRuntimeFrontend;
 
-impl crate::engine::message::UserMessageSink for NoopRuntimeFrontend {
-    fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+impl crate::data::message::UserMessageSink for NoopRuntimeFrontend {
+    fn write_message(&mut self, _: crate::data::message::UserMessage) {}
     fn replay_queued(&mut self) {}
 }
 
@@ -667,8 +667,8 @@ mod tests {
     // ── SpecsCommand::Amend tests ────────────────────────────────────────────
 
     struct FakeSpecsFrontend;
-    impl crate::engine::message::UserMessageSink for FakeSpecsFrontend {
-        fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for FakeSpecsFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
     impl crate::command::commands::mount_scope::MountScopeFrontend for FakeSpecsFrontend {

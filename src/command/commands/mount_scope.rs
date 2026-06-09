@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::command::error::CommandError;
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountScopeDecision {

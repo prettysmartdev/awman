@@ -26,8 +26,8 @@ use crate::command::commands::{
 use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentFrontend;
-use crate::engine::message::{UserMessage, UserMessageSink};
 
 use super::user_message::CliUserMessageQueue;
 

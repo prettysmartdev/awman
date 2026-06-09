@@ -26,7 +26,7 @@ use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
-use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
+use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
 pub mod actions;
@@ -76,7 +76,7 @@ enum InterruptibleStepResult {
 pub use actions::{
     StepOutput, StepOutputKind, WorkflowOutcome as Outcome, WorkflowStepStatus as Status,
 };
-pub use factory::{ContainerExecutionFactory as Factory, WorkflowRuntimeContext as RuntimeContext};
+pub use factory::{AgentExecutionFactory as Factory, WorkflowRuntimeContext as RuntimeContext};
 pub use frontend::WorkflowFrontend as Frontend;
 
 /// Request sent from the TUI event loop (via per-tab channel) to the engine.
@@ -104,7 +104,7 @@ pub struct WorkflowEngine {
     state_store: WorkflowStateStore,
     effective_config: EffectiveConfig,
     frontend: Box<dyn WorkflowFrontend>,
-    container_factory: Box<dyn ContainerExecutionFactory>,
+    agent_factory: Box<dyn AgentExecutionFactory>,
     git_engine: Arc<GitEngine>,
     overlay_engine: Arc<OverlayEngine>,
     current_execution: Option<AgentExecution>,
@@ -121,22 +121,22 @@ pub struct WorkflowEngine {
 impl WorkflowEngine {
     fn msg_info(&mut self, text: impl Into<String>) {
         self.frontend
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Info,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Info,
                 text: text.into(),
             });
     }
     fn msg_warning(&mut self, text: impl Into<String>) {
         self.frontend
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Warning,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
                 text: text.into(),
             });
     }
     fn msg_success(&mut self, text: impl Into<String>) {
         self.frontend
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Success,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Success,
                 text: text.into(),
             });
     }
@@ -146,7 +146,7 @@ impl WorkflowEngine {
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
-        container_factory: Box<dyn ContainerExecutionFactory>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
         git_engine: Arc<GitEngine>,
         overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
@@ -171,7 +171,7 @@ impl WorkflowEngine {
             state_store,
             effective_config,
             frontend,
-            container_factory,
+            agent_factory,
             git_engine,
             overlay_engine,
             current_execution: None,
@@ -201,7 +201,7 @@ impl WorkflowEngine {
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
-        container_factory: Box<dyn ContainerExecutionFactory>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
         git_engine: Arc<GitEngine>,
         overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
@@ -245,8 +245,8 @@ impl WorkflowEngine {
 
         let interrupted = state.interrupted_running_steps();
         if !interrupted.is_empty() {
-            frontend.write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Warning,
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
                 text: format!(
                     "Interrupted steps detected (prior crash?): {}. Resetting to Pending.",
                     interrupted.join(", "),
@@ -268,7 +268,7 @@ impl WorkflowEngine {
             state_store: store,
             effective_config,
             frontend,
-            container_factory,
+            agent_factory,
             git_engine,
             overlay_engine,
             current_execution: None,
@@ -502,9 +502,9 @@ impl WorkflowEngine {
             .report_step_status(&step, WorkflowStepStatus::Running);
         self.persist()?;
 
-        let execution =
-            self.container_factory
-                .execution_for_step(&step, &self.session, &runtime)?;
+        let execution = self
+            .agent_factory
+            .execution_for_step(&step, &self.session, &runtime)?;
 
         self.state.set_status(
             &step.name,
@@ -726,7 +726,7 @@ impl WorkflowEngine {
             }
             NextAction::ContinueInCurrentContainer { prompt } => {
                 if let Some(exec) = self.current_execution.as_ref() {
-                    let _ = self.container_factory.inject_prompt(exec, &prompt);
+                    let _ = self.agent_factory.inject_prompt(exec, &prompt);
                 }
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
@@ -1197,7 +1197,7 @@ impl WorkflowEngine {
             ));
         }
         match &self.current_execution {
-            Some(exec) => match self.container_factory.inject_prompt(exec, prompt)? {
+            Some(exec) => match self.agent_factory.inject_prompt(exec, prompt)? {
                 Some(()) => {
                     self.state.set_status(&next_step.name, StepState::Succeeded);
                     self.current_step_name = Some(next_step.name.clone());
@@ -1679,11 +1679,11 @@ impl WorkflowEngine {
         let result =
             poll_ci::run_poll_ci_loop(&git_root, interval_secs, max_retries, |level, msg| {
                 let ml = match level {
-                    poll_ci::PollMessage::Info => crate::engine::message::MessageLevel::Info,
-                    poll_ci::PollMessage::Warning => crate::engine::message::MessageLevel::Warning,
+                    poll_ci::PollMessage::Info => crate::data::message::MessageLevel::Info,
+                    poll_ci::PollMessage::Warning => crate::data::message::MessageLevel::Warning,
                 };
                 self.frontend
-                    .write_message(crate::engine::message::UserMessage {
+                    .write_message(crate::data::message::UserMessage {
                         level: ml,
                         text: msg,
                     });
@@ -1920,17 +1920,17 @@ impl WorkflowEngine {
             workflow_step_info: None,
         };
 
-        let execution = match self.container_factory.execution_for_step(
-            &synthetic_step,
-            &self.session,
-            &runtime,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                self.msg_warning(format!("on_failure: failed to launch agent: {e}"));
-                return;
-            }
-        };
+        let execution =
+            match self
+                .agent_factory
+                .execution_for_step(&synthetic_step, &self.session, &runtime)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    self.msg_warning(format!("on_failure: failed to launch agent: {e}"));
+                    return;
+                }
+            };
 
         let handle = tokio::runtime::Handle::current();
         let mut exec = execution;
@@ -2025,8 +2025,8 @@ mod tests {
         }
     }
 
-    impl crate::engine::message::UserMessageSink for FakeWorkflowFrontend {
-        fn write_message(&mut self, _msg: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for FakeWorkflowFrontend {
+        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
 
@@ -2078,7 +2078,7 @@ mod tests {
         }
     }
 
-    struct FakeContainerExecutionFactory {
+    struct FakeAgentExecutionFactory {
         exit_codes: Mutex<VecDeque<i32>>,
         pub execution_call_count: AtomicUsize,
         pub inject_call_count: AtomicUsize,
@@ -2086,7 +2086,7 @@ mod tests {
         inject_result: Option<()>,
     }
 
-    impl FakeContainerExecutionFactory {
+    impl FakeAgentExecutionFactory {
         fn new(exit_codes: impl IntoIterator<Item = i32>) -> Self {
             Self {
                 exit_codes: Mutex::new(exit_codes.into_iter().collect()),
@@ -2109,7 +2109,7 @@ mod tests {
         }
     }
 
-    impl ContainerExecutionFactory for FakeContainerExecutionFactory {
+    impl AgentExecutionFactory for FakeAgentExecutionFactory {
         fn execution_for_step(
             &self,
             _step: &WorkflowStep,
@@ -2189,7 +2189,7 @@ mod tests {
     fn make_engine(
         session: &Session,
         workflow: Workflow,
-        factory: FakeContainerExecutionFactory,
+        factory: FakeAgentExecutionFactory,
         actions: impl IntoIterator<Item = NextAction>,
     ) -> WorkflowEngine {
         make_engine_with_frontend(
@@ -2203,7 +2203,7 @@ mod tests {
     fn make_engine_with_frontend(
         session: &Session,
         workflow: Workflow,
-        factory: FakeContainerExecutionFactory,
+        factory: FakeAgentExecutionFactory,
         frontend: FakeWorkflowFrontend,
     ) -> WorkflowEngine {
         let overlay = OverlayEngine::with_auth_resolver(
@@ -2232,7 +2232,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(&session, workflow, factory, []);
 
         let outcome = engine.step_once().await.unwrap();
@@ -2263,7 +2263,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext]);
         let overlay = OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
@@ -2296,7 +2296,7 @@ mod tests {
                 make_step("c", &["a"], None),
             ],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(
             &session,
             workflow,
@@ -2322,7 +2322,7 @@ mod tests {
                 make_step("d", &["b", "c"], None),
             ],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(
             &session,
             workflow,
@@ -2347,7 +2347,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None)],
         );
-        let factory = FakeContainerExecutionFactory::new([1]);
+        let factory = FakeAgentExecutionFactory::new([1]);
         let mut engine = make_engine(&session, workflow, factory, []);
 
         let outcome = engine.step_once().await.unwrap();
@@ -2366,7 +2366,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None)],
         );
-        let factory = FakeContainerExecutionFactory::new([2]);
+        let factory = FakeAgentExecutionFactory::new([2]);
         let frontend = FakeWorkflowFrontend::new([]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
@@ -2383,7 +2383,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None)],
         );
-        let factory = FakeContainerExecutionFactory::new([1, 0]);
+        let factory = FakeAgentExecutionFactory::new([1, 0]);
         let mut frontend = FakeWorkflowFrontend::new([]);
         frontend.failure_choice = StepFailureChoice::Retry;
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
@@ -2401,7 +2401,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None)],
         );
-        let factory = FakeContainerExecutionFactory::new([1]);
+        let factory = FakeAgentExecutionFactory::new([1]);
         let mut frontend = FakeWorkflowFrontend::new([]);
         frontend.failure_choice = StepFailureChoice::Pause;
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
@@ -2419,7 +2419,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(&session, workflow, factory, [NextAction::Pause]);
 
         let result = engine.run_to_completion().await.unwrap();
@@ -2441,12 +2441,12 @@ mod tests {
         );
 
         {
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let mut engine = make_engine(&session, wf.clone(), factory, [NextAction::Pause]);
             engine.run_to_completion().await.unwrap();
         }
 
-        let factory2 = FakeContainerExecutionFactory::always_success();
+        let factory2 = FakeAgentExecutionFactory::always_success();
         let overlay = OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
         );
@@ -2477,7 +2477,7 @@ mod tests {
         );
 
         {
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let mut engine = make_engine(&session, wf1, factory, [NextAction::Pause]);
             engine.run_to_completion().await.unwrap();
         }
@@ -2496,7 +2496,7 @@ mod tests {
             wf2,
             None,
             Box::new(frontend),
-            Box::new(FakeContainerExecutionFactory::always_success()),
+            Box::new(FakeAgentExecutionFactory::always_success()),
             Arc::new(GitEngine::new()),
             Arc::new(overlay),
         )
@@ -2517,11 +2517,11 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], Some("codex"))],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
-        let factory_arc: Arc<FakeContainerExecutionFactory> = Arc::new(factory);
+        let factory = FakeAgentExecutionFactory::always_success();
+        let factory_arc: Arc<FakeAgentExecutionFactory> = Arc::new(factory);
 
-        struct RecordingFactory(Arc<FakeContainerExecutionFactory>);
-        impl ContainerExecutionFactory for RecordingFactory {
+        struct RecordingFactory(Arc<FakeAgentExecutionFactory>);
+        impl AgentExecutionFactory for RecordingFactory {
             fn execution_for_step(
                 &self,
                 step: &WorkflowStep,
@@ -2568,7 +2568,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         let mut engine = make_engine(&session, workflow, factory, []);
 
         engine.step_once().await.unwrap();
@@ -2591,7 +2591,7 @@ mod tests {
                 make_step("c", &["b"], None),
             ],
         );
-        let factory = FakeContainerExecutionFactory::always_success();
+        let factory = FakeAgentExecutionFactory::always_success();
         // No actions queued — yolo mode should auto-advance without prompting.
         let mut engine = make_engine(&session, workflow, factory, []);
         engine.set_yolo(true);
@@ -2690,7 +2690,7 @@ mod tests {
         }
     }
 
-    impl ContainerExecutionFactory for BlockingFactory {
+    impl AgentExecutionFactory for BlockingFactory {
         fn execution_for_step(
             &self,
             _step: &WorkflowStep,
@@ -2768,8 +2768,8 @@ mod tests {
         }
     }
 
-    impl crate::engine::message::UserMessageSink for CapturingFrontend {
-        fn write_message(&mut self, _msg: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for CapturingFrontend {
+        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
 
@@ -3030,8 +3030,8 @@ mod tests {
             yolo_started: AtomicBool,
             yolo_finished: AtomicBool,
         }
-        impl crate::engine::message::UserMessageSink for YoloTrackingFrontend {
-            fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+        impl crate::data::message::UserMessageSink for YoloTrackingFrontend {
+            fn write_message(&mut self, _: crate::data::message::UserMessage) {}
             fn replay_queued(&mut self) {}
         }
         impl WorkflowFrontend for YoloTrackingFrontend {
@@ -3191,8 +3191,8 @@ mod tests {
             engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
             step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
         }
-        impl crate::engine::message::UserMessageSink for UnstuckTestFrontend {
-            fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+        impl crate::data::message::UserMessageSink for UnstuckTestFrontend {
+            fn write_message(&mut self, _: crate::data::message::UserMessage) {}
             fn replay_queued(&mut self) {}
         }
         impl WorkflowFrontend for UnstuckTestFrontend {
@@ -3473,7 +3473,7 @@ mod tests {
         make_engine(
             &session,
             workflow,
-            FakeContainerExecutionFactory::always_success(),
+            FakeAgentExecutionFactory::always_success(),
             [],
         )
     }
@@ -3664,7 +3664,7 @@ mod tests {
     }
 
     #[test]
-    fn run_teardown_continues_after_per_step_container_factory_failure() {
+    fn run_teardown_continues_after_per_step_agent_factory_failure() {
         // Per-step container build failure must not abort teardown; it should
         // record the step as Failed and proceed to the next one.
         use crate::data::workflow_definition::TeardownStep;
@@ -3909,11 +3909,11 @@ mod tests {
     /// Frontend that records every `write_message` call so tests can assert on
     /// the on_failure status messages emitted by the engine.
     struct MessageCapturingFrontend {
-        messages: Arc<Mutex<Vec<crate::engine::message::UserMessage>>>,
+        messages: Arc<Mutex<Vec<crate::data::message::UserMessage>>>,
     }
 
     impl MessageCapturingFrontend {
-        fn new() -> (Self, Arc<Mutex<Vec<crate::engine::message::UserMessage>>>) {
+        fn new() -> (Self, Arc<Mutex<Vec<crate::data::message::UserMessage>>>) {
             let store = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
@@ -3924,8 +3924,8 @@ mod tests {
         }
     }
 
-    impl crate::engine::message::UserMessageSink for MessageCapturingFrontend {
-        fn write_message(&mut self, msg: crate::engine::message::UserMessage) {
+    impl crate::data::message::UserMessageSink for MessageCapturingFrontend {
+        fn write_message(&mut self, msg: crate::data::message::UserMessage) {
             self.messages.lock().unwrap().push(msg);
         }
         fn replay_queued(&mut self) {}
@@ -3964,7 +3964,7 @@ mod tests {
     fn make_engine_capturing(
         session: &Session,
         workflow: Workflow,
-        factory: FakeContainerExecutionFactory,
+        factory: FakeAgentExecutionFactory,
         frontend: MessageCapturingFrontend,
     ) -> WorkflowEngine {
         let overlay = OverlayEngine::with_auth_resolver(
@@ -4003,7 +4003,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4043,8 +4043,8 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            // The on_failure agent uses FakeContainerExecutionFactory (exit 0, ignored).
-            let factory = FakeContainerExecutionFactory::always_success();
+            // The on_failure agent uses FakeAgentExecutionFactory (exit 0, ignored).
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4083,7 +4083,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4126,7 +4126,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4172,7 +4172,7 @@ mod tests {
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
             // Agent exits non-zero — should be ignored.
-            let factory = FakeContainerExecutionFactory::new(std::iter::repeat_n(42, 10));
+            let factory = FakeAgentExecutionFactory::new(std::iter::repeat_n(42, 10));
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4212,7 +4212,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4265,7 +4265,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4300,9 +4300,9 @@ mod tests {
     // on_failure messages are emitted correctly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn on_failure_emits_launch_and_success_messages() {
-        use crate::engine::message::MessageLevel;
+        use crate::data::message::MessageLevel;
 
-        let msg_store = Arc::new(Mutex::new(Vec::<crate::engine::message::UserMessage>::new()));
+        let msg_store = Arc::new(Mutex::new(Vec::<crate::data::message::UserMessage>::new()));
         let msg_store_clone = Arc::clone(&msg_store);
 
         tokio::task::spawn_blocking(move || {
@@ -4310,7 +4310,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let frontend = MessageCapturingFrontend {
                 messages: Arc::clone(&msg_store_clone),
             };
@@ -4360,9 +4360,9 @@ mod tests {
     // Exhausting max_attempts emits a Warning message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn on_failure_exhausted_emits_warning_message() {
-        use crate::engine::message::MessageLevel;
+        use crate::data::message::MessageLevel;
 
-        let msg_store = Arc::new(Mutex::new(Vec::<crate::engine::message::UserMessage>::new()));
+        let msg_store = Arc::new(Mutex::new(Vec::<crate::data::message::UserMessage>::new()));
         let msg_store_clone = Arc::clone(&msg_store);
 
         tokio::task::spawn_blocking(move || {
@@ -4370,7 +4370,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let frontend = MessageCapturingFrontend {
                 messages: Arc::clone(&msg_store_clone),
             };
@@ -4413,7 +4413,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4467,7 +4467,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4538,7 +4538,7 @@ mod tests {
             let session = make_session(&tmp);
             let workflow =
                 make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
-            let factory = FakeContainerExecutionFactory::always_success();
+            let factory = FakeAgentExecutionFactory::always_success();
             let (frontend, _msgs) = MessageCapturingFrontend::new();
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 

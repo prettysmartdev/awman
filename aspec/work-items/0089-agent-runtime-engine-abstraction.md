@@ -589,3 +589,53 @@ After implementation, update:
 - The grand architecture doc (Phase 8).
 
 No work-item-specific docs.
+
+## Post-implementation notes (review outcomes)
+
+Decisions made during/after implementation that deviate from or extend the
+text above. Each was reviewed deliberately; none is an oversight.
+
+- **`AgentExecution` is a concrete struct, not a trait.** Phase 2.6 sketches
+  `pub trait AgentExecution` with `run_with_frontend → Box<dyn AgentExecution>`.
+  The pre-refactor `ContainerExecution` was already a concrete struct wrapping
+  an internal backend trait, and the grand architecture describes
+  `AgentExecution` as a *type* handed to `WorkflowEngine`. The implementation
+  keeps that shape: `AgentExecution` (struct, `src/engine/agent_runtime/execution.rs`)
+  wraps a `pub(crate) ExecutionBackend` trait that both paradigms' backends
+  implement. Same polymorphism, one fewer public trait, zero behavior change —
+  per Phase 0, the grand architecture wins over the Phase 2.6 sketch.
+- **`Engines::require_container_runtime()` replaces the spec'd `.expect(...)`
+  pattern.** Phase 5 suggested `container_runtime.as_ref().expect(...)` at
+  container-paradigm call sites. The implementation instead returns a clean
+  `EngineError::NotImplemented` naming WI 0090, so a sandbox-configured user
+  can never hit a panic. Strictly better than the spec'd shape.
+- **`awman init` requires a container runtime.** The switching contract above
+  says "basic non-runtime operations work"; `init` is not one of them — its
+  engine builds the agent image. Under `docker-sbx-experimental` it fails
+  up-front with the standard `NotImplemented` error. A kit-based init path is
+  WI 0090's concern.
+- **`awman config` is exempt from runtime detection.** Platform guards live in
+  the runtime constructors (Phase 4), so an unsupported `runtime:` string
+  fails at startup. To keep the "switching back immediately restores full
+  functionality" promise reachable from the CLI, `main.rs` consults
+  `CommandCatalogue::requires_runtime()` and lets `config` proceed on an inert
+  default runtime (with a warning) when detection fails. All other commands
+  and the bare-TUI invocation still fail.
+- **Detect-error/log wording changed** from "container runtime" to "agent
+  runtime" (`main.rs`, `frontend/api/mod.rs`). Reachable only on
+  detection-failure paths, never in a working Docker/Apple flow; the new
+  wording matches the abstraction.
+- **Merge fix:** the WI branch landed concurrently with the stuck-detection
+  fix (`dcb88068`), which referenced `StuckEvent` at its pre-refactor path.
+  The merge compiled neither; the follow-up commit repoints the four
+  references at `engine::agent_runtime::StuckEvent`.
+- **`ContainerExecutionFactory` → `AgentExecutionFactory`.** The Phase 2.5
+  rename inventory missed this trait (the checklist grep's word boundary
+  doesn't trip on the `Factory` suffix). It produces `AgentExecution` and is
+  paradigm-agnostic, so it follows the cross-paradigm rename rule; renamed in
+  a follow-up commit (`container_factory` field → `agent_factory`).
+- **`engine::message` moved to `data::message`.** Pre-existing
+  `architecture-lint` violations (Layer 0 `data::issue` importing
+  `engine::message`) surfaced during this WI's review. The message types and
+  sink traits are dependency-free and belong at Layer 0, importable by every
+  layer. Mechanical move; no type or trait renamed.

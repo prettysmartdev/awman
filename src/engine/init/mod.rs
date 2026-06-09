@@ -128,8 +128,8 @@ impl InitEngine {
                         match crate::data::network::extract_aspec_tarball(&bytes, &aspec_dir) {
                             Ok(()) => downloaded = true,
                             Err(e) => {
-                                frontend.write_message(crate::engine::message::UserMessage {
-                                    level: crate::engine::message::MessageLevel::Warning,
+                                frontend.write_message(crate::data::message::UserMessage {
+                                    level: crate::data::message::MessageLevel::Warning,
                                     text: format!(
                                         "aspec download failed: {e}; using empty aspec directory"
                                     ),
@@ -138,8 +138,8 @@ impl InitEngine {
                         }
                     }
                     Err(e) => {
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Warning,
                             text: format!(
                                 "aspec download failed: {e}; using empty aspec directory"
                             ),
@@ -217,8 +217,8 @@ impl InitEngine {
                     )
                     .await;
                     if let Err(e) = dl {
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Warning,
                             text: format!(
                                 "agent Dockerfile download failed: {e}; continuing without it"
                             ),
@@ -237,8 +237,8 @@ impl InitEngine {
                     };
                     cfg.save(&git_root)?;
                 } else {
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Info,
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Info,
                         text: ".awman/config.json already present — preserving existing config."
                             .to_string(),
                     });
@@ -339,8 +339,8 @@ impl InitEngine {
                     }
                 } else {
                     self.summary.agent_image_build = StepStatus::Skipped;
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Warning,
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Warning,
                         text: "Agent Dockerfile not found; skipping agent image build.".to_string(),
                     });
                 }
@@ -378,8 +378,8 @@ impl InitEngine {
                         // Unknown agent or option-build failure — skip audit
                         // gracefully (init flow continues).
                         self.summary.audit = StepStatus::Skipped;
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Warning,
                             text: format!("skipping audit: {e}"),
                         });
                     }
@@ -392,8 +392,8 @@ impl InitEngine {
                         {
                             Err(e) => {
                                 self.summary.audit = StepStatus::Skipped;
-                                frontend.write_message(crate::engine::message::UserMessage {
-                                    level: crate::engine::message::MessageLevel::Warning,
+                                frontend.write_message(crate::data::message::UserMessage {
+                                    level: crate::data::message::MessageLevel::Warning,
                                     text: format!("skipping audit: {e}"),
                                 });
                             }
@@ -402,13 +402,10 @@ impl InitEngine {
                                 match instance.run_with_frontend(container_fe) {
                                     Err(e) => {
                                         self.summary.audit = StepStatus::Skipped;
-                                        frontend.write_message(
-                                            crate::engine::message::UserMessage {
-                                                level:
-                                                    crate::engine::message::MessageLevel::Warning,
-                                                text: format!("skipping audit: {e}"),
-                                            },
-                                        );
+                                        frontend.write_message(crate::data::message::UserMessage {
+                                            level: crate::data::message::MessageLevel::Warning,
+                                            text: format!("skipping audit: {e}"),
+                                        });
                                     }
                                     Ok(mut exec) => match exec.wait().await {
                                         Err(e) => {
@@ -539,9 +536,9 @@ mod tests {
 
     use super::*;
     use crate::data::config::repo::WorkItemsConfig;
+    use crate::data::message::{UserMessage, UserMessageSink};
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
     use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
-    use crate::engine::message::{UserMessage, UserMessageSink};
     use crate::engine::overlay::OverlayEngine;
     use crate::engine::step_status::StepStatus;
 

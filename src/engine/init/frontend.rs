@@ -1,11 +1,11 @@
 //! `InitFrontend` trait — defined by Layer 1, implemented by Layer 3.
 
 use crate::data::config::repo::WorkItemsConfig;
+use crate::data::message::UserMessageSink;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::init::phase::InitPhase;
 use crate::engine::init::summary::InitSummary;
-use crate::engine::message::UserMessageSink;
 use crate::engine::step_status::StepStatus;
 
 /// User's choice when no project-base Dockerfile is found during init.

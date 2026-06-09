@@ -9,7 +9,7 @@ pub mod router;
 use std::fmt;
 use std::path::Path;
 
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 
 /// Generic output of every `IssueSource`.
 #[derive(Debug, Clone)]

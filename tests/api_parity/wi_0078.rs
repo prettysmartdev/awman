@@ -1389,7 +1389,7 @@ async fn api_frontend_write_stdout_emits_stdout_line_events() {
 /// emit a `StatusMessage` event with the correct phase mapping.
 #[tokio::test]
 async fn api_frontend_write_message_emits_status_message_event() {
-    use awman::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+    use awman::data::message::{MessageLevel, UserMessage, UserMessageSink};
     use awman::frontend::api::command_frontend::ApiDispatchFrontend;
 
     let bus = EventBus::new(64);
@@ -1530,13 +1530,13 @@ mod remote_session_start_wait_tests {
     use awman::data::config::env::EnvSnapshot;
     use awman::data::fs::api_paths::ApiPaths;
     use awman::data::fs::auth_paths::AuthPathResolver;
+    use awman::data::message::{MessageLevel, UserMessage, UserMessageSink};
     use awman::data::session::{Session, SessionOpenOptions};
     use awman::data::EngineWorkflowStateStore;
     use awman::engine::agent::AgentEngine;
     use awman::engine::auth::AuthEngine;
     use awman::engine::container::ContainerRuntime;
     use awman::engine::git::GitEngine;
-    use awman::engine::message::{MessageLevel, UserMessage, UserMessageSink};
     use awman::engine::overlay::OverlayEngine;
     use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 

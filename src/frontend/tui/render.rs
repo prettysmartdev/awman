@@ -823,8 +823,8 @@ fn truncate_middle(s: &str, max: usize) -> String {
 }
 
 /// Map message level to display color.
-fn status_level_color(level: &crate::engine::message::MessageLevel) -> Color {
-    use crate::engine::message::MessageLevel;
+fn status_level_color(level: &crate::data::message::MessageLevel) -> Color {
+    use crate::data::message::MessageLevel;
     match level {
         MessageLevel::Info => Color::White,
         MessageLevel::Warning => Color::Yellow,

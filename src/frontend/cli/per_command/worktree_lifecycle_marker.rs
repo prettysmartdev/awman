@@ -10,7 +10,7 @@ use crate::command::commands::worktree_lifecycle::{
     PreWorktreeDecision, WorktreeLifecycleFrontend,
 };
 use crate::command::error::CommandError;
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 use crate::frontend::cli::output::stdin_is_tty;
@@ -83,8 +83,8 @@ impl WorktreeLifecycleFrontend for CliFrontend {
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
         self.messages
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Info,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Info,
                 text: format!("worktree created at {} on branch {branch}", path.display()),
             });
     }
@@ -167,8 +167,8 @@ impl WorktreeLifecycleFrontend for CliFrontend {
 
     fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, git_root: &Path) {
         self.messages
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Error,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Error,
                 text: format!(
                     "merge conflict on {branch} (worktree {}, git root {})",
                     worktree_path.display(),
@@ -179,16 +179,16 @@ impl WorktreeLifecycleFrontend for CliFrontend {
 
     fn report_worktree_discarded(&mut self, branch: &str) {
         self.messages
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Info,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Info,
                 text: format!("worktree for {branch} discarded"),
             });
     }
 
     fn report_worktree_kept(&mut self, path: &Path, branch: &str) {
         self.messages
-            .write_message(crate::engine::message::UserMessage {
-                level: crate::engine::message::MessageLevel::Info,
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Info,
                 text: format!("worktree for {branch} kept at {}", path.display()),
             });
     }

@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::data::error::DataError;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::GitRootResolver;
 use crate::data::worktree_paths::{
     worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
 };
 use crate::engine::error::EngineError;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 /// Run a git command and log both the command line and output to the sink.
 fn run_git_logged(

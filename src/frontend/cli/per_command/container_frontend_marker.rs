@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use std::io::Write;
 
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
-use crate::engine::message::{UserMessage, UserMessageSink};
 
 use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
 
@@ -279,7 +279,7 @@ pub(crate) struct CliInteractiveContainerProxy {
 
 impl UserMessageSink for CliContainerProxy {
     fn write_message(&mut self, msg: UserMessage) {
-        use crate::engine::message::MessageLevel;
+        use crate::data::message::MessageLevel;
         let prefix = match msg.level {
             MessageLevel::Info | MessageLevel::Success => "awman:",
             MessageLevel::Warning => "awman warning:",
@@ -333,7 +333,7 @@ impl AgentFrontend for CliContainerProxy {
 
 impl UserMessageSink for CliInteractiveContainerProxy {
     fn write_message(&mut self, msg: UserMessage) {
-        use crate::engine::message::MessageLevel;
+        use crate::data::message::MessageLevel;
         let prefix = match msg.level {
             MessageLevel::Info | MessageLevel::Success => "awman:",
             MessageLevel::Warning => "awman warning:",

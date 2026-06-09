@@ -158,8 +158,8 @@ impl ReadyEngine {
                     self.summary.aspec_folder = StepStatus::Done;
                 } else {
                     self.summary.aspec_folder = StepStatus::Warn("aspec/ folder not found".into());
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Warning,
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Warning,
                         text: "aspec/ folder not found in git root; run `awman init` to create it."
                             .to_string(),
                     });
@@ -171,8 +171,8 @@ impl ReadyEngine {
                 } else {
                     self.summary.work_items_config =
                         StepStatus::Warn(".awman/config.json not found".into());
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Warning,
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Warning,
                         text: ".awman/config.json not found; run `awman init` to create it."
                             .to_string(),
                     });
@@ -439,8 +439,8 @@ impl ReadyEngine {
                         self.summary
                             .non_default_agent_images
                             .push(("Missing images".to_string(), status));
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Warning,
                             text: format!("Missing agent images: {names_csv}"),
                         });
                     }
@@ -470,12 +470,12 @@ impl ReadyEngine {
                             .next()
                             .unwrap_or("")
                             .to_string();
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Info,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Info,
                             text: format!("> {greeting}"),
                         });
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Info,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Info,
                             text: format!("< {response}"),
                         });
                         self.summary.local_agent = StepStatus::Done;
@@ -527,8 +527,8 @@ impl ReadyEngine {
                 if dockerfile_path.exists() {
                     let content = std::fs::read_to_string(&dockerfile_path).unwrap_or_default();
                     if !templates::dockerfile_matches_template(&content) {
-                        frontend.write_message(crate::engine::message::UserMessage {
-                            level: crate::engine::message::MessageLevel::Warning,
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Warning,
                             text:
                                 "Dockerfile.dev has been customised; audit may overwrite changes."
                                     .into(),
@@ -723,10 +723,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::data::message::{UserMessage, UserMessageSink};
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
     use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
     use crate::engine::error::EngineError;
-    use crate::engine::message::{UserMessage, UserMessageSink};
     use crate::engine::overlay::OverlayEngine;
     use crate::engine::step_status::StepStatus;
 

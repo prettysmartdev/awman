@@ -1,8 +1,8 @@
 //! `ReadyFrontend` impl for the TUI.
 
+use crate::data::message::UserMessageSink;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
-use crate::engine::message::UserMessageSink;
 use crate::engine::ready::frontend::ReadyFrontend;
 use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;

@@ -1,8 +1,8 @@
 //! `AgentAuthFrontend` — first-run keychain consent prompt.
 
 use crate::command::error::CommandError;
+use crate::data::message::UserMessageSink;
 use crate::data::session::AgentName;
-use crate::engine::message::UserMessageSink;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAuthDecision {

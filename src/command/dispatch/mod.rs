@@ -44,6 +44,7 @@ use crate::command::commands::status::{StatusCommand, StatusCommandFlags, Status
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind, FlagSpec};
 use crate::command::error::CommandError;
+use crate::data::message::UserMessageSink;
 use crate::data::session::Session;
 use crate::engine::agent::AgentEngine;
 use crate::engine::agent_runtime::AgentRuntimeEngine;
@@ -51,7 +52,6 @@ use crate::engine::auth::AuthEngine;
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
-use crate::engine::message::UserMessageSink;
 use crate::engine::overlay::OverlayEngine;
 use crate::engine::sandbox::SandboxRuntime;
 
@@ -871,8 +871,8 @@ mod tests {
         }
     }
 
-    impl crate::engine::message::UserMessageSink for FakeCommandFrontend {
-        fn write_message(&mut self, _msg: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for FakeCommandFrontend {
+        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
 

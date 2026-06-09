@@ -12,6 +12,7 @@ pub mod execution_event;
 pub mod fs;
 pub mod image_tags;
 pub mod issue;
+pub mod message;
 pub mod migration;
 pub mod network;
 pub mod ready_phase;

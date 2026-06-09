@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 /// Status log entry stored per-tab.
 #[derive(Debug, Clone)]

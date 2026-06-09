@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 use super::{Issue, IssueSource, IssueSourceError};
 
@@ -988,7 +988,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn fetch_with_progress_emits_gh_command_message_on_success() {
-        use crate::engine::message::RecordingMessageSink;
+        use crate::data::message::RecordingMessageSink;
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1050,7 +1050,7 @@ exit 0
 
     #[test]
     fn fetch_with_progress_emits_fallback_message_when_gh_fails() {
-        use crate::engine::message::RecordingMessageSink;
+        use crate::data::message::RecordingMessageSink;
 
         let tmp = tempfile::tempdir().unwrap();
 

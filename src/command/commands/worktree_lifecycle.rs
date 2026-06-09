@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::command::error::CommandError;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreWorktreeDecision {
@@ -330,8 +330,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::data::message::{MessageLevel, UserMessage};
     use crate::engine::git::GitEngine;
-    use crate::engine::message::{MessageLevel, UserMessage};
 
     // ─── Recording frontend ───────────────────────────────────────────────────
 
@@ -368,7 +368,7 @@ mod tests {
         }
     }
 
-    impl crate::engine::message::UserMessageSink for RecordingWorktreeLifecycleFrontend {
+    impl crate::data::message::UserMessageSink for RecordingWorktreeLifecycleFrontend {
         fn write_message(&mut self, msg: UserMessage) {
             self.messages.push(msg);
         }
@@ -908,7 +908,7 @@ mod tests {
             inner: RecordingWorktreeLifecycleFrontend,
             received_had_error: Option<bool>,
         }
-        impl crate::engine::message::UserMessageSink for ErrorRecordingFrontend {
+        impl crate::data::message::UserMessageSink for ErrorRecordingFrontend {
             fn write_message(&mut self, msg: UserMessage) {
                 self.inner.write_message(msg);
             }

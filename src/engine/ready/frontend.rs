@@ -1,8 +1,8 @@
 //! `ReadyFrontend` trait — defined by Layer 1, implemented by Layer 3.
 
+use crate::data::message::UserMessageSink;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
-use crate::engine::message::UserMessageSink;
 use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;
 use crate::engine::step_status::StepStatus;

@@ -34,7 +34,10 @@ mod tests {
         let a = generate_sandbox_name("hash1", "claude");
         let b = generate_sandbox_name("hash2", "claude");
         let c = generate_sandbox_name("hash1", "gemini");
-        assert_ne!(a, b, "different worktree hashes must produce different names");
+        assert_ne!(
+            a, b,
+            "different worktree hashes must produce different names"
+        );
         assert_ne!(a, c, "different agents must produce different names");
     }
 }

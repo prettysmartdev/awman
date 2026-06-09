@@ -16,7 +16,6 @@ pub mod context_prompt;
 pub mod error;
 pub mod git;
 pub mod init;
-pub mod message;
 pub mod overlay;
 pub mod ready;
 pub mod sandbox;
@@ -24,5 +23,4 @@ pub mod step_status;
 pub mod workflow;
 
 pub use error::EngineError;
-pub use message::{MessageLevel, RecordingMessageSink, UserMessage, UserMessageSink};
 pub use step_status::StepStatus;

@@ -2,9 +2,9 @@
 //! requested agent, fall back to default, or abort.
 
 use crate::command::error::CommandError;
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
-use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +79,9 @@ impl<F: ?Sized + HasAgentFrontend> crate::engine::agent::AgentFrontend
 {
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
         let level = match &status {
-            StepStatus::Failed(_) => crate::engine::message::MessageLevel::Error,
-            StepStatus::Warn(_) => crate::engine::message::MessageLevel::Warning,
-            _ => crate::engine::message::MessageLevel::Info,
+            StepStatus::Failed(_) => crate::data::message::MessageLevel::Error,
+            StepStatus::Warn(_) => crate::data::message::MessageLevel::Warning,
+            _ => crate::data::message::MessageLevel::Info,
         };
         let text = match status {
             StepStatus::Failed(msg) => format!("{step}: failed — {msg}"),

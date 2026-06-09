@@ -8,8 +8,8 @@
 
 use async_trait::async_trait;
 
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::user_message::{SharedStatusLog, StatusLogEntry};
 

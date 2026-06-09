@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct StatusCommandFlags {

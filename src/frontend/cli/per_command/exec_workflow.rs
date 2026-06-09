@@ -8,7 +8,7 @@
 
 use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
 use crate::command::error::CommandError;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 

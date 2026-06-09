@@ -1,12 +1,12 @@
 //! `InitFrontend` impl for the TUI.
 
 use crate::data::config::repo::WorkItemsConfig;
+use crate::data::message::UserMessageSink;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::{DockerfileSetupDecision, InitFrontend};
 use crate::engine::init::phase::InitPhase;
 use crate::engine::init::summary::InitSummary;
-use crate::engine::message::UserMessageSink;
 use crate::engine::step_status::StepStatus;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};

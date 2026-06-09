@@ -259,9 +259,7 @@ mod tests {
         };
         let res = detect(&cfg);
         // dsbx is only supported on macOS arm64 and Windows.
-        if cfg!(target_os = "linux")
-            || cfg!(all(target_os = "macos", target_arch = "x86_64"))
-        {
+        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
             match res {
                 Err(EngineError::BackendUnsupportedOnPlatform { .. }) => {}
                 Err(e) => panic!("expected BackendUnsupportedOnPlatform, got: {e:?}"),
@@ -319,9 +317,11 @@ mod tests {
             return;
         }
 
-        use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+        use crate::data::message::{UserMessage, UserMessageSink};
+        use crate::engine::agent_runtime::frontend::{
+            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
+        };
         use crate::engine::container::ContainerRuntime;
-        use crate::engine::message::{UserMessage, UserMessageSink};
 
         // Minimal no-op frontend for test purposes.
         struct NullFrontend;
@@ -349,13 +349,12 @@ mod tests {
         }
 
         // Build through the trait surface (Box<dyn AgentRuntimeEngine>).
-        let engine: Arc<dyn AgentRuntimeEngine> =
-            Arc::new(ContainerRuntime::docker());
+        let engine: Arc<dyn AgentRuntimeEngine> = Arc::new(ContainerRuntime::docker());
         let opts = ResolvedAgentOptions::container([
             ContainerOption::Image(ImageRef::new("busybox:latest")),
-            ContainerOption::Entrypoint(
-                crate::engine::container::options::Entrypoint::new(["true"]),
-            ),
+            ContainerOption::Entrypoint(crate::engine::container::options::Entrypoint::new([
+                "true",
+            ])),
         ])
         .expect("resolve container options");
 

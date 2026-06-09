@@ -141,6 +141,41 @@ impl AgentRuntimeEngine for SandboxRuntime {
     }
 }
 
+/// Configured-but-not-running sandbox agent — the sandbox tier's half of the
+/// two-step build/run pattern.
+struct SandboxAgentInstance {
+    backend: Arc<dyn SandboxBackend>,
+    options: ResolvedSandboxOptions,
+}
+
+impl AgentInstance for SandboxAgentInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        let name = self
+            .options
+            .sandbox_name
+            .clone()
+            .unwrap_or_else(|| self.options.agent_id.clone());
+        AgentHandlePreview {
+            id: name.clone(),
+            name,
+            // Sandboxes boot a kit/template rather than a local image; the
+            // kit selector is the closest analogue.
+            image: self.options.agent_id.clone(),
+        }
+    }
+
+    fn run_with_frontend(
+        self: Box<Self>,
+        _frontend: Box<dyn AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
+        // Stubbed: `start_sandbox` returns NotImplemented until WI 0090.
+        let _id = self.backend.start_sandbox(&self.options)?;
+        Err(EngineError::NotImplemented(
+            "SandboxAgentInstance::run_with_frontend is stubbed; see work-item 0090 for the implementation",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,9 +214,9 @@ mod tests {
                         "platform should mention x86_64, got: {platform}"
                     );
                 }
-                Err(e) => panic!(
-                    "expected BackendUnsupportedOnPlatform on x86_64 macos, got: {e:?}"
-                ),
+                Err(e) => {
+                    panic!("expected BackendUnsupportedOnPlatform on x86_64 macos, got: {e:?}")
+                }
                 Ok(_) => panic!("dsbx() must fail on x86_64 macos"),
             }
         }
@@ -198,8 +233,7 @@ mod tests {
             Ok(rt) => rt,
             Err(_) => return, // unsupported platform — platform guard test covers this
         };
-        let opts =
-            ResolvedAgentOptions::Container(ResolvedContainerOptions::resolve([]).unwrap());
+        let opts = ResolvedAgentOptions::Container(ResolvedContainerOptions::resolve([]).unwrap());
         match <SandboxRuntime as AgentRuntimeEngine>::build(&rt, opts) {
             Err(EngineError::OptionVariantMismatch { runtime, got }) => {
                 assert_eq!(runtime, "docker-sbx-experimental");
@@ -214,51 +248,15 @@ mod tests {
 
     #[test]
     fn dsbx_runtime_name_and_display_name() {
-        match SandboxRuntime::dsbx() {
-            Ok(rt) => {
-                assert_eq!(rt.runtime_name(), "docker-sbx-experimental");
-                assert!(
-                    rt.display_name().contains("experimental"),
-                    "display_name should mention experimental, got: {}",
-                    rt.display_name()
-                );
-            }
-            Err(_) => {} // unsupported platform
+        // dsbx() errors on unsupported platforms; the guard tests above
+        // cover that path.
+        if let Ok(rt) = SandboxRuntime::dsbx() {
+            assert_eq!(rt.runtime_name(), "docker-sbx-experimental");
+            assert!(
+                rt.display_name().contains("experimental"),
+                "display_name should mention experimental, got: {}",
+                rt.display_name()
+            );
         }
-    }
-}
-
-/// Configured-but-not-running sandbox agent — the sandbox tier's half of the
-/// two-step build/run pattern.
-struct SandboxAgentInstance {
-    backend: Arc<dyn SandboxBackend>,
-    options: ResolvedSandboxOptions,
-}
-
-impl AgentInstance for SandboxAgentInstance {
-    fn handle_preview(&self) -> AgentHandlePreview {
-        let name = self
-            .options
-            .sandbox_name
-            .clone()
-            .unwrap_or_else(|| self.options.agent_id.clone());
-        AgentHandlePreview {
-            id: name.clone(),
-            name,
-            // Sandboxes boot a kit/template rather than a local image; the
-            // kit selector is the closest analogue.
-            image: self.options.agent_id.clone(),
-        }
-    }
-
-    fn run_with_frontend(
-        self: Box<Self>,
-        _frontend: Box<dyn AgentFrontend>,
-    ) -> Result<AgentExecution, EngineError> {
-        // Stubbed: `start_sandbox` returns NotImplemented until WI 0090.
-        let _id = self.backend.start_sandbox(&self.options)?;
-        Err(EngineError::NotImplemented(
-            "SandboxAgentInstance::run_with_frontend is stubbed; see work-item 0090 for the implementation",
-        ))
     }
 }

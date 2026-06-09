@@ -1,5 +1,5 @@
-//! `ContainerExecutionFactory` — wired by Layer 2 to bridge the workflow
-//! engine and the container runtime without leaking option lists or frontend
+//! `AgentExecutionFactory` — wired by Layer 2 to bridge the workflow
+//! engine and the agent runtime without leaking option lists or frontend
 //! types into engine internals.
 
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ pub struct WorkflowRuntimeContext {
 
 /// Trait implemented by Layer 2: produce a fresh `AgentExecution` for a
 /// step, or inject a prompt into an already-running container.
-pub trait ContainerExecutionFactory: Send + Sync {
+pub trait AgentExecutionFactory: Send + Sync {
     fn execution_for_step(
         &self,
         step: &WorkflowStep,

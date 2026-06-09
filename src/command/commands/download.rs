@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 /// Typed enum of every asset the `download` command knows how to fetch.
 /// Catalogue parsing maps the user-supplied string into this enum so unknown

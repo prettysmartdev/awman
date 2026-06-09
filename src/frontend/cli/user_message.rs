@@ -9,7 +9,7 @@
 
 use std::io::Write;
 
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Default)]
 pub struct CliUserMessageQueue {
@@ -83,7 +83,7 @@ impl CliUserMessageQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::message::MessageLevel;
+    use crate::data::message::MessageLevel;
 
     fn info(text: &str) -> UserMessage {
         UserMessage {

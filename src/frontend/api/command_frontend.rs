@@ -44,6 +44,7 @@ use crate::command::commands::worktree_lifecycle::{
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::data::config::repo::WorkItemsConfig;
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::engine::agent_runtime::execution::AgentExitInfo;
@@ -52,7 +53,6 @@ use crate::engine::error::EngineError;
 use crate::engine::init::frontend::InitFrontend;
 use crate::engine::init::phase::InitPhase;
 use crate::engine::init::summary::InitSummary;
-use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::engine::ready::frontend::ReadyFrontend;
 use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;
@@ -333,10 +333,10 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
 impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
         let phase = match msg.level {
-            crate::engine::message::MessageLevel::Info => "info",
-            crate::engine::message::MessageLevel::Warning => "warn",
-            crate::engine::message::MessageLevel::Error => "error",
-            crate::engine::message::MessageLevel::Success => "ok",
+            crate::data::message::MessageLevel::Info => "info",
+            crate::data::message::MessageLevel::Warning => "warn",
+            crate::data::message::MessageLevel::Error => "error",
+            crate::data::message::MessageLevel::Success => "ok",
         };
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: phase.to_string(),
@@ -519,10 +519,10 @@ struct ApiContainerSink {
 impl UserMessageSink for ApiContainerSink {
     fn write_message(&mut self, msg: UserMessage) {
         let phase = match msg.level {
-            crate::engine::message::MessageLevel::Info => "info",
-            crate::engine::message::MessageLevel::Warning => "warn",
-            crate::engine::message::MessageLevel::Error => "error",
-            crate::engine::message::MessageLevel::Success => "ok",
+            crate::data::message::MessageLevel::Info => "info",
+            crate::data::message::MessageLevel::Warning => "warn",
+            crate::data::message::MessageLevel::Error => "error",
+            crate::data::message::MessageLevel::Success => "ok",
         };
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: phase.to_string(),

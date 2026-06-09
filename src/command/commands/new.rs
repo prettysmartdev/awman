@@ -10,10 +10,10 @@ use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::fs::{SkillDirs, WorkflowDirs};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::ContainerOption;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct NewSpecFlags {
@@ -678,8 +678,8 @@ mod tests {
             self
         }
     }
-    impl crate::engine::message::UserMessageSink for FakeNewFrontend {
-        fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for FakeNewFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
     impl crate::command::commands::mount_scope::MountScopeFrontend for FakeNewFrontend {

@@ -7,7 +7,7 @@ use crate::command::commands::remote_client::RemoteClient;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 /// Build a `RemoteClient` for `addr`, pinning the locally-stored self-signed
 /// cert when (a) the target is loopback AND (b) the cert PEM is on disk.

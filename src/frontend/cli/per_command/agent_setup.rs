@@ -6,8 +6,8 @@
 
 use crate::command::commands::agent_setup::{AgentSetupDecision, AgentSetupFrontend};
 use crate::command::error::CommandError;
+use crate::data::message::{MessageLevel, UserMessageSink};
 use crate::data::session::AgentName;
-use crate::engine::message::{MessageLevel, UserMessageSink};
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 use crate::frontend::cli::output::stdin_is_tty;
@@ -54,7 +54,7 @@ impl AgentSetupFrontend for CliFrontend {
         // re-prompts within a single invocation.
         let level = MessageLevel::Info;
         self.messages
-            .write_message(crate::engine::message::UserMessage {
+            .write_message(crate::data::message::UserMessage {
                 level,
                 text: format!("falling back to agent {}", fallback.as_str()),
             });

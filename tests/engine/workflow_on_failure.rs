@@ -19,7 +19,7 @@ use awman::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, WorkflowOutcome,
     WorkflowStepStatus, YoloTickOutcome,
 };
-use awman::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
+use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use awman::engine::workflow::{Frontend, WorkflowEngine};
 use awman::{data::session::Session, engine::git::GitEngine};
 use std::collections::{HashMap, VecDeque};
@@ -106,7 +106,7 @@ impl AgentExec for MockAgentExec {
     }
 }
 
-/// A `ContainerExecutionFactory` for on_failure agent launches in integration tests.
+/// A `AgentExecutionFactory` for on_failure agent launches in integration tests.
 ///
 /// `AgentExecution::finished` is `pub(crate)` so we can't construct a finished
 /// execution from an external test crate.  Returning `Err` causes
@@ -121,7 +121,7 @@ impl FinishedFactory {
     }
 }
 
-impl ContainerExecutionFactory for FinishedFactory {
+impl AgentExecutionFactory for FinishedFactory {
     fn execution_for_step(
         &self,
         _step: &WorkflowStep,
@@ -144,11 +144,11 @@ impl ContainerExecutionFactory for FinishedFactory {
 
 /// Frontend that records messages and provides safe defaults for all methods.
 struct RecordingFrontend {
-    messages: Arc<Mutex<Vec<awman::engine::message::UserMessage>>>,
+    messages: Arc<Mutex<Vec<awman::data::message::UserMessage>>>,
 }
 
 impl RecordingFrontend {
-    fn new() -> (Self, Arc<Mutex<Vec<awman::engine::message::UserMessage>>>) {
+    fn new() -> (Self, Arc<Mutex<Vec<awman::data::message::UserMessage>>>) {
         let store = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
@@ -159,8 +159,8 @@ impl RecordingFrontend {
     }
 }
 
-impl awman::engine::message::UserMessageSink for RecordingFrontend {
-    fn write_message(&mut self, msg: awman::engine::message::UserMessage) {
+impl awman::data::message::UserMessageSink for RecordingFrontend {
+    fn write_message(&mut self, msg: awman::data::message::UserMessage) {
         self.messages.lock().unwrap().push(msg);
     }
     fn replay_queued(&mut self) {}
@@ -252,7 +252,7 @@ impl AgentExec for SharedMockExec {
 /// Verifies that the step is marked Succeeded and the correct messages are emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_run_shell_on_failure_retry_succeeds() {
-    let msg_store: Arc<Mutex<Vec<awman::engine::message::UserMessage>>> =
+    let msg_store: Arc<Mutex<Vec<awman::data::message::UserMessage>>> =
         Arc::new(Mutex::new(Vec::new()));
     let msg_store_clone = Arc::clone(&msg_store);
 
@@ -318,7 +318,7 @@ async fn integration_run_shell_on_failure_retry_succeeds() {
 /// Verifies the step is marked Failed and a warning is emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_run_shell_on_failure_exhausts_all_attempts() {
-    let msg_store: Arc<Mutex<Vec<awman::engine::message::UserMessage>>> =
+    let msg_store: Arc<Mutex<Vec<awman::data::message::UserMessage>>> =
         Arc::new(Mutex::new(Vec::new()));
     let msg_store_clone = Arc::clone(&msg_store);
 
@@ -371,7 +371,7 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
     .unwrap();
 
     let messages = msg_store.lock().unwrap().clone();
-    use awman::engine::message::MessageLevel;
+    use awman::data::message::MessageLevel;
     let warning = messages
         .iter()
         .find(|m| m.level == MessageLevel::Warning && m.text.contains("exhausted"));
@@ -551,7 +551,7 @@ async fn integration_poll_ci_setup_step_fails_when_not_a_git_repo() {
 /// This covers the "teardown poll_ci with on_failure exhausts attempts" path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_poll_ci_teardown_with_on_failure_exhausts_and_continues() {
-    let msg_store: Arc<Mutex<Vec<awman::engine::message::UserMessage>>> =
+    let msg_store: Arc<Mutex<Vec<awman::data::message::UserMessage>>> =
         Arc::new(Mutex::new(Vec::new()));
     let msg_store_clone = Arc::clone(&msg_store);
 
@@ -620,7 +620,7 @@ async fn integration_poll_ci_teardown_with_on_failure_exhausts_and_continues() {
 /// banner must appear before any failure or success message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_poll_ci_emits_polling_attempt_message_before_error() {
-    let msg_store: Arc<Mutex<Vec<awman::engine::message::UserMessage>>> =
+    let msg_store: Arc<Mutex<Vec<awman::data::message::UserMessage>>> =
         Arc::new(Mutex::new(Vec::new()));
     let msg_store_clone = Arc::clone(&msg_store);
 
@@ -661,7 +661,7 @@ async fn integration_poll_ci_emits_polling_attempt_message_before_error() {
     assert!(
         attempt_msgs
             .iter()
-            .all(|m| m.level == awman::engine::message::MessageLevel::Info),
+            .all(|m| m.level == awman::data::message::MessageLevel::Info),
         "attempt banners must be Info level"
     );
 }

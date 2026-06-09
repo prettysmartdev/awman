@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
+use crate::data::message::UserMessageSink;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::error::EngineError;
-use crate::engine::message::UserMessageSink;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,

@@ -263,7 +263,7 @@ impl App {
             Some("chat" | "exec")
         );
         if is_containerized {
-            use crate::engine::message::UserMessageSink;
+            use crate::data::message::UserMessageSink;
             use crate::frontend::tui::user_message::TuiUserMessageSink;
             let mut sink = TuiUserMessageSink::new(tab.status_log.clone());
             sink.info(

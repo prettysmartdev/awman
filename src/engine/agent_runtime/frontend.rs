@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::data::message::UserMessageSink;
 use crate::engine::container::timing::{DEFAULT_GRACE_TIMEOUT, DEFAULT_STUCK_TIMEOUT};
-use crate::engine::message::UserMessageSink;
 
 /// What stage an agent execution is in.
 #[derive(Debug, Clone, PartialEq, Eq)]

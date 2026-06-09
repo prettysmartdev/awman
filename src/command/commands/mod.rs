@@ -464,15 +464,15 @@ pub fn resolve_context_overlays(
     agent: &crate::data::session::AgentName,
     workflow_invocation_id: Option<uuid::Uuid>,
     workflow_step_info: Option<&crate::engine::context_prompt::WorkflowStepInfo>,
-    sink: &mut dyn crate::engine::message::UserMessageSink,
+    sink: &mut dyn crate::data::message::UserMessageSink,
 ) -> Result<
     (Vec<crate::engine::overlay::ContextOverlay>, Option<String>),
     crate::command::error::CommandError,
 > {
     use crate::data::fs::ContextDirResolver;
+    use crate::data::message::{MessageLevel, UserMessage};
     use crate::engine::agent::agent_matrix::{matrix_for, SystemPromptMode};
     use crate::engine::context_prompt::ContextPromptBuilder;
-    use crate::engine::message::{MessageLevel, UserMessage};
     use crate::engine::overlay::ContextOverlay;
 
     if specs.is_empty() {
@@ -599,18 +599,18 @@ pub fn resolve_context_overlays(
 /// Emit deprecation warnings for legacy `envPassthrough` config fields.
 pub fn warn_legacy_config(
     session: &crate::data::session::Session,
-    sink: &mut dyn crate::engine::message::UserMessageSink,
+    sink: &mut dyn crate::data::message::UserMessageSink,
 ) {
     let ec = session.effective_config();
     if ec.repo().legacy_env_passthrough.is_some() {
-        sink.write_message(crate::engine::message::UserMessage {
-            level: crate::engine::message::MessageLevel::Warning,
+        sink.write_message(crate::data::message::UserMessage {
+            level: crate::data::message::MessageLevel::Warning,
             text: "'.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
         });
     }
     if ec.global().legacy_env_passthrough.is_some() {
-        sink.write_message(crate::engine::message::UserMessage {
-            level: crate::engine::message::MessageLevel::Warning,
+        sink.write_message(crate::data::message::UserMessage {
+            level: crate::data::message::MessageLevel::Warning,
             text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
         });
     }
@@ -1154,8 +1154,8 @@ mod collect_overlay_specs_tests {
 mod warn_legacy_config_tests {
     use super::*;
     use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::message::{MessageLevel, RecordingMessageSink};
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
-    use crate::engine::message::{MessageLevel, RecordingMessageSink};
 
     fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
         let resolver = StaticGitRootResolver::new(git_root);

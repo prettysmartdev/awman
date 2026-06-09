@@ -5,7 +5,7 @@
 //! by qualified path): this trait reports agent *setup* progress, while the
 //! runtime frontend binds a running agent's I/O.
 
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 use crate::engine::step_status::StepStatus;
 
 /// Frontend trait the engine uses to report agent setup progress.

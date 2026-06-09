@@ -18,6 +18,7 @@ use crate::command::commands::{
 };
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_prompt_template::{substitute_prompt, WorkItemContext};
@@ -26,12 +27,11 @@ use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 use crate::engine::error::EngineError;
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
-use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
+use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
 use crate::engine::workflow::{EngineRequest, WorkflowEngine};
 
@@ -292,7 +292,7 @@ impl UserMessageSink for AgentFrontendProxy {
 
 // ─── CommandLayerFactory ─────────────────────────────────────────────────────
 //
-// Implements `ContainerExecutionFactory` for the workflow engine. Builds a
+// Implements `AgentExecutionFactory` for the workflow engine. Builds a
 // container instance from per-step parameters + command flags, then binds a
 // `AgentFrontendProxy` to it via `run_with_frontend`.
 
@@ -309,7 +309,7 @@ struct CommandLayerFactory {
     workflow_overlays: Option<Vec<String>>,
 }
 
-impl ContainerExecutionFactory for CommandLayerFactory {
+impl AgentExecutionFactory for CommandLayerFactory {
     fn execution_for_step(
         &self,
         step: &WorkflowStep,
@@ -591,8 +591,8 @@ impl Command for ExecWorkflowCommand {
                     match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
                         Some(content) => Some(WorkItemContext { number, content }),
                         None => {
-                            frontend.write_message(crate::engine::message::UserMessage {
-                                level: crate::engine::message::MessageLevel::Warning,
+                            frontend.write_message(crate::data::message::UserMessage {
+                                level: crate::data::message::MessageLevel::Warning,
                                 text: format!(
                                     "work item file for {:04} not found; \
                                      {{{{work_item_*}}}} placeholders will be empty",
@@ -604,8 +604,8 @@ impl Command for ExecWorkflowCommand {
                     }
                 }
                 None => {
-                    frontend.write_message(crate::engine::message::UserMessage {
-                        level: crate::engine::message::MessageLevel::Warning,
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Warning,
                         text: format!(
                             "could not parse work item number from {:?}; \
                              {{{{work_item_*}}}} placeholders will be empty",
@@ -1644,11 +1644,11 @@ mod tests {
         ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
         WorktreeLifecycleFrontend,
     };
+    use crate::data::message::UserMessage;
     use crate::data::session::AgentName;
     use crate::data::workflow_state::WorkflowState;
     use crate::engine::agent_runtime::execution::AgentExitInfo;
     use crate::engine::agent_runtime::frontend::{AgentProgress, AgentStatus};
-    use crate::engine::message::UserMessage;
     use crate::engine::workflow::actions::{
         AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput,
         WorkflowOutcome, WorkflowStepStatus, YoloTickOutcome,
@@ -1976,7 +1976,7 @@ prompt = "do something"
             Arc::new(Mutex::new(Box::new(FakeExecWorkflowFrontend::new())));
         let mut proxy = WorkflowProxy(Arc::clone(&inner));
 
-        use crate::engine::message::MessageLevel;
+        use crate::data::message::MessageLevel;
         proxy.write_message(UserMessage {
             level: MessageLevel::Info,
             text: "hello".into(),

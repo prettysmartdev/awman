@@ -904,7 +904,7 @@ fn copy_selection_to_clipboard(app: &mut App) {
                 .lock()
                 .map(|mut log| {
                     log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                        level: crate::engine::message::MessageLevel::Error,
+                        level: crate::data::message::MessageLevel::Error,
                         text: format!("clipboard unavailable: {e}"),
                     })
                 })

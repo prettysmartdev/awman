@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::message::{MessageLevel, UserMessage};
+use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
 use crate::engine::step_status::StepStatus;
 

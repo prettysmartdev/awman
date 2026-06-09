@@ -1,5 +1,7 @@
-//! `UserMessage` and `UserMessageSink` — Layer 1.
+//! `UserMessage` and `UserMessageSink` — Layer 0.
 //!
+//! Plain message types and sink traits with no dependencies, importable by
+//! every layer (notably `data::issue`, which reports GitHub fetch progress).
 //! All engines write status messages to the user through a `UserMessageSink`.
 //! Layer 3 implements one sink per concrete frontend type. The CLI sink queues
 //! while a PTY-bound container owns the terminal and replays after the

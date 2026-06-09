@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 
 use super::github::GithubIssueSource;
 use super::{Issue, IssueSource, IssueSourceError};

@@ -57,15 +57,31 @@ mod tests {
     fn docker_runtime_capabilities_match_expected() {
         let rt = ContainerRuntime::docker();
         let caps = rt.capabilities();
-        assert!(caps.arbitrary_env_vars, "docker supports arbitrary env vars");
-        assert!(caps.arbitrary_host_mounts, "docker supports arbitrary host mounts");
+        assert!(
+            caps.arbitrary_env_vars,
+            "docker supports arbitrary env vars"
+        );
+        assert!(
+            caps.arbitrary_host_mounts,
+            "docker supports arbitrary host mounts"
+        );
         assert!(caps.cpu_limits, "docker supports cpu limits");
-        assert!(caps.per_resource_stats, "docker supports per-resource stats");
+        assert!(
+            caps.per_resource_stats,
+            "docker supports per-resource stats"
+        );
         assert!(!caps.persistent_lifecycle, "docker is ephemeral");
         assert!(!caps.kit_declarative, "docker uses local images, not kits");
-        assert_eq!(caps.dind, DindSupport::OnRequest, "docker dind is on-request");
+        assert_eq!(
+            caps.dind,
+            DindSupport::OnRequest,
+            "docker dind is on-request"
+        );
         assert!(caps.host_paths_visible, "docker can mount host paths");
-        assert!(caps.session_label_supported, "docker supports session labels");
+        assert!(
+            caps.session_label_supported,
+            "docker supports session labels"
+        );
     }
 
     #[test]
@@ -86,15 +102,27 @@ mod tests {
         match SandboxRuntime::dsbx() {
             Ok(rt) => {
                 let caps = rt.capabilities();
-                assert!(!caps.arbitrary_env_vars, "sandbox cannot inject arbitrary env");
-                assert!(!caps.arbitrary_host_mounts, "sandbox cannot bind arbitrary paths");
+                assert!(
+                    !caps.arbitrary_env_vars,
+                    "sandbox cannot inject arbitrary env"
+                );
+                assert!(
+                    !caps.arbitrary_host_mounts,
+                    "sandbox cannot bind arbitrary paths"
+                );
                 assert!(!caps.cpu_limits, "sandbox does not enforce cpu limits");
-                assert!(!caps.per_resource_stats, "sandbox has no per-resource stats");
+                assert!(
+                    !caps.per_resource_stats,
+                    "sandbox has no per-resource stats"
+                );
                 assert!(caps.persistent_lifecycle, "sandbox is persistent");
                 assert!(caps.kit_declarative, "sandbox uses kit/template");
                 assert_eq!(caps.dind, DindSupport::Always, "sandbox always has dind");
                 assert!(!caps.host_paths_visible, "sandbox cannot see host paths");
-                assert!(!caps.session_label_supported, "sandbox uses names, not labels");
+                assert!(
+                    !caps.session_label_supported,
+                    "sandbox uses names, not labels"
+                );
             }
             Err(_) => {
                 // Unsupported platform — platform guard test covers this branch.

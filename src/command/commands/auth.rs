@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 
 #[derive(Debug, Clone)]
 pub struct AuthCommandFlags {

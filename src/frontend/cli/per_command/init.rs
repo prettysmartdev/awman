@@ -5,11 +5,11 @@
 //! non-interactive defaults.
 
 use crate::data::config::repo::WorkItemsConfig;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::DockerfileSetupDecision;
 use crate::engine::init::{InitFrontend, InitPhase, InitSummary};
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::step_status::StepStatus;
 
 use crate::frontend::cli::command_frontend::CliFrontend;

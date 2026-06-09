@@ -565,7 +565,7 @@ impl Tab {
                     };
                     if let Ok(mut log) = self.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                            level: crate::engine::message::MessageLevel::Success,
+                            level: crate::data::message::MessageLevel::Success,
                             text: format!("Command '{}' completed successfully.", cmd_name),
                         });
                     }
@@ -587,7 +587,7 @@ impl Tab {
                     let err_msg = format!("{err}");
                     if let Ok(mut log) = self.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                            level: crate::engine::message::MessageLevel::Error,
+                            level: crate::data::message::MessageLevel::Error,
                             text: format!("Command '{}' failed: {}", cmd_name, err_msg),
                         });
                     }
@@ -613,7 +613,7 @@ impl Tab {
                     let err_msg = "command task dropped unexpectedly".to_string();
                     if let Ok(mut log) = self.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                            level: crate::engine::message::MessageLevel::Error,
+                            level: crate::data::message::MessageLevel::Error,
                             text: format!("Command '{}' failed: {}", cmd_name, err_msg),
                         });
                     }

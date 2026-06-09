@@ -13,10 +13,10 @@ use crate::command::commands::{
 };
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
-use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct ChatCommandFlags {

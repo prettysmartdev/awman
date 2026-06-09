@@ -4,9 +4,9 @@ use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
 use crate::command::error::CommandError;
+use crate::data::message::UserMessageSink;
 use crate::data::session::AgentName;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
-use crate::engine::message::UserMessageSink;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{AgentSetupState, DialogRequest, DialogResponse};
 

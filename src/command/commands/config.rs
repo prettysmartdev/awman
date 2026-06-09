@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 
 /// Scope metadata for each config field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,7 @@ const REMOVED_CONFIG_FIELDS: &[(&str, &str)] = &[(
     "envPassthrough",
     "the 'envPassthrough' field was removed; express env passthrough as overlay entries \
      instead (e.g. `awman config set overlays \"env(VAR_NAME)\"` or add `\"env(VAR_NAME)\"` \
-     to the `overlays` array in `.awman/config.json`). See `docs/08-overlays.md`.",
+     to the `overlays` array in `.awman/config.json`). See `docs/09-overlays.md`.",
 )];
 
 fn removed_field_message(name: &str) -> Option<&'static str> {
@@ -392,8 +392,8 @@ impl Command for ConfigCommand {
                             let coerced = match validate_and_coerce(&edit.field, &edit.value) {
                                 Ok(v) => v,
                                 Err(reason) => {
-                                    frontend.write_message(crate::engine::message::UserMessage {
-                                        level: crate::engine::message::MessageLevel::Warning,
+                                    frontend.write_message(crate::data::message::UserMessage {
+                                        level: crate::data::message::MessageLevel::Warning,
                                         text: format!("Invalid value: {reason}"),
                                     });
                                     continue;

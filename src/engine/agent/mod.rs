@@ -824,14 +824,14 @@ mod tests {
         }
     }
 
-    impl crate::engine::message::UserMessageSink for FakeAgentFrontend {
-        fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for FakeAgentFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
 
     struct FakeRuntimeFrontend;
-    impl crate::engine::message::UserMessageSink for FakeRuntimeFrontend {
-        fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+    impl crate::data::message::UserMessageSink for FakeRuntimeFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
         fn replay_queued(&mut self) {}
     }
     #[async_trait::async_trait]

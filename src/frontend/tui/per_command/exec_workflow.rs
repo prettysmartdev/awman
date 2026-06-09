@@ -2,7 +2,7 @@
 
 use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
 use crate::command::error::CommandError;
-use crate::engine::message::UserMessageSink;
+use crate::data::message::UserMessageSink;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 

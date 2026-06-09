@@ -13,8 +13,8 @@ use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind};
 use crate::command::dispatch::parsed_input::{ArgValue, FlagValue, ParsedCommandBoxInput};
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentIo;
-use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
     SharedActiveWorktreePath, SharedContainerName, SharedEngineTx, SharedPtyResetFlag,
