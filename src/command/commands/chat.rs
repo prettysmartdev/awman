@@ -46,6 +46,18 @@ pub trait ChatCommandFrontend:
     + Sync
 {
     fn set_pty_active(&mut self, active: bool);
+
+    /// Called after the agent container launches. The sender is the broadcast
+    /// channel from the container's stuck detector; the TUI stores it so the
+    /// tab can subscribe for stuck-coloring. Default impl: no-op (CLI/API
+    /// frontends ignore it).
+    fn set_stuck_sender(
+        &mut self,
+        _sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>,
+        >,
+    ) {
+    }
 }
 
 pub struct ChatCommand {
@@ -278,6 +290,10 @@ impl Command for ChatCommand {
                 return Err(CommandError::from(e));
             }
         };
+        // Publish the stuck sender so the TUI can color the tab when the
+        // agent stops producing output (mirrors the workflow engine's
+        // set_stuck_sender call after each step launch).
+        frontend.set_stuck_sender(execution.stuck_sender());
         let exit = execution.wait().await;
         frontend.set_pty_active(false);
         frontend.replay_queued();

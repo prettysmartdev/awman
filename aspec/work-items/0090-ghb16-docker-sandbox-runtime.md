@@ -154,6 +154,22 @@ The implementing agent must add a regression test in `tests/` (or extend an exis
 
 ---
 
+## Subprocess transparency via the user message sink (load-bearing)
+
+The user must have full visibility into everything awman does with the `sbx` CLI on their behalf. Every `sbx` subprocess invocation — across `awman ready`, launch, re-attach, stop, remove, listing, and validation — is reported through the existing user message sink (`UserMessageSink`), so the messages surface uniformly in the TUI status log, CLI output, and API event stream.
+
+Concretely:
+
+- **Command announcement**: immediately before spawning any `sbx` subprocess, emit an Info-level message containing the full argv that is about to run (e.g. `Running: sbx run --kit ~/.awman/kits/claude --name awman-ab12-claude --workspace-dir /path/to/wt claude`). This applies to every `sbx` invocation without exception: `sbx run`, `sbx create`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx ls`, `sbx secret set`, `sbx kit validate`, and any others added later.
+- **stdout/stderr publication**: all stdout and stderr produced by these `sbx` invocations is published on the sink as it is produced (line-buffered streaming where the invocation is long-running, e.g. install steps during first launch; a single post-exit message is acceptable for short, quiet commands like `sbx ls`). stdout lines are emitted at Info level; stderr lines at Warning level (or Error when the command exits non-zero).
+- **Exit reporting**: when an `sbx` subprocess exits non-zero, the failure message must include the command that ran and its captured stderr, in addition to the wrapped `EngineError::Sandbox(...)`.
+- **Exception — the interactive agent PTY**: the agent's own interactive I/O (the PTY bridged `sbx run` / `sbx exec -it` session the user is typing into) flows through the container/sandbox I/O bridge as today, not through the message sink. The announcement message for that invocation is still emitted before the PTY takes over.
+- **Credential masking**: `sbx secret set` invocations are announced like any other command, but the secret value never appears in any message — it is piped via stdin (per Phase 4) and the announcement shows only the service name (e.g. `Running: sbx secret set -g anthropic (value piped via stdin)`). Any stdout/stderr from `sbx secret set` is scanned by the existing masking helpers before publication in case the CLI echoes input.
+
+This mirrors how the Docker and Apple backends report their lifecycle phases today, but is stricter: because sbx is experimental and its CLI behavior may shift between releases, the user must always be able to see exactly which commands awman ran and what they printed, without raising verbosity flags or consulting external logs.
+
+---
+
 ## User Stories
 
 ### User Story 1
@@ -303,6 +319,8 @@ Create `src/engine/sandbox/dsbx/backend.rs` with `pub(super) struct DSbxBackend`
 3. Determine launch mode: if a sandbox with the resolved name exists and is stopped, the argv is `sbx run --name <name> <agent>` (no `--kit` flag — the kit is already baked into the existing sandbox). If new, `sbx run --kit <kit-dir> --name <name> --workspace-dir <workspace> <agent>`.
 4. Spawn via the same `portable-pty` / piped-stdio bridge pattern used by `DockerContainerInstance` and `AppleContainerInstance`.
 
+All `sbx` subprocess invocations made by `DSbxBackend` and `DSbxSandboxInstance` go through a single spawn helper that implements the "Subprocess transparency via the user message sink" requirements above: announce the argv on the sink before spawning, stream/publish stdout and stderr on the sink, and report non-zero exits with the command and captured stderr. Do not scatter ad-hoc `Command::new("sbx")` calls that bypass this helper.
+
 **Argv mapping — what `ResolvedSandboxOptions` fields translate to**:
 
 The option type used by `DSbxBackend` is `ResolvedSandboxOptions` (defined in WI 0089 by `SandboxRuntime`). It is **not** `ContainerOption` — those are two distinct option families, owned by their respective runtimes. `ResolvedSandboxOptions` fields and how `DSbxBackend` handles each:
@@ -355,6 +373,7 @@ Module: `src/engine/sandbox/dsbx/auth.rs`, `pub(super)`. Contains:
 - The awman-credential → sbx-service-name mapping table.
 - `inject_credentials(creds: &[(String, String)]) -> Result<(), EngineError>` that calls `sbx secret set -g <service>` with each value piped via **stdin** (never argv) to avoid process-listing leakage.
 - Credential-not-found warning logic that mirrors today's behavior for Docker (warn at launch, don't silently fail).
+- Sink reporting per the "Subprocess transparency" section: each `sbx secret set` invocation is announced on the user message sink with the service name only (never the value), and its stdout/stderr is masked before publication.
 
 Service mapping:
 
@@ -426,7 +445,7 @@ Update `src/engine/ready/` for the sbx path:
 4. Copy bundled `apply-session-config.sh` into each kit's `files/home/.awman/`.
 5. For each agent, run the credential pre-flight: resolve required credentials via `AuthEngine`, call `sbx secret set` for the mapped services, warn on missing.
 6. Validate the kit by invoking `sbx kit validate <kit-dir>` for each emitted kit (if available — confirm in Phase 0). Surface validation errors with the kit path.
-7. Report per-phase status messages.
+7. Report per-phase status messages. Every `sbx` invocation made by the ready flow (`sbx ls`, `sbx secret set`, `sbx kit validate`, any `sbx rm` triggered by `--no-cache`) follows the "Subprocess transparency" section: the command is announced on the user message sink and its stdout/stderr is published there.
 
 No registry push step. No `docker build` step for sbx. `awman ready` for sbx is text-file emission plus subprocess validation.
 
@@ -513,6 +532,9 @@ User docs must cover:
 - **Auto-auth credential not found**: clear warning, not a panic, when a required key is absent from keychain and environment.
 - **Auto-auth stdin pipe — no argv leakage**: verify `sbx secret set` is invoked with the credential piped via stdin, never argv or env.
 - **Naming determinism**: `generate_sbx_sandbox_name(worktree_hash, agent)` produces the same name for the same inputs across invocations.
+- **Subprocess announcement**: every code path that spawns an `sbx` subprocess emits an Info-level sink message containing the full argv before the spawn (use a mock sink and a stubbed spawn helper; no live sbx binary needed).
+- **Subprocess output publication**: stdout lines from a (stubbed) `sbx` invocation arrive on the sink at Info level and stderr lines at Warning level; on non-zero exit the failure message includes the argv and captured stderr.
+- **Secret-value redaction on the sink**: the announcement for `sbx secret set` names the service but never contains the credential value, and a stubbed `sbx secret set` that echoes its stdin back does not leak the value to the sink (masking applies).
 
 ### Integration tests
 
