@@ -204,7 +204,7 @@ From your local machine, use `awman remote` or cURL:
 awman config set remote.defaultAPIKey <key>
 awman config set remote.defaultAddr <host>
 awman remote session start /workspace/myproject
-awman remote run "exec workflow aspec/workflows/implement-pr.toml --work-item 0027" --session <id> --follow
+awman remote exec workflow aspec/workflows/implement-pr.toml --work-item 0027 --session <id> --follow
 ```
 
 ```sh
@@ -227,7 +227,7 @@ curl -s http://localhost:9090/v1/commands/<command-id>/logs
 ```
 API commands run inside containers with the same isolation as running awman locally. All inputs and outputs and logs are stored in `~/.awman/api/` on the server for later review or auditing. The API server is authenticated using an API key generated the first time it is run, and can be refreshed (invalidating the old key) using `awman api start --refresh-key`.
 
-See [API Mode](docs/09-api-mode.md) and [Remote Mode](docs/10-remote-mode.md) for details.
+See [API Mode](docs/10-api-mode.md) and [Remote Mode](docs/11-remote-mode.md) for details.
 
 ---
 
@@ -264,7 +264,8 @@ awman config show                      # view all config values
 awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
 awman api status                       # check if the API server is running
 awman api kill                         # stop the API server
-awman remote run <cmd> [--follow]      # run a command on a remote API server
+awman remote exec workflow <path> [--follow]   # run a workflow on a remote API server
+awman remote exec prompt "<text>" [--follow]   # run a one-shot prompt on a remote API server
 awman remote session start <dir>       # create a session on a remote server
 awman remote session kill <id>         # close a session on a remote server
 ```
@@ -276,16 +277,17 @@ All commands work in both TUI mode (without the `awman` prefix) and CLI mode. AP
 ## Documentation
 
 - [Getting Started](docs/00-getting-started.md)
-- [Using the TUI](docs/01-using-the-tui.md)
-- [Agent Sessions](docs/02-agent-sessions.md)
-- [Security & Isolation](docs/03-security-and-isolation.md)
-- [Workflows](docs/04-workflows.md)
-- [Yolo Mode](docs/05-yolo-mode.md)
-- [Configuration](docs/07-configuration.md)
-- [Overlays](docs/08-overlays.md)
-- [API Mode](docs/09-api-mode.md)
-- [Remote Mode](docs/10-remote-mode.md)
-- [Architecture](docs/11-architecture-overview.md)
+- [Concepts](docs/01-concepts.md)
+- [Using the TUI](docs/02-using-the-tui.md)
+- [Agent Sessions](docs/03-agent-sessions.md)
+- [Security & Isolation](docs/04-security-and-isolation.md)
+- [Workflows](docs/05-workflows.md)
+- [Yolo Mode](docs/06-yolo-mode.md)
+- [Configuration](docs/08-configuration.md)
+- [Overlays](docs/09-overlays.md)
+- [API Mode](docs/10-api-mode.md)
+- [Remote Mode](docs/11-remote-mode.md)
+- [Architecture](docs/12-architecture-overview.md)
 
 ---
 

@@ -33,7 +33,7 @@ Credential values are masked (`***`), but everything else is visible. You can al
 The `--worktree` flag runs agent sessions in an isolated Git worktree rather than your main working directory. The agent's changes land on a separate branch, completely isolated from your current work until you decide what to do with them.
 
 ```sh
-awman exec workflow path/to/workflow.md --worktree
+awman exec workflow path/to/workflow.toml --worktree
 ```
 
 ### Why use it
@@ -115,13 +115,13 @@ When Git commit signing is enabled, awman **suspends the TUI** around each `git 
 | Branch exists, no worktree dir | Worktree created using the existing branch |
 | Merge conflict | Error with manual resolution instructions; worktree kept |
 | Combined with `--workflow` | All workflow-step containers share the same worktree |
-| Combined with `--mount-ssh` | Both flags apply independently |
+| Combined with `--overlay ssh()` | Both flags apply independently |
 
 ### Examples
 
 ```sh
-awman exec workflow path/to/workflow.md --worktree                    # isolated run; prompt to merge after
-awman exec workflow path/to/workflow.md --worktree --mount-ssh        # worktree + SSH keys in container
+awman exec workflow path/to/workflow.toml --worktree                              # isolated run; prompt to merge after
+awman exec workflow path/to/workflow.toml --worktree --overlay "ssh()"            # worktree + SSH keys in container
 ```
 
 ---
@@ -159,17 +159,17 @@ Mounts `~/.awman/skills/` read-only into the agent's native skills directory (de
 
 ```sh
 # Mount your personal skills library
-awman exec workflow path/to/workflow.md --overlay "skill()"
+awman exec workflow path/to/workflow.toml --overlay "skill()"
 
 # Mount a reference dataset read-only
-awman exec workflow path/to/workflow.md --overlay "dir(/data/reference:/mnt/reference:ro)"
+awman exec workflow path/to/workflow.toml --overlay "dir(/data/reference:/mnt/reference:ro)"
 
 # Mount a shared prompts directory read-write
 awman chat --overlay "dir(~/prompts:/mnt/prompts:rw)"
 
 # Skills + directories (repeated flag or comma-separated — both are equivalent)
-awman exec workflow path/to/workflow.md --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)" --overlay "dir(~/snippets:/mnt/snippets)"
-awman exec workflow path/to/workflow.md --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/snippets:/mnt/snippets)"
+awman exec workflow path/to/workflow.toml --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)" --overlay "dir(~/snippets:/mnt/snippets)"
+awman exec workflow path/to/workflow.toml --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/snippets:/mnt/snippets)"
 ```
 
 Available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`.
@@ -184,71 +184,43 @@ export AWMAN_OVERLAYS="skill(),dir(~/personal-prompts:/mnt/prompts),dir(/data/sh
 
 ### Config-based overlays
 
-Overlays can be declared in config files so they are applied automatically without requiring any flags each time. Both the per-repo and global configs support an `overlays` object with optional `skills` and `directories` fields:
+Overlays can be declared in config files so they are applied automatically without requiring any flags each time. The `overlays` field is a flat array of overlay expression strings — the same syntax as `--overlay`:
 
 **Per-repo config** (`.awman/config.json`):
 ```json
 {
-  "overlays": {
-    "skills": true,
-    "directories": [
-      { "host": "/data/fixtures", "container": "/mnt/fixtures", "permission": "ro" },
-      { "host": "~/shared-prompts", "container": "/mnt/prompts" }
-    ]
-  }
+  "overlays": [
+    "skill(*)",
+    "dir(/data/fixtures:/mnt/fixtures:ro)",
+    "dir(~/shared-prompts:/mnt/prompts)"
+  ]
 }
 ```
 
 **Global config** (`~/.awman/config.json`):
 ```json
 {
-  "overlays": {
-    "skills": true,
-    "directories": [
-      { "host": "~/personal-prompts", "container": "/mnt/prompts", "permission": "ro" }
-    ]
-  }
+  "overlays": [
+    "skill(*)",
+    "dir(~/personal-prompts:/mnt/prompts:ro)"
+  ]
 }
 ```
-
-**Skills field:**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `skills` | boolean | `false` | When `true`, mount `~/.awman/skills/` read-only into the agent's native skills directory. |
-
-**Directory field:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `host` | string | yes | Host path (absolute or `~`-prefixed). |
-| `container` | string | yes | Container path (absolute). |
-| `permission` | string | no | `"ro"` or `"rw"`. Defaults to `"ro"` when omitted. |
 
 ### Priority and conflict resolution
 
 Overlays are **additive**: all four sources contribute entries, then conflicts are resolved.
 
-**For directory overlays**, the priority order, from lowest to highest:
+**Priority order**, from lowest to highest:
 
 1. Global config (`~/.awman/config.json`)
 2. Per-repo config (`.awman/config.json`)
 3. `AWMAN_OVERLAYS` environment variable
 4. `--overlay` CLI flags (highest priority)
 
-Unlike `envPassthrough` (where the per-repo list replaces the global list entirely), directory overlay sources are merged — entries from all four sources appear in the final mount list unless they conflict.
+Overlay sources are merged — entries from all four sources appear in the final mount list unless they conflict. When two sources specify the same container path, the higher-priority source wins.
 
-**For skills overlay**, there is no priority hierarchy. If *any* source sets `"skills": true` or includes `skill()`, the mount is enabled. It's an **additive OR** operation.
-
-**Conflict resolution rules for directories:**
-
-When two sources specify the same host path:
-- The **higher-priority source** wins for the container path.
-- The **more restrictive permission always wins** — `:ro` beats `:rw` regardless of which source is higher priority. A warning is logged whenever permissions are downgraded. This prevents a CLI flag from silently escalating a read-only global config entry to read-write.
-
-When two sources specify different host paths that map to the **same container path**, both mounts are applied and a warning is logged (Docker will shadow one with the other; the last mount in the list wins).
-
-**Skills overlay mounts are always read-only** and cannot be modified by the agent, even if you attempt to override with `:rw`.
+**Skills overlays are always read-only** and cannot be modified by the agent.
 
 ### Missing host paths
 
@@ -264,7 +236,7 @@ Overlay mounts extend the base isolation model: the agent still cannot access an
 
 Skills overlays are always mounted read-only, whether skills are provided by global config, per-repo config, environment variable, or CLI flag. The agent cannot modify any skill files.
 
-Like `--mount-ssh` and `--allow-docker`, overlay mounts are always printed in the Docker command before execution so you can see exactly what is mounted.
+Like `--overlay ssh()` and `--allow-docker`, all overlay mounts are printed in the Docker command before execution so you can see exactly what is mounted.
 
 ### TUI usage
 
@@ -272,10 +244,10 @@ In the TUI command box, use comma-separated syntax when specifying multiple over
 
 ```
 # Correct: comma-separated in one value
-exec workflow path/to/workflow.md --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/prompts:/mnt/prompts)"
+exec workflow path/to/workflow.toml --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/prompts:/mnt/prompts)"
 
 # Incorrect in TUI (second value silently overwrites first):
-exec workflow path/to/workflow.md --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)"
+exec workflow path/to/workflow.toml --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)"
 ```
 
 On the CLI, both repeated flags and comma-separated syntax are equivalent.
@@ -316,20 +288,20 @@ Mounting the Docker socket gives the agent root-equivalent access to your host �
 ### Examples
 
 ```sh
-awman exec workflow path/to/workflow.md --allow-docker  # workflow that needs to build a Docker image
+awman exec workflow path/to/workflow.toml --allow-docker  # workflow that needs to build a Docker image
 awman chat --allow-docker                               # freeform session with Docker access
 awman ready --refresh --allow-docker                    # Dockerfile audit with Docker access
 ```
 
 ---
 
-## SSH key mounting
+## SSH key access
 
-The `--mount-ssh` flag mounts your host `~/.ssh` directory read-only into the container, so the agent can authenticate with remote Git servers using your existing SSH keys.
+Use the `ssh()` overlay to mount your host `~/.ssh` directory read-only into the container, so the agent can authenticate with remote Git servers using your existing SSH keys.
 
 ### When to use it
 
-Use `--mount-ssh` when the task requires the agent to:
+Use `--overlay ssh()` when the task requires the agent to:
 
 - Clone private repositories over SSH
 - Push branches or tags to a remote
@@ -340,28 +312,28 @@ Use `--mount-ssh` when the task requires the agent to:
 Before launching the container, awman verifies `~/.ssh` exists and prints a warning:
 
 ```
-WARNING: --mount-ssh: mounting host ~/.ssh into container (read-only). Ensure you trust the agent image.
+WARNING: overlay ssh(): mounting host ~/.ssh into container (read-only). Ensure you trust the agent image.
 ```
 
 The directory is mounted as `-v /home/user/.ssh:/root/.ssh:ro`. The `:ro` flag prevents the agent from modifying your host SSH keys.
 
-`~/.ssh` is never mounted without this explicit flag — there is no config option to enable it silently.
+`~/.ssh` is never mounted without an explicit `ssh()` overlay — there is no config option to enable it silently.
 
 ### Security notes
 
 - The mount is read-only; the agent can use your keys but cannot modify them
 - SSH key permissions must be correct on the host (`600` for private keys); Docker bind mounts inherit host permissions
-- Only use `--mount-ssh` with agent images you trust
+- Only use the `ssh()` overlay with agent images you trust
 
 ### Examples
 
 ```sh
-awman exec workflow path/to/workflow.md --mount-ssh              # agent can push/pull over SSH
-awman chat --mount-ssh                                           # freeform session with SSH access
-awman exec workflow path/to/workflow.md --worktree --mount-ssh   # combine with worktree isolation
+awman exec workflow path/to/workflow.toml --overlay "ssh()"              # agent can push/pull over SSH
+awman chat --overlay "ssh()"                                             # freeform session with SSH access
+awman exec workflow path/to/workflow.toml --worktree --overlay "ssh()"   # combine with worktree isolation
 ```
 
-When used with `--workflow`, the SSH directory is mounted into every workflow-step container.
+When used with a workflow, the SSH directory is mounted into every workflow-step container.
 
 ---
 
@@ -382,4 +354,4 @@ With the Apple Containers runtime, the same commands are shown with `container` 
 
 ---
 
-[← Agent Sessions](02-agent-sessions.md) · [Next: Workflows →](04-workflows.md)
+[← Agent Sessions](03-agent-sessions.md) · [Next: Workflows →](05-workflows.md)

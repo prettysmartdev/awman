@@ -8,7 +8,7 @@ awman is now built from a single, unified four-layer architecture:
 
 - **`src/`** — the production source tree organized as a four-layer architecture. The `awman` binary is built from `src/main.rs`.
 
-For the best introduction to the new architecture, see the [Architecture Overview](11-architecture-overview.md) guide. The detailed specification is in [`aspec/architecture/2026-grand-architecture.md`](../aspec/architecture/2026-grand-architecture.md).
+For the best introduction to the new architecture, see the [Architecture Overview](12-architecture-overview.md) guide. The detailed specification is in [`aspec/architecture/2026-grand-architecture.md`](../aspec/architecture/2026-grand-architecture.md).
 
 ---
 
@@ -2489,4 +2489,4 @@ The binary crate opts out of all unsafe code at the crate level. Layer 3 and Lay
 
 ---
 
-[← API Mode](09-api-mode.md) · [Contents](contents.md)
+[← API Mode](10-api-mode.md) · [Contents](contents.md)

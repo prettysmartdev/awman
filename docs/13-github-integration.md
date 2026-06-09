@@ -353,20 +353,5 @@ awman exec prompt --issue owner/private-repo#99
 
 ---
 
-## Future providers
-
-This implementation is designed to support multiple issue trackers. Jira, Linear, and other providers can be added by implementing the same interface — the command layer will automatically discover and route to the correct provider based on the input format.
-
-When a new provider is added, you'll be able to use syntax like:
-
-```sh
-awman new spec --issue PROJ-123              # Jira
-awman new spec --issue linear/issue/abc-123  # Linear
-```
-
-No changes to the CLI or command structure are needed — just register the new provider in the router.
-
----
-
-[← Architecture Overview](11-architecture-overview.md) · [Context Overlays →](13-context-overlays.md)
+[← Architecture Overview](12-architecture-overview.md) · [Context Overlays →](14-context-overlays.md)
 

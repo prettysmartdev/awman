@@ -26,14 +26,14 @@ Yolo mode is **not** appropriate for:
 ## Basic usage
 
 ```sh
-awman exec workflow aspec/workflows/implement-feature.md --yolo
+awman exec workflow aspec/workflows/implement-feature.toml --yolo
 awman chat --yolo
 ```
 
 For the safest yolo experience — fully autonomous, changes isolated to a branch, easy to review or discard:
 
 ```sh
-awman exec workflow aspec/workflows/implement-feature.md --yolo
+awman exec workflow aspec/workflows/implement-feature.toml --yolo
 ```
 
 This implies `--worktree` automatically (see below).
@@ -56,6 +56,7 @@ The agent-specific skip-permissions flag is appended to the container entrypoint
 | `copilot` | `--autopilot` (copilot's only CLI autonomous mode) |
 | `crush` | `--yolo` (inserted before the `run` subcommand: `crush --yolo run`) |
 | `cline` | `--yolo` (on the `task` subcommand) |
+| `antigravity` | `--dangerously-skip-permissions` |
 
 ### 2. Applies `yoloDisallowedTools`
 
@@ -178,7 +179,7 @@ This is your safety net for operations you never want the agent to perform auton
 
 **Config precedence:** per-repo config takes precedence over global config entirely (lists are not merged). To inherit the global list for a specific repo, omit the field from the repo config.
 
-See [Configuration](07-configuration.md) for the full config reference.
+See [Configuration](08-configuration.md) for the full config reference.
 
 ---
 
@@ -196,6 +197,7 @@ See [Configuration](07-configuration.md) for the full config reference.
 | `copilot` | `--autopilot` (copilot has no intermediate mode; same flag as `--yolo`) |
 | `crush` | `--yolo` (crush has no intermediate mode; same flag as `--yolo`; a warning is printed) |
 | `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
+| `antigravity` | *(no equivalent — warning printed)* |
 
 `--auto` applies `yoloDisallowedTools` config identically to `--yolo`. Combined with `--workflow`, it implies `--worktree` but does **not** auto-advance stuck steps (the countdown is `--yolo`-only).
 
@@ -220,10 +222,10 @@ When both `--yolo` and `--auto` are passed, `--yolo` wins.
 
 ```sh
 # Run a workflow with no prompts, changes in an isolated worktree
-awman exec workflow aspec/workflows/implement-feature.md --yolo
+awman exec workflow aspec/workflows/implement-feature.toml --yolo
 
 # Run a workflow with explicit worktree flag — identical to omitting it
-awman exec workflow aspec/workflows/implement-feature.md --yolo --worktree
+awman exec workflow aspec/workflows/implement-feature.toml --yolo --worktree
 
 # Autonomous chat session with Bash tool blocked
 # (add to .awman/config.json: "yoloDisallowedTools": ["Bash"])
@@ -232,4 +234,4 @@ awman chat --yolo
 
 ---
 
-[← Workflows](04-workflows.md) · [Next: Headless Mode →](06-headless-mode.md)
+[← Workflows](05-workflows.md) · [Next: Headless Mode →](07-headless-mode.md)

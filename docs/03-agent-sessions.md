@@ -31,12 +31,12 @@ Override the configured agent for this session. Available agents: `claude`, `cod
 ```sh
 # CLI
 awman chat --agent codex               # launch a Codex session for this project
-awman exec workflow path/to/workflow.md --agent gemini    # run workflow with Gemini instead of the configured agent
+awman exec workflow path/to/workflow.toml --agent gemini    # run workflow with Gemini instead of the configured agent
 awman chat --agent=copilot             # --flag=value form is also accepted
 
 # TUI command box
 chat --agent crush
-exec workflow path/to/workflow.md --agent=cline
+exec workflow path/to/workflow.toml --agent=cline
 ```
 
 Both `--agent NAME` and `--agent=NAME` forms are accepted in both the CLI and the TUI command box. The TUI command box honours the flag and passes the correct agent to the container — it is not silently ignored.
@@ -58,12 +58,12 @@ Override the model used by the launched agent for this session.
 ```sh
 # CLI
 awman chat --model claude-opus-4-6
-awman exec workflow path/to/workflow.md --model claude-haiku-4-5
+awman exec workflow path/to/workflow.toml --model claude-haiku-4-5
 awman chat --model=gpt-4o               # --flag=value form is also accepted
 
 # TUI command box
 chat --model claude-opus-4-6
-exec workflow path/to/workflow.md --model=claude-haiku-4-5
+exec workflow path/to/workflow.toml --model=claude-haiku-4-5
 ```
 
 Both `--model NAME` and `--model=NAME` forms are accepted in both the CLI and the TUI command box.
@@ -88,7 +88,7 @@ For agents that support multiple providers (`opencode`, `crush`, `maki`), the `p
 
 If an agent does not support `--model`, the behaviour varies. For Antigravity, the command exits with an error; configure the model via `~/.gemini/antigravity-cli/settings.json` or the `/model` slash command inside the agent session instead. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
 
-`--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `Model:` field. See [Per-step model overrides](04-workflows.md#per-step-model-overrides).
+`--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
 ### `--non-interactive` / `-n`
 
@@ -96,15 +96,15 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 
 | Agent | Flag used |
 |-------|-----------|
-| Claude | `-p` (print mode) |
-| Codex | `--quiet` |
+| Claude | `--print` |
+| Codex | `exec` subcommand |
 | OpenCode | `run` subcommand |
-| Maki | `--print` |
-| Gemini | `-p` (`--prompt`) |
+| Maki | *(not supported — warning printed, agent launches in interactive mode)* |
+| Gemini | *(not supported — warning printed, agent launches in interactive mode)* |
 | Antigravity | `--print` |
-| Copilot | `-p` (prompt mode — reads from stdin, suppresses interactive prompts, exits when done) |
-| Crush | `run` subcommand (`crush run` streams output and exits) |
-| Cline | `--json` on the `task` subcommand (triggers non-interactive structured output) |
+| Copilot | *(not supported — warning printed, agent launches in interactive mode)* |
+| Crush | `run` subcommand |
+| Cline | `task` subcommand |
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
 
@@ -128,45 +128,32 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 
 ### `--overlay <SPEC>`
 
-Mount additional host directories or skills into the agent container. Accepts typed overlay expressions:
+Mount additional host resources into the agent container. Accepts typed overlay expressions:
 
-- `skill()` — mount your global awman skills directory (`~/.awman/skills/`) as slash commands (no arguments)
-- `dir(host_path:container_path[:ro|rw])` — mount a host directory
+- `dir(host_path:container_path[:ro|rw])` — mount a host directory (permission defaults to `:ro`)
+- `env(VAR)` — pass a host environment variable into the container
+- `skill(name)` / `skill(*)` — mount a named skill or all global skills
+- `ssh()` — mount `~/.ssh` read-only (for Git operations over SSH)
 
-May be repeated or combined with a comma-separated list. Permission defaults to `:ro` when omitted. `:rw` grants read-write access.
+May be repeated or comma-separated. Available on `chat`, `exec prompt`, and `exec workflow`.
 
 ```sh
-# Mount skills
-awman exec workflow path/to/workflow.md --overlay "skill()"
-
-# Mount a directory
+awman chat --overlay "env(ANTHROPIC_API_KEY)"
+awman chat --overlay "ssh()"
 awman chat --overlay "dir(/data/reference:/mnt/reference:ro)"
-awman chat --overlay "dir(~/prompts:/mnt/prompts:rw)"
-
-# Skills + directories (repeated flag or comma-separated)
-awman exec workflow path/to/workflow.md --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
-awman exec workflow path/to/workflow.md --overlay "skill(),dir(/data:/mnt/data:ro)"
-
-# TUI command box (use comma-separated syntax — repeated --overlay in TUI keeps only the last value)
-exec workflow path/to/workflow.md --overlay "skill(),dir(/data/reference:/mnt/reference:ro),dir(~/prompts:/mnt/prompts)"
+awman exec workflow path/to/workflow.toml --overlay "env(GITHUB_TOKEN),ssh(),skill(*)"
 ```
 
-Available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`.
-
-See [Configuration → Overlays](07-configuration.md#overlays) for the full overlay reference including config-based overlays, the `AWMAN_OVERLAYS` env var, and conflict resolution rules.
-See [Security & Isolation](03-security-and-isolation.md#overlay-mounts) for security considerations.
+See [Overlays](09-overlays.md) for the full reference including config-based overlays, the `AWMAN_OVERLAYS` env var, and conflict resolution rules.
+See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for security considerations.
 
 ### `--allow-docker`
 
-Mount the host Docker socket into the container, giving the agent the ability to build and run Docker containers. See [Security & Isolation](03-security-and-isolation.md#docker-socket-access) for details on when to use this.
-
-### `--mount-ssh`
-
-Mount your host `~/.ssh` directory read-only into the container, allowing the agent to clone private repos or push branches over SSH. See [Security & Isolation](03-security-and-isolation.md#ssh-key-mounting).
+Mount the host Docker socket into the container, giving the agent the ability to build and run Docker containers. See [Security & Isolation](04-security-and-isolation.md#docker-socket-access) for details on when to use this.
 
 ### `--worktree`
 
-Run the agent in an isolated Git worktree instead of your main working tree. After the agent finishes you choose to merge, discard, or keep the branch. See [Security & Isolation](03-security-and-isolation.md#worktree-isolation).
+Run the agent in an isolated Git worktree instead of your main working tree. After the agent finishes you choose to merge, discard, or keep the branch. See [Security & Isolation](04-security-and-isolation.md#worktree-isolation).
 
 ### `--auto`
 
@@ -179,7 +166,7 @@ Enable intermediate autonomous operation — the agent auto-approves file edits 
 | `opencode` | *(no equivalent — a warning is printed, flag omitted)* |
 | `maki` | `--yolo` (maki's own flag) |
 | `gemini` | `--approval-mode=auto_edit` |
-| `antigravity` | `--approval-mode=auto_edit` |
+| `antigravity` | *(no equivalent — warning printed, flag omitted)* |
 | `copilot` | `--autopilot` (copilot's only CLI autonomous mode — same flag as `--yolo`) |
 | `crush` | `--yolo` (crush's only autonomous flag — same as `--yolo`; a warning is printed that no intermediate mode exists) |
 | `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
@@ -190,11 +177,11 @@ When both `--yolo` and `--auto` are passed, `--yolo` wins.
 
 ### `--yolo`
 
-Enable fully autonomous operation — the agent skips all permission prompts. See [Yolo Mode](05-yolo-mode.md).
+Enable fully autonomous operation — the agent skips all permission prompts. See [Yolo Mode](06-yolo-mode.md).
 
 ### `--worktree`
 
-(`exec workflow` only) Run in an isolated Git worktree under `~/.awman/worktrees/`. Implied by `--yolo` and `--auto` when used with `exec workflow`. See [Security & Isolation](03-security-and-isolation.md).
+(`exec workflow` only) Run in an isolated Git worktree under `~/.awman/worktrees/`. Implied by `--yolo` and `--auto` when used with `exec workflow`. See [Security & Isolation](04-security-and-isolation.md).
 
 ---
 
@@ -217,7 +204,7 @@ awman config set work_items.dir docs/work-items
 awman config set work_items.template docs/work-items/my-template.md
 ```
 
-If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Work item paths](07-configuration.md#work-item-paths) for full details on path resolution and auto-discovery.
+If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Configuration: Work item paths](08-configuration.md#work-item-paths) for full details on path resolution and auto-discovery.
 
 ```sh
 awman new spec --interview
@@ -237,7 +224,7 @@ awman new spec --issue https://github.com/prettysmartdev/awman/issues/84      # 
 
 Fetches the GitHub issue and launches an agent to generate a structured work item spec from its content. Combined with `--interview`, the issue description is pre-populated in the text box for editing before the agent runs.
 
-For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](12-github-integration.md).
+For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](13-github-integration.md).
 
 ### Updating a spec after implementation
 
@@ -315,16 +302,16 @@ Writes to `~/.awman/skills/<name>/SKILL.md` instead of the current repo. Use thi
 To make global skills available inside agent containers, enable the skills overlay via config:
 
 ```json
-{ "overlays": { "skills": true } }
+{ "overlays": ["skill(*)"] }
 ```
 
 Or pass it at the command line:
 
 ```sh
-awman exec workflow path/to/workflow.md --overlay "skill()"
+awman exec workflow path/to/workflow.toml --overlay "skill(*)"
 ```
 
-Once enabled, your global skills appear as slash commands. See [Configuration → Overlays](07-configuration.md#overlays) for details.
+Once enabled, your global skills appear as slash commands. See [Overlays](09-overlays.md) for details.
 
 `--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.awman/skills/<name>/` directory — not the whole repo or home directory. This still requires being inside a git repository (for agent image lookup).
 
@@ -381,14 +368,14 @@ For Claude Code, awman reads the OAuth token from the macOS Keychain (service: `
 | `claude` | OAuth token read from macOS Keychain (`Claude Code-credentials`), injected as `CLAUDE_CODE_OAUTH_TOKEN` |
 | `codex` | — |
 | `opencode` | — |
-| `maki` | API key via `envPassthrough` |
-| `gemini` | API key via `envPassthrough` and/or `~/.gemini/` OAuth directory mount |
-| `antigravity` | API key via `envPassthrough` (`ANTIGRAVITY_API_KEY`) and/or `~/.gemini/antigravity-cli/` OAuth directory mount |
-| `copilot` | GitHub token via `envPassthrough` (`COPILOT_GITHUB_TOKEN` or `GH_TOKEN`) |
-| `crush` | Provider API key(s) via `envPassthrough` |
-| `cline` | `~/.cline/data/` directory mount (contains `secrets.json` with API keys) |
+| `maki` | API key via `env()` overlay |
+| `gemini` | API key via `env()` overlay and/or `~/.gemini/` OAuth directory (auto-mounted) |
+| `antigravity` | API key via `env()` overlay (`ANTIGRAVITY_API_KEY`) and/or `~/.gemini/antigravity-cli/` OAuth directory (auto-mounted) |
+| `copilot` | GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN` or `GH_TOKEN`) |
+| `crush` | Provider API key(s) via `env()` overlay |
+| `cline` | `~/.cline/data/` directory mount (contains `secrets.json` with API keys) — auto-mounted |
 
-Maki, Gemini, Copilot, and Crush authenticate via API keys passed from your host environment using `envPassthrough`. Cline uses a directory mount. See [Configuration](07-configuration.md#envpassthrough) for details, [Gemini authentication](#gemini-authentication) for the full Gemini auth options, and [Copilot authentication](#copilot-authentication), [Crush authentication](#crush-authentication), and [Cline authentication](#cline-authentication) below for the new agents.
+Maki, Gemini, Copilot, and Crush authenticate via API keys passed from your host environment using `env()` overlays. Cline uses an auto-mounted directory. See [Gemini authentication](#gemini-authentication) for the full Gemini auth options, and [Copilot authentication](#copilot-authentication), [Crush authentication](#crush-authentication), and [Cline authentication](#cline-authentication) below.
 
 ### Host settings injection
 
@@ -407,15 +394,17 @@ Your original files are never modified. The copies are created in a temporary di
 
 Gemini supports two authentication paths. You can use either or both — awman sets up both automatically.
 
-### API key (`envPassthrough`)
+### API key (`env()` overlay)
 
-Add `GEMINI_API_KEY` (or one of the Vertex AI variables) to your `envPassthrough` config:
+Add `GEMINI_API_KEY` (or one of the Vertex AI variables) to your overlays config:
 
 ```json
-{ "envPassthrough": ["GEMINI_API_KEY"] }
+{ "overlays": ["env(GEMINI_API_KEY)"] }
 ```
 
-Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey) (1,000 requests/day on the free tier). awman reads the value from your host shell and injects it into the container as a `-e` flag on the `docker run` invocation. The value is masked (`***`) in all displayed Docker commands.
+Or pass it per-command: `awman chat --agent gemini --overlay "env(GEMINI_API_KEY)"`.
+
+Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey) (1,000 requests/day on the free tier). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
 
 Supported Gemini auth environment variables:
 
@@ -427,7 +416,7 @@ Supported Gemini auth environment variables:
 | `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
 | `GOOGLE_GENAI_USE_VERTEXAI` | Set to `true` to enable the Vertex AI auth path |
 
-> **Note on `GOOGLE_APPLICATION_CREDENTIALS`:** This variable points to a file path on the host. Passing it via `envPassthrough` injects the path string but not the file itself, so the container cannot read it. Service account JSON authentication requires either embedding the key in your `Dockerfile.dev` or mounting it manually. For most users, `GEMINI_API_KEY` is simpler.
+> **Note on `GOOGLE_APPLICATION_CREDENTIALS`:** This variable points to a file path on the host. Passing it via `env()` overlay injects the path string but not the file itself, so the container cannot read it. Service account JSON authentication requires either embedding the key in your `Dockerfile.dev` or mounting it with a `dir()` overlay. For most users, `GEMINI_API_KEY` is simpler.
 
 ### OAuth token (`~/.gemini/` mount)
 
@@ -439,7 +428,7 @@ The mount is a copy, not a bind mount — changes the agent makes to its auth st
 
 ### Auth precedence
 
-When both an API key env var and OAuth tokens are present, Gemini uses the API key. This is Gemini's own resolution logic — awman does not arbitrate. If you want to use OAuth auth exclusively, omit the key variables from `envPassthrough`.
+When both an API key env var and OAuth tokens are present, Gemini uses the API key. This is Gemini's own resolution logic — awman does not arbitrate. If you want to use OAuth auth exclusively, omit the key variables from your overlays config.
 
 ---
 
@@ -447,13 +436,15 @@ When both an API key env var and OAuth tokens are present, Gemini uses the API k
 
 Antigravity supports two authentication paths, similar to Gemini. You can use either or both — awman sets up both automatically.
 
-### API key (`envPassthrough`)
+### API key (`env()` overlay)
 
-Add `ANTIGRAVITY_API_KEY` to your `envPassthrough` config:
+Add `ANTIGRAVITY_API_KEY` to your overlays config:
 
 ```json
-{ "envPassthrough": ["ANTIGRAVITY_API_KEY"] }
+{ "overlays": ["env(ANTIGRAVITY_API_KEY)"] }
 ```
+
+Or pass it per-command: `awman chat --agent antigravity --overlay "env(ANTIGRAVITY_API_KEY)"`.
 
 Get an API key from [Google AI Studio](https://aistudio.google.com/apikey) or through your Antigravity account. awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in all displayed Docker commands.
 
@@ -476,7 +467,7 @@ The mount is a copy, not a bind mount — changes the agent makes to its auth st
 
 ### Auth precedence
 
-When both an API key env var and OAuth tokens are present, Antigravity uses the API key. If you want to use OAuth auth exclusively, omit the key variables from `envPassthrough`.
+When both an API key env var and OAuth tokens are present, Antigravity uses the API key. If you want to use OAuth auth exclusively, omit the key variables from your overlays config.
 
 ### Model configuration
 
@@ -504,11 +495,13 @@ Antigravity is a drop-in replacement for Gemini with the same CLI interface and 
 
 ## Copilot authentication
 
-GitHub Copilot CLI authenticates entirely via a GitHub token — there is no OAuth config directory to mount. Set your token in `envPassthrough`:
+GitHub Copilot CLI authenticates entirely via a GitHub token — there is no OAuth config directory to mount. Set your token via overlays config:
 
 ```json
-{ "envPassthrough": ["COPILOT_GITHUB_TOKEN"] }
+{ "overlays": ["env(COPILOT_GITHUB_TOKEN)"] }
 ```
+
+Or pass it per-command: `awman chat --agent copilot --overlay "env(COPILOT_GITHUB_TOKEN)"`.
 
 Copilot reads the following environment variables in precedence order:
 
@@ -524,17 +517,17 @@ The token must have the "Copilot Requests" fine-grained PAT permission, or be a 
 For GitHub Enterprise users, add `COPILOT_GH_HOST` alongside the token:
 
 ```json
-{ "envPassthrough": ["COPILOT_GITHUB_TOKEN", "COPILOT_GH_HOST"] }
+{ "overlays": ["env(COPILOT_GITHUB_TOKEN)", "env(COPILOT_GH_HOST)"] }
 ```
 
 ---
 
 ## Crush authentication
 
-Crush authenticates entirely via provider API keys passed as environment variables — there is no config directory to mount. Add whichever API key(s) match your chosen provider to `envPassthrough`:
+Crush authenticates entirely via provider API keys passed as environment variables — there is no config directory to mount. Add whichever API key(s) match your chosen provider to your overlays config:
 
 ```json
-{ "envPassthrough": ["ANTHROPIC_API_KEY"] }
+{ "overlays": ["env(ANTHROPIC_API_KEY)"] }
 ```
 
 Supported Crush auth environment variables:
@@ -560,7 +553,7 @@ Crush's project-local config file (`.crush.json` at the repo root) is automatica
 
 Cline stores API keys in `~/.cline/data/secrets.json` on your host, written there by `cline auth`. awman automatically copies `~/.cline/data/` into a temporary directory and mounts it into the container at `/home/awman/.cline/data`, so the agent picks up your existing credentials without re-running `cline auth` inside every container.
 
-No `envPassthrough` configuration is needed — credentials travel with the directory mount.
+No overlay configuration is needed — credentials travel with the auto-mounted directory.
 
 If `~/.cline/data/` does not exist on the host (you've never run `cline auth`), awman creates an empty temporary directory and mounts that instead. Cline will prompt for authentication inside the container on first interactive use.
 
@@ -576,134 +569,8 @@ cline auth -p anthropic -k <your-api-key> -m claude-sonnet-4-6
 cat ~/.cline/data/secrets.json
 ```
 
----
 
-## `awman auth`
-
-```sh
-awman auth [--accept]
-```
-
-The `awman auth` command manages whether awman may automatically pass your agent's credentials into containers. This consent is per-repo and persisted in `.awman/config.json`.
-
-Run it at any time to set or update your preference:
-
-```sh
-awman auth
-```
-
-When stdin is a TTY, a consent dialog appears:
-
-```
-awman needs permission to automatically pass your agent credentials into containers.
-
-  [y] Accept — save this choice for the current repo
-  [n] Decline — save this choice for the current repo
-  [o] Once — accept for this session only (not saved)
-```
-
-| Choice | Key | Behaviour |
-|--------|-----|-----------|
-| Accept | `y` | Saves `auto_agent_auth_accepted = true` in `.awman/config.json`. Future sessions use auto-passthrough without prompting. |
-| Decline | `n` | Saves `auto_agent_auth_accepted = false` in `.awman/config.json`. Future sessions do not auto-pass credentials. |
-| Once | `o` | Accepts for this session only — no change to config. |
-
-The result is confirmed on stdout:
-
-```
-auth: accepted; persisted=true
-```
-
-```
-auth: declined; persisted=true
-```
-
-```
-auth: accepted; persisted=false    # once mode — not saved
-```
-
-### Non-interactive accept
-
-```sh
-awman auth --accept
-```
-
-Accepts without showing the dialog. Useful in CI or scripts where stdin is not a TTY. When `--accept` is not provided and stdin is not a TTY, `awman auth` defaults to declining without prompting.
-
-### Viewing the stored choice
-
-The persisted choice is visible in `awman config show` under the `auto_agent_auth_accepted` field (marked read-only — it is managed exclusively by `awman auth`):
-
-```sh
-awman config get auto_agent_auth_accepted
-```
-
-```
-Field: auto_agent_auth_accepted
-  Global:     N/A
-  Repo:       true
-  Effective:  true (read-only)
-```
-
-Attempting to set this field via `awman config set` exits with an error.
-
----
-
-## `awman download`
-
-```sh
-awman download <asset>
-```
-
-Downloads a static asset from the awman distribution servers into the current repo. Useful for:
-
-- Manually fetching an agent Dockerfile before customizing or building it
-- Refreshing the `aspec/` template folder without re-running `awman init`
-- Auditing the exact Dockerfile template that awman uses for a given agent
-
-### Supported assets
-
-| Asset identifier | Example | Destination |
-|------------------|---------|-------------|
-| `aspec` or `aspec-tarball` | `awman download aspec` | `<git_root>/aspec/` (tarball extracted in-place) |
-| `dockerfile-<agent>` | `awman download dockerfile-claude` | `<git_root>/.awman/Dockerfile.<agent>` |
-
-Valid agent names for Dockerfile download: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
-
-### Examples
-
-```sh
-# Download the Claude agent Dockerfile into .awman/
-awman download dockerfile-claude
-
-# Download the aspec template folder
-awman download aspec
-
-# Download the Codex Dockerfile to inspect it before building
-awman download dockerfile-codex
-```
-
-### Output
-
-```
-downloaded dockerfile-claude -> /home/user/myproject/.awman/Dockerfile.claude (4231 bytes)
-```
-
-```
-downloaded aspec -> /home/user/myproject/aspec (218432 bytes)
-```
-
-### Edge cases
-
-| Situation | Behaviour |
-|-----------|-----------|
-| Network unavailable | Exits with `awman: network error: ...` and exit code 1 |
-| Unknown agent name in `dockerfile-<agent>` | Exits with error listing valid agent names |
-| Destination file already exists | Overwrites silently (Dockerfiles replaced atomically via a temporary file rename) |
-| Run outside a git repo | Exits with `awman: not in a git repository` and exit code 1 |
-
----
-
+## Reference: `awman init`
 ## Reference: `awman init`
 
 ```sh
@@ -719,7 +586,7 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.
 
-When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#work-item-paths).
+When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](08-configuration.md#work-item-paths).
 
 ---
 
@@ -827,8 +694,7 @@ When `--refresh` is also set, the audit runs and its results are included once c
 | `--non-interactive` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
 | `--plan` | ✓ | ✓ | ✓ | Read-only analysis mode |
 | `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
-| `--mount-ssh` | ✓ | ✓ | ✓ | Mount `~/.ssh` read-only |
-| `--overlay=<path>` | ✓ | ✓ | ✓ | Mount a host directory into the container (repeatable) |
+| `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
 | `--worktree` | — | — | ✓ | Run in isolated Git worktree |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
@@ -836,4 +702,4 @@ When `--refresh` is also set, the audit runs and its results are included once c
 
 ---
 
-[← Using the TUI](01-using-the-tui.md) · [Next: Security & Isolation →](03-security-and-isolation.md)
+[← Using the TUI](02-using-the-tui.md) · [Next: Security & Isolation →](04-security-and-isolation.md)

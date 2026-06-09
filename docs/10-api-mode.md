@@ -84,7 +84,7 @@ SESSION=$(awman remote session start "$HOME/my-project" \
   | awk '/Session started:/ {print $NF}')
 
 # Dispatch the same prompt and stream its output live
-awman remote run exec prompt "Summarise recent changes" --non-interactive \
+awman remote exec prompt "Summarise recent changes" --non-interactive \
   --session "$SESSION" --follow
 
 # Close the session
@@ -130,11 +130,11 @@ curl -sk -X DELETE "$SERVER/v1/sessions/$SESSION" \
   -H "Authorization: Bearer $KEY"
 ```
 
-**Using `awman` itself:** the `awman remote session start` command currently expects a path that already exists on the server, so for remote (clone-on-server) sessions create the session via curl as shown above, then drive it with `awman remote run --session <id>`:
+**Using `awman` itself:** the `awman remote session start` command currently expects a path that already exists on the server, so for remote (clone-on-server) sessions create the session via curl as shown above, then drive it with `awman remote exec --session <id>`:
 
 ```sh
 # Drive the just-created remote-clone session with awman
-awman remote run exec workflow aspec/workflows/implement-feature.toml \
+awman remote exec workflow aspec/workflows/implement-feature.toml \
   --work-item 0053 \
   --session "$SESSION" --follow
 ```
@@ -175,17 +175,17 @@ When neither a positional prompt nor `--issue` are provided, the command exits w
 
 | Flag | Description |
 |------|-------------|
-| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; see [GitHub Integration](12-github-integration.md) |
+| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; see [GitHub Integration](13-github-integration.md) |
 | `--non-interactive` / `-n` | Run in print/batch mode — agent executes and exits |
 | `--plan` | Read-only analysis mode — agent cannot modify files |
 | `--allow-docker` | Mount host Docker socket into the container |
-| `--mount-ssh` | Mount `~/.ssh` read-only into the container |
+| `--overlay=<SPEC>` | Apply overlay(s) for this run; see [Overlays](09-overlays.md) |
 | `--auto` | Auto-approve file edits; prompt before shell commands |
 | `--yolo` | Fully autonomous mode — skip all permission prompts |
 | `--agent=<name>` | Override the agent for this run |
 | `--model=<NAME>` | Override the model for this run |
 
-All flags behave identically to their `chat` counterparts. See [Agent Sessions](02-agent-sessions.md#flags-common-to-chat-and-other-commands).
+All flags behave identically to their `chat` counterparts. See [Agent Sessions](03-agent-sessions.md#flags-common-to-chat-and-other-commands).
 
 ---
 
@@ -195,19 +195,19 @@ Runs a workflow file. The work item is optional — when provided, it's used for
 
 ```sh
 # Run a workflow without a work item
-awman exec workflow ./aspec/workflows/implement-feature.md
+awman exec workflow ./aspec/workflows/implement-feature.toml
 
 # Alias: exec wf
-awman exec wf ./aspec/workflows/implement-feature.md
+awman exec wf ./aspec/workflows/implement-feature.toml
 
 # Associate a local work item for template variable substitution
-awman exec workflow ./aspec/workflows/implement-feature.md --work-item 0053
+awman exec workflow ./aspec/workflows/implement-feature.toml --work-item 0053
 
 # Or fetch a GitHub issue instead
-awman exec workflow ./aspec/workflows/implement-feature.md --issue 84
+awman exec workflow ./aspec/workflows/implement-feature.toml --issue 84
 
 # Non-interactive workflow run
-awman exec workflow ./aspec/workflows/review.md --non-interactive
+awman exec workflow ./aspec/workflows/review.toml --non-interactive
 ```
 
 `exec workflow` and `exec wf` are identical — `wf` is a short alias.
@@ -242,13 +242,13 @@ $GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 | `--plan` | Read-only mode for all steps |
 | `--allow-docker` | Mount host Docker socket into each step's container |
 | `--worktree` | Run all steps in an isolated Git worktree |
-| `--mount-ssh` | Mount `~/.ssh` read-only into each step's container |
+| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](09-overlays.md) |
 | `--auto` | Auto-approve file edits; prompt before shell commands |
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
 | `--agent=<name>` | Default agent for steps that do not specify an `Agent:` field |
 | `--model=<NAME>` | Default model for steps that do not specify a `Model:` field |
 
-All workflow flags are described in [Workflows](04-workflows.md#flags).
+All workflow flags are described in [Workflows](05-workflows.md#flags).
 
 ---
 
@@ -433,7 +433,7 @@ curl -s http://localhost:9876/v1/status \
   -H "Authorization: <your-api-key>"
 ```
 
-When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](10-remote-mode.md#api-key-authentication).
+When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](11-remote-mode.md#api-key-authentication).
 
 **Error responses from the middleware:**
 
@@ -830,7 +830,7 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.md","--work-item","0053"]}'
+  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.toml","--work-item","0053"]}'
 ```
 
 **Workflow files:** For `exec workflow`, the workflow file path is specified as a positional argument relative to the session's working directory (same format as the CLI). The file must exist within the session's working directory and be a valid TOML or YAML workflow definition. Workflow files are never passed as inline JSON — always use file paths.
@@ -960,9 +960,9 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
 - If the client disconnects mid-stream, the command continues executing unaffected.
 - If the log file does not yet exist (the command is `pending`), the server waits up to 10 s for it to appear before returning HTTP 404.
 - The `Content-Type` response header is `text/event-stream`.
-- **Read timeout:** `awman remote run --follow` uses a 10-minute read timeout per SSE event. Any output from the server resets the timer, so long-running commands that produce incremental output can stream for hours. If the server is completely silent for 10 minutes, the client disconnects with a timeout message; the command continues running on the server. When using cURL directly with `--no-buffer`, consider adding `--max-time 0` to disable cURL's own timeout for very long-running commands.
+- **Read timeout:** `awman remote exec --follow` uses a 10-minute read timeout per SSE event. Any output from the server resets the timer, so long-running commands that produce incremental output can stream for hours. If the server is completely silent for 10 minutes, the client disconnects with a timeout message; the command continues running on the server. When using cURL directly with `--no-buffer`, consider adding `--max-time 0` to disable cURL's own timeout for very long-running commands.
 
-`awman remote run --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
+`awman remote exec --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
 
 #### Get session queue status
 
@@ -1108,7 +1108,7 @@ done
 
 If the endpoint returns HTTP 404 on the first poll, the command either has not started yet or is not a workflow command — treat 404 as "no workflow" and skip the strip. If 404 is returned after a non-404 response, the workflow was removed; stop polling.
 
-The [Remote-bound TUI tabs](10-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
+The [Remote-bound TUI tabs](11-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
 
 ---
 
@@ -1130,7 +1130,7 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.md"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.toml"]}' | jq -r .command_id)
 echo "Command: $CMD"
 
 # 3. Poll until done
@@ -1258,7 +1258,7 @@ Pre-configure working directories so you don't have to repeat `--workdirs` every
 awman config set --global api.workDirs "/home/user/my-project,/home/user/other-project"
 ```
 
-Paths from `api.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](07-configuration.md#global-config) for the full global config reference.
+Paths from `api.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](08-configuration.md#global-config) for the full global config reference.
 
 ### `api.alwaysNonInteractive`
 
@@ -1356,4 +1356,4 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 
 ---
 
-[← Overlays](08-overlays.md) · [Remote Mode →](10-remote-mode.md)
+[← Overlays](09-overlays.md) · [Remote Mode →](11-remote-mode.md)

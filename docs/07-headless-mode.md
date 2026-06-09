@@ -54,7 +54,7 @@ In this context, GitHub Actions provides no controlling terminal. awman detects 
 
 ## API: always non-interactive
 
-The API frontend (`awman serve` or the API in general) always runs non-interactive, regardless of the server process's stdin state. The API communicates via HTTP/WebSocket — there is no terminal to speak of.
+The API frontend (`awman api start`) always runs non-interactive, regardless of the server process's stdin state. The API communicates via HTTP/WebSocket — there is no terminal to speak of.
 
 Clients receive status updates through the event stream. The API applies `yolo` auto-advance behavior the same way the CLI does: when a step goes silent for 30 seconds, a 60-second countdown begins, and the step auto-advances when it expires.
 
@@ -158,7 +158,7 @@ No special configuration is needed for headless mode — TTY detection is automa
 - `yoloDisallowedTools` — restrict which tools the agent can use even in headless yolo mode
 - Workflow definitions can specify per-step agents and models, which all work identically in headless mode
 
-See [Configuration](07-configuration.md) for the full config reference.
+See [Configuration](08-configuration.md) for the full config reference.
 
 ---
 
@@ -187,4 +187,4 @@ If you're running an agent that requires full-screen terminal control (like an i
 
 ---
 
-[← Yolo Mode](05-yolo-mode.md) · [Next: Configuration →](07-configuration.md)
+[← Yolo Mode](06-yolo-mode.md) · [Next: Configuration →](08-configuration.md)

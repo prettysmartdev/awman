@@ -17,9 +17,9 @@ The key principle: **agents can handle scroll events if they request mouse track
 
 ## Agent mouse tracking
 
-When an agent enables mouse tracking via escape sequences (e.g., `CSI ? 1000 h` for X10 button-press mode), awman detects this through its internal vt100 parser. The parser maintains the agent's current mouse protocol state in real time as escape sequences are processed.
+When an agent enables mouse tracking via escape sequences (e.g., `CSI ? 1000 h` for X10 button-press mode), awman detects this and begins forwarding scroll events to the agent.
 
-Modern terminal applications (tmux, less, vim plugins, custom TUIs) often enable mouse tracking to support scrolling within panes, file listings, or code diffs. When running these inside awman, you can now interact with them naturally using your mouse.
+Modern terminal applications (tmux, less, vim plugins, custom TUIs) often enable mouse tracking to support scrolling within panes, file listings, or code diffs. When running these inside awman, you can interact with them naturally using your mouse.
 
 ---
 
@@ -121,7 +121,7 @@ When running tmux or Screen inside awman:
 
 ## Agent detection and real-time updates
 
-awman's vt100 parser continuously tracks the agent's mouse protocol mode as it processes escape sequences. This means:
+awman continuously tracks the agent's mouse protocol mode. This means:
 - If an agent **enables** mouse tracking mid-session, forwarding activates immediately
 - If an agent **disables** mouse tracking, awman resumes owning all scroll events
 - Mouse protocol mode changes are detected in real time — no restart needed
@@ -159,9 +159,9 @@ Text selection (click and drag) is always under awman's control. If you are tryi
 
 ## See also
 
-- [Using the TUI](01-using-the-tui.md) — keyboard shortcuts and container window controls
-- [Agent Sessions](02-agent-sessions.md) — running agents interactively
+- [Using the TUI](02-using-the-tui.md) — keyboard shortcuts and container window controls
+- [Agent Sessions](03-agent-sessions.md) — running agents interactively
 
 ---
 
-[← Context Overlays](13-context-overlays.md) · [Architecture Overview →](11-architecture-overview.md)
+[← Context Overlays](14-context-overlays.md) · [Architecture Overview →](12-architecture-overview.md)

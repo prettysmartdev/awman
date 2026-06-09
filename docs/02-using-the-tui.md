@@ -99,7 +99,7 @@ When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** t
 ```
 chat --agent codex
 chat --agent=codex
-exec workflow path/to/workflow.md --agent opencode --plan
+exec workflow path/to/workflow.toml --agent opencode --plan
 ```
 
 Suggestions include flag hints from the command catalogue:
@@ -304,7 +304,7 @@ Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly �
 │  runtime                     docker (built-in)   N/A         docker        │
 │▶ terminal_scrollback_lines   10000 (built-in)    5000        5000          │
 │  yolo_disallowed_tools       (empty)             (not set)   (empty)       │
-│  env_passthrough             (empty)             (not set)   (empty)       │
+│  overlays                    (empty)             (not set)   (empty)       │
 │  agent                       N/A                 codex       codex         │
 │  auto_agent_auth_accepted    N/A                 true        true          │
 │                                                                            │
@@ -369,15 +369,15 @@ Tab names are truncated at 14 characters with `…`. The tab bar distributes wid
 | Purple / Magenta | Permanently bound to a remote API session |
 | Red | Exited with error |
 | Yellow | Container silent for >30 seconds (stuck warning) |
-| Alternating Yellow / Purple | Background yolo countdown in progress: tab label alternates between `⚠️ yolo in Ns` and `🤘 yolo in Ns` every 2 seconds (see [Yolo Mode](05-yolo-mode.md#background-yolo-countdown)) |
+| Alternating Yellow / Purple | Background yolo countdown in progress: tab label alternates between `⚠️ yolo in Ns` and `🤘 yolo in Ns` every 2 seconds (see [Yolo Mode](06-yolo-mode.md#background-yolo-countdown)) |
 
 ### Remote-bound tabs
 
-When `remote.defaultAddr` is set in `~/.awman/config.json`, opening a new tab with **Ctrl+T** offers an option to bind the tab to a remote API session. A **remote-bound tab** forwards every command you type to the remote host via the API API — no `remote run` prefix or session flags needed.
+When `remote.defaultAddr` is set in `~/.awman/config.json`, opening a new tab with **Ctrl+T** offers an option to bind the tab to a remote API session. A **remote-bound tab** forwards every command you type to the remote host via the API — no extra flags or session arguments needed.
 
 Remote-bound tabs are **purple** in the tab bar. The tab label shows `host:port` of the remote host instead of the local directory name. When a workflow runs on the remote session, the workflow state strip appears automatically and updates every 5 seconds.
 
-For full details on creating remote-bound tabs, the create-session sub-modal, and workflow strip behavior, see [Remote Mode: Remote-bound TUI tabs](10-remote-mode.md#remote-bound-tui-tabs).
+For full details on creating remote-bound tabs, the create-session sub-modal, and workflow strip behavior, see [Remote Mode: Remote-bound TUI tabs](11-remote-mode.md#remote-bound-tui-tabs).
 
 ---
 
@@ -391,7 +391,7 @@ If a running container produces no output for more than 30 seconds, the tab turn
 
 **Active-tab suppression:** On the currently active tab, any keypress or mouse scroll also resets the stuck timer directly. If you are actively reading or scrolling through output, the tab will not turn yellow or show any stuck indicator — the timer only starts when both the container and the user have been idle for 30 seconds. Background tabs are not affected by this; they use output time alone to determine stuck state.
 
-For workflow tabs, awman goes further: the [workflow control board](04-workflows.md#workflow-control-board) opens automatically so you can act without having to notice the yellow indicator. In yolo mode, background tabs show a live countdown directly in the tab bar instead of a dialog. See [Workflows](04-workflows.md) and [Yolo Mode](05-yolo-mode.md) for details.
+For workflow tabs, awman goes further: the [workflow control board](05-workflows.md#workflow-control-board) opens automatically so you can act without having to notice the yellow indicator. In yolo mode, background tabs show a live countdown directly in the tab bar instead of a dialog. See [Workflows](05-workflows.md) and [Yolo Mode](06-yolo-mode.md) for details.
 
 ---
 
@@ -495,8 +495,8 @@ For workflow tabs, awman goes further: the [workflow control board](04-workflows
 
 ---
 
-For detailed information on mouse interaction with agents that have mouse tracking enabled, see [Mouse & TUI Agents](14-mouse-and-tui-agents.md).
+For detailed information on mouse interaction with agents that have mouse tracking enabled, see [Mouse & TUI Agents](15-mouse-and-tui-agents.md).
 
 ---
 
-[← Getting Started](00-getting-started.md) · [Next: Agent Sessions →](02-agent-sessions.md)
+[← Getting Started](00-getting-started.md) · [Next: Agent Sessions →](03-agent-sessions.md)

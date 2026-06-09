@@ -1,4 +1,5 @@
 title = "Implement Hard Feature Workflow"
+overlays = ["context(workflow)"]
 
 [[step]]
 name = "implement"
@@ -12,6 +13,7 @@ Be sure to double check your work against the work item implementation spec.
 [[step]]
 name = "tests"
 depends_on = ["implement"]
+model = "claude-sonnet-4-6"
 prompt = """
 Implement tests for work item {{work_item_number}} as described in the project aspec and the work item test considerations below:
 
@@ -20,7 +22,7 @@ Implement tests for work item {{work_item_number}} as described in the project a
 
 [[step]]
 name = "docs"
-model = "claude-haiku-4-5"
+model = "claude-sonnet-4-6"
 depends_on = ["implement"]
 prompt = """
 Write comprehensive documentation for work item {{work_item_number}}, following the plan that was previously written and following guidelines from the project aspec.

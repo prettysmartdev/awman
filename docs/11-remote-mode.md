@@ -9,24 +9,23 @@ Remote mode lets you connect to an API awman server running on another machine a
 A typical setup has one machine running `awman api start` (the _remote host_), and one or more developers or pipelines using `awman remote` (the _client_) to dispatch work to it. The remote host manages all sessions and containers. The client only needs the server's address.
 
 ```
-Local machine                          Remote host
-──────────────                         ──────────────────────────
-awman remote run exec workflow my.md -f ─► POST /v1/commands
-                                       ◄─── SSE stream: log output
-                                       ◄─── [awman:done] sentinel
+Local machine                                    Remote host
+──────────────                                   ──────────────────────────
+awman remote exec workflow my.toml -f ──────────► POST /v1/commands
+                                                 ◄── SSE stream: log output
+                                                 ◄── [awman:done] sentinel
 ```
 
-Three subcommands cover the full lifecycle:
+Four subcommands cover the full lifecycle:
 
 | Command | What it does |
 |---------|-------------|
-| `awman remote run <command>` | Dispatch a command to a session on the remote host |
+| `awman remote exec workflow <file>` | Submit a workflow to a session on the remote host |
+| `awman remote exec prompt <prompt>` | Send a one-shot prompt to a session on the remote host |
 | `awman remote session start [dir]` | Create a new session on the remote host |
 | `awman remote session kill [session-id]` | Close a session on the remote host |
 
-All three subcommands work from the terminal (CLI mode) and from inside the TUI (where interactive pickers are also available). An API server can also delegate `remote` subcommands to itself as subprocesses when triggered via the HTTP API.
-
-`<command>` can be any awman command — for example `exec workflow path/to/workflow.md`, `chat`, `exec prompt "Fix the tests" --yolo`, or `ready`.
+All subcommands work from the terminal (CLI mode) and from inside the TUI (where interactive pickers are also available).
 
 ---
 
@@ -85,7 +84,7 @@ For CI pipelines, use the environment variable:
 export AWMAN_REMOTE_ADDR=http://build-server.internal:9876
 export AWMAN_API_KEY=<your-api-key>
 
-awman remote run exec workflow aspec/workflows/implement-feature.md --follow
+awman remote exec workflow aspec/workflows/implement-feature.toml --follow
 ```
 
 ### Security note
@@ -94,30 +93,30 @@ awman remote run exec workflow aspec/workflows/implement-feature.md --follow
 
 ---
 
-## `awman remote run`
+## `awman remote exec workflow`
 
-Dispatches an awman subcommand to a session on the remote host.
+Submits a workflow file to a session on the remote host.
 
 ```sh
-awman remote run <command> [--session <ID>] [--follow] [--remote-addr <URL>]
+awman remote exec workflow <file> [--session <ID>] [--follow] [--remote-addr <URL>] [exec workflow flags]
 ```
 
-`<command>` is any awman subcommand that the remote host can execute — for example `exec workflow path/to/workflow.md`, `exec prompt "Fix the tests" --yolo`, or `chat`. Everything after `remote run` (except the `--session`, `--follow`, and `--remote-addr` flags) is forwarded to the remote host verbatim.
+Accepts the same flags as `awman exec workflow` (except `--worktree`, which is a server-side concern), plus the remote transport flags below.
 
 ### Basic usage
 
 ```sh
-# Dispatch a workflow to a session; return a command ID immediately
-awman remote run exec workflow path/to/workflow.md --session abc123
+# Submit a workflow; return a command ID immediately
+awman remote exec workflow path/to/workflow.toml --session abc123
 
-# Wait for the command to complete and stream its output to your terminal
-awman remote run exec workflow path/to/workflow.md --session abc123 --follow
+# Stream output to your terminal until complete
+awman remote exec workflow path/to/workflow.toml --session abc123 --follow
 
 # Short form for --follow
-awman remote run exec workflow path/to/workflow.md --session abc123 -f
+awman remote exec workflow path/to/workflow.toml --session abc123 -f
 
-# Pass inner-command flags through unchanged; awman does not consume them
-awman remote run exec prompt "Fix the tests" --yolo --non-interactive --session abc123 -f
+# Pass exec workflow flags through unchanged
+awman remote exec workflow path/to/workflow.toml --yolo --work-item 0042 --session abc123 -f
 ```
 
 ### Flags
@@ -129,15 +128,17 @@ awman remote run exec prompt "Fix the tests" --yolo --non-interactive --session 
 | `--remote-addr <URL>` | | Remote host address. Overrides `AWMAN_REMOTE_ADDR` and `remote.defaultAddr` |
 | `--api-key <KEY>` | | API key for the remote server. Overrides `AWMAN_API_KEY` and `remote.defaultAPIKey` |
 
+Plus all `exec workflow` flags (except `--worktree`): `--work-item`, `--yolo`, `--auto`, `--plan`, `--agent`, `--model`, `--overlay`, `--issue`, `-n/--non-interactive`.
+
 ### Session resolution
 
-For `remote run`, the session is resolved in this order:
+The session is resolved in this order:
 
 | Priority | Source |
 |----------|--------|
 | 1 | `--session <ID>` flag |
 | 2 | `AWMAN_REMOTE_SESSION` environment variable |
-| 3 | TUI only — last session used in this tab (not available in CLI/API) |
+| 3 | TUI only — last session used in this tab (not available in CLI) |
 | 4 | TUI only — interactive session picker |
 
 In CLI mode, if neither `--session` nor `AWMAN_REMOTE_SESSION` is set, the command fails with:
@@ -150,17 +151,13 @@ error: No session specified. Pass --session <ID> or set AWMAN_REMOTE_SESSION.
 
 ### Live log streaming (`--follow`)
 
-Without `--follow`, `remote run` submits the command and returns immediately with the command ID:
+Without `--follow`, the command submits the workflow and returns immediately with the command ID:
 
 ```
 Command dispatched: e5f6a7b8-...
 ```
 
-With `--follow`, awman connects to the SSE log-streaming endpoint and relays the command's output to your terminal in real time, as if the session were local:
-
-```sh
-awman remote run exec workflow path/to/workflow.md --session abc123 --follow
-```
+With `--follow`, awman connects to the SSE log-streaming endpoint and relays output to your terminal in real time:
 
 ```
 Connecting to log stream for e5f6a7b8-... on http://build-server.example.com:9876...
@@ -178,7 +175,6 @@ Once the command completes, awman prints a summary table and exits:
 ├──────────────┼────────────────────────────────────────┤
 │ Command ID   │ e5f6a7b8-…                             │
 │ Session ID   │ abc123                                 │
-│ Subcommand   │ exec workflow path/to/workflow.md     │
 │ Status       │ done                                   │
 │ Exit Code    │ 0                                      │
 │ Started      │ 2026-04-22T10:00:00Z                   │
@@ -186,9 +182,34 @@ Once the command completes, awman prints a summary table and exits:
 └──────────────┴────────────────────────────────────────┘
 ```
 
-If the command had already completed before you connected, `--follow` replays the full historical log and then immediately prints the summary — there is no gap or missed output.
+If the command had already completed before you connected, `--follow` replays the full historical log and then prints the summary immediately — there is no gap or missed output.
 
-When output is piped rather than printed to a terminal, log lines are written without ANSI decoration — output is script-friendly by default.
+When output is piped to a non-terminal, log lines are written without ANSI decoration.
+
+---
+
+## `awman remote exec prompt`
+
+Sends a one-shot prompt to a session on the remote host.
+
+```sh
+awman remote exec prompt <prompt> [--session <ID>] [--follow] [--remote-addr <URL>] [exec prompt flags]
+```
+
+Accepts the same flags as `awman exec prompt` plus the remote transport flags.
+
+```sh
+# Submit a prompt; return a command ID immediately
+awman remote exec prompt "Fix the failing tests" --session abc123
+
+# Stream output to your terminal until complete
+awman remote exec prompt "Fix the failing tests" --session abc123 --follow
+
+# Pass exec prompt flags through
+awman remote exec prompt "Fix the tests" --yolo --agent claude --session abc123 -f
+```
+
+Session resolution and `--follow` behavior are identical to `remote exec workflow`.
 
 ---
 
@@ -255,9 +276,9 @@ In CLI mode, `session-id` is required. In TUI mode, if omitted, awman fetches th
 
 When used inside the awman TUI, `remote` subcommands gain interactive capabilities that are not available in CLI mode.
 
-### Session picker (`remote run` without `--session`)
+### Session picker (`remote exec` without `--session`)
 
-If you run `remote run` in the TUI without specifying a session, and no session is stored from previous activity in the current tab, awman fetches the **active** session list from the remote host (using `GET /v1/sessions?status=active`) and displays an interactive picker. Closed sessions are never shown in the picker.
+If you run `remote exec workflow` or `remote exec prompt` in the TUI without specifying a session, and no session is stored from previous activity in the current tab, awman fetches the **active** session list from the remote host (using `GET /v1/sessions?status=active`) and displays an interactive picker. Closed sessions are never shown in the picker.
 
 The picker dialog has a dynamic width that adjusts to fit long session IDs and working directory paths. Session IDs are truncated with `…` if necessary to preserve the full workdir path — the part most useful for identification.
 
@@ -271,7 +292,7 @@ The picker dialog has a dynamic width that adjusts to fit long session IDs and w
 ╰────────────────────────────────────────────────────────────────────╯
 ```
 
-Use `↑` / `↓` to highlight a session and `Enter` to confirm. The TUI remembers your choice for the rest of the tab's lifetime — subsequent `remote run` commands in the same tab skip the picker and use the remembered session automatically.
+Use `↑` / `↓` to highlight a session and `Enter` to confirm. The TUI remembers your choice for the rest of the tab's lifetime — subsequent `remote exec` commands in the same tab skip the picker and use the remembered session automatically.
 
 If the remote host has no active sessions, the picker displays:
 
@@ -323,7 +344,7 @@ If you run `remote session kill` in the TUI without a session ID, awman fetches 
 
 ## Remote-bound TUI tabs
 
-When `remote.defaultAddr` is configured in `~/.awman/config.json`, the TUI's **new-tab dialog** (opened with **Ctrl+T**) can permanently bind a new tab to a remote API session. Every command typed in a remote-bound tab is forwarded to the remote host via the API API — no `remote run` prefix or `--session` flag required.
+When `remote.defaultAddr` is configured in `~/.awman/config.json`, the TUI's **new-tab dialog** (opened with **Ctrl+T**) can permanently bind a new tab to a remote API session. Every command typed in a remote-bound tab is forwarded to the remote host via the API — no `remote exec` prefix or `--session` flag required.
 
 ### Creating a remote-bound tab
 
@@ -399,7 +420,7 @@ The `display_host` label is fixed for the lifetime of the tab — it does not ch
 
 ### Command execution in a remote-bound tab
 
-Every command typed in a remote-bound tab is sent to the remote session via `POST /v1/commands`, then output is streamed back in real time via the SSE log-streaming endpoint — identical to `remote run <command> --follow` but with no flags required. The tab transitions through the same execution phase states as a local tab (running → done / error).
+Every command typed in a remote-bound tab is sent to the remote session via `POST /v1/commands`, then output is streamed back in real time via the SSE log-streaming endpoint — identical to `remote exec workflow <file> --follow` but with no flags required. The tab transitions through the same execution phase states as a local tab (running → done / error).
 
 When first created, the tab automatically dispatches a `ready` command to the remote session (matching local tab behavior). The `ready` output appears in the execution window.
 
@@ -501,11 +522,11 @@ awman config set --global remote.defaultAPIKey <your-api-key>
 SESSION=$(awman remote session start /home/user/my-project | grep 'Session started:' | awk '{print $NF}')
 echo "Session: $SESSION"
 
-# Dispatch a command and stream its output
-awman remote run exec workflow path/to/workflow.md --session "$SESSION" --follow
+# Dispatch a workflow and stream its output
+awman remote exec workflow path/to/workflow.toml --session "$SESSION" --follow
 
 # Or pipe into a log file (no ANSI decoration)
-awman remote run exec workflow path/to/workflow.md --session "$SESSION" --follow > workflow.log
+awman remote exec workflow path/to/workflow.toml --session "$SESSION" --follow > workflow.log
 
 # Kill the session when you are done
 awman remote session kill "$SESSION"
@@ -521,7 +542,7 @@ export AWMAN_API_KEY=<your-api-key>
 export AWMAN_REMOTE_SESSION=<pre-provisioned-session-id>
 
 # Dispatch the workflow; exit code reflects the command's exit code
-awman remote run exec workflow path/to/workflow.md --follow
+awman remote exec workflow path/to/workflow.toml --follow
 ```
 
 For CI contexts where a session is long-lived and pre-provisioned, setting `AWMAN_REMOTE_SESSION` and `AWMAN_API_KEY` in the pipeline environment avoids per-command flags entirely.
@@ -530,7 +551,7 @@ For CI contexts where a session is long-lived and pre-provisioned, setting `AWMA
 
 ## Using cURL directly
 
-Because `remote run` is built on the API HTTP API, you can use cURL (or any HTTP client) wherever `awman remote` is inconvenient — for example, in scripts with no awman binary available:
+Because `remote exec` is built on the API HTTP API, you can use cURL (or any HTTP client) wherever `awman remote` is inconvenient — for example, in scripts with no awman binary available:
 
 ```sh
 SERVER=http://build-server.example.com:9876
@@ -542,7 +563,7 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","path/to/workflow.md"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec","args":["workflow","path/to/workflow.toml"]}' | jq -r .command_id)
 
 # Stream live output via SSE (prints each log line as it arrives)
 curl -s "$SERVER/v1/commands/$CMD/logs/stream" \
@@ -565,7 +586,7 @@ curl -s "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" | jq -r .output
 ```
 
-See [API Mode](09-api-mode.md) for the full HTTP API reference, including session management endpoints.
+See [API Mode](10-api-mode.md) for the full HTTP API reference, including session management endpoints.
 
 ---
 
@@ -574,21 +595,21 @@ See [API Mode](09-api-mode.md) for the full HTTP API reference, including sessio
 | Situation | Behaviour |
 |-----------|-----------|
 | No remote address configured | Error with instructions to pass `--remote-addr`, set `AWMAN_REMOTE_ADDR`, or configure `remote.defaultAddr` |
-| `remote run` without `--session` in CLI/API mode | Error with instructions to pass `--session` or set `AWMAN_REMOTE_SESSION` |
+| `remote exec` without `--session` in CLI mode | Error with instructions to pass `--session` or set `AWMAN_REMOTE_SESSION` |
 | `remote session start` without a directory in CLI mode | Error with instructions to pass a directory argument |
 | `remote session kill` without a session ID in CLI mode | Error with instructions to pass a session ID |
 | Session not found on remote | HTTP 404 from the server; error message includes the session ID and suggests `remote session start` |
 | Remote host unreachable | Connection timeout after 10 s; error message includes the target address |
 | Session is busy (command already running) | HTTP 403 from the server; error message includes the running command ID |
 | `--follow` on a command that already completed | Full historical log is replayed, then summary is printed — no output is missed |
-| `--follow` command runs longer than 10 minutes with no output | Client times out and prints: `"Request to <addr> timed out after 10 minutes. The remote command may still be running on the server."` The command continues running on the server; reconnect with `remote run` (without `--follow`) to check status |
+| `--follow` command runs longer than 10 minutes with no output | Client times out and prints: `"Request to <addr> timed out after 10 minutes. The remote command may still be running on the server."` The command continues running on the server; reconnect with `remote exec` (without `--follow`) to check status |
 | `--follow` receives any output from server within 10 minutes | Timeout is reset on each received event; commands that produce incremental output can run for hours |
 | `remote session start` with a new dir (TUI) | Offers to save the path to `remote.savedDirs`; session starts regardless of whether you save |
 | TUI session picker: remote host has no active sessions | Picker modal shows "No active sessions" message; `Enter` and `Esc` both cancel |
 | TUI session picker: fetch fails | Error shown in command input bar; no modal opens |
 | TUI `remote session start` with no saved dirs and no dir argument | Error in command input bar: "No directory specified and no savedDirs configured" |
 | `remote session start` with a dir already in `savedDirs` | Dir is not duplicated in the list when the save-dir prompt is accepted |
-| Inner command flags (e.g. `--yolo`) | Forwarded to the remote host verbatim; not consumed by the `remote run` parser |
+| Inner command flags (e.g. `--yolo`) | Forwarded to the remote host verbatim; not consumed by the `remote exec` parser |
 | No API key provided and server requires auth | HTTP 401; error body explains which header to use |
 | `remote.defaultAPIKey` set but target address differs from `remote.defaultAddr` | Config key is ignored; request proceeds without auth (server returns 401 if auth is required) |
 | `remote.defaultAPIKey` matches `remote.defaultAddr` with trailing slash difference | Trailing slashes are stripped from both sides before comparison; key is used |
@@ -608,4 +629,4 @@ See [API Mode](09-api-mode.md) for the full HTTP API reference, including sessio
 
 ---
 
-[← API Mode](09-api-mode.md) · [Architecture Overview →](11-architecture-overview.md)
+[← API Mode](10-api-mode.md) · [Architecture Overview →](12-architecture-overview.md)

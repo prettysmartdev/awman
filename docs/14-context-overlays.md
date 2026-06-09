@@ -280,7 +280,7 @@ overlays = ["context(global)", "context(repo)", "context(workflow)"]
 
 [[step]]
 name = "plan"
-prompt_template = """
+prompt = """
 Review the requirements and the repo context at /awman/context/repo.
 Write a detailed implementation plan to /awman/context/workflow/plan.md.
 Include:
@@ -292,7 +292,7 @@ Include:
 
 [[step]]
 name = "implement"
-prompt_template = """
+prompt = """
 Read the plan from /awman/context/workflow/plan.md.
 Implement the feature according to the plan.
 Write implementation notes to /awman/context/workflow/implementation-notes.md
@@ -301,7 +301,7 @@ as you go (so the next step can see what you did).
 
 [[step]]
 name = "document"
-prompt_template = """
+prompt = """
 Read the plan and implementation notes from /awman/context/workflow/.
 Write user-facing documentation based on what was actually implemented.
 """
@@ -391,7 +391,7 @@ overlays = ["context(repo:ro)"]  # Access project knowledge, but don't modify it
 
 [[step]]
 name = "run_tests"
-prompt_template = "Run the test suite..."
+prompt = "Run the test suite..."
 ```
 
 ---
@@ -451,7 +451,7 @@ overlays = ["context(global)", "context(repo)", "context(workflow)"]
 [[step]]
 name = "review"
 agent = "claude"
-prompt_template = """
+prompt = """
 Review the codebase architecture (you have repo context at /awman/context/repo).
 Based on our coding style (in /awman/context/global), propose 3 refactorings
 ranked by impact.
@@ -469,7 +469,7 @@ Include:
 name = "implement"
 agent = "claude"
 depends_on = ["review"]
-prompt_template = """
+prompt = """
 Read the refactoring proposal at /awman/context/workflow/refactoring-proposal.md.
 
 Implement the top-ranked refactoring.
@@ -486,7 +486,7 @@ The next step will read your notes.
 name = "test"
 agent = "claude"
 depends_on = ["implement"]
-prompt_template = """
+prompt = """
 Read what the implementation step did at /awman/context/workflow/implementation.md.
 
 Write tests for the changes (especially focus on the risks noted).
@@ -641,6 +641,6 @@ A: Technically yes, but it's not recommended. Context is meant for human-readabl
 - Set up your **global context** with coding style and common mistakes to avoid — it travels with you.
 - Add **repo context** to projects you work on frequently — it improves over time.
 - Use **workflow context** in multi-step workflows to coordinate between steps.
-- See [Overlays](08-overlays.md) for syntax reference and configuration options.
+- See [Overlays](09-overlays.md) for syntax reference and configuration options.
 
-[← GitHub Integration](12-github-integration.md) · [Architecture (Detailed) →](architecture.md)
+[← GitHub Integration](13-github-integration.md) · [Architecture (Detailed) →](architecture.md)

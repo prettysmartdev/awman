@@ -8,22 +8,23 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 
 | # | File | What's covered |
 |---|------|----------------|
-| 00 | [Getting Started](00-getting-started.md) | Installation, concepts, first agent session |
-| 01 | [Using the TUI](01-using-the-tui.md) | TUI layout, tabs, container window, keyboard reference |
-| 02 | [Agent Sessions](02-agent-sessions.md) | `chat`, work items, authentication, `awman auth`, `awman download` |
-| 03 | [Security & Isolation](03-security-and-isolation.md) | Worktrees, SSH keys, Docker socket, container transparency |
-| 04 | [Workflows](04-workflows.md) | Multi-step workflows, control board, state persistence |
-| 05 | [Yolo Mode](05-yolo-mode.md) | Fully autonomous operation, disallowed tools, countdown |
-| 06 | [Headless Mode](06-headless-mode.md) | TTY detection, non-interactive operation, CI/CD integration |
-| 07 | [Configuration](07-configuration.md) | Config files, runtime selection, all fields |
-| 08 | [Overlays](08-overlays.md) | Directory mounts, environment variables, skills, context, merge semantics |
-| 09 | [API Mode](09-api-mode.md) | HTTP server, sessions, commands, CI/automation, auditability |
-| 10 | [Remote Mode](10-remote-mode.md) | `remote run`, `remote session`, live log streaming, TUI pickers |
-| 11 | [Architecture Overview](11-architecture-overview.md) | Four-layer design, layers 0–4, design principles, adding features |
-| 12 | [GitHub Integration](12-github-integration.md) | Fetching issues, `--issue` flag, authentication, input formats |
-| 13 | [Context Overlays](13-context-overlays.md) | Persistent context, system prompts, global/repo/workflow scopes, worked examples |
-| 14 | [Mouse & TUI Agents](14-mouse-and-tui-agents.md) | Scroll forwarding, text selection, agent mouse tracking, scrollback interaction |
-| — | [Architecture (Detailed)](architecture.md) | Source layout, modules, in-depth design decisions |
+| 00 | [Getting Started](00-getting-started.md) | Installation, first agent session |
+| 01 | [Concepts](01-concepts.md) | Mental model: containers, agents, modes, overlays |
+| 02 | [Using the TUI](02-using-the-tui.md) | TUI layout, tabs, container window, keyboard reference |
+| 03 | [Agent Sessions](03-agent-sessions.md) | `chat`, work items, agent authentication |
+| 04 | [Security & Isolation](04-security-and-isolation.md) | Worktrees, overlays, Docker socket, container transparency |
+| 05 | [Workflows](05-workflows.md) | Multi-step workflows, control board, state persistence |
+| 06 | [Yolo Mode](06-yolo-mode.md) | Fully autonomous operation, disallowed tools, countdown |
+| 07 | [Headless Mode](07-headless-mode.md) | TTY detection, non-interactive operation, CI/CD integration |
+| 08 | [Configuration](08-configuration.md) | Config files, runtime selection, all fields |
+| 09 | [Overlays](09-overlays.md) | `dir()`, `env()`, `skill()`, `ssh()`, `context()` — sources and merge semantics |
+| 10 | [API Mode](10-api-mode.md) | HTTP server, sessions, commands, CI/automation |
+| 11 | [Remote Mode](11-remote-mode.md) | `remote exec`, `remote session`, live log streaming, TUI pickers |
+| 12 | [Architecture Overview](12-architecture-overview.md) | Layer design, design principles |
+| 13 | [GitHub Integration](13-github-integration.md) | `--issue` flag, fetching issues, authentication |
+| 14 | [Context Overlays](14-context-overlays.md) | Persistent context, system prompts, global/repo/workflow scopes |
+| 15 | [Mouse & TUI Agents](15-mouse-and-tui-agents.md) | Scroll forwarding, text selection, agent mouse tracking |
+| — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---
 

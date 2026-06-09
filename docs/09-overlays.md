@@ -160,7 +160,7 @@ context(global:rw)     # personal preferences, explicit read-write
 
 **Agent system prompt support:**
 
-Most agents natively support system prompt injection. If your agent does not (e.g. `maki`, `crush`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context Overlays](13-context-overlays.md).
+Most agents natively support system prompt injection. If your agent does not (e.g. `maki`, `crush`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context Overlays](14-context-overlays.md).
 
 **Note on `rw` vs `ro`:**
 
@@ -299,12 +299,12 @@ In workflow TOML or YAML files, each step can define its own `overlays` array:
 ```toml
 [[step]]
 name = "research"
-prompt_template = "Research the topic..."
+prompt = "Research the topic..."
 overlays = ["ssh()", "skill(search)", "skill(fetch)"]
 
 [[step]]
 name = "write"
-prompt_template = "Write the report..."
+prompt = "Write the report..."
 overlays = ["dir(/data/reports:/workspace/reports:rw)", "skill(*)"]
 ```
 
@@ -312,14 +312,14 @@ overlays = ["dir(/data/reports:/workspace/reports:rw)", "skill(*)"]
 ```yaml
 steps:
   - name: research
-    prompt_template: "Research the topic..."
+    prompt: "Research the topic..."
     overlays:
       - "ssh()"
       - "skill(search)"
       - "skill(fetch)"
   
   - name: write
-    prompt_template: "Write the report..."
+    prompt: "Write the report..."
     overlays:
       - "dir(/data/reports:/workspace/reports:rw)"
       - "skill(*)"
@@ -340,15 +340,15 @@ overlays = ["context(repo)", "context(workflow)"]
 
 [[step]]
 name = "plan"
-prompt_template = "Plan the implementation..."
+prompt = "Plan the implementation..."
 
 [[step]]
 name = "implement"
-prompt_template = "Implement according to the plan..."
+prompt = "Implement according to the plan..."
 
 [[step]]
 name = "test"
-prompt_template = "Test the implementation..."
+prompt = "Test the implementation..."
 ```
 
 **YAML example:**
@@ -360,13 +360,13 @@ overlays:
 
 steps:
   - name: plan
-    prompt_template: "Plan the implementation..."
+    prompt: "Plan the implementation..."
   
   - name: implement
-    prompt_template: "Implement according to the plan..."
+    prompt: "Implement according to the plan..."
   
   - name: test
-    prompt_template: "Test the implementation..."
+    prompt: "Test the implementation..."
 ```
 
 Workflow-level overlays apply to all steps unless overridden by step-level overlays (which take highest priority). This is useful for context overlays that you want all steps to share (e.g. `context(repo)` so every agent in the workflow has access to the project's accumulated knowledge).
@@ -479,17 +479,17 @@ When different steps need different skills:
 ```toml
 [[step]]
 name = "lint"
-prompt_template = "Lint the code..."
+prompt = "Lint the code..."
 overlays = ["skill(lint)"]
 
 [[step]]
 name = "review"
-prompt_template = "Review the PR..."
+prompt = "Review the PR..."
 overlays = ["skill(review)"]
 
 [[step]]
 name = "refactor"
-prompt_template = "Refactor the code..."
+prompt = "Refactor the code..."
 overlays = ["skill(lint)", "skill(refactor)"]
 ```
 
@@ -642,9 +642,9 @@ overlays = ["skill(review)"]
 - Only use `:rw` when the task genuinely requires write access to that directory.
 - Environment variable overlays are masked in displayed commands (values shown as `***`) to avoid leaking secrets in logs.
 - SSH keys are always mounted read-only — the agent cannot modify or replace your keys, only use them for authentication.
-- **Context overlays (`rw` default):** Because `context(global)` and `context(repo)` default to read-write, agents can persist files to your host that will be automatically injected into future agent runs. This is intentional — it allows agents to accumulate and refine knowledge. Use `:ro` (e.g. `context(repo:ro)`) if you want read-only context in CI/CD or shared environments. See [Context Overlays](13-context-overlays.md) for more details on managing context.
+- **Context overlays (`rw` default):** Because `context(global)` and `context(repo)` default to read-write, agents can persist files to your host that will be automatically injected into future agent runs. This is intentional — it allows agents to accumulate and refine knowledge. Use `:ro` (e.g. `context(repo:ro)`) if you want read-only context in CI/CD or shared environments. See [Context Overlays](14-context-overlays.md) for more details on managing context.
 
-See [Security & Isolation](03-security-and-isolation.md) for additional details on container transparency and isolation.
+See [Security & Isolation](04-security-and-isolation.md) for additional details on container transparency and isolation.
 
 ---
 
@@ -683,7 +683,7 @@ If you see this warning for a path that should exist, check:
 
 ### Agent not receiving context system prompt
 
-- Is your agent one that supports system prompt injection? Check the [Context Overlays](13-context-overlays.md) guide for which agents support native injection.
+- Is your agent one that supports system prompt injection? Check the [Context Overlays](14-context-overlays.md) guide for which agents support native injection.
 - For agents that support it (e.g. `claude`), is `context(...)` configured?
 - If your agent doesn't support native injection (e.g. `maki`), the context directory is still mounted; reference it manually in your prompt.
 
@@ -695,4 +695,4 @@ If you see this warning for a path that should exist, check:
 
 ---
 
-[← Configuration](07-configuration.md) · [Next: API Mode →](09-api-mode.md)
+[← Configuration](08-configuration.md) · [Next: API Mode →](10-api-mode.md)

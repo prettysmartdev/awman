@@ -35,7 +35,7 @@ awman exec workflow aspec/workflows/implement-hard.toml --issue 84
 awman exec workflow aspec/workflows/dependency-upgrade.toml
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](09-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](12-github-integration.md).
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](10-api-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](13-github-integration.md).
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -123,7 +123,7 @@ Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use thi
 | No steps added before Ctrl-Enter (TUI) | Inline error: "At least one step is required" |
 | Step prompt is empty (CLI) | Warning logged; empty prompt written to file |
 | `depends_on` names non-existent steps | Warning logged; file is still written (steps may be added later) |
-| Load a `.md` workflow file | Error: "Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml). See docs/04-workflows.md for the current format." |
+| Load a `.md` workflow file | Error: "Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml). See docs/05-workflows.md for the current format." |
 
 ---
 
@@ -940,7 +940,7 @@ Press [r] to retry, or any other key to abort:
 | `--plan` | Run each step in read-only mode |
 | `--allow-docker` | Mount Docker socket into each step's container |
 | `--worktree` | Run all steps in an isolated Git worktree |
-| `--mount-ssh` | Mount `~/.ssh` into each step's container |
+| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](09-overlays.md) |
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
 
 ---
@@ -1076,7 +1076,7 @@ When a running workflow step produces no output for **30 seconds**, the engine i
 - In **yolo mode**: the engine starts a 60-second countdown. If the countdown expires, the step is automatically advanced. Pressing Esc cancels the countdown; if the step re-stucks, the countdown restarts from 60 seconds with no backoff.
 - In **non-yolo mode**: the workflow control board opens automatically so you can decide what to do.
 
-Stuck detection fires independently per tab — background tabs detect and report stuck state to their own engine. In yolo mode, background tabs show a live countdown in the tab bar. See [Yolo Mode — Background yolo countdown](05-yolo-mode.md#background-yolo-countdown).
+Stuck detection fires independently per tab — background tabs detect and report stuck state to their own engine. In yolo mode, background tabs show a live countdown in the tab bar. See [Yolo Mode — Background yolo countdown](06-yolo-mode.md#background-yolo-countdown).
 
 **Active-tab suppression:** If you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even if the container is silent. The timer starts only once both the container and the user have been idle for 30 seconds. Background tabs are always checked using output time alone.
 
@@ -1141,8 +1141,7 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 |------|-------------|
 | `implement-hard.toml` | Four-step workflow: implement → tests + docs (parallel) → review. Uses Opus for implementation, Haiku for docs, and a final interactive review step |
 | `implement-pr.toml` | Same four steps as `implement-hard.toml`, plus teardown steps that run tests, commit changes, push the branch, and create a pull request |
-| `hard-parity-local.toml` | Five-step workflow: implement → parity check → tests + docs (parallel) → review. Uses a local model via OpenCode for parity checking, tests, and docs |
-| `dependency-upgrade.toml` | Two-step workflow: security audit → version audit. Upgrades vulnerable dependencies first, then reviews available version updates |
+| `dependency-upgrade-pr.toml` | Two-step workflow: security audit → version audit. Upgrades vulnerable dependencies first, then reviews available version updates, then opens a PR |
 
 ---
 
@@ -1219,4 +1218,4 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 
 ---
 
-[← Security & Isolation](03-security-and-isolation.md) · [Next: Yolo Mode →](05-yolo-mode.md)
+[← Security & Isolation](04-security-and-isolation.md) · [Next: Yolo Mode →](06-yolo-mode.md)
