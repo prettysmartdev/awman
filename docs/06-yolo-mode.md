@@ -179,7 +179,7 @@ This is your safety net for operations you never want the agent to perform auton
 
 **Config precedence:** per-repo config takes precedence over global config entirely (lists are not merged). To inherit the global list for a specific repo, omit the field from the repo config.
 
-See [Configuration](08-configuration.md) for the full config reference.
+See [Configuration](07-configuration.md) for the full config reference.
 
 ---
 
@@ -234,4 +234,4 @@ awman chat --yolo
 
 ---
 
-[← Workflows](05-workflows.md) · [Next: Headless Mode →](07-headless-mode.md)
+[← Workflows](05-workflows.md) · [Next: Configuration →](07-configuration.md)

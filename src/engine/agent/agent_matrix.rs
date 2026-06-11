@@ -300,7 +300,9 @@ pub fn entrypoint_for(matrix: &AgentMatrix, non_interactive: bool) -> Entrypoint
 pub fn model_flag_for(matrix: &AgentMatrix, model: &str) -> Result<ModelFlagForm, EngineError> {
     match matrix.model_flag {
         ModelFlagDelivery::SpaceArg => Ok(ModelFlagForm::Argument(model.to_string())),
-        ModelFlagDelivery::EqArg => Ok(ModelFlagForm::Argument(format!("--model={model}"))),
+        // `--model=NAME` is one self-contained argv token — Shorthand, not
+        // Argument (the backends prepend `--model` to Argument values).
+        ModelFlagDelivery::EqArg => Ok(ModelFlagForm::Shorthand(format!("--model={model}"))),
         ModelFlagDelivery::Unsupported => Err(EngineError::Other(format!(
             "agent '{}' does not support a model flag",
             matrix.agent

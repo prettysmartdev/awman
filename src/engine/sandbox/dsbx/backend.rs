@@ -30,6 +30,11 @@ use crate::engine::sandbox::dsbx::spawn::{SbxCommand, SBX_BIN};
 use crate::engine::sandbox::naming::sandbox_name_for;
 use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
+/// In-VM path of the per-launch config apply script. Must match the
+/// `commands.startup` entry the kit templates declare
+/// (`templates/sbx-kit.<agent>.yaml`).
+const APPLY_SCRIPT_VM_PATH: &str = "/home/agent/.awman/apply-session-config.sh";
+
 #[derive(Debug, Default)]
 pub(in crate::engine::sandbox) struct DSbxBackend;
 
@@ -308,15 +313,11 @@ pub(in crate::engine::sandbox) fn run_interactive(
         &options.env_passthrough,
         &options.env_literal,
         &|key| std::env::var(key).ok(),
+        &auth::secret_registered_for_service,
         &mut *frontend,
     )
-    .and_then(|overlay_registered| {
-        auth::inject_credentials(
-            &options.agent_credentials,
-            &name,
-            overlay_registered,
-            &mut *frontend,
-        )
+    .and_then(|_overlay_registered| {
+        auth::inject_credentials(&options.agent_credentials, &name, &mut *frontend)
     });
     if let Err(e) = auth_result {
         // A failure after a successful create leaves the sandbox behind on
@@ -330,7 +331,42 @@ pub(in crate::engine::sandbox) fn run_interactive(
         });
     }
 
-    // 5. The launch argv is always the positional-run form — the kit and
+    // 5. Re-apply the per-launch session config on a pre-existing sandbox.
+    //    `commands.startup` only runs when the VM boots; a sandbox still
+    //    running from a previous session would otherwise keep the config it
+    //    booted with — a changed `--model` (or permission mode, tool lists,
+    //    …) in the freshly written session.json would silently not apply.
+    //    Best-effort: against a stopped sandbox this exec may fail, and the
+    //    boot-time startup then applies the same file. A freshly created
+    //    sandbox needs none of this — session.json was written before
+    //    `sbx create`, so its first boot reads the current config.
+    if !created {
+        let mut argv = vec!["exec".to_string()];
+        if !options.workspace_dir.as_os_str().is_empty() {
+            // The apply script locates session.json via $WORKDIR; boot-time
+            // startup gets it from sbx, but `sbx exec` does not set it.
+            argv.push("--env".to_string());
+            argv.push(format!("WORKDIR={}", options.workspace_dir.display()));
+        }
+        argv.push(name.clone());
+        argv.push("bash".to_string());
+        argv.push(APPLY_SCRIPT_VM_PATH.to_string());
+        crate::engine::sandbox::dsbx::spawn::announce(
+            &mut *frontend,
+            &format!("{SBX_BIN} {}", argv.join(" ")),
+        );
+        match SbxCommand::new(argv).run_quiet() {
+            Ok(out) if out.success() => {}
+            _ => warn(
+                &mut *frontend,
+                "sbx: could not re-apply the session config on the existing sandbox; \
+                 if it was stopped, the boot-time startup script applies it instead."
+                    .to_string(),
+            ),
+        }
+    }
+
+    // 6. The launch argv is always the positional-run form — the kit and
     //    workspace are baked into the sandbox at creation.
     let argv = run_argv(&name, &agent, &options);
 
@@ -346,7 +382,7 @@ pub(in crate::engine::sandbox) fn run_interactive(
         container_name: name.clone(),
     });
 
-    // 6. Announce the command, then bridge I/O.
+    // 7. Announce the command, then bridge I/O.
     crate::engine::sandbox::dsbx::spawn::announce(
         &mut *frontend,
         &format!("{SBX_BIN} {}", argv.join(" ")),
@@ -402,7 +438,7 @@ fn create_argv(
     argv
 }
 
-/// Launch argv: `sbx run <name> [-- seeded prompt]`. Used for every
+/// Launch argv: `sbx run <name> [-- AGENT_ARGS...]`. Used for every
 /// interactive launch — the sandbox always exists by this point (first
 /// launches run `sbx create` beforehand), and an existing sandbox is
 /// addressed by its positional name: `--name` is creation-only and sbx errors
@@ -410,7 +446,11 @@ fn create_argv(
 /// workspace are baked in at creation, so none of them appear.
 fn run_argv(name: &str, agent: &str, options: &ResolvedSandboxOptions) -> Vec<String> {
     let mut argv = vec!["run".to_string(), name.to_string()];
-    append_seeded_agent_args(&mut argv, agent, options);
+    let args = agent_args(agent, options);
+    if !args.is_empty() {
+        argv.push("--".to_string());
+        argv.extend(args);
+    }
     argv
 }
 
@@ -422,16 +462,43 @@ fn push_workspace_positional(argv: &mut Vec<String>, options: &ResolvedSandboxOp
     }
 }
 
-/// For `kind: agent` kits the seeded prompt is appended as an agent arg after
-/// the `--` delimiter (a bare positional would be parsed as a workspace PATH);
-/// for `kind: mixin` it is delivered via stdin, so nothing is appended here.
-fn append_seeded_agent_args(argv: &mut Vec<String>, agent: &str, options: &ResolvedSandboxOptions) {
-    if let Some(prompt) = &options.seeded_prompt {
-        if matches!(kit_kind_for(agent), SbxKitKind::Agent) {
-            argv.push("--".to_string());
-            argv.push(prompt.clone());
+/// Agent args appended after the `--` delimiter, mirroring the argv the
+/// container path builds after the entrypoint: non-interactive
+/// subcommand/flag, mode flags (yolo/auto/plan), model flag, then the seeded
+/// prompt (a bare positional would be parsed by sbx as a workspace PATH).
+/// Only `kind: agent` kits take agent args — awman owns their entrypoint,
+/// and sbx forwards everything after `--` to it. `kind: mixin` kits launch
+/// through Docker's built-in template (no argv channel): their dynamic
+/// config flows through `session.json` and their prompt via stdin
+/// ([`stdin_seed`]), so they get no args here.
+fn agent_args(agent: &str, options: &ResolvedSandboxOptions) -> Vec<String> {
+    use crate::engine::container::options::ModelFlagForm;
+
+    if !matches!(kit_kind_for(agent), SbxKitKind::Agent) {
+        return Vec::new();
+    }
+    let mut args = Vec::new();
+    if !options.interactive {
+        if let Ok(matrix) = matrix_for(agent) {
+            if let Some(flag) = matrix.non_interactive_flag {
+                args.push(flag.to_string());
+            }
         }
     }
+    args.extend(options.mode_flags.iter().cloned());
+    if let Some(model) = &options.model {
+        match model {
+            ModelFlagForm::Argument(name) => {
+                args.push("--model".to_string());
+                args.push(name.clone());
+            }
+            ModelFlagForm::Shorthand(s) => args.push(s.clone()),
+        }
+    }
+    if let Some(prompt) = &options.seeded_prompt {
+        args.push(prompt.clone());
+    }
+    args
 }
 
 fn spawn_pty_bridged(
@@ -931,6 +998,7 @@ mod tests {
         // positional would be parsed by sbx as a workspace PATH).
         let crush = opts(vec![
             SandboxOption::AgentId("crush".into()),
+            SandboxOption::Interactive(true),
             SandboxOption::SeededPrompt("do the thing".into()),
         ]);
         let argv = run_argv("awman-h-crush", "crush", &crush);
@@ -949,6 +1017,93 @@ mod tests {
         let argv = run_argv("awman-h-claude", "claude", &claude);
         assert!(!argv.iter().any(|a| a == "do the thing"));
         assert!(!argv.iter().any(|a| a == "--"));
+    }
+
+    // ─── WI follow-up: session config re-applied on existing sandboxes ─────
+    //
+    // `commands.startup` only runs at VM boot. When the sandbox already
+    // exists, run_interactive must exec the apply script before `sbx run` so
+    // a changed session.json (e.g. a new --model) reaches the agent even if
+    // the VM never reboots between launches.
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_sandbox_reapplies_session_config_before_run() {
+        use crate::data::message::{UserMessage, UserMessageSink};
+        use crate::engine::agent_runtime::frontend::{
+            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
+        };
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingFrontend {
+            messages: Arc<Mutex<Vec<UserMessage>>>,
+        }
+        impl UserMessageSink for RecordingFrontend {
+            fn write_message(&mut self, msg: UserMessage) {
+                self.messages.lock().unwrap().push(msg);
+            }
+            fn replay_queued(&mut self) {}
+        }
+        impl AgentFrontend for RecordingFrontend {
+            fn report_status(&mut self, _: AgentStatus) {}
+            fn report_progress(&mut self, _: AgentProgress) {}
+            fn take_io(&mut self) -> AgentIo {
+                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+                AgentIo {
+                    stdout,
+                    stderr,
+                    stdin_tx,
+                    stdin_rx,
+                    resize: None,
+                    initial_size: None,
+                }
+            }
+        }
+
+        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        // `ls` reports the sandbox as already existing → no `sbx create`,
+        // and the re-apply exec must run before `sbx run`.
+        crate::engine::sandbox::dsbx::test_support::with_fake_sbx(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               ls) echo '[{\"name\":\"awman-test-claude\"}]';;\n\
+               *) cat > /dev/null 2>&1; exit 0;;\n\
+             esac\n",
+            || {
+                let tmp = tempfile::tempdir().unwrap();
+                let options = ResolvedSandboxOptions::resolve(vec![
+                    SandboxOption::AgentId("claude".into()),
+                    SandboxOption::SandboxName("awman-test-claude".into()),
+                    SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
+                ]);
+                let frontend = Box::new(RecordingFrontend {
+                    messages: messages.clone(),
+                });
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let _ = run_interactive(options, frontend);
+                });
+            },
+        );
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| {
+                m.text.contains("sbx exec")
+                    && m.text.contains(APPLY_SCRIPT_VM_PATH)
+                    && m.text.contains("WORKDIR=")
+            }),
+            "existing sandbox must announce the session-config re-apply exec; \
+             messages: {:?}",
+            *msgs
+        );
+        assert!(
+            !msgs.iter().any(|m| m.text.contains("sbx create")),
+            "existing sandbox must not be re-created; messages: {:?}",
+            *msgs
+        );
     }
 
     // ─── ls parsing ────────────────────────────────────────────────────────
@@ -1051,6 +1206,112 @@ mod tests {
         assert_eq!(argv, vec!["run", "awman-h-gemini"]);
     }
 
+    // ─── Agent args: model / mode flags / non-interactive (kind: agent) ────
+
+    #[test]
+    fn model_flag_appended_after_delimiter_for_agent_kits() {
+        use crate::engine::container::options::ModelFlagForm;
+        let o = opts(vec![
+            SandboxOption::AgentId("crush".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::Model {
+                flag: ModelFlagForm::Argument("anthropic/claude-opus-4-6".into()),
+            },
+        ]);
+        let argv = run_argv("awman-h-crush", "crush", &o);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "awman-h-crush",
+                "--",
+                "--model",
+                "anthropic/claude-opus-4-6"
+            ],
+            "agent-kit model must be delivered as agent args after `--`"
+        );
+    }
+
+    #[test]
+    fn model_shorthand_appended_as_single_token() {
+        use crate::engine::container::options::ModelFlagForm;
+        let o = opts(vec![
+            SandboxOption::AgentId("maki".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::Model {
+                flag: ModelFlagForm::Shorthand("--model=sonnet".into()),
+            },
+        ]);
+        let argv = run_argv("awman-h-maki", "maki", &o);
+        assert_eq!(argv, vec!["run", "awman-h-maki", "--", "--model=sonnet"]);
+    }
+
+    #[test]
+    fn model_not_appended_for_mixin_kits() {
+        use crate::engine::container::options::ModelFlagForm;
+        // Mixins take no agent args — model flows through session.json and
+        // the kit's apply script instead.
+        let o = opts(vec![
+            SandboxOption::AgentId("claude".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::Model {
+                flag: ModelFlagForm::Argument("claude-opus-4-6".into()),
+            },
+        ]);
+        let argv = run_argv("awman-h-claude", "claude", &o);
+        assert_eq!(argv, vec!["run", "awman-h-claude"]);
+    }
+
+    #[test]
+    fn mode_flags_appended_before_model_and_prompt_for_agent_kits() {
+        use crate::engine::container::options::ModelFlagForm;
+        let o = opts(vec![
+            SandboxOption::AgentId("crush".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::AgentModeFlags(vec!["--yolo".into()]),
+            SandboxOption::Model {
+                flag: ModelFlagForm::Argument("gpt-5".into()),
+            },
+            SandboxOption::SeededPrompt("fix it".into()),
+        ]);
+        let argv = run_argv("awman-h-crush", "crush", &o);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "awman-h-crush",
+                "--",
+                "--yolo",
+                "--model",
+                "gpt-5",
+                "fix it"
+            ]
+        );
+    }
+
+    #[test]
+    fn non_interactive_prepends_matrix_flag_for_agent_kits() {
+        // crush's non-interactive shape is the `run` subcommand — it must be
+        // the first agent arg, before flags and the prompt, mirroring the
+        // container path's `entrypoint_for`.
+        let o = opts(vec![
+            SandboxOption::AgentId("crush".into()),
+            SandboxOption::Interactive(false),
+            SandboxOption::SeededPrompt("do it".into()),
+        ]);
+        let argv = run_argv("awman-h-crush", "crush", &o);
+        assert_eq!(argv, vec!["run", "awman-h-crush", "--", "run", "do it"]);
+
+        // maki has no non-interactive flag → no extra token.
+        let o = opts(vec![
+            SandboxOption::AgentId("maki".into()),
+            SandboxOption::Interactive(false),
+            SandboxOption::SeededPrompt("do it".into()),
+        ]);
+        let argv = run_argv("awman-h-maki", "maki", &o);
+        assert_eq!(argv, vec!["run", "awman-h-maki", "--", "do it"]);
+    }
+
     // Seeded prompts for mixin vs agent kit agents (full table check)
     #[test]
     fn all_mixin_agents_do_not_append_prompt_to_argv() {
@@ -1074,6 +1335,7 @@ mod tests {
         for agent in &agent_kits {
             let o = opts(vec![
                 SandboxOption::AgentId((*agent).into()),
+                SandboxOption::Interactive(true),
                 SandboxOption::SeededPrompt("the prompt".into()),
             ]);
             let argv = run_argv("awman-h-x", agent, &o);

@@ -15,16 +15,12 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 04 | [Security & Isolation](04-security-and-isolation.md) | Worktrees, overlays, Docker socket, container transparency |
 | 05 | [Workflows](05-workflows.md) | Multi-step workflows, control board, state persistence |
 | 06 | [Yolo Mode](06-yolo-mode.md) | Fully autonomous operation, disallowed tools, countdown |
-| 07 | [Headless Mode](07-headless-mode.md) | TTY detection, non-interactive operation, CI/CD integration |
-| 08 | [Configuration](08-configuration.md) | Config files, runtime selection, all fields |
-| 09 | [Overlays](09-overlays.md) | `dir()`, `env()`, `skill()`, `ssh()`, `context()` — sources and merge semantics |
-| 10 | [API Mode](10-api-mode.md) | HTTP server, sessions, commands, CI/automation |
-| 11 | [Remote Mode](11-remote-mode.md) | `remote exec`, `remote session`, live log streaming, TUI pickers |
-| 12 | [Architecture Overview](12-architecture-overview.md) | Layer design, design principles |
-| 13 | [GitHub Integration](13-github-integration.md) | `--issue` flag, fetching issues, authentication |
-| 14 | [Context Overlays](14-context-overlays.md) | Persistent context, system prompts, global/repo/workflow scopes |
-| 15 | [Mouse & TUI Agents](15-mouse-and-tui-agents.md) | Scroll forwarding, text selection, agent mouse tracking |
-| 16 | [Runtimes](16-runtimes.md) | Docker, Apple Containers, Docker Sandboxes — platform support, setup, lifecycle |
+| 07 | [Configuration](07-configuration.md) | Config files, runtime selection, all fields |
+| 08 | [Overlays](08-overlays.md) | `dir()`, `env()`, `skill()`, `ssh()`, `context()` — sources, merge semantics, context overlays |
+| 09 | [API Mode](09-api-mode.md) | HTTP server, sessions, commands, non-interactive/headless operation, CI/automation |
+| 10 | [Remote Mode](10-remote-mode.md) | `remote exec`, `remote session`, live log streaming, TUI pickers |
+| 11 | [GitHub Integration](11-github-integration.md) | `--issue` flag, fetching issues, authentication |
+| 12 | [Runtimes](12-runtimes.md) | Docker, Apple Containers, Docker Sandboxes — platform support, setup, lifecycle |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

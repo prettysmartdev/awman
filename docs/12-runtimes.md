@@ -22,6 +22,8 @@ awman config set --global runtime docker-sbx-experimental  # experimental
 
 You can switch runtimes at any time — each keeps its own separate state and does not interfere with the others. See [Switching runtimes](#switching-runtimes).
 
+**Invalid values are a fatal error.** If the `runtime` field holds anything other than the three strings above, awman refuses to start — it does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. CLI commands print the invalid value and the valid options, then exit immediately; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). Fix the `runtime` value in `$HOME/.awman/config.json` and relaunch.
+
 ---
 
 ## Docker (default)
@@ -168,18 +170,12 @@ awman runs `sbx create --kit ~/.awman/kits/claude --name awman-<hash>-claude cla
 awman chat claude          # sbx restarts the existing sandbox, re-runs startup script, attaches
 ```
 
-awman re-registers the sandbox-scoped secrets (so rotated keys apply) and runs `sbx run awman-<hash>-claude` (the existing sandbox is addressed by its positional name — `--name` is only valid when creating a new sandbox — and no `--kit` flag is passed, so the installed state is preserved).
+awman re-registers the sandbox-scoped secrets (so rotated keys apply), re-applies the per-launch session config (`sbx exec <sandbox> bash …/apply-session-config.sh` — the boot-time startup script only runs when the VM boots, so without this step a sandbox still running from a previous session would keep its old config and a changed `--model` would silently not apply), and runs `sbx run awman-<hash>-claude` (the existing sandbox is addressed by its positional name — `--name` is only valid when creating a new sandbox — and no `--kit` flag is passed, so the installed state is preserved).
 
 **Teardown:**
 
 ```sh
-awman destroy <worktree>   # stops and removes the sandbox; clears the persistent volume
-```
-
-Or manually:
-
-```sh
-sbx rm awman-<hash>-claude
+sbx rm awman-<hash>-claude   # stops and removes the sandbox, clearing its persistent volume
 ```
 
 **Listing running sandboxes:**
@@ -215,13 +211,13 @@ Each agent accepts a specific allowlist of auth variables (matching the [Docker 
 Rules:
 
 - An `env(VAR)` overlay for a credential-class variable **not** on the agent's allowlist is dropped with a warning (it is never written anywhere workspace-readable).
-- Launching with no supported auth overlay prints a warning that auth must be configured manually (`sbx secret set <sandbox> <service>` — sandbox-scoped secrets apply immediately, even to a running sandbox) or via the agent's own login flow inside the sandbox — the launch still proceeds.
+- Launching with no supported auth overlay does not warn blindly. awman first probes for a pre-existing sbx secret that already covers the agent's provider — it runs `sbx secret ls --service <service>` (the well-known service name, e.g. `anthropic` for `claude`) and `sbx secret ls -g` (the global store). If a matching secret is found (from a previous launch, a manual `sbx secret set`, or a global key), awman prints an informational note that the existing credential will authenticate the agent and launches normally. Only when no pre-existing secret is found does it warn that auth must be configured manually (`sbx secret set <sandbox> <service>` — sandbox-scoped secrets apply immediately, even to a running sandbox) or via the agent's own login flow inside the sandbox — and the launch still proceeds either way.
 - Custom-kit agents (`antigravity`, `crush`, `maki`, `cline`) do not participate in launch-time auto-auth yet; register their credentials manually with `sbx secret set`.
 - Non-credential `env(VAR)` overlays (e.g. `LOG_LEVEL`) are unaffected — they reach the agent through `session.json` as before.
 
 Credentials are piped to `sbx secret set` via stdin — they never appear in process listings, and they are masked in all awman output.
 
-**Claude subscription tokens:** Docker Sandboxes does not yet support `CLAUDE_CODE_OAUTH_TOKEN` (the token from `claude setup-token`), so awman cannot register it with `sbx secret set` and warns instead. To use Claude Code under the sbx runtime, either set `ANTHROPIC_API_KEY`, or run `/login` inside the sandbox on first launch — the sbx credential proxy completes the OAuth flow and keeps the resulting token on the host.
+**Claude subscription tokens:** Docker Sandboxes does not yet support `CLAUDE_CODE_OAUTH_TOKEN` (the token from `claude setup-token`), so awman silently skips it — no warning is printed, since the token is surfaced on every launch whenever you are logged in to Claude Code and auth works without it. To use Claude Code under the sbx runtime, either set `ANTHROPIC_API_KEY` (the missing-auth warning above still fires when no supported variable is configured), or run `/login` inside the sandbox on first launch — the sbx credential proxy completes the OAuth flow and keeps the resulting token on the host.
 
 Non-credential config (model selection, mode flags, system prompts, tool lists) is written to `<workspace>/.awman/session.json` before each launch and read by the startup script inside the VM. Credential values are never written to `session.json`.
 
@@ -239,10 +235,11 @@ Mixin kits launch their agent through Docker's built-in sandbox template, so awm
 Mixin startup scripts consume these `session.json` fields where the agent supports them natively:
 
 - `model` — sets the agent's default model
+- `permission_mode` — `--plan` / `--auto` / `--yolo`; claude renders it as `permissions.defaultMode` (`plan` / `acceptEdits` / `bypassPermissions`) in its settings file. For `--yolo`, the script also sets `skipDangerousModePermissionPrompt: true` so claude does not ask for interactive confirmation of bypass-permissions mode — the sandbox is the isolation boundary, matching the container runtimes' behavior
 - `system_prompt_inline.text` — applies an inline system prompt via the agent's native config
 - `allowed_tools` / `disallowed_tools` — configures tool allow/deny lists
 
-If a mixin agent cannot express a field through its native config, awman prints a warning at launch time rather than silently dropping the setting. `kind: agent` kits do not consume these fields from `session.json` — configuration is delivered entirely through launch arguments. (`antigravity` delivers system prompts through extra directory mounts under the container runtimes; those mounts don't exist under sbx, so awman warns that the system prompt was not applied.)
+If a mixin agent cannot express a field through its native config, awman prints a warning at launch time rather than silently dropping the setting. `kind: agent` kits do not consume these fields from `session.json` — configuration is delivered as launch arguments appended after the `--` delimiter, mirroring the container runtimes' argv: the non-interactive subcommand/flag (e.g. `crush run`, `cline task`), mode flags (`--yolo`, …), the model flag (`--model <NAME>`), then the seeded prompt. (`antigravity` delivers system prompts through extra directory mounts under the container runtimes; those mounts don't exist under sbx, so awman warns that the system prompt was not applied.)
 
 No prompt is delivered twice: mixin kits use stdin; `kind: agent` kits use positional arguments; neither path uses both.
 
@@ -273,6 +270,16 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 **`--allow-docker`:** Docker-in-Docker is always on inside an sbx sandbox (each VM has a private Docker daemon). The `--allow-docker` flag (which mounts the host daemon socket into Docker containers) is a no-op under sbx — it is ignored (noted in the debug log).
 
 **Directory overlays, skills, and context mounts:** the VM can only see the workspace, which is virtiofs-mounted at sandbox creation. `dir(...)` overlays, skill mounts (`--include-all-skills` / `skill(...)`), and context directory mounts (`context(...)`) cannot be honored — awman warns at launch and continues without them. For `context(...)`, the rendered system prompt text is still delivered to the agent; only the directory mount is skipped.
+
+**Mixin launch flags:** mixin kits launch the agent through Docker's built-in template, whose launch command takes no CLI flags from awman. Anything with a native config-file equivalent is delivered through `session.json` (see [Session config](#session-config-and-seeded-prompts)); the rest is warned about at launch instead of silently dropped:
+
+| Option | claude | codex / gemini / opencode | copilot |
+|---|---|---|---|
+| `--model` | applied (settings file) | applied (settings/config file) | **not deliverable** — warned; use the `/model` slash command in-session |
+| `--plan` / `--auto` / `--yolo` | applied (`permissions.defaultMode`) | **not deliverable** — warned | **not deliverable** — warned |
+| `--non-interactive` | **not deliverable** — warned; the prompt is still piped to the agent's interactive entrypoint | same | same |
+
+`kind: agent` kits (`antigravity`, `crush`, `maki`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, and the non-interactive subcommand as launch arguments, exactly like the container runtimes. (`antigravity` rejects `--model` on every runtime — it has no model flag.)
 
 **Port mappings:** if a workflow binds a port inside the sandbox, that port mapping is lost when the sandbox stops. Port-based workflows must keep the sandbox running continuously.
 
@@ -351,4 +358,4 @@ awman chat claude                   # runs in Docker container, unchanged
 
 ---
 
-[← Architecture Overview](12-architecture-overview.md) · [Next: GitHub Integration →](13-github-integration.md)
+[← GitHub Integration](11-github-integration.md) · [Architecture (Detailed) →](architecture.md)

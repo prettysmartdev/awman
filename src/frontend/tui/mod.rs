@@ -53,7 +53,15 @@ use keymap::{Action, FocusContext};
 use tabs::{ContainerWindowState, Tab};
 
 /// Entry point invoked by `main.rs` for bare (no-subcommand) launches.
-pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
+///
+/// `fatal_runtime_error` carries the invalid-runtime config message when the
+/// global config names a runtime awman doesn't recognize. In that case the
+/// TUI presents only a fatal modal (Enter quits) — no startup command runs.
+pub async fn run(
+    _matches: clap::ArgMatches,
+    ctx: RuntimeContext,
+    fatal_runtime_error: Option<String>,
+) -> ExitCode {
     let catalogue = CommandCatalogue::get();
     let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
 
@@ -68,6 +76,23 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
         initial_tab,
         runtime_handle,
     );
+
+    if let Some(message) = fatal_runtime_error {
+        app.active_dialog = Some(Dialog::FatalError {
+            title: "Invalid Runtime Configuration".to_string(),
+            body: format!(
+                "{message}\n\nUpdate the 'runtime' value in $HOME/.awman/config.json \
+                 and restart awman."
+            ),
+        });
+        return match run_event_loop(&mut app) {
+            Ok(()) => ExitCode::from(2),
+            Err(e) => {
+                eprintln!("awman: TUI error: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     // Auto-spawn startup command: `ready` for git repos, `status --watch`
     // for non-git directories.
@@ -342,6 +367,13 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.should_quit = true;
                 return;
             }
+            // A fatal startup error leaves nothing to return to — Ctrl-C
+            // quits outright, same as Enter/Esc.
+            if matches!(app.active_dialog, Some(Dialog::FatalError { .. })) {
+                app.active_dialog = None;
+                app.should_quit = true;
+                return;
+            }
             if app.active_dialog.is_some() {
                 return;
             }
@@ -484,6 +516,13 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 
         // ── Dialog actions ────────────────────────────────────────────
         Action::DismissDialog => {
+            // A fatal startup error cannot be dismissed back into a usable
+            // app — Esc quits, same as Enter.
+            if matches!(app.active_dialog, Some(Dialog::FatalError { .. })) {
+                app.active_dialog = None;
+                app.should_quit = true;
+                return;
+            }
             // In ConfigShow editing mode, Esc cancels the edit (back to browse).
             if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
                 if state.editing {
@@ -1029,6 +1068,10 @@ fn handle_dialog_submit(app: &mut App) {
     match &app.active_dialog {
         Some(Dialog::QuitConfirm) => {}
         Some(Dialog::CloseTabConfirm) => {}
+        Some(Dialog::FatalError { .. }) => {
+            app.active_dialog = None;
+            app.should_quit = true;
+        }
 
         Some(Dialog::TextInput { editor, .. }) if is_command => {
             let text = editor.text.clone();
@@ -1327,7 +1370,8 @@ fn handle_dialog_char(app: &mut App, c: char) {
         | Some(Dialog::ListPicker { .. })
         | Some(Dialog::KindSelect { .. })
         | Some(Dialog::YesNo { .. })
-        | Some(Dialog::YesNoCancel { .. }) => {}
+        | Some(Dialog::YesNoCancel { .. })
+        | Some(Dialog::FatalError { .. }) => {}
 
         None => {}
     }
@@ -1548,6 +1592,52 @@ mod tests {
         press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
         assert!(app.active_dialog.is_none());
+    }
+
+    // ─── FatalError dialog (invalid runtime config) ───────────────────────────
+
+    fn fatal_error_dialog() -> Dialog {
+        Dialog::FatalError {
+            title: "Invalid Runtime Configuration".into(),
+            body: "invalid runtime 'blarg'".into(),
+        }
+    }
+
+    #[test]
+    fn fatal_error_dialog_enter_quits() {
+        let mut app = make_app();
+        app.active_dialog = Some(fatal_error_dialog());
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.should_quit, "Enter on FatalError must quit the TUI");
+        assert!(app.active_dialog.is_none());
+    }
+
+    #[test]
+    fn fatal_error_dialog_esc_quits() {
+        let mut app = make_app();
+        app.active_dialog = Some(fatal_error_dialog());
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit, "Esc on FatalError must quit the TUI");
+    }
+
+    #[test]
+    fn fatal_error_dialog_ctrl_c_quits() {
+        let mut app = make_app();
+        app.active_dialog = Some(fatal_error_dialog());
+        press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit, "Ctrl-C on FatalError must quit the TUI");
+    }
+
+    #[test]
+    fn fatal_error_dialog_ignores_regular_chars() {
+        let mut app = make_app();
+        app.active_dialog = Some(fatal_error_dialog());
+        press_char(&mut app, 'x');
+        assert!(!app.should_quit);
+        assert!(
+            matches!(app.active_dialog, Some(Dialog::FatalError { .. })),
+            "regular chars must not dismiss the fatal dialog"
+        );
     }
 
     #[test]

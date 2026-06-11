@@ -175,11 +175,11 @@ When neither a positional prompt nor `--issue` are provided, the command exits w
 
 | Flag | Description |
 |------|-------------|
-| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; see [GitHub Integration](13-github-integration.md) |
+| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; see [GitHub Integration](11-github-integration.md) |
 | `--non-interactive` / `-n` | Run in print/batch mode — agent executes and exits |
 | `--plan` | Read-only analysis mode — agent cannot modify files |
 | `--allow-docker` | Mount host Docker socket into the container |
-| `--overlay=<SPEC>` | Apply overlay(s) for this run; see [Overlays](09-overlays.md) |
+| `--overlay=<SPEC>` | Apply overlay(s) for this run; see [Overlays](08-overlays.md) |
 | `--auto` | Auto-approve file edits; prompt before shell commands |
 | `--yolo` | Fully autonomous mode — skip all permission prompts |
 | `--agent=<name>` | Override the agent for this run |
@@ -242,13 +242,80 @@ $GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 | `--plan` | Read-only mode for all steps |
 | `--allow-docker` | Mount host Docker socket into each step's container |
 | `--worktree` | Run all steps in an isolated Git worktree |
-| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](09-overlays.md) |
+| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md) |
 | `--auto` | Auto-approve file edits; prompt before shell commands |
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
 | `--agent=<name>` | Default agent for steps that do not specify an `Agent:` field |
 | `--model=<NAME>` | Default model for steps that do not specify a `Model:` field |
 
 All workflow flags are described in [Workflows](05-workflows.md#flags).
+
+---
+
+## Non-interactive (headless) operation
+
+Both `exec` and the API server run **non-interactively** — without expecting input from a terminal. There are no interactive prompts, dialogs, or pauses for confirmation; the agent runs from start to finish and you observe the result through stdout/stderr or the event stream. This is what makes awman safe to drive from CI/CD pipelines, cron jobs, and scripts.
+
+### Automatic TTY detection
+
+For the one-shot CLI (`awman chat`, `exec prompt`, `exec workflow`), awman checks whether stdin is connected to a terminal and switches to non-interactive mode automatically when it is not:
+
+```sh
+# Interactive (TTY detected)
+awman chat
+
+# Non-interactive (stdin redirected from a pipe or file)
+awman chat < /dev/null
+
+# Non-interactive (explicit flag, even when a TTY is present)
+awman chat --non-interactive
+```
+
+When a TTY is present and `--non-interactive` is not passed, awman allows interactive features — full-screen agent sessions, PTY passthrough, and terminal resize (SIGWINCH) forwarding. When no TTY is detected, the agent runs in print/batch mode and awman makes no attempt to manage the terminal.
+
+The API server (`awman api start`) is **always** non-interactive, regardless of the server process's stdin: clients drive it over HTTP and receive updates through the event stream, so there is no terminal to manage.
+
+### The `--non-interactive` / `-n` flag
+
+Force non-interactive mode even when a TTY is available. Useful for:
+
+- Testing how a workflow behaves headlessly without leaving your terminal.
+- Scripting awman commands inside a shell script you happen to be running interactively.
+- Environments with a quirky terminal where TTY detection is unreliable.
+
+### Yolo mode in headless contexts
+
+`--yolo` works seamlessly without a terminal, and its stuck-detection keeps unattended runs from stalling:
+
+1. **Stuck detection** runs continuously — the engine tracks output on stdout and stderr.
+2. **Auto-advance after 30 seconds of silence** — a 60-second countdown begins when no output is seen.
+3. **Countdown via stderr/logs** — progress is printed to stderr (one message every 10 seconds to avoid noise).
+4. **Auto-advance when the countdown expires** — the step advances with no user input.
+
+```sh
+# CI: no explicit --non-interactive needed; awman detects the headless context
+awman exec workflow aspec/workflows/feature-impl.toml --work-item 0042 --yolo
+```
+
+The API applies the same `yolo` auto-advance behavior as the CLI.
+
+### Error handling and exit codes
+
+When something fails in a non-interactive run, awman:
+
+1. **Prints error details to stderr** — step name, error code, and any container output.
+2. **Exits non-zero** — so CI/CD detects the failure and stops the pipeline.
+3. **Does not attempt interactive recovery** — no retry prompts, no manual intervention.
+
+This makes results easy to integrate: check the exit code and act on it. All output goes to stdout (step output, status messages) and stderr (errors, yolo countdown), so you can capture and redirect freely:
+
+```sh
+awman exec workflow workflow.toml --yolo > workflow.log 2>&1
+```
+
+### Terminal-dependent agents
+
+An agent that needs full-screen terminal control (e.g. an interactive editor) requires a real TTY and cannot run headlessly. Either refactor the workflow to avoid full-screen features, run it on a machine with a terminal, or provide a virtual TTY (tmux/screen) inside the container — rarely needed.
 
 ---
 
@@ -433,7 +500,7 @@ curl -s http://localhost:9876/v1/status \
   -H "Authorization: <your-api-key>"
 ```
 
-When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](11-remote-mode.md#api-key-authentication).
+When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](10-remote-mode.md#api-key-authentication).
 
 **Error responses from the middleware:**
 
@@ -1108,7 +1175,7 @@ done
 
 If the endpoint returns HTTP 404 on the first poll, the command either has not started yet or is not a workflow command — treat 404 as "no workflow" and skip the strip. If 404 is returned after a non-404 response, the workflow was removed; stop polling.
 
-The [Remote-bound TUI tabs](11-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
+The [Remote-bound TUI tabs](10-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
 
 ---
 
@@ -1258,7 +1325,7 @@ Pre-configure working directories so you don't have to repeat `--workdirs` every
 awman config set --global api.workDirs "/home/user/my-project,/home/user/other-project"
 ```
 
-Paths from `api.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](08-configuration.md#global-config) for the full global config reference.
+Paths from `api.workDirs` and paths from `--workdirs` flags are merged at startup — both sources can be used together. See [Configuration](07-configuration.md#global-config) for the full global config reference.
 
 ### `api.alwaysNonInteractive`
 
@@ -1356,4 +1423,4 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 
 ---
 
-[← Overlays](09-overlays.md) · [Remote Mode →](11-remote-mode.md)
+[← Overlays](08-overlays.md) · [Remote Mode →](10-remote-mode.md)

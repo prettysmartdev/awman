@@ -160,7 +160,7 @@ context(global:rw)     # personal preferences, explicit read-write
 
 **Agent system prompt support:**
 
-Most agents natively support system prompt injection. If your agent does not (e.g. `maki`, `crush`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context Overlays](14-context-overlays.md).
+Most agents natively support system prompt injection. If your agent does not (e.g. `maki`, `crush`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context overlays in depth](#context-overlays-in-depth) below.
 
 **Note on `rw` vs `ro`:**
 
@@ -510,6 +510,157 @@ Mount shared reference data or fixture files:
 
 ---
 
+## Context overlays in depth
+
+Context overlays give you and your agents a persistent, shared workspace on disk — combined with automatic system prompt instructions explaining what that workspace is and how to use it. They solve a recurring problem: how do you avoid re-explaining the same project context, developer preferences, or workflow state to every agent you run?
+
+A context overlay is three things at once:
+
+1. **A directory on your host** — persistent files you create and manage, located under `~/.awman/context/`.
+2. **A system prompt** — automatically injected into the agent's instructions, explaining the context and what files to expect.
+3. **A unified syntax** — expressed as `context(scope[:permission])`, just like every other overlay.
+
+The three scopes:
+
+| Scope | Location | Purpose | Shared across |
+|-------|----------|---------|----------------|
+| **global** | `~/.awman/context/global/` | Personal coding preferences, style rules, recurring mistakes to avoid | All projects and workflows |
+| **repo** | `~/.awman/context/repo/{owner}/{repo}/` | Project-specific architecture notes, gotchas, accumulated team knowledge | All agents working on this repo |
+| **workflow** | `~/.awman/context/workflow/` (per workflow invocation) | Shared state and coordination between steps in a multi-agent workflow | All steps in the same workflow run |
+
+### When to use each scope
+
+**Global context** (`context(global)`) — standing guidance that applies everywhere: personal coding style, common gotchas you've learned to avoid, architectural patterns you always want followed, links to frequently-referenced docs. Example: a `~/.awman/context/global/coding-style.md` that says "Always use async/await, never callbacks." Every agent you run, in any project, reads it.
+
+**Repo context** (`context(repo)`) — project-specific knowledge worth preserving: architecture decisions unique to this codebase, known workarounds and technical debt, team conventions that differ from your personal style, notes from previous agent sessions ("we tried X, it failed because Y"). Example: after an agent refactors your auth layer, you add notes to `~/.awman/context/repo/myorg/myproject/auth-layer.md` so the next agent avoids the pitfalls the previous one discovered.
+
+**Workflow context** (`context(workflow)`) — multi-step coordination where each step needs to see which steps completed, notes left by earlier steps, and a shared workspace. Example: a `plan` step writes `/awman/context/workflow/plan.md`, the `implement` step reads it and builds accordingly, the `document` step reads both. No step re-discovers what earlier steps decided.
+
+### System prompt injection
+
+When you use `context()`, awman automatically injects a section into the agent's system prompt explaining the context directory and what to do with it. The exact wording may vary slightly; the shapes are:
+
+**Global context prompt** — explains that `/awman/context/global` is the developer's personal, cross-project workspace, instructs the agent to read all files at the start of the task, and encourages it to write back significant insights or mistakes for future sessions.
+
+**Repo context prompt** — explains that `/awman/context/repo` holds knowledge specific to the current project, maintained collaboratively by the developer and prior agents, and instructs the agent to read it for orientation and write back decisions and discoveries.
+
+**Workflow context prompt (dynamic)** — regenerated for each step with live progress, e.g.:
+
+```
+## Workflow Context
+
+You are running as part of the multi-agent "Build API Implementation" workflow,
+managed by awman.
+
+Your current step: implement (step 2 of 3)
+
+Workflow progress:
+  [✓] plan — completed
+  [→] implement — in progress (this is you)
+  [○] test — pending
+
+You have access to a shared workflow context directory mounted at /awman/context/workflow.
+Every agent step in this workflow shares this directory and can read and write files there.
+
+Instructions:
+1. At the start of your task, read any files left by previous steps in
+   /awman/context/workflow — intermediate results, shared state, scripts, or instructions.
+2. Write your outputs, notes, and any state that later steps will need into
+   /awman/context/workflow, using descriptive file names.
+3. You are one step in a coordinated workflow — produce your deliverables reliably,
+   document what you produced, and leave the workspace ready for the next step.
+```
+
+### Setting up context directories
+
+**Global** — create the directory and add files describing your standing guidance:
+
+```sh
+mkdir -p ~/.awman/context/global
+```
+
+Useful files: `coding-style.md` (language conventions), `common-mistakes.md` (gotchas to avoid), `decision-log.md` (standing decisions like "we use Postgres, not SQLite, in user-facing code"). Then enable it in `~/.awman/config.json`:
+
+```json
+{ "overlays": ["context(global)"] }
+```
+
+**Repo** — after working with an agent on a project, capture project knowledge:
+
+```sh
+mkdir -p ~/.awman/context/repo/myorg/myproject
+```
+
+Useful files: `architecture.md` (layered design, module boundaries), `gotchas.md` (known traps, e.g. "changing a workflow step's name breaks resumption"). Enable it in the repo-local `.awman/config.json`:
+
+```json
+{ "overlays": ["context(repo)"] }
+```
+
+**Workflow** — these directories are created automatically per workflow invocation; you don't set them up by hand. Reference them in the workflow's overlays and have steps read/write `/awman/context/workflow/`:
+
+```toml
+[workflow]
+title = "Implement Feature"
+overlays = ["context(global)", "context(repo)", "context(workflow)"]
+
+[[step]]
+name = "plan"
+prompt = "Review the repo context at /awman/context/repo. Write a detailed plan to /awman/context/workflow/plan.md."
+
+[[step]]
+name = "implement"
+prompt = "Read /awman/context/workflow/plan.md and implement it. Write progress notes alongside it."
+
+[[step]]
+name = "document"
+prompt = "Read the plan and notes from /awman/context/workflow/ and write user-facing docs."
+```
+
+### Agent system prompt support
+
+Most awman-compatible agents support system prompt injection natively, so the context prompt is delivered automatically. If an agent doesn't, awman still mounts the context directory — you just reference it manually in your prompt.
+
+**Native injection:**
+
+| Agent | Delivery method |
+|-------|-----------------|
+| **claude** | CLI flag `--append-system-prompt-file` (recommended) |
+| **codex** | CLI flag `--config developer_instructions=<text>` |
+| **opencode** | Auto-reads `AGENTS.md` in the mounted context directory |
+| **copilot** | Env var `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` |
+| **antigravity (agy)** | CLI flag `--add-dir` + auto-reads `AGENTS.md` |
+
+**No native injection** (directory mounted, prompt not auto-delivered — reference it manually): **maki**, **crush**.
+
+**Degraded support** (replaces the entire system prompt rather than appending; awman prepends a baseline preamble to restore tool guidance, and logs a `warning` at startup): **gemini** (deprecated), **cline**. Prefer `claude` for the smoothest context experience.
+
+### Read-only vs read-write
+
+Context overlays default to **read-write (`rw`)** because the entire point is to **accumulate knowledge** across sessions — an agent should be able to update `common-mistakes.md`, add notes after a complex task, or leave files for the next workflow step. Making them read-only by default would defeat that purpose.
+
+Use `:ro` when you want to share guidance without letting agents modify it:
+
+- **CI/CD pipelines** — `context(repo:ro), context(global:ro)` so agents read project knowledge but don't write to shared context.
+- **Shared/untrusted environments** — `context(global:ro)` to share your preferences without letting the agent add to them.
+- **Archival/reference** — `context(repo:ro)` for a directory meant to stay fixed.
+
+### Managing context effectively
+
+**Good practices:** keep files short and focused (one topic per file); write for future-you (assume no prior context); link to code (commits, paths, line numbers); explain *why*, not *what*; curate periodically and remove outdated guidance; for teams, consider version-controlling context files in the repo.
+
+**Avoid:** context bloat (dumping every thought turns signal into noise); stale guidance ("we tried X, it failed" after you've fixed X); secrets in context files (never store API keys or passwords); vague notes ("be careful with auth" vs "`refresh_token()` mutates state under the state lock").
+
+### Context FAQs
+
+- **Works with the TUI?** Yes — context overlays behave identically in TUI, CLI, and API modes.
+- **Two workflows at once?** Each invocation gets its own `/awman/context/workflow/` directory keyed by the workflow UUID; they don't interfere.
+- **Share across teams?** Not directly — context lives under `~/.awman/` on your host. For team context, add it to the repo's `docs/`, check context files into the repo, or use shared mounted directories.
+- **How big can files be?** No hard limit, but keep them readable; split files that exceed a few thousand lines.
+- **Binary files?** Technically allowed, but not useful — context is for human-readable guidance (Markdown, JSON, YAML).
+
+---
+
 ## Path expansion
 
 ### Host-side `~` expansion
@@ -642,7 +793,7 @@ overlays = ["skill(review)"]
 - Only use `:rw` when the task genuinely requires write access to that directory.
 - Environment variable overlays are masked in displayed commands (values shown as `***`) to avoid leaking secrets in logs.
 - SSH keys are always mounted read-only — the agent cannot modify or replace your keys, only use them for authentication.
-- **Context overlays (`rw` default):** Because `context(global)` and `context(repo)` default to read-write, agents can persist files to your host that will be automatically injected into future agent runs. This is intentional — it allows agents to accumulate and refine knowledge. Use `:ro` (e.g. `context(repo:ro)`) if you want read-only context in CI/CD or shared environments. See [Context Overlays](14-context-overlays.md) for more details on managing context.
+- **Context overlays (`rw` default):** Because `context(global)` and `context(repo)` default to read-write, agents can persist files to your host that will be automatically injected into future agent runs. This is intentional — it allows agents to accumulate and refine knowledge. Use `:ro` (e.g. `context(repo:ro)`) if you want read-only context in CI/CD or shared environments. See [Context overlays in depth](#context-overlays-in-depth) for more details on managing context.
 
 See [Security & Isolation](04-security-and-isolation.md) for additional details on container transparency and isolation.
 
@@ -683,7 +834,7 @@ If you see this warning for a path that should exist, check:
 
 ### Agent not receiving context system prompt
 
-- Is your agent one that supports system prompt injection? Check the [Context Overlays](14-context-overlays.md) guide for which agents support native injection.
+- Is your agent one that supports system prompt injection? See [Context overlays in depth](#context-overlays-in-depth) for which agents support native injection.
 - For agents that support it (e.g. `claude`), is `context(...)` configured?
 - If your agent doesn't support native injection (e.g. `maki`), the context directory is still mounted; reference it manually in your prompt.
 
@@ -695,4 +846,4 @@ If you see this warning for a path that should exist, check:
 
 ---
 
-[← Configuration](08-configuration.md) · [Next: API Mode →](10-api-mode.md)
+[← Configuration](07-configuration.md) · [Next: API Mode →](09-api-mode.md)

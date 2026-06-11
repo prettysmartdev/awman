@@ -56,8 +56,27 @@ async fn main() -> Result<ExitCode> {
     }
 
     let global_config = GlobalConfig::load().unwrap_or_default();
+    // Set when the configured `runtime:` value is invalid and the TUI is
+    // about to start: the TUI boots just far enough to present a fatal
+    // modal with this message and quits on Enter.
+    let mut fatal_runtime_error: Option<String> = None;
     let detected = match agent_runtime::detect(&global_config) {
         Ok(d) => d,
+        Err(e @ awman::engine::error::EngineError::UnknownRuntime { .. }) => {
+            // An invalid (unrecognized) `runtime:` value is a fatal config
+            // error — never a silent Docker fallback. CLI invocations print
+            // the message and exit immediately; the bare-invocation TUI
+            // shows the same message in a startup modal instead, so it
+            // still constructs default engines (which it never exercises:
+            // the modal's only action is quit).
+            if matches.subcommand_name().is_some() {
+                eprintln!("awman: {e}");
+                return Ok(ExitCode::from(2));
+            }
+            fatal_runtime_error = Some(e.to_string());
+            agent_runtime::detect(&GlobalConfig::default())
+                .context("failed to detect agent runtime")?
+        }
         Err(e) => {
             // A `runtime:` config string this host can't construct (e.g.
             // `apple-containers` on Linux) must not lock the user out of
@@ -144,7 +163,7 @@ async fn main() -> Result<ExitCode> {
     if matches.subcommand_name().is_some() {
         Ok(cli::run(matches, ctx).await)
     } else {
-        Ok(tui::run(matches, ctx).await)
+        Ok(tui::run(matches, ctx, fatal_runtime_error).await)
     }
 }
 

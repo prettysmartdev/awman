@@ -123,6 +123,13 @@ pub enum Dialog {
         body: String,
         keys: Vec<(char, String)>,
     },
+    /// Unrecoverable startup error (e.g. an invalid `runtime:` value in the
+    /// global config). The only action is quitting: Enter, Esc, and Ctrl-C
+    /// all exit the TUI.
+    FatalError {
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone)]

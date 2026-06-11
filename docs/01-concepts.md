@@ -8,7 +8,7 @@ This page is the mental model for awman: what runs where, what the moving pieces
 
 An agent running directly on your machine can touch your home directory, SSH keys, credentials, and anything else your user account can. awman never does that. Every agent session runs in an isolated environment — a Docker container, an Apple VM, or a Docker Sandbox microVM — that sees only your project directory plus whatever you explicitly add. Credentials are injected per-session, SSH keys stay out unless you opt in, and the environment is stopped or removed when the session ends.
 
-This is what makes autonomous operation ([Yolo Mode](06-yolo-mode.md)) reasonable: the blast radius of a bad agent decision is the container or VM and the mounted project, nothing else. See [Security & Isolation](04-security-and-isolation.md) for the full model, and [Runtimes](16-runtimes.md) for the difference between container-based and microVM-based isolation.
+This is what makes autonomous operation ([Yolo Mode](06-yolo-mode.md)) reasonable: the blast radius of a bad agent decision is the container or VM and the mounted project, nothing else. See [Security & Isolation](04-security-and-isolation.md) for the full model, and [Runtimes](12-runtimes.md) for the difference between container-based and microVM-based isolation.
 
 ## The two-layer image system (Docker and Apple Containers)
 
@@ -21,7 +21,7 @@ For the Docker and Apple Containers runtimes, awman builds two images per projec
 
 The split means you can update project tooling without touching the agent setup, and switch agents without rebuilding your project environment. Both files come from templates: the **agent audit** (run during `awman init` or via `awman ready --refresh`) launches an agent to inspect your codebase and fill `Dockerfile.dev` with the tools your project actually needs; agent Dockerfiles are maintained by awman and rarely need editing. Commit both files.
 
-For the Docker Sandboxes runtime, agent environments are set up using **kit YAML specs** instead of Dockerfiles. awman generates per-agent kit files at `~/.awman/kits/<agent>/` when you run `awman ready`. No custom image build or registry push is required. See [Runtimes](16-runtimes.md#docker-sandboxes-experimental).
+For the Docker Sandboxes runtime, agent environments are set up using **kit YAML specs** instead of Dockerfiles. awman generates per-agent kit files at `~/.awman/kits/<agent>/` when you run `awman ready`. No custom image build or registry push is required. See [Runtimes](12-runtimes.md#docker-sandboxes-experimental).
 
 ## Agents
 
@@ -33,9 +33,9 @@ The same engine runs in several modes; pick whichever fits the task:
 
 - **TUI** (`awman`) — interactive multiplexer: tabs, live agent terminals, a command box with autocomplete. See [Using the TUI](02-using-the-tui.md).
 - **One-shot CLI** (`awman chat`, `awman exec prompt`, `awman exec workflow`) — single commands from your shell. See [Agent Sessions](03-agent-sessions.md).
-- **Headless** — non-interactive output for scripts and CI; awman detects the missing TTY or you force it with `-n`. See [Headless Mode](07-headless-mode.md).
-- **API** (`awman api start`) — an HTTP server that queues and executes prompts and workflows. See [API Mode](10-api-mode.md).
-- **Remote** (`awman remote …`) — a thin client for an awman API server on another machine. See [Remote Mode](11-remote-mode.md).
+- **Headless** — non-interactive output for scripts and CI; awman detects the missing TTY or you force it with `-n`. See [Non-interactive operation](09-api-mode.md#non-interactive-headless-operation).
+- **API** (`awman api start`) — an HTTP server that queues and executes prompts and workflows. See [API Mode](09-api-mode.md).
+- **Remote** (`awman remote …`) — a thin client for an awman API server on another machine. See [Remote Mode](10-remote-mode.md).
 
 Permission levels apply across modes: default (agent asks), `--plan` (read-only), `--auto` (auto-approve edits), `--yolo` (fully autonomous, isolated in a Git worktree). See [Yolo Mode](06-yolo-mode.md).
 
@@ -57,11 +57,11 @@ Overlays add things to an agent's container beyond the project mount:
 - `env(VAR)` — pass through a host environment variable
 - `skill(name)` / `skill(*)` — mount reusable skill files
 
-They can be set per-command (`--overlay`), per-repo or globally (config `overlays`), per workflow step, or via `AWMAN_OVERLAYS`. See [Overlays](09-overlays.md), and [Context Overlays](14-context-overlays.md) for persistent context and system prompts.
+They can be set per-command (`--overlay`), per-repo or globally (config `overlays`), per workflow step, or via `AWMAN_OVERLAYS`. See [Overlays](08-overlays.md), including [Context overlays in depth](08-overlays.md#context-overlays-in-depth) for persistent context and system prompts.
 
 ## Configuration
 
-Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.awman/config.json` (global). Effective values resolve as flags > environment variables > repo config > global config > built-in defaults. Inspect and edit with `awman config show|get|set`. See [Configuration](08-configuration.md) for every field.
+Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.awman/config.json` (global). Effective values resolve as flags > environment variables > repo config > global config > built-in defaults. Inspect and edit with `awman config show|get|set`. See [Configuration](07-configuration.md) for every field.
 
 ---
 
@@ -80,9 +80,9 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman new spec\|workflow\|skill` | Create artefacts | [03](03-agent-sessions.md), [05](05-workflows.md) |
 | `awman specs amend <N>` | Sync a spec with the implementation | [03](03-agent-sessions.md) |
 | `awman status` | Show running agent containers | [03](03-agent-sessions.md) |
-| `awman config show\|get\|set` | Inspect and edit config | [08](08-configuration.md) |
-| `awman api start\|status\|logs\|kill` | HTTP API server | [10](10-api-mode.md) |
-| `awman remote …` | Client for a remote awman server | [11](11-remote-mode.md) |
+| `awman config show\|get\|set` | Inspect and edit config | [07](07-configuration.md) |
+| `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-mode.md) |
+| `awman remote …` | Client for a remote awman server | [10](10-remote-mode.md) |
 
 ### Key locations
 

@@ -54,7 +54,7 @@ Applies to every project on the machine unless a repo overrides it.
 }
 ```
 
-> **Upgrading from an old config?** The `envPassthrough` field was removed. Express environment passthrough as `env(VAR)` entries in the `overlays` array instead — see [Overlays](09-overlays.md). The old object-style `overlays` block (`{"skills": …, "directories": …}`) is also gone; `overlays` is now a flat array of overlay specs and the old format produces a parse error.
+> **Upgrading from an old config?** The `envPassthrough` field was removed. Express environment passthrough as `env(VAR)` entries in the `overlays` array instead — see [Overlays](08-overlays.md). The old object-style `overlays` block (`{"skills": …, "directories": …}`) is also gone; `overlays` is now a flat array of overlay specs and the old format produces a parse error.
 
 ---
 
@@ -75,7 +75,7 @@ Examples:
 Two wrinkles:
 
 - **List fields replace, they don't merge.** A repo `yoloDisallowedTools` list completely replaces the global one — even an empty list. To inherit the global list, omit the field from the repo config.
-- **Overlays are additive.** `overlays` entries from global config, repo config, `AWMAN_OVERLAYS`, and `--overlay` flags are all merged. See [Overlays](09-overlays.md).
+- **Overlays are additive.** `overlays` entries from global config, repo config, `AWMAN_OVERLAYS`, and `--overlay` flags are all merged. See [Overlays](08-overlays.md).
 
 ---
 
@@ -126,7 +126,7 @@ awman never forwards your whole environment into a container — name each varia
 awman config set --global overlays "env(ANTHROPIC_API_KEY),env(OPENAI_API_KEY)"
 ```
 
-Or per-invocation: `awman chat --overlay "env(ANTHROPIC_API_KEY)"`. See [Overlays](09-overlays.md) for the full syntax and [Agent Sessions](03-agent-sessions.md) for per-agent authentication details.
+Or per-invocation: `awman chat --overlay "env(ANTHROPIC_API_KEY)"`. See [Overlays](08-overlays.md) for the full syntax and [Agent Sessions](03-agent-sessions.md) for per-agent authentication details.
 
 ### Switch container runtime
 
@@ -178,11 +178,11 @@ The global `runtime` key selects how agent processes are isolated from your host
 |-------|----------|-------|
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple-containers` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
-| `docker-sbx-experimental` | macOS arm64, Windows x86_64 | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](16-runtimes.md) |
+| `docker-sbx-experimental` | macOS arm64, Windows x86_64 | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](12-runtimes.md) |
 
-An unrecognized value (e.g. a typo) logs a warning and falls back to `docker`.
+An unrecognized value (e.g. a typo) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). Fix the value in `$HOME/.awman/config.json` and relaunch.
 
-`awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](16-runtimes.md).
+`awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](12-runtimes.md).
 
 ---
 
@@ -231,13 +231,13 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `yoloDisallowedTools` | string array | `[]` | Machine-wide yolo tool denylist (unless a repo overrides it) | yes |
 | `overlays` | string array | `[]` | Overlay specs applied to every project; additive with other sources | yes |
 | `agentStuckTimeout` | integer (seconds) | 30 | Default agent-stuck timeout | yes |
-| `workers` | integer | 2 | API server worker tasks processing the command queue in parallel — see [API Mode](10-api-mode.md) | no (edit file) |
+| `workers` | integer | 2 | API server worker tasks processing the command queue in parallel — see [API Mode](09-api-mode.md) | no (edit file) |
 | `baseImage` | string | (unset) | Default image tag for workflow setup/teardown containers | no (edit file) |
 | `api.workDirs` | string array | `[]` | Directories pre-approved for API session creation; merged with `--workdirs` at server start | yes |
 | `api.alwaysNonInteractive` | bool | `false` | Force non-interactive mode for all dispatched commands (useful on API servers with no TTY) | no (edit file) |
 | `remote.defaultAddr` | string | (unset) | Default remote awman API server address | yes |
 | `remote.defaultAPIKey` | string | (unset) | API key for the default remote server; only sent when the target address matches `remote.defaultAddr` | yes |
-| `remote.savedDirs` | string array | `[]` | Remote-host paths shown in the `remote session start` picker — see [Remote Mode](11-remote-mode.md) | no (edit file) |
+| `remote.savedDirs` | string array | `[]` | Remote-host paths shown in the `remote session start` picker — see [Remote Mode](10-remote-mode.md) | no (edit file) |
 
 ### `awman config` subcommands
 
@@ -286,11 +286,11 @@ Value handling:
 | `XDG_CONFIG_HOME` | Global config goes to `$XDG_CONFIG_HOME/awman/` |
 | `XDG_DATA_HOME` | Global data (workflows, skills, worktrees, API state) goes to `$XDG_DATA_HOME/awman/` |
 | `AWMAN_API_ROOT` | Relocate only the API server storage root |
-| `AWMAN_OVERLAYS` | Comma-separated overlay specs (e.g. `env(TOKEN),dir(/a:/b:ro)`); merged with config and flags — see [Overlays](09-overlays.md) |
+| `AWMAN_OVERLAYS` | Comma-separated overlay specs (e.g. `env(TOKEN),dir(/a:/b:ro)`); merged with config and flags — see [Overlays](08-overlays.md) |
 | `AWMAN_REMOTE_ADDR` | Remote API server address; beats `remote.defaultAddr`, beaten by `--remote-addr` |
 | `AWMAN_API_KEY` | Remote API key; beats `remote.defaultAPIKey`, beaten by `--api-key` |
 | `AWMAN_REMOTE_SESSION` | Sticky session id for `remote exec` commands; beaten by `--session` |
 
 ---
 
-[← Previous: Headless Mode](07-headless-mode.md) · [Next: Overlays →](09-overlays.md)
+[← Yolo Mode](06-yolo-mode.md) · [Next: Overlays →](08-overlays.md)

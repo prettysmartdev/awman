@@ -29,20 +29,36 @@ fi
 # ---------------------------------------------------------------------------
 # Claude-specific config: write $HOME/.claude/settings.json, merging the
 # passthrough agent_settings.claude block with the dynamic session fields
-# claude can express natively (model and allow/deny tool permissions).
+# claude can express natively (model, permission mode, and allow/deny tool
+# permissions).
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.claude"
 
 MODEL="$(jq -r '.model // empty' "$SESSION_FILE")"
+
+# Map awman's permission mode onto claude's permissions.defaultMode.
+PERM_MODE="$(jq -r '.permission_mode // empty' "$SESSION_FILE")"
+case "$PERM_MODE" in
+  plan) CLAUDE_PERM_MODE="plan" ;;
+  auto) CLAUDE_PERM_MODE="acceptEdits" ;;
+  yolo) CLAUDE_PERM_MODE="bypassPermissions" ;;
+  *) CLAUDE_PERM_MODE="" ;;
+esac
+
 jq -n \
   --argjson base "$(jq '.agent_settings.claude // {}' "$SESSION_FILE")" \
   --arg model "$MODEL" \
+  --arg mode "$CLAUDE_PERM_MODE" \
   --argjson allowed "$(jq -c '.allowed_tools // []' "$SESSION_FILE")" \
   --argjson disallowed "$(jq -c '.disallowed_tools // []' "$SESSION_FILE")" '
   $base
   + (if $model != "" then { model: $model } else {} end)
-  + (if ($allowed | length) > 0 or ($disallowed | length) > 0 then
+  # The sandbox is the isolation boundary — suppress the interactive
+  # bypass-permissions confirmation, like the awman container backends do.
+  + (if $mode == "bypassPermissions" then { skipDangerousModePermissionPrompt: true } else {} end)
+  + (if $mode != "" or ($allowed | length) > 0 or ($disallowed | length) > 0 then
        { permissions: (($base.permissions // {})
+         + (if $mode != "" then { defaultMode: $mode } else {} end)
          + (if ($allowed | length) > 0 then { allow: $allowed } else {} end)
          + (if ($disallowed | length) > 0 then { deny: $disallowed } else {} end)) }
      else {} end)

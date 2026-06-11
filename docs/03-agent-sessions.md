@@ -90,6 +90,8 @@ If an agent does not support `--model`, the behaviour varies. For Antigravity, t
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
+Under the `docker-sbx-experimental` runtime, the flag is delivered through the sandbox's per-launch session config (built-in template agents) or as launch arguments (custom-kit agents) rather than directly on the command line; the supported agents and modes are the same, except copilot, which cannot receive a model override there. See [Runtimes](12-runtimes.md#known-limitations).
+
 ### `--non-interactive` / `-n`
 
 Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on all commands that support the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`).
@@ -107,6 +109,8 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 | Cline | `task` subcommand |
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
+
+Under the `docker-sbx-experimental` runtime, agents that launch through Docker's built-in sandbox templates (`claude`, `codex`, `gemini`, `copilot`, `opencode`) cannot have their non-interactive flag enabled — awman warns at launch and pipes the prompt to the interactive entrypoint instead. See [Runtimes](12-runtimes.md#known-limitations).
 
 ### `--plan`
 
@@ -126,6 +130,8 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 
 `--plan` can be combined with `--non-interactive`.
 
+Under the `docker-sbx-experimental` runtime, `--plan` / `--auto` / `--yolo` reach claude through its settings file (`permissions.defaultMode`) and the custom-kit agents (`crush`, `maki`, `cline`, `antigravity`) as launch arguments; the other built-in-template agents (`codex`, `gemini`, `copilot`, `opencode`) cannot receive them — awman warns at launch. See [Runtimes](12-runtimes.md#known-limitations).
+
 ### `--overlay <SPEC>`
 
 Mount additional host resources into the agent container. Accepts typed overlay expressions:
@@ -144,7 +150,7 @@ awman chat --overlay "dir(/data/reference:/mnt/reference:ro)"
 awman exec workflow path/to/workflow.toml --overlay "env(GITHUB_TOKEN),ssh(),skill(*)"
 ```
 
-See [Overlays](09-overlays.md) for the full reference including config-based overlays, the `AWMAN_OVERLAYS` env var, and conflict resolution rules.
+See [Overlays](08-overlays.md) for the full reference including config-based overlays, the `AWMAN_OVERLAYS` env var, and conflict resolution rules.
 See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for security considerations.
 
 ### `--allow-docker`
@@ -204,7 +210,7 @@ awman config set work_items.dir docs/work-items
 awman config set work_items.template docs/work-items/my-template.md
 ```
 
-If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Configuration: Work item paths](08-configuration.md#work-item-paths) for full details on path resolution and auto-discovery.
+If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Configuration: Work item paths](07-configuration.md#work-item-paths) for full details on path resolution and auto-discovery.
 
 ```sh
 awman new spec --interview
@@ -224,7 +230,7 @@ awman new spec --issue https://github.com/prettysmartdev/awman/issues/84      # 
 
 Fetches the GitHub issue and launches an agent to generate a structured work item spec from its content. Combined with `--interview`, the issue description is pre-populated in the text box for editing before the agent runs.
 
-For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](13-github-integration.md).
+For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](11-github-integration.md).
 
 ### Updating a spec after implementation
 
@@ -311,7 +317,7 @@ Or pass it at the command line:
 awman exec workflow path/to/workflow.toml --overlay "skill(*)"
 ```
 
-Once enabled, your global skills appear as slash commands. See [Overlays](09-overlays.md) for details.
+Once enabled, your global skills appear as slash commands. See [Overlays](08-overlays.md) for details.
 
 `--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.awman/skills/<name>/` directory — not the whole repo or home directory. This still requires being inside a git repository (for agent image lookup).
 
@@ -586,7 +592,7 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.
 
-When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](08-configuration.md#work-item-paths).
+When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#work-item-paths).
 
 ---
 

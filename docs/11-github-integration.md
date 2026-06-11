@@ -353,5 +353,5 @@ awman exec prompt --issue owner/private-repo#99
 
 ---
 
-[← Architecture Overview](12-architecture-overview.md) · [Context Overlays →](14-context-overlays.md)
+[← Remote Mode](10-remote-mode.md) · [Next: Runtimes →](12-runtimes.md)
 

@@ -8,7 +8,7 @@ awman is now built from a single, unified four-layer architecture:
 
 - **`src/`** — the production source tree organized as a four-layer architecture. The `awman` binary is built from `src/main.rs`.
 
-For the best introduction to the new architecture, see the [Architecture Overview](12-architecture-overview.md) guide. The detailed specification is in [`aspec/architecture/2026-grand-architecture.md`](../aspec/architecture/2026-grand-architecture.md).
+For the authoritative design and rationale, see the spec files under [`aspec/`](../aspec/) — in particular the detailed specification in [`aspec/architecture/2026-grand-architecture.md`](../aspec/architecture/2026-grand-architecture.md).
 
 ---
 
@@ -823,7 +823,7 @@ pub struct ContainerRuntime { /* holds Box<dyn ContainerBackend> — opaque */ }
 impl ContainerRuntime {
     /// Inspect global_config to pick Docker (default) or Apple Containers.
     /// Returns BackendUnsupportedOnPlatform if Apple Containers is requested on non-macOS.
-    /// Unknown runtime values default to Docker and emit a warning.
+    /// Unknown runtime values are a fatal UnknownRuntime error (no Docker fallback).
     pub fn detect(global_config: &GlobalConfig) -> Result<Self, EngineError>;
 
     /// Name of the chosen backend ("docker" or "apple-containers"). Safe for display.
@@ -2489,4 +2489,4 @@ The binary crate opts out of all unsafe code at the crate level. Layer 3 and Lay
 
 ---
 
-[← API Mode](10-api-mode.md) · [Contents](contents.md)
+[← Runtimes](12-runtimes.md) · [Contents](contents.md)

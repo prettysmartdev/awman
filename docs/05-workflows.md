@@ -35,7 +35,7 @@ awman exec workflow aspec/workflows/implement-hard.toml --issue 84
 awman exec workflow aspec/workflows/dependency-upgrade.toml
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](10-api-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](13-github-integration.md).
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](09-api-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](11-github-integration.md).
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -940,7 +940,7 @@ Press [r] to retry, or any other key to abort:
 | `--plan` | Run each step in read-only mode |
 | `--allow-docker` | Mount Docker socket into each step's container |
 | `--worktree` | Run all steps in an isolated Git worktree |
-| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](09-overlays.md) |
+| `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md) |
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
 
 ---

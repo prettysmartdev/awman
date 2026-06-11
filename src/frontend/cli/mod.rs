@@ -199,6 +199,10 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             format!("workflow file not found: {}", path.display())
         }
         CommandError::Engine(e) => match e {
+            crate::engine::error::EngineError::UnknownRuntime { value, valid } => format!(
+                "invalid runtime '{value}' in global config ($HOME/.awman/config.json); \
+                 valid values: {valid}"
+            ),
             crate::engine::error::EngineError::AgentRequiresProjectImage { tag } => format!(
                 "agent image build requires the project base image first ({tag}); run `awman ready --build`"
             ),

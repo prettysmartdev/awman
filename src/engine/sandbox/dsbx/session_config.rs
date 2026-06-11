@@ -47,6 +47,13 @@ impl DSbxSessionConfig {
             };
             root.insert("model".into(), json!(model_str));
         }
+        // Mixin permission mode ("plan" / "auto" / "yolo"): the apply script
+        // renders the agent's native equivalent (claude: permissions.
+        // defaultMode). `mode_flags` are argv-only (kind: agent kits) and
+        // intentionally never land here.
+        if let Some(mode) = &options.permission_mode {
+            root.insert("permission_mode".into(), json!(mode));
+        }
 
         // System prompts — workspace paths are identical inside the VM, so the
         // in-VM (container) path is what the startup script uses.
@@ -299,6 +306,30 @@ mod tests {
         assert_eq!(
             parsed["system_prompt_env_file"]["env_var"],
             json!("CLAUDE_SYSTEM_PROMPT")
+        );
+    }
+
+    #[test]
+    fn permission_mode_round_trips() {
+        let v = DSbxSessionConfig::build_value(&resolve(vec![
+            SandboxOption::AgentId("claude".into()),
+            SandboxOption::PermissionMode("yolo".into()),
+        ]));
+        assert_eq!(v["permission_mode"], json!("yolo"));
+    }
+
+    #[test]
+    fn mode_flags_do_not_appear_in_session_json() {
+        // Argv mode flags are `kind: agent` launch args, never session.json
+        // fields (the apply script has no use for raw argv strings).
+        let v = DSbxSessionConfig::build_value(&resolve(vec![
+            SandboxOption::AgentId("crush".into()),
+            SandboxOption::AgentModeFlags(vec!["--yolo".into()]),
+        ]));
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(
+            !s.contains("--yolo"),
+            "mode flags must not leak into session.json"
         );
     }
 

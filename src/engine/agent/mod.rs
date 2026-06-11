@@ -451,6 +451,89 @@ impl AgentEngine {
         if let Some(model) = run.model.as_deref() {
             let flag = agent_matrix::model_flag_for(&matrix, model)?;
             options.push(SandboxOption::Model { flag });
+            // Copilot's built-in template has no mixin-safe model config (the
+            // in-VM apply script also warns); surface that host-side instead
+            // of letting the flag vanish into the VM boot log.
+            if agent.as_str() == "copilot" {
+                options.push(SandboxOption::UnsupportedNote(
+                    "--model cannot be applied to copilot under the sandbox runtime \
+                     (no mixin-safe config); use the /model slash command inside the \
+                     session instead"
+                        .into(),
+                ));
+            }
+        }
+
+        // Mode flags (plan/yolo/auto). `kind: agent` kits accept agent args
+        // after the `--` delimiter, so they get the same literal argv flags
+        // the container path emits. Mixin kits launch through Docker's
+        // built-in template (no argv channel): claude has a native settings
+        // equivalent (`permissions.defaultMode`, rendered by its apply
+        // script from `session.json`); the other mixins have none awman
+        // manages, so the request is warned about rather than dropped.
+        let mut mode_flags = Vec::new();
+        if matches!(run.yolo, Some(YoloMode::Enabled)) {
+            if let Some(flag) = matrix.yolo_flag {
+                mode_flags.push(flag.to_string());
+            }
+        }
+        if matches!(
+            run.auto,
+            Some(crate::engine::container::options::AutoMode::Enabled)
+        ) {
+            if let Some(flags) = matrix.auto_flag {
+                mode_flags.extend(flags.iter().map(|s| s.to_string()));
+            }
+        }
+        if matches!(run.plan, Some(PlanMode::Enabled)) {
+            if let Some(flags) = matrix.plan_flag {
+                mode_flags.extend(flags.iter().map(|s| s.to_string()));
+            }
+        }
+        if !mode_flags.is_empty() {
+            match matrix.sbx_kit_kind {
+                agent_matrix::SbxKitKind::Agent => {
+                    options.push(SandboxOption::AgentModeFlags(mode_flags));
+                }
+                agent_matrix::SbxKitKind::Mixin => {
+                    let mode = if matches!(run.yolo, Some(YoloMode::Enabled)) {
+                        "yolo"
+                    } else if matches!(run.plan, Some(PlanMode::Enabled)) {
+                        "plan"
+                    } else {
+                        "auto"
+                    };
+                    if agent.as_str() == "claude" {
+                        options.push(SandboxOption::PermissionMode(mode.to_string()));
+                    } else {
+                        options.push(SandboxOption::UnsupportedNote(format!(
+                            "--{mode} cannot be delivered to '{agent}' under the sandbox \
+                             runtime (the built-in template's launch command takes no \
+                             flags and the agent has no settings-file equivalent awman \
+                             manages); continuing without it",
+                            agent = agent.as_str(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Non-interactive shape (`--print` / `exec` / `run` / `task`): the
+        // dsbx driver appends it as an agent arg for `kind: agent` kits, but
+        // mixin kits launch through the built-in template's interactive
+        // entrypoint — the prompt still arrives via piped stdin, the agent's
+        // own non-interactive mode just cannot be enabled. Warn, don't drop
+        // silently.
+        if run.non_interactive && matches!(matrix.sbx_kit_kind, agent_matrix::SbxKitKind::Mixin) {
+            if let Some(flag) = matrix.non_interactive_flag {
+                options.push(SandboxOption::UnsupportedNote(format!(
+                    "non-interactive mode ('{flag}') cannot be enabled for '{agent}' \
+                     under the sandbox runtime (the built-in template owns the launch \
+                     command); the prompt is piped to the agent's interactive \
+                     entrypoint instead",
+                    agent = agent.as_str(),
+                )));
+            }
         }
 
         // Tool allow/deny lists.
@@ -1478,6 +1561,162 @@ mod tests {
         assert!(
             !interactive_val,
             "Interactive must be false for non_interactive=true"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_mode_flags_for_agent_kits_mirror_container_argv() {
+        // crush is a `kind: agent` kit: yolo must surface as the same literal
+        // argv flag the container path emits.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("crush").unwrap();
+        let run = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            ..Default::default()
+        };
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::AgentModeFlags(flags) if flags == &vec!["--yolo".to_string()]
+            )),
+            "crush yolo must emit AgentModeFlags([--yolo]); got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_claude_modes_become_permission_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        for (run, expected) in [
+            (
+                AgentRunOptions {
+                    yolo: Some(YoloMode::Enabled),
+                    ..Default::default()
+                },
+                "yolo",
+            ),
+            (
+                AgentRunOptions {
+                    plan: Some(PlanMode::Enabled),
+                    ..Default::default()
+                },
+                "plan",
+            ),
+            (
+                AgentRunOptions {
+                    auto: Some(crate::engine::container::options::AutoMode::Enabled),
+                    ..Default::default()
+                },
+                "auto",
+            ),
+        ] {
+            let opts = engine
+                .build_sandbox_options(&session, &agent, &run)
+                .unwrap();
+            assert!(
+                opts.iter().any(|o| matches!(
+                    o,
+                    SandboxOption::PermissionMode(m) if m == expected
+                )),
+                "claude mixin mode must emit PermissionMode({expected}); got {opts:?}"
+            );
+            assert!(
+                !opts
+                    .iter()
+                    .any(|o| matches!(o, SandboxOption::AgentModeFlags(_))),
+                "mixin kits must not receive argv mode flags; got {opts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_sandbox_options_non_claude_mixin_modes_become_unsupported_notes() {
+        // codex is a mixin without an awman-managed settings equivalent for
+        // permission modes — the request must surface as a warning note,
+        // never silently drop.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("codex").unwrap();
+        let run = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            ..Default::default()
+        };
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("--yolo") && n.contains("codex")
+            )),
+            "codex yolo under sbx must surface as an UnsupportedNote; got {opts:?}"
+        );
+        assert!(
+            !opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::AgentModeFlags(_) | SandboxOption::PermissionMode(_)
+            )),
+            "codex must get neither argv flags nor a permission mode; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_mixin_non_interactive_adds_unsupported_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            non_interactive: true,
+            ..Default::default()
+        };
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("non-interactive")
+            )),
+            "mixin non-interactive mode under sbx must warn; got {opts:?}"
+        );
+
+        // kind: agent kits CAN take the flag as an agent arg — no note.
+        let agent = crate::data::session::AgentName::new("crush").unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
+        assert!(
+            !opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("non-interactive")
+            )),
+            "agent-kit non-interactive mode is deliverable — no note expected; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_copilot_model_adds_unsupported_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("copilot").unwrap();
+        let run = AgentRunOptions {
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("--model")
+            )),
+            "copilot --model under sbx must warn host-side; got {opts:?}"
         );
     }
 

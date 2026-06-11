@@ -96,18 +96,23 @@ pub(super) fn is_credential_like(key: &str) -> bool {
 /// `lookup_env` abstracts `std::env::var` so tests don't mutate process-global
 /// state. A failed `sbx secret set` subprocess is launch-blocking (WI 0090).
 ///
+/// `secret_already_registered` abstracts the read-only `sbx secret ls` probe
+/// (production: [`secret_registered_for_service`]) so tests stay hermetic. It
+/// is consulted only on the no-overlay path: before warning that auth is
+/// unconfigured, awman checks whether a pre-existing sbx secret (sandbox-scoped
+/// or global) already authenticates the agent's provider, and downgrades the
+/// warning to an informational note when one is found.
+///
 /// Returns `true` when at least one supported auth var was read from the host
 /// and registered with `sbx secret set` — i.e. the sbx proxy now has a
-/// credential awman put there. The caller threads this into
-/// [`inject_credentials`] so a redundant warning (e.g. about
-/// `CLAUDE_CODE_OAUTH_TOKEN`) is suppressed once env-overlay auth already
-/// covered the agent.
+/// credential awman put there.
 pub(super) fn auto_auth_env_overlays(
     agent: &str,
     sandbox: &str,
     env_passthrough: &[EnvVar],
     env_literal: &[EnvLiteral],
     lookup_env: &dyn Fn(&str) -> Option<String>,
+    secret_already_registered: &dyn Fn(&str) -> bool,
     sink: &mut dyn UserMessageSink,
 ) -> Result<bool, EngineError> {
     let supported = supported_auth_env_vars(agent);
@@ -155,15 +160,47 @@ pub(super) fn auto_auth_env_overlays(
     }
 
     if !supported.is_empty() && configured_services.is_empty() {
-        sink.write_message(warning(format!(
-            "sbx: no env(...) overlay supplied a supported auth variable for \
-             '{agent}' (supported: {}). The sbx proxy has no credential configured \
-             by awman — register one manually with `sbx secret set {sandbox} \
-             <service>` (sandbox-scoped secrets apply immediately, even while \
-             running), or complete the agent's login flow inside the sandbox. \
-             Launching anyway.",
-            supported.join(", ")
-        )));
+        // No env() overlay registered a credential this launch. Before warning
+        // that auth is unconfigured, probe for a pre-existing sbx secret
+        // (sandbox-scoped or global) that already covers the agent's provider —
+        // a previous launch, a manual `sbx secret set`, or a global key all
+        // count. Deduplicate services so e.g. copilot's GH_TOKEN/GITHUB_TOKEN
+        // pair probes `github` once.
+        let mut services: Vec<&'static str> = Vec::new();
+        for var in supported {
+            if let Some(service) = service_for_credential(var) {
+                if !services.contains(&service) {
+                    services.push(service);
+                }
+            }
+        }
+        let covered: Vec<&str> = services
+            .iter()
+            .copied()
+            .filter(|service| secret_already_registered(service))
+            .collect();
+
+        if covered.is_empty() {
+            sink.write_message(warning(format!(
+                "sbx: no env(...) overlay supplied a supported auth variable for \
+                 '{agent}' (supported: {}), and no pre-existing sbx secret for {} \
+                 was found (checked `sbx secret ls --service <service>` and `sbx \
+                 secret ls -g`). The sbx proxy has no credential awman can use — \
+                 register one manually with `sbx secret set {sandbox} <service>` \
+                 (sandbox-scoped secrets apply immediately, even while running), \
+                 or complete the agent's login flow inside the sandbox. Launching \
+                 anyway.",
+                supported.join(", "),
+                services.join(", ")
+            )));
+        } else {
+            sink.write_message(info(format!(
+                "sbx: no env(...) auth overlay was passed for '{agent}', but a \
+                 pre-existing sbx secret for {} is already registered (sandbox-scoped \
+                 or global) and will authenticate the agent. Launching.",
+                covered.join(", ")
+            )));
+        }
     }
 
     Ok(!configured_services.is_empty())
@@ -267,6 +304,59 @@ fn warning(text: String) -> crate::data::message::UserMessage {
     }
 }
 
+fn info(text: String) -> crate::data::message::UserMessage {
+    crate::data::message::UserMessage {
+        level: crate::data::message::MessageLevel::Info,
+        text,
+    }
+}
+
+/// Best-effort, read-only probe: does a pre-existing sbx secret already cover
+/// `service` (e.g. `anthropic`, `openai`, `github`)?
+///
+/// Checks both a service-scoped listing (`sbx secret ls --service <service>`)
+/// and the global store (`sbx secret ls -g`). The query runs quietly — these
+/// are decision probes, not actions, so they are deliberately not announced on
+/// the sink to avoid two extra "Running: …" lines on every no-overlay launch.
+///
+/// Fail-safe: if `sbx` is absent or either listing exits non-zero, the probe
+/// returns `false`, so the manual-auth warning still fires rather than being
+/// suppressed on a faulty assumption. The `<service>` value passed to
+/// `--service` is the Docker Sandboxes well-known service name (per
+/// [`service_for_credential`]), e.g. `anthropic` for the `claude` agent — never
+/// the agent name.
+pub(super) fn secret_registered_for_service(service: &str) -> bool {
+    let queries = [
+        vec![
+            "secret".to_string(),
+            "ls".to_string(),
+            "--service".to_string(),
+            service.to_string(),
+        ],
+        vec!["secret".to_string(), "ls".to_string(), "-g".to_string()],
+    ];
+    for args in queries {
+        if let Ok(out) = SbxCommand::new(args).run_quiet() {
+            if out.success() && listing_mentions_service(&out.stdout, service) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does a `sbx secret ls` listing report a secret for `service`? Treats an
+/// empty listing (or the JSON empty array `[]`) as "no secret", and otherwise
+/// looks for the service name in the output. Conservative by design: an
+/// ambiguous listing should not suppress the manual-auth warning.
+fn listing_mentions_service(stdout: &str, service: &str) -> bool {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return false;
+    }
+    trimmed.contains(service)
+}
+
 /// Register awman-resolved credentials (keychain etc.) with `sbx secret set`.
 ///
 /// Mapped credentials are piped to `sbx secret set <sandbox> <service>` via
@@ -275,16 +365,16 @@ fn warning(text: String) -> crate::data::message::UserMessage {
 /// and suggests the kit-level `environment.proxyManaged` route. The value is
 /// never written anywhere awman controls on the host.
 ///
-/// `auth_overlay_registered` reports whether [`auto_auth_env_overlays`] already
-/// registered a supported auth var for this launch. When it did, the
-/// `CLAUDE_CODE_OAUTH_TOKEN` warning is redundant (the sbx proxy is already
-/// authenticated via the overlay, e.g. `ANTHROPIC_API_KEY`) and is suppressed;
-/// when no supported overlay var was registered, the warning still fires so the
-/// user knows the OAuth token was dropped and how to authenticate.
+/// `CLAUDE_CODE_OAUTH_TOKEN` is the one silent exception: the keychain
+/// resolver always surfaces it when the user is logged in to Claude Code, but
+/// sbx has no OAuth-token support yet (docker/sbx-releases#11), so it can
+/// never be injected. Auth still works without it — via an `ANTHROPIC_API_KEY`
+/// env() overlay ([`auto_auth_env_overlays`]) or `/login` inside the sandbox —
+/// and the missing-auth case already gets its own warning from
+/// [`auto_auth_env_overlays`], so warning here on every launch is pure noise.
 pub(super) fn inject_credentials(
     creds: &[(String, String)],
     sandbox: &str,
-    auth_overlay_registered: bool,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
     for (key, value) in creds {
@@ -292,25 +382,8 @@ pub(super) fn inject_credentials(
             Some(service) => {
                 set_secret(service, value, sandbox, sink)?;
             }
-            None if key == "CLAUDE_CODE_OAUTH_TOKEN" && auth_overlay_registered => {
-                // A supported auth var (e.g. ANTHROPIC_API_KEY) was already
-                // registered via an env() overlay, so the proxy is
-                // authenticated and the OAuth token is moot — stay quiet
-                // rather than warning about a credential that isn't needed.
-            }
             None if key == "CLAUDE_CODE_OAUTH_TOKEN" => {
-                // sbx's credential proxy injects the `anthropic` service value as
-                // an `x-api-key` header, which a subscription OAuth token cannot
-                // use — sbx has no OAuth-token support yet (docker/sbx-releases#11).
-                sink.write_message(crate::data::message::UserMessage {
-                    level: crate::data::message::MessageLevel::Warning,
-                    text: "sbx: CLAUDE_CODE_OAUTH_TOKEN is not supported by Docker \
-                           Sandboxes yet and was not injected. Either set \
-                           ANTHROPIC_API_KEY, or run `/login` inside the sandbox — \
-                           the sbx proxy completes the OAuth flow and keeps the \
-                           token on the host."
-                        .to_string(),
-                });
+                // Silently skipped — see the doc comment above.
             }
             None => {
                 sink.write_message(crate::data::message::UserMessage {
@@ -369,7 +442,7 @@ mod tests {
         let mut sink = VecSink::default();
         let creds = vec![("SOME_UNKNOWN_VAR".to_string(), "value".to_string())];
         // Must not return Err — unmapped credentials are soft-skipped.
-        let result = inject_credentials(&creds, "awman-h-claude", false, &mut sink);
+        let result = inject_credentials(&creds, "awman-h-claude", &mut sink);
         assert!(
             result.is_ok(),
             "unmapped credential must not produce an error"
@@ -386,58 +459,24 @@ mod tests {
     }
 
     #[test]
-    fn claude_oauth_token_warns_with_supported_alternatives() {
+    fn claude_oauth_token_is_silently_skipped() {
+        // The keychain resolver surfaces CLAUDE_CODE_OAUTH_TOKEN on every
+        // launch when the user is logged in to Claude Code, but sbx cannot use
+        // it — it is skipped without an error AND without a warning (the
+        // missing-auth case is covered by auto_auth_env_overlays).
         let mut sink = VecSink::default();
         let creds = vec![(
             "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
             "sk-ant-oat-secret".to_string(),
         )];
-        // No supported env() overlay was registered → the warning must fire so
-        // the user knows the OAuth token was dropped and how to authenticate.
-        let result = inject_credentials(&creds, "awman-h-claude", false, &mut sink);
+        let result = inject_credentials(&creds, "awman-h-claude", &mut sink);
         assert!(
             result.is_ok(),
             "unsupported OAuth token must not produce an error"
         );
-        let warning = sink
-            .messages
-            .iter()
-            .find(|m| m.level == MessageLevel::Warning)
-            .expect("must warn about CLAUDE_CODE_OAUTH_TOKEN");
         assert!(
-            warning.text.contains("CLAUDE_CODE_OAUTH_TOKEN")
-                && warning.text.contains("ANTHROPIC_API_KEY")
-                && warning.text.contains("/login"),
-            "warning must name the token and both supported alternatives; got: {:?}",
-            warning.text
-        );
-        assert!(
-            !warning.text.contains("sk-ant-oat-secret"),
-            "token value must never appear in messages"
-        );
-    }
-
-    #[test]
-    fn claude_oauth_token_warning_suppressed_when_overlay_auth_registered() {
-        // When a supported env() overlay (e.g. ANTHROPIC_API_KEY) was already
-        // registered, the proxy is authenticated and the OAuth token is moot —
-        // the warning must not fire.
-        let mut sink = VecSink::default();
-        let creds = vec![(
-            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-            "sk-ant-oat-secret".to_string(),
-        )];
-        let result = inject_credentials(&creds, "awman-h-claude", true, &mut sink);
-        assert!(
-            result.is_ok(),
-            "suppressed OAuth token must not produce an error"
-        );
-        assert!(
-            !sink
-                .messages
-                .iter()
-                .any(|m| m.text.contains("CLAUDE_CODE_OAUTH_TOKEN")),
-            "OAuth warning must be suppressed once overlay auth is registered; messages: {:?}",
+            sink.messages.is_empty(),
+            "OAuth token must be skipped without any message; messages: {:?}",
             sink.messages
         );
     }
@@ -452,7 +491,7 @@ mod tests {
             "sk-supersecret".to_string(),
         )];
         // Ignore Ok/Err — sbx may not be installed.
-        let _ = inject_credentials(&creds, "awman-h-claude", false, &mut sink);
+        let _ = inject_credentials(&creds, "awman-h-claude", &mut sink);
         let announcement = sink
             .messages
             .iter()
@@ -516,7 +555,7 @@ mod tests {
     #[test]
     fn inject_empty_creds_is_noop_ok() {
         let mut sink = VecSink::default();
-        let result = inject_credentials(&[], "awman-h-claude", false, &mut sink);
+        let result = inject_credentials(&[], "awman-h-claude", &mut sink);
         assert!(result.is_ok());
         assert!(sink.messages.is_empty());
     }
@@ -531,6 +570,12 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    /// Default secret probe for tests: no pre-existing sbx secret, so the
+    /// no-overlay path takes the manual-auth warning branch.
+    fn no_secret(_: &str) -> bool {
+        false
     }
 
     #[test]
@@ -580,6 +625,7 @@ mod tests {
             &passthrough(&["ANTHROPIC_API_KEY"]),
             &[],
             &no_env,
+            &no_secret,
             &mut sink,
         );
         assert!(result.is_ok(), "missing host value must not block launch");
@@ -609,6 +655,7 @@ mod tests {
             &passthrough(&["OPENAI_API_KEY"]),
             &[],
             &|_| Some("sk-value".into()),
+            &no_secret,
             &mut sink,
         );
         assert!(result.is_ok());
@@ -638,6 +685,7 @@ mod tests {
             &passthrough(&["LOG_LEVEL"]),
             &[],
             &|_| Some("debug".into()),
+            &no_secret,
             &mut sink,
         )
         .unwrap();
@@ -657,6 +705,7 @@ mod tests {
             &passthrough(&["ANTHROPIC_API_KEY"]),
             &[],
             &|_| Some("sk-value".into()),
+            &no_secret,
             &mut sink,
         )
         .unwrap();
@@ -688,6 +737,7 @@ mod tests {
                 value: "hunter2".into(),
             }],
             &no_env,
+            &no_secret,
             &mut sink,
         )
         .unwrap();
@@ -707,6 +757,89 @@ mod tests {
         );
     }
 
+    // ─── Pre-existing secret probe on the no-overlay path ─────────────────
+
+    #[test]
+    fn pre_existing_secret_suppresses_manual_auth_warning() {
+        // No env() overlay, but the probe reports a registered secret for the
+        // agent's provider — the manual-auth warning is replaced by an Info note.
+        let mut sink = VecSink::default();
+        let probed: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        let result = auto_auth_env_overlays(
+            "claude",
+            "awman-h-claude",
+            &[],
+            &[],
+            &no_env,
+            &|service| {
+                probed.borrow_mut().push(service.to_string());
+                service == "anthropic"
+            },
+            &mut sink,
+        );
+        assert!(result.is_ok());
+        assert!(
+            probed.borrow().iter().any(|s| s == "anthropic"),
+            "the probe must be consulted for the agent's sbx service, not its name; \
+             probed: {:?}",
+            probed.borrow()
+        );
+        assert!(
+            !sink
+                .messages
+                .iter()
+                .any(|m| m.text.contains("Launching anyway")),
+            "a pre-existing secret must suppress the manual-auth warning: {:?}",
+            sink.messages
+        );
+        assert!(
+            sink.messages.iter().any(|m| {
+                m.level == MessageLevel::Info
+                    && m.text.contains("pre-existing sbx secret for anthropic")
+            }),
+            "must note the pre-existing credential at Info level: {:?}",
+            sink.messages
+        );
+    }
+
+    #[test]
+    fn no_pre_existing_secret_still_warns_manual_auth() {
+        // The probe reports nothing for the provider, so the manual-auth warning
+        // fires and names the service that was checked.
+        let mut sink = VecSink::default();
+        auto_auth_env_overlays(
+            "claude",
+            "awman-h-claude",
+            &[],
+            &[],
+            &no_env,
+            &no_secret,
+            &mut sink,
+        )
+        .unwrap();
+        let warn = sink
+            .messages
+            .iter()
+            .find(|m| m.text.contains("Launching anyway"))
+            .expect("missing auth with no pre-existing secret must warn");
+        assert_eq!(warn.level, MessageLevel::Warning);
+        assert!(
+            warn.text
+                .contains("no pre-existing sbx secret for anthropic"),
+            "warning must name the service it probed: {}",
+            warn.text
+        );
+    }
+
+    #[test]
+    fn listing_mentions_service_treats_empty_and_array_as_absent() {
+        assert!(!listing_mentions_service("", "anthropic"));
+        assert!(!listing_mentions_service("   \n", "anthropic"));
+        assert!(!listing_mentions_service("[]", "anthropic"));
+        assert!(listing_mentions_service("anthropic  set", "anthropic"));
+        assert!(!listing_mentions_service("openai  set", "anthropic"));
+    }
+
     #[cfg(unix)]
     mod with_subprocess {
         use super::*;
@@ -722,6 +855,7 @@ mod tests {
                     &passthrough(&["ANTHROPIC_API_KEY"]),
                     &[],
                     &|_| Some("sk-ant-secret".into()),
+                    &no_secret,
                     &mut sink,
                 )
                 .unwrap();
@@ -770,6 +904,7 @@ mod tests {
                     &passthrough(&["GH_TOKEN", "GITHUB_TOKEN"]),
                     &[],
                     &|_| Some("ghp-secret".into()),
+                    &no_secret,
                     &mut sink,
                 )
                 .unwrap();
@@ -807,6 +942,7 @@ mod tests {
                         &passthrough(&["ANTHROPIC_API_KEY"]),
                         &[],
                         &|_| Some("sk-ant-secret".into()),
+                        &no_secret,
                         &mut sink,
                     );
                     assert!(result.is_ok(), "retry with --password-stdin must succeed: {result:?}");
@@ -835,6 +971,7 @@ mod tests {
                         &passthrough(&["ANTHROPIC_API_KEY"]),
                         &[],
                         &|_| Some("sk-ant-secret".into()),
+                        &no_secret,
                         &mut sink,
                     );
                     match result {
@@ -852,6 +989,65 @@ mod tests {
                     }
                 },
             );
+        }
+
+        // ─── secret_registered_for_service probe ──────────────────────────
+
+        #[test]
+        fn probe_finds_service_in_scoped_listing() {
+            // A fake sbx whose `secret ls --service anthropic` reports the
+            // service; `secret ls -g` is never needed.
+            with_fake_sbx(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *'--service anthropic'*) echo 'anthropic  set';;\n\
+                   *) echo '[]';;\n\
+                 esac\n",
+                || {
+                    assert!(
+                        secret_registered_for_service("anthropic"),
+                        "a scoped listing naming the service must count as registered"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn probe_falls_back_to_global_listing() {
+            // Service-scoped listing is empty, but the global store has it.
+            with_fake_sbx(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                   *-g*) echo 'anthropic  set';;\n\
+                   *) echo '';;\n\
+                 esac\n",
+                || {
+                    assert!(
+                        secret_registered_for_service("anthropic"),
+                        "a global listing naming the service must count as registered"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        fn probe_returns_false_when_no_listing_mentions_service() {
+            with_fake_sbx("#!/bin/sh\necho '[]'\n", || {
+                assert!(
+                    !secret_registered_for_service("anthropic"),
+                    "empty listings must not be treated as a registered secret"
+                );
+            });
+        }
+
+        #[test]
+        fn probe_returns_false_on_listing_failure() {
+            with_fake_sbx("#!/bin/sh\necho 'ERROR: boom' >&2\nexit 1\n", || {
+                assert!(
+                    !secret_registered_for_service("anthropic"),
+                    "a failing probe must be fail-safe (warning still fires)"
+                );
+            });
         }
     }
 

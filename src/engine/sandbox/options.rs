@@ -63,6 +63,15 @@ pub enum SandboxOption {
     Model {
         flag: ModelFlagForm,
     },
+    /// Literal per-agent mode-flag argv strings (yolo/auto/plan). Only
+    /// deliverable to `kind: agent` kits, whose launch accepts agent args
+    /// after the `--` delimiter; mixin kits launch through Docker's
+    /// built-in template and use [`SandboxOption::PermissionMode`] instead.
+    AgentModeFlags(Vec<String>),
+    /// Requested permission mode (`"plan"` / `"auto"` / `"yolo"`) for mixin
+    /// kits whose apply script can render a native settings equivalent
+    /// (claude's `permissions.defaultMode`). Written to `session.json`.
+    PermissionMode(String),
     /// Keep the sandbox after the agent exits (persistent lifecycle).
     KeepAfterExit,
     /// A user-facing note about a requested feature the sandbox runtime cannot
@@ -103,6 +112,12 @@ pub struct ResolvedSandboxOptions {
     pub disallowed_tools: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub model: Option<ModelFlagForm>,
+    /// Literal mode-flag argv strings; appended after `--` for `kind: agent`
+    /// kits only.
+    pub mode_flags: Vec<String>,
+    /// Permission mode for mixins with a native settings equivalent; lands
+    /// in `session.json`.
+    pub permission_mode: Option<String>,
     pub keep_after_exit: bool,
     /// User-facing warnings about requested-but-unsupported features, surfaced
     /// by `run_interactive` before launch.
@@ -157,6 +172,8 @@ impl ResolvedSandboxOptions {
             SandboxOption::DisallowedTools(v) => self.disallowed_tools.extend(v),
             SandboxOption::AllowedTools(v) => self.allowed_tools.extend(v),
             SandboxOption::Model { flag } => self.model = Some(flag),
+            SandboxOption::AgentModeFlags(v) => self.mode_flags.extend(v),
+            SandboxOption::PermissionMode(v) => self.permission_mode = Some(v),
             SandboxOption::KeepAfterExit => self.keep_after_exit = true,
             SandboxOption::UnsupportedNote(v) => self.unsupported_notes.push(v),
         }

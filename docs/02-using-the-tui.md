@@ -386,7 +386,7 @@ When `remote.defaultAddr` is set in `~/.awman/config.json`, opening a new tab wi
 
 Remote-bound tabs are **purple** in the tab bar. The tab label shows `host:port` of the remote host instead of the local directory name. When a workflow runs on the remote session, the workflow state strip appears automatically and updates every 5 seconds.
 
-For full details on creating remote-bound tabs, the create-session sub-modal, and workflow strip behavior, see [Remote Mode: Remote-bound TUI tabs](11-remote-mode.md#remote-bound-tui-tabs).
+For full details on creating remote-bound tabs, the create-session sub-modal, and workflow strip behavior, see [Remote Mode: Remote-bound TUI tabs](10-remote-mode.md#remote-bound-tui-tabs).
 
 ---
 
@@ -501,10 +501,6 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | Lightweight step-confirm | **Enter** | Advance to next step |
 | Lightweight step-confirm | **Esc** | Pause workflow |
 | Lightweight step-confirm | **Ctrl+W** | Open full control board |
-
----
-
-For detailed information on mouse interaction with agents that have mouse tracking enabled, see [Mouse & TUI Agents](15-mouse-and-tui-agents.md).
 
 ---
 

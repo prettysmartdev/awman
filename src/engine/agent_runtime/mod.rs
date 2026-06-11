@@ -159,6 +159,10 @@ impl DetectedRuntime {
     }
 }
 
+/// Every value `GlobalConfig::runtime` accepts. Quoted in the fatal
+/// invalid-runtime error so the user can see what to fix the config to.
+pub const VALID_RUNTIMES: &[&str] = &["docker", "apple-containers", "docker-sbx-experimental"];
+
 /// Factory: pick the right runtime based on `GlobalConfig::runtime`.
 ///
 /// - `None` / `"docker"` → `ContainerRuntime` with the Docker backend
@@ -166,7 +170,10 @@ impl DetectedRuntime {
 ///   (macOS only)
 /// - `"docker-sbx-experimental"` → `SandboxRuntime` with the (stubbed)
 ///   Docker Sandbox backend (macOS arm64 / Windows only; see WI 0090)
-/// - anything else → warn and fall back to Docker
+/// - anything else → `EngineError::UnknownRuntime`. A misspelled runtime is
+///   a fatal configuration error, never a silent fall back to Docker: the
+///   user asked for an isolation model awman can't identify, and launching
+///   agents under a different one than they configured is unsafe.
 pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineError> {
     let runtime_name = global_config
         .runtime
@@ -192,12 +199,10 @@ pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineErr
         Some("docker-sbx-experimental") => {
             Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
         }
-        Some(other) => {
-            tracing::warn!(runtime = other, "unknown runtime, falling back to Docker");
-            Ok(DetectedRuntime::Container(Arc::new(
-                ContainerRuntime::docker(),
-            )))
-        }
+        Some(other) => Err(EngineError::UnknownRuntime {
+            value: other.to_string(),
+            valid: VALID_RUNTIMES.join(", "),
+        }),
     }
 }
 
@@ -283,14 +288,47 @@ mod tests {
     }
 
     #[test]
-    fn detect_unknown_runtime_falls_back_to_docker() {
+    fn detect_unknown_runtime_is_a_fatal_error() {
         let cfg = GlobalConfig {
             runtime: Some("blarg".into()),
             ..Default::default()
         };
-        // Unknown runtime should fall back to Docker with a warning, not error.
-        let rt = detect(&cfg).unwrap();
-        assert_eq!(rt.engine().runtime_name(), "docker");
+        // Unknown runtime must error — never silently fall back to Docker.
+        match detect(&cfg) {
+            Err(EngineError::UnknownRuntime { value, valid }) => {
+                assert_eq!(value, "blarg");
+                for name in VALID_RUNTIMES {
+                    assert!(
+                        valid.contains(name),
+                        "error must list valid runtime '{name}'; got: {valid}"
+                    );
+                }
+            }
+            Err(e) => panic!("expected UnknownRuntime error, got {e:?}"),
+            Ok(_) => panic!("expected UnknownRuntime error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn unknown_runtime_error_message_names_value_and_valid_set() {
+        let cfg = GlobalConfig {
+            runtime: Some("dokcer".into()),
+            ..Default::default()
+        };
+        let msg = match detect(&cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected UnknownRuntime error, got Ok"),
+        };
+        assert!(
+            msg.contains("'dokcer'"),
+            "message must quote the bad value: {msg}"
+        );
+        assert!(
+            msg.contains("docker"),
+            "message must list valid values: {msg}"
+        );
+        assert!(msg.contains("apple-containers"), "{msg}");
+        assert!(msg.contains("docker-sbx-experimental"), "{msg}");
     }
 
     // ─── Runtime switching (host-side, no live sbx needed) ───────────────────
@@ -359,15 +397,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_runtime_string_falls_back_to_docker_not_sbx() {
-        // "blarg" must not accidentally select sbx or any other runtime.
+    fn unknown_runtime_string_never_selects_a_runtime() {
+        // "blarg" must not accidentally select sbx or any other runtime —
+        // and must not fall back to Docker either.
         let cfg = GlobalConfig {
             runtime: Some("blarg".into()),
             ..Default::default()
         };
-        let rt = detect(&cfg).unwrap();
-        assert_eq!(rt.engine().runtime_name(), "docker");
-        assert_ne!(rt.engine().runtime_name(), "docker-sbx-experimental");
+        assert!(matches!(
+            detect(&cfg),
+            Err(EngineError::UnknownRuntime { .. })
+        ));
     }
 
     // ─── Option-variant mismatch via ContainerRuntime ─────────────────────────

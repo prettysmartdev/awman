@@ -40,7 +40,7 @@ The installer detects your platform and puts `awman` on your `PATH`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.9.1`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.10.0`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/awman/releases):
 
@@ -172,6 +172,25 @@ overlays = ["skill(review)"]
 Supported agents: `claude`, `codex`, `opencode`, `maki`, `antigravity`, `copilot`, `crush`, `cline`. Steps without an `agent` field use your project's default.
 
 
+### Drive work directly from GitHub issues
+
+Point any of `new spec`, `exec workflow`, or `exec prompt` at a GitHub issue with `--issue` — no local work item file needed. awman fetches the issue (via the `gh` CLI, a `GITHUB_TOKEN`, or unauthenticated for public repos) and feeds it in as the input:
+
+```sh
+# Generate a work item spec from an issue
+awman new spec --issue 84
+
+# Run a workflow against an issue (resolves {{work_item_content}} from the issue body)
+awman exec workflow ./aspec/workflows/implement-pr.toml --issue 84 --worktree
+
+# Send an issue straight to the agent as a prompt
+awman exec prompt "Security review this" --issue 84
+```
+
+A bare number resolves against the current repo's GitHub remote; `owner/repo#84` and full issue URLs also work. See [GitHub Integration](docs/11-github-integration.md).
+
+Workflow setup/teardown phases can also wait on CI: a `poll_ci` step blocks until GitHub Actions goes green, and any step can declare an `on_failure` block that launches an agent to fix the problem and retries.
+
 ### Hand off to the agent workflow completely (yolo mode)
 
 ![awman yolo mode](./docs/blog/images/tui-yolo-mode.png)
@@ -227,7 +246,7 @@ curl -s http://localhost:9090/v1/commands/<command-id>/logs
 ```
 API commands run inside containers with the same isolation as running awman locally. All inputs and outputs and logs are stored in `~/.awman/api/` on the server for later review or auditing. The API server is authenticated using an API key generated the first time it is run, and can be refreshed (invalidating the old key) using `awman api start --refresh-key`.
 
-See [API Mode](docs/10-api-mode.md) and [Remote Mode](docs/11-remote-mode.md) for details.
+See [API Mode](docs/09-api-mode.md) and [Remote Mode](docs/10-remote-mode.md) for details.
 
 ---
 
@@ -240,7 +259,7 @@ Every agent runs inside a container built from `Dockerfile.dev` — agents can n
 - Overlays allow optionally providing access to ssh keys, env vars, additional directories, and your personal skills library
 - awman itself is a statically compiled Rust binary — it cannot be modified by anything running inside a container
 
-Apple Containers (macOS 26+) and Docker are supported container runtimes.
+Docker, Apple Containers (macOS 26+), and Docker Sandboxes (`docker-sbx-experimental`, microVM isolation) are supported runtimes. See [Runtimes](docs/12-runtimes.md).
 
 ![awman TUI status](./docs/blog/images/tui-status.png)
 
@@ -253,9 +272,9 @@ awman                                  # open the TUI
 awman init [--agent <name>]            # set up a project
 awman ready [--refresh]                # verify environment; rebuild Dockerfile.dev
 awman chat [--agent <name>] [--plan] [--auto] [--yolo]
-awman exec prompt "<prompt>"           # run a one-off prompt in a container
-awman exec workflow <path> [--work-item <nnnn>] [--yolo] [--worktree]
-awman new spec [--interview]           # create a work item
+awman exec prompt "<prompt>" [--issue <ref>]   # run a one-off prompt in a container
+awman exec workflow <path> [--work-item <nnnn> | --issue <ref>] [--yolo] [--worktree]
+awman new spec [--interview] [--issue <ref>]   # create a work item (optionally from a GitHub issue)
 awman new workflow [--interview]       # create a workflow file
 awman new skill [--interview]          # create a skill file
 awman specs amend <nnnn>               # update a spec to match what was built
@@ -283,11 +302,13 @@ All commands work in both TUI mode (without the `awman` prefix) and CLI mode. AP
 - [Security & Isolation](docs/04-security-and-isolation.md)
 - [Workflows](docs/05-workflows.md)
 - [Yolo Mode](docs/06-yolo-mode.md)
-- [Configuration](docs/08-configuration.md)
-- [Overlays](docs/09-overlays.md)
-- [API Mode](docs/10-api-mode.md)
-- [Remote Mode](docs/11-remote-mode.md)
-- [Architecture](docs/12-architecture-overview.md)
+- [Configuration](docs/07-configuration.md)
+- [Overlays](docs/08-overlays.md)
+- [API Mode](docs/09-api-mode.md)
+- [Remote Mode](docs/10-remote-mode.md)
+- [GitHub Integration](docs/11-github-integration.md)
+- [Runtimes](docs/12-runtimes.md)
+- [Architecture](docs/architecture.md)
 
 ---
 

@@ -60,6 +60,12 @@ pub enum EngineError {
     #[error("backend {backend} is not supported on platform {platform}")]
     BackendUnsupportedOnPlatform { backend: String, platform: String },
 
+    #[error(
+        "invalid runtime '{value}' in global config ($HOME/.awman/config.json); \
+         valid values: {valid}"
+    )]
+    UnknownRuntime { value: String, valid: String },
+
     #[error("invalid advance action: {0}")]
     InvalidAdvanceAction(String),
 
