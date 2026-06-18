@@ -39,7 +39,7 @@ Write comprehensive documentation for work item {{work_item_number}}, following 
 [[step]]
 name = "review"
 depends_on = ["docs", "tests"]
-model = "claude-fable-5"
+model = "claude-opus-4-6"
 prompt = """
 Review the changes made for work item {{work_item_number}} in the previous steps for correctness, completeness, security, and style. Address major issues or gaps automatically, but you MUST ask me for clarification if anything is unclear or if there are diverging possible solutions or spec mismatches. Then suggest minor improvements/nits if needed for my approval. Ensure all edge cases are considered:
 

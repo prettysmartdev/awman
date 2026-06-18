@@ -177,7 +177,8 @@
       "WebFetch(domain:codex.danielvaughan.com)",
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:thenewstack.io)",
-      "WebFetch(domain:emirb.github.io)"
+      "WebFetch(domain:emirb.github.io)",
+      "Bash(xargs ls -la)"
     ]
   }
 }
