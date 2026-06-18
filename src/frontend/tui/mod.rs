@@ -2084,6 +2084,7 @@ mod tests {
                 cancel_to_previous_unavailable_reason: None,
                 finish_workflow_unavailable_reason: None,
                 can_dismiss: false,
+                launch_next_label: None,
             },
         ));
         app.command_dialog_active = true;
@@ -2162,6 +2163,7 @@ mod tests {
                 cancel_to_previous_unavailable_reason: None,
                 finish_workflow_unavailable_reason: Some("not last step".into()),
                 can_dismiss: false,
+                launch_next_label: None,
             },
         ));
         app.command_dialog_active = true;

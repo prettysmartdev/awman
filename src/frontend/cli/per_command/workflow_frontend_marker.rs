@@ -46,7 +46,11 @@ impl WorkflowFrontend for CliFrontend {
             lines_printed += 1;
         }
         if available.can_launch_next {
-            eprintln!("  [n] Launch next step (new container)");
+            let label = available
+                .launch_next_label
+                .as_deref()
+                .unwrap_or("Launch next step (new container)");
+            eprintln!("  [n] {label}");
             lines_printed += 1;
         }
         if available.can_continue_in_current_container {

@@ -1323,7 +1323,16 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                     Span::styled(" Cancel to prev", left_label_style),
                     Span::raw("   "),
                     Span::styled("\u{2192}", right_arrow_style),
-                    Span::styled(" Next: new container", right_label_style),
+                    Span::styled(
+                        format!(
+                            " {}",
+                            state
+                                .launch_next_label
+                                .as_deref()
+                                .unwrap_or("Next: new container")
+                        ),
+                        right_label_style,
+                    ),
                 ]),
                 Line::from(""),
                 // ↓ Next: same container (bottom of diamond)

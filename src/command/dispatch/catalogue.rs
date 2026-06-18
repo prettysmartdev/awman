@@ -671,9 +671,11 @@ const EXEC_WORKFLOW: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "workflow",
-        help: "Path to the workflow file.",
+        // Optional at the catalogue level so `--dynamic` can omit it; the
+        // command layer still requires it for every non-dynamic invocation.
+        help: "Path to the workflow file (omit with --dynamic).",
         kind: ArgumentKind::Path,
-        optional: false,
+        optional: true,
     }],
     flags: &EXEC_WORKFLOW_FLAGS,
     api_allowed: true,
@@ -1501,7 +1503,7 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 9] = [
     },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 13] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -1620,6 +1622,34 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &["work-item"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "dynamic",
+        short: None,
+        help: "Have a leader agent design and run a workflow for --work-item. \
+               Implies --yolo, --worktree, and context(workflow); the positional \
+               workflow path must be omitted.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        // Mutual exclusions (positional path, --plan) and the --work-item
+        // requirement are enforced in the command layer because --yolo may be
+        // implied rather than explicitly supplied (WI-0092 §3).
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "leader",
+        short: None,
+        help: "Agent and model for the dynamic leader, as agent::model \
+               (e.g. claude::claude-opus-4-8). Only valid with --dynamic.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
         implies: &[],
         optional: true,
     },

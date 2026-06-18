@@ -151,6 +151,11 @@ pub struct WorkflowControlBoardState {
     /// computes this from `can_dismiss` in `AvailableActions`.
     /// Changes rendering: Esc = dismiss (step keeps running), [p] = pause.
     pub can_dismiss: bool,
+    /// Custom label for the right-arrow (launch-next) action, copied from
+    /// `AvailableActions.launch_next_label`. `None` renders the default
+    /// "Next: new container". The dynamic leader step sets this to
+    /// "Start dynamic workflow".
+    pub launch_next_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]

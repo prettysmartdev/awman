@@ -75,6 +75,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
                                         .finish_workflow_unavailable_reason
                                         .clone(),
                                     can_dismiss: available.can_dismiss,
+                                    launch_next_label: available.launch_next_label.clone(),
                                 },
                             ))
                             .map_err(|e| EngineError::Other(e.to_string()))?;
@@ -103,6 +104,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
                         .finish_workflow_unavailable_reason
                         .clone(),
                     can_dismiss: available.can_dismiss,
+                    launch_next_label: available.launch_next_label.clone(),
                 },
             ))
             .map_err(|e| EngineError::Other(e.to_string()))?;

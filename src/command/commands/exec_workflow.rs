@@ -37,7 +37,11 @@ use crate::engine::workflow::{EngineRequest, WorkflowEngine};
 
 #[derive(Debug, Clone)]
 pub struct ExecWorkflowCommandFlags {
-    pub workflow: PathBuf,
+    /// The positional workflow path. `None` is only valid with `--dynamic`,
+    /// where the leader agent generates the workflow file. Non-dynamic
+    /// invocations with `None` produce the existing missing-required-argument
+    /// error.
+    pub workflow: Option<PathBuf>,
     pub work_item: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
@@ -49,6 +53,37 @@ pub struct ExecWorkflowCommandFlags {
     pub model: Option<String>,
     pub overlay: Vec<String>,
     pub issue_source: crate::data::issue::IssueSourceFlags,
+    /// When true, a leader agent designs and runs a workflow for the work item.
+    /// Implies `--yolo`, `--worktree`, and `context(workflow)`.
+    pub dynamic: bool,
+    /// Raw `agent::model` string for the dynamic leader agent. Only valid with
+    /// `--dynamic`.
+    pub leader: Option<String>,
+}
+
+/// Fully-specified leader agent selection parsed from `--leader agent::model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderSpec {
+    pub agent: String,
+    pub model: String,
+}
+
+impl LeaderSpec {
+    /// Parse a `--leader` value of the form `agent::model`. The value must
+    /// contain exactly two non-empty components separated by a single `::`.
+    pub fn parse(raw: &str) -> Result<Self, CommandError> {
+        let parts: Vec<&str> = raw.split("::").collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(CommandError::Other(format!(
+                "invalid --leader value {raw:?}; expected agent::model \
+                 (e.g. claude::claude-opus-4-8)"
+            )));
+        }
+        Ok(LeaderSpec {
+            agent: parts[0].to_string(),
+            model: parts[1].to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -427,13 +462,42 @@ impl Command for ExecWorkflowCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        // Early flag validation (Layer 2) — runs before any IO for both the
+        // dynamic and non-dynamic paths. Surfaces an error message and aborts.
+        if let Err(e) = validate_dynamic_flags(&self.flags) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+
+        // Dynamic mode: a leader agent designs the workflow, then it executes.
+        if self.flags.dynamic {
+            return self.run_dynamic(frontend).await;
+        }
+
+        // Non-dynamic: the positional path is required.
+        let workflow_arg = match &self.flags.workflow {
+            Some(p) => p.clone(),
+            None => {
+                let err =
+                    CommandError::missing_required_argument(&["exec", "workflow"], "workflow");
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: "exec workflow: missing required argument 'workflow'".into(),
+                });
+                return Err(err);
+            }
+        };
+
         // Resolve the workflow path relative to the session's working
         // directory so that relative paths work regardless of where the
         // awman process was originally launched.
-        let workflow_path = if self.flags.workflow.is_absolute() {
-            self.flags.workflow.clone()
+        let workflow_path = if workflow_arg.is_absolute() {
+            workflow_arg.clone()
         } else {
-            self.session.working_dir().join(&self.flags.workflow)
+            self.session.working_dir().join(&workflow_arg)
         };
 
         // Track whether the gemini deprecation warning has already been emitted
@@ -673,9 +737,7 @@ impl Command for ExecWorkflowCommand {
                         }
                     }
                 } else {
-                    let name = self
-                        .flags
-                        .workflow
+                    let name = workflow_path
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("workflow")
@@ -698,9 +760,7 @@ impl Command for ExecWorkflowCommand {
                     }
                 }
             } else {
-                let name = self
-                    .flags
-                    .workflow
+                let name = workflow_path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("workflow")
@@ -782,494 +842,1283 @@ impl Command for ExecWorkflowCommand {
             all
         };
 
-        // 5b. Detect a persisted workflow-state file and ask the user whether
-        //     to resume it or delete it and start fresh. The check uses the
-        //     session_root the engine will pick up below — the worktree path
-        //     when --worktree is active, otherwise cwd. Done before PTY
-        //     activation so the dialog renders immediately, like the
-        //     existing-worktree dialog does in the lifecycle step above.
-        let session_root_for_state = worktree_path.as_deref().unwrap_or(&cwd).to_path_buf();
-        let git_root_for_state =
-            match Arc::clone(&self.engines.git_engine).resolve_root(&session_root_for_state) {
-                Ok(r) => r,
-                Err(_) => session_root_for_state.clone(),
-            };
-        let workflow_name_for_state = crate::engine::workflow::workflow_name_for(&workflow);
-        let work_item_number_for_state = work_item_context.as_ref().map(|c| c.number);
-        {
-            let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
-                git_root_for_state.clone(),
-            );
-            match store.load(work_item_number_for_state, &workflow_name_for_state) {
-                Ok(Some(saved)) => {
-                    let total = saved.step_states.len();
-                    let completed = saved
-                        .step_states
-                        .values()
-                        .filter(|s| {
-                            matches!(
-                                s,
-                                crate::data::workflow_state::StepState::Succeeded
-                                    | crate::data::workflow_state::StepState::Skipped
-                            )
-                        })
-                        .count();
-                    let resume = frontend.ask_workflow_resume_or_fresh(
-                        &workflow_name_for_state,
-                        completed,
-                        total,
-                    )?;
-                    if !resume {
-                        if let Err(e) =
-                            store.delete(work_item_number_for_state, &workflow_name_for_state)
-                        {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Warning,
-                                text: format!(
-                                    "exec workflow: failed to delete workflow state file: {e}",
-                                ),
-                            });
-                        }
+        let prepared = PreparedRun {
+            workflow,
+            workflow_path,
+            work_item_context,
+            cli_typed,
+            mount_path,
+            worktree_path,
+            worktree_lifecycle,
+            worktree_git_mount,
+            git_root_for_scope,
+            cwd,
+            original_session: self.session,
+            issue_temp_file: _issue_temp_file,
+        };
+        execute_prepared(&self.flags, &self.engines, prepared, frontend).await
+
+    }
+}
+
+// ─── Shared workflow execution + dynamic preflight (WI-0092) ─────────────────
+
+/// All state needed to execute a parsed workflow once the worktree, session,
+/// context, and work item have been prepared. Both the non-dynamic path and
+/// the dynamic leader path build one of these and hand it to
+/// [`execute_prepared`], so workflow execution lives in exactly one place
+/// (WI-0092 §10) — neither path recursively re-enters
+/// `ExecWorkflowCommand::run_with_frontend`.
+struct PreparedRun {
+    workflow: Workflow,
+    workflow_path: PathBuf,
+    work_item_context: Option<WorkItemContext>,
+    cli_typed: Vec<TypedOverlay>,
+    mount_path: PathBuf,
+    worktree_path: Option<PathBuf>,
+    worktree_lifecycle: Option<WorktreeLifecycle>,
+    worktree_git_mount: Option<crate::engine::container::options::OverlaySpec>,
+    git_root_for_scope: PathBuf,
+    cwd: PathBuf,
+    /// The pre-worktree session. `execute_prepared` re-roots it at the worktree
+    /// when `worktree_path` is set.
+    original_session: Session,
+    /// Kept alive for the duration of the run; its Drop removes the issue temp
+    /// file. `None` for non-issue invocations.
+    issue_temp_file: Option<IssueTempFile>,
+}
+
+/// Execute a fully-prepared workflow: persisted-state resume check, engine
+/// setup/main/teardown phases, summary reporting, and worktree finalize.
+/// Shared by the non-dynamic and dynamic execution paths.
+async fn execute_prepared(
+    flags: &ExecWorkflowCommandFlags,
+    engines: &Engines,
+    prepared: PreparedRun,
+    frontend: Box<dyn ExecWorkflowCommandFrontend>,
+) -> Result<ExecWorkflowOutcome, CommandError> {
+    let PreparedRun {
+        workflow,
+        workflow_path,
+        work_item_context,
+        cli_typed,
+        mount_path,
+        worktree_path,
+        worktree_lifecycle,
+        worktree_git_mount,
+        git_root_for_scope,
+        cwd,
+        original_session,
+        issue_temp_file: _issue_temp_file,
+    } = prepared;
+    let mut frontend = frontend;
+
+
+    // 5b. Detect a persisted workflow-state file and ask the user whether
+    //     to resume it or delete it and start fresh. The check uses the
+    //     session_root the engine will pick up below — the worktree path
+    //     when --worktree is active, otherwise cwd. Done before PTY
+    //     activation so the dialog renders immediately, like the
+    //     existing-worktree dialog does in the lifecycle step above.
+    let session_root_for_state = worktree_path.as_deref().unwrap_or(&cwd).to_path_buf();
+    let git_root_for_state =
+        match Arc::clone(&engines.git_engine).resolve_root(&session_root_for_state) {
+            Ok(r) => r,
+            Err(_) => session_root_for_state.clone(),
+        };
+    let workflow_name_for_state = crate::engine::workflow::workflow_name_for(&workflow);
+    let work_item_number_for_state = work_item_context.as_ref().map(|c| c.number);
+    {
+        let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
+            git_root_for_state.clone(),
+        );
+        match store.load(work_item_number_for_state, &workflow_name_for_state) {
+            Ok(Some(saved)) => {
+                let total = saved.step_states.len();
+                let completed = saved
+                    .step_states
+                    .values()
+                    .filter(|s| {
+                        matches!(
+                            s,
+                            crate::data::workflow_state::StepState::Succeeded
+                                | crate::data::workflow_state::StepState::Skipped
+                        )
+                    })
+                    .count();
+                let resume = frontend.ask_workflow_resume_or_fresh(
+                    &workflow_name_for_state,
+                    completed,
+                    total,
+                )?;
+                if !resume {
+                    if let Err(e) =
+                        store.delete(work_item_number_for_state, &workflow_name_for_state)
+                    {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Warning,
+                            text: format!(
+                                "exec workflow: failed to delete workflow state file: {e}",
+                            ),
+                        });
                     }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Warning,
-                        text: format!(
-                            "exec workflow: failed to read workflow state file: {e}; \
-                             starting fresh",
-                        ),
-                    });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "exec workflow: failed to read workflow state file: {e}; \
+                         starting fresh",
+                    ),
+                });
+            }
+        }
+    }
+
+    // 6. Set PTY active — queues user messages during the engine run.
+    frontend.set_pty_active(true);
+
+    // 7. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
+    //    CommandLayerFactory can share it for the duration of the engine run.
+    let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
+        Arc::new(Mutex::new(frontend));
+
+    let flags_arc = Arc::new(flags.clone());
+
+    // 8. Build the session for the engine.
+    // When a worktree is active, re-root the session at the worktree so
+    // that `build_options` mounts the worktree checkout, not the main repo.
+    let session = if let Some(ref wt) = worktree_path {
+        let git_root_for_session = match Arc::clone(&engines.git_engine).resolve_root(wt) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = CommandError::from(e);
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!(
+                        "exec workflow: failed to resolve git root for worktree session: {err}"
+                    ),
+                });
+                return Err(err);
+            }
+        };
+        match Session::open_at_git_root(
+            wt.clone(),
+            git_root_for_session,
+            crate::data::session::SessionOpenOptions::default(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = CommandError::Other(format!("opening worktree session: {e}"));
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: failed to open worktree session: {e}"),
+                });
+                return Err(err);
+            }
+        }
+    } else {
+        original_session
+    };
+
+    // 9. Run the engine with three-phase coordination.
+    // The engine block is scoped so proxy + factory are dropped before we
+    // reclaim the frontend via Arc::try_unwrap.
+    let yolo = flags.yolo;
+    let setup_steps: Vec<crate::data::workflow_definition::SetupStep> =
+        workflow.setup.iter().map(|e| e.step.clone()).collect();
+    let teardown_steps: Vec<crate::data::workflow_definition::TeardownStep> =
+        workflow.teardown.iter().map(|e| e.step.clone()).collect();
+    let setup_entry_overlays: Vec<Option<Vec<String>>> =
+        workflow.setup.iter().map(|e| e.overlays.clone()).collect();
+    let setup_abort_flags: Vec<bool> =
+        workflow.setup.iter().map(|e| e.abort_on_failure).collect();
+    let setup_on_failure_configs: Vec<
+        Option<crate::data::workflow_definition::RemediationConfig>,
+    > = workflow
+        .setup
+        .iter()
+        .map(|e| e.on_failure.clone())
+        .collect();
+    let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
+        .teardown
+        .iter()
+        .map(|e| e.overlays.clone())
+        .collect();
+    let teardown_on_failure_configs: Vec<
+        Option<crate::data::workflow_definition::RemediationConfig>,
+    > = workflow
+        .teardown
+        .iter()
+        .map(|e| e.on_failure.clone())
+        .collect();
+    let teardown_abort_flags: Vec<bool> = workflow
+        .teardown
+        .iter()
+        .map(|e| e.abort_on_failure)
+        .collect();
+    let teardown_on_failure = workflow.teardown_on_failure;
+    let engine_work_item_context = work_item_context.clone();
+    let (engine_result, step_counts) = {
+        let proxy = WorkflowProxy(Arc::clone(&shared));
+        let factory = CommandLayerFactory {
+            shared: Arc::clone(&shared),
+            engines: engines.clone(),
+            flags: Arc::clone(&flags_arc),
+            cli_typed_overlays: cli_typed.clone(),
+            work_item_context,
+            image_git_root: git_root_for_scope.clone(),
+            workflow_overlays: workflow.overlays.clone(),
+        };
+        let mut engine = match WorkflowEngine::resume(
+            &session,
+            workflow,
+            engine_work_item_context,
+            Box::new(proxy),
+            Box::new(factory),
+            Arc::clone(&engines.git_engine),
+            Arc::clone(&engines.overlay_engine),
+        )
+        .await
+        {
+            Ok(eng) => eng,
+            Err(e) => {
+                let err = CommandError::from(e);
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: failed to initialize workflow engine: {err}"),
+                });
+                return Err(err);
+            }
+        };
+        engine.set_yolo(yolo);
+
+        // Warn if the workflow will commit but git identity is not configured.
+        if teardown_steps.iter().any(|s| {
+            matches!(
+                s,
+                crate::data::workflow_definition::TeardownStep::CommitChanges { .. }
+            )
+        }) {
+            let name_ok = std::process::Command::new("git")
+                .args(["config", "user.name"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let email_ok = std::process::Command::new("git")
+                .args(["config", "user.email"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !name_ok || !email_ok {
+                let missing: Vec<&str> = [
+                    if !name_ok { Some("user.name") } else { None },
+                    if !email_ok { Some("user.email") } else { None },
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "workflow has a commit_changes teardown step but git {} not set; \
+                         set them locally (git config {0}) or use a dir() overlay to mount \
+                         your global ~/.gitconfig into the agent container",
+                        missing.join(" and "),
+                    ),
+                });
+            }
+        }
+
+        // === SETUP PHASE ===
+        //
+        // Each setup entry runs in its own container built from THAT
+        // entry's overlays only (WI-0082): per-step isolation matters
+        // because, e.g. an entry asking for `env(GITHUB_TOKEN)` must not
+        // leak that token into a sibling entry that only asked for
+        // `ssh()`. Container start/stop cost is amortized acceptably by
+        // the small number of setup steps in real workflows.
+        let mut setup_failed = false;
+        if !setup_steps.is_empty() && !engine.state().setup_completed {
+            let base_image = resolve_base_image(&session, &git_root_for_scope);
+            let resolved = resolve_phase_overlays(
+                &engines,
+                &session,
+                &cli_typed,
+                &setup_entry_overlays,
+                worktree_git_mount.as_ref(),
+                &base_image,
+            );
+
+            // A bad overlay on ANY entry aborts the whole phase before
+            // any container starts — otherwise earlier steps would have
+            // already mutated the workspace.
+            if let Some(e) = resolved.iter().find_map(|r| r.as_ref().err()) {
+                shared.lock().unwrap().write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: {e}"),
+                });
+                setup_failed = true;
+            }
+
+            if !setup_failed {
+                let runtime = Arc::clone(
+                    engines
+                        .require_container_runtime()
+                        .map_err(CommandError::from)?,
+                );
+                let mount = mount_path.clone();
+                let base = base_image.clone();
+                let shared_for_factory = Arc::clone(&shared);
+                let setup_result = tokio::task::block_in_place(|| {
+                    let factory = |idx: usize| -> Result<
+                        Box<dyn crate::engine::agent_runtime::background::AgentExec>,
+                        EngineError,
+                    > {
+                        let (overlays, env) = resolved
+                            .get(idx)
+                            .ok_or_else(|| {
+                                EngineError::Other(format!(
+                                    "internal: missing pre-resolved overlays for setup step {idx}",
+                                ))
+                            })?
+                            .as_ref()
+                            .map_err(|e| EngineError::Other(e.to_string()))?;
+                        let container =
+                            runtime.start_background(&base, &mount, env, overlays)?;
+                        Ok(Box::new(container))
+                    };
+                    let r = engine.run_setup(
+                        &setup_steps,
+                        &setup_abort_flags,
+                        &setup_on_failure_configs,
+                        factory,
+                    );
+                    if let Err(e) = &r {
+                        shared_for_factory
+                            .lock()
+                            .unwrap()
+                            .write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("exec workflow: setup phase failed: {e}"),
+                            });
+                    }
+                    r
+                });
+                if setup_result.is_err() {
+                    setup_failed = true;
                 }
             }
         }
 
-        // 6. Set PTY active — queues user messages during the engine run.
-        frontend.set_pty_active(true);
-
-        // 7. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
-        //    CommandLayerFactory can share it for the duration of the engine run.
-        let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
-            Arc::new(Mutex::new(frontend));
-
-        let flags_arc = Arc::new(self.flags.clone());
-
-        // 8. Build the session for the engine.
-        // When a worktree is active, re-root the session at the worktree so
-        // that `build_options` mounts the worktree checkout, not the main repo.
-        let session = if let Some(ref wt) = worktree_path {
-            let git_root_for_session = match Arc::clone(&self.engines.git_engine).resolve_root(wt) {
-                Ok(r) => r,
-                Err(e) => {
-                    let err = CommandError::from(e);
-                    shared.lock().unwrap().write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!(
-                            "exec workflow: failed to resolve git root for worktree session: {err}"
-                        ),
-                    });
-                    return Err(err);
-                }
-            };
-            match Session::open_at_git_root(
-                wt.clone(),
-                git_root_for_session,
-                crate::data::session::SessionOpenOptions::default(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    let err = CommandError::Other(format!("opening worktree session: {e}"));
-                    shared.lock().unwrap().write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec workflow: failed to open worktree session: {e}"),
-                    });
-                    return Err(err);
-                }
-            }
+        // === MAIN PHASE ===
+        let result = if setup_failed {
+            Err(crate::engine::error::EngineError::Container(
+                "setup phase failed; main workflow not started".into(),
+            ))
         } else {
-            self.session
+            engine.run_to_completion().await
         };
 
-        // 9. Run the engine with three-phase coordination.
-        // The engine block is scoped so proxy + factory are dropped before we
-        // reclaim the frontend via Arc::try_unwrap.
-        let yolo = self.flags.yolo;
-        let setup_steps: Vec<crate::data::workflow_definition::SetupStep> =
-            workflow.setup.iter().map(|e| e.step.clone()).collect();
-        let teardown_steps: Vec<crate::data::workflow_definition::TeardownStep> =
-            workflow.teardown.iter().map(|e| e.step.clone()).collect();
-        let setup_entry_overlays: Vec<Option<Vec<String>>> =
-            workflow.setup.iter().map(|e| e.overlays.clone()).collect();
-        let setup_abort_flags: Vec<bool> =
-            workflow.setup.iter().map(|e| e.abort_on_failure).collect();
-        let setup_on_failure_configs: Vec<
-            Option<crate::data::workflow_definition::RemediationConfig>,
-        > = workflow
-            .setup
-            .iter()
-            .map(|e| e.on_failure.clone())
-            .collect();
-        let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
-            .teardown
-            .iter()
-            .map(|e| e.overlays.clone())
-            .collect();
-        let teardown_on_failure_configs: Vec<
-            Option<crate::data::workflow_definition::RemediationConfig>,
-        > = workflow
-            .teardown
-            .iter()
-            .map(|e| e.on_failure.clone())
-            .collect();
-        let teardown_abort_flags: Vec<bool> = workflow
-            .teardown
-            .iter()
-            .map(|e| e.abort_on_failure)
-            .collect();
-        let teardown_on_failure = workflow.teardown_on_failure;
-        let engine_work_item_context = work_item_context.clone();
-        let (engine_result, step_counts) = {
-            let proxy = WorkflowProxy(Arc::clone(&shared));
-            let factory = CommandLayerFactory {
-                shared: Arc::clone(&shared),
-                engines: self.engines.clone(),
-                flags: Arc::clone(&flags_arc),
-                cli_typed_overlays: cli_typed.clone(),
-                work_item_context,
-                image_git_root: git_root_for_scope.clone(),
-                workflow_overlays: workflow.overlays.clone(),
-            };
-            let mut engine = match WorkflowEngine::resume(
-                &session,
-                workflow,
-                engine_work_item_context,
-                Box::new(proxy),
-                Box::new(factory),
-                Arc::clone(&self.engines.git_engine),
-                Arc::clone(&self.engines.overlay_engine),
-            )
-            .await
-            {
-                Ok(eng) => eng,
-                Err(e) => {
-                    let err = CommandError::from(e);
-                    shared.lock().unwrap().write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec workflow: failed to initialize workflow engine: {err}"),
-                    });
-                    return Err(err);
-                }
-            };
-            engine.set_yolo(yolo);
+        let workflow_succeeded = matches!(
+            result,
+            Ok(WorkflowOutcome::Completed) | Ok(WorkflowOutcome::CompletedTeardownFailed)
+        );
 
-            // Warn if the workflow will commit but git identity is not configured.
-            if teardown_steps.iter().any(|s| {
-                matches!(
-                    s,
-                    crate::data::workflow_definition::TeardownStep::CommitChanges { .. }
-                )
-            }) {
-                let name_ok = std::process::Command::new("git")
-                    .args(["config", "user.name"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                let email_ok = std::process::Command::new("git")
-                    .args(["config", "user.email"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !name_ok || !email_ok {
-                    let missing: Vec<&str> = [
-                        if !name_ok { Some("user.name") } else { None },
-                        if !email_ok { Some("user.email") } else { None },
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    shared.lock().unwrap().write_message(UserMessage {
-                        level: MessageLevel::Warning,
-                        text: format!(
-                            "workflow has a commit_changes teardown step but git {} not set; \
-                             set them locally (git config {0}) or use a dir() overlay to mount \
-                             your global ~/.gitconfig into the agent container",
-                            missing.join(" and "),
-                        ),
-                    });
-                }
-            }
-
-            // === SETUP PHASE ===
-            //
-            // Each setup entry runs in its own container built from THAT
-            // entry's overlays only (WI-0082): per-step isolation matters
-            // because, e.g. an entry asking for `env(GITHUB_TOKEN)` must not
-            // leak that token into a sibling entry that only asked for
-            // `ssh()`. Container start/stop cost is amortized acceptably by
-            // the small number of setup steps in real workflows.
-            let mut setup_failed = false;
-            if !setup_steps.is_empty() && !engine.state().setup_completed {
+        // === TEARDOWN PHASE ===
+        //
+        // Same per-entry container pattern as setup: overlays are
+        // pre-resolved via `resolve_phase_overlays` and the factory
+        // indexes into the results. Unlike setup, no upfront abort
+        // gate — per-entry overlay errors flow through the factory and
+        // `run_teardown` handles them as per-step failures (best-effort).
+        //
+        // If the setup or main phase triggered abort_on_failure,
+        // teardown is skipped regardless of teardown_on_failure.
+        let mut teardown_aborted = false;
+        let mut any_teardown_failed = false;
+        if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
+            let should_run = teardown_on_failure || workflow_succeeded;
+            if should_run {
                 let base_image = resolve_base_image(&session, &git_root_for_scope);
                 let resolved = resolve_phase_overlays(
-                    &self.engines,
+                    &engines,
                     &session,
                     &cli_typed,
-                    &setup_entry_overlays,
+                    &teardown_entry_overlays,
                     worktree_git_mount.as_ref(),
                     &base_image,
                 );
-
-                // A bad overlay on ANY entry aborts the whole phase before
-                // any container starts — otherwise earlier steps would have
-                // already mutated the workspace.
-                if let Some(e) = resolved.iter().find_map(|r| r.as_ref().err()) {
-                    shared.lock().unwrap().write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec workflow: {e}"),
-                    });
-                    setup_failed = true;
-                }
-
-                if !setup_failed {
-                    let runtime = Arc::clone(
-                        self.engines
-                            .require_container_runtime()
-                            .map_err(CommandError::from)?,
-                    );
-                    let mount = mount_path.clone();
-                    let base = base_image.clone();
-                    let shared_for_factory = Arc::clone(&shared);
-                    let setup_result = tokio::task::block_in_place(|| {
-                        let factory = |idx: usize| -> Result<
-                            Box<dyn crate::engine::agent_runtime::background::AgentExec>,
-                            EngineError,
-                        > {
-                            let (overlays, env) = resolved
-                                .get(idx)
-                                .ok_or_else(|| {
-                                    EngineError::Other(format!(
-                                        "internal: missing pre-resolved overlays for setup step {idx}",
-                                    ))
-                                })?
-                                .as_ref()
-                                .map_err(|e| EngineError::Other(e.to_string()))?;
-                            let container =
-                                runtime.start_background(&base, &mount, env, overlays)?;
-                            Ok(Box::new(container))
-                        };
-                        let r = engine.run_setup(
-                            &setup_steps,
-                            &setup_abort_flags,
-                            &setup_on_failure_configs,
+                let runtime = Arc::clone(
+                    engines
+                        .require_container_runtime()
+                        .map_err(CommandError::from)?,
+                );
+                let mount = mount_path.clone();
+                (teardown_aborted, any_teardown_failed) = tokio::task::block_in_place(|| {
+                    let factory = |idx: usize| -> Result<
+                        Box<dyn crate::engine::agent_runtime::background::AgentExec>,
+                        EngineError,
+                    > {
+                        let (overlays, env) = resolved
+                            .get(idx)
+                            .ok_or_else(|| {
+                                EngineError::Other(format!(
+                                    "internal: missing pre-resolved overlays for teardown step {idx}",
+                                ))
+                            })?
+                            .as_ref()
+                            .map_err(|e| EngineError::Other(e.to_string()))?;
+                        let container =
+                            runtime.start_background(&base_image, &mount, env, overlays)?;
+                        Ok(Box::new(container))
+                    };
+                    engine
+                        .run_teardown(
+                            &teardown_steps,
+                            &teardown_abort_flags,
+                            &teardown_on_failure_configs,
+                            workflow_succeeded,
+                            teardown_on_failure,
                             factory,
-                        );
-                        if let Err(e) = &r {
-                            shared_for_factory
-                                .lock()
-                                .unwrap()
-                                .write_message(UserMessage {
-                                    level: MessageLevel::Error,
-                                    text: format!("exec workflow: setup phase failed: {e}"),
-                                });
-                        }
-                        r
-                    });
-                    if setup_result.is_err() {
-                        setup_failed = true;
-                    }
-                }
-            }
-
-            // === MAIN PHASE ===
-            let result = if setup_failed {
-                Err(crate::engine::error::EngineError::Container(
-                    "setup phase failed; main workflow not started".into(),
-                ))
-            } else {
-                engine.run_to_completion().await
-            };
-
-            let workflow_succeeded = matches!(
-                result,
-                Ok(WorkflowOutcome::Completed) | Ok(WorkflowOutcome::CompletedTeardownFailed)
-            );
-
-            // === TEARDOWN PHASE ===
-            //
-            // Same per-entry container pattern as setup: overlays are
-            // pre-resolved via `resolve_phase_overlays` and the factory
-            // indexes into the results. Unlike setup, no upfront abort
-            // gate — per-entry overlay errors flow through the factory and
-            // `run_teardown` handles them as per-step failures (best-effort).
-            //
-            // If the setup or main phase triggered abort_on_failure,
-            // teardown is skipped regardless of teardown_on_failure.
-            let mut teardown_aborted = false;
-            let mut any_teardown_failed = false;
-            if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
-                let should_run = teardown_on_failure || workflow_succeeded;
-                if should_run {
-                    let base_image = resolve_base_image(&session, &git_root_for_scope);
-                    let resolved = resolve_phase_overlays(
-                        &self.engines,
-                        &session,
-                        &cli_typed,
-                        &teardown_entry_overlays,
-                        worktree_git_mount.as_ref(),
-                        &base_image,
-                    );
-                    let runtime = Arc::clone(
-                        self.engines
-                            .require_container_runtime()
-                            .map_err(CommandError::from)?,
-                    );
-                    let mount = mount_path.clone();
-                    (teardown_aborted, any_teardown_failed) = tokio::task::block_in_place(|| {
-                        let factory = |idx: usize| -> Result<
-                            Box<dyn crate::engine::agent_runtime::background::AgentExec>,
-                            EngineError,
-                        > {
-                            let (overlays, env) = resolved
-                                .get(idx)
-                                .ok_or_else(|| {
-                                    EngineError::Other(format!(
-                                        "internal: missing pre-resolved overlays for teardown step {idx}",
-                                    ))
-                                })?
-                                .as_ref()
-                                .map_err(|e| EngineError::Other(e.to_string()))?;
-                            let container =
-                                runtime.start_background(&base_image, &mount, env, overlays)?;
-                            Ok(Box::new(container))
-                        };
-                        engine
-                            .run_teardown(
-                                &teardown_steps,
-                                &teardown_abort_flags,
-                                &teardown_on_failure_configs,
-                                workflow_succeeded,
-                                teardown_on_failure,
-                                factory,
-                            )
-                            .unwrap_or((false, false))
-                    });
-                }
-            }
-
-            // If any teardown step failed, promote the result to
-            // CompletedTeardownFailed so post-workflow flows know.
-            let result = if (teardown_aborted || any_teardown_failed) && workflow_succeeded {
-                shared.lock().unwrap().write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: "Workflow completed but one or more teardown steps failed".into(),
+                        )
+                        .unwrap_or((false, false))
                 });
-                Ok(WorkflowOutcome::CompletedTeardownFailed)
-            } else {
-                result
-            };
-
-            // If teardown didn't run (no teardown steps, or skipped on failure)
-            // the engine's current_phase still reads Main — promote it to Done
-            // so persisted state reflects completion.
-            if !matches!(
-                engine.state().current_phase,
-                crate::data::workflow_state::WorkflowPhase::Done
-            ) {
-                let _ = engine.mark_done();
             }
+        }
 
-            let mut completed = 0usize;
-            let mut failed = 0usize;
-            for state in engine.state().step_states.values() {
-                match state {
-                    crate::data::workflow_state::StepState::Succeeded
-                    | crate::data::workflow_state::StepState::Skipped => completed += 1,
-                    crate::data::workflow_state::StepState::Failed { .. } => failed += 1,
-                    _ => {}
-                }
-            }
-            (result, (completed, failed))
+        // If any teardown step failed, promote the result to
+        // CompletedTeardownFailed so post-workflow flows know.
+        let result = if (teardown_aborted || any_teardown_failed) && workflow_succeeded {
+            shared.lock().unwrap().write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: "Workflow completed but one or more teardown steps failed".into(),
+            });
+            Ok(WorkflowOutcome::CompletedTeardownFailed)
+        } else {
+            result
         };
 
-        // 8. Reclaim exclusive ownership of the frontend after proxy + factory drop.
-        let mut frontend = Arc::try_unwrap(shared)
-            .unwrap_or_else(|_| panic!("no other Arc references remain after engine block"))
+        // If teardown didn't run (no teardown steps, or skipped on failure)
+        // the engine's current_phase still reads Main — promote it to Done
+        // so persisted state reflects completion.
+        if !matches!(
+            engine.state().current_phase,
+            crate::data::workflow_state::WorkflowPhase::Done
+        ) {
+            let _ = engine.mark_done();
+        }
+
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        for state in engine.state().step_states.values() {
+            match state {
+                crate::data::workflow_state::StepState::Succeeded
+                | crate::data::workflow_state::StepState::Skipped => completed += 1,
+                crate::data::workflow_state::StepState::Failed { .. } => failed += 1,
+                _ => {}
+            }
+        }
+        (result, (completed, failed))
+    };
+
+    // 8. Reclaim exclusive ownership of the frontend after proxy + factory drop.
+    let mut frontend = Arc::try_unwrap(shared)
+        .unwrap_or_else(|_| panic!("no other Arc references remain after engine block"))
+        .into_inner()
+        .unwrap();
+
+    // 9. PTY inactive — flush queued messages.
+    frontend.set_pty_active(false);
+    frontend.replay_queued();
+
+    // 10. Determine whether the workflow ended with an error.
+    let had_error = matches!(
+        engine_result,
+        Err(_)
+            | Ok(WorkflowOutcome::Failed { .. })
+            | Ok(WorkflowOutcome::Aborted)
+            | Ok(WorkflowOutcome::CompletedTeardownFailed)
+    );
+
+    // 11. Report summary.
+    //
+    // `exit_code` is the unambiguous overall outcome:
+    //   Some(0) — workflow completed successfully
+    //   Some(N) — a step failed (Failed → failing step's exit code;
+    //             Aborted → 1, since the user/engine bailed after a failure)
+    //   None    — workflow paused; no terminal status yet
+    //
+    // Callers (CLI, TUI, API queue worker) inspect this to determine the
+    // final success/failure of the run.
+    let exit_code = match &engine_result {
+        Ok(WorkflowOutcome::Completed) => Some(0),
+        Ok(WorkflowOutcome::CompletedTeardownFailed) => Some(1),
+        Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
+        Ok(WorkflowOutcome::Aborted) => Some(1),
+        Ok(WorkflowOutcome::Paused) => None,
+        Err(_) => Some(1),
+    };
+    frontend.report_workflow_summary(&WorkflowSummary {
+        steps_completed: step_counts.0,
+        steps_failed: step_counts.1.max(if had_error { 1 } else { 0 }),
+    });
+
+    // 12. Worktree finalize.
+    if let Some(lifecycle) = worktree_lifecycle {
+        if let Err(e) = lifecycle.finalize(&mut *frontend, had_error).await {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: worktree finalize failed: {e}"),
+            });
+            return Err(e);
+        }
+        frontend.replay_queued();
+    }
+
+    // 13. Surface engine errors after lifecycle cleanup.
+    if let Err(e) = engine_result {
+        let err = CommandError::from(e);
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Error,
+            text: format!("exec workflow: workflow engine error: {err}"),
+        });
+        return Err(err);
+    }
+
+    // `_issue_temp_file`'s Drop impl removes the temp file when this
+    // function returns — covers both this success path and every early
+    // error return above.
+
+    Ok(ExecWorkflowOutcome {
+        workflow: workflow_path.display().to_string(),
+        exit_code,
+        worktree_used: flags.worktree,
+    })
+}
+
+
+/// Validate the `--dynamic` / `--leader` flag relationships before any IO.
+/// Runs for every `exec workflow` invocation (dynamic or not). The non-dynamic
+/// missing-`workflow`-path error is handled separately in the dispatcher so the
+/// existing missing-required-argument message is preserved.
+pub(crate) fn validate_dynamic_flags(
+    flags: &ExecWorkflowCommandFlags,
+) -> Result<(), CommandError> {
+    if flags.dynamic && flags.workflow.is_some() {
+        return Err(CommandError::Other(
+            "cannot specify a workflow file path with --dynamic; the path is \
+             created automatically"
+                .into(),
+        ));
+    }
+    if flags.leader.is_some() && !flags.dynamic {
+        return Err(CommandError::Other(
+            "--leader is only valid with --dynamic".into(),
+        ));
+    }
+    if flags.dynamic && flags.work_item.is_none() {
+        return Err(CommandError::Other("--dynamic requires --work-item".into()));
+    }
+    if flags.dynamic && flags.plan {
+        return Err(CommandError::Other(
+            "--dynamic cannot be used with --plan because dynamic mode enforces --yolo".into(),
+        ));
+    }
+    // Parse --leader eagerly so a malformed value fails before any container work.
+    if let Some(raw) = &flags.leader {
+        LeaderSpec::parse(raw)?;
+    }
+    Ok(())
+}
+
+/// Apply the implied flags for `--dynamic` mode (WI-0092 §4): forces `yolo`
+/// and `worktree` to `true` and appends `context(workflow)` to the overlay
+/// list if it is not already present. Called once before any downstream
+/// resolution so all subsequent code sees the correct values.
+pub(crate) fn apply_dynamic_implied_flags(flags: &mut ExecWorkflowCommandFlags) {
+    flags.yolo = true;
+    flags.worktree = true;
+    if !flags
+        .overlay
+        .iter()
+        .any(|o| o.trim_start().starts_with("context(workflow"))
+    {
+        flags.overlay.push("context(workflow)".to_string());
+    }
+}
+
+/// Resolve the leader agent name and optional model override from `flags` and
+/// `session` (WI-0092 §7 precedence).
+///
+/// Precedence:
+/// 1. `--leader agent::model` provided → `leader_agent = spec.agent`, `leader_model = spec.model`;
+///    `--model` is ignored for the leader.
+/// 2. `--model` provided, no `--leader` → default agent, `leader_model = flags.model`.
+/// 3. Neither → default agent, `leader_model = None`.
+pub(crate) fn resolve_leader_model(
+    flags: &ExecWorkflowCommandFlags,
+    session: &Session,
+) -> Result<(crate::data::session::AgentName, Option<String>), CommandError> {
+    match &flags.leader {
+        Some(raw) => {
+            let spec = LeaderSpec::parse(raw)?;
+            let agent = crate::data::session::AgentName::new(&spec.agent)
+                .map_err(CommandError::from)?;
+            Ok((agent, Some(spec.model)))
+        }
+        None => {
+            let agent = crate::command::commands::resolve_agent(&flags.agent, session)?;
+            Ok((agent, flags.model.clone()))
+        }
+    }
+}
+
+/// Validate the `workflow.toml` produced by the leader agent: checks file
+/// presence, TOML parse, and resolved-agent Dockerfile validation. Returns the
+/// parsed [`Workflow`] on success or a human-readable error string that is
+/// passed to the repair loop (WI-0092 §9).
+pub(crate) fn validate_generated_workflow(
+    generated_path: &std::path::Path,
+    session: &Session,
+    paths: &crate::data::RepoDockerfilePaths,
+) -> Result<Workflow, String> {
+    if !generated_path.exists() {
+        return Err(format!(
+            "leader agent did not produce workflow.toml at {}",
+            generated_path.display()
+        ));
+    }
+    match Workflow::load(generated_path) {
+        Err(e) => Err(e.to_string()),
+        Ok(wf) => match resolve_and_validate_workflow_agents(&wf, session, paths) {
+            Err(e) => Err(e),
+            Ok(_) => Ok(wf),
+        },
+    }
+}
+
+/// Format the discovered agents into the newline-separated listing substituted
+/// into the leader prompt's `{{available_agents}}` slot.
+pub(crate) fn format_available_agents(agents: &[(String, std::path::PathBuf)]) -> String {
+    if agents.is_empty() {
+        return "(no agents discovered — the project has no .awman/Dockerfile.<agent> files)"
+            .to_string();
+    }
+    agents
+        .iter()
+        .map(|(name, _)| format!("  - {name}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Resolve the unique set of agent names a workflow will launch, using the same
+/// precedence as `WorkflowEngine::resolve_agent` (step → workflow → session
+/// default), and validate that each has a project Dockerfile. On success
+/// returns the set of resolved agents; on failure returns a human-readable
+/// error string suitable for the leader repair prompt (WI-0092 §9a).
+pub(crate) fn resolve_and_validate_workflow_agents(
+    workflow: &Workflow,
+    session: &Session,
+    paths: &crate::data::RepoDockerfilePaths,
+) -> Result<Vec<String>, String> {
+    let workflow_default = workflow.agent.as_deref();
+    let session_default = session.default_agent().map(|a| a.as_str().to_string());
+
+    let mut resolved: Vec<String> = Vec::new();
+    for step in &workflow.steps {
+        let agent = step
+            .agent
+            .as_deref()
+            .or(workflow_default)
+            .or(session_default.as_deref());
+        match agent {
+            Some(a) => {
+                if !resolved.iter().any(|r| r == a) {
+                    resolved.push(a.to_string());
+                }
+            }
+            None => {
+                let available = paths.discover_agent_dockerfiles();
+                let names: Vec<String> = available.into_iter().map(|(n, _)| n).collect();
+                return Err(format!(
+                    "step '{}' resolves to no agent: it sets no agent, the workflow sets no \
+                     default agent, and the session has no default agent. Add a workflow-level \
+                     `agent` field. Available agents: {}",
+                    step.name,
+                    if names.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        names.join(", ")
+                    },
+                ));
+            }
+        }
+    }
+
+    let available = paths.discover_agent_dockerfiles();
+    let available_names: Vec<String> = available.iter().map(|(n, _)| n.clone()).collect();
+    let unknown: Vec<&String> = resolved
+        .iter()
+        .filter(|a| !paths.agent_dockerfile(a).exists())
+        .collect();
+    if !unknown.is_empty() {
+        let mut msg = String::from(
+            "workflow.toml references agents with no Dockerfile in the project:\n",
+        );
+        for a in &unknown {
+            msg.push_str(&format!("  - \"{a}\" (expected .awman/Dockerfile.{a})\n"));
+        }
+        msg.push_str(&format!(
+            "Available agents: {}",
+            if available_names.is_empty() {
+                "(none)".to_string()
+            } else {
+                available_names.join(", ")
+            },
+        ));
+        return Err(msg);
+    }
+    Ok(resolved)
+}
+
+/// Outcome of driving a single leader/repair agent attempt through the stuck →
+/// yolo countdown → auto-advance pipeline.
+enum LeaderDriveOutcome {
+    /// The leader container completed or was advanced; proceed to validation.
+    Advanced,
+    /// The user aborted the dynamic invocation.
+    Aborted,
+}
+
+impl ExecWorkflowCommand {
+    /// Dynamic mode (WI-0092): a leader agent designs a `workflow.toml` for the
+    /// requested work item, then awman validates and executes it. Performs all
+    /// shared setup (worktree, context, work item) exactly once, then falls
+    /// through to [`execute_prepared`] — it never re-enters
+    /// `run_with_frontend`.
+    async fn run_dynamic(
+        self,
+        mut frontend: Box<dyn ExecWorkflowCommandFrontend>,
+    ) -> Result<ExecWorkflowOutcome, CommandError> {
+        warn_legacy_config(&self.session, frontend.as_mut());
+
+        // ── Effective (implied) flags: --dynamic forces --yolo, --worktree,
+        //    and context(workflow) (WI-0092 §4). Computed once so all
+        //    downstream code sees the correct values.
+        let mut effective_flags = self.flags.clone();
+        apply_dynamic_implied_flags(&mut effective_flags);
+
+        // ── Resolve the leader agent + model (WI-0092 §7). ──────────────────
+        let (leader_agent, leader_model) = resolve_leader_model(&self.flags, &self.session)?;
+
+        // ── Resolve the work item file + content (REQUIRED for dynamic). ────
+        let wi_str = self
+            .flags
+            .work_item
+            .as_deref()
+            .expect("validated: --dynamic requires --work-item");
+        let wi_number = parse_work_item_number(wi_str).ok_or_else(|| {
+            CommandError::Other(format!("could not parse a work item number from {wi_str:?}"))
+        })?;
+        let base_session = self.session.clone();
+        let git_root_for_scope = base_session.git_root().to_path_buf();
+        let cwd = base_session.working_dir().to_path_buf();
+        let wi_file = find_work_item_file(&git_root_for_scope, wi_number).ok_or_else(|| {
+            CommandError::Other(format!(
+                "work item file for {wi_number:04} not found; dynamic mode cannot design a \
+                 workflow without the work item content"
+            ))
+        })?;
+        let wi_content = std::fs::read_to_string(&wi_file).map_err(|e| {
+            CommandError::Other(format!(
+                "failed to read work item file {}: {e}",
+                wi_file.display()
+            ))
+        })?;
+        let work_item_context = WorkItemContext {
+            number: wi_number,
+            content: wi_content,
+        };
+
+        // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
+        if base_session.session_type().is_remote() {
+            return Err(CommandError::Other(
+                "dynamic workflows are not supported for remote sessions".into(),
+            ));
+        }
+        let git_root = self
+            .engines
+            .git_engine
+            .resolve_root(&cwd)
+            .map_err(CommandError::from)?;
+        let lifecycle = WorktreeLifecycle::for_work_item(
+            Arc::clone(&self.engines.git_engine),
+            git_root,
+            wi_number,
+        )?;
+        let worktree_path = lifecycle.prepare(&mut *frontend).await?;
+        let mount_path = worktree_path.clone();
+        let worktree_git_mount = worktree_git_overlay(&mount_path)?;
+
+        // Re-root a session at the worktree so the leader operates on the
+        // isolated checkout.
+        let leader_git_root = self
+            .engines
+            .git_engine
+            .resolve_root(&worktree_path)
+            .map_err(CommandError::from)?;
+        let leader_session = Session::open_at_git_root(
+            worktree_path.clone(),
+            leader_git_root,
+            crate::data::session::SessionOpenOptions::default(),
+        )
+        .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?;
+
+        // The work item path the leader sees is inside the mounted worktree.
+        let wi_relative = wi_file
+            .strip_prefix(&git_root_for_scope)
+            .unwrap_or(&wi_file);
+        let leader_work_item_path = std::path::Path::new("/workspace").join(wi_relative);
+
+        // ── Resolve the context(workflow) overlay for the leader. ───────────
+        let (leader_context_overlays, leader_system_prompt) = resolve_context_overlays(
+            &[crate::command::commands::ContextOverlaySpec {
+                scope: crate::engine::overlay::ContextScope::Workflow,
+                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+            }],
+            &leader_session,
+            &leader_agent,
+            None,
+            None,
+            frontend.as_mut(),
+        )?;
+        let context_dir = leader_context_overlays
+            .iter()
+            .find(|o| matches!(o.scope, crate::engine::overlay::ContextScope::Workflow))
+            .map(|o| o.host_path.clone())
+            .ok_or_else(|| {
+                CommandError::Other("failed to resolve workflow context directory".into())
+            })?;
+
+        // ── Seed the context dir: remove stale workflow.toml, write refs. ───
+        let generated_path = context_dir.join("workflow.toml");
+        let _ = std::fs::remove_file(&generated_path);
+        std::fs::write(
+            context_dir.join("example-workflow.toml"),
+            crate::data::dynamic_workflow_assets::EXAMPLE_WORKFLOW_TOML,
+        )
+        .map_err(|e| CommandError::Other(format!("writing example-workflow.toml: {e}")))?;
+        std::fs::write(
+            context_dir.join("workflow-usage.md"),
+            crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD,
+        )
+        .map_err(|e| CommandError::Other(format!("writing workflow-usage.md: {e}")))?;
+
+        // ── Discover available agents + ensure the leader image is built. ───
+        let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
+        let available_agents = paths.discover_agent_dockerfiles();
+        ensure_agent_image(
+            &self.engines,
+            &git_root_for_scope,
+            &paths,
+            leader_agent.as_str(),
+            frontend.as_mut(),
+        )?;
+
+        let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            &format!("{wi_number:04}"),
+            &leader_work_item_path.display().to_string(),
+            &format_available_agents(&available_agents),
+        );
+
+        // Record the worktree's clean baseline so we can detect a leader that
+        // illicitly modifies source files (WI-0092 §7 mutation guard).
+        let worktree_baseline = worktree_git_status(&worktree_path);
+
+        // ── Wrap the frontend so the agent run + yolo ticks can share it. ───
+        let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
+            Arc::new(Mutex::new(frontend));
+
+        // ── Leader + repair loop (WI-0092 §9). ──────────────────────────────
+        let mut attempt = 0usize;
+        let mut current_prompt = leader_prompt;
+        let validated_workflow = loop {
+            let label = if attempt == 0 {
+                "leader".to_string()
+            } else {
+                format!("leader-repair-{attempt}")
+            };
+            let drive = self
+                .drive_leader_agent(
+                    Arc::clone(&shared),
+                    &leader_session,
+                    &leader_agent,
+                    leader_model.as_deref(),
+                    &current_prompt,
+                    &git_root_for_scope,
+                    leader_context_overlays.clone(),
+                    leader_system_prompt.clone(),
+                    &label,
+                )
+                .await?;
+            if matches!(drive, LeaderDriveOutcome::Aborted) {
+                return Err(CommandError::Other(
+                    "dynamic workflow aborted during the leader step".into(),
+                ));
+            }
+
+            // Mutation guard: the leader may only write under the context dir.
+            let after = worktree_git_status(&worktree_path);
+            if after != worktree_baseline {
+                return Err(CommandError::Other(format!(
+                    "leader agent modified files in the worktree; dynamic pre-flight may only \
+                     write under the workflow context directory. Changed worktree status:\n{after}"
+                )));
+            }
+
+            // Validate: file present → parse → agent validation.
+            let result = validate_generated_workflow(&generated_path, &leader_session, &paths);
+
+            match result {
+                Ok(wf) => break wf,
+                Err(err) => {
+                    attempt += 1;
+                    if attempt > 3 {
+                        return Err(CommandError::Other(format!(
+                            "leader agent failed to produce a valid workflow.toml after 3 repair \
+                             attempts; last error: {err}; file is at {}",
+                            generated_path.display()
+                        )));
+                    }
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "workflow.toml validation failed (attempt {attempt}/3): {err}"
+                        ),
+                    });
+                    current_prompt =
+                        crate::data::dynamic_workflow_assets::build_repair_prompt(&err);
+                }
+            }
+        };
+
+        // ── Build any missing agent images before execution (WI-0092 §9b). ──
+        let resolved_agents =
+            resolve_and_validate_workflow_agents(&validated_workflow, &leader_session, &paths)
+                .map_err(CommandError::Other)?;
+        {
+            let mut guard = shared.lock().unwrap();
+            for agent in &resolved_agents {
+                ensure_agent_image(
+                    &self.engines,
+                    &git_root_for_scope,
+                    &paths,
+                    agent,
+                    guard.as_mut(),
+                )?;
+            }
+        }
+
+        // ── Reclaim the frontend and execute the generated workflow. ────────
+        let frontend = Arc::try_unwrap(shared)
+            .unwrap_or_else(|_| panic!("no other Arc references remain after leader phase"))
             .into_inner()
             .unwrap();
 
-        // 9. PTY inactive — flush queued messages.
-        frontend.set_pty_active(false);
-        frontend.replay_queued();
+        // Build the CLI overlay list (includes the implied context(workflow)).
+        let mut cli_typed = Vec::new();
+        for s in &effective_flags.overlay {
+            match parse_overlay_list(s) {
+                Ok(parsed) => cli_typed.extend(parsed),
+                Err(reason) => {
+                    return Err(CommandError::InvalidOverlaySpec {
+                        spec: s.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
 
-        // 10. Determine whether the workflow ended with an error.
-        let had_error = matches!(
-            engine_result,
-            Err(_)
-                | Ok(WorkflowOutcome::Failed { .. })
-                | Ok(WorkflowOutcome::Aborted)
-                | Ok(WorkflowOutcome::CompletedTeardownFailed)
-        );
-
-        // 11. Report summary.
-        //
-        // `exit_code` is the unambiguous overall outcome:
-        //   Some(0) — workflow completed successfully
-        //   Some(N) — a step failed (Failed → failing step's exit code;
-        //             Aborted → 1, since the user/engine bailed after a failure)
-        //   None    — workflow paused; no terminal status yet
-        //
-        // Callers (CLI, TUI, API queue worker) inspect this to determine the
-        // final success/failure of the run.
-        let exit_code = match &engine_result {
-            Ok(WorkflowOutcome::Completed) => Some(0),
-            Ok(WorkflowOutcome::CompletedTeardownFailed) => Some(1),
-            Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
-            Ok(WorkflowOutcome::Aborted) => Some(1),
-            Ok(WorkflowOutcome::Paused) => None,
-            Err(_) => Some(1),
+        let prepared = PreparedRun {
+            workflow: validated_workflow,
+            workflow_path: generated_path,
+            work_item_context: Some(work_item_context),
+            cli_typed,
+            mount_path,
+            worktree_path: Some(worktree_path),
+            worktree_lifecycle: Some(lifecycle),
+            worktree_git_mount,
+            git_root_for_scope,
+            cwd,
+            original_session: base_session,
+            issue_temp_file: None,
         };
-        frontend.report_workflow_summary(&WorkflowSummary {
-            steps_completed: step_counts.0,
-            steps_failed: step_counts.1.max(if had_error { 1 } else { 0 }),
+        execute_prepared(&effective_flags, &self.engines, prepared, frontend).await
+    }
+
+    /// Launch a single leader/repair agent container and drive it through the
+    /// same stuck → yolo countdown → auto-advance pipeline a workflow step
+    /// uses. The container is killed when the countdown advances (WI-0092 §8).
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_leader_agent(
+        &self,
+        shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+        session: &Session,
+        agent: &crate::data::session::AgentName,
+        model: Option<&str>,
+        prompt: &str,
+        image_git_root: &std::path::Path,
+        context_overlays: Vec<crate::engine::overlay::ContextOverlay>,
+        system_prompt: Option<String>,
+        label: &str,
+    ) -> Result<LeaderDriveOutcome, CommandError> {
+        use crate::engine::agent_runtime::execution::StuckEvent;
+
+        let run_opts = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            initial_prompt: Some(prompt.to_string()),
+            model: model.map(|m| m.to_string()),
+            allow_docker: self.flags.allow_docker,
+            non_interactive: self.flags.non_interactive,
+            image_tag_override: Some(crate::data::image_tags::agent_image_tag(
+                image_git_root,
+                agent.as_str(),
+            )),
+            system_prompt,
+            context_overlays,
+            ..Default::default()
+        };
+        let creds = self
+            .engines
+            .auth_engine
+            .resolve_agent_auth(session, agent)
+            .map(|c| c.env_vars)
+            .unwrap_or_default();
+        let resolved = self.engines.agent_engine.resolve_agent_options(
+            session,
+            agent,
+            &run_opts,
+            &creds,
+            self.engines.runtime.as_ref(),
+        )?;
+        let instance = self.engines.runtime.build(resolved)?;
+
+        shared.lock().unwrap().write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("Launching dynamic workflow {label} agent ({})…", agent.as_str()),
+        });
+        shared.lock().unwrap().set_pty_active(true);
+
+        let proxy = AgentFrontendProxy(Arc::clone(&shared));
+        let mut execution = match instance.run_with_frontend(Box::new(proxy)) {
+            Ok(e) => e,
+            Err(e) => {
+                let mut g = shared.lock().unwrap();
+                g.set_pty_active(false);
+                g.replay_queued();
+                return Err(CommandError::from(e));
+            }
+        };
+
+        let cancel = execution.cancel_handle();
+        let mut stuck_rx = execution.subscribe_stuck();
+        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = execution.wait().await;
+            let _ = wait_tx.send(());
         });
 
-        // 12. Worktree finalize.
-        if let Some(lifecycle) = worktree_lifecycle {
-            if let Err(e) = lifecycle.finalize(&mut *frontend, had_error).await {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec workflow: worktree finalize failed: {e}"),
-                });
-                return Err(e);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = &mut wait_rx => {
+                    break LeaderDriveOutcome::Advanced;
+                }
+                ev = stuck_rx.recv() => {
+                    match ev {
+                        Ok(StuckEvent::Stuck) => {
+                            match run_leader_yolo_countdown(
+                                &shared,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                                label,
+                            )
+                            .await
+                            {
+                                LeaderCountdownOutcome::Advance => {
+                                    if let Some(c) = &cancel {
+                                        let _ = c.cancel();
+                                    }
+                                    break LeaderDriveOutcome::Advanced;
+                                }
+                                LeaderCountdownOutcome::Completed => {
+                                    break LeaderDriveOutcome::Advanced;
+                                }
+                                LeaderCountdownOutcome::Recovered => continue,
+                                LeaderCountdownOutcome::Abort => {
+                                    if let Some(c) = &cancel {
+                                        let _ = c.cancel();
+                                    }
+                                    break LeaderDriveOutcome::Aborted;
+                                }
+                            }
+                        }
+                        Ok(StuckEvent::Unstuck) => continue,
+                        Ok(StuckEvent::StartupGraceExpired) => {
+                            break LeaderDriveOutcome::Advanced;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            let _ = (&mut wait_rx).await;
+                            break LeaderDriveOutcome::Advanced;
+                        }
+                    }
+                }
             }
-            frontend.replay_queued();
-        }
+        };
 
-        // 13. Surface engine errors after lifecycle cleanup.
-        if let Err(e) = engine_result {
-            let err = CommandError::from(e);
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: workflow engine error: {err}"),
-            });
-            return Err(err);
-        }
-
-        // `_issue_temp_file`'s Drop impl removes the temp file when this
-        // function returns — covers both this success path and every early
-        // error return above.
-
-        Ok(ExecWorkflowOutcome {
-            workflow: workflow_path.display().to_string(),
-            exit_code,
-            worktree_used: self.flags.worktree,
-        })
+        let mut g = shared.lock().unwrap();
+        g.set_pty_active(false);
+        g.replay_queued();
+        Ok(outcome)
     }
+}
+
+/// Result of the leader yolo countdown.
+enum LeaderCountdownOutcome {
+    /// Countdown expired or user advanced — kill the container and proceed.
+    Advance,
+    /// The leader container exited on its own during the countdown.
+    Completed,
+    /// The leader resumed output (`Unstuck`) — cancel the countdown.
+    Recovered,
+    /// The user aborted.
+    Abort,
+}
+
+/// Drive the 60-second yolo countdown for the leader step, reusing the same
+/// `WorkflowFrontend::yolo_countdown_tick` pipeline as a workflow step. The
+/// right-arrow / advance action carries the "Start dynamic workflow" label via
+/// [`AvailableActions::launch_next_label`].
+async fn run_leader_yolo_countdown(
+    shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    wait_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    stuck_rx: &mut tokio::sync::broadcast::Receiver<
+        crate::engine::agent_runtime::execution::StuckEvent,
+    >,
+    step_name: &str,
+) -> LeaderCountdownOutcome {
+    use crate::engine::agent_runtime::execution::StuckEvent;
+    use crate::engine::workflow::actions::YoloTickOutcome;
+    use crate::engine::workflow::timing::YOLO_COUNTDOWN_DURATION;
+
+    let total = YOLO_COUNTDOWN_DURATION;
+    let tick = Duration::from_millis(200);
+    let mut remaining = total;
+    shared.lock().unwrap().yolo_countdown_started(step_name);
+
+    let outcome = loop {
+        let tick_result = shared
+            .lock()
+            .unwrap()
+            .yolo_countdown_tick(step_name, remaining, total);
+        match tick_result {
+            Ok(YoloTickOutcome::Continue) => {}
+            Ok(YoloTickOutcome::AdvanceNow) => break LeaderCountdownOutcome::Advance,
+            Ok(YoloTickOutcome::Cancel) => break LeaderCountdownOutcome::Abort,
+            Err(_) => break LeaderCountdownOutcome::Advance,
+        }
+        if remaining.is_zero() {
+            break LeaderCountdownOutcome::Advance;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut *wait_rx => break LeaderCountdownOutcome::Completed,
+            ev = stuck_rx.recv() => {
+                match ev {
+                    Ok(StuckEvent::Unstuck) => break LeaderCountdownOutcome::Recovered,
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
+            }
+            _ = tokio::time::sleep(tick) => {
+                remaining = remaining.saturating_sub(tick);
+            }
+        }
+    };
+
+    shared.lock().unwrap().yolo_countdown_finished(step_name);
+    outcome
+}
+
+/// Capture the worktree's `git status --porcelain` output, used as a mutation
+/// guard around leader/repair runs (the leader must only write under the
+/// context dir, never touch the worktree's tracked or untracked files).
+fn worktree_git_status(worktree: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// Ensure a Dockerfile-backed agent image is available for a container runtime,
+/// building it from `.awman/Dockerfile.<agent>` when missing (WI-0092 §9b).
+/// A missing Dockerfile is a hard error; a build failure is a hard error and
+/// is never routed through the repair loop.
+fn ensure_agent_image(
+    engines: &Engines,
+    git_root: &std::path::Path,
+    paths: &crate::data::RepoDockerfilePaths,
+    agent: &str,
+    sink: &mut dyn UserMessageSink,
+) -> Result<(), CommandError> {
+    let runtime = engines.require_container_runtime().map_err(CommandError::from)?;
+    let dockerfile = paths.agent_dockerfile(agent);
+    if !dockerfile.exists() {
+        return Err(CommandError::Other(format!(
+            "agent '{agent}' has no Dockerfile (expected {})",
+            dockerfile.display()
+        )));
+    }
+    let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
+    if runtime.image_exists(&tag) {
+        return Ok(());
+    }
+    sink.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!("Building image for agent '{agent}' ({tag})…"),
+    });
+    runtime
+        .build_image(&tag, &dockerfile, git_root, false, &mut |line: &str| {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: line.to_string(),
+            });
+        })
+        .map_err(|e| {
+            CommandError::Other(format!(
+                "failed to build image for agent '{agent}' from {}: {e}",
+                dockerfile.display()
+            ))
+        })?;
+    sink.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!("Built image for agent '{agent}'."),
+    });
+    Ok(())
 }
 
 /// Emit the gemini → antigravity deprecation warning. Centralised so the wording
@@ -1922,7 +2771,7 @@ prompt = "do something"
         );
 
         let flags = ExecWorkflowCommandFlags {
-            workflow: wf_path,
+            workflow: Some(wf_path),
             work_item: None,
             non_interactive: true,
             plan: false,
@@ -1935,6 +2784,8 @@ prompt = "do something"
             model: None,
             overlay: vec![],
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            dynamic: false,
+            leader: None,
         };
         let session = {
             let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
@@ -1983,7 +2834,7 @@ prompt = "do something"
         // Verify ExecWorkflowCommandFlags is constructable and worktree defaults
         // correctly reflect what dispatch sets.
         let flags = ExecWorkflowCommandFlags {
-            workflow: PathBuf::from("wf.toml"),
+            workflow: Some(PathBuf::from("wf.toml")),
             work_item: None,
             non_interactive: false,
             plan: false,
@@ -1996,6 +2847,8 @@ prompt = "do something"
             model: None,
             overlay: vec![],
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            dynamic: false,
+            leader: None,
         };
         assert!(!flags.worktree);
         assert!(!flags.yolo);
@@ -2006,7 +2859,7 @@ prompt = "do something"
         // Dispatch sets worktree=true when yolo=true; verify the flag struct
         // allows that combination.
         let flags = ExecWorkflowCommandFlags {
-            workflow: PathBuf::from("wf.toml"),
+            workflow: Some(PathBuf::from("wf.toml")),
             work_item: None,
             non_interactive: false,
             plan: false,
@@ -2019,6 +2872,8 @@ prompt = "do something"
             model: None,
             overlay: vec![],
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            dynamic: false,
+            leader: None,
         };
         assert!(flags.yolo);
         assert!(flags.worktree, "yolo must imply worktree");
@@ -2366,5 +3221,896 @@ prompt = "do something"
         );
         assert!(file_name.ends_with(".md"));
         assert!(file_name.contains(&build.slug));
+    }
+
+    // ─── WI-0092: Dynamic Workflows — unit tests ─────────────────────────────
+
+    // ── Helpers shared by WI-0092 tests ──────────────────────────────────────
+
+    fn make_dynamic_flags(
+        dynamic: bool,
+        workflow: Option<&str>,
+        work_item: Option<&str>,
+        leader: Option<&str>,
+        plan: bool,
+        model: Option<&str>,
+    ) -> ExecWorkflowCommandFlags {
+        ExecWorkflowCommandFlags {
+            workflow: workflow.map(PathBuf::from),
+            work_item: work_item.map(|s| s.to_string()),
+            non_interactive: false,
+            plan,
+            allow_docker: false,
+            worktree: false,
+            yolo: false,
+            auto: false,
+            agent: None,
+            model: model.map(|s| s.to_string()),
+            overlay: vec![],
+            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
+            dynamic,
+            leader: leader.map(|s| s.to_string()),
+        }
+    }
+
+    fn make_session_simple(tmp: &tempfile::TempDir) -> crate::data::session::Session {
+        make_session_with_default_agent(tmp, None)
+    }
+
+    fn make_session_with_agent(
+        tmp: &tempfile::TempDir,
+        agent: &str,
+    ) -> crate::data::session::Session {
+        make_session_with_default_agent(tmp, Some(agent))
+    }
+
+    // ── validate_dynamic_flags ────────────────────────────────────────────────
+
+    #[test]
+    fn validate_dynamic_flags_rejects_path_with_dynamic() {
+        let flags = make_dynamic_flags(true, Some("/tmp/wf.toml"), Some("0042"), None, false, None);
+        let err = validate_dynamic_flags(&flags).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot specify a workflow file path with --dynamic"),
+            "error must explain the conflict, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_requires_work_item_with_dynamic() {
+        let flags = make_dynamic_flags(true, None, None, None, false, None);
+        let err = validate_dynamic_flags(&flags).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--dynamic requires --work-item"),
+            "error must name the missing flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_rejects_leader_without_dynamic() {
+        let flags = make_dynamic_flags(
+            false,
+            Some("/tmp/wf.toml"),
+            None,
+            Some("claude::claude-opus-4-8"),
+            false,
+            None,
+        );
+        let err = validate_dynamic_flags(&flags).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--leader is only valid with --dynamic"),
+            "error must name the constraint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_rejects_dynamic_with_plan() {
+        let flags = make_dynamic_flags(true, None, Some("0042"), None, true, None);
+        let err = validate_dynamic_flags(&flags).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--dynamic cannot be used with --plan"),
+            "error must explain why dynamic+plan is rejected, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_rejects_malformed_leader_value() {
+        // Malformed --leader (no "::" separator) is caught by validate_dynamic_flags.
+        let flags = make_dynamic_flags(true, None, Some("0042"), Some("claude"), false, None);
+        let err = validate_dynamic_flags(&flags).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid --leader value"),
+            "error must describe malformed leader, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_ok_with_valid_dynamic_invocation() {
+        let flags =
+            make_dynamic_flags(true, None, Some("0042"), Some("claude::claude-opus-4-8"), false, None);
+        assert!(
+            validate_dynamic_flags(&flags).is_ok(),
+            "valid dynamic invocation with --leader must pass"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_ok_with_dynamic_no_leader() {
+        let flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        assert!(
+            validate_dynamic_flags(&flags).is_ok(),
+            "valid dynamic invocation without --leader must pass"
+        );
+    }
+
+    #[test]
+    fn validate_dynamic_flags_ok_with_static_invocation() {
+        let flags = make_dynamic_flags(false, Some("/tmp/wf.toml"), None, None, false, None);
+        assert!(
+            validate_dynamic_flags(&flags).is_ok(),
+            "valid static invocation must pass"
+        );
+    }
+
+    // ── LeaderSpec::parse ─────────────────────────────────────────────────────
+
+    #[test]
+    fn leader_spec_parses_valid_agent_and_model() {
+        let spec = LeaderSpec::parse("claude::claude-opus-4-8").unwrap();
+        assert_eq!(spec.agent, "claude");
+        assert_eq!(spec.model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn leader_spec_error_plain_string_no_double_colon() {
+        let err = LeaderSpec::parse("claude").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --leader value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn leader_spec_error_empty_string() {
+        let err = LeaderSpec::parse("").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --leader value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn leader_spec_error_empty_agent_component() {
+        let err = LeaderSpec::parse("::claude-opus-4-8").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --leader value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn leader_spec_error_empty_model_component() {
+        let err = LeaderSpec::parse("claude::").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --leader value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn leader_spec_error_three_components() {
+        let err = LeaderSpec::parse("a::b::c").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid --leader value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn leader_spec_error_message_includes_format_hint() {
+        let err = LeaderSpec::parse("badvalue").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent::model"),
+            "error must include the expected format hint, got: {msg}"
+        );
+    }
+
+    // ── apply_dynamic_implied_flags ───────────────────────────────────────────
+
+    #[test]
+    fn apply_dynamic_implied_flags_sets_yolo_true() {
+        let mut flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        flags.yolo = false;
+        apply_dynamic_implied_flags(&mut flags);
+        assert!(flags.yolo, "apply_dynamic_implied_flags must set yolo=true");
+    }
+
+    #[test]
+    fn apply_dynamic_implied_flags_sets_worktree_true() {
+        let mut flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        flags.worktree = false;
+        apply_dynamic_implied_flags(&mut flags);
+        assert!(
+            flags.worktree,
+            "apply_dynamic_implied_flags must set worktree=true"
+        );
+    }
+
+    #[test]
+    fn apply_dynamic_implied_flags_adds_context_workflow_overlay() {
+        let mut flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        flags.overlay.clear();
+        apply_dynamic_implied_flags(&mut flags);
+        assert!(
+            flags.overlay.iter().any(|o| o.contains("context(workflow")),
+            "apply_dynamic_implied_flags must add context(workflow) overlay"
+        );
+    }
+
+    #[test]
+    fn apply_dynamic_implied_flags_does_not_duplicate_context_overlay() {
+        let mut flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        flags.overlay = vec!["context(workflow)".to_string()];
+        apply_dynamic_implied_flags(&mut flags);
+        let count = flags
+            .overlay
+            .iter()
+            .filter(|o| o.contains("context(workflow"))
+            .count();
+        assert_eq!(count, 1, "context(workflow) must not be duplicated");
+    }
+
+    #[test]
+    fn apply_dynamic_implied_flags_preserves_existing_overlays() {
+        let mut flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        flags.overlay = vec!["env(MY_VAR)".to_string()];
+        apply_dynamic_implied_flags(&mut flags);
+        assert!(
+            flags.overlay.contains(&"env(MY_VAR)".to_string()),
+            "pre-existing overlays must be preserved"
+        );
+    }
+
+    // ── build_leader_prompt / build_repair_prompt ─────────────────────────────
+
+    #[test]
+    fn build_leader_prompt_substitutes_work_item_number() {
+        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0042",
+            "/workspace/aspec/work-items/0042-my-item.md",
+            "  - claude",
+        );
+        assert!(
+            prompt.contains("0042"),
+            "leader prompt must contain the work item number"
+        );
+    }
+
+    #[test]
+    fn build_leader_prompt_substitutes_work_item_path() {
+        let path = "/workspace/aspec/work-items/0042-my-item.md";
+        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0042",
+            path,
+            "  - claude",
+        );
+        assert!(
+            prompt.contains(path),
+            "leader prompt must contain the work item path"
+        );
+    }
+
+    #[test]
+    fn build_leader_prompt_substitutes_available_agents() {
+        let agents = "  - claude\n  - maki";
+        let prompt =
+            crate::data::dynamic_workflow_assets::build_leader_prompt("0042", "/path", agents);
+        assert!(
+            prompt.contains("claude"),
+            "leader prompt must list available agents"
+        );
+        assert!(
+            prompt.contains("maki"),
+            "leader prompt must list all available agents"
+        );
+    }
+
+    #[test]
+    fn build_leader_prompt_no_unreplaced_placeholders() {
+        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0099",
+            "/workspace/aspec/work-items/0099-task.md",
+            "  - claude",
+        );
+        assert!(
+            !prompt.contains("{{work_item_number}}"),
+            "{{work_item_number}} must be substituted"
+        );
+        assert!(
+            !prompt.contains("{{work_item_path}}"),
+            "{{work_item_path}} must be substituted"
+        );
+        assert!(
+            !prompt.contains("{{available_agents}}"),
+            "{{available_agents}} must be substituted"
+        );
+    }
+
+    #[test]
+    fn build_repair_prompt_substitutes_validation_error() {
+        let error = "TOML parse error: unexpected key 'bogus' at line 3";
+        let prompt = crate::data::dynamic_workflow_assets::build_repair_prompt(error);
+        assert!(
+            prompt.contains(error),
+            "repair prompt must contain the verbatim validation error, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_repair_prompt_no_unreplaced_placeholders() {
+        let prompt = crate::data::dynamic_workflow_assets::build_repair_prompt("some error");
+        assert!(
+            !prompt.contains("{{validation_error}}"),
+            "{{validation_error}} must be substituted"
+        );
+    }
+
+    // ── Embedded assets ───────────────────────────────────────────────────────
+
+    #[test]
+    fn example_workflow_toml_parses_as_valid_workflow() {
+        use crate::data::workflow_definition::WorkflowFormat;
+        let result = crate::data::workflow_definition::Workflow::parse(
+            crate::data::dynamic_workflow_assets::EXAMPLE_WORKFLOW_TOML,
+            WorkflowFormat::Toml,
+        );
+        assert!(
+            result.is_ok(),
+            "EXAMPLE_WORKFLOW_TOML must parse as a valid Workflow: {:?}",
+            result.err()
+        );
+        let wf = result.unwrap();
+        assert!(!wf.steps.is_empty(), "example workflow must have at least one step");
+    }
+
+    #[test]
+    fn workflow_usage_md_is_nonempty() {
+        assert!(
+            !crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD.is_empty(),
+            "WORKFLOW_USAGE_MD must not be empty"
+        );
+    }
+
+    #[test]
+    fn leader_prompt_md_is_nonempty() {
+        assert!(
+            !crate::data::dynamic_workflow_assets::LEADER_PROMPT_MD.is_empty(),
+            "LEADER_PROMPT_MD must not be empty"
+        );
+    }
+
+    #[test]
+    fn leader_repair_prompt_is_nonempty() {
+        assert!(
+            !crate::data::dynamic_workflow_assets::LEADER_REPAIR_PROMPT.is_empty(),
+            "LEADER_REPAIR_PROMPT must not be empty"
+        );
+    }
+
+    // ── Leader model selection (WI-0092 §7) ──────────────────────────────────
+
+    #[test]
+    fn resolve_leader_model_with_leader_flag_uses_spec_agent_and_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_simple(&tmp);
+        let mut flags = make_dynamic_flags(
+            true,
+            None,
+            Some("0042"),
+            Some("claude::claude-opus-4-8"),
+            false,
+            None,
+        );
+        flags.agent = None;
+        let (agent, model) = resolve_leader_model(&flags, &session).unwrap();
+        assert_eq!(agent.as_str(), "claude");
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn resolve_leader_model_with_leader_flag_ignores_flags_model() {
+        // --leader takes full precedence; --model must NOT be used for the leader.
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_simple(&tmp);
+        let mut flags = make_dynamic_flags(
+            true,
+            None,
+            Some("0042"),
+            Some("claude::claude-opus-4-8"),
+            false,
+            Some("some-other-model"),
+        );
+        flags.agent = None;
+        let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-opus-4-8"),
+            "--model must be ignored for the leader when --leader is present"
+        );
+    }
+
+    #[test]
+    fn resolve_leader_model_with_model_flag_no_leader_passes_model() {
+        // Case (b): --model present, no --leader → model forwarded from flags.
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_agent(&tmp, "maki");
+        let flags = make_dynamic_flags(true, None, Some("0042"), None, false, Some("custom-model"));
+        let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("custom-model"),
+            "--model must be passed to leader when no --leader"
+        );
+    }
+
+    #[test]
+    fn resolve_leader_model_with_neither_flag_model_is_none() {
+        // Case (c): neither --leader nor --model → no model override.
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_simple(&tmp);
+        let flags = make_dynamic_flags(true, None, Some("0042"), None, false, None);
+        let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+        assert!(
+            model.is_none(),
+            "model must be None when neither --leader nor --model is set"
+        );
+    }
+
+    #[test]
+    fn resolve_leader_model_both_flags_leader_model_wins() {
+        // Case (d): both --leader and --model → leader spec's model governs.
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_simple(&tmp);
+        let flags = make_dynamic_flags(
+            true,
+            None,
+            Some("0042"),
+            Some("claude::claude-opus-4-8"),
+            false,
+            Some("should-be-ignored-for-leader"),
+        );
+        let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-opus-4-8"),
+            "leader spec model must win over --model when both are set"
+        );
+    }
+
+    // ── AvailableActions.launch_next_label ────────────────────────────────────
+
+    #[test]
+    fn available_actions_launch_next_label_defaults_to_none() {
+        let actions = AvailableActions::default();
+        assert!(
+            actions.launch_next_label.is_none(),
+            "launch_next_label must default to None (renders fallback label)"
+        );
+    }
+
+    #[test]
+    fn available_actions_launch_next_label_can_be_set_to_dynamic_string() {
+        let actions = AvailableActions {
+            launch_next_label: Some("Start dynamic workflow".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            actions.launch_next_label.as_deref(),
+            Some("Start dynamic workflow")
+        );
+    }
+
+    #[test]
+    fn available_actions_cli_uses_launch_next_label_when_set() {
+        // Verify the rendering pattern: .as_deref().unwrap_or(fallback).
+        // The CLI uses: `available.launch_next_label.as_deref().unwrap_or("Launch next step (new container)")`.
+        let actions = AvailableActions {
+            launch_next_label: Some("Start dynamic workflow".to_string()),
+            can_launch_next: true,
+            ..Default::default()
+        };
+        let rendered = actions
+            .launch_next_label
+            .as_deref()
+            .unwrap_or("Launch next step (new container)");
+        assert_eq!(rendered, "Start dynamic workflow");
+    }
+
+    #[test]
+    fn available_actions_cli_falls_back_when_label_is_none() {
+        let actions = AvailableActions {
+            launch_next_label: None,
+            can_launch_next: true,
+            ..Default::default()
+        };
+        let rendered = actions
+            .launch_next_label
+            .as_deref()
+            .unwrap_or("Launch next step (new container)");
+        assert_eq!(rendered, "Launch next step (new container)");
+    }
+
+    #[test]
+    fn available_actions_tui_uses_launch_next_label_when_set() {
+        // TUI renders: state.launch_next_label.as_deref().unwrap_or("Next: new container")
+        let label: Option<String> = Some("Start dynamic workflow".to_string());
+        let rendered = label.as_deref().unwrap_or("Next: new container");
+        assert_eq!(rendered, "Start dynamic workflow");
+    }
+
+    #[test]
+    fn available_actions_tui_falls_back_to_next_new_container() {
+        let label: Option<String> = None;
+        let rendered = label.as_deref().unwrap_or("Next: new container");
+        assert_eq!(rendered, "Next: new container");
+    }
+
+    // ── format_available_agents ───────────────────────────────────────────────
+
+    #[test]
+    fn format_available_agents_empty_list_gives_placeholder() {
+        let result = format_available_agents(&[]);
+        assert!(
+            result.contains("no agents discovered"),
+            "empty agent list must give placeholder message, got: {result}"
+        );
+        assert!(
+            result.contains(".awman/Dockerfile.<agent>"),
+            "placeholder must mention the expected path, got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_available_agents_single_agent() {
+        let agents = vec![("claude".to_string(), std::path::PathBuf::from("/r/.awman/Dockerfile.claude"))];
+        let result = format_available_agents(&agents);
+        assert!(
+            result.contains("claude"),
+            "formatted agents must include the agent name, got: {result}"
+        );
+        assert!(
+            result.contains("  - claude"),
+            "agents must be formatted with '  - ' prefix, got: {result}"
+        );
+    }
+
+    #[test]
+    fn format_available_agents_multiple_agents_are_listed() {
+        let agents = vec![
+            ("claude".to_string(), std::path::PathBuf::from("/r/.awman/Dockerfile.claude")),
+            ("maki".to_string(), std::path::PathBuf::from("/r/.awman/Dockerfile.maki")),
+        ];
+        let result = format_available_agents(&agents);
+        assert!(result.contains("claude"), "must list claude");
+        assert!(result.contains("maki"), "must list maki");
+    }
+
+    // ── resolve_and_validate_workflow_agents ──────────────────────────────────
+
+    #[test]
+    fn resolve_validates_step_agent_with_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(None, &[Some("claude")]);
+        let result = resolve_and_validate_workflow_agents(&wf, &session, &paths);
+        assert!(
+            result.is_ok(),
+            "step agent with Dockerfile must validate OK, got: {:?}",
+            result.err()
+        );
+        let agents = result.unwrap();
+        assert!(agents.contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn resolve_error_step_agent_without_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        // No Dockerfile.gemini
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(None, &[Some("gemini")]);
+        let err = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap_err();
+        assert!(
+            err.contains("gemini"),
+            "error must name the unknown agent, got: {err}"
+        );
+        assert!(
+            err.contains("Dockerfile.gemini"),
+            "error must name the expected Dockerfile path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_error_unknown_agent_lists_available_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(None, &[Some("gemini")]);
+        let err = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap_err();
+        assert!(
+            err.contains("Available agents"),
+            "error must list available agents, got: {err}"
+        );
+        assert!(
+            err.contains("claude"),
+            "error must list claude as an available agent, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_validates_workflow_level_agent_with_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.maki"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        // Workflow-level agent, steps have no agent.
+        let wf = make_workflow(Some("maki"), &[None]);
+        let result = resolve_and_validate_workflow_agents(&wf, &session, &paths);
+        assert!(
+            result.is_ok(),
+            "workflow-level agent with Dockerfile must validate OK"
+        );
+    }
+
+    #[test]
+    fn resolve_error_workflow_level_agent_without_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(Some("badname"), &[None]);
+        let err = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap_err();
+        assert!(
+            err.contains("badname"),
+            "error must name the unknown workflow-level agent, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_error_no_agent_anywhere_suggests_fix() {
+        // No step agent, no workflow agent, no session default → error.
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp); // no default agent
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(None, &[None]); // no step or workflow agent
+        let err = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap_err();
+        assert!(
+            err.contains("no agent"),
+            "error must mention missing agent, got: {err}"
+        );
+        assert!(
+            err.contains("workflow-level"),
+            "error must suggest adding workflow-level agent, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_deduplicates_repeated_agent_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(None, &[Some("claude"), Some("claude"), Some("claude")]);
+        let result = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap();
+        assert_eq!(result.len(), 1, "claude must appear only once in the resolved list");
+    }
+
+    #[test]
+    fn resolve_error_multiple_unknown_agents_listed_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        // No Dockerfiles for gemini or codex.
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf = make_workflow(None, &[Some("gemini"), Some("codex")]);
+        let err = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap_err();
+        assert!(err.contains("gemini"), "error must name gemini, got: {err}");
+        assert!(err.contains("codex"), "error must name codex, got: {err}");
+    }
+
+    // ── validate_generated_workflow (integration-style unit tests) ────────────
+
+    #[test]
+    fn validate_generated_workflow_missing_file_error_contains_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let missing = tmp.path().join("workflow.toml");
+
+        let err = validate_generated_workflow(&missing, &session, &paths).unwrap_err();
+        assert!(
+            err.contains("workflow.toml"),
+            "error must mention the expected file path, got: {err}"
+        );
+        assert!(
+            err.contains("did not produce"),
+            "error must explain the leader failed to produce the file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_generated_workflow_invalid_toml_propagates_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf_path = tmp.path().join("workflow.toml");
+        std::fs::write(&wf_path, "this is NOT valid toml ][").unwrap();
+
+        let err = validate_generated_workflow(&wf_path, &session, &paths).unwrap_err();
+        assert!(!err.is_empty(), "invalid TOML must produce a non-empty error");
+    }
+
+    #[test]
+    fn validate_generated_workflow_unknown_agent_error_names_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        // Only "claude" Dockerfile present; workflow references "gemini".
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf_path = tmp.path().join("workflow.toml");
+        std::fs::write(
+            &wf_path,
+            r#"[[steps]]
+name = "do-stuff"
+agent = "gemini"
+prompt = "do something"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_generated_workflow(&wf_path, &session, &paths).unwrap_err();
+        assert!(err.contains("gemini"), "error must name the unknown agent, got: {err}");
+        assert!(
+            err.contains("Available agents"),
+            "error must list available agents for repair, got: {err}"
+        );
+        assert!(err.contains("claude"), "error must list claude as available, got: {err}");
+    }
+
+    #[test]
+    fn validate_generated_workflow_valid_with_known_agent_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM ubuntu\n").unwrap();
+        let session = make_session_simple(&tmp);
+        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
+        let wf_path = tmp.path().join("workflow.toml");
+        std::fs::write(
+            &wf_path,
+            r#"[[steps]]
+name = "step1"
+agent = "claude"
+prompt = "do something useful"
+"#,
+        )
+        .unwrap();
+
+        let result = validate_generated_workflow(&wf_path, &session, &paths);
+        assert!(
+            result.is_ok(),
+            "valid workflow with known agent must succeed, got: {:?}",
+            result.err()
+        );
+        let wf = result.unwrap();
+        assert_eq!(wf.steps.len(), 1);
+        assert_eq!(wf.steps[0].name, "step1");
+    }
+
+    #[test]
+    fn repair_prompt_substitution_contains_verbatim_validation_error() {
+        // Verify the repair loop passes the exact error string to build_repair_prompt.
+        let error_msg = "workflow.toml references agents with no Dockerfile: \"gemini\"";
+        let repair_prompt = crate::data::dynamic_workflow_assets::build_repair_prompt(error_msg);
+        assert!(
+            repair_prompt.contains(error_msg),
+            "repair prompt must contain the verbatim validation error from Workflow::load(), got: {repair_prompt}"
+        );
+    }
+
+    // ── Integration tests requiring Docker (marked #[ignore]) ─────────────────
+    //
+    // These tests exercise the full `run_dynamic` path including launching
+    // container-based leader/repair agents. They require:
+    //   - A running Docker daemon
+    //   - A built container image for the resolved leader agent
+    //   - The `.awman/Dockerfile.<agent>` to exist in the test repo
+    //
+    // Run selectively with: cargo test -- --ignored
+
+    #[test]
+    #[ignore = "requires Docker daemon and a built leader agent image"]
+    fn integration_happy_path_leader_writes_valid_workflow() {
+        // A mock leader that immediately writes a minimal valid workflow.toml
+        // to the context dir; awman should load and execute it.
+        todo!("set up test repo with a leader agent image that writes a valid workflow.toml")
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon and a built leader agent image"]
+    fn integration_missing_file_repair_loop_exhausted() {
+        // Leader writes nothing; all 3 repair attempts also write nothing.
+        // Final error must include the expected path and "3 repair attempts".
+        todo!("set up mock leader that always writes nothing")
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon and a built leader agent image"]
+    fn integration_invalid_toml_repair_exhausted() {
+        // Leader and all 3 repair agents produce malformed TOML; final error
+        // must surface the parse error and the file path.
+        todo!("set up mock leader that always writes broken TOML")
+    }
+
+    #[test]
+    #[ignore = "requires Docker stuck-event infrastructure"]
+    fn integration_stuck_triggers_yolo_countdown() {
+        // Leader emits StuckEvent::Stuck → 60-second countdown starts →
+        // on expiry, container killed, workflow.toml loaded and executed.
+        todo!("wire up a test container that stalls and observes countdown")
+    }
+
+    #[test]
+    #[ignore = "requires Docker stuck-event infrastructure"]
+    fn integration_yolo_countdown_unstuck_recovery() {
+        // Leader emits Stuck, countdown starts, leader then emits Unstuck →
+        // countdown cancelled, leader continues running.
+        todo!("wire up a test container that recovers from stuck")
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon and WorktreeLifecycle"]
+    fn integration_worktree_before_leader() {
+        // Assert that WorktreeLifecycle setup steps complete before the leader
+        // container is launched. Ordering verified via event sequence.
+        todo!("instrument the lifecycle and verify ordering")
+    }
+
+    #[test]
+    #[ignore = "requires Docker daemon, a test repo, and a real work item file"]
+    fn e2e_full_dynamic_flow() {
+        // awman exec workflow --dynamic --work-item 42 in a test repo with a
+        // stubbed leader agent produces and executes a valid workflow.
+        todo!("end-to-end dynamic workflow test")
     }
 }

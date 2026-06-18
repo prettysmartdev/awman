@@ -414,6 +414,17 @@ impl<F: CommandFrontend> Dispatch<F> {
             }
             ["exec", "workflow"] => {
                 let mut flags = read_exec_workflow_flags(&self.frontend, &canonical_refs)?;
+                // WI-0092: validate dynamic/leader flag relationships in Layer 2
+                // before constructing the command, and enforce the workflow-path
+                // requirement for non-dynamic invocations (the catalogue made the
+                // positional argument optional so --dynamic can omit it).
+                crate::command::commands::exec_workflow::validate_dynamic_flags(&flags)?;
+                if !flags.dynamic && flags.workflow.is_none() {
+                    return Err(CommandError::missing_required_argument(
+                        &canonical_refs,
+                        "workflow",
+                    ));
+                }
                 // Catalogue declares yolo/auto imply worktree; enforce here as well.
                 if flags.yolo || flags.auto {
                     flags.worktree = true;
@@ -814,10 +825,11 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
     f: &F,
     p: &[&str],
 ) -> Result<ExecWorkflowCommandFlags, CommandError> {
+    // The positional path is optional at this layer; the command layer
+    // requires it for non-dynamic invocations and rejects it under --dynamic.
     let workflow = f
         .flag_path(p, "workflow")?
-        .or_else(|| f.argument(p, "workflow").ok().flatten().map(PathBuf::from))
-        .ok_or_else(|| CommandError::missing_required_argument(p, "workflow"))?;
+        .or_else(|| f.argument(p, "workflow").ok().flatten().map(PathBuf::from));
     let yolo = f.flag_bool(p, "yolo")?.unwrap_or(false);
     let worktree = f.flag_bool(p, "worktree")?.unwrap_or(false) || yolo;
     let work_item = f.flag_string(p, "work-item")?;
@@ -838,6 +850,8 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
         model: f.flag_string(p, "model")?,
         overlay: f.flag_strings(p, "overlay")?,
         issue_source: crate::data::issue::IssueSourceFlags { issue },
+        dynamic: f.flag_bool(p, "dynamic")?.unwrap_or(false),
+        leader: f.flag_string(p, "leader")?,
     })
 }
 
@@ -1395,5 +1409,143 @@ mod tests {
             }
             _ => panic!("expected ExecPrompt"),
         }
+    }
+
+    // ─── WI-0092: Dynamic Workflows — dispatch layer tests ───────────────────
+
+    #[test]
+    fn exec_workflow_dynamic_without_path_builds_successfully() {
+        // --dynamic omits the positional workflow path; dispatch must not error.
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("dynamic".into(), true);
+        frontend.strings.insert("work-item".into(), "0042".into());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        assert!(
+            result.is_ok(),
+            "--dynamic without workflow path must succeed at dispatch: {}",
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        );
+        match result.unwrap() {
+            BuiltCommand::ExecWorkflow(cmd) => {
+                assert!(cmd.flags().dynamic, "dynamic flag must be true");
+                assert!(
+                    cmd.flags().workflow.is_none(),
+                    "workflow path must be None for --dynamic"
+                );
+            }
+            _ => panic!("expected ExecWorkflow"),
+        }
+    }
+
+    #[test]
+    fn exec_workflow_dynamic_without_work_item_returns_error() {
+        // --dynamic requires --work-item; missing it must error at dispatch.
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("dynamic".into(), true);
+        // No work-item set.
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--dynamic requires --work-item"),
+                    "error must name the missing flag, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("--dynamic without --work-item must return an error"),
+        }
+    }
+
+    #[test]
+    fn exec_workflow_leader_without_dynamic_returns_error() {
+        // --leader is only valid with --dynamic.
+        let mut frontend = FakeCommandFrontend::new();
+        frontend
+            .strings
+            .insert("leader".into(), "claude::claude-opus-4-8".into());
+        frontend
+            .paths
+            .insert("workflow".into(), std::path::PathBuf::from("/tmp/wf.toml"));
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--leader is only valid with --dynamic"),
+                    "error must state the constraint, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("--leader without --dynamic must return an error"),
+        }
+    }
+
+    #[test]
+    fn exec_workflow_dynamic_parses_leader_flag() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("dynamic".into(), true);
+        frontend.strings.insert("work-item".into(), "0042".into());
+        frontend
+            .strings
+            .insert("leader".into(), "claude::claude-opus-4-8".into());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        assert!(
+            result.is_ok(),
+            "build must succeed: {}",
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        );
+        match result.unwrap() {
+            BuiltCommand::ExecWorkflow(cmd) => {
+                assert_eq!(
+                    cmd.flags().leader.as_deref(),
+                    Some("claude::claude-opus-4-8"),
+                    "leader flag must be preserved in ExecWorkflowCommandFlags"
+                );
+            }
+            _ => panic!("expected ExecWorkflow"),
+        }
+    }
+
+    #[test]
+    fn exec_workflow_dynamic_with_plan_returns_error() {
+        // --dynamic enforces yolo so --plan is incompatible.
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("dynamic".into(), true);
+        frontend.bools.insert("plan".into(), true);
+        frontend.strings.insert("work-item".into(), "0042".into());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--dynamic cannot be used with --plan"),
+                    "error must explain the conflict, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("--dynamic --plan must return an error"),
+        }
+    }
+
+    #[test]
+    fn exec_workflow_static_without_path_returns_missing_required_argument() {
+        // Non-dynamic invocation still requires the positional workflow path.
+        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        assert!(
+            matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
+            "static exec workflow without path must return MissingRequiredArgument"
+        );
     }
 }

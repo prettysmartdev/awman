@@ -1,0 +1,150 @@
+# Example awman workflow file.
+# This file is provided to the leader agent as a reference showing the full
+# structure and available features. Not every workflow needs every section —
+# start simple and add what you need.
+
+title = "Implement Feature and Create PR"
+
+# When true, teardown steps run even if a workflow step fails.
+teardown_on_failure = false
+
+# Workflow-level default agent and model. Steps inherit these unless they
+# specify their own. Omit to use the repo's configured default agent.
+agent = "claude"
+model = "claude-sonnet-4-6"
+
+# Workflow-level overlays applied to every agent step.
+# overlays = ["skill(*)", "env(MY_TOKEN)"]
+
+# ── Setup steps ──────────────────────────────────────────────────────────────
+# Run once on the host before any agent steps. Order is sequential.
+# skill() and skills() overlays are NOT valid here.
+
+[[setup]]
+type = "run_shell"
+command = "cargo fetch --locked"
+
+# [[setup]]
+# type = "checkout_create_branch"
+# branch = "feature/my-branch"
+# base = "main"  # optional; defaults to current HEAD
+
+# [[setup]]
+# type = "pull_branch"
+# remote = "origin"   # optional
+# branch = "main"     # optional
+
+# [[setup]]
+# type = "run_script"
+# path = ".awman/scripts/preflight.sh"
+# env = { VERBOSE = "1" }
+
+# [[setup]]
+# type = "poll_ci"
+# interval_secs = 60   # optional; default chosen by awman
+# max_retries = 20     # optional
+
+# ── Agent steps ──────────────────────────────────────────────────────────────
+# Executed as agent containers. 'name' and 'prompt' are required.
+# Steps without depends_on run in parallel with other independent steps.
+
+[[step]]
+name = "implement"
+# Override model for this step only.
+model = "claude-opus-4-8"
+prompt = """
+Implement work item {{work_item_number}}, following the implementation plan
+in the work item spec closely. Iterate until the build succeeds and all
+existing tests pass. Do not write new tests yet — that happens in the next
+step. Do not update docs yet.
+
+Work item content:
+{{work_item_content}}
+"""
+
+[[step]]
+name = "tests"
+depends_on = ["implement"]
+prompt = """
+Write tests for work item {{work_item_number}} as described in:
+
+{{work_item_section:[Test Considerations]}}
+
+Ensure every new function and module has unit tests. Add integration tests
+for cross-component flows described in the work item.
+"""
+
+[[step]]
+name = "docs"
+depends_on = ["implement"]
+# Use a lighter model for documentation.
+model = "claude-haiku-4-5"
+prompt = """
+Update user-facing documentation in docs/ for work item {{work_item_number}}.
+Follow the project's documentation standards in CLAUDE.md. Do not create
+work-item-specific docs; update or create user guides only.
+"""
+# Step-level overlays (merged with workflow-level overlays above).
+# overlays = ["skill(lint)"]
+
+[[step]]
+name = "review"
+depends_on = ["tests", "docs"]
+model = "claude-opus-4-8"
+# When true, the entire workflow aborts if this step fails.
+abort_on_failure = true
+prompt = """
+Review the changes made for work item {{work_item_number}} for correctness,
+completeness, security, and style. Check edge cases:
+
+{{work_item_section:[Edge Case Considerations]}}
+
+Verify tests match the plan:
+
+{{work_item_section:[Test Considerations]}}
+
+Provide a short manual test plan when done.
+"""
+
+# ── Teardown steps ────────────────────────────────────────────────────────────
+# Run on the host after the last agent step (or on failure if teardown_on_failure
+# is true). Order is sequential. skill() and skills() are NOT valid here.
+
+[[teardown]]
+type = "run_shell"
+command = "make test"
+abort_on_failure = true
+
+# Retry a shell step with an agent if it fails.
+# [teardown.on_failure]
+# prompt = "The tests failed. Fix the failures and make the test suite green."
+# agent = "claude"           # optional; defaults to workflow/repo agent
+# model = "claude-opus-4-8"  # optional
+# max_attempts = 2           # required when on_failure is present; must be >= 1
+
+[[teardown]]
+type = "commit_changes"
+message = "Implement {{work_item_number}}"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+# remote = "origin"  # optional
+# branch = "HEAD"    # optional
+overlays = ["ssh()"]
+
+[[teardown]]
+type = "create_pull_request"
+title = "Implement {{work_item_number}}"
+body = "Automated PR created by awman dynamic workflow."
+# base = "main"  # optional; defaults to repo default branch
+overlays = ["env(GITHUB_TOKEN)"]
+
+# [[teardown]]
+# type = "poll_ci"
+# interval_secs = 60
+# max_retries = 30
+
+# [[teardown]]
+# type = "run_script"
+# path = ".awman/scripts/post-pr.sh"

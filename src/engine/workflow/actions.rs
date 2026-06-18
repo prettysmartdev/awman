@@ -48,6 +48,11 @@ pub struct AvailableActions {
     /// computes this from `current_execution.is_some()` in
     /// `compute_available_actions`. Changes Esc semantics from Pause to Dismiss.
     pub can_dismiss: bool,
+    /// Custom label for the right-arrow (launch-next) action. Defaults to
+    /// "Next: new container" when `None`. The dynamic leader step sets this to
+    /// "Start dynamic workflow" so CLI, TUI, and API frontends all render the
+    /// same presentation hint without forking the rendering code (WI-0092 §8).
+    pub launch_next_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,6 +7,7 @@
 //! is permitted at this layer. See `aspec/architecture/2026-grand-architecture.md`.
 
 pub mod config;
+pub mod dynamic_workflow_assets;
 pub mod error;
 pub mod execution_event;
 pub mod fs;

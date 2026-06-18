@@ -33,9 +33,12 @@ awman exec workflow aspec/workflows/implement-hard.toml --issue 84
 
 # Run a workflow without a work item
 awman exec workflow aspec/workflows/dependency-upgrade.toml
+
+# Let awman design and run the workflow automatically for a work item
+awman exec workflow --dynamic --work-item 42
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](09-api-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](11-github-integration.md).
+Use `exec workflow` to run any workflow file. If you don't want to write a workflow file yourself, see [Dynamic Workflows](13-dynamic-workflows.md) — `--dynamic` launches a leader agent that designs a purpose-built workflow for your work item and then executes it automatically. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](09-api-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](11-github-integration.md).
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -942,6 +945,8 @@ Press [r] to retry, or any other key to abort:
 | `--worktree` | Run all steps in an isolated Git worktree |
 | `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md) |
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
+| `--dynamic` | Let a leader agent design the workflow file from your work item; see [Dynamic Workflows](13-dynamic-workflows.md) |
+| `--leader=<agent::model>` | Override the agent and model used as the leader when `--dynamic` is set; format: `agent::model` |
 
 ---
 
