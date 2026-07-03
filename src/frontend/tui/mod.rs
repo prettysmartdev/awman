@@ -35,6 +35,7 @@ pub mod command_box;
 pub mod command_frontend;
 pub mod container_view;
 pub mod dialogs;
+pub mod git_sidebar;
 pub mod hints;
 pub mod keymap;
 mod mouse;
@@ -408,7 +409,31 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             tab.mouse_selection = None;
             if tab.container_window_state != ContainerWindowState::Hidden {
                 if let Ok(size) = crossterm::terminal::size() {
-                    let (cols, rows) = compute_container_inner_size(size.0, size.1);
+                    let sidebar = git_sidebar::sidebar_width(size.0, tab.git_sidebar_state);
+                    let left_cols = size.0.saturating_sub(sidebar);
+                    let (cols, rows) = compute_container_inner_size(left_cols, size.1);
+                    tab.vt100_parser.screen_mut().set_size(rows, cols);
+                    if let Some(ref tx) = tab.container_resize_tx {
+                        let _ = tx.send((cols, rows));
+                    }
+                }
+            }
+        }
+        Action::ToggleGitSidebar => {
+            let tab = app.active_tab_mut();
+            tab.git_sidebar_state = match tab.git_sidebar_state {
+                git_sidebar::GitSidebarState::Open => git_sidebar::GitSidebarState::Closed,
+                git_sidebar::GitSidebarState::Closed => git_sidebar::GitSidebarState::Open,
+            };
+            // Opening/closing the sidebar changes the width of the left chunk
+            // that the container overlay occupies, so reflow the container PTY
+            // to the new width. This is needed even when the container is
+            // Maximized (it fills the left chunk, not the whole frame).
+            if tab.container_window_state != ContainerWindowState::Hidden {
+                if let Ok(size) = crossterm::terminal::size() {
+                    let sidebar = git_sidebar::sidebar_width(size.0, tab.git_sidebar_state);
+                    let left_cols = size.0.saturating_sub(sidebar);
+                    let (cols, rows) = compute_container_inner_size(left_cols, size.1);
                     tab.vt100_parser.screen_mut().set_size(rows, cols);
                     if let Some(ref tx) = tab.container_resize_tx {
                         let _ = tx.send((cols, rows));
@@ -885,7 +910,9 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     for tab in &mut app.tabs {
         tab.mouse_selection = None;
         if tab.container_window_state != ContainerWindowState::Hidden {
-            let (inner_cols, inner_rows) = compute_container_inner_size(cols, rows);
+            let sidebar = git_sidebar::sidebar_width(cols, tab.git_sidebar_state);
+            let left_cols = cols.saturating_sub(sidebar);
+            let (inner_cols, inner_rows) = compute_container_inner_size(left_cols, rows);
             tab.vt100_parser
                 .screen_mut()
                 .set_size(inner_rows, inner_cols);
@@ -1592,6 +1619,149 @@ mod tests {
         press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
         assert!(app.active_dialog.is_none());
+    }
+
+    // ─── Git sidebar ──────────────────────────────────────────────────────────
+
+    fn render_app(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render::render_frame(app, frame))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// True if the buffer contains a green rounded top-left corner ('╭'). The
+    /// only green rounded border in an idle app is the git sidebar (idle tabs
+    /// are DarkGray), so this uniquely detects a rendered sidebar.
+    fn has_green_sidebar_corner(buf: &ratatui::buffer::Buffer) -> Option<u16> {
+        let area = *buf.area();
+        for x in 0..area.width {
+            for y in 0..area.height {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() == "\u{256d}" && cell.fg == ratatui::style::Color::Green {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+
+    fn set_summary(app: &App, additions: u32, deletions: u32) {
+        use crate::frontend::tui::git_sidebar::GitDiffSummary;
+        *app.active_tab().git_diff_summary.lock().unwrap() = Some(GitDiffSummary {
+            files: Vec::new(),
+            total_additions: additions,
+            total_deletions: deletions,
+        });
+    }
+
+    #[test]
+    fn ctrl_g_toggles_sidebar_twice_returns_to_closed() {
+        use crate::frontend::tui::git_sidebar::GitSidebarState;
+        let mut app = make_app();
+        assert_eq!(
+            app.active_tab().git_sidebar_state,
+            GitSidebarState::Closed,
+            "sidebar starts closed"
+        );
+        press_key(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_tab().git_sidebar_state, GitSidebarState::Open);
+        press_key(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.active_tab().git_sidebar_state,
+            GitSidebarState::Closed,
+            "toggling twice returns to Closed"
+        );
+    }
+
+    #[test]
+    fn render_frame_closed_has_no_sidebar_and_uses_full_width() {
+        let mut app = make_app();
+        let buf = render_app(&mut app, 80, 24);
+        assert!(
+            has_green_sidebar_corner(&buf).is_none(),
+            "closed sidebar must not render a green border"
+        );
+        // The vertical layout still spans the full width: the tab bar's rounded
+        // top-left corner sits at column 0.
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{256d}");
+    }
+
+    #[test]
+    fn render_frame_open_allocates_at_most_a_quarter_to_the_sidebar() {
+        use crate::frontend::tui::git_sidebar::GitSidebarState;
+        let mut app = make_app();
+        app.active_tab_mut().git_sidebar_state = GitSidebarState::Open;
+        let width = 80u16;
+        let buf = render_app(&mut app, width, 24);
+        let sidebar_x = has_green_sidebar_corner(&buf)
+            .expect("open sidebar must render a green rounded border");
+        let sidebar_width = width - sidebar_x;
+        assert!(
+            sidebar_width <= width / 4,
+            "sidebar width {sidebar_width} must be ≤ 25% of {width}"
+        );
+        assert_eq!(sidebar_width, 20, "80/4 == 20 columns");
+    }
+
+    #[test]
+    fn render_frame_narrow_terminal_collapses_sidebar() {
+        use crate::frontend::tui::git_sidebar::GitSidebarState;
+        let mut app = make_app();
+        app.active_tab_mut().git_sidebar_state = GitSidebarState::Open;
+        // 60/4 == 15 < MIN_SIDEBAR_WIDTH (20) → sidebar collapses to nothing.
+        let buf = render_app(&mut app, 60, 24);
+        assert!(
+            has_green_sidebar_corner(&buf).is_none(),
+            "sidebar must collapse when a quarter of the width is < 20 columns"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_plus_minus_when_sidebar_closed_and_summary_present() {
+        let mut app = make_app();
+        set_summary(&app, 12, 3);
+        let buf = render_app(&mut app, 80, 24);
+        let text: String = {
+            let area = *buf.area();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text.contains("+12"), "status bar shows additions: had lines");
+        assert!(text.contains("-3"), "status bar shows deletions");
+    }
+
+    #[test]
+    fn status_bar_omits_summary_when_none() {
+        // No summary set → no `+`/`-` diff readout injected into the status bar.
+        let mut app = make_app();
+        let buf = render_app(&mut app, 80, 24);
+        // The idle status hint contains "ctrl-g git" but never a "+N -N" pair.
+        let last_rows: String = {
+            let area = *buf.area();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !last_rows.contains("+0 -0"),
+            "no diff summary must be shown when the summary is None"
+        );
     }
 
     // ─── FatalError dialog (invalid runtime config) ───────────────────────────

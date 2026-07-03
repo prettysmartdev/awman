@@ -2,11 +2,14 @@
 //! command box, suggestion row.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
+};
 
 use crate::frontend::tui::app::{App, Focus};
 use crate::frontend::tui::container_view;
 use crate::frontend::tui::dialogs;
+use crate::frontend::tui::git_sidebar::{self, GitDiffSummary, GitFileChangeType, GitFileEntry};
 use crate::frontend::tui::tabs::{
     self, compute_tab_bar_width, phase_label, tab_color, window_border_color, ContainerWindowState,
     ExecutionPhase,
@@ -18,7 +21,7 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
     // Read shape decisions from the active tab (immutable borrow).
-    let (workflow_height, container_state, has_summary) = {
+    let (workflow_height, container_state, has_summary, git_sidebar_state) = {
         let tab = app.active_tab();
         let workflow_height = tab
             .workflow_state
@@ -30,7 +33,21 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
             workflow_height,
             tab.container_window_state,
             tab.last_container_summary.is_some(),
+            tab.git_sidebar_state,
         )
+    };
+
+    // When the git sidebar is open (and wide enough), reserve the right ≤25%
+    // of the frame for it; the execution/container windows shrink into the
+    // remaining left chunk. Below `MIN_SIDEBAR_WIDTH` the sidebar is treated
+    // as closed (only the status-bar summary shows).
+    let sidebar_w = git_sidebar::sidebar_width(area.width, git_sidebar_state);
+    let (main_area, sidebar_area) = if sidebar_w > 0 {
+        let split =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(sidebar_w)]).split(area);
+        (split[0], Some(split[1]))
+    } else {
+        (area, None)
     };
 
     let has_minimized_container = container_state == ContainerWindowState::Minimized;
@@ -55,7 +72,7 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         Constraint::Length(3),                // command box
         Constraint::Length(1),                // suggestion row
     ])
-    .split(area);
+    .split(main_area);
 
     render_tab_bar(app, chunks[0], frame);
     render_execution_window(app, chunks[1], frame);
@@ -87,13 +104,25 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     render_suggestion_row(app, chunks[6], frame);
 
     // Container maximized overlay (rendered on top of execution window only,
-    // not over the workflow strip or bottom chrome).
+    // not over the workflow strip or bottom chrome). Confined to the left
+    // chunk (`main_area`) so it never covers the git sidebar.
     if container_state == ContainerWindowState::Maximized {
         let tab = app.active_tab_mut();
         // The overlay made it to the screen; close_container_overlay no
         // longer needs to replay its contents into the status log.
         tab.container_rendered = true;
-        container_view::render_container_maximized(tab, area, workflow_height, frame);
+        container_view::render_container_maximized(tab, main_area, workflow_height, frame);
+    }
+
+    // Git sidebar (right chunk), when open and wide enough.
+    if let Some(sidebar_area) = sidebar_area {
+        let summary = app
+            .active_tab()
+            .git_diff_summary
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        render_git_sidebar(frame, sidebar_area, &summary);
     }
 
     // Active dialog (rendered on top of everything).
@@ -570,6 +599,92 @@ fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
 /// (Esc to deselect, ↑ to focus the window, ctrl-m to cycle the container,
 /// etc.). Background is forced black so the row stands out against the
 /// surrounding chrome.
+/// Render the git sidebar into the right chunk: a rounded, green-bordered
+/// block with a bold `+A -D` title and a color-coded per-file change list.
+fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option<GitDiffSummary>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Green));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let Some(summary) = summary else {
+        let line = Line::from(Span::styled(
+            "no git data",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+        frame.render_widget(Paragraph::new(line), inner);
+        return;
+    };
+
+    // Bold `+A -D` totals on the first inner row.
+    let title = Line::from(vec![
+        Span::styled(
+            format!("+{}", summary.total_additions),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("-{}", summary.total_deletions),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    // Split the inner area into the title row and the file list. The list is
+    // clipped to the visible rows (extra files are dropped for now).
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    frame.render_widget(Paragraph::new(title), rows[0]);
+
+    let inner_width = inner.width as usize;
+    let list_height = rows[1].height as usize;
+    let items: Vec<ListItem> = summary
+        .files
+        .iter()
+        .take(list_height)
+        .map(|f| ListItem::new(git_file_line(f, inner_width)))
+        .collect();
+    frame.render_widget(List::new(items), rows[1]);
+}
+
+/// Build a single sidebar file line: a fixed `+A -D ` stat prefix followed by
+/// the (possibly truncated) path, all in the change type's accent color.
+fn git_file_line(entry: &GitFileEntry, inner_width: usize) -> Line<'static> {
+    let color = match entry.change_type {
+        GitFileChangeType::Added => Color::Green,
+        GitFileChangeType::Deleted => Color::Red,
+        GitFileChangeType::Modified => Color::Blue,
+    };
+    let stat = format!("+{} -{} ", entry.additions, entry.deletions);
+    let suffix = if entry.binary { " (binary)" } else { "" };
+    let reserved = stat.chars().count() + suffix.chars().count();
+    let avail = inner_width.saturating_sub(reserved);
+    let path = truncate_path(&entry.path, avail);
+    Line::from(vec![
+        Span::styled(stat, Style::default().fg(color)),
+        Span::styled(format!("{path}{suffix}"), Style::default().fg(color)),
+    ])
+}
+
+/// Truncate `path` to at most `max` display columns, appending `…` when cut.
+fn truncate_path(path: &str, max: usize) -> String {
+    let len = path.chars().count();
+    if len <= max {
+        return path.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let truncated: String = path.chars().take(max - 1).collect();
+    format!("{truncated}\u{2026}")
+}
+
 fn render_status_bar(app: &App, area: Rect, frame: &mut Frame) {
     use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
 
@@ -580,7 +695,7 @@ fn render_status_bar(app: &App, area: Rect, frame: &mut Frame) {
         .map(|g| g.is_some())
         .unwrap_or(false);
 
-    let spans: Vec<Span> = match (&tab.execution_phase, app.focus, tab.container_window_state) {
+    let mut spans: Vec<Span> = match (&tab.execution_phase, app.focus, tab.container_window_state) {
         // Running + ExecWindow + Maximized container
         (
             ExecutionPhase::Running { .. },
@@ -681,9 +796,37 @@ fn render_status_bar(app: &App, area: Rect, frame: &mut Frame) {
                 ),
             ]
         }
-        // Idle: empty row (just the black background).
-        _ => vec![],
+        // Idle: just the git-sidebar hint.
+        _ => vec![Span::styled(
+            " \u{00b7} ctrl-g git ",
+            Style::default().fg(Color::DarkGray),
+        )],
     };
+
+    // When the sidebar is closed, show the compact `+A -D` diff summary at the
+    // far right of the 1-row status bar (green `+`, red `-`).
+    if tab.git_sidebar_state == git_sidebar::GitSidebarState::Closed {
+        if let Some(summary) = tab.git_diff_summary.lock().ok().and_then(|g| g.clone()) {
+            let git_spans = vec![
+                Span::styled(
+                    format!("+{}", summary.total_additions),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("-{} ", summary.total_deletions),
+                    Style::default().fg(Color::Red),
+                ),
+            ];
+            let left_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let git_w: usize = git_spans.iter().map(|s| s.content.chars().count()).sum();
+            let total = area.width as usize;
+            if total > left_w + git_w {
+                spans.push(Span::raw(" ".repeat(total - left_w - git_w)));
+                spans.extend(git_spans);
+            }
+        }
+    }
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     frame.render_widget(bar, area);
@@ -1760,9 +1903,189 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_selection_highlight, capture_buffer_grid, truncate_middle};
+    use super::{
+        apply_selection_highlight, capture_buffer_grid, git_file_line, render_git_sidebar,
+        truncate_middle, truncate_path,
+    };
+    use crate::frontend::tui::git_sidebar::{GitDiffSummary, GitFileChangeType, GitFileEntry};
     use crate::frontend::tui::tabs::TextSelection;
     use ratatui::prelude::*;
+
+    /// Render a closure into a fresh `TestBackend` and return the resulting
+    /// buffer for cell-level assertions.
+    fn render_to_buffer(
+        width: u16,
+        height: u16,
+        f: impl FnOnce(ratatui::layout::Rect, &mut ratatui::Frame),
+    ) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| f(frame.area(), frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sample_summary() -> GitDiffSummary {
+        GitDiffSummary {
+            files: vec![
+                GitFileEntry {
+                    path: "src/foo.rs".to_string(),
+                    change_type: GitFileChangeType::Modified,
+                    additions: 5,
+                    deletions: 2,
+                    binary: false,
+                },
+                GitFileEntry {
+                    path: "img.png".to_string(),
+                    change_type: GitFileChangeType::Added,
+                    additions: 0,
+                    deletions: 0,
+                    binary: true,
+                },
+            ],
+            total_additions: 5,
+            total_deletions: 2,
+        }
+    }
+
+    // ── git sidebar block ──────────────────────────────────────────────────
+
+    #[test]
+    fn sidebar_block_uses_rounded_green_border() {
+        let buf = render_to_buffer(24, 8, |area, frame| {
+            render_git_sidebar(frame, area, &Some(sample_summary()));
+        });
+        // Rounded corners are the '╭╮╰╯' glyph set.
+        let top_left = buf.cell((0, 0)).unwrap();
+        assert_eq!(top_left.symbol(), "\u{256d}", "top-left rounded corner");
+        assert_eq!(buf.cell((23, 0)).unwrap().symbol(), "\u{256e}", "top-right");
+        assert_eq!(buf.cell((0, 7)).unwrap().symbol(), "\u{2570}", "bottom-left");
+        assert_eq!(buf.cell((23, 7)).unwrap().symbol(), "\u{256f}", "bottom-right");
+        // Border style is green.
+        assert_eq!(top_left.fg, Color::Green, "border must be green");
+    }
+
+    #[test]
+    fn sidebar_shows_totals_and_binary_suffix() {
+        let buf = render_to_buffer(24, 8, |area, frame| {
+            render_git_sidebar(frame, area, &Some(sample_summary()));
+        });
+        let text = buffer_text(&buf);
+        assert!(text.contains("+5"), "totals additions shown: {text:?}");
+        assert!(text.contains("-2"), "totals deletions shown: {text:?}");
+        assert!(text.contains("foo.rs"), "file path shown: {text:?}");
+        assert!(
+            text.contains("(binary)"),
+            "binary file gets a (binary) suffix: {text:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_none_summary_shows_no_git_data() {
+        let buf = render_to_buffer(24, 8, |area, frame| {
+            render_git_sidebar(frame, area, &None);
+        });
+        assert!(buffer_text(&buf).contains("no git data"));
+    }
+
+    // ── git_file_line ──────────────────────────────────────────────────────
+
+    #[test]
+    fn git_file_line_added_is_green_with_stat_prefix() {
+        let entry = GitFileEntry {
+            path: "a.rs".to_string(),
+            change_type: GitFileChangeType::Added,
+            additions: 3,
+            deletions: 0,
+            binary: false,
+        };
+        let line = git_file_line(&entry, 40);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("+3 -0 "), "stat prefix: {text:?}");
+        assert!(text.contains("a.rs"));
+        assert!(
+            line.spans.iter().all(|s| s.style.fg == Some(Color::Green)),
+            "added file rendered green"
+        );
+    }
+
+    #[test]
+    fn git_file_line_deleted_is_red_and_modified_is_blue() {
+        let deleted = GitFileEntry {
+            path: "d.rs".to_string(),
+            change_type: GitFileChangeType::Deleted,
+            additions: 0,
+            deletions: 4,
+            binary: false,
+        };
+        let modified = GitFileEntry {
+            path: "m.rs".to_string(),
+            change_type: GitFileChangeType::Modified,
+            additions: 1,
+            deletions: 1,
+            binary: false,
+        };
+        assert_eq!(
+            git_file_line(&deleted, 40).spans[0].style.fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            git_file_line(&modified, 40).spans[0].style.fg,
+            Some(Color::Blue)
+        );
+    }
+
+    #[test]
+    fn git_file_line_binary_has_suffix() {
+        let entry = GitFileEntry {
+            path: "img.png".to_string(),
+            change_type: GitFileChangeType::Added,
+            additions: 0,
+            deletions: 0,
+            binary: true,
+        };
+        let line = git_file_line(&entry, 40);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("(binary)"), "binary suffix: {text:?}");
+    }
+
+    // ── truncate_path ──────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_path_short_unchanged() {
+        assert_eq!(truncate_path("src/foo.rs", 40), "src/foo.rs");
+    }
+
+    #[test]
+    fn truncate_path_long_gets_ellipsis() {
+        let p = "src/deeply/nested/very-long-file-name.rs";
+        let out = truncate_path(p, 10);
+        assert!(out.ends_with('\u{2026}'), "truncated with …: {out:?}");
+        assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
+    fn truncate_path_zero_width_is_empty() {
+        assert_eq!(truncate_path("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_path_at_exact_width_unchanged() {
+        assert_eq!(truncate_path("abcdef", 6), "abcdef");
+    }
 
     #[test]
     fn capture_buffer_grid_reads_cell_symbols() {

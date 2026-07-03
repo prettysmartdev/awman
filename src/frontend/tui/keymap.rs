@@ -14,6 +14,7 @@ pub enum Action {
     CycleContainerWindow,
     OpenConfigShow,
     WorkflowControl,
+    ToggleGitSidebar,
 
     // ── Command box ─────────────────────────────────────────────────────
     SubmitCommand,
@@ -82,6 +83,10 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
                 return Action::CycleContainerWindow
             }
             KeyCode::Char('w') => return Action::WorkflowControl,
+            // Ctrl-G (BEL, 0x07) is rarely used by terminal programs, so we
+            // intercept it here — before the ContainerMaximized ForwardToPty
+            // path below — in every focus context so it never reaches the PTY.
+            KeyCode::Char('g') => return Action::ToggleGitSidebar,
             _ => {}
         }
     }
@@ -245,6 +250,44 @@ mod tests {
         let k = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = map_key(k, FocusContext::ContainerMaximized);
         assert_eq!(action, Action::ForwardToPty(k));
+    }
+
+    // ── Ctrl-G / git sidebar ───────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_g_toggles_git_sidebar_in_all_contexts() {
+        // Covers the Idle / Running / CommandBox scenarios from the work item:
+        // the sidebar toggle is a global shortcut in every focus context.
+        for ctx in [
+            FocusContext::CommandBox,
+            FocusContext::ExecutionWindow,
+            FocusContext::Dialog,
+            FocusContext::ContainerMaximized,
+        ] {
+            let action = map_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL), ctx);
+            assert_eq!(
+                action,
+                Action::ToggleGitSidebar,
+                "Ctrl-G must toggle the git sidebar in {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_g_in_maximized_container_is_not_forwarded_to_pty() {
+        // Ctrl-G (BEL) must be intercepted before the ContainerMaximized
+        // ForwardToPty fallthrough so it never reaches the running process.
+        let k = key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let action = map_key(k, FocusContext::ContainerMaximized);
+        assert_eq!(action, Action::ToggleGitSidebar);
+        assert_ne!(action, Action::ForwardToPty(k));
+    }
+
+    #[test]
+    fn plain_g_is_not_a_sidebar_toggle() {
+        // Without Ctrl, `g` is ordinary input (a char in the command box).
+        let action = map_key(key(KeyCode::Char('g'), KeyModifiers::NONE), FocusContext::CommandBox);
+        assert_ne!(action, Action::ToggleGitSidebar);
     }
 
     #[test]

@@ -12,6 +12,9 @@ use crate::command::error::CommandError;
 use crate::data::session::Session;
 use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+use crate::frontend::tui::git_sidebar::{
+    start_git_diff_poll_task, GitSidebarState, SharedGitDiffSummary,
+};
 use crate::frontend::tui::user_message::SharedStatusLog;
 
 /// Per-tab execution lifecycle.
@@ -299,12 +302,40 @@ pub struct Tab {
     /// on every tick; `TuiCommandFrontend` reads from it on each watch
     /// iteration so the status table always reflects current tab state.
     pub tui_context_shared: SharedTuiContext,
+
+    // ── Git sidebar ──────────────────────────────────────────────────────
+    /// Whether the git sidebar is open. Toggled by Ctrl-G.
+    pub git_sidebar_state: GitSidebarState,
+    /// Shared diff summary written by the background poll task and read by the
+    /// renderer for the sidebar and the status-bar `+X -Y` summary.
+    pub git_diff_summary: SharedGitDiffSummary,
+    /// Handle to the background poll task, aborted on `Drop`.
+    git_poll_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation token for the current poll task; triggered before a
+    /// restart (worktree change) and on `Drop`.
+    git_poll_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// The directory the poll task is currently watching. Compared against the
+    /// desired root each tick so the task restarts when the worktree changes.
+    git_poll_root: Option<std::path::PathBuf>,
+}
+
+impl Drop for Tab {
+    fn drop(&mut self) {
+        // Stop the background git poll task so it doesn't outlive the tab.
+        if let Some(cancel) = self.git_poll_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(handle) = self.git_poll_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Tab {
     pub fn new(session: Session) -> Self {
         let scrollback = session.effective_config().scrollback_lines();
-        Self {
+        let git_root = session.git_root().to_path_buf();
+        let mut tab = Self {
             session,
             execution_phase: ExecutionPhase::Idle,
             vt100_parser: vt100::Parser::new(24, 80, scrollback),
@@ -351,6 +382,58 @@ impl Tab {
             tui_context_shared: Arc::new(Mutex::new(
                 crate::command::commands::status::StatusCommandTuiContext::default(),
             )),
+            git_sidebar_state: GitSidebarState::Closed,
+            git_diff_summary: Arc::new(Mutex::new(None)),
+            git_poll_handle: None,
+            git_poll_cancel: None,
+            git_poll_root: None,
+        };
+        // Start polling against the session git root. Once a worktree is
+        // created, `refresh_git_poll` (called each tick) restarts the task
+        // pointed at the worktree path.
+        tab.start_git_poll(git_root);
+        tab
+    }
+
+    /// (Re)start the git diff poll task against `root`, cancelling any existing
+    /// task first. No-ops (leaving the summary untouched) when called outside a
+    /// tokio runtime, e.g. in synchronous unit tests.
+    fn start_git_poll(&mut self, root: std::path::PathBuf) {
+        // Cancel and drop the previous task, if any.
+        if let Some(cancel) = self.git_poll_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(handle) = self.git_poll_handle.take() {
+            handle.abort();
+        }
+
+        // `tokio::spawn` panics without a runtime; skip gracefully so
+        // non-async tests can construct tabs.
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.git_poll_root = Some(root);
+            return;
+        }
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            start_git_diff_poll_task(root.clone(), self.git_diff_summary.clone(), cancel.clone());
+        self.git_poll_cancel = Some(cancel);
+        self.git_poll_handle = Some(handle);
+        self.git_poll_root = Some(root);
+    }
+
+    /// Restart the poll task if the tab's effective working directory changed.
+    /// The effective root is the active worktree path when set, otherwise the
+    /// session git root. Called each tick from `tick_all_tabs`.
+    pub fn refresh_git_poll(&mut self) {
+        let desired = self
+            .active_worktree_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| self.session.git_root().to_path_buf());
+        if self.git_poll_root.as_ref() != Some(&desired) {
+            self.start_git_poll(desired);
         }
     }
 
@@ -563,8 +646,15 @@ impl Tab {
             }
             if received_any && self.container_window_state == ContainerWindowState::Hidden {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(
+                        cols,
+                        self.git_sidebar_state,
+                    );
                     let (inner_cols, inner_rows) =
-                        crate::frontend::tui::compute_container_inner_size(cols, rows);
+                        crate::frontend::tui::compute_container_inner_size(
+                            cols.saturating_sub(sidebar),
+                            rows,
+                        );
                     self.vt100_parser
                         .screen_mut()
                         .set_size(inner_rows, inner_cols);
@@ -976,6 +1066,23 @@ mod tests {
 
     fn make_tab() -> Tab {
         Tab::new(make_test_session())
+    }
+
+    // ── git sidebar state ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_tab_git_sidebar_is_closed() {
+        let tab = make_tab();
+        assert_eq!(tab.git_sidebar_state, GitSidebarState::Closed);
+    }
+
+    #[test]
+    fn new_tab_git_diff_summary_is_none() {
+        let tab = make_tab();
+        assert!(
+            tab.git_diff_summary.lock().unwrap().is_none(),
+            "a fresh tab has no diff summary until the poll task populates it"
+        );
     }
 
     #[test]

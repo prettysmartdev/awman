@@ -34,6 +34,7 @@ strsim = "0.11"
 tempfile = "3"
 vt100 = { package = "vt100-ctt", version = "0.17", default-features = false }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.13", features = ["rustls", "json", "stream", "blocking"], default-features = false }
 tokio-stream = "0.1"
 unicode-width = "0.2"

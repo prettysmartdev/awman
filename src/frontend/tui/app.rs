@@ -210,7 +210,16 @@ impl App {
         // inside the container, like Claude, would render against an 80x24
         // default until the first SIGWINCH).
         let initial_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => crate::frontend::tui::compute_container_inner_size(cols, rows),
+            Ok((cols, rows)) => {
+                let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(
+                    cols,
+                    tab.git_sidebar_state,
+                );
+                crate::frontend::tui::compute_container_inner_size(
+                    cols.saturating_sub(sidebar),
+                    rows,
+                )
+            }
             Err(_) => (80u16, 24u16),
         };
 
@@ -369,6 +378,8 @@ impl App {
             tab.drain_container_output();
             tab.poll_command_completion();
             tab.drain_stuck_events();
+            // Restart the git poll task if the worktree path changed.
+            tab.refresh_git_poll();
 
             // TUI-4: Sync the vt100 parser size with the actual rendered
             // container overlay dimensions. The overlay size varies with

@@ -56,6 +56,61 @@ The TUI is composed of three areas:
 
 ---
 
+## Git Sidebar
+
+Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts.
+
+```
+┌─ Tab 1: myproject ──────────────┬─ +5 -3 ─┐
+│  exec workflow                   │ ┌─ +11 -10 ─┐
+└──────────────────────────────────┴─│ +3 -1 file.rs     │
+┌─── ● running: exec workflow ────────┤ +0 -8 old.rs     │
+│ $ docker run --rm -it ...           │ +8 -0 new.rs     │
+│                                     │ +0 -1 config     │
+│  ╭─ 🔒 Claude Code (containerized)  │ +0 -0 (binary)   │
+│  │                                  │               │
+│  │  [agent output here]              ╰─────────────────┘
+│  │                                  │
+│  ╰──────────────────────────────────╯
+│                                     │
+│  Ctrl-M toggle · Ctrl-W workflow   │
+└──────────────────────────────────────┘
+```
+
+### Opening and closing
+
+When the sidebar is **open**, press **Ctrl+G** again to close it. The execution window expands to fill the space, and a compact `+X -Y` summary appears in the bottom status bar showing the total additions and deletions across all files.
+
+When the sidebar is **closed**, the `+X -Y` summary is always visible on the right side of the status bar (when there are changes to display).
+
+### File list
+
+The sidebar displays each modified file with:
+- The **line change counts** in the format `+additions -deletions`
+- The **file path**, truncated with `…` if too long to fit
+
+Binary files are marked with a `(binary)` suffix and show `+0 -0` line counts.
+
+### Colors
+
+Each file row is color-coded by the type of change:
+
+- **Green** — added files
+- **Red** — deleted files
+- **Blue** — modified files
+
+The `+` symbol in the summary is always green, and the `-` symbol is always red, regardless of the actual changes displayed.
+
+### Narrow terminals
+
+If your terminal is narrower than 80 columns, the sidebar may not have enough space to display usefully. In this case, the sidebar automatically treats itself as closed even if you toggle it open — the `+X -Y` summary still appears in the status bar, giving you a quick overview of changes on narrow screens.
+
+### Refresh cadence
+
+The sidebar updates every 2 seconds, reflecting any staged or unstaged changes in the repository. Changes are polled automatically — there's no manual refresh needed.
+
+---
+
 ## The command box
 
 The command box is where you interact with awman. Type any subcommand and press **Enter**.
@@ -413,6 +468,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+T** | Open a new tab (prompts for working directory) |
 | **Ctrl+A** | Switch to the previous tab |
 | **Ctrl+D** | Switch to the next tab |
+| **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
 | **Ctrl+,** | Open / close the configuration dialog |
