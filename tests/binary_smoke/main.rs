@@ -10,6 +10,7 @@
 mod helpers;
 
 mod antigravity_0083;
+mod clean_command;
 mod cli_subprocess;
 mod context_overlay_0087;
 mod headless_no_tty;

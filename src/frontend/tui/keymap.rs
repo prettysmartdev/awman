@@ -286,7 +286,10 @@ mod tests {
     #[test]
     fn plain_g_is_not_a_sidebar_toggle() {
         // Without Ctrl, `g` is ordinary input (a char in the command box).
-        let action = map_key(key(KeyCode::Char('g'), KeyModifiers::NONE), FocusContext::CommandBox);
+        let action = map_key(
+            key(KeyCode::Char('g'), KeyModifiers::NONE),
+            FocusContext::CommandBox,
+        );
         assert_ne!(action, Action::ToggleGitSidebar);
     }
 

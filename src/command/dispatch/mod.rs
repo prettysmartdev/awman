@@ -17,6 +17,7 @@ use crate::command::commands::api_server::{
 };
 use crate::command::commands::auth::{AuthCommand, AuthCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFlags, ChatCommandFrontend};
+use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend, CleanFlags};
 use crate::command::commands::config::{
     ConfigCommand, ConfigCommandFrontend, ConfigGetFlags, ConfigSetFlags, ConfigShowFlags,
     ConfigSubcommand,
@@ -160,6 +161,7 @@ pub trait DispatchFrontend:
     + AuthCommandFrontend
     + DownloadCommandFrontend
     + SpecsCommandFrontend
+    + CleanCommandFrontend
     + 'static
 {
 }
@@ -179,6 +181,7 @@ impl<T> DispatchFrontend for T where
         + AuthCommandFrontend
         + DownloadCommandFrontend
         + SpecsCommandFrontend
+        + CleanCommandFrontend
         + 'static
 {
 }
@@ -203,6 +206,7 @@ pub enum CommandOutcome {
     Specs(crate::command::commands::specs::SpecsOutcome),
     Auth(crate::command::commands::auth::AuthOutcome),
     Download(crate::command::commands::download::DownloadOutcome),
+    Clean(crate::command::commands::clean::CleanOutcome),
     /// Trivial wrapper used by no-op leaf commands during the refactor.
     Empty,
 }
@@ -223,6 +227,7 @@ pub enum BuiltCommand {
     New(NewCommand),
     Auth(AuthCommand),
     Download(DownloadCommand),
+    Clean(CleanCommand),
 }
 
 // ─── Dispatch ───────────────────────────────────────────────────────────────
@@ -638,6 +643,21 @@ impl<F: CommandFrontend> Dispatch<F> {
                     session.clone(),
                 )))
             }
+            ["clean"] => {
+                let yes = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "yes")?
+                    .unwrap_or(false);
+                let dry_run = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "dry-run")?
+                    .unwrap_or(false);
+                Ok(BuiltCommand::Clean(CleanCommand::new(
+                    CleanFlags { yes, dry_run },
+                    self.engines.clone(),
+                    session.clone(),
+                )))
+            }
             _ => Err(CommandError::unknown_command(&canonical_refs)),
         }
     }
@@ -726,6 +746,12 @@ impl<F: DispatchFrontend> Dispatch<F> {
                 cmd.run_with_frontend(boxed)
                     .await
                     .map(CommandOutcome::Download)
+            }
+            BuiltCommand::Clean(cmd) => {
+                let boxed: Box<dyn CleanCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Clean)
             }
         }
     }

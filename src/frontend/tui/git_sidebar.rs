@@ -315,9 +315,7 @@ async fn poll_once(root: &Path) -> Option<GitDiffSummary> {
     // Count lines for untracked files (`??`) not covered by numstat.
     let mut untracked_lines = HashMap::new();
     for (path, change_type) in &porcelain {
-        if *change_type == GitFileChangeType::Added
-            && !numstat.iter().any(|n| &n.path == path)
-        {
+        if *change_type == GitFileChangeType::Added && !numstat.iter().any(|n| &n.path == path) {
             let count = match repo_relative_file_path(root, path) {
                 Some(file_path) => count_file_lines(&file_path).await,
                 None => 0,
@@ -414,21 +412,30 @@ mod tests {
     fn porcelain_staged_modify_is_modified() {
         // `M ` (modified in index) → Modified.
         let got = parse_porcelain_status("M  mod.rs\n");
-        assert_eq!(got, vec![("mod.rs".to_string(), GitFileChangeType::Modified)]);
+        assert_eq!(
+            got,
+            vec![("mod.rs".to_string(), GitFileChangeType::Modified)]
+        );
     }
 
     #[test]
     fn porcelain_unstaged_modify_is_modified() {
         // ` M` (modified in worktree) → Modified.
         let got = parse_porcelain_status(" M mod.rs\n");
-        assert_eq!(got, vec![("mod.rs".to_string(), GitFileChangeType::Modified)]);
+        assert_eq!(
+            got,
+            vec![("mod.rs".to_string(), GitFileChangeType::Modified)]
+        );
     }
 
     #[test]
     fn porcelain_rename_resolves_to_destination() {
         // `R ` rename lines carry `old -> new`; we track the destination path.
         let got = parse_porcelain_status("R  old.rs -> new.rs\n");
-        assert_eq!(got, vec![("new.rs".to_string(), GitFileChangeType::Modified)]);
+        assert_eq!(
+            got,
+            vec![("new.rs".to_string(), GitFileChangeType::Modified)]
+        );
     }
 
     #[test]
@@ -642,7 +649,10 @@ mod tests {
 
     #[test]
     fn sidebar_title_detached_head_falls_back_to_head() {
-        assert_eq!(sidebar_title(&Some(summary_with(None, 2))), "HEAD: 2 changed");
+        assert_eq!(
+            sidebar_title(&Some(summary_with(None, 2))),
+            "HEAD: 2 changed"
+        );
         assert_eq!(sidebar_title(&Some(summary_with(None, 0))), "HEAD: clean");
     }
 
@@ -679,10 +689,7 @@ mod tests {
     fn sidebar_width_never_exceeds_quarter() {
         for w in [20u16, 80, 100, 123, 200, 255] {
             let sw = sidebar_width(w, GitSidebarState::Open);
-            assert!(
-                sw <= w / 4,
-                "sidebar width {sw} for term {w} must be ≤ 25%"
-            );
+            assert!(sw <= w / 4, "sidebar width {sw} for term {w} must be ≤ 25%");
         }
     }
 
@@ -693,8 +700,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let summary: SharedGitDiffSummary = Arc::new(Mutex::new(None));
         let cancel = CancellationToken::new();
-        let handle =
-            start_git_diff_poll_task(tmp.path().to_path_buf(), summary, cancel.clone());
+        let handle = start_git_diff_poll_task(tmp.path().to_path_buf(), summary, cancel.clone());
 
         // Let the task run at least one iteration and settle into its 2s sleep.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -742,7 +748,9 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(outside.path(), "one\ntwo\n").await.unwrap();
+        tokio::fs::write(outside.path(), "one\ntwo\n")
+            .await
+            .unwrap();
         let link = tmp.path().join("outside-link");
         symlink(outside.path(), &link).unwrap();
 

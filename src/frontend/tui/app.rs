@@ -211,10 +211,8 @@ impl App {
         // default until the first SIGWINCH).
         let initial_size = match crossterm::terminal::size() {
             Ok((cols, rows)) => {
-                let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(
-                    cols,
-                    tab.git_sidebar_state,
-                );
+                let sidebar =
+                    crate::frontend::tui::git_sidebar::sidebar_width(cols, tab.git_sidebar_state);
                 crate::frontend::tui::compute_container_inner_size(
                     cols.saturating_sub(sidebar),
                     rows,

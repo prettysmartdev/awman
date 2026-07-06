@@ -11,6 +11,7 @@ pub mod agent_setup;
 pub mod api_server;
 pub mod auth;
 pub mod chat;
+pub mod clean;
 pub mod command_trait;
 pub mod config;
 pub mod download;

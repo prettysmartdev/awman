@@ -54,7 +54,18 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
         CommandOutcome::Specs(o) => render_specs(o),
         CommandOutcome::Auth(o) => render_auth(o),
         CommandOutcome::Download(o) => render_download(o),
+        CommandOutcome::Clean(o) => render_clean(o),
     }
+}
+
+// ─── clean ─────────────────────────────────────────────────────────────────────
+//
+// `awman clean` streams its itemized summary, confirmation, and result
+// messages through the frontend during the run (CLI: stdout + message queue).
+// The success outcome adds nothing further on stdout.
+
+fn render_clean(_o: &crate::command::commands::clean::CleanOutcome) -> Option<String> {
+    None
 }
 
 // ─── status ──────────────────────────────────────────────────────────────────

@@ -34,6 +34,19 @@ pub(super) trait ContainerBackend: Send + Sync {
 
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
+    /// List stopped (exited/dead) awman containers. Backends that cannot
+    /// enumerate stopped containers fall back to an empty list.
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+
+    /// List dangling awman images eligible for cleanup. Default: empty.
+    fn list_dangling_images(
+        &self,
+    ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
+        Ok(Vec::new())
+    }
+
     /// Build the CLI arguments for `docker exec -it` (or equivalent) into a
     /// running container. Used by TUI re-attach.
     fn exec_args(

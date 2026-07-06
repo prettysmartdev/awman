@@ -15,6 +15,7 @@ pub(crate) mod render;
 
 mod api_server;
 mod chat;
+mod clean;
 mod exec_prompt;
 mod exec_workflow;
 mod init;

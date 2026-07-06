@@ -870,7 +870,6 @@ impl Command for ExecWorkflowCommand {
             issue_temp_file: _issue_temp_file,
         };
         execute_prepared(&self.flags, &self.engines, prepared, frontend).await
-
     }
 }
 
@@ -925,7 +924,6 @@ async fn execute_prepared(
         issue_temp_file: _issue_temp_file,
     } = prepared;
     let mut frontend = frontend;
-
 
     // 5b. Detect a persisted workflow-state file and ask the user whether
     //     to resume it or delete it and start fresh. The check uses the
@@ -995,8 +993,7 @@ async fn execute_prepared(
 
     // 7. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
     //    CommandLayerFactory can share it for the duration of the engine run.
-    let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
-        Arc::new(Mutex::new(frontend));
+    let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> = Arc::new(Mutex::new(frontend));
 
     let flags_arc = Arc::new(flags.clone());
 
@@ -1046,15 +1043,13 @@ async fn execute_prepared(
         workflow.teardown.iter().map(|e| e.step.clone()).collect();
     let setup_entry_overlays: Vec<Option<Vec<String>>> =
         workflow.setup.iter().map(|e| e.overlays.clone()).collect();
-    let setup_abort_flags: Vec<bool> =
-        workflow.setup.iter().map(|e| e.abort_on_failure).collect();
-    let setup_on_failure_configs: Vec<
-        Option<crate::data::workflow_definition::RemediationConfig>,
-    > = workflow
-        .setup
-        .iter()
-        .map(|e| e.on_failure.clone())
-        .collect();
+    let setup_abort_flags: Vec<bool> = workflow.setup.iter().map(|e| e.abort_on_failure).collect();
+    let setup_on_failure_configs: Vec<Option<crate::data::workflow_definition::RemediationConfig>> =
+        workflow
+            .setup
+            .iter()
+            .map(|e| e.on_failure.clone())
+            .collect();
     let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
         .teardown
         .iter()
@@ -1203,8 +1198,7 @@ async fn execute_prepared(
                             })?
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
-                        let container =
-                            runtime.start_background(&base, &mount, env, overlays)?;
+                        let container = runtime.start_background(&base, &mount, env, overlays)?;
                         Ok(Box::new(container))
                     };
                     let r = engine.run_setup(
@@ -1416,14 +1410,11 @@ async fn execute_prepared(
     })
 }
 
-
 /// Validate the `--dynamic` / `--leader` flag relationships before any IO.
 /// Runs for every `exec workflow` invocation (dynamic or not). The non-dynamic
 /// missing-`workflow`-path error is handled separately in the dispatcher so the
 /// existing missing-required-argument message is preserved.
-pub(crate) fn validate_dynamic_flags(
-    flags: &ExecWorkflowCommandFlags,
-) -> Result<(), CommandError> {
+pub(crate) fn validate_dynamic_flags(flags: &ExecWorkflowCommandFlags) -> Result<(), CommandError> {
     if flags.dynamic && flags.workflow.is_some() {
         return Err(CommandError::Other(
             "cannot specify a workflow file path with --dynamic; the path is \
@@ -1482,8 +1473,8 @@ pub(crate) fn resolve_leader_model(
     match &flags.leader {
         Some(raw) => {
             let spec = LeaderSpec::parse(raw)?;
-            let agent = crate::data::session::AgentName::new(&spec.agent)
-                .map_err(CommandError::from)?;
+            let agent =
+                crate::data::session::AgentName::new(&spec.agent).map_err(CommandError::from)?;
             Ok((agent, Some(spec.model)))
         }
         None => {
@@ -1582,9 +1573,8 @@ pub(crate) fn resolve_and_validate_workflow_agents(
         .filter(|a| !paths.agent_dockerfile(a).exists())
         .collect();
     if !unknown.is_empty() {
-        let mut msg = String::from(
-            "workflow.toml references agents with no Dockerfile in the project:\n",
-        );
+        let mut msg =
+            String::from("workflow.toml references agents with no Dockerfile in the project:\n");
         for a in &unknown {
             msg.push_str(&format!("  - \"{a}\" (expected .awman/Dockerfile.{a})\n"));
         }
@@ -1638,7 +1628,9 @@ impl ExecWorkflowCommand {
             .as_deref()
             .expect("validated: --dynamic requires --work-item");
         let wi_number = parse_work_item_number(wi_str).ok_or_else(|| {
-            CommandError::Other(format!("could not parse a work item number from {wi_str:?}"))
+            CommandError::Other(format!(
+                "could not parse a work item number from {wi_str:?}"
+            ))
         })?;
         let base_session = self.session.clone();
         let git_root_for_scope = base_session.git_root().to_path_buf();
@@ -1925,7 +1917,10 @@ impl ExecWorkflowCommand {
 
         shared.lock().unwrap().write_message(UserMessage {
             level: MessageLevel::Info,
-            text: format!("Launching dynamic workflow {label} agent ({})…", agent.as_str()),
+            text: format!(
+                "Launching dynamic workflow {label} agent ({})…",
+                agent.as_str()
+            ),
         });
         shared.lock().unwrap().set_pty_active(true);
 
@@ -2129,7 +2124,9 @@ fn ensure_agent_image(
     agent: &str,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), CommandError> {
-    let runtime = engines.require_container_runtime().map_err(CommandError::from)?;
+    let runtime = engines
+        .require_container_runtime()
+        .map_err(CommandError::from)?;
     let dockerfile = paths.agent_dockerfile(agent);
     if !dockerfile.exists() {
         return Err(CommandError::Other(format!(
@@ -3375,8 +3372,14 @@ prompt = "do something"
 
     #[test]
     fn validate_dynamic_flags_ok_with_valid_dynamic_invocation() {
-        let flags =
-            make_dynamic_flags(true, None, Some("0042"), Some("claude::claude-opus-4-8"), false, None);
+        let flags = make_dynamic_flags(
+            true,
+            None,
+            Some("0042"),
+            Some("claude::claude-opus-4-8"),
+            false,
+            None,
+        );
         assert!(
             validate_dynamic_flags(&flags).is_ok(),
             "valid dynamic invocation with --leader must pass"
@@ -3539,11 +3542,8 @@ prompt = "do something"
     #[test]
     fn build_leader_prompt_substitutes_work_item_path() {
         let path = "/workspace/aspec/work-items/0042-my-item.md";
-        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
-            "0042",
-            path,
-            "  - claude",
-        );
+        let prompt =
+            crate::data::dynamic_workflow_assets::build_leader_prompt("0042", path, "  - claude");
         assert!(
             prompt.contains(path),
             "leader prompt must contain the work item path"
@@ -3620,7 +3620,10 @@ prompt = "do something"
             result.err()
         );
         let wf = result.unwrap();
-        assert!(!wf.steps.is_empty(), "example workflow must have at least one step");
+        assert!(
+            !wf.steps.is_empty(),
+            "example workflow must have at least one step"
+        );
     }
 
     #[test]
@@ -3822,7 +3825,10 @@ prompt = "do something"
 
     #[test]
     fn format_available_agents_single_agent() {
-        let agents = vec![("claude".to_string(), std::path::PathBuf::from("/r/.awman/Dockerfile.claude"))];
+        let agents = vec![(
+            "claude".to_string(),
+            std::path::PathBuf::from("/r/.awman/Dockerfile.claude"),
+        )];
         let result = format_available_agents(&agents);
         assert!(
             result.contains("claude"),
@@ -3837,8 +3843,14 @@ prompt = "do something"
     #[test]
     fn format_available_agents_multiple_agents_are_listed() {
         let agents = vec![
-            ("claude".to_string(), std::path::PathBuf::from("/r/.awman/Dockerfile.claude")),
-            ("maki".to_string(), std::path::PathBuf::from("/r/.awman/Dockerfile.maki")),
+            (
+                "claude".to_string(),
+                std::path::PathBuf::from("/r/.awman/Dockerfile.claude"),
+            ),
+            (
+                "maki".to_string(),
+                std::path::PathBuf::from("/r/.awman/Dockerfile.maki"),
+            ),
         ];
         let result = format_available_agents(&agents);
         assert!(result.contains("claude"), "must list claude");
@@ -3969,7 +3981,11 @@ prompt = "do something"
         let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
         let wf = make_workflow(None, &[Some("claude"), Some("claude"), Some("claude")]);
         let result = resolve_and_validate_workflow_agents(&wf, &session, &paths).unwrap();
-        assert_eq!(result.len(), 1, "claude must appear only once in the resolved list");
+        assert_eq!(
+            result.len(),
+            1,
+            "claude must appear only once in the resolved list"
+        );
     }
 
     #[test]
@@ -4019,7 +4035,10 @@ prompt = "do something"
         std::fs::write(&wf_path, "this is NOT valid toml ][").unwrap();
 
         let err = validate_generated_workflow(&wf_path, &session, &paths).unwrap_err();
-        assert!(!err.is_empty(), "invalid TOML must produce a non-empty error");
+        assert!(
+            !err.is_empty(),
+            "invalid TOML must produce a non-empty error"
+        );
     }
 
     #[test]
@@ -4043,12 +4062,18 @@ prompt = "do something"
         .unwrap();
 
         let err = validate_generated_workflow(&wf_path, &session, &paths).unwrap_err();
-        assert!(err.contains("gemini"), "error must name the unknown agent, got: {err}");
+        assert!(
+            err.contains("gemini"),
+            "error must name the unknown agent, got: {err}"
+        );
         assert!(
             err.contains("Available agents"),
             "error must list available agents for repair, got: {err}"
         );
-        assert!(err.contains("claude"), "error must list claude as available, got: {err}");
+        assert!(
+            err.contains("claude"),
+            "error must list claude as available, got: {err}"
+        );
     }
 
     #[test]

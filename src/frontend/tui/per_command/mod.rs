@@ -9,6 +9,7 @@ mod agent_setup;
 mod api_server;
 mod auth;
 mod chat;
+mod clean;
 mod config;
 mod container_frontend;
 mod download;

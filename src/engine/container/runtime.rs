@@ -25,6 +25,18 @@ use crate::engine::container::docker::DockerBackend;
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
+/// A container image row returned by image-listing queries. Used by
+/// `awman clean` to enumerate dangling awman images eligible for removal.
+#[derive(Debug, Clone)]
+pub struct ContainerImageInfo {
+    /// Image ID (short or full).
+    pub id: String,
+    /// `repository:tag` label, or `<none>:<none>` for untagged images.
+    pub repo_tag: String,
+    /// Human-readable size string reported by the runtime (e.g. "1.2GB").
+    pub size: String,
+}
+
 /// Capabilities shared by container-class backends (Docker, Apple
 /// Containers): image-based, ephemeral, arbitrary mounts/env, label-based
 /// session attribution.
@@ -214,6 +226,31 @@ impl ContainerRuntime {
         self.backend.stop(handle)
     }
 
+    /// List stopped (exited/dead) awman containers eligible for cleanup.
+    /// Running and paused containers are never returned. Used by `awman clean`.
+    pub fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        self.backend.list_stopped()
+    }
+
+    /// List dangling awman images (superseded by a newer build of the same
+    /// tag). Used by `awman clean`.
+    pub fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
+        self.backend.list_dangling_images()
+    }
+
+    /// Remove a container by id/name. Returns an error when the runtime refuses
+    /// (e.g. the container transitioned back to running between discovery and
+    /// deletion). Used by `awman clean` for per-item failure handling.
+    pub fn remove_container(&self, id: &str) -> Result<(), EngineError> {
+        run_removal(self.cli_binary(), "rm", id)
+    }
+
+    /// Remove an image by id. Returns an error when the runtime refuses (e.g.
+    /// the image is still referenced by a container). Used by `awman clean`.
+    pub fn remove_image(&self, id: &str) -> Result<(), EngineError> {
+        run_removal(self.cli_binary(), "rmi", id)
+    }
+
     /// Build CLI arguments for `docker exec -it` (or equivalent) into a running
     /// container. Returns args suitable for `Command::new(cli_binary).args(...)`.
     pub fn exec_args(
@@ -337,6 +374,33 @@ impl AgentRuntimeEngine for ContainerRuntime {
     fn cli_binary(&self) -> &'static str {
         ContainerRuntime::cli_binary(self)
     }
+}
+
+/// Shell out to the runtime CLI to remove a container (`rm`) or image (`rmi`).
+/// Returns an error on a non-zero exit so callers can count per-item failures.
+fn run_removal(cli_bin: &str, subcommand: &str, target: &str) -> Result<(), EngineError> {
+    use std::process::{Command, Stdio};
+    let output = Command::new(cli_bin)
+        .args([subcommand, target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EngineError::ContainerRuntimeUnavailable {
+                    binary: cli_bin.to_string(),
+                }
+            } else {
+                EngineError::Container(format!("{cli_bin} {subcommand} {target}: {e}"))
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(EngineError::Container(format!(
+            "{cli_bin} {subcommand} {target} failed: {stderr}"
+        )));
+    }
+    Ok(())
 }
 
 /// Wait for a child process with a timeout. Kills the process and returns

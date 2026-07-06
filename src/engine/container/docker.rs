@@ -179,6 +179,133 @@ impl ContainerBackend for DockerBackend {
         Ok(handles)
     }
 
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        // Two-query deduplicated approach mirroring `list_running_all`: query
+        // by the awman label and by the legacy `awman-` name prefix. Each query
+        // adds `status=exited` and `status=dead` filters (OR'd within the same
+        // filter type) so only stopped containers are returned — running or
+        // paused containers are never included.
+        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
+        let queries: &[&[&str]] = &[
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "label=awman=true",
+                "--filter",
+                "status=exited",
+                "--filter",
+                "status=dead",
+                "--format",
+                format,
+            ],
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "name=awman-",
+                "--filter",
+                "status=exited",
+                "--filter",
+                "status=dead",
+                "--format",
+                format,
+            ],
+        ];
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut handles: Vec<AgentHandle> = Vec::new();
+
+        for args in queries {
+            let output = Command::new("docker")
+                .args(*args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output();
+            let output = match output {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.splitn(4, '\t').collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+                let id = parts[0].to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let name = parts[1].to_string();
+                let image_tag = parts[2].to_string();
+                let created = parts[3];
+                let started_at =
+                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                handles.push(AgentHandle {
+                    id,
+                    image_tag,
+                    name,
+                    started_at,
+                });
+            }
+        }
+
+        Ok(handles)
+    }
+
+    fn list_dangling_images(
+        &self,
+    ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
+        use crate::engine::container::runtime::ContainerImageInfo;
+        let format = "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}";
+        let output = Command::new("docker")
+            .args([
+                "images",
+                "--filter",
+                "label=awman=true",
+                "--filter",
+                "dangling=true",
+                "--format",
+                format,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            // Docker missing or query failed: return an empty list. Callers use
+            // `is_available()` to decide whether Docker is reachable at all.
+            _ => return Ok(Vec::new()),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut images: Vec<ContainerImageInfo> = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let id = parts[0].to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            images.push(ContainerImageInfo {
+                id,
+                repo_tag: parts[1].to_string(),
+                size: parts[2].to_string(),
+            });
+        }
+        Ok(images)
+    }
+
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let output = Command::new("docker")
             .args([

@@ -1714,11 +1714,27 @@ mod tests {
         use crate::frontend::tui::git_sidebar::GitSidebarState;
         let mut app = make_app();
         app.active_tab_mut().git_sidebar_state = GitSidebarState::Open;
+        set_summary(&app, 7, 2);
         // 60/4 == 15 < MIN_SIDEBAR_WIDTH (20) → sidebar collapses to nothing.
         let buf = render_app(&mut app, 60, 24);
         assert!(
             has_green_sidebar_corner(&buf).is_none(),
             "sidebar must collapse when a quarter of the width is < 20 columns"
+        );
+        let text: String = {
+            let area = *buf.area();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            text.contains("+7") && text.contains("-2"),
+            "collapsed sidebar must still show the status-bar summary: {text:?}"
         );
     }
 
@@ -1738,7 +1754,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(text.contains("+12"), "status bar shows additions: had lines");
+        assert!(
+            text.contains("+12"),
+            "status bar shows additions: had lines"
+        );
         assert!(text.contains("-3"), "status bar shows deletions");
     }
 

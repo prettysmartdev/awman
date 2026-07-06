@@ -99,7 +99,7 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         app.active_tab_mut().last_strip_rect = None;
     }
 
-    render_status_bar(app, chunks[4], frame);
+    render_status_bar(app, chunks[4], frame, sidebar_area.is_some());
     render_command_box(app, chunks[5], frame);
     render_suggestion_row(app, chunks[6], frame);
 
@@ -609,7 +609,9 @@ fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option<GitDiffSum
         .border_style(Style::default().fg(Color::Green))
         .title(Span::styled(
             format!(" {} ", git_sidebar::sidebar_title(summary)),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -633,7 +635,9 @@ fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option<GitDiffSum
     let title = Line::from(vec![
         Span::styled(
             format!("+{}", summary.total_additions),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
@@ -690,7 +694,7 @@ fn truncate_path(path: &str, max: usize) -> String {
     format!("{truncated}\u{2026}")
 }
 
-fn render_status_bar(app: &App, area: Rect, frame: &mut Frame) {
+fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sidebar_visible: bool) {
     use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
 
     let tab = app.active_tab();
@@ -808,9 +812,10 @@ fn render_status_bar(app: &App, area: Rect, frame: &mut Frame) {
         )],
     };
 
-    // When the sidebar is closed, show the compact `+A -D` diff summary at the
-    // far right of the 1-row status bar (green `+`, red `-`).
-    if tab.git_sidebar_state == git_sidebar::GitSidebarState::Closed {
+    // When the sidebar is not visible (closed or collapsed for a narrow
+    // terminal), show the compact `+A -D` diff summary at the far right of the
+    // 1-row status bar (green `+`, red `-`).
+    if !sidebar_visible {
         if let Some(summary) = tab.git_diff_summary.lock().ok().and_then(|g| g.clone()) {
             let git_spans = vec![
                 Span::styled(
@@ -1978,8 +1983,16 @@ mod tests {
         let top_left = buf.cell((0, 0)).unwrap();
         assert_eq!(top_left.symbol(), "\u{256d}", "top-left rounded corner");
         assert_eq!(buf.cell((23, 0)).unwrap().symbol(), "\u{256e}", "top-right");
-        assert_eq!(buf.cell((0, 7)).unwrap().symbol(), "\u{2570}", "bottom-left");
-        assert_eq!(buf.cell((23, 7)).unwrap().symbol(), "\u{256f}", "bottom-right");
+        assert_eq!(
+            buf.cell((0, 7)).unwrap().symbol(),
+            "\u{2570}",
+            "bottom-left"
+        );
+        assert_eq!(
+            buf.cell((23, 7)).unwrap().symbol(),
+            "\u{256f}",
+            "bottom-right"
+        );
         // Border style is green.
         assert_eq!(top_left.fg, Color::Green, "border must be green");
     }
@@ -2009,7 +2022,11 @@ mod tests {
 
     /// The top border row of the rendered buffer, as a string.
     fn top_border_row(buf: &ratatui::buffer::Buffer) -> String {
-        buffer_text(buf).lines().next().unwrap_or_default().to_string()
+        buffer_text(buf)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
     }
 
     #[test]

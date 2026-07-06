@@ -1049,6 +1049,18 @@ impl ConfigCommandFrontend for ApiDispatchFrontend {
     }
 }
 
+// `awman clean` is blocked for the API frontend at the catalogue layer
+// (`api_allowed: false`); this impl exists only to satisfy the `DispatchFrontend`
+// supertrait bound and never runs. It never confirms a deletion.
+impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFrontend {
+    fn confirm_deletion(
+        &mut self,
+        _summary: &crate::command::commands::clean::CleanSummary,
+    ) -> Result<bool, CommandError> {
+        Ok(false)
+    }
+}
+
 #[async_trait]
 impl ApiServerCommandFrontend for ApiDispatchFrontend {
     async fn serve_until_shutdown(&mut self, _config: ApiServeConfig) -> Result<(), CommandError> {

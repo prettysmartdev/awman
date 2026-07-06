@@ -340,10 +340,49 @@ const ROOT: CommandSpec = CommandSpec {
         &API_SERVER,
         &REMOTE,
         &NEW,
+        &CLEAN,
     ],
 };
 
 const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
+
+// ── clean ─────────────────────────────────────────────────────────────────────
+
+const CLEAN: CommandSpec = CommandSpec {
+    name: "clean",
+    aliases: &[],
+    help: "Remove stopped awman containers, completed workflow data, and dangling images.",
+    long_help: None,
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "yes",
+            short: Some('y'),
+            help: "Skip the confirmation prompt (for scripting).",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "dry-run",
+            short: None,
+            help: "List what would be removed without deleting anything.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    // Blocked at the catalogue layer for the API frontend; never reaches
+    // command dispatch via the API.
+    api_allowed: false,
+    subcommands: &[],
+};
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
