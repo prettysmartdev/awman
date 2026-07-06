@@ -75,6 +75,17 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     ) {
     }
 
+    /// Called by the engine the moment the current container has actually
+    /// terminated — either it exited on its own (agent quit, crash, startup
+    /// grace kill) or the engine killed it (yolo advance, WCB action).
+    ///
+    /// Contract: this fires ONLY on real container death. It is never called
+    /// for a stuck-but-alive container or while a yolo countdown is still
+    /// running. `exit_code` is the container's exit code when known, or
+    /// [`KILLED_EXIT_CODE`](crate::engine::agent_runtime::execution::KILLED_EXIT_CODE)
+    /// when the engine killed it without waiting for the real code.
+    fn report_container_exited(&mut self, _exit_code: i32) {}
+
     // === User decisions (blocking) ===
 
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;

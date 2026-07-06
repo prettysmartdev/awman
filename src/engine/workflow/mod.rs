@@ -18,7 +18,9 @@ use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
 use crate::engine::agent_runtime::background::AgentExec;
-use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo, StuckEvent};
+use crate::engine::agent_runtime::execution::{
+    AgentExecution, AgentExitInfo, StuckEvent, KILLED_EXIT_CODE,
+};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -527,6 +529,9 @@ impl WorkflowEngine {
         exit: AgentExitInfo,
     ) -> Result<StepOutcome, EngineError> {
         self.last_exit_info = Some(exit.clone());
+        // The step's container has actually terminated (wait() resolved) —
+        // tell the frontend so it can tear down any live container UI.
+        self.frontend.report_container_exited(exit.exit_code);
 
         let (status, step_state) = if exit.exit_code == 0 {
             (WorkflowStepStatus::Succeeded, StepState::Succeeded)
@@ -691,6 +696,20 @@ impl WorkflowEngine {
         }
     }
 
+    /// Kill the current step's container and immediately tell the frontend
+    /// it is gone. Used by every engine-initiated kill (yolo auto-advance,
+    /// WCB advance/restart/back/pause/abort/finish). Steps whose container
+    /// exits on its own are reported via `finalize_step` instead.
+    fn kill_current_container(
+        &mut self,
+        cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
+    ) {
+        if let Some(ch) = cancel_handle {
+            let _ = ch.cancel();
+            self.frontend.report_container_exited(KILLED_EXIT_CODE);
+        }
+    }
+
     fn handle_mid_step_control_board(
         &mut self,
         step_name: &str,
@@ -737,9 +756,7 @@ impl WorkflowEngine {
             }
             NextAction::Pause => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 self.state.set_status(step_name, StepState::Pending);
                 self.persist()?;
@@ -749,9 +766,7 @@ impl WorkflowEngine {
             }
             NextAction::Abort => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 for s in &self.workflow.steps {
                     if !self.state.completed_steps.contains(&s.name) {
@@ -770,9 +785,7 @@ impl WorkflowEngine {
                     ));
                 }
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 for s in &self.workflow.steps {
                     if !self.state.completed_steps.contains(&s.name) {
@@ -786,9 +799,7 @@ impl WorkflowEngine {
             }
             NextAction::LaunchNext => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 self.state.set_status(step_name, StepState::Succeeded);
                 self.persist()?;
@@ -796,9 +807,7 @@ impl WorkflowEngine {
             }
             NextAction::RestartCurrentStep => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 self.state.set_status(step_name, StepState::Pending);
                 self.persist()?;
@@ -806,9 +815,7 @@ impl WorkflowEngine {
             }
             NextAction::CancelToPreviousStep => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 if let Some(prev) = self.previous_step_name() {
                     self.state.set_status(step_name, StepState::Cancelled);
@@ -858,9 +865,7 @@ impl WorkflowEngine {
                 MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => Ok(None),
                 MidStepYoloResult::Advanced => {
                     self.msg_info(format!("Yolo auto-advancing past step '{}'", step_name,));
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                     self.state.set_status(step_name, StepState::Succeeded);
                     self.persist()?;
                     let step = self.find_step(step_name)?;
@@ -2751,6 +2756,9 @@ mod tests {
         completed: Mutex<Option<WorkflowOutcome>>,
         available_log: Mutex<Vec<AvailableActions>>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+        /// Exit codes passed to `report_container_exited`, shared so tests
+        /// can assert on them after the engine consumes the frontend.
+        container_exits: Arc<Mutex<Vec<i32>>>,
     }
 
     impl CapturingFrontend {
@@ -2764,6 +2772,7 @@ mod tests {
                 completed: Mutex::new(None),
                 available_log: Mutex::new(Vec::new()),
                 engine_tx,
+                container_exits: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -2821,6 +2830,10 @@ mod tests {
             *self.completed.lock().unwrap() = Some(outcome.clone());
         }
 
+        fn report_container_exited(&mut self, exit_code: i32) {
+            self.container_exits.lock().unwrap().push(exit_code);
+        }
+
         fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
             *self.engine_tx.lock().unwrap() = Some(tx);
         }
@@ -2832,12 +2845,13 @@ mod tests {
         factory: BlockingFactory,
         actions: impl IntoIterator<Item = NextAction>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
-    ) -> WorkflowEngine {
+    ) -> (WorkflowEngine, Arc<Mutex<Vec<i32>>>) {
         let overlay = OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
         );
         let frontend = CapturingFrontend::new(actions, engine_tx);
-        WorkflowEngine::new(
+        let container_exits = frontend.container_exits.clone();
+        let engine = WorkflowEngine::new(
             session,
             workflow,
             None,
@@ -2846,7 +2860,8 @@ mod tests {
             Arc::new(crate::engine::git::GitEngine::new()),
             Arc::new(overlay),
         )
-        .unwrap()
+        .unwrap();
+        (engine, container_exits)
     }
 
     // ── Mid-step control board tests ─────────────────────────────────────────
@@ -2866,7 +2881,7 @@ mod tests {
             Arc::new(Mutex::new(None));
 
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion1.clone())]);
-        let mut engine = make_capturing_engine(
+        let (mut engine, container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2890,11 +2905,19 @@ mod tests {
             !cancel_flag.load(Ordering::Relaxed),
             "cancel must not be called when user picks Dismiss"
         );
+        assert!(
+            container_exits.lock().unwrap().is_empty(),
+            "no container exit may be reported while the container still runs"
+        );
 
         signal_completion(&completion1, 0);
 
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+        assert!(
+            container_exits.lock().unwrap().contains(&0),
+            "the step's natural completion must be reported with its exit code"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2910,7 +2933,7 @@ mod tests {
         let (cancel_flag, completion) = make_blocking_entry();
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2946,7 +2969,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion1)]);
         let execution_count = factory.execution_count.clone();
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2982,7 +3005,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion1)]);
         let execution_count = factory.execution_count.clone();
-        let mut engine = make_capturing_engine(
+        let (mut engine, container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2998,6 +3021,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert!(cancel_flag.load(Ordering::Relaxed));
+        assert_eq!(
+            container_exits.lock().unwrap().first(),
+            Some(&KILLED_EXIT_CODE),
+            "an engine kill must be reported to the frontend immediately"
+        );
 
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
@@ -3140,7 +3168,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
         // When WCB opens due to stuck: Dismiss, then later LaunchNext between steps.
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -3306,7 +3334,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory =
             BlockingFactory::new([(Arc::new(AtomicBool::new(false)), completion.clone())]);
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,

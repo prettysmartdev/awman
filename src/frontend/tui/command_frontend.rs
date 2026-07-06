@@ -17,9 +17,9 @@ use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
-    SharedActiveWorktreePath, SharedContainerName, SharedEngineTx, SharedPtyResetFlag,
-    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender, SharedTuiContext,
-    SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
+    SharedActiveWorktreePath, SharedContainerExitCode, SharedContainerName, SharedEngineTx,
+    SharedPtyResetFlag, SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender,
+    SharedTuiContext, SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
@@ -47,6 +47,10 @@ pub struct TuiCommandFrontend {
     pub(crate) yolo_cancel_flag: SharedYoloCancelFlag,
     pub(crate) pty_reset_flag: SharedPtyResetFlag,
     pub(crate) container_name_shared: SharedContainerName,
+    /// Shared exit-code slot: written when the engine reports a workflow
+    /// container actually terminated; the TUI event loop takes it and closes
+    /// the container window.
+    pub(crate) container_exit_shared: SharedContainerExitCode,
     /// Persistent stdout sender — kept alive across workflow steps so each
     /// new `AgentIo` can send output to the same TUI event loop receiver.
     pub(crate) stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -92,6 +96,7 @@ impl TuiCommandFrontend {
         yolo_cancel_flag: SharedYoloCancelFlag,
         pty_reset_flag: SharedPtyResetFlag,
         container_name_shared: SharedContainerName,
+        container_exit_shared: SharedContainerExitCode,
         stdin_tx_shared: SharedStdinTx,
         resize_tx_shared: SharedResizeTx,
         engine_tx_shared: SharedEngineTx,
@@ -114,6 +119,7 @@ impl TuiCommandFrontend {
             yolo_cancel_flag,
             pty_reset_flag,
             container_name_shared,
+            container_exit_shared,
             stdout_tx,
             stdin_tx_shared,
             resize_tx_shared,

@@ -60,15 +60,22 @@ The TUI is composed of three areas:
 
 Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts.
 
+The sidebar's border always carries a title summarizing the repository state, like a condensed `git status`:
+
+- `main: 3 changed` — current branch and the number of changed files
+- `main: clean` — no uncommitted changes
+- `HEAD: 2 changed` — detached HEAD state
+- `git status` — no git data available (e.g. not a git repository)
+
 ```
 ┌─ Tab 1: myproject ──────────────┬─ +5 -3 ─┐
-│  exec workflow                   │ ┌─ +11 -10 ─┐
-└──────────────────────────────────┴─│ +3 -1 file.rs     │
-┌─── ● running: exec workflow ────────┤ +0 -8 old.rs     │
-│ $ docker run --rm -it ...           │ +8 -0 new.rs     │
-│                                     │ +0 -1 config     │
-│  ╭─ 🔒 Claude Code (containerized)  │ +0 -0 (binary)   │
-│  │                                  │               │
+│  exec workflow                   │ ┌─ main: 5 changed ─┐
+└──────────────────────────────────┴─│ +11 -10           │
+┌─── ● running: exec workflow ────────┤ +3 -1 file.rs    │
+│ $ docker run --rm -it ...           │ +0 -8 old.rs     │
+│                                     │ +8 -0 new.rs     │
+│  ╭─ 🔒 Claude Code (containerized)  │ +0 -1 config     │
+│  │                                  │ +0 -0 (binary)   │
 │  │  [agent output here]              ╰─────────────────┘
 │  │                                  │
 │  ╰──────────────────────────────────╯
@@ -352,6 +359,10 @@ The container window closes and a summary bar appears:
 ```
 
 This summary persists until a new container is launched.
+
+The window closes the moment the container actually terminates, for any reason: the agent process exits or you quit it manually, awman kills it (for example when a [yolo countdown](06-yolo-mode.md) expires and auto-advances a workflow), or a workflow action replaces it. During a workflow this happens immediately — the dead container's window never lingers over the execution window between steps; you see the summary bar and the execution window behind it until the next step's container opens a fresh window.
+
+The window does **not** close while the container is still alive: a stuck agent (no output) keeps its window open, and so does an agent with a yolo countdown running — only actual container death closes it.
 
 ---
 

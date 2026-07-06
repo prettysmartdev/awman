@@ -1656,6 +1656,7 @@ mod tests {
             files: Vec::new(),
             total_additions: additions,
             total_deletions: deletions,
+            branch: None,
         });
     }
 

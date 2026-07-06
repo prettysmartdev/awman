@@ -102,6 +102,12 @@ pub type SharedPtyResetFlag = Arc<AtomicBool>;
 /// polling.
 pub type SharedContainerName = Arc<Mutex<Option<String>>>;
 
+/// Shared container exit code. Set by the workflow frontend when the engine
+/// reports `report_container_exited` — the step's container has actually
+/// terminated (killed by awman or the agent process exited). The TUI event
+/// loop takes it and closes the container window, leaving the summary bar.
+pub type SharedContainerExitCode = Arc<Mutex<Option<i32>>>;
+
 /// Shared active-worktree path. Set by the worktree-lifecycle frontend on
 /// `report_worktree_created` and cleared on the post-workflow report
 /// (kept/discarded). The renderer reads this so the bottom-bar context
@@ -265,6 +271,12 @@ pub struct Tab {
     /// Broadcast receiver for stuck/unstuck events from the container engine.
     /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
     pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    /// Set after a mid-workflow container exit closes the window: PTY bytes
+    /// that were still in flight from the dead container must not re-open it
+    /// via `drain_container_output`'s auto-open branch. Cleared when the next
+    /// container launches (new command, step transition, or a fresh
+    /// `Running { container_name }` report).
+    pub suppress_container_auto_open: bool,
 
     // ── Async command plumbing ───────────────────────────────────────────
     /// Event loop drains container stdout/stderr into the vt100 parser.
@@ -285,6 +297,9 @@ pub struct Tab {
     /// Shared container name: set by the container frontend when the engine
     /// reports the running container's name.
     pub container_name_shared: SharedContainerName,
+    /// Shared container exit code: set by the workflow frontend when the
+    /// engine reports a mid-workflow container has actually terminated.
+    pub container_exit_shared: SharedContainerExitCode,
     /// Shared stdin sender slot for workflow step transitions.
     pub stdin_tx_shared: SharedStdinTx,
     /// Shared resize sender slot for workflow step transitions.
@@ -366,6 +381,7 @@ impl Tab {
             stuck: false,
             yolo_mode: false,
             stuck_rx: None,
+            suppress_container_auto_open: false,
             container_stdout_rx: None,
             container_stdin_tx: None,
             container_resize_tx: None,
@@ -374,6 +390,7 @@ impl Tab {
             dialog_response_tx: None,
             pty_reset_flag: Arc::new(AtomicBool::new(false)),
             container_name_shared: Arc::new(Mutex::new(None)),
+            container_exit_shared: Arc::new(Mutex::new(None)),
             stdin_tx_shared: Arc::new(Mutex::new(None)),
             resize_tx_shared: Arc::new(Mutex::new(None)),
             engine_tx_shared: Arc::new(Mutex::new(None)),
@@ -629,6 +646,8 @@ impl Tab {
                 self.agent_alt_screen = false;
                 self.agent_alternate_scroll = false;
                 self.region_scroll.reset();
+                // A new step's container is launching — allow auto-open again.
+                self.suppress_container_auto_open = false;
             }
 
             let mut received_any = false;
@@ -644,7 +663,10 @@ impl Tab {
                     .process(&mut self.vt100_parser, &filtered.bytes);
                 received_any = true;
             }
-            if received_any && self.container_window_state == ContainerWindowState::Hidden {
+            if received_any
+                && !self.suppress_container_auto_open
+                && self.container_window_state == ContainerWindowState::Hidden
+            {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
                     let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(
                         cols,
@@ -736,6 +758,37 @@ impl Tab {
         self.stuck_rx = None;
     }
 
+    /// Close the container window as soon as the engine reports that a
+    /// mid-workflow container has actually terminated (killed by awman —
+    /// e.g. after a yolo countdown — or the user quit the agent process).
+    ///
+    /// The engine only publishes the exit code on real container death,
+    /// never for a stuck-but-alive container or while a yolo countdown is
+    /// still running, so taking the slot is the whole gate. The summary bar
+    /// is left behind (captured by `close_container_overlay`), and
+    /// `container_info` is kept alive because later workflow steps reuse it
+    /// for stats polling and the overlay title — matching the existing
+    /// step-transition behavior in `tick_all_tabs`.
+    pub fn poll_container_exit(&mut self) {
+        let exit_code = self
+            .container_exit_shared
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(exit_code) = exit_code else {
+            return;
+        };
+        // Pull any final bytes into the parser first so the captured
+        // scrollback (and `surface_unseen_container_output`) is complete.
+        self.drain_container_output();
+        let info = self.container_info.clone();
+        self.close_container_overlay(exit_code);
+        self.container_info = info;
+        // Late bytes still in flight from the dead container must not
+        // re-open the window; cleared when the next container launches.
+        self.suppress_container_auto_open = true;
+    }
+
     /// Check if the command task has completed; update execution phase.
     ///
     /// Closes the container overlay on completion so the user regains full
@@ -776,6 +829,10 @@ impl Tab {
                         exit_code,
                     };
                     self.close_container_overlay(exit_code);
+                    // The window may already be closed (mid-workflow container
+                    // exit), in which case the overlay-close above skipped the
+                    // take — the command is over, so drop the info regardless.
+                    self.container_info = None;
                     self.command_result_rx = None;
                     self.container_stdout_rx = None;
                     self.container_stdin_tx = None;
@@ -798,6 +855,7 @@ impl Tab {
                         message: err_msg,
                     };
                     self.close_container_overlay(-1);
+                    self.container_info = None;
                     self.command_result_rx = None;
                     self.container_stdout_rx = None;
                     self.container_stdin_tx = None;
@@ -824,6 +882,7 @@ impl Tab {
                         message: err_msg,
                     };
                     self.close_container_overlay(-1);
+                    self.container_info = None;
                     self.command_result_rx = None;
                     self.container_stdout_rx = None;
                     self.container_stdin_tx = None;
@@ -1083,6 +1142,76 @@ mod tests {
             tab.git_diff_summary.lock().unwrap().is_none(),
             "a fresh tab has no diff summary until the poll task populates it"
         );
+    }
+
+    // ── mid-workflow container exit (poll_container_exit) ─────────────────
+
+    #[test]
+    fn container_exit_report_closes_window_and_leaves_summary() {
+        let mut tab = make_tab();
+        tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
+        tab.container_rendered = true; // pretend a frame made it to screen
+        *tab.container_exit_shared.lock().unwrap() = Some(137);
+
+        tab.poll_container_exit();
+
+        assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
+        let summary = tab
+            .last_container_summary
+            .as_ref()
+            .expect("closing on container exit must capture the summary bar");
+        assert_eq!(summary.exit_code, 137);
+        assert_eq!(summary.container_name, "awman-abc");
+        assert!(
+            tab.container_info.is_some(),
+            "container_info must survive so later workflow steps keep stats polling"
+        );
+        assert!(
+            tab.container_exit_shared.lock().unwrap().is_none(),
+            "the exit slot is consumed"
+        );
+    }
+
+    #[test]
+    fn poll_container_exit_is_noop_without_a_reported_exit() {
+        let mut tab = make_tab();
+        tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
+
+        tab.poll_container_exit();
+
+        // No exit was reported (stuck container / yolo countdown running /
+        // container alive) — the window must stay open.
+        assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
+        assert!(tab.last_container_summary.is_none());
+    }
+
+    #[test]
+    fn late_bytes_after_container_exit_do_not_reopen_window() {
+        let mut tab = make_tab();
+        tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
+        tab.container_rendered = true;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.container_stdout_rx = Some(rx);
+
+        *tab.container_exit_shared.lock().unwrap() = Some(0);
+        tab.poll_container_exit();
+        assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
+
+        // Bytes still in flight from the dead container arrive afterwards.
+        tx.send(b"leftover output".to_vec()).unwrap();
+        tab.drain_container_output();
+        assert_eq!(
+            tab.container_window_state,
+            ContainerWindowState::Hidden,
+            "a dead container's late bytes must not resurrect the window"
+        );
+
+        // The next step launches: the engine sets pty_reset_flag, after which
+        // fresh output auto-opens the window again.
+        tab.pty_reset_flag.store(true, Ordering::Relaxed);
+        tx.send(b"next step output".to_vec()).unwrap();
+        tab.drain_container_output();
+        assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
     }
 
     #[test]

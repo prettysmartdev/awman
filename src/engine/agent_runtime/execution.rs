@@ -88,6 +88,10 @@ enum ExecutionState {
     Detached,
 }
 
+/// Exit code recorded when the engine kills a container without waiting
+/// for its real exit status (128 + SIGKILL, the code `docker kill` yields).
+pub const KILLED_EXIT_CODE: i32 = 137;
+
 /// Standalone cancel handle — extracted before `wait()` moves the backend,
 /// so the engine can cancel an agent mid-step while the wait future is
 /// in flight. Backends produce these via `ExecutionBackend::cancel_handle`.

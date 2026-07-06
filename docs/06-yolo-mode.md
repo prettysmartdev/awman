@@ -129,8 +129,9 @@ This lets you monitor all tabs' countdown state without leaving your current wor
 **CLI and API countdown messages:** In command-line and API modes, countdown status messages are sent to the message sink (stderr for CLI, the event stream for API). To avoid overwhelming the output, these messages are **throttled to one every 10 seconds** — even though the countdown updates internally every ~100 ms. The TUI still receives per-tick updates and renders the countdown with full granularity.
 
 **When the countdown expires:**
-- If this is not the last step — awman advances to the next step in a new container
+- If this is not the last step — awman kills the stuck step's container and advances to the next step in a new container
 - If this is the last step — the workflow transitions to complete
+- In the TUI, the killed container's window closes immediately, leaving the [summary bar](02-using-the-tui.md#when-the-container-exits) behind — the window only closes on actual container death, never while the container is merely stuck or while the countdown is still running
 
 **Cancellation:**
 - Any PTY output during the countdown immediately clears the stuck state and dismisses the countdown

@@ -90,6 +90,8 @@ The leader agent runs like a regular workflow step:
 
 In the Workflow Control Board, the right-arrow action is labelled **"Start dynamic workflow"** instead of the usual "Next: new container", reflecting that advancing past the leader step starts the generated workflow.
 
+In the TUI, the moment the leader container is killed (or exits on its own), its container window closes and the [summary bar](02-using-the-tui.md#when-the-container-exits) takes its place, so the execution window stays visible while awman validates the generated file and launches the workflow.
+
 Other WCB actions work identically to a regular step:
 
 | Action | Effect |

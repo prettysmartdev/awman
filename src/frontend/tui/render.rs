@@ -600,12 +600,17 @@ fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
 /// etc.). Background is forced black so the row stands out against the
 /// surrounding chrome.
 /// Render the git sidebar into the right chunk: a rounded, green-bordered
-/// block with a bold `+A -D` title and a color-coded per-file change list.
+/// block titled with a condensed `git status` line (branch + change count),
+/// containing bold `+A -D` totals and a color-coded per-file change list.
 fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option<GitDiffSummary>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(
+            format!(" {} ", git_sidebar::sidebar_title(summary)),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1958,6 +1963,7 @@ mod tests {
             ],
             total_additions: 5,
             total_deletions: 2,
+            branch: Some("main".to_string()),
         }
     }
 
@@ -1999,6 +2005,50 @@ mod tests {
             render_git_sidebar(frame, area, &None);
         });
         assert!(buffer_text(&buf).contains("no git data"));
+    }
+
+    /// The top border row of the rendered buffer, as a string.
+    fn top_border_row(buf: &ratatui::buffer::Buffer) -> String {
+        buffer_text(buf).lines().next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn sidebar_title_shows_branch_and_change_count() {
+        let buf = render_to_buffer(30, 8, |area, frame| {
+            render_git_sidebar(frame, area, &Some(sample_summary()));
+        });
+        let top = top_border_row(&buf);
+        assert!(
+            top.contains(" main: 2 changed "),
+            "border title condenses git status: {top:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_title_clean_when_no_changed_files() {
+        let summary = GitDiffSummary {
+            files: Vec::new(),
+            total_additions: 0,
+            total_deletions: 0,
+            branch: Some("main".to_string()),
+        };
+        let buf = render_to_buffer(30, 8, |area, frame| {
+            render_git_sidebar(frame, area, &Some(summary));
+        });
+        let top = top_border_row(&buf);
+        assert!(top.contains(" main: clean "), "clean title: {top:?}");
+    }
+
+    #[test]
+    fn sidebar_title_present_even_without_git_data() {
+        let buf = render_to_buffer(30, 8, |area, frame| {
+            render_git_sidebar(frame, area, &None);
+        });
+        let top = top_border_row(&buf);
+        assert!(
+            top.contains(" git status "),
+            "sidebar is titled even with no data: {top:?}"
+        );
     }
 
     // ── git_file_line ──────────────────────────────────────────────────────

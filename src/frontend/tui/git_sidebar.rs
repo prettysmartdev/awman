@@ -41,6 +41,8 @@ pub struct GitDiffSummary {
     pub files: Vec<GitFileEntry>,
     pub total_additions: u32,
     pub total_deletions: u32,
+    /// Current branch name. `None` on detached HEAD or when git can't tell.
+    pub branch: Option<String>,
 }
 
 /// Cross-thread shared diff summary. The poll task writes here; the TUI
@@ -216,6 +218,23 @@ pub fn build_summary(
         files,
         total_additions,
         total_deletions,
+        // The branch comes from a separate git call; the poll task fills it in.
+        branch: None,
+    }
+}
+
+/// The sidebar's border title — a condensed `git status` line. Always
+/// non-empty so the open sidebar is labeled even with no data or no changes:
+/// `main: 3 changed`, `main: clean`, `HEAD: 1 changed` (detached), or
+/// `git status` when there is no git data at all.
+pub fn sidebar_title(summary: &Option<GitDiffSummary>) -> String {
+    let Some(summary) = summary else {
+        return "git status".to_string();
+    };
+    let branch = summary.branch.as_deref().unwrap_or("HEAD");
+    match summary.files.len() {
+        0 => format!("{branch}: clean"),
+        n => format!("{branch}: {n} changed"),
     }
 }
 
@@ -260,6 +279,13 @@ async fn poll_once(root: &Path) -> Option<GitDiffSummary> {
     let porcelain_out = run_git(&["status", "--porcelain"], root).await?;
     let porcelain = parse_porcelain_status(&porcelain_out);
 
+    // Branch name for the sidebar title. Empty output means detached HEAD;
+    // surfaced as `None` so the title falls back to "HEAD".
+    let branch = run_git(&["branch", "--show-current"], root)
+        .await
+        .map(|out| out.trim().to_string())
+        .filter(|name| !name.is_empty());
+
     // numstat fails when there are no commits (no HEAD). Fall back to an empty
     // list + "no commits" flag so we still render the file set.
     let (numstat, has_commits) = match run_git(&["diff", "--numstat", "HEAD"], root).await {
@@ -281,7 +307,9 @@ async fn poll_once(root: &Path) -> Option<GitDiffSummary> {
             .into_iter()
             .map(|(path, _)| (path, GitFileChangeType::Added))
             .collect();
-        return Some(build_summary(&porcelain, &[], &HashMap::new()));
+        let mut summary = build_summary(&porcelain, &[], &HashMap::new());
+        summary.branch = branch;
+        return Some(summary);
     }
 
     // Count lines for untracked files (`??`) not covered by numstat.
@@ -298,7 +326,8 @@ async fn poll_once(root: &Path) -> Option<GitDiffSummary> {
         }
     }
 
-    let summary = build_summary(&porcelain, &numstat, &untracked_lines);
+    let mut summary = build_summary(&porcelain, &numstat, &untracked_lines);
+    summary.branch = branch;
 
     Some(summary)
 }
@@ -565,6 +594,56 @@ mod tests {
         assert_eq!(summary.total_deletions, 0);
         assert_eq!(summary.files[0].additions, 0);
         assert!(!summary.files[0].binary);
+    }
+
+    // ── sidebar_title ──────────────────────────────────────────────────────
+
+    fn summary_with(branch: Option<&str>, file_count: usize) -> GitDiffSummary {
+        GitDiffSummary {
+            files: (0..file_count)
+                .map(|i| GitFileEntry {
+                    path: format!("f{i}.rs"),
+                    change_type: GitFileChangeType::Modified,
+                    additions: 1,
+                    deletions: 0,
+                    binary: false,
+                })
+                .collect(),
+            total_additions: file_count as u32,
+            total_deletions: 0,
+            branch: branch.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sidebar_title_no_data_is_git_status() {
+        assert_eq!(sidebar_title(&None), "git status");
+    }
+
+    #[test]
+    fn sidebar_title_clean_worktree() {
+        assert_eq!(
+            sidebar_title(&Some(summary_with(Some("main"), 0))),
+            "main: clean"
+        );
+    }
+
+    #[test]
+    fn sidebar_title_branch_and_change_count() {
+        assert_eq!(
+            sidebar_title(&Some(summary_with(Some("feature/x"), 3))),
+            "feature/x: 3 changed"
+        );
+        assert_eq!(
+            sidebar_title(&Some(summary_with(Some("main"), 1))),
+            "main: 1 changed"
+        );
+    }
+
+    #[test]
+    fn sidebar_title_detached_head_falls_back_to_head() {
+        assert_eq!(sidebar_title(&Some(summary_with(None, 2))), "HEAD: 2 changed");
+        assert_eq!(sidebar_title(&Some(summary_with(None, 0))), "HEAD: clean");
     }
 
     // ── sidebar_width ──────────────────────────────────────────────────────

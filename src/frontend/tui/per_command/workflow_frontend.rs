@@ -240,6 +240,15 @@ impl WorkflowFrontend for TuiCommandFrontend {
             .info(format!("Launching agent '{}' in new container...", agent));
     }
 
+    fn report_container_exited(&mut self, exit_code: i32) {
+        // Publish the exit so the TUI event loop closes the container window
+        // (leaving the summary bar). The engine only calls this on real
+        // container death — never for stuck states or during a yolo countdown.
+        if let Ok(mut guard) = self.container_exit_shared.lock() {
+            *guard = Some(exit_code);
+        }
+    }
+
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
         let response = self
             .ask_dialog(DialogRequest::YesNo {
@@ -431,6 +440,7 @@ mod tests {
             yolo_state,
             yolo_cancel_flag,
             pty_reset_flag,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             stdin_tx_shared,
             resize_tx_shared,
@@ -805,6 +815,17 @@ mod tests {
         assert!(frontend.yolo_state.lock().unwrap().is_some());
         frontend.yolo_countdown_finished("build");
         assert!(frontend.yolo_state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn report_container_exited_publishes_exit_code() {
+        use crate::engine::workflow::frontend::WorkflowFrontend;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        assert!(frontend.container_exit_shared.lock().unwrap().is_none());
+
+        frontend.report_container_exited(137);
+        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(137));
     }
 
     #[test]

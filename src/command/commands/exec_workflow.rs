@@ -230,6 +230,10 @@ impl WorkflowFrontend for WorkflowProxy {
             .report_step_interactive_launch(step, agent, model);
     }
 
+    fn report_container_exited(&mut self, exit_code: i32) {
+        self.0.lock().unwrap().report_container_exited(exit_code);
+    }
+
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
         self.0.lock().unwrap().confirm_resume(mismatch)
     }
@@ -247,6 +251,15 @@ impl WorkflowFrontend for WorkflowProxy {
 
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         self.0.lock().unwrap().set_engine_sender(tx);
+    }
+
+    fn set_stuck_sender(
+        &mut self,
+        sender: Arc<
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::execution::StuckEvent>,
+        >,
+    ) {
+        self.0.lock().unwrap().set_stuck_sender(sender);
     }
 
     fn on_setup_step_started(&mut self, description: &str) {
@@ -1879,7 +1892,7 @@ impl ExecWorkflowCommand {
         system_prompt: Option<String>,
         label: &str,
     ) -> Result<LeaderDriveOutcome, CommandError> {
-        use crate::engine::agent_runtime::execution::StuckEvent;
+        use crate::engine::agent_runtime::execution::{StuckEvent, KILLED_EXIT_CODE};
 
         let run_opts = AgentRunOptions {
             yolo: Some(YoloMode::Enabled),
@@ -1929,16 +1942,29 @@ impl ExecWorkflowCommand {
 
         let cancel = execution.cancel_handle();
         let mut stuck_rx = execution.subscribe_stuck();
-        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel::<()>();
+        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel::<i32>();
         tokio::spawn(async move {
-            let _ = execution.wait().await;
-            let _ = wait_tx.send(());
+            let code = execution
+                .wait()
+                .await
+                .map(|info| info.exit_code)
+                .unwrap_or(-1);
+            let _ = wait_tx.send(code);
         });
 
+        // Every `break` below corresponds to the leader container actually
+        // being dead (self-exit, engine kill, or grace-expiry kill), so each
+        // reports the exit to the frontend before leaving the loop. The
+        // container window must NOT close on mere stuck states or while the
+        // yolo countdown is still running — those paths `continue` instead.
         let outcome = loop {
             tokio::select! {
                 biased;
-                _ = &mut wait_rx => {
+                code = &mut wait_rx => {
+                    shared
+                        .lock()
+                        .unwrap()
+                        .report_container_exited(code.unwrap_or(-1));
                     break LeaderDriveOutcome::Advanced;
                 }
                 ev = stuck_rx.recv() => {
@@ -1956,9 +1982,14 @@ impl ExecWorkflowCommand {
                                     if let Some(c) = &cancel {
                                         let _ = c.cancel();
                                     }
+                                    shared
+                                        .lock()
+                                        .unwrap()
+                                        .report_container_exited(KILLED_EXIT_CODE);
                                     break LeaderDriveOutcome::Advanced;
                                 }
-                                LeaderCountdownOutcome::Completed => {
+                                LeaderCountdownOutcome::Completed(code) => {
+                                    shared.lock().unwrap().report_container_exited(code);
                                     break LeaderDriveOutcome::Advanced;
                                 }
                                 LeaderCountdownOutcome::Recovered => continue,
@@ -1966,17 +1997,27 @@ impl ExecWorkflowCommand {
                                     if let Some(c) = &cancel {
                                         let _ = c.cancel();
                                     }
+                                    shared
+                                        .lock()
+                                        .unwrap()
+                                        .report_container_exited(KILLED_EXIT_CODE);
                                     break LeaderDriveOutcome::Aborted;
                                 }
                             }
                         }
                         Ok(StuckEvent::Unstuck) => continue,
                         Ok(StuckEvent::StartupGraceExpired) => {
+                            // The io bridge already killed the container.
+                            shared
+                                .lock()
+                                .unwrap()
+                                .report_container_exited(KILLED_EXIT_CODE);
                             break LeaderDriveOutcome::Advanced;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            let _ = (&mut wait_rx).await;
+                            let code = (&mut wait_rx).await.unwrap_or(-1);
+                            shared.lock().unwrap().report_container_exited(code);
                             break LeaderDriveOutcome::Advanced;
                         }
                     }
@@ -1995,8 +2036,9 @@ impl ExecWorkflowCommand {
 enum LeaderCountdownOutcome {
     /// Countdown expired or user advanced — kill the container and proceed.
     Advance,
-    /// The leader container exited on its own during the countdown.
-    Completed,
+    /// The leader container exited on its own (with this exit code) during
+    /// the countdown.
+    Completed(i32),
     /// The leader resumed output (`Unstuck`) — cancel the countdown.
     Recovered,
     /// The user aborted.
@@ -2009,7 +2051,7 @@ enum LeaderCountdownOutcome {
 /// [`AvailableActions::launch_next_label`].
 async fn run_leader_yolo_countdown(
     shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
-    wait_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    wait_rx: &mut tokio::sync::oneshot::Receiver<i32>,
     stuck_rx: &mut tokio::sync::broadcast::Receiver<
         crate::engine::agent_runtime::execution::StuckEvent,
     >,
@@ -2041,7 +2083,9 @@ async fn run_leader_yolo_countdown(
 
         tokio::select! {
             biased;
-            _ = &mut *wait_rx => break LeaderCountdownOutcome::Completed,
+            code = &mut *wait_rx => {
+                break LeaderCountdownOutcome::Completed(code.unwrap_or(-1));
+            }
             ev = stuck_rx.recv() => {
                 match ev {
                     Ok(StuckEvent::Unstuck) => break LeaderCountdownOutcome::Recovered,

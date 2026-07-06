@@ -236,6 +236,7 @@ impl App {
         // `Arc<Mutex<...>>` between the engine-side frontend impl and the
         // renderer.
         tab.container_name_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        tab.container_exit_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.engine_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -250,6 +251,7 @@ impl App {
             tab.yolo_cancel_flag.clone(),
             tab.pty_reset_flag.clone(),
             tab.container_name_shared.clone(),
+            tab.container_exit_shared.clone(),
             tab.stdin_tx_shared.clone(),
             tab.resize_tx_shared.clone(),
             tab.engine_tx_shared.clone(),
@@ -282,6 +284,7 @@ impl App {
             stats_history: Vec::new(),
             sandboxed,
         });
+        tab.suppress_container_auto_open = false;
 
         // Show the "Interactive Mode" banner for containerized commands.
         let is_containerized = matches!(
@@ -376,6 +379,7 @@ impl App {
         let active = self.active_tab;
         for tab in self.tabs.iter_mut() {
             tab.drain_container_output();
+            tab.poll_container_exit();
             tab.poll_command_completion();
             tab.drain_stuck_events();
             // Restart the git poll task if the worktree path changed.
@@ -412,6 +416,10 @@ impl App {
                     if let Some(name) = name_guard.take() {
                         info.container_name = name;
                         info.latest_stats = None;
+                        // A fresh container is running — let its output
+                        // auto-open the window again after a mid-workflow
+                        // container exit closed it.
+                        tab.suppress_container_auto_open = false;
                     }
                 }
             }
