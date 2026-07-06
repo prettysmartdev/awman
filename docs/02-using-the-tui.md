@@ -404,7 +404,9 @@ Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly �
 
 When a row is selected, a hint line below the table shows the accepted values for that field (e.g. `claude | codex | opencode | maki | gemini`).
 
-Fields marked `(read-only)` — such as `auto_agent_auth_accepted` — are skipped during navigation for edit purposes. Their values are shown but cannot be changed from this dialog. If you press **Enter** on a read-only field, a toast message appears briefly at the bottom of the dialog: `This field is read-only`.
+Fields marked `(read-only)` — such as `auto_agent_auth_accepted` — are skipped during navigation for edit purposes. Their values are shown but cannot be changed from this dialog. If you press **Enter** on a read-only field, a toast message appears briefly at the bottom of the dialog: `This field is read-only`. For `dynamicWorkflows.agentsToModels` rows specifically, the toast instead reads `Edit this value directly in .awman/config.json`, since that field is not editable through `config set` at all.
+
+Values too long to fit their column — like `dynamicWorkflows.agentsToModels.<agentName>`'s comma-separated model list — are truncated with `…` in the table cell. A two-line detail area below the table always shows the full, untruncated value of the selected row's focused column, so long values stay inspectable without leaving the dialog.
 
 ### Scope and saving
 

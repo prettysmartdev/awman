@@ -40,6 +40,10 @@ const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
     ("api.background", FieldScope::GlobalOnly),
     ("remote.defaultAddr", FieldScope::Both),
     ("remote.defaultAPIKey", FieldScope::Both),
+    // Dynamic-workflow config (WI-0095), repo-only.
+    ("dynamicWorkflows.defaultLeader", FieldScope::RepoOnly),
+    ("dynamicWorkflows.maxConcurrentSteps", FieldScope::RepoOnly),
+    ("dynamicWorkflows.agentsToModels", FieldScope::RepoOnly),
 ];
 
 /// Field names that were removed in WI-0082 (overlay unification). Naming any
@@ -123,6 +127,30 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
                 .map(|n| serde_json::Value::Number(n.into()))
                 .map_err(|_| format!("'{}' is not a valid number", value))
         }
+        "dynamicWorkflows.maxConcurrentSteps" => {
+            // Positive integer; zero would deadlock any workflow (WI-0095).
+            let n = value
+                .parse::<u64>()
+                .map_err(|_| format!("'{}' is not a valid number", value))?;
+            if n < 1 {
+                return Err("dynamicWorkflows.maxConcurrentSteps must be >= 1".to_string());
+            }
+            Ok(serde_json::Value::Number(n.into()))
+        }
+        "dynamicWorkflows.defaultLeader" => {
+            validate_default_leader_value(value)?;
+            Ok(serde_json::Value::String(value.to_string()))
+        }
+        "dynamicWorkflows.agentsToModels" => {
+            // A map value can't be expressed as a `config set` string; without
+            // this rejection the coerced string would fail RepoConfig
+            // deserialization and the set would silently write nothing.
+            Err(
+                "dynamicWorkflows.agentsToModels cannot be set with `config set`; \
+                 edit .awman/config.json directly"
+                    .to_string(),
+            )
+        }
         _ => {
             // Default: try bool, then number, then string
             if value == "true" {
@@ -136,6 +164,38 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
             }
         }
     }
+}
+
+/// Validate a `dynamicWorkflows.defaultLeader` value for `awman config set`
+/// (WI-0095). Enforces the same `agent::model` shape as the Layer 0 config-load
+/// validator: exactly two non-empty components, no surrounding whitespace, and
+/// an `AgentName`-valid agent component.
+fn validate_default_leader_value(value: &str) -> Result<(), String> {
+    let parts: Vec<&str> = value.split("::").collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(format!(
+            "'{value}' is not a valid leader; expected agent::model \
+             (e.g. claude::claude-opus-4-8)"
+        ));
+    }
+    let (agent, model) = (parts[0], parts[1]);
+    if agent != agent.trim() || model != model.trim() {
+        return Err(
+            "leader agent and model components must not have leading or trailing whitespace"
+                .to_string(),
+        );
+    }
+    if agent.len() > 64
+        || !agent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "'{agent}' is not a valid agent name: only ASCII alphanumerics, '-', and '_' are \
+             allowed, length 1..=64"
+        ));
+    }
+    Ok(())
 }
 
 /// Levenshtein edit distance between two strings.
@@ -245,7 +305,10 @@ fn config_field_kind(name: &str) -> ConfigFieldKind {
     match name {
         "agent" | "default_agent" => ConfigFieldKind::Enum,
         "auto_agent_auth_accepted" | "api.background" => ConfigFieldKind::Bool,
-        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => ConfigFieldKind::Number,
+        "terminal_scrollback_lines"
+        | "agentStuckTimeout"
+        | "api.port"
+        | "dynamicWorkflows.maxConcurrentSteps" => ConfigFieldKind::Number,
         _ => ConfigFieldKind::String,
     }
 }
@@ -253,6 +316,27 @@ fn config_field_kind(name: &str) -> ConfigFieldKind {
 /// Fields whose value is computed by awman itself and cannot be set by the
 /// user via `awman config set`. Surfaced with `(read-only)` in the table.
 const READ_ONLY_FIELDS: &[&str] = &["auto_agent_auth_accepted"];
+
+/// Whether a config field is read-only in the show/edit UI. The
+/// `dynamicWorkflows.agentsToModels` map and its per-agent expansions are
+/// read-only in the table (edited directly in `.awman/config.json`), while the
+/// scalar dynamic-workflow fields remain inline-editable (WI-0095).
+fn is_read_only_field(name: &str) -> bool {
+    READ_ONLY_FIELDS.contains(&name) || name.starts_with("dynamicWorkflows.agentsToModels")
+}
+
+/// Render an `agentsToModels` model-list JSON value as a comma-separated string
+/// for a display row.
+fn render_models_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
 
 const SENSITIVE_FIELDS: &[&str] = &["remote.defaultAPIKey"];
 
@@ -273,22 +357,48 @@ pub fn collect_config_rows(
     global: &serde_json::Value,
     repo: &serde_json::Value,
 ) -> Vec<ConfigFieldRow> {
-    VALID_CONFIG_FIELDS
-        .iter()
-        .map(|(name, _scope)| {
-            let g = config_field_value(global, name);
-            let r = config_field_value(repo, name);
-            let effective = r.clone().or_else(|| g.clone());
-            ConfigFieldRow {
-                field: (*name).to_string(),
-                global_value: mask_sensitive(name, g),
-                repo_value: mask_sensitive(name, r),
-                effective_value: mask_sensitive(name, effective),
-                kind: config_field_kind(name),
-                read_only: READ_ONLY_FIELDS.contains(name),
-            }
-        })
-        .collect()
+    let mut rows: Vec<ConfigFieldRow> = Vec::new();
+    for (name, _scope) in VALID_CONFIG_FIELDS {
+        // The agentsToModels map is expanded into one row per agent below rather
+        // than shown as a single unreadable JSON blob (WI-0095).
+        if *name == "dynamicWorkflows.agentsToModels" {
+            continue;
+        }
+        let g = config_field_value(global, name);
+        let r = config_field_value(repo, name);
+        let effective = r.clone().or_else(|| g.clone());
+        rows.push(ConfigFieldRow {
+            field: (*name).to_string(),
+            global_value: mask_sensitive(name, g),
+            repo_value: mask_sensitive(name, r),
+            effective_value: mask_sensitive(name, effective),
+            kind: config_field_kind(name),
+            read_only: is_read_only_field(name),
+        });
+    }
+    // Flatten dynamicWorkflows.agentsToModels into one read-only, repo-only row
+    // per agent, keyed by `dynamicWorkflows.agentsToModels.<agentName>`. Keys are
+    // sorted for deterministic ordering.
+    if let Some(map) = repo
+        .get("dynamicWorkflows")
+        .and_then(|dw| dw.get("agentsToModels"))
+        .and_then(|m| m.as_object())
+    {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = map.get(key).map(render_models_value);
+            rows.push(ConfigFieldRow {
+                field: format!("dynamicWorkflows.agentsToModels.{key}"),
+                global_value: None,
+                repo_value: value.clone(),
+                effective_value: value,
+                kind: ConfigFieldKind::String,
+                read_only: true,
+            });
+        }
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -761,6 +871,129 @@ mod tests {
             validate_and_coerce("some_field", "hello").unwrap(),
             serde_json::Value::String("hello".into())
         );
+    }
+
+    // ── validate_and_coerce: dynamicWorkflows (WI-0095) ─────────────────────
+
+    #[test]
+    fn validate_and_coerce_max_concurrent_steps_accepts_positive() {
+        let v = validate_and_coerce("dynamicWorkflows.maxConcurrentSteps", "3").unwrap();
+        assert_eq!(v, serde_json::json!(3u64));
+    }
+
+    #[test]
+    fn validate_and_coerce_max_concurrent_steps_rejects_zero() {
+        let err = validate_and_coerce("dynamicWorkflows.maxConcurrentSteps", "0").unwrap_err();
+        assert!(
+            err.contains("must be >= 1"),
+            "zero must be rejected with the >= 1 message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_default_leader_valid_shape() {
+        let v = validate_and_coerce("dynamicWorkflows.defaultLeader", "claude::claude-opus-4-8")
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::Value::String("claude::claude-opus-4-8".into())
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_default_leader_invalid_shape() {
+        let err = validate_and_coerce("dynamicWorkflows.defaultLeader", "claude").unwrap_err();
+        assert!(
+            err.contains("expected agent::model"),
+            "malformed leader must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_rejects_agents_to_models_map() {
+        // The map field is valid for `config get`/`config show` but cannot be
+        // written through `config set`; without this rejection the set would
+        // silently no-op (string value fails RepoConfig deserialization).
+        let err = validate_and_coerce("dynamicWorkflows.agentsToModels", "claude:foo").unwrap_err();
+        assert!(
+            err.contains("edit .awman/config.json directly"),
+            "agentsToModels set must point at direct file editing, got: {err}"
+        );
+    }
+
+    // ── collect_config_rows: dynamicWorkflows (WI-0095) ─────────────────────
+
+    #[test]
+    fn collect_config_rows_includes_dynamic_workflows_scalar_fields() {
+        let global = serde_json::json!({});
+        let repo = serde_json::json!({
+            "dynamicWorkflows": {
+                "defaultLeader": "claude::claude-opus-4-8",
+                "maxConcurrentSteps": 3
+            }
+        });
+        let rows = collect_config_rows(&global, &repo);
+
+        let leader_row = rows
+            .iter()
+            .find(|r| r.field == "dynamicWorkflows.defaultLeader")
+            .expect("flattened dynamicWorkflows.defaultLeader row must be present");
+        assert_eq!(
+            leader_row.repo_value.as_deref(),
+            Some("claude::claude-opus-4-8")
+        );
+        assert!(!leader_row.read_only, "defaultLeader stays inline-editable");
+
+        let steps_row = rows
+            .iter()
+            .find(|r| r.field == "dynamicWorkflows.maxConcurrentSteps")
+            .expect("flattened dynamicWorkflows.maxConcurrentSteps row must be present");
+        assert_eq!(steps_row.repo_value.as_deref(), Some("3"));
+        assert!(
+            !steps_row.read_only,
+            "maxConcurrentSteps stays inline-editable"
+        );
+    }
+
+    #[test]
+    fn collect_config_rows_expands_agents_to_models_into_per_agent_rows() {
+        let global = serde_json::json!({});
+        let repo = serde_json::json!({
+            "dynamicWorkflows": {
+                "agentsToModels": {
+                    "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
+                    "codex": ["codex-mini-latest"]
+                }
+            }
+        });
+        let rows = collect_config_rows(&global, &repo);
+
+        // The raw blob row must not appear — only its per-agent expansion.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.field == "dynamicWorkflows.agentsToModels"),
+            "the unexpanded agentsToModels blob row must not appear: {rows:?}"
+        );
+
+        let claude_row = rows
+            .iter()
+            .find(|r| r.field == "dynamicWorkflows.agentsToModels.claude")
+            .expect("per-agent row for claude must be present");
+        assert_eq!(
+            claude_row.repo_value.as_deref(),
+            Some("claude-opus-4-8, claude-sonnet-4-6")
+        );
+        assert!(
+            claude_row.read_only,
+            "agentsToModels per-agent rows must be read-only"
+        );
+
+        let codex_row = rows
+            .iter()
+            .find(|r| r.field == "dynamicWorkflows.agentsToModels.codex")
+            .expect("per-agent row for codex must be present");
+        assert_eq!(codex_row.repo_value.as_deref(), Some("codex-mini-latest"));
     }
 
     // ── removed_field_message ────────────────────────────────────────────────

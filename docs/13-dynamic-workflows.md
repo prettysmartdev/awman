@@ -50,7 +50,7 @@ The leader agent cannot see or modify source files beyond the context directory 
 
 ## Choosing the leader agent
 
-By default, the leader uses whatever agent is configured as the project default (from `.awman/config.json` or `~/.awman/config.json`). You can override this in two ways:
+By default, the leader uses whatever agent is configured as the project default (from `.awman/config.json` or `~/.awman/config.json`), unless `dynamicWorkflows.defaultLeader` is set (see [Configuring dynamic workflows](#configuring-dynamic-workflows) below). You can override this per invocation in two ways:
 
 **`--leader agent::model`** — specify both the agent container and model for the leader:
 
@@ -75,6 +75,79 @@ claude                        # invalid — missing ::model
 ::claude-opus-4-8             # invalid — missing agent
 claude::opus::extra           # invalid — too many components
 ```
+
+### Leader resolution order
+
+When more than one source could determine the leader, awman applies this precedence:
+
+1. `--leader agent::model` on the command line
+2. `dynamicWorkflows.defaultLeader` in `.awman/config.json`
+3. `--model`, applied to the project's default agent
+4. No override — the project's default agent and model
+
+`defaultLeader` governs both the leader's agent and model. A separate `--model` flag continues to set the session-level default model for the *generated workflow's* steps, but it does not override the model half of `defaultLeader`.
+
+---
+
+## Configuring dynamic workflows
+
+Add a `dynamicWorkflows` section to `.awman/config.json` to pin which agents and models the leader may schedule, cap how many steps run concurrently, and set a repo-wide default leader — all shared with your team via version control instead of passed as flags on every run.
+
+```json
+{
+  "dynamicWorkflows": {
+    "agentsToModels": {
+      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
+      "codex": ["codex-mini-latest"]
+    },
+    "maxConcurrentSteps": 3,
+    "defaultLeader": "claude::claude-opus-4-8"
+  }
+}
+```
+
+All three fields are optional and independent.
+
+### `agentsToModels`
+
+Restricts the leader to a known, approved set of agents and models instead of everything discovered from `.awman/Dockerfile.<agent>` files. When set and non-empty, this list — not Dockerfile discovery — is what the leader prompt's "Available Agents" section shows, so the leader only schedules steps against agents and models your team has vetted.
+
+- Every key must name an agent that has a `.awman/Dockerfile.<agent>` in the project. If any configured agent has no matching Dockerfile, the workflow fails immediately, before any container is spawned:
+
+  ```
+  Error: dynamicWorkflows.agentsToModels references agents that have no Dockerfile in this repo: [foo, bar].
+  Available agents: [claude, codex, gemini].
+  Add a .awman/Dockerfile.<agent> for each missing agent, or remove it from agentsToModels.
+  ```
+
+- Agent name matching is case-insensitive as a compatibility aid (`"Claude"` matches a `claude` Dockerfile), but the workflow always uses the lowercase agent name, and a warning is shown when a match only succeeds after case folding. Two configured keys that fold to the same agent (e.g. `"Claude"` and `"claude"`) is a configuration error, since awman won't guess which model list should win.
+- An empty map (`{}`) is treated the same as omitting the field — the leader falls back to Dockerfile discovery.
+- Each agent's model list must be non-empty, and no model name may be empty or whitespace-only; both are rejected when the config is loaded.
+
+### `maxConcurrentSteps`
+
+An advisory cap the leader is told to plan around:
+
+```
+Note: the repository configuration advises a maximum of 3 concurrent steps. Plan your workflow accordingly.
+```
+
+This is advisory only — awman does not enforce it in the workflow scheduler. It is a hint the leader agent uses when deciding how much of the workflow to run in parallel via `depends_on`. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow.
+
+### `defaultLeader`
+
+Sets the repo-wide default leader agent and model, in the same `agent::model` format as `--leader` (see [Leader resolution order](#leader-resolution-order) above). Rejected at config-load time if the format is invalid, if either component is empty or has surrounding whitespace, or if the agent component isn't a valid agent name.
+
+### Managing this config
+
+`dynamicWorkflows.defaultLeader` and `dynamicWorkflows.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog like any other repo field:
+
+```sh
+awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
+awman config set dynamicWorkflows.maxConcurrentSteps 3
+```
+
+`agentsToModels` is not settable through `config set` — edit `.awman/config.json` directly for that field. In `awman config show` and the TUI config dialog, each configured agent appears as its own read-only row (`dynamicWorkflows.agentsToModels.<agentName>`) showing its comma-separated model list. See [Configuration](07-configuration.md#reference) for the full field reference.
 
 ---
 
@@ -181,6 +254,14 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Leader becomes unstuck during yolo countdown | Countdown cancelled; leader continues running normally |
 | `--leader` and `--model` both set | `--leader` controls the leader's agent and model; `--model` applies to the generated workflow's steps |
 | Context directory already contains a `workflow.toml` from a previous run | Deleted before the leader launches; stale files are never executed |
+| `dynamicWorkflows.agentsToModels` references an agent with no matching Dockerfile | Hard error before any container is spawned; lists the missing agents and the available ones |
+| `dynamicWorkflows.agentsToModels` is `{}` (empty map) | Treated as if unset; falls back to Dockerfile discovery |
+| `dynamicWorkflows.agentsToModels` key matches a Dockerfile only after case folding | Workflow proceeds using the lowercase agent name; a warning is shown |
+| Two `dynamicWorkflows.agentsToModels` keys fold to the same agent (e.g. `"Claude"` and `"claude"`) | Error at workflow start, before any container is spawned; ambiguous model lists are never merged |
+| `dynamicWorkflows.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
+| `dynamicWorkflows.defaultLeader` is malformed | Rejected when the config is loaded, before any UI or workflow starts |
+| `--leader` and `dynamicWorkflows.defaultLeader` both set | `--leader` wins |
+| `--model` and `dynamicWorkflows.defaultLeader` both set, no `--leader` | `defaultLeader` controls the leader's model; `--model` still applies to the generated workflow's steps |
 
 ---
 

@@ -1146,7 +1146,12 @@ fn handle_dialog_submit(app: &mut App) {
                 // selected row. edit_column 0 = global, 1 = repo.
                 let row = &state.rows[state.selected];
                 if row.read_only {
-                    app.status_bar.text = "This field is read-only".to_string();
+                    app.status_bar.text =
+                        if row.field.starts_with("dynamicWorkflows.agentsToModels") {
+                            "Edit this value directly in .awman/config.json".to_string()
+                        } else {
+                            "This field is read-only".to_string()
+                        };
                     return;
                 }
                 let initial_value = if state.edit_column == 0 {
@@ -2686,6 +2691,40 @@ mod tests {
         assert!(
             app.active_dialog.is_some(),
             "dialog must stay open after read-only toast"
+        );
+    }
+
+    #[test]
+    fn enter_on_read_only_agents_to_models_row_shows_edit_config_json_toast() {
+        use crate::frontend::tui::dialogs::{ConfigShowRow, ConfigShowState};
+        use crate::frontend::tui::text_edit::TextEdit;
+
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::ConfigShow(ConfigShowState {
+            rows: vec![ConfigShowRow {
+                field: "dynamicWorkflows.agentsToModels.claude".into(),
+                global: String::new(),
+                repo: "claude-opus-4-8, claude-sonnet-4-6".into(),
+                effective: "claude-opus-4-8, claude-sonnet-4-6".into(),
+                read_only: true,
+            }],
+            selected: 0,
+            editing: false,
+            edit_column: 0,
+            editor: TextEdit::new(false),
+        }));
+        app.command_dialog_active = true;
+
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.status_bar.text, "Edit this value directly in .awman/config.json",
+            "pressing Enter on a read-only agentsToModels row must show the config.json \
+             edit hint, not the generic read-only toast"
+        );
+        assert!(
+            app.active_dialog.is_some(),
+            "dialog must stay open after the toast"
         );
     }
 

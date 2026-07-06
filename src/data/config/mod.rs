@@ -12,7 +12,8 @@ pub use env::{Env, EnvSnapshot};
 pub use flags::FlagConfig;
 pub use global::GlobalConfig;
 pub use repo::{
-    ApiConfig, RemoteConfig, RepoConfig, WorkItemsConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
+    ApiConfig, DynamicWorkflowsConfig, RemoteConfig, RepoConfig, WorkItemsConfig,
+    REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
 
 /// Built-in default number of scrollback lines for the container terminal emulator.

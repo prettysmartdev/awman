@@ -4,6 +4,7 @@
 //! preserved for forward and backward compatibility — users upgrading from a
 //! prior release must continue to read their existing files.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,110 @@ pub struct WorkItemsConfig {
     pub template: Option<String>,
 }
 
+/// Dynamic-workflow configuration nested within `RepoConfig` (WI-0095).
+///
+/// Lets teams pin which agents/models a dynamic workflow's leader may schedule,
+/// cap concurrent steps, and set a default leader — all via version-controlled
+/// repo config rather than per-run CLI flags. Layer 0 owns schema-shape
+/// validation (see [`DynamicWorkflowsConfig::validate`]); Dockerfile-availability
+/// validation lives in the command layer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicWorkflowsConfig {
+    /// agent name → list of model name strings available for that agent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_to_models: Option<HashMap<String, Vec<String>>>,
+    /// advisory cap on concurrent workflow steps (None = unlimited)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_steps: Option<usize>,
+    /// default leader spec in agent::model format; overridden by --leader flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_leader: Option<String>,
+}
+
+impl DynamicWorkflowsConfig {
+    /// Layer 0 semantic validation, run by [`RepoConfig::load`] after
+    /// deserialization. Enforces the schema-local invariants that serde cannot
+    /// express; returns [`DataError::Other`] with a user-facing message on the
+    /// first violation. Dockerfile-availability checks are intentionally *not*
+    /// here — they depend on filesystem discovery and belong to the command
+    /// layer.
+    pub fn validate(&self) -> Result<(), DataError> {
+        if let Some(n) = self.max_concurrent_steps {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "dynamicWorkflows.maxConcurrentSteps must be >= 1".to_string(),
+                ));
+            }
+        }
+        if let Some(leader) = &self.default_leader {
+            validate_default_leader(leader)?;
+        }
+        if let Some(map) = &self.agents_to_models {
+            for (agent, models) in map {
+                validate_dynamic_agent_key(agent)?;
+                if models.is_empty() {
+                    return Err(DataError::Other(format!(
+                        "dynamicWorkflows.agentsToModels.{agent} has an empty model list. \
+                         Provide at least one model name."
+                    )));
+                }
+                for m in models {
+                    if m.trim().is_empty() {
+                        return Err(DataError::Other(format!(
+                            "dynamicWorkflows.agentsToModels.{agent} contains an empty model name."
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate a `dynamicWorkflows.agentsToModels` key against the same lexical
+/// rules as [`crate::data::session::AgentName`] (ASCII alphanumerics, `-`, `_`,
+/// length 1..=64). Returns [`DataError::Other`] so the failure surfaces as a
+/// config-load error rather than a synthesized parse error.
+fn validate_dynamic_agent_key(key: &str) -> Result<(), DataError> {
+    crate::data::session::AgentName::new(key).map_err(|_| {
+        DataError::Other(format!(
+            "dynamicWorkflows.agentsToModels key {key:?} is not a valid agent name: only ASCII \
+             alphanumerics, '-', and '_' are allowed, length 1..=64"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Layer 0 validator for `dynamicWorkflows.defaultLeader`. Enforces the same
+/// `agent::model` syntax as `LeaderSpec::parse` (two non-empty components) plus
+/// no leading/trailing whitespace in either component and an `AgentName`-valid
+/// agent component. Kept in the data layer so the config fails fast at load
+/// without depending on the command layer's `LeaderSpec`.
+fn validate_default_leader(raw: &str) -> Result<(), DataError> {
+    let parts: Vec<&str> = raw.split("::").collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(DataError::Other(format!(
+            "dynamicWorkflows.defaultLeader {raw:?} is invalid; expected agent::model \
+             (e.g. claude::claude-opus-4-8)"
+        )));
+    }
+    let (agent, model) = (parts[0], parts[1]);
+    if agent != agent.trim() || model != model.trim() {
+        return Err(DataError::Other(format!(
+            "dynamicWorkflows.defaultLeader {raw:?} must not have leading or trailing whitespace \
+             in the agent or model component"
+        )));
+    }
+    if crate::data::session::AgentName::new(agent).is_err() {
+        return Err(DataError::Other(format!(
+            "dynamicWorkflows.defaultLeader agent component {agent:?} is not a valid agent name: \
+             only ASCII alphanumerics, '-', and '_' are allowed, length 1..=64"
+        )));
+    }
+    Ok(())
+}
+
 /// Per-repository configuration stored at `<git_root>/.awman/config.json`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoConfig {
@@ -79,6 +184,12 @@ pub struct RepoConfig {
     pub base_image: Option<String>,
     #[serde(rename = "dockerfile", skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
+    #[serde(
+        rename = "dynamicWorkflows",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dynamic_workflows: Option<DynamicWorkflowsConfig>,
 }
 
 impl RepoConfig {
@@ -97,7 +208,15 @@ impl RepoConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&path).map_err(|e| DataError::io(&path, e))?;
-        serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))
+        let cfg: Self =
+            serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))?;
+        // Layer 0 semantic validation of the dynamicWorkflows section (WI-0095):
+        // schema shape that serde cannot express is enforced here so malformed
+        // config fails at load, before any UI or workflow starts.
+        if let Some(dw) = &cfg.dynamic_workflows {
+            dw.validate()?;
+        }
+        Ok(cfg)
     }
 
     /// Persist this config to disk, creating parent directories if needed.
@@ -423,6 +542,156 @@ mod tests {
             loaded.dockerfile.as_deref(),
             Some("docker/Dockerfile.base"),
             "dockerfile field must survive a save/load round-trip unmodified"
+        );
+    }
+
+    // ─── DynamicWorkflowsConfig serde (WI-0095) ──────────────────────────────
+
+    #[test]
+    fn dynamic_workflows_config_deserializes_with_all_fields() {
+        let json = r#"{
+            "agentsToModels": {"claude": ["claude-opus-4-8", "claude-sonnet-4-6"]},
+            "maxConcurrentSteps": 3,
+            "defaultLeader": "claude::claude-opus-4-8"
+        }"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.agents_to_models,
+            Some(HashMap::from([(
+                "claude".to_string(),
+                vec![
+                    "claude-opus-4-8".to_string(),
+                    "claude-sonnet-4-6".to_string()
+                ]
+            )]))
+        );
+        assert_eq!(cfg.max_concurrent_steps, Some(3));
+        assert_eq!(
+            cfg.default_leader.as_deref(),
+            Some("claude::claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn dynamic_workflows_config_deserializes_with_missing_fields() {
+        let json = r#"{"maxConcurrentSteps": 5}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_concurrent_steps, Some(5));
+        assert!(cfg.agents_to_models.is_none());
+        assert!(cfg.default_leader.is_none());
+    }
+
+    #[test]
+    fn dynamic_workflows_config_deserializes_with_extra_unknown_fields() {
+        // deny_unknown_fields must NOT be set on DynamicWorkflowsConfig: unknown
+        // keys are ignored rather than causing a deserialize error, so forward
+        // config files written by newer awman versions still parse.
+        let json = r#"{"maxConcurrentSteps": 2, "someFutureField": "ignored"}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_concurrent_steps, Some(2));
+    }
+
+    #[test]
+    fn dynamic_workflows_config_empty_object_deserializes_to_default() {
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg, DynamicWorkflowsConfig::default());
+    }
+
+    // ─── RepoConfig::load semantic validation (WI-0095) ──────────────────────
+
+    #[test]
+    fn load_rejects_max_concurrent_steps_zero() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"maxConcurrentSteps": 0}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maxConcurrentSteps must be >= 1"),
+            "error must explain the >= 1 requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_default_leader_missing_double_colon() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"defaultLeader": "claude"}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("expected agent::model"),
+            "error must explain the expected agent::model format, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_default_leader_empty_component() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"defaultLeader": "claude::"}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("expected agent::model"),
+            "empty model component must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_valid_default_leader() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"defaultLeader": "claude::claude-opus-4-8"}}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.dynamic_workflows
+                .as_ref()
+                .and_then(|dw| dw.default_leader.as_deref()),
+            Some("claude::claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn load_rejects_empty_model_list_for_one_agent() {
+        // Edge case from the WI-0095 spec: an agent key with an empty model
+        // list is a configuration error, not a silent no-op.
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"agentsToModels": {"claude": []}}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dynamicWorkflows.agentsToModels.claude has an empty model list"),
+            "error must name the empty-model-list agent, got: {err}"
         );
     }
 

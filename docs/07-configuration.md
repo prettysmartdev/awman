@@ -23,6 +23,13 @@ Created by `awman init`; commit it so the whole team shares the same setup.
   "workItems": {
     "dir": "docs/work-items",
     "template": "docs/work-items/0000-template.md"
+  },
+  "dynamicWorkflows": {
+    "agentsToModels": {
+      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
+    },
+    "maxConcurrentSteps": 3,
+    "defaultLeader": "claude::claude-opus-4-8"
   }
 }
 ```
@@ -149,6 +156,15 @@ awman config set work_items.template docs/work-items/0000-template.md
 
 Paths may be relative to the repo root (recommended) or absolute. Note the CLI names are `work_items.dir` / `work_items.template`, but they are stored in the JSON file under a single `workItems` block.
 
+### Configure dynamic workflow agents, models, and leader
+
+```sh
+awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
+awman config set dynamicWorkflows.maxConcurrentSteps 3
+```
+
+`dynamicWorkflows.agentsToModels` is not settable via `config set`; edit `.awman/config.json` directly. See [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) for the full reference.
+
 ### Custom Dockerfile path
 
 By default awman builds the project base image from `<git_root>/Dockerfile.dev`. To use a Dockerfile elsewhere, set `dockerfile` in `.awman/config.json` directly (it is not settable via `config set`):
@@ -220,6 +236,9 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `agentStuckTimeout` | integer (seconds) | 30 | Inactivity period before an agent is flagged as stuck | yes |
 | `baseImage` | string | (unset → global) | Image tag for workflow setup/teardown containers — see [Workflows](05-workflows.md) | no (edit file) |
 | `dockerfile` | string | `Dockerfile.dev` | Path to the project base Dockerfile, relative to repo root or absolute | no (edit file) |
+| `dynamicWorkflows.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Restricts a dynamic workflow's leader to this agent/model set — see [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) | no (edit file) |
+| `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
+| `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
 
 ### Global config fields (`$HOME/.awman/config.json`)
 
@@ -270,12 +289,15 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `api.background` | global only |
 | `remote.defaultAddr` | repo or global |
 | `remote.defaultAPIKey` | repo or global |
+| `dynamicWorkflows.defaultLeader` | repo only |
+| `dynamicWorkflows.maxConcurrentSteps` | repo only |
 
 Value handling:
 
 - `yoloDisallowedTools`, `overlays`, `api.workDirs` — comma-separated values are stored as arrays; an empty string stores an empty array.
-- `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port` — must be positive integers.
+- `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `dynamicWorkflows.maxConcurrentSteps` — must be positive integers; `0` is rejected.
 - `agent`, `default_agent` — validated against the supported agent list.
+- `dynamicWorkflows.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).
 - `envPassthrough` — removed; the error message points you to `env(VAR)` overlay entries.
 
 ### Environment variables

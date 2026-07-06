@@ -20,7 +20,8 @@ pub const EXAMPLE_WORKFLOW_TOML: &str = include_str!("../assets/dynamic/example-
 pub const WORKFLOW_USAGE_MD: &str = include_str!("../assets/dynamic/workflow-usage.md");
 
 /// The leader prompt template. Substituted with `{{work_item_number}}`,
-/// `{{work_item_path}}`, and `{{available_agents}}` before being delivered.
+/// `{{work_item_path}}`, `{{available_agents}}`, and
+/// `{{max_concurrent_steps_note}}` before being delivered.
 pub const LEADER_PROMPT_MD: &str = include_str!("../assets/dynamic/leader-prompt.md");
 
 /// The repair prompt template. Substituted with `{{validation_error}}`.
@@ -32,11 +33,20 @@ pub fn build_leader_prompt(
     work_item_number: &str,
     work_item_path: &str,
     available_agents: &str,
+    max_concurrent_steps: Option<usize>,
 ) -> String {
+    let max_concurrent_steps_note = match max_concurrent_steps {
+        Some(n) => format!(
+            "Note: the repository configuration advises a maximum of {n} concurrent steps. \
+             Plan your workflow accordingly."
+        ),
+        None => String::new(),
+    };
     LEADER_PROMPT_MD
         .replace("{{work_item_number}}", work_item_number)
         .replace("{{work_item_path}}", work_item_path)
         .replace("{{available_agents}}", available_agents)
+        .replace("{{max_concurrent_steps_note}}", &max_concurrent_steps_note)
 }
 
 /// Construct the repair prompt by substituting the verbatim validation error

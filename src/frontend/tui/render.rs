@@ -1803,12 +1803,27 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
     frame.render_widget(block, popup);
 
     let bottom_height: u16 = if state.editing { 3 } else { 2 };
+    // A 2-row detail area shows the full (untruncated) value of the selected
+    // row, since table cells are truncated to their column width (WI-0095).
+    let detail_height: u16 = 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(bottom_height)])
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(detail_height),
+            Constraint::Length(bottom_height),
+        ])
         .split(inner);
     let table_area = chunks[0];
-    let hint_area = chunks[1];
+    let detail_area = chunks[1];
+    let hint_area = chunks[2];
+
+    // Column widths mirror the `widths` constraints below (28/24/24/24), minus
+    // the 3 single-cell gaps ratatui inserts between the 4 columns. Cell values
+    // are truncated to these widths so long values don't overflow.
+    let usable = table_area.width.saturating_sub(3) as u32;
+    let field_w = (usable * 28 / 100) as usize;
+    let col_w = (usable * 24 / 100) as usize;
 
     let header_style = Style::default()
         .fg(Color::Cyan)
@@ -1833,14 +1848,14 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
                 let cursor = state.editor.cursor;
                 format!("{}|{}", &ev[..cursor], &ev[cursor..])
             } else {
-                row.global.clone()
+                truncate_path(&row.global, col_w)
             };
             let rval = if is_selected && state.editing && state.edit_column == 1 {
                 let ev = &state.editor.text;
                 let cursor = state.editor.cursor;
                 format!("{}|{}", &ev[..cursor], &ev[cursor..])
             } else {
-                row.repo.clone()
+                truncate_path(&row.repo, col_w)
             };
 
             let (gcell, rcell) = if is_selected && !state.editing {
@@ -1862,10 +1877,10 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
             };
 
             let r = Row::new(vec![
-                Cell::from(row.field.as_str()),
+                Cell::from(truncate_path(&row.field, field_w)),
                 gcell,
                 rcell,
-                Cell::from(row.effective.as_str()),
+                Cell::from(truncate_path(&row.effective, col_w)),
             ]);
             if is_selected {
                 r.style(Style::default().fg(Color::White).bg(Color::DarkGray))
@@ -1885,6 +1900,32 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
     ];
     let table = Table::new(rows, widths).header(header);
     frame.render_widget(table, table_area);
+
+    // Detail line: full (untruncated) value of the focused column for the
+    // selected row, so truncated cells remain inspectable (WI-0095).
+    if let Some(row) = state.rows.get(state.selected) {
+        let full = if state.edit_column == 0 {
+            &row.global
+        } else {
+            &row.repo
+        };
+        let full = if full.is_empty() {
+            &row.effective
+        } else {
+            full
+        };
+        let detail = if full.is_empty() {
+            format!("  {} (no value set)", row.field)
+        } else {
+            format!("  {} = {full}", row.field)
+        };
+        frame.render_widget(
+            Paragraph::new(detail)
+                .style(Style::default().fg(Color::Gray))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            detail_area,
+        );
+    }
 
     let mut hint_lines: Vec<Line> = Vec::new();
     if state.editing {
@@ -1914,8 +1955,8 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_selection_highlight, capture_buffer_grid, git_file_line, render_git_sidebar,
-        truncate_middle, truncate_path,
+        apply_selection_highlight, capture_buffer_grid, dialogs, git_file_line, render_config_show,
+        render_git_sidebar, truncate_middle, truncate_path,
     };
     use crate::frontend::tui::git_sidebar::{GitDiffSummary, GitFileChangeType, GitFileEntry};
     use crate::frontend::tui::tabs::TextSelection;
@@ -2152,6 +2193,53 @@ mod tests {
     #[test]
     fn truncate_path_at_exact_width_unchanged() {
         assert_eq!(truncate_path("abcdef", 6), "abcdef");
+    }
+
+    // ── render_config_show: truncation + detail line (WI-0095) ───────────────
+
+    #[test]
+    fn config_show_truncates_long_cell_and_shows_full_value_in_detail_line() {
+        let field = "dynamicWorkflows.agentsToModels.claude".to_string();
+        let value = "claude-opus-4-8, claude-sonnet-4-6, gemini-2.5-pro".to_string();
+        let state = dialogs::ConfigShowState {
+            rows: vec![dialogs::ConfigShowRow {
+                field: field.clone(),
+                global: String::new(),
+                repo: value.clone(),
+                effective: value.clone(),
+                read_only: true,
+            }],
+            selected: 0,
+            editing: false,
+            edit_column: 0,
+            editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+        };
+
+        let buf = render_to_buffer(140, 30, |area, frame| {
+            render_config_show(&state, area, frame);
+        });
+        let text = buffer_text(&buf);
+        let lines: Vec<&str> = text.lines().collect();
+
+        let header_idx = lines
+            .iter()
+            .position(|l| l.contains("Field") && l.contains("Effective"))
+            .expect("header row must be present");
+        let data_row = lines[header_idx + 1];
+
+        assert!(
+            data_row.contains('\u{2026}'),
+            "long value must be truncated with an ellipsis in the table cell: {data_row:?}"
+        );
+        assert!(
+            !data_row.contains(&value),
+            "the full untruncated value must not fit in the table row cell: {data_row:?}"
+        );
+        assert!(
+            text.contains(&value),
+            "the full untruncated value must appear in the detail line when the row is \
+             focused: {text}"
+        );
     }
 
     #[test]

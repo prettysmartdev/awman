@@ -740,6 +740,65 @@ mod tests {
     }
 
     #[test]
+    fn render_config_show_does_not_truncate_dynamic_workflows_values() {
+        use crate::command::commands::config::{ConfigFieldKind, ConfigFieldRow};
+        let long_models = "claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, \
+                            gemini-2.5-pro, codex-mini-latest";
+        let o = ConfigShowOutcome {
+            global: serde_json::json!({}),
+            repo: serde_json::json!({}),
+            rows: vec![
+                ConfigFieldRow {
+                    field: "dynamicWorkflows.defaultLeader".into(),
+                    global_value: None,
+                    repo_value: Some("claude::claude-opus-4-8".into()),
+                    effective_value: Some("claude::claude-opus-4-8".into()),
+                    kind: ConfigFieldKind::String,
+                    read_only: false,
+                },
+                ConfigFieldRow {
+                    field: "dynamicWorkflows.maxConcurrentSteps".into(),
+                    global_value: None,
+                    repo_value: Some("3".into()),
+                    effective_value: Some("3".into()),
+                    kind: ConfigFieldKind::Number,
+                    read_only: false,
+                },
+                ConfigFieldRow {
+                    field: "dynamicWorkflows.agentsToModels.claude".into(),
+                    global_value: None,
+                    repo_value: Some(long_models.into()),
+                    effective_value: Some(long_models.into()),
+                    kind: ConfigFieldKind::String,
+                    read_only: true,
+                },
+            ],
+        };
+        let s = render_config_show(&o);
+
+        assert!(
+            s.contains("dynamicWorkflows.defaultLeader"),
+            "defaultLeader field must appear: {s}"
+        );
+        assert!(
+            s.contains("dynamicWorkflows.maxConcurrentSteps"),
+            "maxConcurrentSteps field must appear: {s}"
+        );
+        assert!(
+            s.contains("dynamicWorkflows.agentsToModels.claude (read-only)"),
+            "read-only agentsToModels row must be marked, got: {s}"
+        );
+        assert!(
+            s.contains(long_models),
+            "long agentsToModels value must appear untruncated in CLI text output, got: {s}"
+        );
+        assert!(
+            !s.contains('\u{2026}'),
+            "CLI config show output must never truncate values with an ellipsis, got: {s}"
+        );
+    }
+
+    #[test]
     fn render_config_set_formats_field_scope_and_value() {
         let o = ConfigSetOutcome {
             field: "agent".into(),
