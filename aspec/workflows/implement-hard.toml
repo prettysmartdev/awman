@@ -21,7 +21,7 @@ Be sure to double check your work against the work item implementation spec.
 [[step]]
 name = "tests"
 depends_on = ["implement"]
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-5"
 prompt = """
 Implement tests for work item {{work_item_number}} as described in the project aspec and the work item test considerations below:
 
@@ -30,7 +30,7 @@ Implement tests for work item {{work_item_number}} as described in the project a
 
 [[step]]
 name = "docs"
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-5"
 depends_on = ["implement"]
 prompt = """
 Write comprehensive documentation for work item {{work_item_number}}, following the plan that was previously written and following guidelines from the project aspec.
@@ -39,7 +39,7 @@ Write comprehensive documentation for work item {{work_item_number}}, following 
 [[step]]
 name = "review"
 depends_on = ["docs", "tests"]
-model = "claude-opus-4-6"
+model = "claude-fable-5"
 prompt = """
 Review the changes made for work item {{work_item_number}} in the previous steps for correctness, completeness, security, and style. Address major issues or gaps automatically, but you MUST ask me for clarification if anything is unclear or if there are diverging possible solutions or spec mismatches. Then suggest minor improvements/nits if needed for my approval. Ensure all edge cases are considered:
 
