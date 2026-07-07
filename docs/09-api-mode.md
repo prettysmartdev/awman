@@ -275,6 +275,17 @@ When a TTY is present and `--non-interactive` is not passed, awman allows intera
 
 The API server (`awman api start`) is **always** non-interactive, regardless of the server process's stdin: clients drive it over HTTP and receive updates through the event stream, so there is no terminal to manage.
 
+### Parallel agents in interactive CLI mode
+
+`exec workflow` can run more than one step at once when the workflow's steps are independent (see [Parallel Workflows](15-parallel-workflows.md)). In command mode, running multiple agents at once with a real terminal attached would normally mean several containers writing to your terminal at the same time. Instead, when stdout is a TTY and more than one step is running, awman activates a lightweight status chrome:
+
+- The bottom row of the terminal is reserved for a status line: `[N agents running | showing: <step_name> | Ctrl-S: switch]`
+- The rest of the terminal shows the output of whichever step is currently "showing" (the **focused** step)
+- Press **Ctrl-S** to cycle the focused step; the display switches to that step's output and the status line updates
+- A stuck focused step (no output for 30 seconds) gets a `⚠` prefix on its name in the status line
+
+This chrome is deliberately minimal — a single reserved status row, not a full UI — and only appears when there is something to arbitrate between. With a single running step, or when stdout is not a TTY (redirected to a file, piped, or `--non-interactive`), awman falls back to plain sequential passthrough exactly as described above. In that non-interactive case, if a workflow launches more than one step in parallel, awman prints a warning that step output will interleave without any chrome to separate it, since there is no terminal to reserve a status row on.
+
 ### The `--non-interactive` / `-n` flag
 
 Force non-interactive mode even when a TTY is available. Useful for:

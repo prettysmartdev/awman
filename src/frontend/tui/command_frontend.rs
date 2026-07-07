@@ -6,6 +6,7 @@
 //! the parsed input's typed maps. Interactive Q&A methods open modal dialogs
 //! via the dialog channel and block until the user responds.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -81,6 +82,13 @@ pub struct TuiCommandFrontend {
     /// Live TUI context shared with the event loop. The event loop refreshes
     /// this on every tick; the status command reads it on each watch iteration.
     pub(crate) tui_context_shared: SharedTuiContext,
+    /// Shared queue of parallel-slot lifecycle events (WI-0096). The parallel
+    /// workflow callbacks push here; the TUI event loop drains it to maintain
+    /// `Tab::parallel_slots`.
+    pub(crate) parallel_slot_events: crate::frontend::tui::tabs::SharedParallelSlotEvents,
+    pub(crate) parallel_group_active: bool,
+    pub(crate) pending_parallel_slot_io:
+        HashMap<String, crate::frontend::tui::tabs::ParallelSlotIo>,
     /// Field name of the most recent config-dialog edit, so the re-presented
     /// table reopens with that row selected (the `config show` edit loop
     /// presents the dialog again after every save).
@@ -108,6 +116,7 @@ impl TuiCommandFrontend {
         active_worktree_path: SharedActiveWorktreePath,
         status_dashboard: SharedStatusDashboard,
         tui_context_shared: SharedTuiContext,
+        parallel_slot_events: crate::frontend::tui::tabs::SharedParallelSlotEvents,
     ) -> Self {
         let stdout_tx = container_io.stdout.clone();
         Self {
@@ -132,6 +141,9 @@ impl TuiCommandFrontend {
             active_worktree_path,
             status_dashboard,
             tui_context_shared,
+            parallel_slot_events,
+            parallel_group_active: false,
+            pending_parallel_slot_io: HashMap::new(),
             last_config_edit_field: None,
         }
     }
@@ -166,6 +178,46 @@ impl TuiCommandFrontend {
             resize: Some(resize_rx),
             initial_size: Some(initial_size),
         });
+    }
+
+    pub(crate) fn recreate_parallel_container_io(&mut self, step_name: &str) {
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let stdin_tx_for_engine = stdin_tx.clone();
+        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+
+        let initial_size = match crossterm::terminal::size() {
+            Ok((cols, rows)) => crate::frontend::tui::compute_container_inner_size(cols, rows),
+            Err(_) => (80u16, 24u16),
+        };
+
+        self.container_io = Some(AgentIo {
+            stdout: stdout_tx.clone(),
+            stderr: stdout_tx,
+            stdin_tx: stdin_tx_for_engine,
+            stdin_rx,
+            resize: Some(resize_rx),
+            initial_size: Some(initial_size),
+        });
+        self.pending_parallel_slot_io.insert(
+            step_name.to_string(),
+            crate::frontend::tui::tabs::ParallelSlotIo {
+                stdout_rx,
+                stdin_tx,
+                resize_tx,
+            },
+        );
+    }
+
+    /// Push a parallel-slot lifecycle event into the shared queue for the
+    /// TUI event loop to drain (WI-0096).
+    pub(crate) fn push_parallel_slot_event(
+        &self,
+        event: crate::frontend::tui::tabs::ParallelSlotEvent,
+    ) {
+        if let Ok(mut q) = self.parallel_slot_events.lock() {
+            q.push_back(event);
+        }
     }
 
     /// Send a dialog request and block waiting for the response.
@@ -280,6 +332,31 @@ impl CommandFrontend for TuiCommandFrontend {
                         flag: flag.to_string(),
                         reason: format!("'{v}' is not a valid u16"),
                     })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn flag_usize(
+        &self,
+        _command_path: &[&str],
+        flag: &str,
+    ) -> Result<Option<usize>, CommandError> {
+        match self.parsed.flags.get(flag) {
+            Some(FlagValue::String(v)) => {
+                let n: usize = v.parse().map_err(|_| CommandError::InvalidFlagValue {
+                    command: self.parsed.path.clone(),
+                    flag: flag.to_string(),
+                    reason: format!("'{v}' is not a valid number"),
+                })?;
+                if n < 1 {
+                    return Err(CommandError::InvalidFlagValue {
+                        command: self.parsed.path.clone(),
+                        flag: flag.to_string(),
+                        reason: format!("'{v}' must be >= 1"),
+                    });
+                }
+                Ok(Some(n))
             }
             _ => Ok(None),
         }

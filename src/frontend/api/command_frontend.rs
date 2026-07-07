@@ -72,6 +72,7 @@ struct ParsedArgs {
     paths: HashMap<String, PathBuf>,
     enums: HashMap<String, String>,
     u16s: HashMap<String, u16>,
+    usizes: HashMap<String, usize>,
     args: HashMap<String, String>,
     args_vec: HashMap<String, Vec<String>>,
 }
@@ -195,6 +196,7 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
     let mut paths = HashMap::new();
     let mut enums = HashMap::new();
     let mut u16s = HashMap::new();
+    let mut usizes = HashMap::new();
     let mut positional_args = HashMap::new();
     let positional_args_vec: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -230,6 +232,10 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
                     bools.insert(flag_name.to_string(), next == "true");
                 } else if let Ok(n) = next.parse::<u16>() {
                     u16s.insert(flag_name.to_string(), n);
+                    usizes.insert(flag_name.to_string(), n as usize);
+                    strings.insert(flag_name.to_string(), next.clone());
+                } else if let Ok(n) = next.parse::<usize>() {
+                    usizes.insert(flag_name.to_string(), n);
                     strings.insert(flag_name.to_string(), next.clone());
                 } else {
                     strings.insert(flag_name.to_string(), next.clone());
@@ -323,6 +329,7 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
         paths,
         enums,
         u16s,
+        usizes,
         args: positional_args,
         args_vec: positional_args_vec,
     }
@@ -393,6 +400,14 @@ impl CommandFrontend for ApiDispatchFrontend {
 
     fn flag_u16(&self, _command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
         Ok(self.parsed.u16s.get(flag).copied())
+    }
+
+    fn flag_usize(
+        &self,
+        _command_path: &[&str],
+        flag: &str,
+    ) -> Result<Option<usize>, CommandError> {
+        Ok(self.parsed.usizes.get(flag).copied())
     }
 
     fn argument(&self, _command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
@@ -723,6 +738,32 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
+
+    fn report_parallel_step_launched(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
+        let idx = self.step_index_for(step_name);
+        self.event_bus
+            .emit(EventPayload::WorkflowParallelStepLaunched {
+                step_name: step_name.to_string(),
+                step_index: idx,
+                agent: agent.to_string(),
+                model: model.map(|m| m.to_string()),
+            });
+    }
+
+    fn report_parallel_step_exited(&mut self, step_name: &str, exit_code: i32) {
+        let idx = self.step_index_for(step_name);
+        self.event_bus
+            .emit(EventPayload::WorkflowParallelStepExited {
+                step_name: step_name.to_string(),
+                step_index: idx,
+                exit_code,
+            });
+    }
+
+    fn report_parallel_group_finished(&mut self) {
+        self.event_bus
+            .emit(EventPayload::WorkflowParallelGroupFinished);
+    }
 
     fn report_workflow_progress(
         &mut self,

@@ -241,6 +241,13 @@ impl CommandFrontend for CliFrontend {
         Ok(m.get_one::<u16>(flag).copied())
     }
 
+    fn flag_usize(&self, command_path: &[&str], flag: &str) -> Result<Option<usize>, CommandError> {
+        let Some(m) = self.matches_for(command_path) else {
+            return Ok(None);
+        };
+        Ok(m.get_one::<usize>(flag).copied())
+    }
+
     fn argument(&self, command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
         let Some(m) = self.matches_for(command_path) else {
             return Ok(None);

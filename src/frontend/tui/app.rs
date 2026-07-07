@@ -257,6 +257,7 @@ impl App {
             tab.active_worktree_path.clone(),
             tab.status_dashboard.clone(),
             tab.tui_context_shared.clone(),
+            tab.parallel_slot_events.clone(),
         );
 
         // Store the receiving/sending ends in the tab.
@@ -379,6 +380,10 @@ impl App {
             tab.drain_container_output();
             tab.poll_container_exit();
             tab.poll_command_completion();
+            // WI-0096: maintain parallel_slots before aggregating stuck/yolo
+            // (drain_stuck_events reads each slot's flags).
+            tab.drain_parallel_slot_events();
+            tab.drain_parallel_slot_outputs();
             tab.drain_stuck_events();
             // Restart the git poll task if the worktree path changed.
             tab.refresh_git_poll();
@@ -652,10 +657,9 @@ impl App {
                             state.editor.set_text(&rej.value);
                             // A rejected Ctrl+N mapping has no row yet —
                             // resume the add flow in its value phase.
-                            state.new_entry = new_mapping_key
-                                .map(|key| crate::frontend::tui::dialogs::NewMapEntryPhase::Value {
-                                    key,
-                                });
+                            state.new_entry = new_mapping_key.map(|key| {
+                                crate::frontend::tui::dialogs::NewMapEntryPhase::Value { key }
+                            });
                         }
                     }
                     Dialog::ConfigShow(state)
@@ -1126,9 +1130,7 @@ mod tests {
         };
         assert_eq!(
             state.new_entry,
-            Some(crate::frontend::tui::dialogs::NewMapEntryPhase::Value {
-                key: "maki".into()
-            }),
+            Some(crate::frontend::tui::dialogs::NewMapEntryPhase::Value { key: "maki".into() }),
             "the add-mapping flow must resume in the value phase"
         );
         assert!(state.editing);

@@ -16,7 +16,9 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::frontend::tui::tabs::{format_duration, LastContainerSummary, Tab, TextSelection};
+use crate::frontend::tui::tabs::{
+    format_duration, LastContainerSummary, ParallelContainerSlot, Tab, TextSelection,
+};
 
 /// Render the container overlay when Maximized.
 ///
@@ -57,18 +59,21 @@ pub fn render_container_maximized(
     frame.render_widget(Clear, container_area);
 
     // Title strings.
-    let agent_name = tab
-        .container_info
-        .as_ref()
+    let focused_slot_idx = tab.has_multiple_slots().then_some(tab.focused_slot_idx);
+    let focused_info = focused_slot_idx
+        .and_then(|idx| tab.parallel_slots.get(idx))
+        .and_then(|slot| slot.container_info.as_ref());
+    let info = focused_info.or(tab.container_info.as_ref());
+    let agent_name = info
         .map(|i| i.agent_display_name.as_str())
         .unwrap_or("Agent");
-    let runtime_label = if tab.container_info.as_ref().is_some_and(|i| i.sandboxed) {
+    let runtime_label = if info.is_some_and(|i| i.sandboxed) {
         "sandboxed"
     } else {
         "containerized"
     };
     let left_title = format!(" \u{1F512} {} ({}) ", agent_name, runtime_label);
-    let right_title = build_stats_title(tab);
+    let right_title = info.map(build_stats_title_from_info).unwrap_or_default();
 
     let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
@@ -86,7 +91,11 @@ pub fn render_container_maximized(
     // and reading back the clamped value, then probe the depth via
     // `set_scrollback(usize::MAX)`. Reset to live before rendering.
     let (effective_scroll_offset, max_scrollback) = if tab.container_scroll_offset > 0 {
-        let screen = tab.vt100_parser.screen_mut();
+        let screen = if let Some(idx) = focused_slot_idx {
+            tab.parallel_slots[idx].vt100_parser.screen_mut()
+        } else {
+            tab.vt100_parser.screen_mut()
+        };
         screen.set_scrollback(tab.container_scroll_offset);
         let eff = screen.scrollback();
         screen.set_scrollback(usize::MAX);
@@ -128,7 +137,11 @@ pub fn render_container_maximized(
     // Publish the inner area for the mouse handler.
     tab.container_inner_area = Some(inner);
 
-    let screen = tab.vt100_parser.screen_mut();
+    let screen = if let Some(idx) = focused_slot_idx {
+        tab.parallel_slots[idx].vt100_parser.screen_mut()
+    } else {
+        tab.vt100_parser.screen_mut()
+    };
     if effective_scroll_offset > 0 {
         screen.set_scrollback(effective_scroll_offset);
         render_vt100_screen(frame, screen, inner, selection.as_ref(), false);
@@ -215,6 +228,59 @@ pub fn render_container_summary(summary: &LastContainerSummary, area: Rect, fram
     frame.render_widget(para, area);
 }
 
+/// Render the stacked one-row minimized bars for a parallel workflow group
+/// (WI-0096 §5). One row per non-focused slot; `area.height` is expected to
+/// equal the number of minimized slots. Each row reads:
+///   `[step_name] agent · duration · status_glyph`
+/// Stuck slots get a `⚠` prefix and yellow color; slots in a yolo countdown
+/// flash purple/yellow on a per-second parity.
+pub fn render_parallel_minimized_bars(tab: &Tab, area: Rect, frame: &mut Frame) {
+    let mut row: u16 = 0;
+    for (idx, slot) in tab.parallel_slots.iter().enumerate() {
+        if idx == tab.focused_slot_idx {
+            continue; // the focused slot is shown maximized, not as a bar
+        }
+        if row >= area.height {
+            break;
+        }
+        let bar_area = Rect::new(area.x, area.y + row, area.width, 1);
+        render_one_minimized_bar(slot, bar_area, frame);
+        row += 1;
+    }
+}
+
+fn render_one_minimized_bar(slot: &ParallelContainerSlot, area: Rect, frame: &mut Frame) {
+    let duration = format_duration(slot.elapsed_secs());
+    let (color, prefix, glyph) = if slot.stuck {
+        // Yellow + ⚠ prefix for stuck bars.
+        (Color::Yellow, "\u{26a0} ", '\u{26a0}')
+    } else if slot.yolo_mode {
+        // Purple/yellow flash keyed off the same per-second parity the tab
+        // header uses.
+        let c = if slot.elapsed_secs().is_multiple_of(2) {
+            Color::Magenta
+        } else {
+            Color::Yellow
+        };
+        (c, "", '\u{25cf}')
+    } else {
+        (Color::Green, "", '\u{25cf}')
+    };
+    let content = format!(
+        "{}[{}] {} \u{00b7} {} \u{00b7} {}",
+        prefix,
+        slot.step_name,
+        slot.agent_name(),
+        duration,
+        glyph
+    );
+    let para = Paragraph::new(Line::from(Span::styled(
+        content,
+        Style::default().fg(color),
+    )));
+    frame.render_widget(para, area);
+}
+
 // ─── Internals ──────────────────────────────────────────────────────────
 
 /// Test-accessible wrapper for `build_stats_title`.
@@ -230,6 +296,10 @@ fn build_stats_title(tab: &Tab) -> String {
         Some(i) => i,
         None => return String::new(),
     };
+    build_stats_title_from_info(info)
+}
+
+fn build_stats_title_from_info(info: &crate::frontend::tui::tabs::ContainerInfo) -> String {
     let elapsed = info.start_time.elapsed().as_secs();
     let time_str = format_duration(elapsed);
     if let Some(ref stats) = info.latest_stats {
@@ -400,5 +470,121 @@ mod tests {
     #[test]
     fn cell_in_selection_none_returns_false() {
         assert!(!cell_in_selection(None, 5, 5));
+    }
+
+    // ── WI-0096 minimized-bar rendering (E2E) ───────────────────────────────
+
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+    use crate::frontend::tui::tabs::{ParallelContainerSlot, ParallelSlotEvent, Tab};
+
+    fn make_test_session() -> Session {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn render_bars_to_text(tab: &Tab, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_parallel_minimized_bars(tab, area, frame);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn slot(name: &str) -> ParallelContainerSlot {
+        ParallelContainerSlot::new(name.to_string(), "claude".to_string(), 1000)
+    }
+
+    #[test]
+    fn minimized_bars_render_only_non_focused_slots_and_swap_on_ctrl_s() {
+        let mut tab = Tab::new(make_test_session());
+        tab.parallel_slots.push(slot("build"));
+        tab.parallel_slots.push(slot("test"));
+        tab.focused_slot_idx = 0; // "build" is maximized (no bar)
+
+        // Only the non-focused slot renders a minimized status bar.
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            text.contains("[test]"),
+            "non-focused slot renders as a bar: {text}"
+        );
+        assert!(
+            !text.contains("[build]"),
+            "the focused (maximized) slot is not drawn as a bar: {text}"
+        );
+
+        // Ctrl-S swaps focus → now "build" is the minimized bar, "test" maximized.
+        tab.cycle_focused_slot();
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            text.contains("[build]"),
+            "after swap 'build' is the bar: {text}"
+        );
+        assert!(
+            !text.contains("[test]"),
+            "after swap the focused 'test' has no bar: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_bar_disappears_when_its_slot_exits() {
+        let mut tab = Tab::new(make_test_session());
+        tab.parallel_slots.push(slot("build"));
+        tab.parallel_slots.push(slot("test"));
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(text.contains("[test]"));
+
+        // The background step exits → its slot is evicted and the bar is gone.
+        tab.parallel_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ParallelSlotEvent::Exited {
+                step_name: "test".to_string(),
+            });
+        tab.drain_parallel_slot_events();
+
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            !text.contains("[test]"),
+            "the exited slot's bar must disappear: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_stuck_bar_shows_warning_glyph() {
+        let mut tab = Tab::new(make_test_session());
+        tab.parallel_slots.push(slot("build"));
+        let mut stuck = slot("test");
+        stuck.stuck = true;
+        tab.parallel_slots.push(stuck);
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            text.contains('\u{26a0}'),
+            "a stuck minimized bar shows the ⚠ glyph: {text}"
+        );
     }
 }

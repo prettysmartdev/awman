@@ -190,6 +190,11 @@ pub struct RepoConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub dynamic_workflows: Option<DynamicWorkflowsConfig>,
+    #[serde(
+        rename = "maxConcurrentAgents",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent_agents: Option<usize>,
 }
 
 impl RepoConfig {
@@ -215,6 +220,13 @@ impl RepoConfig {
         // config fails at load, before any UI or workflow starts.
         if let Some(dw) = &cfg.dynamic_workflows {
             dw.validate()?;
+        }
+        if let Some(n) = cfg.max_concurrent_agents {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "maxConcurrentAgents must be >= 1".to_string(),
+                ));
+            }
         }
         Ok(cfg)
     }
@@ -616,6 +628,40 @@ mod tests {
             msg.contains("maxConcurrentSteps must be >= 1"),
             "error must explain the >= 1 requirement, got: {msg}"
         );
+    }
+
+    #[test]
+    fn load_rejects_max_concurrent_agents_zero() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"maxConcurrentAgents": 0}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maxConcurrentAgents must be >= 1"),
+            "error must explain the >= 1 requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_max_concurrent_agents_positive() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"maxConcurrentAgents": 4}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.max_concurrent_agents, Some(4));
     }
 
     #[test]

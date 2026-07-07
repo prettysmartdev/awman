@@ -124,7 +124,7 @@ pub fn parse(
                     let value = read_value(inline_value, &format!("flag --{name} needs a value"))?;
                     flags.insert(name.to_string(), FlagValue::String(value));
                 }
-                FlagKind::U16 => {
+                FlagKind::U16 | FlagKind::UsizeAtLeastOne => {
                     let raw = read_value(inline_value, &format!("flag --{name} needs a number"))?;
                     flags.insert(name.to_string(), FlagValue::String(raw));
                 }

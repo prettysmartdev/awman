@@ -87,6 +87,7 @@ mod tests {
             Arc::new(Mutex::new(
                 crate::command::commands::status::StatusCommandTuiContext { tabs: vec![] },
             )),
+            Arc::new(Mutex::new(std::collections::VecDeque::new())),
         )
     }
 

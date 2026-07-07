@@ -134,6 +134,8 @@ Note: the repository configuration advises a maximum of 3 concurrent steps. Plan
 
 This is advisory only — awman does not enforce it in the workflow scheduler. It is a hint the leader agent uses when deciding how much of the workflow to run in parallel via `depends_on`. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow.
 
+Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), a differently-named, differently-scoped setting: `maxConcurrentAgents` is the cap the engine actually enforces at run time, for every workflow (dynamic or not), regardless of what the leader planned. See [Parallel Workflows](15-parallel-workflows.md).
+
 ### `defaultLeader`
 
 Sets the repo-wide default leader agent and model, in the same `agent::model` format as `--leader` (see [Leader resolution order](#leader-resolution-order) above). Rejected at config-load time if the format is invalid, if either component is empty or has surrounding whitespace, or if the agent component isn't a valid agent name.

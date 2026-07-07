@@ -44,6 +44,11 @@ pub struct GlobalConfig {
     pub workers: Option<u8>,
     #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
+    #[serde(
+        rename = "maxConcurrentAgents",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent_agents: Option<usize>,
 }
 
 impl GlobalConfig {
@@ -108,7 +113,16 @@ impl GlobalConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&path).map_err(|e| DataError::io(&path, e))?;
-        serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))
+        let cfg: Self =
+            serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))?;
+        if let Some(n) = cfg.max_concurrent_agents {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "maxConcurrentAgents must be >= 1".to_string(),
+                ));
+            }
+        }
+        Ok(cfg)
     }
 
     /// Persist this config to disk, creating parent directories if needed.
@@ -171,11 +185,43 @@ mod tests {
             agent_stuck_timeout_secs: Some(45),
             workers: None,
             base_image: None,
+            max_concurrent_agents: Some(4),
         };
 
         original.save_with(&env).unwrap();
         let reloaded = GlobalConfig::load_with(&env).unwrap();
         assert_eq!(original, reloaded);
+    }
+
+    #[test]
+    fn load_rejects_max_concurrent_agents_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, r#"{"maxConcurrentAgents": 0}"#).unwrap();
+
+        let err = GlobalConfig::load_with(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("maxConcurrentAgents must be >= 1"),
+            "error must explain the >= 1 requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_max_concurrent_agents_positive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, r#"{"maxConcurrentAgents": 8}"#).unwrap();
+
+        let cfg = GlobalConfig::load_with(&env).unwrap();
+        assert_eq!(cfg.max_concurrent_agents, Some(8));
     }
 
     #[test]

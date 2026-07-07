@@ -28,6 +28,7 @@ const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
     ("workItems", FieldScope::RepoOnly),
     ("overlays", FieldScope::Both),
     ("agentStuckTimeout", FieldScope::Both),
+    ("maxConcurrentAgents", FieldScope::Both),
     ("runtime", FieldScope::GlobalOnly),
     ("default_agent", FieldScope::GlobalOnly),
     ("api", FieldScope::GlobalOnly),
@@ -193,6 +194,15 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
                 .map_err(|_| format!("'{}' is not a valid number", value))?;
             if n < 1 {
                 return Err("dynamicWorkflows.maxConcurrentSteps must be >= 1".to_string());
+            }
+            Ok(serde_json::Value::Number(n.into()))
+        }
+        "maxConcurrentAgents" => {
+            let n = value
+                .parse::<u64>()
+                .map_err(|_| format!("'{}' is not a valid number", value))?;
+            if n < 1 {
+                return Err("maxConcurrentAgents must be >= 1".to_string());
             }
             Ok(serde_json::Value::Number(n.into()))
         }
@@ -374,7 +384,8 @@ fn config_field_kind(name: &str) -> ConfigFieldKind {
         "terminal_scrollback_lines"
         | "agentStuckTimeout"
         | "api.port"
-        | "dynamicWorkflows.maxConcurrentSteps" => ConfigFieldKind::Number,
+        | "dynamicWorkflows.maxConcurrentSteps"
+        | "maxConcurrentAgents" => ConfigFieldKind::Number,
         _ => ConfigFieldKind::String,
     }
 }
@@ -418,6 +429,7 @@ fn config_field_hint(name: &str) -> Option<String> {
             Some("positive integer".to_string())
         }
         "dynamicWorkflows.maxConcurrentSteps" => Some("integer >= 1".to_string()),
+        "maxConcurrentAgents" => Some("integer >= 1 (unset = unlimited)".to_string()),
         "dynamicWorkflows.defaultLeader" => {
             Some("agent::model (e.g. claude::claude-opus-4-8)".to_string())
         }
@@ -651,11 +663,10 @@ impl Command for ConfigCommand {
                             // a rejection so the user's input is preserved
                             // and the reason is visible in the dialog. It is
                             // also logged for the post-dialog record.
-                            let result = validate_and_coerce(&edit.field, &edit.value).and_then(
-                                |coerced| {
+                            let result =
+                                validate_and_coerce(&edit.field, &edit.value).and_then(|coerced| {
                                     write_config_field(&session, &edit.field, coerced, edit.global)
-                                },
-                            );
+                                });
                             if let Err(reason) = result {
                                 frontend.write_message(crate::data::message::UserMessage {
                                     level: crate::data::message::MessageLevel::Warning,

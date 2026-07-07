@@ -17,6 +17,7 @@ use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{
     DialogRequest, DialogResponse, WorkflowControlBoardState, WorkflowStepErrorState,
 };
+use crate::frontend::tui::tabs::ParallelSlotEvent;
 
 impl WorkflowFrontend for TuiCommandFrontend {
     fn show_workflow_control_board(
@@ -74,8 +75,14 @@ impl WorkflowFrontend for TuiCommandFrontend {
                                     finish_workflow_unavailable_reason: available
                                         .finish_workflow_unavailable_reason
                                         .clone(),
+                                    restart_unavailable_reason: available
+                                        .restart_unavailable_reason
+                                        .clone(),
                                     can_dismiss: available.can_dismiss,
                                     launch_next_label: available.launch_next_label.clone(),
+                                    focused_step_name: step_name.clone(),
+                                    parallel_peer_count: available.parallel_peer_count,
+                                    parallel_peers_running: available.parallel_peers_running,
                                 },
                             ))
                             .map_err(|e| EngineError::Other(e.to_string()))?;
@@ -90,6 +97,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         let response = self
             .ask_dialog(DialogRequest::WorkflowControlBoard(
                 WorkflowControlBoardState {
+                    focused_step_name: step_name.clone(),
                     step_name,
                     can_launch_next: available.can_launch_next,
                     can_continue_current: available.can_continue_in_current_container,
@@ -103,8 +111,11 @@ impl WorkflowFrontend for TuiCommandFrontend {
                     finish_workflow_unavailable_reason: available
                         .finish_workflow_unavailable_reason
                         .clone(),
+                    restart_unavailable_reason: available.restart_unavailable_reason.clone(),
                     can_dismiss: available.can_dismiss,
                     launch_next_label: available.launch_next_label.clone(),
+                    parallel_peer_count: available.parallel_peer_count,
+                    parallel_peers_running: available.parallel_peers_running,
                 },
             ))
             .map_err(|e| EngineError::Other(e.to_string()))?;
@@ -214,12 +225,13 @@ impl WorkflowFrontend for TuiCommandFrontend {
                 .iter()
                 .find(|s| matches!(s.status, WorkflowStepStatus::Running))
                 .map(|s| s.name.clone());
+            view.max_concurrent = steps.first().and_then(|s| s.max_concurrent);
         }
     }
 
     fn report_step_interactive_launch(
         &mut self,
-        _step: &WorkflowStep,
+        step: &WorkflowStep,
         agent: &str,
         _model: Option<&str>,
     ) {
@@ -230,7 +242,11 @@ impl WorkflowFrontend for TuiCommandFrontend {
             *guard = None;
         }
 
-        self.recreate_container_io();
+        if self.parallel_group_active {
+            self.recreate_parallel_container_io(&step.name);
+        } else {
+            self.recreate_container_io();
+        }
 
         if let Ok(mut name) = self.container_name_shared.lock() {
             *name = None;
@@ -353,6 +369,74 @@ impl WorkflowFrontend for TuiCommandFrontend {
             *guard = Some(sender);
         }
     }
+
+    // ── Parallel group callbacks (WI-0096) ───────────────────────────────
+    // These publish lifecycle events into the shared queue; the TUI event
+    // loop drains it and maintains `Tab::parallel_slots`. Layer discipline:
+    // the frontend never inspects `active_steps` or makes scheduling
+    // decisions — it only reacts to these engine callbacks.
+
+    fn report_parallel_group_started(&mut self, _step_names: &[String]) {
+        self.parallel_group_active = true;
+        self.pending_parallel_slot_io.clear();
+    }
+
+    fn report_parallel_step_launched(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
+        let io = self.pending_parallel_slot_io.remove(step_name);
+        self.push_parallel_slot_event(ParallelSlotEvent::Launched {
+            step_name: step_name.to_string(),
+            agent: agent.to_string(),
+            model: model.map(|m| m.to_string()),
+            io,
+        });
+    }
+
+    fn report_parallel_step_dequeued(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
+        // A queued step took a freed slot — same visual as a launch.
+        let io = self.pending_parallel_slot_io.remove(step_name);
+        self.push_parallel_slot_event(ParallelSlotEvent::Launched {
+            step_name: step_name.to_string(),
+            agent: agent.to_string(),
+            model: model.map(|m| m.to_string()),
+            io,
+        });
+    }
+
+    fn report_parallel_step_exited(&mut self, step_name: &str, _exit_code: i32) {
+        self.push_parallel_slot_event(ParallelSlotEvent::Exited {
+            step_name: step_name.to_string(),
+        });
+    }
+
+    fn report_parallel_group_finished(&mut self) {
+        self.parallel_group_active = false;
+        self.pending_parallel_slot_io.clear();
+        self.push_parallel_slot_event(ParallelSlotEvent::GroupFinished);
+    }
+
+    fn report_parallel_step_stuck(&mut self, step_name: &str) {
+        self.push_parallel_slot_event(ParallelSlotEvent::Stuck {
+            step_name: step_name.to_string(),
+        });
+    }
+
+    fn report_parallel_step_unstuck(&mut self, step_name: &str) {
+        self.push_parallel_slot_event(ParallelSlotEvent::Unstuck {
+            step_name: step_name.to_string(),
+        });
+    }
+
+    fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
+        self.push_parallel_slot_event(ParallelSlotEvent::YoloStarted {
+            step_name: step_name.to_string(),
+        });
+    }
+
+    fn parallel_step_yolo_countdown_finished(&mut self, step_name: &str) {
+        self.push_parallel_slot_event(ParallelSlotEvent::YoloFinished {
+            step_name: step_name.to_string(),
+        });
+    }
 }
 
 /// Map a WCB dialog response to a `NextAction`.
@@ -451,6 +535,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::command::commands::status::StatusCommandTuiContext::default(),
             )),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         );
         (frontend, req_rx, resp_tx)
     }

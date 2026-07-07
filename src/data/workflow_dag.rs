@@ -208,6 +208,48 @@ mod tests {
     }
 
     #[test]
+    fn ready_steps_returns_all_four_concurrent_ready_steps() {
+        // Four independent roots (no dependencies) are all ready at once —
+        // the parallel-group path relies on ready_steps surfacing every one.
+        let steps = vec![
+            step("a", &[]),
+            step("b", &[]),
+            step("c", &[]),
+            step("d", &[]),
+        ];
+        let dag = WorkflowDag::build(&steps).unwrap();
+        let ready = dag.ready_steps(&HashSet::new());
+        assert_eq!(
+            ready,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            "all four concurrently-ready steps must be returned in source order"
+        );
+    }
+
+    #[test]
+    fn ready_steps_returns_all_fan_out_children_together() {
+        // A common root fans out to four children that share the same single
+        // dependency; once the root completes, all four become ready at once.
+        let steps = vec![
+            step("root", &[]),
+            step("a", &["root"]),
+            step("b", &["root"]),
+            step("c", &["root"]),
+            step("d", &["root"]),
+        ];
+        let dag = WorkflowDag::build(&steps).unwrap();
+        let mut completed = HashSet::new();
+        completed.insert("root".to_string());
+        let ready = dag.ready_steps(&completed);
+        assert_eq!(ready, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
     fn ready_steps_unlocks_after_completion() {
         let steps = vec![step("a", &[]), step("b", &["a"])];
         let dag = WorkflowDag::build(&steps).unwrap();

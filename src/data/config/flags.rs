@@ -40,6 +40,8 @@ pub struct FlagConfig {
     pub api_key: Option<String>,
     /// `--work-item <N>`.
     pub work_item: Option<u32>,
+    /// `--max-concurrent <N>`: cap on concurrently-running workflow steps.
+    pub max_concurrent_agents: Option<usize>,
 }
 
 impl FlagConfig {

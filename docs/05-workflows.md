@@ -947,6 +947,7 @@ Press [r] to retry, or any other key to abort:
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
 | `--dynamic` | Let a leader agent design the workflow file from your work item; see [Dynamic Workflows](13-dynamic-workflows.md) |
 | `--leader=<agent::model>` | Override the agent and model used as the leader when `--dynamic` is set; format: `agent::model` |
+| `--max-concurrent=<N>` | Cap on concurrently-running steps for this invocation (must be ≥ 1); overrides `maxConcurrentAgents` in config — see [Parallel Workflows](15-parallel-workflows.md) |
 
 ---
 
@@ -1066,7 +1067,9 @@ You can always open the control board manually via **Ctrl+W** regardless of stuc
 
 ### Parallel step groups
 
-Steps that share the same dependencies form a **parallel group** and execute sequentially in file order. In the workflow strip, they are stacked vertically with slight indentation. If a group has more than two steps, the additional steps are shown as `+ N more…`. Use **mouse wheel** to scroll within the strip and view hidden parallel steps.
+Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`maxConcurrentAgents`](07-configuration.md#reference) cap (unlimited by default). In the workflow strip, they are stacked vertically at the same indent — no per-row stagger, since they aren't running one after another. If a group has more members than fit on screen, completed steps collapse into a single `<name> (+N completed)` row; use the **mouse wheel** to scroll within the strip and view hidden parallel steps.
+
+In the TUI, running steps beyond the concurrency cap wait their turn with a `·` prefix on their name until a slot frees up. See [Parallel Workflows](15-parallel-workflows.md) for the full scheduling model, and [Using the TUI](02-using-the-tui.md#parallel-containers) for how multiple running containers are displayed and switched between.
 
 ### Viewing the full control board
 
@@ -1134,7 +1137,7 @@ Start it over (s) or skip to next step (n)? [s/n]:
 
 ## Parallel groups
 
-Steps that share the same `Depends-on` set form a **parallel group**. awman executes them sequentially in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically. If a group has more than two steps, the third box shows `+ N more…`.
+Steps that share the same `Depends-on` set form a **parallel group** and run concurrently, each in its own container, up to the configured [`maxConcurrentAgents`](07-configuration.md#reference) cap. In the TUI they are rendered stacked vertically at the same indent; a group with more steps than fit collapses completed ones into a single `+ N completed` row. See [Parallel Workflows](15-parallel-workflows.md) for details.
 
 ---
 
@@ -1218,7 +1221,6 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 
 ### Limitations (v0.3)
 
-- **Sequential only**: parallel groups run one step at a time. True concurrent container execution is not yet supported.
 - **TUI resume dialogs**: hash-mismatch and resume prompts use auto-restart behaviour rather than a full dialog.
 
 ---

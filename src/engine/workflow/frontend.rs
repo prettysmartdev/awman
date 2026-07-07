@@ -4,13 +4,17 @@
 //! The frontend is a pure I/O layer — it renders what the engine tells it
 //! and collects user input when the engine asks for it.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::broadcast;
 
 use crate::data::message::UserMessageSink;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::execution::StuckEvent;
+use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
@@ -129,4 +133,69 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     fn on_teardown_step_completed(&mut self, _description: &str) {}
     fn on_teardown_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
     fn on_teardown_step_fixing(&mut self, _description: &str, _attempt: u32, _of: u32) {}
+
+    // === Parallel-group commands (WI-0096) ===
+    //
+    // All default no-ops. The single-step path never calls these; frontends
+    // that don't render multi-container UX simply ignore them. The engine owns
+    // every scheduling/concurrency decision — these callbacks are pure
+    // presentation notifications.
+
+    /// Engine is launching multiple parallel containers for this group.
+    /// `step_names` is the ordered list of all steps in this parallel batch
+    /// (including queued ones that are not yet running).
+    fn report_parallel_group_started(&mut self, _step_names: &[String]) {}
+
+    /// One container in a parallel group has started running.
+    fn report_parallel_step_launched(
+        &mut self,
+        _step_name: &str,
+        _agent: &str,
+        _model: Option<&str>,
+    ) {
+    }
+
+    /// One container in a parallel group has exited.
+    /// `evict` — the frontend should remove the status bar for this step
+    /// entirely (not replace it with a grey summary bar).
+    fn report_parallel_step_exited(&mut self, _step_name: &str, _exit_code: i32) {}
+
+    /// A queued step in this parallel group has started (because a slot freed up).
+    fn report_parallel_step_dequeued(
+        &mut self,
+        _step_name: &str,
+        _agent: &str,
+        _model: Option<&str>,
+    ) {
+    }
+
+    /// The parallel group has fully drained; all steps completed.
+    fn report_parallel_group_finished(&mut self) {}
+
+    /// Per-step stuck notification for a parallel container.
+    fn report_parallel_step_stuck(&mut self, _step_name: &str) {}
+    fn report_parallel_step_unstuck(&mut self, _step_name: &str) {}
+
+    /// Per-step yolo countdown updates.
+    fn parallel_step_yolo_countdown_started(&mut self, _step_name: &str) {}
+    fn parallel_step_yolo_countdown_tick(
+        &mut self,
+        _step_name: &str,
+        _remaining: Duration,
+        _total: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        Ok(YoloTickOutcome::Continue)
+    }
+    fn parallel_step_yolo_countdown_finished(&mut self, _step_name: &str) {}
+
+    /// Set per-step I/O channels. Called once per parallel step launch.
+    fn set_parallel_step_io(&mut self, _step_name: &str, _io: AgentIo) {}
+
+    /// Set per-step stuck sender (one per active parallel container).
+    fn set_parallel_step_stuck_sender(
+        &mut self,
+        _step_name: &str,
+        _sender: Arc<broadcast::Sender<StuckEvent>>,
+    ) {
+    }
 }

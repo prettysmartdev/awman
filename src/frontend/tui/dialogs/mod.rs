@@ -154,6 +154,10 @@ pub struct WorkflowControlBoardState {
     pub continue_unavailable_reason: Option<String>,
     pub cancel_to_previous_unavailable_reason: Option<String>,
     pub finish_workflow_unavailable_reason: Option<String>,
+    /// Reason "Restart current step" is unavailable — set in a parallel group
+    /// where restart applies only to the focused container (WI-0096 §10).
+    /// Rendered in DarkGray under the dimmed Restart line.
+    pub restart_unavailable_reason: Option<String>,
     /// True when a container is currently running (mid-step). The engine
     /// computes this from `can_dismiss` in `AvailableActions`.
     /// Changes rendering: Esc = dismiss (step keeps running), [p] = pause.
@@ -163,6 +167,16 @@ pub struct WorkflowControlBoardState {
     /// "Next: new container". The dynamic leader step sets this to
     /// "Start dynamic workflow".
     pub launch_next_label: Option<String>,
+    /// The step this Workflow Control Board's actions apply to (WI-0096 §10).
+    /// In a parallel group this is the currently-focused container. Defaults to
+    /// `step_name` for single-step workflows.
+    pub focused_step_name: String,
+    /// Number of steps in the focused step's parallel group. `0` means the
+    /// focused step is not part of a multi-step parallel batch.
+    pub parallel_peer_count: usize,
+    /// Live peers still running in the focused step's parallel group (excludes
+    /// the focused step). Non-zero disables back/finish in the WCB.
+    pub parallel_peers_running: usize,
 }
 
 #[derive(Debug, Clone)]

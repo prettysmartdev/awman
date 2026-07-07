@@ -52,6 +52,7 @@ pub struct ExecWorkflowCommandFlags {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub overlay: Vec<String>,
+    pub max_concurrent: Option<usize>,
     pub issue_source: crate::data::issue::IssueSourceFlags,
     /// When true, a leader agent designs and runs a workflow for the work item.
     /// Implies `--yolo`, `--worktree`, and `context(workflow)`.
@@ -295,6 +296,100 @@ impl WorkflowFrontend for WorkflowProxy {
             .lock()
             .unwrap()
             .on_teardown_step_failed(description, exit_code, stderr);
+    }
+
+    // === Parallel-group commands (WI-0096) — forwarded like everything else
+    // above. Without these overrides the trait's default no-ops would run
+    // instead of the boxed frontend's real implementation. ===
+
+    fn report_parallel_group_started(&mut self, step_names: &[String]) {
+        self.0
+            .lock()
+            .unwrap()
+            .report_parallel_group_started(step_names);
+    }
+
+    fn report_parallel_step_launched(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
+        self.0
+            .lock()
+            .unwrap()
+            .report_parallel_step_launched(step_name, agent, model);
+    }
+
+    fn report_parallel_step_exited(&mut self, step_name: &str, exit_code: i32) {
+        self.0
+            .lock()
+            .unwrap()
+            .report_parallel_step_exited(step_name, exit_code);
+    }
+
+    fn report_parallel_step_dequeued(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
+        self.0
+            .lock()
+            .unwrap()
+            .report_parallel_step_dequeued(step_name, agent, model);
+    }
+
+    fn report_parallel_group_finished(&mut self) {
+        self.0.lock().unwrap().report_parallel_group_finished();
+    }
+
+    fn report_parallel_step_stuck(&mut self, step_name: &str) {
+        self.0.lock().unwrap().report_parallel_step_stuck(step_name);
+    }
+
+    fn report_parallel_step_unstuck(&mut self, step_name: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .report_parallel_step_unstuck(step_name);
+    }
+
+    fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .parallel_step_yolo_countdown_started(step_name);
+    }
+
+    fn parallel_step_yolo_countdown_tick(
+        &mut self,
+        step_name: &str,
+        remaining: Duration,
+        total: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        self.0
+            .lock()
+            .unwrap()
+            .parallel_step_yolo_countdown_tick(step_name, remaining, total)
+    }
+
+    fn parallel_step_yolo_countdown_finished(&mut self, step_name: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .parallel_step_yolo_countdown_finished(step_name);
+    }
+
+    fn set_parallel_step_io(
+        &mut self,
+        step_name: &str,
+        io: crate::engine::agent_runtime::frontend::AgentIo,
+    ) {
+        self.0.lock().unwrap().set_parallel_step_io(step_name, io);
+    }
+
+    fn set_parallel_step_stuck_sender(
+        &mut self,
+        step_name: &str,
+        sender: Arc<
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::execution::StuckEvent>,
+        >,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .set_parallel_step_stuck_sender(step_name, sender);
     }
 }
 
@@ -1000,7 +1095,7 @@ async fn execute_prepared(
     // 8. Build the session for the engine.
     // When a worktree is active, re-root the session at the worktree so
     // that `build_options` mounts the worktree checkout, not the main repo.
-    let session = if let Some(ref wt) = worktree_path {
+    let mut session = if let Some(ref wt) = worktree_path {
         let git_root_for_session = match Arc::clone(&engines.git_engine).resolve_root(wt) {
             Ok(r) => r,
             Err(e) => {
@@ -1032,6 +1127,7 @@ async fn execute_prepared(
     } else {
         original_session
     };
+    session.set_flags(workflow_flag_config(flags));
 
     // 9. Run the engine with three-phase coordination.
     // The engine block is scoped so proxy + factory are dropped before we
@@ -1408,6 +1504,23 @@ async fn execute_prepared(
         exit_code,
         worktree_used: flags.worktree,
     })
+}
+
+fn workflow_flag_config(flags: &ExecWorkflowCommandFlags) -> crate::data::config::FlagConfig {
+    crate::data::config::FlagConfig {
+        agent: flags.agent.clone(),
+        model: flags.model.clone(),
+        yolo: Some(flags.yolo),
+        auto: Some(flags.auto),
+        non_interactive: Some(flags.non_interactive),
+        overlays_raw: (!flags.overlay.is_empty()).then_some(flags.overlay.clone()),
+        work_item: flags
+            .work_item
+            .as_deref()
+            .and_then(|raw| raw.parse::<u32>().ok()),
+        max_concurrent_agents: flags.max_concurrent,
+        ..Default::default()
+    }
 }
 
 /// Validate the `--dynamic` / `--leader` flag relationships before any IO.
@@ -2972,6 +3085,7 @@ prompt = "do something"
             agent: None,
             model: None,
             overlay: vec![],
+            max_concurrent: None,
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
@@ -3035,6 +3149,7 @@ prompt = "do something"
             agent: None,
             model: None,
             overlay: vec![],
+            max_concurrent: None,
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
@@ -3060,6 +3175,7 @@ prompt = "do something"
             agent: None,
             model: None,
             overlay: vec![],
+            max_concurrent: None,
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
@@ -3436,6 +3552,7 @@ prompt = "do something"
             agent: None,
             model: model.map(|s| s.to_string()),
             overlay: vec![],
+            max_concurrent: None,
             issue_source: crate::data::issue::IssueSourceFlags { issue: None },
             dynamic,
             leader: leader.map(|s| s.to_string()),

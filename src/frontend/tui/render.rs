@@ -21,7 +21,7 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
     // Read shape decisions from the active tab (immutable borrow).
-    let (workflow_height, container_state, has_summary, git_sidebar_state) = {
+    let (workflow_height, container_state, has_summary, git_sidebar_state, slot_count) = {
         let tab = app.active_tab();
         let workflow_height = tab
             .workflow_state
@@ -34,8 +34,14 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
             tab.container_window_state,
             tab.last_container_summary.is_some(),
             tab.git_sidebar_state,
+            tab.parallel_slots.len(),
         )
     };
+
+    // WI-0096 §5: multi-container chrome activates only with more than one
+    // parallel slot. With zero or one slot, `multi_slot` is false and every
+    // branch below falls through to the legacy rendering — pixel-identical.
+    let multi_slot = slot_count > 1;
 
     // When the git sidebar is open (and wide enough), reserve the right ≤25%
     // of the frame for it; the execution/container windows shrink into the
@@ -50,14 +56,26 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         (area, None)
     };
 
-    let has_minimized_container = container_state == ContainerWindowState::Minimized;
+    let has_minimized_container = !multi_slot && container_state == ContainerWindowState::Minimized;
     // Show the post-exit summary in the same slot as the minimized bar, but
     // only when the container is Hidden (i.e. the previous run finished and
     // we haven't started another).
-    let has_summary_bar =
-        !has_minimized_container && container_state == ContainerWindowState::Hidden && has_summary;
+    let has_summary_bar = !multi_slot
+        && !has_minimized_container
+        && container_state == ContainerWindowState::Hidden
+        && has_summary;
 
-    let extra_bar_height = if has_minimized_container || has_summary_bar {
+    // WI-0096 §5: one row per minimized (non-focused) slot, stacked above the
+    // status bar. Ctrl-M (Hidden) hides everything, including the bars.
+    let n_minimized_bars = if multi_slot && container_state != ContainerWindowState::Hidden {
+        (slot_count - 1) as u16
+    } else {
+        0
+    };
+
+    let extra_bar_height = if multi_slot {
+        n_minimized_bars
+    } else if has_minimized_container || has_summary_bar {
         3
     } else {
         0
@@ -77,7 +95,11 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     render_tab_bar(app, chunks[0], frame);
     render_execution_window(app, chunks[1], frame);
 
-    if has_minimized_container {
+    if multi_slot {
+        if n_minimized_bars > 0 {
+            container_view::render_parallel_minimized_bars(app.active_tab(), chunks[2], frame);
+        }
+    } else if has_minimized_container {
         container_view::render_container_minimized(app.active_tab(), chunks[2], frame);
     } else if has_summary_bar {
         if let Some(summary) = app.active_tab().last_container_summary.as_ref() {
@@ -106,7 +128,21 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     // Container maximized overlay (rendered on top of execution window only,
     // not over the workflow strip or bottom chrome). Confined to the left
     // chunk (`main_area`) so it never covers the git sidebar.
-    if container_state == ContainerWindowState::Maximized {
+    if multi_slot {
+        // The focused slot is shown maximized (the rest are the minimized
+        // bars). Ctrl-M (Hidden) hides everything. Its overlay reserves the
+        // minimized-bar rows at the bottom so it doesn't overlap them.
+        if container_state != ContainerWindowState::Hidden {
+            let tab = app.active_tab_mut();
+            tab.container_rendered = true;
+            container_view::render_container_maximized(
+                tab,
+                main_area,
+                workflow_height + n_minimized_bars,
+                frame,
+            );
+        }
+    } else if container_state == ContainerWindowState::Maximized {
         let tab = app.active_tab_mut();
         // The overlay made it to the screen; close_container_overlay no
         // longer needs to replay its contents into the status log.
@@ -1409,6 +1445,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 state.continue_unavailable_reason.is_some(),
                 state.cancel_to_previous_unavailable_reason.is_some(),
                 state.finish_workflow_unavailable_reason.is_some(),
+                state.restart_unavailable_reason.is_some(),
             ]
             .iter()
             .filter(|x| **x)
@@ -1420,6 +1457,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 state.continue_unavailable_reason.as_deref(),
                 state.cancel_to_previous_unavailable_reason.as_deref(),
                 state.finish_workflow_unavailable_reason.as_deref(),
+                state.restart_unavailable_reason.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -1463,6 +1501,14 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             } else {
                 (dimmed_style, dimmed_style)
             };
+            // Restart is disabled in a parallel group unless this is the
+            // focused container (WI-0096 §10).
+            let restart_disabled = state.restart_unavailable_reason.is_some() || !state.can_restart;
+            let (up_arrow_style, up_label_style) = if restart_disabled {
+                (dimmed_style, dimmed_style)
+            } else {
+                (arrow_style, label_style)
+            };
 
             let mut lines: Vec<Line> = vec![
                 Line::from(vec![
@@ -1473,10 +1519,18 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 // ↑ Restart (top of diamond)
                 Line::from(vec![
                     Span::raw("         "),
-                    Span::styled("\u{2191}", arrow_style),
-                    Span::styled(" Restart current step", label_style),
+                    Span::styled("\u{2191}", up_arrow_style),
+                    Span::styled(" Restart current step", up_label_style),
                 ]),
-                Line::from(""),
+            ];
+            if let Some(ref reason) = state.restart_unavailable_reason {
+                lines.push(Line::from(Span::styled(
+                    format!("           {reason}"),
+                    dimmed_style,
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.extend([
                 // ← Cancel to prev    → Next: new container
                 Line::from(vec![
                     Span::styled("\u{2190}", left_arrow_style),
@@ -1501,7 +1555,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                     Span::styled("\u{2193}", down_arrow_style),
                     Span::styled(" Next: same container", down_label_style),
                 ]),
-            ];
+            ]);
             if let Some(ref reason) = state.continue_unavailable_reason {
                 lines.push(Line::from(Span::styled(
                     format!("           {reason}"),

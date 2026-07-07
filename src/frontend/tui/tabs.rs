@@ -49,6 +49,11 @@ impl ContainerWindowState {
 pub struct WorkflowViewState {
     pub steps: Vec<WorkflowStepView>,
     pub current_step: Option<String>,
+    /// Effective `maxConcurrentAgents` for the running workflow (WI-0096 §11),
+    /// set by the frontend when the engine reports a parallel group start.
+    /// `None` means unlimited — the strip caps parallel rows at the legacy 3
+    /// and renders no "queued" markers, so behavior is unchanged.
+    pub max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +198,111 @@ pub struct LastContainerSummary {
     pub exit_code: i32,
 }
 
+/// One running container in a parallel workflow group (WI-0096 §4).
+///
+/// Each slot owns its own PTY parser and I/O channels so several containers
+/// can run concurrently. The slot at `Tab::focused_slot_idx` is Maximized;
+/// the others render as one-row minimized status bars. When `parallel_slots`
+/// is empty (non-workflow commands, single-step workflows) the legacy
+/// single-container fields on `Tab` are used instead and behavior is
+/// unchanged.
+pub struct ParallelContainerSlot {
+    pub step_name: String,
+    pub vt100_parser: vt100::Parser,
+    pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
+    pub container_info: Option<ContainerInfo>,
+    pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
+    pub stuck: bool,
+    pub yolo_mode: bool,
+    pub yolo_state: SharedYoloState,
+    pub yolo_cancel_flag: SharedYoloCancelFlag,
+    pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+}
+
+pub struct ParallelSlotIo {
+    pub stdout_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pub stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    pub resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
+}
+
+impl ParallelContainerSlot {
+    /// Create a fresh slot for a newly-launched parallel step. The PTY parser
+    /// starts at 80x24 and is resized to the real terminal when the slot is
+    /// focused; live I/O channels are attached later.
+    pub fn new(step_name: String, agent_display_name: String, scrollback: usize) -> Self {
+        Self {
+            step_name,
+            vt100_parser: vt100::Parser::new(24, 80, scrollback),
+            region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator::new(),
+            container_info: Some(ContainerInfo {
+                agent_display_name,
+                container_name: String::new(),
+                start_time: Instant::now(),
+                latest_stats: None,
+                stats_history: Vec::new(),
+                sandboxed: false,
+            }),
+            container_stdout_rx: None,
+            container_stdin_tx: None,
+            container_resize_tx: None,
+            stuck: false,
+            yolo_mode: false,
+            yolo_state: Arc::new(Mutex::new(None)),
+            yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
+            stuck_rx: None,
+        }
+    }
+
+    /// Agent display name for the minimized bar, falling back to "agent".
+    pub fn agent_name(&self) -> &str {
+        self.container_info
+            .as_ref()
+            .map(|i| i.agent_display_name.as_str())
+            .unwrap_or("agent")
+    }
+
+    /// Elapsed run time for the minimized bar.
+    pub fn elapsed_secs(&self) -> u64 {
+        self.container_info
+            .as_ref()
+            .map(|i| i.start_time.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+}
+
+/// Lifecycle event published by the workflow frontend (engine thread) and
+/// drained by the TUI event loop to maintain `Tab::parallel_slots`
+/// (WI-0096 §12). Kept in a shared queue rather than mutating `Tab` directly
+/// because the frontend runs on the engine's tokio task while `Tab` lives on
+/// the TUI thread.
+pub enum ParallelSlotEvent {
+    /// A container in the group started running (initial launch or dequeued).
+    Launched {
+        step_name: String,
+        agent: String,
+        model: Option<String>,
+        io: Option<ParallelSlotIo>,
+    },
+    /// A container exited — evict its slot with no grey summary bar.
+    Exited { step_name: String },
+    /// A container's stuck timer fired (yolo off).
+    Stuck { step_name: String },
+    /// A stuck container recovered.
+    Unstuck { step_name: String },
+    /// A container's yolo countdown started.
+    YoloStarted { step_name: String },
+    /// A container's yolo countdown ended (cancelled, expired, or advanced).
+    YoloFinished { step_name: String },
+    /// The whole group drained; clear any remaining slots.
+    GroupFinished,
+}
+
+/// Shared queue of [`ParallelSlotEvent`]s. Mirrors the other `SharedXxx`
+/// slots: the workflow frontend pushes, the event loop drains.
+pub type SharedParallelSlotEvents = Arc<Mutex<std::collections::VecDeque<ParallelSlotEvent>>>;
+
 /// Tab state — one per open tab.
 pub struct Tab {
     pub session: Session,
@@ -271,6 +381,20 @@ pub struct Tab {
     /// Broadcast receiver for stuck/unstuck events from the container engine.
     /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
     pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+
+    // ── Parallel container slots (WI-0096) ───────────────────────────────
+    /// Running containers of the current parallel workflow group. Empty for
+    /// non-workflow commands and single-step workflows, in which case the
+    /// legacy single-container fields above are used and behavior is
+    /// unchanged. When more than one slot exists, `focused_slot_idx` is
+    /// Maximized and the rest render as minimized status bars.
+    pub parallel_slots: Vec<ParallelContainerSlot>,
+    /// Index into `parallel_slots` of the Maximized (focused) slot. Cycled
+    /// by Ctrl-S. Always `0` when there are no parallel slots.
+    pub focused_slot_idx: usize,
+    /// Shared queue of parallel-slot lifecycle events published by the
+    /// workflow frontend; drained each tick to maintain `parallel_slots`.
+    pub parallel_slot_events: SharedParallelSlotEvents,
     /// Set after a mid-workflow container exit closes the window: PTY bytes
     /// that were still in flight from the dead container must not re-open it
     /// via `drain_container_output`'s auto-open branch. Cleared when the next
@@ -381,6 +505,9 @@ impl Tab {
             stuck: false,
             yolo_mode: false,
             stuck_rx: None,
+            parallel_slots: Vec::new(),
+            focused_slot_idx: 0,
+            parallel_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             suppress_container_auto_open: false,
             container_stdout_rx: None,
             container_stdin_tx: None,
@@ -473,6 +600,172 @@ impl Tab {
                     StuckEvent::StartupGraceExpired => self.stuck = false,
                 }
             }
+        }
+
+        // WI-0096 §9: when parallel slots are active, aggregate the stuck /
+        // yolo indicators across all slots for tab coloring. `tab_color`
+        // reads `tab.stuck` / `tab.yolo_mode` unchanged.
+        if !self.parallel_slots.is_empty() {
+            self.stuck = self.parallel_slots.iter().any(|s| s.stuck);
+            self.yolo_mode = self.parallel_slots.iter().any(|s| s.yolo_mode);
+        }
+    }
+
+    /// Number of active (non-exited) parallel slots. `0` for non-workflow /
+    /// single-container commands.
+    pub fn active_slot_count(&self) -> usize {
+        self.parallel_slots.len()
+    }
+
+    /// Whether the tab is showing more than one parallel container. Multi-slot
+    /// chrome (minimized-bar stack, Ctrl-S switching) only activates here; with
+    /// zero or one slot the rendering is pixel-identical to the legacy path.
+    pub fn has_multiple_slots(&self) -> bool {
+        self.parallel_slots.len() > 1
+    }
+
+    /// Mutable access to the currently-focused parallel slot.
+    ///
+    /// Returns `None` when there are no parallel slots — callers in that case
+    /// fall back to the legacy single-container fields on `Tab`. This mirrors
+    /// the spec's "focused_slot_mut() falls back to the legacy single-container
+    /// fields" while avoiding a blast-radius refactor: only new multi-slot code
+    /// calls this helper; existing single-container paths keep using the legacy
+    /// fields directly.
+    pub fn focused_slot_mut(&mut self) -> Option<&mut ParallelContainerSlot> {
+        self.parallel_slots.get_mut(self.focused_slot_idx)
+    }
+
+    /// Immutable counterpart to [`focused_slot_mut`](Self::focused_slot_mut).
+    pub fn focused_slot(&self) -> Option<&ParallelContainerSlot> {
+        self.parallel_slots.get(self.focused_slot_idx)
+    }
+
+    /// Drain the shared parallel-slot event queue and update `parallel_slots`
+    /// accordingly (WI-0096 §12). Events are processed in the order the engine
+    /// emitted them, so an "exited then dequeued" pair in the same tick evicts
+    /// the old slot before adding the new one — keeping the net slot count
+    /// correct.
+    pub fn drain_parallel_slot_events(&mut self) {
+        let events: Vec<ParallelSlotEvent> = match self.parallel_slot_events.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => return,
+        };
+        for event in events {
+            self.apply_parallel_slot_event(event);
+        }
+    }
+
+    fn apply_parallel_slot_event(&mut self, event: ParallelSlotEvent) {
+        match event {
+            ParallelSlotEvent::Launched {
+                step_name,
+                agent,
+                io,
+                ..
+            } => {
+                if self.parallel_slots.iter().any(|s| s.step_name == step_name) {
+                    return;
+                }
+                let scrollback = self.session.effective_config().scrollback_lines();
+                let mut slot = ParallelContainerSlot::new(step_name, agent, scrollback);
+                if let Some(io) = io {
+                    slot.container_stdout_rx = Some(io.stdout_rx);
+                    slot.container_stdin_tx = Some(io.stdin_tx);
+                    slot.container_resize_tx = Some(io.resize_tx);
+                }
+                self.parallel_slots.push(slot);
+            }
+            ParallelSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
+            ParallelSlotEvent::Stuck { step_name } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.stuck = true;
+                }
+            }
+            ParallelSlotEvent::Unstuck { step_name } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.stuck = false;
+                }
+            }
+            ParallelSlotEvent::YoloStarted { step_name } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.yolo_mode = true;
+                }
+            }
+            ParallelSlotEvent::YoloFinished { step_name } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.yolo_mode = false;
+                }
+            }
+            ParallelSlotEvent::GroupFinished => {
+                self.parallel_slots.clear();
+                self.focused_slot_idx = 0;
+            }
+        }
+    }
+
+    pub fn drain_parallel_slot_outputs(&mut self) {
+        for slot in &mut self.parallel_slots {
+            let Some(rx) = slot.container_stdout_rx.as_mut() else {
+                continue;
+            };
+            while let Ok(bytes) = rx.try_recv() {
+                let filtered = strip_alternate_screen_sequences(&bytes);
+                slot.region_scroll
+                    .process(&mut slot.vt100_parser, &filtered.bytes);
+            }
+        }
+    }
+
+    fn slot_mut(&mut self, step_name: &str) -> Option<&mut ParallelContainerSlot> {
+        self.parallel_slots
+            .iter_mut()
+            .find(|s| s.step_name == step_name)
+    }
+
+    /// Remove the slot for `step_name` with NO grey summary bar (WI-0096 §12)
+    /// and recompute `focused_slot_idx`: if a slot before the focused one is
+    /// removed, shift the index down; if the focused slot itself exits, advance
+    /// to the next live slot (wrapping). When no slots remain, reset the index
+    /// and let the container window go Hidden.
+    fn evict_slot(&mut self, step_name: &str) {
+        let Some(pos) = self
+            .parallel_slots
+            .iter()
+            .position(|s| s.step_name == step_name)
+        else {
+            return;
+        };
+        self.parallel_slots.remove(pos);
+        let len = self.parallel_slots.len();
+        if len == 0 {
+            self.focused_slot_idx = 0;
+            self.container_window_state = ContainerWindowState::Hidden;
+            return;
+        }
+        if pos < self.focused_slot_idx {
+            self.focused_slot_idx -= 1;
+        } else if pos == self.focused_slot_idx {
+            // Removing shifts the next live slot into `pos`; wrap if it was the
+            // last slot.
+            if self.focused_slot_idx >= len {
+                self.focused_slot_idx = 0;
+            }
+        }
+    }
+
+    /// Advance `focused_slot_idx` to the next active slot (WI-0096 §6, Ctrl-S).
+    /// No-op with zero or one slot. Returns the newly-focused slot's resize
+    /// sender (if any) so the caller can push the current terminal size to it.
+    pub fn cycle_focused_slot(&mut self) {
+        if self.parallel_slots.len() <= 1 {
+            return;
+        }
+        self.focused_slot_idx = (self.focused_slot_idx + 1) % self.parallel_slots.len();
+        self.mouse_selection = None;
+        // Un-minimize so the rotated container becomes visible.
+        if self.container_window_state == ContainerWindowState::Minimized {
+            self.container_window_state = ContainerWindowState::Maximized;
         }
     }
 
@@ -1900,5 +2193,142 @@ mod tests {
                 .any(|(_, text)| text.contains("normal session output")),
             "output the user already saw must not be replayed: {logs:?}"
         );
+    }
+
+    // ── WI-0096 parallel-slot behavior ───────────────────────────────────────
+
+    fn slot(name: &str) -> ParallelContainerSlot {
+        ParallelContainerSlot::new(name.to_string(), "claude".to_string(), 1000)
+    }
+
+    #[test]
+    fn parallel_slots_aggregate_stuck_and_yolo_flags() {
+        let mut tab = make_tab();
+        tab.parallel_slots.push(slot("a"));
+        tab.parallel_slots.push(slot("b"));
+
+        // All slots clear → aggregate is false.
+        tab.drain_stuck_events();
+        assert!(!tab.stuck);
+        assert!(!tab.yolo_mode);
+
+        // Any slot stuck → aggregate stuck is true.
+        tab.parallel_slots[1].stuck = true;
+        tab.drain_stuck_events();
+        assert!(tab.stuck, "any stuck slot makes the tab aggregate stuck");
+        assert!(!tab.yolo_mode);
+
+        // Clear stuck, set yolo on the other slot → aggregate yolo is true.
+        tab.parallel_slots[1].stuck = false;
+        tab.parallel_slots[0].yolo_mode = true;
+        tab.drain_stuck_events();
+        assert!(!tab.stuck);
+        assert!(tab.yolo_mode, "any yolo slot makes the tab aggregate yolo");
+
+        // Everything clear again → both false.
+        tab.parallel_slots[0].yolo_mode = false;
+        tab.drain_stuck_events();
+        assert!(!tab.stuck);
+        assert!(!tab.yolo_mode);
+    }
+
+    #[test]
+    fn evicting_focused_slot_advances_focus_to_next_live_slot() {
+        let mut tab = make_tab();
+        tab.parallel_slots.push(slot("a"));
+        tab.parallel_slots.push(slot("b"));
+        tab.parallel_slots.push(slot("c"));
+        tab.focused_slot_idx = 1; // focus "b"
+
+        tab.parallel_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ParallelSlotEvent::Exited {
+                step_name: "b".to_string(),
+            });
+        tab.drain_parallel_slot_events();
+
+        assert_eq!(tab.active_slot_count(), 2);
+        assert!(
+            !tab.parallel_slots.iter().any(|s| s.step_name == "b"),
+            "the exited slot must be gone"
+        );
+        assert_eq!(tab.focused_slot_idx, 1);
+        assert_eq!(
+            tab.focused_slot().unwrap().step_name,
+            "c",
+            "focus advances to the slot that shifted into the freed index"
+        );
+    }
+
+    #[test]
+    fn evicting_slot_before_focused_shifts_index_down() {
+        let mut tab = make_tab();
+        tab.parallel_slots.push(slot("a"));
+        tab.parallel_slots.push(slot("b"));
+        tab.parallel_slots.push(slot("c"));
+        tab.focused_slot_idx = 2; // focus "c"
+
+        tab.parallel_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ParallelSlotEvent::Exited {
+                step_name: "a".to_string(),
+            });
+        tab.drain_parallel_slot_events();
+
+        assert_eq!(tab.active_slot_count(), 2);
+        assert_eq!(tab.focused_slot_idx, 1, "index shifts down by one");
+        assert_eq!(
+            tab.focused_slot().unwrap().step_name,
+            "c",
+            "the same slot stays focused after the shift"
+        );
+    }
+
+    #[test]
+    fn evicting_last_slot_hides_the_container_window() {
+        let mut tab = make_tab();
+        tab.parallel_slots.push(slot("a"));
+        tab.container_window_state = ContainerWindowState::Maximized;
+
+        tab.parallel_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ParallelSlotEvent::Exited {
+                step_name: "a".to_string(),
+            });
+        tab.drain_parallel_slot_events();
+
+        assert_eq!(tab.active_slot_count(), 0);
+        assert_eq!(tab.focused_slot_idx, 0);
+        assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
+    }
+
+    #[test]
+    fn cycle_focused_slot_advances_cyclically_through_three_slots() {
+        let mut tab = make_tab();
+        tab.parallel_slots.push(slot("a"));
+        tab.parallel_slots.push(slot("b"));
+        tab.parallel_slots.push(slot("c"));
+
+        assert_eq!(tab.focused_slot_idx, 0);
+        tab.cycle_focused_slot();
+        assert_eq!(tab.focused_slot_idx, 1);
+        tab.cycle_focused_slot();
+        assert_eq!(tab.focused_slot_idx, 2);
+        tab.cycle_focused_slot();
+        assert_eq!(
+            tab.focused_slot_idx, 0,
+            "one full cycle of three slots returns to slot 0"
+        );
+    }
+
+    #[test]
+    fn cycle_focused_slot_is_noop_with_a_single_slot() {
+        let mut tab = make_tab();
+        tab.parallel_slots.push(slot("a"));
+        tab.cycle_focused_slot();
+        assert_eq!(tab.focused_slot_idx, 0);
     }
 }

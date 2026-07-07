@@ -34,6 +34,21 @@ pub enum EventPayload {
         step_desc: String,
         status: String,
     },
+    /// One container in a parallel group (WI-0096) has started running.
+    WorkflowParallelStepLaunched {
+        step_name: String,
+        step_index: usize,
+        agent: String,
+        model: Option<String>,
+    },
+    /// One container in a parallel group (WI-0096) has exited.
+    WorkflowParallelStepExited {
+        step_name: String,
+        step_index: usize,
+        exit_code: i32,
+    },
+    /// A parallel group (WI-0096) has fully drained; all its steps completed.
+    WorkflowParallelGroupFinished,
     CommandStatus {
         status: String,
         exit_code: Option<i32>,
@@ -50,6 +65,9 @@ impl EventPayload {
             EventPayload::StatusMessage { .. } => "status_message",
             EventPayload::WorkflowStepTransition { .. } => "workflow_step_transition",
             EventPayload::WorkflowPhaseTransition { .. } => "workflow_phase_transition",
+            EventPayload::WorkflowParallelStepLaunched { .. } => "workflow_parallel_step_launched",
+            EventPayload::WorkflowParallelStepExited { .. } => "workflow_parallel_step_exited",
+            EventPayload::WorkflowParallelGroupFinished => "workflow_parallel_group_finished",
             EventPayload::CommandStatus { .. } => "command_status",
             EventPayload::Done => "done",
         }
@@ -71,6 +89,26 @@ impl EventPayload {
                 step_desc,
                 status,
             } => Some(format!("[{phase}] {step_desc} → {status}")),
+            EventPayload::WorkflowParallelStepLaunched {
+                step_name,
+                agent,
+                model,
+                ..
+            } => Some(format!(
+                "[parallel] {step_name} launched ({agent}{})",
+                model
+                    .as_deref()
+                    .map(|m| format!("::{m}"))
+                    .unwrap_or_default()
+            )),
+            EventPayload::WorkflowParallelStepExited {
+                step_name,
+                exit_code,
+                ..
+            } => Some(format!("[parallel] {step_name} exited (exit {exit_code})")),
+            EventPayload::WorkflowParallelGroupFinished => {
+                Some("[parallel] group finished".to_string())
+            }
             EventPayload::CommandStatus {
                 status, exit_code, ..
             } => {

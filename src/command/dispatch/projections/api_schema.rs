@@ -112,6 +112,7 @@ fn json_kind_for_flag(kind: FlagKind) -> Value {
             json!({ "type": "string", "format": "path" })
         }
         FlagKind::U16 => json!({ "type": "integer", "minimum": 0, "maximum": 65535 }),
+        FlagKind::UsizeAtLeastOne => json!({ "type": "integer", "minimum": 1 }),
     }
 }
 

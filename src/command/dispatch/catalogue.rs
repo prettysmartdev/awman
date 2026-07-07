@@ -41,6 +41,8 @@ pub enum FlagKind {
     OptionalPath,
     /// `--foo N` u16 number.
     U16,
+    /// `--foo N` usize number, must be >= 1.
+    UsizeAtLeastOne,
 }
 
 /// Default value for a flag.
@@ -1542,7 +1544,7 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 9] = [
     },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 13] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 14] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -1686,6 +1688,17 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 13] = [
         help: "Agent and model for the dynamic leader, as agent::model \
                (e.g. claude::claude-opus-4-8). Only valid with --dynamic.",
         kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "max-concurrent",
+        short: None,
+        help: "Cap on concurrently-running workflow steps (must be >= 1).",
+        kind: FlagKind::UsizeAtLeastOne,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],

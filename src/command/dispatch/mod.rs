@@ -132,6 +132,8 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
 
     fn flag_u16(&self, command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError>;
 
+    fn flag_usize(&self, command_path: &[&str], flag: &str) -> Result<Option<usize>, CommandError>;
+
     fn argument(&self, command_path: &[&str], name: &str) -> Result<Option<String>, CommandError>;
 
     fn arguments(&self, command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError>;
@@ -777,6 +779,7 @@ fn validate_conflicts<F: CommandFrontend>(
             }
             FlagKind::VecString => !frontend.flag_strings(command_path, f.long)?.is_empty(),
             FlagKind::U16 => frontend.flag_u16(command_path, f.long)?.is_some(),
+            FlagKind::UsizeAtLeastOne => frontend.flag_usize(command_path, f.long)?.is_some(),
         };
         if is_set {
             active.push(f.long);
@@ -875,6 +878,7 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
         agent: f.flag_string(p, "agent")?,
         model: f.flag_string(p, "model")?,
         overlay: f.flag_strings(p, "overlay")?,
+        max_concurrent: f.flag_usize(p, "max-concurrent")?,
         issue_source: crate::data::issue::IssueSourceFlags { issue },
         dynamic: f.flag_bool(p, "dynamic")?.unwrap_or(false),
         leader: f.flag_string(p, "leader")?,
@@ -893,6 +897,7 @@ mod tests {
         pub paths: std::collections::HashMap<String, PathBuf>,
         pub enums: std::collections::HashMap<String, String>,
         pub u16s: std::collections::HashMap<String, u16>,
+        pub usizes: std::collections::HashMap<String, usize>,
         pub args: std::collections::HashMap<String, String>,
         pub args_vec: std::collections::HashMap<String, Vec<String>>,
     }
@@ -906,6 +911,7 @@ mod tests {
                 paths: Default::default(),
                 enums: Default::default(),
                 u16s: Default::default(),
+                usizes: Default::default(),
                 args: Default::default(),
                 args_vec: Default::default(),
             }
@@ -935,6 +941,9 @@ mod tests {
         }
         fn flag_u16(&self, _p: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
             Ok(self.u16s.get(flag).copied())
+        }
+        fn flag_usize(&self, _p: &[&str], flag: &str) -> Result<Option<usize>, CommandError> {
+            Ok(self.usizes.get(flag).copied())
         }
         fn argument(&self, _p: &[&str], name: &str) -> Result<Option<String>, CommandError> {
             Ok(self.args.get(name).cloned())

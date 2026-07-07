@@ -530,6 +530,40 @@ fn spawn_tracing_subscriber(
                             "Engine reported command status: failure"
                         ),
                     },
+                    EventPayload::WorkflowParallelStepLaunched {
+                        step_name,
+                        step_index,
+                        agent,
+                        model,
+                    } => tracing::info!(
+                        command_id = %command_id,
+                        session_id = %session_id,
+                        subcommand = %subcommand,
+                        step_index = step_index,
+                        step = %step_name,
+                        agent = %agent,
+                        model = ?model,
+                        "Parallel step launched"
+                    ),
+                    EventPayload::WorkflowParallelStepExited {
+                        step_name,
+                        step_index,
+                        exit_code,
+                    } => tracing::info!(
+                        command_id = %command_id,
+                        session_id = %session_id,
+                        subcommand = %subcommand,
+                        step_index = step_index,
+                        step = %step_name,
+                        exit_code = exit_code,
+                        "Parallel step exited"
+                    ),
+                    EventPayload::WorkflowParallelGroupFinished => tracing::info!(
+                        command_id = %command_id,
+                        session_id = %session_id,
+                        subcommand = %subcommand,
+                        "Parallel group finished"
+                    ),
                     EventPayload::Done => break,
                     EventPayload::StdoutLine(_)
                     | EventPayload::StderrLine(_)

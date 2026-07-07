@@ -24,6 +24,10 @@ pub const AWMAN_REMOTE_SESSION: &str = "AWMAN_REMOTE_SESSION";
 /// `AWMAN_API_KEY` — API key for the remote API server.
 pub const AWMAN_API_KEY: &str = "AWMAN_API_KEY";
 
+/// `AWMAN_MAX_CONCURRENT_AGENTS` — overrides the max-concurrent-agents cap
+/// for workflow execution.
+pub const AWMAN_MAX_CONCURRENT_AGENTS: &str = "AWMAN_MAX_CONCURRENT_AGENTS";
+
 /// `XDG_CONFIG_HOME` — XDG base directory for user-specific configuration.
 pub const XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
 
@@ -97,6 +101,11 @@ impl EnvSnapshot {
         self.get(AWMAN_API_KEY)
     }
 
+    /// `AWMAN_MAX_CONCURRENT_AGENTS` parsed as a `usize`, if set and valid.
+    pub fn max_concurrent_agents(&self) -> Option<usize> {
+        self.get(AWMAN_MAX_CONCURRENT_AGENTS)?.parse().ok()
+    }
+
     /// `XDG_CONFIG_HOME` as a `PathBuf` if set and non-empty.
     pub fn xdg_config_home(&self) -> Option<PathBuf> {
         self.get(XDG_CONFIG_HOME)
@@ -128,6 +137,7 @@ impl Env {
             AWMAN_REMOTE_ADDR,
             AWMAN_REMOTE_SESSION,
             AWMAN_API_KEY,
+            AWMAN_MAX_CONCURRENT_AGENTS,
             XDG_CONFIG_HOME,
             XDG_DATA_HOME,
         ];

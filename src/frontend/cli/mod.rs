@@ -16,17 +16,20 @@ use std::sync::Arc;
 use clap::ArgMatches;
 use tokio::sync::RwLock;
 
-use crate::command::dispatch::{Dispatch, Engines};
+use crate::command::commands::Command;
+use crate::command::dispatch::{BuiltCommand, Dispatch, Engines};
 use crate::command::error::CommandError;
 use crate::command::CommandOutcome;
 use crate::data::session::Session;
 
 mod command_frontend;
 mod output;
+mod parallel;
 pub(crate) mod per_command;
 mod user_message;
 
 pub use command_frontend::{command_path_from_matches, CliFrontend};
+pub use parallel::CliParallelFrontend;
 
 /// Bundle of state that `main.rs` constructs once at startup and hands to
 /// either [`run`] (CLI path) or [`crate::frontend::tui::run`] (TUI path).
@@ -59,6 +62,22 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         return ExitCode::from(2);
     }
     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    if path_strs == ["exec", "workflow"] {
+        let build_frontend = CliFrontend::new(matches.clone());
+        let dispatch = Dispatch::new(build_frontend, ctx.session.clone(), ctx.engines.clone());
+        return match dispatch.build_command(&path_strs) {
+            Ok(BuiltCommand::ExecWorkflow(cmd)) => {
+                let frontend = CliParallelFrontend::new(CliFrontend::new(matches));
+                match cmd.run_with_frontend(Box::new(frontend)).await {
+                    Ok(outcome) => render_outcome(&CommandOutcome::ExecWorkflow(outcome)),
+                    Err(err) => render_error(&err),
+                }
+            }
+            Ok(_) => render_error(&CommandError::unknown_command(&path_strs)),
+            Err(err) => render_error(&err),
+        };
+    }
+
     let frontend = CliFrontend::new(matches);
     let dispatch = Dispatch::new(frontend, ctx.session, ctx.engines);
     match dispatch.run_command(&path_strs).await {

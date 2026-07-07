@@ -206,6 +206,21 @@ impl EffectiveConfig {
         }
         self.global.base_image.clone()
     }
+
+    /// Effective cap on concurrently-running workflow steps
+    /// (flags > env > repo > global > `None` = unlimited).
+    pub fn effective_max_concurrent_agents(&self) -> Option<usize> {
+        if let Some(n) = self.flags.max_concurrent_agents {
+            return Some(n);
+        }
+        if let Some(n) = self.env.max_concurrent_agents() {
+            return Some(n);
+        }
+        if let Some(n) = self.repo.max_concurrent_agents {
+            return Some(n);
+        }
+        self.global.max_concurrent_agents
+    }
 }
 
 #[cfg(test)]
@@ -802,5 +817,88 @@ mod tests {
             GlobalConfig::default(),
         );
         assert_eq!(ec4.scrollback_lines(), DEFAULT_SCROLLBACK_LINES);
+    }
+
+    // ─── effective_max_concurrent_agents (WI-0096) ──────────────────────────
+
+    fn env_with_max_concurrent(n: &str) -> EnvSnapshot {
+        EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS, n)])
+    }
+
+    #[test]
+    fn max_concurrent_flag_beats_env_repo_and_global() {
+        let flags = FlagConfig {
+            max_concurrent_agents: Some(1),
+            ..Default::default()
+        };
+        let repo = RepoConfig {
+            max_concurrent_agents: Some(3),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(flags, env_with_max_concurrent("2"), repo, global);
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(1));
+    }
+
+    #[test]
+    fn max_concurrent_env_beats_repo_and_global() {
+        let repo = RepoConfig {
+            max_concurrent_agents: Some(3),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            env_with_max_concurrent("2"),
+            repo,
+            global,
+        );
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(2));
+    }
+
+    #[test]
+    fn max_concurrent_repo_beats_global() {
+        let repo = RepoConfig {
+            max_concurrent_agents: Some(3),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(3));
+    }
+
+    #[test]
+    fn max_concurrent_global_used_when_repo_env_flag_unset() {
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(4));
+    }
+
+    #[test]
+    fn max_concurrent_none_when_all_unset_means_unlimited() {
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(ec.effective_max_concurrent_agents(), None);
     }
 }

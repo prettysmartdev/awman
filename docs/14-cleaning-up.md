@@ -225,3 +225,7 @@ awman clean --dry-run
 ```
 
 The command output lists what would be removed; no confirmation dialog is shown and nothing is deleted.
+
+---
+
+[← Dynamic Workflows](13-dynamic-workflows.md) · [Next: Parallel Workflows →](15-parallel-workflows.md)

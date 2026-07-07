@@ -370,6 +370,47 @@ The window does **not** close while the container is still alive: a stuck agent 
 
 ---
 
+## Parallel containers
+
+Workflow steps that don't depend on each other can run at the same time, each in its own container — see [Parallel Workflows](15-parallel-workflows.md) for how the engine decides what runs concurrently. When more than one container is running, the container window changes shape: one container is **focused** and shown maximized as usual, while the others render as a stack of one-row **minimized status bars** underneath it.
+
+```
+╭─ 🔒 Claude Code (containerized) ── myproject | 5% | 200mb ──╮
+│                                                               │
+│  [focused container's output — full terminal emulation]      │
+│                                                               │
+╰───────────────────────────────────────────────────────────────╯
+[tests] codex · 45s · ●
+⚠ [docs] claude · 1m · ⚠
+  Ctrl-S switch  ·  Ctrl-M toggle  ·  Ctrl-W workflow
+```
+
+Each minimized bar reads `[step_name] agent · duration · status`:
+
+| Appearance | Meaning |
+|---|---|
+| Green `●` | Container running normally |
+| Yellow, `⚠` prefix | No output for more than 30 seconds — [stuck](05-workflows.md#stuck-steps) |
+| Flashing purple / yellow `●` | A [yolo](06-yolo-mode.md) auto-advance countdown is running for that container; the color alternates every second |
+
+Only the focused container receives keyboard input; the others keep running in the background regardless of which one is focused.
+
+### Switching containers — Ctrl-S
+
+Press **Ctrl-S** to move focus to the next running container. The newly-focused container swaps into the maximized window and is resized to match the current terminal dimensions; the container it replaces drops into the minimized stack.
+
+Ctrl-S only cycles focus when more than one container is currently running. With a single container, Ctrl-S has no special effect and is passed through to the container's PTY as usual (some programs use it for flow control).
+
+### Ctrl-M with multiple containers
+
+**Ctrl-M** still cycles the container display, but with multiple parallel containers only its **Hidden** state changes what's on screen: the focused container and all the minimized bars stay visible through the Maximized and Minimized states, and disappear together only when the display is Hidden. The agents keep running while hidden — press **Ctrl-M** again to bring the whole group back into view.
+
+To bring a background container to the front, press **Ctrl-S** until it's focused.
+
+This section only applies while a workflow has more than one container running at once. The rest of the time — including single-container commands like `chat` — the container window behaves exactly as described earlier in this section.
+
+---
+
 ## Config dialog
 
 Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly — even while an agent is running or the container window is maximized. You can also type `config show` in the command box and press **Enter**. Either way opens the same modal overlay for viewing and editing all configuration fields without leaving the TUI. The dialog takes up 90% of the terminal in both dimensions, so as much of the table as possible is visible at once.
@@ -498,6 +539,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+D** | Switch to the next tab |
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
+| **Ctrl+S** | Switch focus to the next running container (only when [multiple parallel containers](#parallel-containers) are running; otherwise passed to the container's PTY) |
 | **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
 | **Ctrl+,** | Open / close the configuration dialog |
 | **Ctrl+C** | Quit awman (single tab) or close current tab (multiple tabs open) |

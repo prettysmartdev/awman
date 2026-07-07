@@ -111,6 +111,11 @@ fn build_clap_flag(spec: &FlagSpec) -> Arg {
                 arg = arg.default_value(s);
             }
         }
+        FlagKind::UsizeAtLeastOne => {
+            arg = arg
+                .action(ArgAction::Set)
+                .value_parser(clap::builder::RangedU64ValueParser::<usize>::new().range(1..));
+        }
     }
     for c in spec.conflicts_with {
         arg = arg.conflicts_with(*c);

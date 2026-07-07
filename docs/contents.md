@@ -23,6 +23,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 12 | [Runtimes](12-runtimes.md) | Docker, Apple Containers, Docker Sandboxes — platform support, setup, lifecycle |
 | 13 | [Dynamic Workflows](13-dynamic-workflows.md) | `--dynamic` mode — leader agent designs the workflow, repair loop, `--leader` flag |
 | 14 | [Cleaning Up](14-cleaning-up.md) | `awman clean` — remove containers, workflow files, and dangling images |
+| 15 | [Parallel Workflows](15-parallel-workflows.md) | Concurrent workflow steps, `maxConcurrentAgents`, engine scheduling, per-container stuck/yolo, control board scoping |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

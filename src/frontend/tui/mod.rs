@@ -369,6 +369,31 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         }
     }
 
+    // WI-0096 §6: Ctrl-S cycles the focused parallel container when more than
+    // one is active. With zero or one slot it falls through untouched, so a
+    // single container still receives Ctrl-S (flow control) via the PTY.
+    if key.code == KeyCode::Char('s')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && app.active_dialog.is_none()
+        && app.active_tab().has_multiple_slots()
+    {
+        let size = crossterm::terminal::size().ok();
+        let tab = app.active_tab_mut();
+        tab.cycle_focused_slot();
+        if let Some((term_cols, term_rows)) = size {
+            let sidebar = git_sidebar::sidebar_width(term_cols, tab.git_sidebar_state);
+            let left_cols = term_cols.saturating_sub(sidebar);
+            let (cols, rows) = compute_container_inner_size(left_cols, term_rows);
+            if let Some(slot) = tab.focused_slot_mut() {
+                slot.vt100_parser.screen_mut().set_size(rows, cols);
+                if let Some(ref tx) = slot.container_resize_tx {
+                    let _ = tx.send((cols, rows));
+                }
+            }
+        }
+        return;
+    }
+
     let action = keymap::map_key(key, ctx);
 
     match action {
@@ -500,7 +525,14 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 } else if app.command_dialog_active {
                     dismiss_dialog(app);
                 }
-                let _ = tx.send(crate::engine::workflow::EngineRequest::OpenControlBoard);
+                let focused_step = app
+                    .active_tab()
+                    .focused_slot()
+                    .map(|slot| slot.step_name.clone())
+                    .unwrap_or_default();
+                let _ = tx.send(crate::engine::workflow::EngineRequest::OpenControlBoard {
+                    step_name: focused_step,
+                });
             }
         }
         Action::OpenConfigShow => {
@@ -990,6 +1022,17 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
             if let Some(ref tx) = tab.container_resize_tx {
                 let _ = tx.send((inner_cols, inner_rows));
             }
+            // WI-0096 edge case: broadcast the resize to every active parallel
+            // slot's PTY (not just the focused one) so each container tracks
+            // the real terminal size even while minimized.
+            for slot in &mut tab.parallel_slots {
+                slot.vt100_parser
+                    .screen_mut()
+                    .set_size(inner_rows, inner_cols);
+                if let Some(ref tx) = slot.container_resize_tx {
+                    let _ = tx.send((inner_cols, inner_rows));
+                }
+            }
         }
     }
 }
@@ -1023,6 +1066,16 @@ fn compute_container_inner_size_with_extra(
 fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
     if let Some(bytes) = key_to_bytes(&key) {
         let tab = app.active_tab_mut();
+        // WI-0096: with multiple parallel slots, route keystrokes (incl.
+        // Ctrl-C) only to the focused slot's PTY. When the focused slot has
+        // no dedicated stdin channel (or there are no slots), fall back to
+        // the legacy single-container channel.
+        if let Some(slot) = tab.focused_slot_mut() {
+            if let Some(tx) = slot.container_stdin_tx.as_ref() {
+                let _ = tx.send(bytes);
+                return;
+            }
+        }
         if let Some(ref tx) = tab.container_stdin_tx {
             let _ = tx.send(bytes);
         }
@@ -2488,8 +2541,12 @@ mod tests {
                 continue_unavailable_reason: None,
                 cancel_to_previous_unavailable_reason: None,
                 finish_workflow_unavailable_reason: None,
+                restart_unavailable_reason: None,
                 can_dismiss: false,
                 launch_next_label: None,
+                focused_step_name: "test".into(),
+                parallel_peer_count: 0,
+                parallel_peers_running: 0,
             },
         ));
         app.command_dialog_active = true;
@@ -2567,8 +2624,12 @@ mod tests {
                 continue_unavailable_reason: None,
                 cancel_to_previous_unavailable_reason: None,
                 finish_workflow_unavailable_reason: Some("not last step".into()),
+                restart_unavailable_reason: None,
                 can_dismiss: false,
                 launch_next_label: None,
+                focused_step_name: "test".into(),
+                parallel_peer_count: 0,
+                parallel_peers_running: 0,
             },
         ));
         app.command_dialog_active = true;
@@ -2811,6 +2872,7 @@ mod tests {
                 depends_on: vec![],
             }],
             current_step: Some("build".into()),
+            max_concurrent: None,
         };
         *app.active_tab_mut().workflow_state.lock().unwrap() = Some(view);
 
@@ -2822,7 +2884,7 @@ mod tests {
 
         let msg = rx.try_recv().expect("engine tx must receive a message");
         assert!(
-            matches!(msg, EngineRequest::OpenControlBoard),
+            matches!(msg, EngineRequest::OpenControlBoard { .. }),
             "Ctrl+W during a running step must send OpenControlBoard"
         );
     }
@@ -3337,6 +3399,7 @@ mod tests {
                 })
                 .collect(),
             current_step: None,
+            max_concurrent: None,
         };
         *app.active_tab_mut().workflow_state.lock().unwrap() = Some(view);
 
@@ -3379,6 +3442,7 @@ mod tests {
                 depends_on: vec![],
             }],
             current_step: None,
+            max_concurrent: None,
         };
         *app.active_tab_mut().workflow_state.lock().unwrap() = Some(view);
 

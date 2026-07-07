@@ -44,6 +44,17 @@ pub struct AvailableActions {
     pub continue_unavailable_reason: Option<String>,
     pub cancel_to_previous_unavailable_reason: Option<String>,
     pub finish_workflow_unavailable_reason: Option<String>,
+    /// Reason `RestartCurrentStep` is unavailable / scoped. Set when the WCB
+    /// is opened inside a parallel group (WI-0096 §10): restart only affects
+    /// the focused container.
+    pub restart_unavailable_reason: Option<String>,
+    /// Total number of steps in the focused step's parallel group (0 when the
+    /// focused step is not part of a multi-step parallel batch). Lets frontends
+    /// scope the Workflow Control Board to the parallel context.
+    pub parallel_peer_count: usize,
+    /// Live peers of the focused step still running in the same parallel group
+    /// (excludes the focused step itself). Non-zero disables back/finish.
+    pub parallel_peers_running: usize,
     /// True when a container is currently running (mid-step). The engine
     /// computes this from `current_execution.is_some()` in
     /// `compute_available_actions`. Changes Esc semantics from Pause to Dismiss.
@@ -146,4 +157,6 @@ pub struct WorkflowStepProgressInfo {
     /// Steps this one depends on. Drives the topological column grouping in
     /// the workflow strip renderer.
     pub depends_on: Vec<String>,
+    /// Effective workflow concurrency cap. `None` means unlimited.
+    pub max_concurrent: Option<usize>,
 }

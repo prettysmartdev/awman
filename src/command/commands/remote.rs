@@ -310,6 +310,39 @@ async fn run_remote_exec(
                             text: format!("[{phase}] {step_desc} → {status}"),
                         });
                     }
+                    EventPayload::WorkflowParallelStepLaunched {
+                        step_name,
+                        agent,
+                        model,
+                        ..
+                    } => {
+                        let model_suffix = model
+                            .as_deref()
+                            .map(|m| format!("::{m}"))
+                            .unwrap_or_default();
+                        self.sink.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: format!(
+                                "[parallel] {step_name} launched ({agent}{model_suffix})"
+                            ),
+                        });
+                    }
+                    EventPayload::WorkflowParallelStepExited {
+                        step_name,
+                        exit_code,
+                        ..
+                    } => {
+                        self.sink.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: format!("[parallel] {step_name} exited (exit {exit_code})"),
+                        });
+                    }
+                    EventPayload::WorkflowParallelGroupFinished => {
+                        self.sink.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text: "[parallel] group finished".to_string(),
+                        });
+                    }
                     EventPayload::CommandStatus {
                         status,
                         exit_code,
