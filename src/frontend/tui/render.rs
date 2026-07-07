@@ -931,23 +931,27 @@ fn render_command_box(app: &App, area: Rect, frame: &mut Frame) {
         let text_before_cursor = &app.command_input.text[..app.command_input.cursor];
         unicode_width::UnicodeWidthStr::width(text_before_cursor.replace('\n', "\u{21b5}").as_str())
     };
-    let scroll_offset = if cursor_col >= visible_width {
-        cursor_col - visible_width + 1
-    } else {
-        0
-    };
+    let scroll_offset = command_box_scroll_offset(cursor_col, visible_width);
     let visible_text: String = display_text.chars().skip(scroll_offset).collect();
     let line = Line::from(vec![prefix, Span::raw(visible_text)]);
     frame.render_widget(Paragraph::new(line), inner);
 
     if focused && app.active_dialog.is_none() {
-        let display_cursor_x = (cursor_col - scroll_offset) as u16;
+        let display_cursor_x = cursor_col.saturating_sub(scroll_offset) as u16;
         let cursor_x = area.x + 1 + 2 + display_cursor_x;
         let cursor_y = area.y + 1;
         if cursor_x < area.x + area.width.saturating_sub(1) {
             frame.set_cursor_position(Position::new(cursor_x, cursor_y));
         }
     }
+}
+
+/// How many leading characters of the command-box input to hide so the
+/// cursor stays visible (E.1 horizontal scroll). With a zero-width box
+/// (degenerate terminal) everything scrolls off and the cursor pins to
+/// column 0 — must never underflow.
+fn command_box_scroll_offset(cursor_col: usize, visible_width: usize) -> usize {
+    (cursor_col + 1).saturating_sub(visible_width)
 }
 
 /// Render the 1-row suggestion / context line below the command box.
@@ -2108,8 +2112,8 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_selection_highlight, capture_buffer_grid, dialogs, git_file_line, render_config_show,
-        render_git_sidebar, truncate_middle, truncate_path,
+        apply_selection_highlight, capture_buffer_grid, command_box_scroll_offset, dialogs,
+        git_file_line, render_config_show, render_git_sidebar, truncate_middle, truncate_path,
     };
     use crate::frontend::tui::git_sidebar::{GitDiffSummary, GitFileChangeType, GitFileEntry};
     use crate::frontend::tui::tabs::TextSelection;
@@ -2802,5 +2806,30 @@ mod tests {
         assert!(result.starts_with("star"), "prefix must be preserved");
         assert!(result.ends_with("end"), "suffix must be preserved");
         assert!(result.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn command_box_scroll_offset_no_scroll_when_cursor_fits() {
+        assert_eq!(command_box_scroll_offset(0, 80), 0);
+        assert_eq!(command_box_scroll_offset(79, 80), 0);
+    }
+
+    #[test]
+    fn command_box_scroll_offset_scrolls_long_input() {
+        // Cursor at the width boundary scrolls one column off the left.
+        assert_eq!(command_box_scroll_offset(80, 80), 1);
+        assert_eq!(command_box_scroll_offset(100, 80), 21);
+        // Cursor stays at the last visible column in both cases.
+        assert_eq!(80 - command_box_scroll_offset(80, 80), 79);
+        assert_eq!(100 - command_box_scroll_offset(100, 80), 79);
+    }
+
+    #[test]
+    fn command_box_scroll_offset_zero_width_does_not_underflow() {
+        // Degenerate terminal (width 0): everything scrolls off; the cursor
+        // math downstream saturates to column 0 instead of panicking.
+        assert_eq!(command_box_scroll_offset(0, 0), 1);
+        assert_eq!(command_box_scroll_offset(5, 0), 6);
+        assert_eq!(5usize.saturating_sub(command_box_scroll_offset(5, 0)), 0);
     }
 }

@@ -870,12 +870,20 @@ impl Tab {
                     // Still running — nothing to do.
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Command task dropped without sending a result.
+                    // Command task dropped without sending a result — in
+                    // practice this means the task panicked. The panic hook
+                    // records the backtrace; point the user at it.
                     let cmd_name = match &self.execution_phase {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
-                    let err_msg = "command task dropped unexpectedly".to_string();
+                    let err_msg = match crate::frontend::tui::panic_log_path() {
+                        Some(path) => format!(
+                            "command task ended unexpectedly (likely a panic — see {})",
+                            path.display()
+                        ),
+                        None => "command task ended unexpectedly (likely a panic)".to_string(),
+                    };
                     if let Ok(mut log) = self.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
                             level: crate::data::message::MessageLevel::Error,
@@ -1139,8 +1147,7 @@ mod tests {
         let dir = tmp.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let resolver = StaticGitRootResolver::new(&dir);
-        let session =
-            Session::open(dir.clone(), &resolver, SessionOpenOptions::default()).unwrap();
+        let session = Session::open(dir.clone(), &resolver, SessionOpenOptions::default()).unwrap();
         (Tab::new(session), tmp)
     }
 

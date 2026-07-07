@@ -1918,12 +1918,22 @@ impl WorkflowEngine {
 
         let runtime = WorkflowRuntimeContext {
             step_agent: agent_name,
-            step_model: model,
+            step_model: model.clone(),
             git_root: self.session.git_root().to_path_buf(),
             session_id: self.session.id(),
             workflow_invocation_id: self.state.invocation_id,
             workflow_step_info: None,
         };
+
+        // Same pre-launch notification main steps get (mod.rs `launch_step`).
+        // Frontends rely on it to prepare per-container state — the TUI
+        // recreates its AgentIo channels here; skipping it would make the
+        // factory's `take_io` find no channels and fail.
+        self.frontend.report_step_interactive_launch(
+            &synthetic_step,
+            agent_name_str,
+            model.as_deref(),
+        );
 
         let execution =
             match self
@@ -3935,9 +3945,11 @@ mod tests {
     // explicitly permitted, while the multi-thread runtime handles the future.
 
     /// Frontend that records every `write_message` call so tests can assert on
-    /// the on_failure status messages emitted by the engine.
+    /// the on_failure status messages emitted by the engine. Also records the
+    /// step name of every `report_step_interactive_launch` call.
     struct MessageCapturingFrontend {
         messages: Arc<Mutex<Vec<crate::data::message::UserMessage>>>,
+        interactive_launches: Arc<Mutex<Vec<String>>>,
     }
 
     impl MessageCapturingFrontend {
@@ -3946,9 +3958,16 @@ mod tests {
             (
                 Self {
                     messages: Arc::clone(&store),
+                    interactive_launches: Arc::new(Mutex::new(Vec::new())),
                 },
                 store,
             )
+        }
+
+        /// Handle to the recorded `report_step_interactive_launch` step names.
+        /// Grab before moving the frontend into the engine.
+        fn launches_handle(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.interactive_launches)
         }
     }
 
@@ -3978,6 +3997,17 @@ mod tests {
             Ok(StepFailureChoice::Abort)
         }
         fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
+        fn report_step_interactive_launch(
+            &mut self,
+            step: &WorkflowStep,
+            _agent: &str,
+            _model: Option<&str>,
+        ) {
+            self.interactive_launches
+                .lock()
+                .unwrap()
+                .push(step.name.clone());
+        }
         fn yolo_countdown_tick(
             &mut self,
             _step_name: &str,
@@ -4341,6 +4371,7 @@ mod tests {
             let factory = FakeAgentExecutionFactory::always_success();
             let frontend = MessageCapturingFrontend {
                 messages: Arc::clone(&msg_store_clone),
+                interactive_launches: Arc::new(Mutex::new(Vec::new())),
             };
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4401,6 +4432,7 @@ mod tests {
             let factory = FakeAgentExecutionFactory::always_success();
             let frontend = MessageCapturingFrontend {
                 messages: Arc::clone(&msg_store_clone),
+                interactive_launches: Arc::new(Mutex::new(Vec::new())),
             };
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4479,6 +4511,57 @@ mod tests {
             let states = &engine.state().teardown_step_states;
             assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
             assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+        })
+        .await
+        .unwrap();
+    }
+
+    // The remediation agent launch must announce itself through
+    // report_step_interactive_launch, like main steps do. Frontends prepare
+    // per-container state there — the TUI recreates its AgentIo channels, so
+    // skipping the call would leave the factory's take_io with no channels
+    // and kill the whole command task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_agent_launch_reports_interactive_launch() {
+        use crate::data::workflow_definition::TeardownStep;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeAgentExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let launches = frontend.launches_handle();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "tests".into(),
+                env: None,
+            }];
+            // Step fails, retry fails again → exactly one remediation attempt.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "err".into(), 1),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            assert_eq!(
+                launches.lock().unwrap().as_slice(),
+                ["__on_failure__".to_string()],
+                "remediation agent launch must fire report_step_interactive_launch"
+            );
         })
         .await
         .unwrap();

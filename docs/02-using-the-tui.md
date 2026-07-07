@@ -259,6 +259,10 @@ Press **l** (lowercase L) while the execution window is focused to toggle betwee
 
 The status log is per-tab and accumulates for the lifetime of the session. It does not include agent output (that lives in the container window's scrollback).
 
+### Crash log
+
+If awman hits an internal error (a panic) while the TUI is running, the full error and backtrace are appended to `$HOME/.awman/panic.log`. When a running command dies this way, its tab shows an error in the status log pointing at that file — include its contents when filing a bug report. A crash on the TUI thread itself restores your terminal to a usable state before the error is printed.
+
 ### Border colours
 
 | Colour | Meaning |

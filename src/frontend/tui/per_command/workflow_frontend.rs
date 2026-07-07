@@ -840,4 +840,27 @@ mod tests {
         frontend.set_engine_sender(tx);
         assert!(frontend.engine_tx_shared.lock().unwrap().is_some());
     }
+
+    // take_io self-heals when the slot is empty. Launch paths that skip
+    // report_step_interactive_launch (historically, on_failure remediation
+    // agents) must get fresh channels instead of panicking the command task.
+    #[test]
+    fn take_io_self_heals_when_slot_already_consumed() {
+        use crate::engine::agent_runtime::frontend::AgentFrontend;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+
+        let first = frontend.take_io();
+        assert!(first.initial_size.is_some());
+
+        // Second call without an intervening report_step_interactive_launch:
+        // must rebuild channels, not panic.
+        let second = frontend.take_io();
+        assert!(second.initial_size.is_some());
+
+        // The rebuilt channels publish fresh stdin/resize senders for the
+        // TUI event loop to swap to.
+        assert!(frontend.stdin_tx_shared.lock().unwrap().is_some());
+        assert!(frontend.resize_tx_shared.lock().unwrap().is_some());
+    }
 }

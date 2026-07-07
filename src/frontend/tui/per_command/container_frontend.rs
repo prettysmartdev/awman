@@ -32,9 +32,16 @@ impl AgentFrontend for TuiCommandFrontend {
     }
 
     fn take_io(&mut self) -> AgentIo {
+        // The slot is normally refilled by `report_step_interactive_launch`
+        // before each container launch. Launch paths that skip that hook
+        // (e.g. a remediation agent) must not crash the whole command task —
+        // build fresh channels so the container still bridges into the TUI.
+        if self.container_io.is_none() {
+            self.recreate_container_io();
+        }
         self.container_io
             .take()
-            .expect("TuiCommandFrontend::take_io called but no AgentIo available")
+            .expect("recreate_container_io always fills the slot")
     }
 }
 

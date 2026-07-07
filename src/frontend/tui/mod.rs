@@ -151,6 +151,40 @@ fn restore_terminal(keyboard_enhanced: bool) {
     );
 }
 
+/// Where TUI panics are recorded: `$HOME/.awman/panic.log`. `None` when the
+/// home directory can't be resolved.
+pub(crate) fn panic_log_path() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".awman").join("panic.log"))
+}
+
+/// Append a panic report (message, location, thread, backtrace) to
+/// [`panic_log_path`]. Best-effort — a panic hook must never itself panic
+/// or block on errors.
+fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
+    let Some(path) = panic_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let thread = std::thread::current();
+    let entry = format!(
+        "──── panic at {} ────\nthread: {}\n{}\nbacktrace:\n{}\n",
+        chrono::Utc::now().to_rfc3339(),
+        thread.name().unwrap_or("<unnamed>"),
+        info,
+        std::backtrace::Backtrace::force_capture(),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = f.write_all(entry.as_bytes());
+    }
+}
+
 /// Set up the terminal, run the main loop, and restore on exit.
 fn run_event_loop(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
@@ -180,11 +214,21 @@ fn run_event_loop(app: &mut App) -> io::Result<()> {
     // event loop would leave the shell in raw mode with the kitty
     // keyboard protocol pushed, so every keystroke (arrows, Ctrl-C, …)
     // would appear as a literal escape sequence in the user's prompt.
+    //
+    // Every panic is also appended to `$HOME/.awman/panic.log` with a full
+    // backtrace. For panics on a worker thread (e.g. a spawned command task)
+    // the TUI keeps running and would immediately repaint over anything the
+    // default hook printed, so the log file is the only readable record —
+    // the terminal is left alone and the default hook is skipped.
     let original_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        TUI_ACTIVE.store(false, Ordering::Relaxed);
-        restore_terminal(keyboard_enhanced);
-        original_hook(info);
+        log_panic_to_file(info);
+        if std::thread::current().id() == main_thread {
+            TUI_ACTIVE.store(false, Ordering::Relaxed);
+            restore_terminal(keyboard_enhanced);
+            original_hook(info);
+        }
     }));
 
     TUI_ACTIVE.store(true, Ordering::Relaxed);
@@ -3949,5 +3993,19 @@ mod tests {
             "cycling the container window must drop a selection — its coords \
              are relative to the window it started in"
         );
+    }
+
+    // ─── Panic log ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn panic_log_path_lives_under_awman_home() {
+        // Skip on hosts with no resolvable home dir (the hook no-ops there).
+        if let Some(path) = super::panic_log_path() {
+            assert!(
+                path.ends_with(".awman/panic.log"),
+                "panic log must live in the awman data dir: {}",
+                path.display()
+            );
+        }
     }
 }
