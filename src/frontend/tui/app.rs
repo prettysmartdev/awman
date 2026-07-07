@@ -618,14 +618,47 @@ impl App {
                 DialogRequest::QuitConfirm => Dialog::QuitConfirm,
                 DialogRequest::CloseTabConfirm => Dialog::CloseTabConfirm,
                 DialogRequest::WorkflowCancelConfirm => Dialog::WorkflowCancelConfirm,
-                DialogRequest::ConfigShow { rows } => {
-                    Dialog::ConfigShow(crate::frontend::tui::dialogs::ConfigShowState {
+                DialogRequest::ConfigShow {
+                    rows,
+                    selected,
+                    rejected,
+                } => {
+                    let selected = selected.min(rows.len().saturating_sub(1));
+                    let mut state = crate::frontend::tui::dialogs::ConfigShowState {
                         rows,
-                        selected: 0,
+                        selected,
                         editing: false,
                         edit_column: 0,
                         editor: TextEdit::new(false),
-                    })
+                        new_entry: None,
+                        error: None,
+                    };
+                    // A rejected edit reopens in edit mode with the typed
+                    // value preserved and the reason displayed, so the user
+                    // corrects it instead of retyping from scratch.
+                    if let Some(rej) = rejected {
+                        let has_row = state.rows.iter().any(|r| r.field == rej.field);
+                        let new_mapping_key = if has_row {
+                            None
+                        } else {
+                            rej.field
+                                .strip_prefix("dynamicWorkflows.agentsToModels.")
+                                .map(str::to_string)
+                        };
+                        if has_row || new_mapping_key.is_some() {
+                            state.error = Some(rej.reason);
+                            state.editing = true;
+                            state.edit_column = if rej.global { 0 } else { 1 };
+                            state.editor.set_text(&rej.value);
+                            // A rejected Ctrl+N mapping has no row yet —
+                            // resume the add flow in its value phase.
+                            state.new_entry = new_mapping_key
+                                .map(|key| crate::frontend::tui::dialogs::NewMapEntryPhase::Value {
+                                    key,
+                                });
+                        }
+                    }
+                    Dialog::ConfigShow(state)
                 }
                 DialogRequest::Loading { title } => Dialog::Loading { title },
                 DialogRequest::Custom { title, body, keys } => Dialog::Custom { title, body, keys },
@@ -998,5 +1031,108 @@ mod tests {
             title.contains("awman-test"),
             "title must contain name: {title}"
         );
+    }
+
+    // ── ConfigShow dialog request: rejected-edit reopen ──────────────────
+
+    fn config_show_row(field: &str) -> crate::frontend::tui::dialogs::ConfigShowRow {
+        crate::frontend::tui::dialogs::ConfigShowRow {
+            field: field.to_string(),
+            global: String::new(),
+            repo: String::new(),
+            effective: String::new(),
+            read_only: false,
+            global_writable: false,
+            repo_writable: true,
+            value_hint: None,
+        }
+    }
+
+    fn deliver_config_show(
+        app: &mut App,
+        rows: Vec<crate::frontend::tui::dialogs::ConfigShowRow>,
+        rejected: Option<crate::frontend::tui::dialogs::ConfigShowRejectedEdit>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[0].dialog_request_rx = Some(rx);
+        tx.send(DialogRequest::ConfigShow {
+            rows,
+            selected: 0,
+            rejected,
+        })
+        .unwrap();
+        app.poll_dialog_requests();
+    }
+
+    #[test]
+    fn config_show_request_without_rejection_opens_in_browse_mode() {
+        let mut app = make_app();
+        deliver_config_show(&mut app, vec![config_show_row("agent")], None);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("ConfigShow request must open the dialog");
+        };
+        assert!(!state.editing);
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn config_show_request_with_rejection_reopens_edit_with_input_preserved() {
+        let mut app = make_app();
+        deliver_config_show(
+            &mut app,
+            vec![config_show_row("dynamicWorkflows.defaultLeader")],
+            Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
+                field: "dynamicWorkflows.defaultLeader".into(),
+                value: "claude".into(),
+                global: false,
+                reason: "expected agent::model".into(),
+            }),
+        );
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("ConfigShow request must open the dialog");
+        };
+        assert!(
+            state.editing,
+            "a rejected edit must reopen in edit mode so the input is not lost"
+        );
+        assert_eq!(state.edit_column, 1, "repo-scoped edit stays on Repo");
+        assert_eq!(
+            state.editor.text, "claude",
+            "the rejected input must be preserved for correction"
+        );
+        assert_eq!(state.error.as_deref(), Some("expected agent::model"));
+    }
+
+    #[test]
+    fn config_show_request_with_rejected_new_mapping_resumes_value_phase() {
+        // A rejected Ctrl+N mapping has no table row yet; the dialog must
+        // resume the add flow in its value phase for the same key.
+        let mut app = make_app();
+        deliver_config_show(
+            &mut app,
+            vec![config_show_row("agent")],
+            Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
+                field: "dynamicWorkflows.agentsToModels.maki".into(),
+                value: "model-a, model-b".into(),
+                global: false,
+                reason: "could not write config".into(),
+            }),
+        );
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("ConfigShow request must open the dialog");
+        };
+        assert_eq!(
+            state.new_entry,
+            Some(crate::frontend::tui::dialogs::NewMapEntryPhase::Value {
+                key: "maki".into()
+            }),
+            "the add-mapping flow must resume in the value phase"
+        );
+        assert!(state.editing);
+        assert_eq!(state.editor.text, "model-a, model-b");
+        assert_eq!(state.error.as_deref(), Some("could not write config"));
     }
 }

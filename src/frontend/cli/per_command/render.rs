@@ -714,6 +714,9 @@ mod tests {
                     effective_value: Some("claude".into()),
                     kind: ConfigFieldKind::Enum,
                     read_only: false,
+                    global_writable: true,
+                    repo_writable: true,
+                    value_hint: None,
                 },
                 ConfigFieldRow {
                     field: "auto_agent_auth_accepted".into(),
@@ -722,6 +725,9 @@ mod tests {
                     effective_value: Some("true".into()),
                     kind: ConfigFieldKind::Bool,
                     read_only: true,
+                    global_writable: false,
+                    repo_writable: false,
+                    value_hint: None,
                 },
             ],
         };
@@ -755,6 +761,9 @@ mod tests {
                     effective_value: Some("claude::claude-opus-4-8".into()),
                     kind: ConfigFieldKind::String,
                     read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
                 },
                 ConfigFieldRow {
                     field: "dynamicWorkflows.maxConcurrentSteps".into(),
@@ -763,6 +772,9 @@ mod tests {
                     effective_value: Some("3".into()),
                     kind: ConfigFieldKind::Number,
                     read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
                 },
                 ConfigFieldRow {
                     field: "dynamicWorkflows.agentsToModels.claude".into(),
@@ -770,7 +782,10 @@ mod tests {
                     repo_value: Some(long_models.into()),
                     effective_value: Some(long_models.into()),
                     kind: ConfigFieldKind::String,
-                    read_only: true,
+                    read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
                 },
             ],
         };
@@ -785,8 +800,13 @@ mod tests {
             "maxConcurrentSteps field must appear: {s}"
         );
         assert!(
-            s.contains("dynamicWorkflows.agentsToModels.claude (read-only)"),
-            "read-only agentsToModels row must be marked, got: {s}"
+            s.contains("dynamicWorkflows.agentsToModels.claude"),
+            "per-agent agentsToModels row must appear, got: {s}"
+        );
+        assert!(
+            !s.contains("dynamicWorkflows.agentsToModels.claude (read-only)"),
+            "per-agent agentsToModels rows are inline-editable and must not be marked \
+             read-only, got: {s}"
         );
         assert!(
             s.contains(long_models),

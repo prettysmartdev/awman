@@ -511,9 +511,13 @@ impl Tab {
         });
     }
 
-    /// Project name for display in the tab bar. Truncated to 14 chars + `…`
-    /// when the cwd's basename is longer.
-    pub fn project_name(&self) -> String {
+    /// Project name for the tab title, truncated to fit a `tab_width`-wide
+    /// tab cell. The rendered title is `" ➡ {name} "` inside the two border
+    /// cells — 6 chars of chrome in the active variant, which sizing always
+    /// reserves — so the name may use `tab_width - 6` chars. Wide tabs show
+    /// more of a long project name instead of clipping at a fixed length;
+    /// pass `u16::MAX` to measure the untruncated name.
+    pub fn project_name(&self, tab_width: u16) -> String {
         let name = self
             .session
             .working_dir()
@@ -521,7 +525,8 @@ impl Tab {
             .and_then(|n| n.to_str())
             .unwrap_or("?")
             .to_string();
-        truncate_with_ellipsis(&name, 14)
+        let max = (tab_width as usize).saturating_sub(6).max(1);
+        truncate_with_ellipsis(&name, max)
     }
 
     /// Yolo countdown label for background tabs: alternates emoji + countdown.
@@ -1125,6 +1130,48 @@ mod tests {
 
     fn make_tab() -> Tab {
         Tab::new(make_test_session())
+    }
+
+    /// Tab whose working-dir basename is `name`, for project_name tests.
+    /// Returns the TempDir so the directory outlives `Session::open`.
+    fn make_named_tab(name: &str) -> (Tab, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolver = StaticGitRootResolver::new(&dir);
+        let session =
+            Session::open(dir.clone(), &resolver, SessionOpenOptions::default()).unwrap();
+        (Tab::new(session), tmp)
+    }
+
+    // ── project_name width behavior ─────────────────────────────────────────
+
+    #[test]
+    fn project_name_at_minimum_tab_width_matches_historical_cap() {
+        // 20 cols is the minimum tab width; 6 chars of title chrome leave 14
+        // for the name — the old fixed truncation limit.
+        let (tab, _tmp) = make_named_tab("a-very-long-project-directory-name");
+        let out = tab.project_name(20);
+        assert_eq!(out.chars().count(), 14);
+        assert!(out.ends_with('\u{2026}'), "clipped name must mark: {out}");
+    }
+
+    #[test]
+    fn project_name_uses_extra_space_in_wide_tabs() {
+        let name = "a-very-long-project-directory-name";
+        let (tab, _tmp) = make_named_tab(name);
+        assert_eq!(
+            tab.project_name(name.chars().count() as u16 + 6),
+            name,
+            "a tab wide enough for the full name must not truncate it"
+        );
+        let out = tab.project_name(30);
+        assert_eq!(
+            out.chars().count(),
+            24,
+            "a 30-col tab must show 24 chars of the name, not clip at 14: {out}"
+        );
+        assert!(out.ends_with('\u{2026}'));
     }
 
     // ── git sidebar state ──────────────────────────────────────────────────

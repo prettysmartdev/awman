@@ -1044,6 +1044,7 @@ impl ConfigCommandFrontend for ApiDispatchFrontend {
     fn present_config_table(
         &mut self,
         _rows: &[ConfigFieldRow],
+        _rejected: Option<&crate::command::commands::config::ConfigEditRejection>,
     ) -> Result<Option<ConfigEditRequest>, CommandError> {
         Ok(None)
     }

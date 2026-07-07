@@ -368,25 +368,23 @@ The window does **not** close while the container is still alive: a stuck agent 
 
 ## Config dialog
 
-Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly — even while an agent is running or the container window is maximized. You can also type `config show` in the command box and press **Enter**. Either way opens the same large centered modal overlay for viewing and editing all configuration fields without leaving the TUI.
+Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly — even while an agent is running or the container window is maximized. You can also type `config show` in the command box and press **Enter**. Either way opens the same modal overlay for viewing and editing all configuration fields without leaving the TUI. The dialog takes up 90% of the terminal in both dimensions, so as much of the table as possible is visible at once.
 
 ```
-╭─── Configuration ────────────────────────────────────────────────────────╮
-│                                                                            │
-│  Field                       Global              Repo        Effective     │
-│ ─────────────────────────────────────────────────────────────────────────  │
-│  default_agent               claude (built-in)   N/A         claude        │
-│  runtime                     docker (built-in)   N/A         docker        │
-│▶ terminal_scrollback_lines   10000 (built-in)    5000        5000          │
-│  yolo_disallowed_tools       (empty)             (not set)   (empty)       │
-│  overlays                    (empty)             (not set)   (empty)       │
-│  agent                       N/A                 codex       codex         │
-│  auto_agent_auth_accepted    N/A                 true        true          │
-│                                                                            │
-│  Accepted values: positive integer                                         │
-│                                                                            │
-│  ↑↓ navigate · e edit · Ctrl+Enter save · Esc close                       │
-╰────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────── awman config ─────────────────────────────────╮
+│  Field                              Global        Repo           Effective     │
+│  agent                              claude                       claude        │
+│  runtime                            docker                       docker        │
+│  terminal_scrollback_lines          10000         5000           5000          │
+│  ...                                                                           │
+│  dynamicWorkflows.agentsToModels                  2 agents ma…   2 agents ma…  │
+│▶ dynamicWorkflows.agentsToModels.…                claude-opus…   claude-opus…  │
+│                                                                                 │
+│  dynamicWorkflows.agentsToModels.claude = claude-opus-4-8, claude-sonnet-4-6   │
+│                                                                                 │
+│  comma-separated model names; save an empty value to remove                    │
+│  ↑↓=row  PgUp/PgDn=page  ←→=col  Enter/e=edit  Ctrl+N=add model mapping  Esc   │
+╰─────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ### Navigation and editing
@@ -394,23 +392,36 @@ Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly �
 | Key | Action |
 |-----|--------|
 | **↑ / ↓** | Move between rows |
-| **← / →** | Move between columns (Global, Repo, Effective) |
-| **e** | Enter edit mode for the selected field |
-| **Enter** (edit mode) | Confirm the new value and exit edit mode |
-| **Esc** (edit mode) | Cancel edit without saving |
-| **Ctrl+Enter** | Save all pending changes to the appropriate config files |
-| **Esc** (navigation) | Close the dialog and return to the previous view |
-| **Ctrl+,** | Close the dialog (same as Esc in navigation mode) |
+| **PgUp / PgDn** | Jump ten rows at a time |
+| **← / →** | Move between the editable columns (Global, Repo) |
+| **Enter** or **e** | Start editing the selected field inline |
+| **Enter** (while editing) | Save the new value to the focused scope's config file |
+| **Esc** (while editing) | Cancel the edit without saving |
+| **Ctrl+N** | Add a new agent→models mapping (see below) — the hint for it appears while an `agentsToModels` row is selected |
+| **Esc** | Close the dialog |
 
-When a row is selected, a hint line below the table shows the accepted values for that field (e.g. `claude | codex | opencode | maki | gemini`).
+While editing, the value is edited inline in its table cell with a visible `|` cursor; **← / →**, **Home / End**, **Backspace**, and **Delete** work as expected. Values longer than the cell scroll horizontally so the cursor never leaves view. Row navigation is frozen until you save or cancel.
 
-Fields marked `(read-only)` — such as `auto_agent_auth_accepted` — are skipped during navigation for edit purposes. Their values are shown but cannot be changed from this dialog. If you press **Enter** on a read-only field, a toast message appears briefly at the bottom of the dialog: `This field is read-only`. For `dynamicWorkflows.agentsToModels` rows specifically, the toast instead reads `Edit this value directly in .awman/config.json`, since that field is not editable through `config set` at all.
+A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agent`, `positive integer` for numeric fields, `comma-separated list` for list fields).
 
-Values too long to fit their column — like `dynamicWorkflows.agentsToModels.<agentName>`'s comma-separated model list — are truncated with `…` in the table cell. A two-line detail area below the table always shows the full, untruncated value of the selected row's focused column, so long values stay inspectable without leaving the dialog.
+Each edit is validated and written immediately when you press **Enter** (surrounding whitespace is trimmed first). If the value is invalid (an unknown agent name, a non-numeric value for a numeric field, a malformed `agent::model` leader) or the config file cannot be written, nothing is saved: the dialog stays in edit mode with your input intact and shows the reason in red where the format hint normally appears, so you can correct the value instead of retyping it. Press **Esc** to abandon the rejected edit. After a successful save the table refreshes with the selected row preserved, so consecutive edits don't send you back to the top.
 
-### Scope and saving
+Editing targets the column the selection is on: the **Global** column writes `$HOME/.awman/config.json`, the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field (like `dynamicWorkflows.*`) moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime`), so a value can never be written into a scope where it isn't read.
 
-The dialog loads both config files when it opens. Each edit targets the repo config by default; global-only fields (like `runtime` and `default_agent`) write to the global config. Changes are not written to disk until you press **Ctrl+Enter**. Pressing **Esc** without saving discards all edits made in this session.
+Fields marked read-only — such as `auto_agent_auth_accepted` — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
+
+There are more fields than fit at once — the table scrolls automatically to keep the selected row visible as you move past the bottom or top of the visible window.
+
+### Agent→model mappings (`dynamicWorkflows.agentsToModels`)
+
+The agent→model map for [dynamic workflows](13-dynamic-workflows.md) is fully manageable from the dialog:
+
+- A summary row (`dynamicWorkflows.agentsToModels`) always appears, showing how many agents are mapped (or `(none)`), so the mapping is discoverable even before it's configured.
+- Each configured agent gets its own row (`dynamicWorkflows.agentsToModels.<agentName>`) whose comma-separated model list is edited inline like any other field.
+- **Ctrl+N** adds a new mapping in two steps: type the agent name and press **Enter**, then type its comma-separated model list and press **Enter** again. **Esc** cancels at either step. Entering the name of an already-mapped agent jumps to that agent's existing row for editing instead of overwriting it.
+- Saving an **empty** value on a per-agent row removes that agent's mapping (an agent cannot be mapped to zero models).
+
+The same per-agent entries work on the command line: `awman config set dynamicWorkflows.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"`.
 
 ---
 
@@ -427,7 +438,7 @@ Ctrl+C, Ctrl+T  (multiple tabs open) close current tab
 
 The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area.
 
-Tab names are truncated at 14 characters with `…`. The tab bar distributes width according to the number of open tabs:
+Tab names are truncated with `…` only when they don't fit their tab: at the minimum tab width (20 columns) that means 14 characters of the name, and wider tabs show correspondingly more of a long name. The tab bar distributes width according to the number of open tabs:
 
 | Open tabs | Each tab gets |
 |-----------|--------------|

@@ -52,6 +52,13 @@ pub enum DialogRequest {
     WorkflowCancelConfirm,
     ConfigShow {
         rows: Vec<ConfigShowRow>,
+        /// Initially selected row, so the dialog can reopen on the field the
+        /// user just edited instead of jumping back to the top.
+        selected: usize,
+        /// The previous edit, when it was rejected (invalid value or failed
+        /// write). The dialog reopens in edit mode with the input preserved
+        /// and the reason displayed.
+        rejected: Option<ConfigShowRejectedEdit>,
     },
     Loading {
         title: String,
@@ -202,6 +209,32 @@ pub struct ConfigShowState {
     pub editing: bool,
     pub edit_column: usize,
     pub editor: TextEdit,
+    /// In-progress Ctrl+N "add model mapping" flow, if any. While `Some`,
+    /// `editing` is also true so text input routes to `editor`.
+    pub new_entry: Option<NewMapEntryPhase>,
+    /// Why the last save attempt was rejected. Rendered in the dialog until
+    /// the user cancels the edit or starts a new one.
+    pub error: Option<String>,
+}
+
+/// A rejected config edit carried in `DialogRequest::ConfigShow`: the value
+/// the user typed plus the rejection reason, so the reopened dialog restores
+/// the edit instead of discarding the input.
+#[derive(Debug, Clone)]
+pub struct ConfigShowRejectedEdit {
+    pub field: String,
+    pub value: String,
+    pub global: bool,
+    pub reason: String,
+}
+
+/// Phase of the Ctrl+N add-model-mapping flow in the config dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewMapEntryPhase {
+    /// Typing the agent name (the new map key).
+    Key,
+    /// Typing the comma-separated model list for the confirmed key.
+    Value { key: String },
 }
 
 #[derive(Debug)]
@@ -211,6 +244,12 @@ pub struct ConfigShowRow {
     pub repo: String,
     pub effective: String,
     pub read_only: bool,
+    /// Whether the value may be written to the global config scope.
+    pub global_writable: bool,
+    /// Whether the value may be written to the repo config scope.
+    pub repo_writable: bool,
+    /// Short format hint shown while editing (e.g. "true or false").
+    pub value_hint: Option<String>,
 }
 
 /// Compute a centered rect for a dialog.

@@ -330,6 +330,7 @@ impl ConfigCommandFrontend for CliFrontend {
     fn present_config_table(
         &mut self,
         _rows: &[crate::command::commands::config::ConfigFieldRow],
+        _rejected: Option<&crate::command::commands::config::ConfigEditRejection>,
     ) -> Result<
         Option<crate::command::commands::config::ConfigEditRequest>,
         crate::command::error::CommandError,

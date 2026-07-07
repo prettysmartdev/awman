@@ -147,7 +147,14 @@ awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
 awman config set dynamicWorkflows.maxConcurrentSteps 3
 ```
 
-`agentsToModels` is not settable through `config set` — edit `.awman/config.json` directly for that field. In `awman config show` and the TUI config dialog, each configured agent appears as its own read-only row (`dynamicWorkflows.agentsToModels.<agentName>`) showing its comma-separated model list. See [Configuration](07-configuration.md#reference) for the full field reference.
+`agentsToModels` is managed one agent at a time. On the command line, set an agent's comma-separated model list (or clear it with an empty value):
+
+```sh
+awman config set dynamicWorkflows.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"
+awman config set dynamicWorkflows.agentsToModels.claude ""   # remove the mapping
+```
+
+In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`dynamicWorkflows.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-dynamicworkflowsagentstomodels). See [Configuration](07-configuration.md#reference) for the full field reference.
 
 ---
 

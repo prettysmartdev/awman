@@ -81,6 +81,10 @@ pub struct TuiCommandFrontend {
     /// Live TUI context shared with the event loop. The event loop refreshes
     /// this on every tick; the status command reads it on each watch iteration.
     pub(crate) tui_context_shared: SharedTuiContext,
+    /// Field name of the most recent config-dialog edit, so the re-presented
+    /// table reopens with that row selected (the `config show` edit loop
+    /// presents the dialog again after every save).
+    pub(crate) last_config_edit_field: Option<String>,
 }
 
 impl TuiCommandFrontend {
@@ -128,6 +132,7 @@ impl TuiCommandFrontend {
             active_worktree_path,
             status_dashboard,
             tui_context_shared,
+            last_config_edit_field: None,
         }
     }
 

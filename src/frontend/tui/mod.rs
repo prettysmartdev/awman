@@ -516,12 +516,20 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         Action::ScrollPageUp => {
-            let tab = app.active_tab_mut();
-            tab.scroll_offset = tab.scroll_offset.saturating_add(20);
+            if ctx == FocusContext::Dialog {
+                handle_dialog_scroll(app, -10);
+            } else {
+                let tab = app.active_tab_mut();
+                tab.scroll_offset = tab.scroll_offset.saturating_add(20);
+            }
         }
         Action::ScrollPageDown => {
-            let tab = app.active_tab_mut();
-            tab.scroll_offset = tab.scroll_offset.saturating_sub(20);
+            if ctx == FocusContext::Dialog {
+                handle_dialog_scroll(app, 10);
+            } else {
+                let tab = app.active_tab_mut();
+                tab.scroll_offset = tab.scroll_offset.saturating_sub(20);
+            }
         }
         Action::ScrollToTop => {
             let tab = app.active_tab_mut();
@@ -548,10 +556,13 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.should_quit = true;
                 return;
             }
-            // In ConfigShow editing mode, Esc cancels the edit (back to browse).
+            // In ConfigShow editing / add-mapping mode, Esc cancels the edit
+            // (back to browse) instead of closing the dialog.
             if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
-                if state.editing {
+                if state.editing || state.new_entry.is_some() {
                     state.editing = false;
+                    state.new_entry = None;
+                    state.error = None;
                     return;
                 }
             }
@@ -563,6 +574,20 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 return;
             }
             dismiss_dialog(app);
+        }
+        Action::NewMapEntry => {
+            // Ctrl+N in the config dialog: start the add-model-mapping flow
+            // (dynamicWorkflows.agentsToModels). No-op elsewhere.
+            if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+                if state.new_entry.is_none() {
+                    state.new_entry = Some(dialogs::NewMapEntryPhase::Key);
+                    state.editing = true;
+                    state.error = None;
+                    // Map entries are repo-scoped.
+                    state.edit_column = 1;
+                    state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                }
+            }
         }
 
         // ── Text input actions ────────────────────────────────────────
@@ -1126,45 +1151,8 @@ fn handle_dialog_submit(app: &mut App) {
             app.command_dialog_active = false;
         }
 
-        Some(Dialog::ConfigShow(state)) if is_command => {
-            if state.editing {
-                // Save the edited value: send "field\tvalue\tscope"
-                let row = &state.rows[state.selected];
-                let field = row.field.clone();
-                let value = state.editor.text.clone();
-                let scope = if state.edit_column == 0 {
-                    "global"
-                } else {
-                    "repo"
-                };
-                let edit_str = format!("{}\t{}\t{}", field, value, scope);
-                app.send_dialog_response(DialogResponse::Text(edit_str));
-                app.active_dialog = None;
-                app.command_dialog_active = false;
-            } else {
-                // Start editing: Enter opens the inline editor on the
-                // selected row. edit_column 0 = global, 1 = repo.
-                let row = &state.rows[state.selected];
-                if row.read_only {
-                    app.status_bar.text =
-                        if row.field.starts_with("dynamicWorkflows.agentsToModels") {
-                            "Edit this value directly in .awman/config.json".to_string()
-                        } else {
-                            "This field is read-only".to_string()
-                        };
-                    return;
-                }
-                let initial_value = if state.edit_column == 0 {
-                    row.global.clone()
-                } else {
-                    row.repo.clone()
-                };
-                if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
-                    state.editing = true;
-                    state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
-                    state.editor.set_text(&initial_value);
-                }
-            }
+        Some(Dialog::ConfigShow(_)) if is_command => {
+            config_show_submit(app);
         }
 
         Some(Dialog::WorkflowStepConfirm(_)) if is_command => {
@@ -1174,6 +1162,173 @@ fn handle_dialog_submit(app: &mut App) {
         }
 
         _ => {}
+    }
+}
+
+/// Lexical validation for a new `agentsToModels` key typed in the config
+/// dialog. Mirrors `data::session::AgentName` rules so bad keys are rejected
+/// before they reach the config writer.
+fn is_valid_map_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Handle Enter in the ConfigShow dialog: advance the add-mapping flow, save
+/// the active inline edit, or begin editing the selected row.
+fn config_show_submit(app: &mut App) {
+    use dialogs::NewMapEntryPhase;
+
+    let mut toast: Option<String> = None;
+    let mut response: Option<String> = None;
+    let mut begin_edit = false;
+
+    if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+        match state.new_entry.clone() {
+            // Phase 1 of Ctrl+N: confirm the agent name.
+            Some(NewMapEntryPhase::Key) => {
+                let key = state.editor.text.trim().to_string();
+                if key.is_empty() {
+                    toast = Some("Type an agent name, or press Esc to cancel".to_string());
+                } else if !is_valid_map_key(&key) {
+                    toast = Some(format!(
+                        "'{key}' is not a valid agent name: use ASCII letters, digits, '-', '_' \
+                         (max 64 chars)"
+                    ));
+                } else {
+                    let field = format!("dynamicWorkflows.agentsToModels.{key}");
+                    if let Some(idx) = state.rows.iter().position(|r| r.field == field) {
+                        // Already mapped: jump to the existing row and edit it
+                        // instead of silently overwriting.
+                        let current = state.rows[idx].repo.clone();
+                        state.selected = idx;
+                        state.new_entry = None;
+                        state.editing = true;
+                        state.edit_column = 1;
+                        state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                        state.editor.set_text(&current);
+                        toast = Some(format!("'{key}' is already mapped — editing its models"));
+                    } else {
+                        state.new_entry = Some(NewMapEntryPhase::Value { key });
+                        state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                    }
+                }
+            }
+            // Phase 2 of Ctrl+N: save the model list for the new key.
+            Some(NewMapEntryPhase::Value { key }) => {
+                let value = state.editor.text.trim().to_string();
+                if value.is_empty() {
+                    toast =
+                        Some("Enter at least one model name, or press Esc to cancel".to_string());
+                } else {
+                    response = Some(format!(
+                        "dynamicWorkflows.agentsToModels.{key}\t{value}\trepo"
+                    ));
+                }
+            }
+            None if state.editing => {
+                // Save the edited value: send "field\tvalue\tscope". The
+                // value is trimmed — stray whitespace would otherwise fail
+                // validation for numbers and agent::model specs.
+                let row = &state.rows[state.selected];
+                let scope = if state.edit_column == 0 {
+                    "global"
+                } else {
+                    "repo"
+                };
+                response = Some(format!(
+                    "{}\t{}\t{}",
+                    row.field,
+                    state.editor.text.trim(),
+                    scope
+                ));
+            }
+            None => begin_edit = true,
+        }
+    }
+
+    if begin_edit {
+        config_show_begin_edit(app);
+    }
+    if let Some(text) = toast {
+        app.status_bar.text = text;
+    }
+    if let Some(edit_str) = response {
+        app.send_dialog_response(DialogResponse::Text(edit_str));
+        app.active_dialog = None;
+        app.command_dialog_active = false;
+    }
+}
+
+/// Begin inline editing of the selected ConfigShow row (Enter or `e` in
+/// browse mode). Snaps the edit column to a writable scope for scope-
+/// restricted fields, and refuses read-only rows with a status-bar hint.
+fn config_show_begin_edit(app: &mut App) {
+    let mut toast: Option<String> = None;
+
+    if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+        if state.editing || state.new_entry.is_some() {
+            return;
+        }
+        let Some(row) = state.rows.get(state.selected) else {
+            return;
+        };
+        let (field, read_only, global_writable, repo_writable, global_val, repo_val) = (
+            row.field.clone(),
+            row.read_only,
+            row.global_writable,
+            row.repo_writable,
+            row.global.clone(),
+            row.repo.clone(),
+        );
+
+        if read_only {
+            toast = Some(if field == "dynamicWorkflows.agentsToModels" {
+                "Press Ctrl+N to add a mapping, or edit a per-agent row below".to_string()
+            } else {
+                "This field is read-only".to_string()
+            });
+        } else {
+            // Snap to a writable column so a repo-only field is never
+            // written into the global config (and vice versa).
+            let column = match (state.edit_column, global_writable, repo_writable) {
+                (0, true, _) | (1, true, false) => Some(0),
+                (1, _, true) | (0, false, true) => Some(1),
+                _ => None,
+            };
+            match column {
+                None => toast = Some("This field is read-only".to_string()),
+                Some(column) => {
+                    if column != state.edit_column {
+                        toast = Some(if column == 1 {
+                            format!("'{field}' is repo-only — editing the Repo value")
+                        } else {
+                            format!("'{field}' is global-only — editing the Global value")
+                        });
+                    }
+                    state.edit_column = column;
+                    state.error = None;
+                    // Sensitive values are masked in the table; start the
+                    // editor empty rather than seeding it with the mask.
+                    let initial = if field == "remote.defaultAPIKey" {
+                        String::new()
+                    } else if column == 0 {
+                        global_val
+                    } else {
+                        repo_val
+                    };
+                    state.editing = true;
+                    state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+                    state.editor.set_text(&initial);
+                }
+            }
+        }
+    }
+
+    if let Some(text) = toast {
+        app.status_bar.text = text;
     }
 }
 
@@ -1237,8 +1392,10 @@ fn handle_dialog_delete(app: &mut App) {
     }
 }
 
-/// Handle arrow-key scrolling in list-based dialogs.
+/// Handle arrow-key / page-key scrolling in list-based dialogs. `direction`
+/// is a signed step count (e.g. -1 for one row up, +10 for a page down).
 fn handle_dialog_scroll(app: &mut App, direction: i32) {
+    let step = direction.unsigned_abs() as usize;
     match &mut app.active_dialog {
         Some(Dialog::ListPicker {
             items, selected, ..
@@ -1248,20 +1405,25 @@ fn handle_dialog_scroll(app: &mut App, direction: i32) {
                 return;
             }
             if direction < 0 {
-                *selected = selected.saturating_sub(1);
+                *selected = selected.saturating_sub(step);
             } else {
-                *selected = (*selected + 1).min(len - 1);
+                *selected = (*selected + step).min(len - 1);
             }
         }
         Some(Dialog::ConfigShow(state)) => {
+            // Row navigation is frozen mid-edit: the editor holds the value
+            // of the row the edit started on.
+            if state.editing || state.new_entry.is_some() {
+                return;
+            }
             let len = state.rows.len();
             if len == 0 {
                 return;
             }
             if direction < 0 {
-                state.selected = state.selected.saturating_sub(1);
+                state.selected = state.selected.saturating_sub(step);
             } else {
-                state.selected = (state.selected + 1).min(len - 1);
+                state.selected = (state.selected + step).min(len - 1);
             }
         }
         _ => {}
@@ -1394,7 +1556,11 @@ fn handle_dialog_char(app: &mut App, c: char) {
             }
         }
         Some(Dialog::ConfigShow(_)) => {
-            // When not editing, ignore char keys (navigate with arrows, Enter to edit)
+            // Browse mode: `e` starts editing the selected row (same as
+            // Enter); other char keys are ignored.
+            if c == 'e' {
+                config_show_begin_edit(app);
+            }
         }
 
         // ── Non-interactive / fallback dialogs ─────────────────────
@@ -2658,28 +2824,54 @@ mod tests {
         );
     }
 
-    // ─── ConfigShow read-only toast ───────────────────────────────────────────
+    // ─── ConfigShow dialog behavior ──────────────────────────────────────────
 
-    #[test]
-    fn enter_on_read_only_shows_toast() {
-        use crate::frontend::tui::dialogs::{ConfigShowRow, ConfigShowState};
-        use crate::frontend::tui::text_edit::TextEdit;
+    fn config_row(
+        field: &str,
+        global: &str,
+        repo: &str,
+        read_only: bool,
+        global_writable: bool,
+        repo_writable: bool,
+    ) -> crate::frontend::tui::dialogs::ConfigShowRow {
+        crate::frontend::tui::dialogs::ConfigShowRow {
+            field: field.into(),
+            global: global.into(),
+            repo: repo.into(),
+            effective: if repo.is_empty() { global } else { repo }.into(),
+            read_only,
+            global_writable,
+            repo_writable,
+            value_hint: None,
+        }
+    }
 
-        let mut app = make_app();
-        app.active_dialog = Some(Dialog::ConfigShow(ConfigShowState {
-            rows: vec![ConfigShowRow {
-                field: "agent".into(),
-                global: "claude".into(),
-                repo: "claude".into(),
-                effective: "claude".into(),
-                read_only: true,
-            }],
+    fn config_show_dialog(rows: Vec<crate::frontend::tui::dialogs::ConfigShowRow>) -> Dialog {
+        Dialog::ConfigShow(crate::frontend::tui::dialogs::ConfigShowState {
+            rows,
             selected: 0,
             editing: false,
             edit_column: 0,
-            editor: TextEdit::new(false),
-        }));
-        app.command_dialog_active = true;
+            editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+            new_entry: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn enter_on_read_only_shows_toast() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row(
+                "auto_agent_auth_accepted",
+                "true",
+                "",
+                true,
+                false,
+                false,
+            )]),
+        );
 
         press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
@@ -2695,37 +2887,327 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_read_only_agents_to_models_row_shows_edit_config_json_toast() {
-        use crate::frontend::tui::dialogs::{ConfigShowRow, ConfigShowState};
-        use crate::frontend::tui::text_edit::TextEdit;
-
+    fn enter_on_agents_to_models_summary_row_points_at_ctrl_n() {
         let mut app = make_app();
-        app.active_dialog = Some(Dialog::ConfigShow(ConfigShowState {
-            rows: vec![ConfigShowRow {
-                field: "dynamicWorkflows.agentsToModels.claude".into(),
-                global: String::new(),
-                repo: "claude-opus-4-8, claude-sonnet-4-6".into(),
-                effective: "claude-opus-4-8, claude-sonnet-4-6".into(),
-                read_only: true,
-            }],
-            selected: 0,
-            editing: false,
-            edit_column: 0,
-            editor: TextEdit::new(false),
-        }));
-        app.command_dialog_active = true;
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row(
+                "dynamicWorkflows.agentsToModels",
+                "",
+                "2 agents mapped",
+                true,
+                false,
+                false,
+            )]),
+        );
 
         press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
         assert_eq!(
-            app.status_bar.text, "Edit this value directly in .awman/config.json",
-            "pressing Enter on a read-only agentsToModels row must show the config.json \
-             edit hint, not the generic read-only toast"
+            app.status_bar.text, "Press Ctrl+N to add a mapping, or edit a per-agent row below",
+            "the map summary row must steer users to Ctrl+N / per-agent rows"
+        );
+        assert!(app.active_dialog.is_some(), "dialog must stay open");
+    }
+
+    #[test]
+    fn enter_on_agents_to_models_row_starts_inline_edit_in_repo_column() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row(
+                "dynamicWorkflows.agentsToModels.claude",
+                "",
+                "claude-opus-4-8, claude-sonnet-4-6",
+                false,
+                false,
+                true,
+            )]),
+        );
+
+        // Selection starts on the Global column; the repo-only field must
+        // snap the edit to the Repo column instead of writing global config.
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("dialog must stay open in edit mode");
+        };
+        assert!(state.editing, "per-agent rows must be inline-editable");
+        assert_eq!(state.edit_column, 1, "edit must snap to the Repo column");
+        assert_eq!(
+            state.editor.text, "claude-opus-4-8, claude-sonnet-4-6",
+            "the editor must be seeded with the current model list"
+        );
+    }
+
+    #[test]
+    fn e_key_starts_editing_like_enter() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row("agent", "claude", "", false, true, true)]),
+        );
+
+        press_char(&mut app, 'e');
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("dialog must stay open in edit mode");
+        };
+        assert!(state.editing, "'e' must start inline editing");
+        assert_eq!(
+            state.editor.text, "claude",
+            "editor must be seeded with the focused column's value"
+        );
+    }
+
+    #[test]
+    fn global_only_field_snaps_edit_to_global_column() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row(
+                "runtime", "docker", "", false, true, false,
+            )]),
+        );
+        if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+            state.edit_column = 1; // user parked on the Repo column
+        }
+
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("dialog must stay open in edit mode");
+        };
+        assert!(state.editing);
+        assert_eq!(
+            state.edit_column, 0,
+            "global-only fields must never be edited into the repo scope"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_do_not_change_row_while_editing() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![
+                config_row("agent", "claude", "", false, true, true),
+                config_row("runtime", "docker", "", false, true, false),
+            ]),
+        );
+
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("dialog must stay open");
+        };
+        assert!(state.editing);
+        assert_eq!(
+            state.selected, 0,
+            "row navigation must be frozen while an inline edit is active"
+        );
+    }
+
+    #[test]
+    fn enter_while_editing_sends_field_value_scope_response() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row("agent", "claude", "", false, true, true)]),
+        );
+
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // start editing (global col)
+        press_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE); // "claud"
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save
+
+        let resp = rx.try_recv().expect("save must send a dialog response");
+        match resp {
+            DialogResponse::Text(s) => assert_eq!(s, "agent\tclaud\tglobal"),
+            other => panic!("expected Text response, got {other:?}"),
+        }
+        assert!(
+            app.active_dialog.is_none(),
+            "dialog closes so the command \
+             loop can apply the edit and re-present the table"
+        );
+    }
+
+    #[test]
+    fn enter_while_editing_trims_whitespace_before_saving() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row(
+                "dynamicWorkflows.maxConcurrentSteps",
+                "",
+                "",
+                false,
+                false,
+                true,
+            )]),
+        );
+
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // start editing
+        for c in " 3 ".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save
+
+        let resp = rx.try_recv().expect("save must send a dialog response");
+        match resp {
+            DialogResponse::Text(s) => assert_eq!(
+                s, "dynamicWorkflows.maxConcurrentSteps\t3\trepo",
+                "stray whitespace must be trimmed so the value validates"
+            ),
+            other => panic!("expected Text response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_cancels_edit_and_clears_rejection_error() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![config_row(
+                "dynamicWorkflows.defaultLeader",
+                "",
+                "",
+                false,
+                false,
+                true,
+            )]),
+        );
+        if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+            state.editing = true;
+            state.error = Some("expected agent::model".to_string());
+        }
+
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("Esc during an edit must cancel the edit, not close the dialog");
+        };
+        assert!(!state.editing);
+        assert_eq!(
+            state.error, None,
+            "cancelling the edit must clear the stale rejection reason"
+        );
+    }
+
+    // ─── ConfigShow Ctrl+N add-mapping flow ──────────────────────────────────
+
+    #[test]
+    fn ctrl_n_starts_add_mapping_flow_and_esc_cancels_it() {
+        use crate::frontend::tui::dialogs::NewMapEntryPhase;
+
+        let mut app = make_app();
+        let _rx = setup_command_dialog(&mut app, config_show_dialog(vec![]));
+
+        press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        {
+            let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+                panic!("dialog must stay open");
+            };
+            assert_eq!(state.new_entry, Some(NewMapEntryPhase::Key));
+            assert!(state.editing, "text input must route to the inline editor");
+        }
+
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("Esc during the add flow must cancel the flow, not close the dialog");
+        };
+        assert_eq!(state.new_entry, None);
+        assert!(!state.editing);
+    }
+
+    #[test]
+    fn ctrl_n_flow_sends_repo_scoped_mapping_edit() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(&mut app, config_show_dialog(vec![]));
+
+        press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        for c in "maki".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // confirm key
+        for c in "model-a, model-b".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save mapping
+
+        let resp = rx.try_recv().expect("saving the mapping must respond");
+        match resp {
+            DialogResponse::Text(s) => assert_eq!(
+                s, "dynamicWorkflows.agentsToModels.maki\tmodel-a, model-b\trepo",
+                "the new mapping must be written to the repo scope"
+            ),
+            other => panic!("expected Text response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_n_flow_rejects_invalid_agent_name() {
+        use crate::frontend::tui::dialogs::NewMapEntryPhase;
+
+        let mut app = make_app();
+        let _rx = setup_command_dialog(&mut app, config_show_dialog(vec![]));
+
+        press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        for c in "bad name!".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("dialog must stay open");
+        };
+        assert_eq!(
+            state.new_entry,
+            Some(NewMapEntryPhase::Key),
+            "an invalid agent name must keep the flow in the key phase"
         );
         assert!(
-            app.active_dialog.is_some(),
-            "dialog must stay open after the toast"
+            app.status_bar.text.contains("not a valid agent name"),
+            "the status bar must explain the rejection: {}",
+            app.status_bar.text
         );
+    }
+
+    #[test]
+    fn ctrl_n_with_existing_agent_jumps_to_that_row_for_editing() {
+        let mut app = make_app();
+        let _rx = setup_command_dialog(
+            &mut app,
+            config_show_dialog(vec![
+                config_row("agent", "claude", "", false, true, true),
+                config_row(
+                    "dynamicWorkflows.agentsToModels.claude",
+                    "",
+                    "claude-opus-4-8",
+                    false,
+                    false,
+                    true,
+                ),
+            ]),
+        );
+
+        press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        for c in "claude".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("dialog must stay open");
+        };
+        assert_eq!(
+            state.new_entry, None,
+            "duplicate key must not open a new entry"
+        );
+        assert_eq!(state.selected, 1, "selection must jump to the existing row");
+        assert!(state.editing, "the existing row must open for editing");
+        assert_eq!(state.editor.text, "claude-opus-4-8");
     }
 
     // ─── ContainerWindow cycle / resize ──────────────────────────────────────

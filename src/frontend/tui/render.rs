@@ -155,7 +155,10 @@ fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
         .enumerate()
         .map(|(i, tab)| {
             let is_active = i == app.active_tab;
-            let project = tab.project_name();
+            // Measure with the untruncated project name so a wide terminal
+            // lets long names claim more width; `compute_tab_bar_width`
+            // still caps the result against the per-tab budget.
+            let project = tab.project_name(u16::MAX);
             // Title interior: `" ➡ {project} "` = project + 4 chars
             // (or `" {project} "` = project + 2 chars when not active);
             // we always size for the wider variant so the active toggle
@@ -184,7 +187,7 @@ fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
         let is_active = i == app.active_tab;
         let tab_area = Rect::new(x, area.y, tab_width, 3);
         let color = tab_color(tab);
-        let project = tab.project_name();
+        let project = tab.project_name(tab_width);
         let subcmd = tab.tab_subcommand_label(tab_width, is_active);
 
         let (border_style, title_style, content_style) = if is_active {
@@ -1787,11 +1790,46 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
     }
 }
 
+/// Render `text` with a visible `|` cursor at byte offset `cursor`, windowed
+/// to at most `max` characters so the cursor never scrolls out of a narrow
+/// table cell. `…` marks clipped content on either side.
+fn cursor_window(text: &str, cursor: usize, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let cursor = cursor.min(text.len());
+    let mut with_cursor = String::with_capacity(text.len() + 1);
+    with_cursor.push_str(&text[..cursor]);
+    with_cursor.push('|');
+    with_cursor.push_str(&text[cursor..]);
+    let chars: Vec<char> = with_cursor.chars().collect();
+    if chars.len() <= max {
+        return with_cursor;
+    }
+    let cursor_idx = text[..cursor].chars().count();
+    // Keep the cursor visible with a char of context to its right.
+    let start = cursor_idx
+        .saturating_sub(max.saturating_sub(2))
+        .min(chars.len() - max);
+    let mut window: Vec<char> = chars[start..start + max].to_vec();
+    if start > 0 {
+        window[0] = '\u{2026}';
+    }
+    if start + max < chars.len() {
+        let last = window.len() - 1;
+        window[last] = '\u{2026}';
+    }
+    window.into_iter().collect()
+}
+
 /// Render the config show dialog using a Ratatui `Table` widget.
+///
+/// The popup takes 90% of the terminal in both dimensions. The bottom pane
+/// shows the full (wrapped) value of the selected row — or the inline editor
+/// or the Ctrl+N add-mapping prompt — so long values are never lost to cell
+/// truncation.
 fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut Frame) {
-    let popup_width = area.width.saturating_sub(4).min(110);
-    let popup_height = area.height.saturating_sub(4).min(26);
-    let popup = dialogs::centered_fixed(popup_width, popup_height, area);
+    let popup = dialogs::centered_rect(90, 90, area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(" awman config ")
@@ -1802,28 +1840,92 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let bottom_height: u16 = if state.editing { 3 } else { 2 };
-    // A 2-row detail area shows the full (untruncated) value of the selected
-    // row, since table cells are truncated to their column width (WI-0095).
-    let detail_height: u16 = 2;
+    // ── Bottom pane content, computed first so its height can flex ──────
+    let editing_value = state.editing && state.new_entry.is_none();
+    let edit_buffer = || {
+        let text = &state.editor.text;
+        let cursor = state.editor.cursor.min(text.len());
+        format!("{}|{}", &text[..cursor], &text[cursor..])
+    };
+    let (detail_text, format_hint): (String, Option<String>) = match &state.new_entry {
+        Some(dialogs::NewMapEntryPhase::Key) => (
+            format!("  New model mapping \u{2014} agent name: {}", edit_buffer()),
+            Some("ASCII letters, digits, '-' and '_'".to_string()),
+        ),
+        Some(dialogs::NewMapEntryPhase::Value { key }) => (
+            format!(
+                "  dynamicWorkflows.agentsToModels.{key} = {}",
+                edit_buffer()
+            ),
+            Some("comma-separated model names".to_string()),
+        ),
+        None => match state.rows.get(state.selected) {
+            Some(row) if editing_value => {
+                let scope = if state.edit_column == 0 {
+                    "global"
+                } else {
+                    "repo"
+                };
+                (
+                    format!("  {} ({scope}) = {}", row.field, edit_buffer()),
+                    row.value_hint.clone(),
+                )
+            }
+            Some(row) => {
+                let full = if state.edit_column == 0 {
+                    &row.global
+                } else {
+                    &row.repo
+                };
+                let full = if full.is_empty() {
+                    &row.effective
+                } else {
+                    full
+                };
+                let text = if full.is_empty() {
+                    format!("  {} (no value set)", row.field)
+                } else {
+                    format!("  {} = {full}", row.field)
+                };
+                let text = if row.read_only {
+                    format!("{text}  [read-only]")
+                } else {
+                    text
+                };
+                (text, row.value_hint.clone())
+            }
+            None => (String::new(), None),
+        },
+    };
+
+    // The detail pane grows with its content (wrapped at the popup width) up
+    // to a third of the popup, so long values stay fully readable.
+    let detail_width = inner.width.max(1) as usize;
+    let detail_lines = detail_text.chars().count().div_ceil(detail_width).max(1) as u16;
+    let max_detail = (inner.height / 3).max(2);
+    let detail_height = detail_lines.clamp(2, max_detail);
+    let hint_height: u16 = 2;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
             Constraint::Length(detail_height),
-            Constraint::Length(bottom_height),
+            Constraint::Length(hint_height),
         ])
         .split(inner);
     let table_area = chunks[0];
     let detail_area = chunks[1];
     let hint_area = chunks[2];
 
-    // Column widths mirror the `widths` constraints below (28/24/24/24), minus
-    // the 3 single-cell gaps ratatui inserts between the 4 columns. Cell values
-    // are truncated to these widths so long values don't overflow.
+    // Column widths mirror the `widths` constraints below (34/22/22/22),
+    // minus the 3 single-cell gaps ratatui inserts between the 4 columns.
+    // Cell values are truncated to these widths so long values don't
+    // overflow; the Field column gets the largest share because dotted
+    // names (dynamicWorkflows.agentsToModels.<agent>) are the longest.
     let usable = table_area.width.saturating_sub(3) as u32;
-    let field_w = (usable * 28 / 100) as usize;
-    let col_w = (usable * 24 / 100) as usize;
+    let field_w = (usable * 34 / 100) as usize;
+    let col_w = (usable * 22 / 100) as usize;
 
     let header_style = Style::default()
         .fg(Color::Cyan)
@@ -1836,24 +1938,32 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
     ])
     .height(1);
 
+    // Window rows so the selection stays visible when the table has more
+    // rows than fit (e.g. dynamicWorkflows.agentsToModels.* expansions),
+    // mirroring the ListPicker windowing pattern above.
+    let visible = (table_area.height.saturating_sub(1)) as usize;
+    let start = state
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(state.rows.len().saturating_sub(visible));
+
     let rows: Vec<Row> = state
         .rows
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, row)| {
             let is_selected = i == state.selected;
+            let cell_editing = is_selected && editing_value;
 
-            let gval = if is_selected && state.editing && state.edit_column == 0 {
-                let ev = &state.editor.text;
-                let cursor = state.editor.cursor;
-                format!("{}|{}", &ev[..cursor], &ev[cursor..])
+            let gval = if cell_editing && state.edit_column == 0 {
+                cursor_window(&state.editor.text, state.editor.cursor, col_w)
             } else {
                 truncate_path(&row.global, col_w)
             };
-            let rval = if is_selected && state.editing && state.edit_column == 1 {
-                let ev = &state.editor.text;
-                let cursor = state.editor.cursor;
-                format!("{}|{}", &ev[..cursor], &ev[cursor..])
+            let rval = if cell_editing && state.edit_column == 1 {
+                cursor_window(&state.editor.text, state.editor.cursor, col_w)
             } else {
                 truncate_path(&row.repo, col_w)
             };
@@ -1865,7 +1975,7 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
                 } else {
                     (Cell::from(gval), Cell::from(rval).style(col_style))
                 }
-            } else if is_selected && state.editing {
+            } else if cell_editing {
                 let edit_style = Style::default().fg(Color::Black).bg(Color::Green);
                 if state.edit_column == 0 {
                     (Cell::from(gval).style(edit_style), Cell::from(rval))
@@ -1893,62 +2003,105 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
         .collect();
 
     let widths = [
-        Constraint::Percentage(28),
-        Constraint::Percentage(24),
-        Constraint::Percentage(24),
-        Constraint::Percentage(24),
+        Constraint::Percentage(34),
+        Constraint::Percentage(22),
+        Constraint::Percentage(22),
+        Constraint::Percentage(22),
     ];
     let table = Table::new(rows, widths).header(header);
     frame.render_widget(table, table_area);
 
-    // Detail line: full (untruncated) value of the focused column for the
-    // selected row, so truncated cells remain inspectable (WI-0095).
-    if let Some(row) = state.rows.get(state.selected) {
-        let full = if state.edit_column == 0 {
-            &row.global
-        } else {
-            &row.repo
-        };
-        let full = if full.is_empty() {
-            &row.effective
-        } else {
-            full
-        };
-        let detail = if full.is_empty() {
-            format!("  {} (no value set)", row.field)
-        } else {
-            format!("  {} = {full}", row.field)
-        };
-        frame.render_widget(
-            Paragraph::new(detail)
-                .style(Style::default().fg(Color::Gray))
-                .wrap(ratatui::widgets::Wrap { trim: false }),
-            detail_area,
-        );
-    }
+    let detail_style = if state.editing {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    frame.render_widget(
+        Paragraph::new(detail_text)
+            .style(detail_style)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        detail_area,
+    );
 
+    // Hint pane: one line with the rejection reason (when the last save
+    // attempt failed) or the field's expected value format, one line with
+    // the active key bindings.
     let mut hint_lines: Vec<Line> = Vec::new();
-    if state.editing {
-        hint_lines.push(Line::from(vec![
+    hint_lines.push(match &state.error {
+        Some(reason) => Line::from(Span::styled(
+            format!("  ✗ {reason}"),
+            Style::default().fg(Color::Red),
+        )),
+        None => Line::from(Span::styled(
+            match format_hint {
+                Some(hint) => format!("  {hint}"),
+                None => String::new(),
+            },
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )),
+    });
+    let key = |k: &str| Span::styled(k.to_string(), Style::default().fg(Color::Yellow));
+    hint_lines.push(match &state.new_entry {
+        Some(dialogs::NewMapEntryPhase::Key) => Line::from(vec![
+            Span::styled("  New mapping", Style::default().fg(Color::Green)),
+            Span::raw("  |  "),
+            key("Enter"),
+            Span::raw("=confirm agent  "),
+            key("Esc"),
+            Span::raw("=cancel"),
+        ]),
+        Some(dialogs::NewMapEntryPhase::Value { .. }) => Line::from(vec![
+            Span::styled("  New mapping", Style::default().fg(Color::Green)),
+            Span::raw("  |  "),
+            key("Enter"),
+            Span::raw("=save mapping  "),
+            key("Esc"),
+            Span::raw("=cancel"),
+        ]),
+        None if state.editing => Line::from(vec![
             Span::styled("  Editing", Style::default().fg(Color::Green)),
             Span::raw("  |  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            key("Enter"),
             Span::raw("=save  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::raw("=cancel"),
-        ]));
-    } else {
-        hint_lines.push(Line::from(vec![
-            Span::styled("  \u{2191}\u{2193}", Style::default().fg(Color::Yellow)),
-            Span::raw("=row  "),
-            Span::styled("\u{2190}\u{2192}", Style::default().fg(Color::Yellow)),
-            Span::raw("=col  "),
-            Span::styled("e", Style::default().fg(Color::Yellow)),
-            Span::raw("=edit  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::raw("=close"),
-        ]));
-    }
+            key("Esc"),
+            Span::raw("=cancel  "),
+            key("\u{2190}\u{2192}"),
+            Span::raw("=cursor  "),
+            key("Home/End"),
+            Span::raw("=jump"),
+        ]),
+        None => {
+            // The Ctrl+N add-mapping hint only makes sense on the
+            // agentsToModels rows; elsewhere it is noise.
+            let on_mapping_row = state
+                .rows
+                .get(state.selected)
+                .map(|r| {
+                    r.field == "dynamicWorkflows.agentsToModels"
+                        || r.field.starts_with("dynamicWorkflows.agentsToModels.")
+                })
+                .unwrap_or(false);
+            let mut spans = vec![
+                key("  \u{2191}\u{2193}"),
+                Span::raw("=row  "),
+                key("PgUp/PgDn"),
+                Span::raw("=page  "),
+                key("\u{2190}\u{2192}"),
+                Span::raw("=col  "),
+                key("Enter/e"),
+                Span::raw("=edit  "),
+            ];
+            if on_mapping_row {
+                spans.push(key("Ctrl+N"));
+                spans.push(Span::raw("=add model mapping  "));
+            }
+            spans.push(key("Esc"));
+            spans.push(Span::raw("=close"));
+            Line::from(spans)
+        }
+    });
     frame.render_widget(Paragraph::new(hint_lines), hint_area);
 }
 
@@ -2207,12 +2360,17 @@ mod tests {
                 global: String::new(),
                 repo: value.clone(),
                 effective: value.clone(),
-                read_only: true,
+                read_only: false,
+                global_writable: false,
+                repo_writable: true,
+                value_hint: None,
             }],
             selected: 0,
             editing: false,
             edit_column: 0,
             editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+            error: None,
+            new_entry: None,
         };
 
         let buf = render_to_buffer(140, 30, |area, frame| {
@@ -2240,6 +2398,304 @@ mod tests {
             "the full untruncated value must appear in the detail line when the row is \
              focused: {text}"
         );
+    }
+
+    #[test]
+    fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
+        // Reproduces the bug where dynamicWorkflows.agentsToModels rows (WI-0095),
+        // appended after ~20 other config rows, fell past the visible table
+        // height and were never rendered — the Table widget always started
+        // from row 0 with no scroll offset tied to `selected`.
+        fn build_rows(target_field: &str) -> Vec<dialogs::ConfigShowRow> {
+            let mut rows: Vec<dialogs::ConfigShowRow> = (0..20)
+                .map(|i| dialogs::ConfigShowRow {
+                    field: format!("field{i}"),
+                    global: String::new(),
+                    repo: "x".to_string(),
+                    effective: "x".to_string(),
+                    read_only: false,
+                    global_writable: true,
+                    repo_writable: true,
+                    value_hint: None,
+                })
+                .collect();
+            rows.push(dialogs::ConfigShowRow {
+                field: target_field.to_string(),
+                global: String::new(),
+                repo: "claude-opus-4-8, claude-sonnet-4-6".to_string(),
+                effective: "claude-opus-4-8, claude-sonnet-4-6".to_string(),
+                read_only: false,
+                global_writable: false,
+                repo_writable: true,
+                value_hint: None,
+            });
+            rows
+        }
+        let target_field = "dynamicWorkflows.agentsToModels.claude".to_string();
+        let last_index = build_rows(&target_field).len() - 1;
+
+        // Short terminal: fewer visible table rows than total rows, so the
+        // last row is off-screen until the selection scrolls down to it.
+        let state_unselected = dialogs::ConfigShowState {
+            rows: build_rows(&target_field),
+            selected: 0,
+            editing: false,
+            edit_column: 0,
+            editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+            error: None,
+            new_entry: None,
+        };
+        let buf = render_to_buffer(140, 20, |area, frame| {
+            render_config_show(&state_unselected, area, frame);
+        });
+        assert!(
+            !buffer_text(&buf).contains(&target_field),
+            "row should not be visible before scrolling to it"
+        );
+
+        let state_selected = dialogs::ConfigShowState {
+            rows: build_rows(&target_field),
+            selected: last_index,
+            editing: false,
+            edit_column: 0,
+            editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+            error: None,
+            new_entry: None,
+        };
+        let buf = render_to_buffer(140, 20, |area, frame| {
+            render_config_show(&state_selected, area, frame);
+        });
+        assert!(
+            buffer_text(&buf).contains(&target_field),
+            "selecting the last row must scroll it into view"
+        );
+    }
+
+    #[test]
+    fn config_show_popup_takes_90_percent_of_the_terminal() {
+        let state = dialogs::ConfigShowState {
+            rows: vec![],
+            selected: 0,
+            editing: false,
+            edit_column: 0,
+            editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+            error: None,
+            new_entry: None,
+        };
+        let buf = render_to_buffer(100, 40, |area, frame| {
+            render_config_show(&state, area, frame);
+        });
+        // 90% of 100x40 centered → the border starts near x=5, y=2 and the
+        // popup spans ~90 columns. Locate the rounded corner glyphs.
+        let text = buffer_text(&buf);
+        let top_line_idx = text
+            .lines()
+            .position(|l| l.contains('\u{256d}'))
+            .expect("popup top border must be present");
+        let top_line = text.lines().nth(top_line_idx).unwrap();
+        let left = top_line.find('\u{256d}').unwrap();
+        let right = top_line.rfind('\u{256e}').unwrap();
+        assert!(
+            top_line_idx <= 3,
+            "popup must start near the top (90% height), got row {top_line_idx}"
+        );
+        assert!(
+            right - left >= 85,
+            "popup must span ~90% of the width, got {} cols",
+            right - left
+        );
+    }
+
+    #[test]
+    fn config_show_editing_long_value_keeps_cursor_visible_in_cell() {
+        let long = "a".repeat(120);
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text(&long); // cursor at the end
+        let state = dialogs::ConfigShowState {
+            rows: vec![dialogs::ConfigShowRow {
+                field: "overlays".into(),
+                global: long.clone(),
+                repo: String::new(),
+                effective: long.clone(),
+                read_only: false,
+                global_writable: true,
+                repo_writable: true,
+                value_hint: None,
+            }],
+            selected: 0,
+            editing: true,
+            edit_column: 0,
+            editor,
+            error: None,
+            new_entry: None,
+        };
+        let buf = render_to_buffer(120, 30, |area, frame| {
+            render_config_show(&state, area, frame);
+        });
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("a|"),
+            "the cell must window the value around the cursor so it stays visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn config_show_add_mapping_prompts_render_per_phase() {
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text("maki");
+        let key_phase = dialogs::ConfigShowState {
+            rows: vec![],
+            selected: 0,
+            editing: true,
+            edit_column: 1,
+            editor,
+            error: None,
+            new_entry: Some(dialogs::NewMapEntryPhase::Key),
+        };
+        let text = buffer_text(&render_to_buffer(120, 30, |area, frame| {
+            render_config_show(&key_phase, area, frame);
+        }));
+        assert!(
+            text.contains("agent name: maki|"),
+            "key phase must prompt for the agent name with a cursor:\n{text}"
+        );
+
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text("model-a");
+        let value_phase = dialogs::ConfigShowState {
+            rows: vec![],
+            selected: 0,
+            editing: true,
+            edit_column: 1,
+            editor,
+            error: None,
+            new_entry: Some(dialogs::NewMapEntryPhase::Value { key: "maki".into() }),
+        };
+        let text = buffer_text(&render_to_buffer(120, 30, |area, frame| {
+            render_config_show(&value_phase, area, frame);
+        }));
+        assert!(
+            text.contains("dynamicWorkflows.agentsToModels.maki = model-a|"),
+            "value phase must show the pending field and model list:\n{text}"
+        );
+    }
+
+    #[test]
+    fn config_show_ctrl_n_hint_only_on_agents_to_models_rows() {
+        fn browse_state(field: &str) -> dialogs::ConfigShowState {
+            dialogs::ConfigShowState {
+                rows: vec![dialogs::ConfigShowRow {
+                    field: field.to_string(),
+                    global: String::new(),
+                    repo: "x".to_string(),
+                    effective: "x".to_string(),
+                    read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
+                }],
+                selected: 0,
+                editing: false,
+                edit_column: 0,
+                editor: crate::frontend::tui::text_edit::TextEdit::new(false),
+                error: None,
+                new_entry: None,
+            }
+        }
+
+        let unrelated = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+            render_config_show(&browse_state("agent"), area, frame);
+        }));
+        assert!(
+            !unrelated.contains("Ctrl+N"),
+            "the add-mapping hint must not show on rows unrelated to \
+             agentsToModels:\n{unrelated}"
+        );
+
+        for field in [
+            "dynamicWorkflows.agentsToModels",
+            "dynamicWorkflows.agentsToModels.claude",
+        ] {
+            let mapping = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+                render_config_show(&browse_state(field), area, frame);
+            }));
+            assert!(
+                mapping.contains("Ctrl+N"),
+                "the add-mapping hint must show on {field}:\n{mapping}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_show_renders_rejection_reason_over_format_hint() {
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text("claude");
+        let state = dialogs::ConfigShowState {
+            rows: vec![dialogs::ConfigShowRow {
+                field: "dynamicWorkflows.defaultLeader".to_string(),
+                global: String::new(),
+                repo: String::new(),
+                effective: String::new(),
+                read_only: false,
+                global_writable: false,
+                repo_writable: true,
+                value_hint: Some("agent::model".to_string()),
+            }],
+            selected: 0,
+            editing: true,
+            edit_column: 1,
+            editor,
+            error: Some("'claude' is not a valid leader; expected agent::model".to_string()),
+            new_entry: None,
+        };
+        let text = buffer_text(&render_to_buffer(140, 30, |area, frame| {
+            render_config_show(&state, area, frame);
+        }));
+        assert!(
+            text.contains("✗ 'claude' is not a valid leader; expected agent::model"),
+            "the rejection reason must be visible in the dialog:\n{text}"
+        );
+        assert!(
+            text.contains("claude|"),
+            "the rejected input must be preserved in the editor:\n{text}"
+        );
+    }
+
+    // ── cursor_window ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_window_short_text_is_untouched_with_cursor_inserted() {
+        assert_eq!(super::cursor_window("abc", 1, 10), "a|bc");
+    }
+
+    #[test]
+    fn cursor_window_clips_left_to_keep_cursor_visible() {
+        let text = "abcdefghij";
+        let out = super::cursor_window(text, text.len(), 6);
+        assert!(
+            out.ends_with("ij|"),
+            "cursor at the end must stay visible: {out:?}"
+        );
+        assert!(out.starts_with('\u{2026}'), "clipped left marked: {out:?}");
+        assert_eq!(out.chars().count(), 6);
+    }
+
+    #[test]
+    fn cursor_window_clips_right_when_cursor_at_start() {
+        let out = super::cursor_window("abcdefghij", 0, 6);
+        assert!(out.starts_with("|abcd"), "cursor first: {out:?}");
+        assert!(out.ends_with('\u{2026}'), "clipped right marked: {out:?}");
+        assert_eq!(out.chars().count(), 6);
+    }
+
+    #[test]
+    fn cursor_window_handles_multibyte_text() {
+        let text = "héllo wörld";
+        // Cursor after "héllo" (byte index of the space).
+        let cursor = text.find(' ').unwrap();
+        let out = super::cursor_window(text, cursor, 8);
+        assert!(out.contains('|'), "cursor must be present: {out:?}");
+        assert!(out.chars().count() <= 8);
     }
 
     #[test]

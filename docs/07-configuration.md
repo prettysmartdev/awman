@@ -163,7 +163,7 @@ awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
 awman config set dynamicWorkflows.maxConcurrentSteps 3
 ```
 
-`dynamicWorkflows.agentsToModels` is not settable via `config set`; edit `.awman/config.json` directly. See [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) for the full reference.
+`dynamicWorkflows.agentsToModels` is set one agent at a time — `awman config set dynamicWorkflows.agentsToModels.<agentName> "model-a, model-b"` (an empty value removes the mapping), or inline in the TUI config dialog where **Ctrl+N** adds a new mapping. See [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) for the full reference.
 
 ### Custom Dockerfile path
 
@@ -236,7 +236,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `agentStuckTimeout` | integer (seconds) | 30 | Inactivity period before an agent is flagged as stuck | yes |
 | `baseImage` | string | (unset → global) | Image tag for workflow setup/teardown containers — see [Workflows](05-workflows.md) | no (edit file) |
 | `dockerfile` | string | `Dockerfile.dev` | Path to the project base Dockerfile, relative to repo root or absolute | no (edit file) |
-| `dynamicWorkflows.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Restricts a dynamic workflow's leader to this agent/model set — see [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) | no (edit file) |
+| `dynamicWorkflows.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Restricts a dynamic workflow's leader to this agent/model set — see [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per agent as `dynamicWorkflows.agentsToModels.<agentName>` (comma-separated; empty value removes) |
 | `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
 | `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
 

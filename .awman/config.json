@@ -1,4 +1,17 @@
 {
   "agent": "claude",
-  "terminal_scrollback_lines": 7500
+  "terminal_scrollback_lines": 7500,
+  "dynamicWorkflows": {
+    "agentsToModels": {
+      "codex": [
+        "gpt-5.5"
+      ],
+      "claude": [
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "claude-fable-5"
+      ]
+    },
+    "defaultLeader": "claude::claude-fable-5"
+  }
 }

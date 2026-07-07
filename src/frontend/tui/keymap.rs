@@ -35,6 +35,8 @@ pub enum Action {
 
     // ── Dialog ──────────────────────────────────────────────────────────
     DismissDialog,
+    /// Ctrl+N in the config dialog: start the add-model-mapping flow.
+    NewMapEntry,
 
     // ── Text input ──────────────────────────────────────────────────────
     Char(char),
@@ -158,12 +160,15 @@ fn map_execution_window_key(key: KeyEvent, ctrl: bool) -> Action {
     }
 }
 
-fn map_dialog_key(key: KeyEvent, _ctrl: bool) -> Action {
+fn map_dialog_key(key: KeyEvent, ctrl: bool) -> Action {
     if key.code == KeyCode::Esc {
         return Action::DismissDialog;
     }
     match key.code {
-        KeyCode::Char(c) => Action::Char(c),
+        KeyCode::Char('n') if ctrl => Action::NewMapEntry,
+        // Other Ctrl chords must not fall through as literal characters
+        // (e.g. Ctrl+X inserting 'x' into an inline editor).
+        KeyCode::Char(c) if !ctrl => Action::Char(c),
         KeyCode::Enter => Action::SubmitCommand,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::Delete,
@@ -171,6 +176,8 @@ fn map_dialog_key(key: KeyEvent, _ctrl: bool) -> Action {
         KeyCode::End => Action::CursorEnd,
         KeyCode::Up => Action::ScrollUp,
         KeyCode::Down => Action::ScrollDown,
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Left => Action::CursorLeft,
         KeyCode::Right => Action::CursorRight,
         _ => Action::None,
@@ -586,6 +593,39 @@ mod tests {
     fn up_in_dialog_maps_to_scroll_up() {
         let action = map_key(key(KeyCode::Up, KeyModifiers::NONE), FocusContext::Dialog);
         assert_eq!(action, Action::ScrollUp);
+    }
+
+    #[test]
+    fn ctrl_n_in_dialog_maps_to_new_map_entry() {
+        let action = map_key(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_eq!(action, Action::NewMapEntry);
+    }
+
+    #[test]
+    fn page_keys_in_dialog_map_to_page_scroll() {
+        let action = map_key(
+            key(KeyCode::PageUp, KeyModifiers::NONE),
+            FocusContext::Dialog,
+        );
+        assert_eq!(action, Action::ScrollPageUp);
+        let action = map_key(
+            key(KeyCode::PageDown, KeyModifiers::NONE),
+            FocusContext::Dialog,
+        );
+        assert_eq!(action, Action::ScrollPageDown);
+    }
+
+    #[test]
+    fn ctrl_chords_in_dialog_do_not_insert_literal_chars() {
+        // A Ctrl chord must never leak its letter into an inline editor.
+        let action = map_key(
+            key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_ne!(action, Action::Char('x'));
     }
 
     // ── ContainerMaximized context ────────────────────────────────────────────
