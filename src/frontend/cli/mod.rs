@@ -307,6 +307,15 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::NotAvailableForFrontend { command, frontend } => {
             format!("command `{command}` is not available via the {frontend} frontend")
         }
+        // Session-creation validation errors (surfaced by multi-session
+        // frontends); their Display text is already user-appropriate.
+        CommandError::SessionInvalidType { .. }
+        | CommandError::SessionWorkdirRequired
+        | CommandError::SessionWorkdirUnresolvable { .. }
+        | CommandError::SessionWorkdirNotAllowed { .. }
+        | CommandError::SessionRepoUrlRequired
+        | CommandError::SessionRepoUrlEmpty
+        | CommandError::SessionRepoUrlInvalidScheme { .. } => err.to_string(),
     };
     format!("awman: {body}")
 }
@@ -351,7 +360,15 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::CommandBoxParse(_)
         | CommandError::InvalidOverlaySpec { .. }
         | CommandError::UnknownConfigField { .. }
-        | CommandError::InteractiveInputUnavailable { .. } => 2,
+        | CommandError::InteractiveInputUnavailable { .. }
+        // Session-creation validation failures are invalid-usage class.
+        | CommandError::SessionInvalidType { .. }
+        | CommandError::SessionWorkdirRequired
+        | CommandError::SessionWorkdirUnresolvable { .. }
+        | CommandError::SessionWorkdirNotAllowed { .. }
+        | CommandError::SessionRepoUrlRequired
+        | CommandError::SessionRepoUrlEmpty
+        | CommandError::SessionRepoUrlInvalidScheme { .. } => 2,
 
         // Exit 4 — missing referenced resource
         CommandError::WorkItemNotFound { .. }

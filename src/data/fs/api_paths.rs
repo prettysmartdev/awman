@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::error::DataError;
+use crate::data::session_setup_event::SessionSetupState;
 
 /// Filename of the API sqlite database.
 pub const API_DB_FILENAME: &str = "awman.db";
@@ -179,6 +180,11 @@ impl ApiPaths {
         self.session_dir(session_id)
     }
 
+    /// On-disk snapshot of a session's async setup progress.
+    pub fn session_setup_state_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("setup_state.json")
+    }
+
     /// Alias for `from_root` to match the legacy `at_root` naming.
     pub fn at_root(root: impl Into<PathBuf>) -> Self {
         Self::from_root(root)
@@ -187,6 +193,95 @@ impl ApiPaths {
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
         std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
+    }
+
+    // ── Session / command storage surface (Layer 0) ──────────────────────────
+    //
+    // These own every filesystem side-effect the API frontend previously
+    // performed inline. Frontends call them so no presentation layer touches
+    // `std::fs`/`tokio::fs` directly (grand-architecture Tenet 2).
+
+    /// Create the full per-session directory set idempotently: `jobs/`,
+    /// `commands/` (legacy, pre-WI-0079 clients), `worktree/`, and
+    /// `agent-settings/`. Creating `jobs/` first materializes the session
+    /// directory itself.
+    pub fn prepare_session_dirs(&self, session_id: &str) -> Result<(), DataError> {
+        let session_dir = self.session_dir(session_id);
+        for sub in ["jobs", "commands", "worktree", "agent-settings"] {
+            let dir = session_dir.join(sub);
+            std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
+        }
+        Ok(())
+    }
+
+    /// Create the output directory for a single command run.
+    pub fn prepare_command_dir(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<(), DataError> {
+        let dir = self.command_dir(session_id, command_id);
+        std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))
+    }
+
+    /// Persist a session's setup-progress snapshot to `setup_state.json`,
+    /// creating the session directory if needed (idempotent).
+    pub fn save_setup_state(
+        &self,
+        session_id: &str,
+        state: &SessionSetupState,
+    ) -> Result<(), DataError> {
+        let session_dir = self.session_dir(session_id);
+        std::fs::create_dir_all(&session_dir).map_err(|e| DataError::io(&session_dir, e))?;
+        let path = self.session_setup_state_path(session_id);
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|source| DataError::ConfigSerialize { source })?;
+        std::fs::write(&path, json).map_err(|e| DataError::io(&path, e))
+    }
+
+    /// Read and parse a session's `setup_state.json`. Returns `None` when the
+    /// file is absent or unparseable (callers fall back to the DB row).
+    pub fn read_setup_state(&self, session_id: &str) -> Option<SessionSetupState> {
+        let path = self.session_setup_state_path(session_id);
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str::<SessionSetupState>(&content).ok()
+    }
+
+    /// Read a command's `events.log` as raw NDJSON text. Returns `None` when
+    /// the file is absent or unreadable (equivalent to an empty log).
+    pub fn read_command_events_raw(&self, session_id: &str, command_id: &str) -> Option<String> {
+        let path = self.command_events_log_path(session_id, command_id);
+        std::fs::read_to_string(&path).ok()
+    }
+
+    /// Write a command's `metadata.json` (pretty-printed).
+    pub fn write_command_metadata(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<(), DataError> {
+        let path = self.command_metadata_path(session_id, command_id);
+        let json = serde_json::to_string_pretty(metadata)
+            .map_err(|source| DataError::ConfigSerialize { source })?;
+        std::fs::write(&path, json).map_err(|e| DataError::io(&path, e))
+    }
+
+    /// Read a command's persisted workflow state as raw JSON text. Returns
+    /// `Ok(None)` when no workflow state exists (the file is absent) and
+    /// `Err` for any other IO failure, so callers can distinguish "no
+    /// workflow" from "read failed".
+    pub fn read_command_workflow_state_raw(
+        &self,
+        session_id: &str,
+        command_id: &str,
+    ) -> Result<Option<String>, DataError> {
+        let path = self.command_workflow_state_path(session_id, command_id);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
     }
 }
 
@@ -230,5 +325,88 @@ mod tests {
         let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let paths = ApiPaths::from_env(&env).unwrap();
         assert_eq!(paths.root(), tmp.path().join("api"));
+    }
+
+    // ── Layer 0 storage methods (WI-0097 Finding C) ──────────────────────────
+
+    use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus};
+
+    #[test]
+    fn save_setup_state_round_trips_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+
+        let mut state = SessionSetupState::new();
+        state.status = SessionSetupStatus::RunningReady;
+        state.current_stage = Some("cloning".to_string());
+
+        paths.save_setup_state("sess-1", &state).expect("save");
+
+        // The file lands at the documented path.
+        assert!(paths.session_setup_state_path("sess-1").exists());
+
+        let read = paths.read_setup_state("sess-1").expect("read back state");
+        assert_eq!(read.status, SessionSetupStatus::RunningReady);
+        assert_eq!(read.current_stage.as_deref(), Some("cloning"));
+    }
+
+    #[test]
+    fn save_setup_state_creates_session_dir_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+        // No prior prepare_session_dirs — save must create the dir itself.
+        assert!(!paths.session_dir("fresh").exists());
+
+        paths
+            .save_setup_state("fresh", &SessionSetupState::new())
+            .expect("save into non-existent session dir");
+        assert!(paths.session_setup_state_path("fresh").exists());
+    }
+
+    #[test]
+    fn read_setup_state_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+        assert!(paths.read_setup_state("nope").is_none());
+    }
+
+    #[test]
+    fn prepare_session_dirs_creates_full_set_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+
+        // First call materializes the session dir and every subdir.
+        paths.prepare_session_dirs("s").expect("first prepare");
+        let session_dir = paths.session_dir("s");
+        for sub in ["jobs", "commands", "worktree", "agent-settings"] {
+            assert!(
+                session_dir.join(sub).is_dir(),
+                "prepare_session_dirs must create {sub}/"
+            );
+        }
+        assert_eq!(paths.session_worktree_dir("s"), session_dir.join("worktree"));
+        assert_eq!(
+            paths.session_agent_settings_dir("s"),
+            session_dir.join("agent-settings")
+        );
+
+        // Second call on the existing tree must succeed (idempotent).
+        paths
+            .prepare_session_dirs("s")
+            .expect("prepare_session_dirs must be idempotent");
+        for sub in ["jobs", "commands", "worktree", "agent-settings"] {
+            assert!(session_dir.join(sub).is_dir());
+        }
+    }
+
+    #[test]
+    fn prepare_command_dir_creates_command_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(tmp.path());
+
+        paths.prepare_command_dir("s", "c").expect("prepare command dir");
+        assert!(paths.command_dir("s", "c").is_dir());
+        // Idempotent.
+        paths.prepare_command_dir("s", "c").expect("idempotent");
     }
 }

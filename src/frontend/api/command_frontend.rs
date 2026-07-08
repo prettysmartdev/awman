@@ -41,6 +41,8 @@ use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
     WorktreeLifecycleFrontend,
 };
+use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
+use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::data::config::repo::WorkItemsConfig;
@@ -63,24 +65,16 @@ use crate::engine::workflow::actions::{
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
-/// Parsed flag/argument store populated from the HTTP request's `args` vector.
-#[derive(Debug)]
-struct ParsedArgs {
-    bools: HashMap<String, bool>,
-    strings: HashMap<String, String>,
-    strings_vec: HashMap<String, Vec<String>>,
-    paths: HashMap<String, PathBuf>,
-    enums: HashMap<String, String>,
-    u16s: HashMap<String, u16>,
-    usizes: HashMap<String, usize>,
-    args: HashMap<String, String>,
-    args_vec: HashMap<String, Vec<String>>,
-}
-
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    /// Typed flags/arguments parsed by Layer 2 (`CommandCatalogue::parse_raw_args`).
+    /// Empty when parsing failed; the error is surfaced via `parse_error`.
     parsed: ParsedArgs,
+    /// A structured parse error captured at construction time, if any. Every
+    /// `CommandFrontend` accessor returns it so Dispatch aborts the command
+    /// rather than running with silently-dropped flags. `None` on success.
+    parse_error: Option<CommandError>,
     event_bus: EventBusSender,
     line_buffer_stdout: String,
     line_buffer_stderr: String,
@@ -104,11 +98,25 @@ impl ApiDispatchFrontend {
     /// `event_bus` is the sender handle for emitting execution events.
     /// `subcommand` is the command path (e.g. "exec prompt" → ["exec", "prompt"]).
     /// `args` is the raw args vector from the HTTP request body.
+    ///
+    /// Parsing is delegated wholesale to Layer 2
+    /// ([`CommandCatalogue::parse_raw_args_with_profile`]): the API frontend
+    /// hands the raw HTTP strings straight to the catalogue and keeps no
+    /// parsing, type-coercion, or flag-default policy of its own (work item
+    /// 0097, Findings A + D). The `Api` frontend profile is what forces
+    /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
-        let parsed = parse_args_to_flags(subcommand, args);
+        let path: Vec<&str> = subcommand.split_whitespace().collect();
+        let (parsed, parse_error) = match CommandCatalogue::get()
+            .parse_raw_args_with_profile(&path, args, FrontendKind::Api)
+        {
+            Ok(parsed) => (parsed, None),
+            Err(e) => (ParsedArgs::default(), Some(e)),
+        };
 
         Self {
             parsed,
+            parse_error,
             event_bus,
             line_buffer_stdout: String::new(),
             line_buffer_stderr: String::new(),
@@ -188,153 +196,6 @@ impl Drop for ApiDispatchFrontend {
     }
 }
 
-/// Parse a raw args vector (CLI-style flags/positionals) into typed storage.
-fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
-    let mut bools = HashMap::new();
-    let mut strings = HashMap::new();
-    let mut strings_vec: HashMap<String, Vec<String>> = HashMap::new();
-    let mut paths = HashMap::new();
-    let mut enums = HashMap::new();
-    let mut u16s = HashMap::new();
-    let mut usizes = HashMap::new();
-    let mut positional_args = HashMap::new();
-    let positional_args_vec: HashMap<String, Vec<String>> = HashMap::new();
-
-    let mut i = 0;
-    let mut positionals: Vec<String> = Vec::new();
-    let mut after_double_dash = false;
-
-    while i < args.len() {
-        let arg = &args[i];
-
-        if arg == "--" {
-            after_double_dash = true;
-            i += 1;
-            continue;
-        }
-
-        if after_double_dash {
-            positionals.push(arg.clone());
-            i += 1;
-            continue;
-        }
-
-        if let Some(flag_name) = arg.strip_prefix("--") {
-            if let Some((key, val)) = flag_name.split_once('=') {
-                strings.insert(key.to_string(), val.to_string());
-                strings_vec
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(val.to_string());
-            } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                let next = &args[i + 1];
-                if next == "true" || next == "false" {
-                    bools.insert(flag_name.to_string(), next == "true");
-                } else if let Ok(n) = next.parse::<u16>() {
-                    u16s.insert(flag_name.to_string(), n);
-                    usizes.insert(flag_name.to_string(), n as usize);
-                    strings.insert(flag_name.to_string(), next.clone());
-                } else if let Ok(n) = next.parse::<usize>() {
-                    usizes.insert(flag_name.to_string(), n);
-                    strings.insert(flag_name.to_string(), next.clone());
-                } else {
-                    strings.insert(flag_name.to_string(), next.clone());
-                    strings_vec
-                        .entry(flag_name.to_string())
-                        .or_default()
-                        .push(next.clone());
-                    enums.insert(flag_name.to_string(), next.clone());
-                    paths.insert(flag_name.to_string(), PathBuf::from(next));
-                }
-                i += 1;
-            } else {
-                bools.insert(flag_name.to_string(), true);
-            }
-        } else {
-            positionals.push(arg.clone());
-        }
-        i += 1;
-    }
-
-    // Map positionals to argument names based on subcommand.
-    match subcommand {
-        "exec prompt" => {
-            if !positionals.is_empty() {
-                positional_args.insert("prompt".to_string(), positionals.join(" "));
-            }
-        }
-        "exec workflow" => {
-            if let Some(wf) = positionals.first() {
-                positional_args.insert("workflow".to_string(), wf.clone());
-                paths.insert("workflow".to_string(), PathBuf::from(wf));
-            }
-        }
-        "specs amend" => {
-            if let Some(wi) = positionals.first() {
-                positional_args.insert("work_item".to_string(), wi.clone());
-            }
-        }
-        "config get" => {
-            if let Some(f) = positionals.first() {
-                positional_args.insert("field".to_string(), f.clone());
-            }
-        }
-        "config set" => {
-            if let Some(f) = positionals.first() {
-                positional_args.insert("field".to_string(), f.clone());
-            }
-            if let Some(v) = positionals.get(1) {
-                positional_args.insert("value".to_string(), v.clone());
-            }
-        }
-        "remote exec workflow" => {
-            if let Some(wf) = positionals.first() {
-                positional_args.insert("workflow".to_string(), wf.clone());
-                paths.insert("workflow".to_string(), PathBuf::from(wf));
-            }
-        }
-        "remote exec prompt" => {
-            if !positionals.is_empty() {
-                positional_args.insert("prompt".to_string(), positionals.join(" "));
-            }
-        }
-        "remote session start" => {}
-        "remote session kill" => {
-            if let Some(s) = positionals.first() {
-                positional_args.insert("session_id".to_string(), s.clone());
-            }
-        }
-        _ => {
-            // For other commands, first positional is a generic argument.
-            if let Some(first) = positionals.first() {
-                positional_args.insert("prompt".to_string(), first.clone());
-            }
-        }
-    }
-
-    // --yolo and --non-interactive are always implied for API dispatch.
-    // Each command is invoked over HTTP — no human is attached to the
-    // worker's stdin even when the API server itself was launched in the
-    // foreground with a TTY. Forcing non_interactive=true keeps the engine
-    // from requesting a PTY for the agent container, which on Apple's
-    // `container` CLI surfaces as `ENOTTY` / "Inappropriate ioctl for
-    // device" when stdin is piped.
-    bools.insert("non-interactive".to_string(), true);
-    bools.insert("yolo".to_string(), true);
-
-    ParsedArgs {
-        bools,
-        strings,
-        strings_vec,
-        paths,
-        enums,
-        u16s,
-        usizes,
-        args: positional_args,
-        args_vec: positional_args_vec,
-    }
-}
-
 // ─── UserMessageSink ────────────────────────────────────────────────────────
 
 impl UserMessageSink for ApiDispatchFrontend {
@@ -356,9 +217,22 @@ impl UserMessageSink for ApiDispatchFrontend {
 
 // ─── CommandFrontend (flag/argument access) ─────────────────────────────────
 
+impl ApiDispatchFrontend {
+    /// Re-materialize the construction-time parse error, if any. The first
+    /// accessor Dispatch calls returns this so a malformed request aborts the
+    /// command instead of running with silently-dropped flags.
+    fn check_parse(&self) -> Result<(), CommandError> {
+        match &self.parse_error {
+            None => Ok(()),
+            Some(e) => Err(clone_parse_error(e)),
+        }
+    }
+}
+
 impl CommandFrontend for ApiDispatchFrontend {
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
-        Ok(self.parsed.bools.get(flag).copied())
+        self.check_parse()?;
+        Ok(self.parsed.flag_bool(flag))
     }
 
     fn flag_string(
@@ -366,7 +240,8 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        Ok(self.parsed.strings.get(flag).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.flag_string(flag))
     }
 
     fn flag_strings(
@@ -374,12 +249,8 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Vec<String>, CommandError> {
-        Ok(self
-            .parsed
-            .strings_vec
-            .get(flag)
-            .cloned()
-            .unwrap_or_default())
+        self.check_parse()?;
+        Ok(self.parsed.flag_strings(flag))
     }
 
     fn flag_path(
@@ -387,7 +258,8 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<PathBuf>, CommandError> {
-        Ok(self.parsed.paths.get(flag).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.flag_path(flag))
     }
 
     fn flag_enum(
@@ -395,11 +267,13 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        Ok(self.parsed.enums.get(flag).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.flag_enum(flag))
     }
 
     fn flag_u16(&self, _command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
-        Ok(self.parsed.u16s.get(flag).copied())
+        self.check_parse()?;
+        Ok(self.parsed.flag_u16(flag))
     }
 
     fn flag_usize(
@@ -407,15 +281,57 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<usize>, CommandError> {
-        Ok(self.parsed.usizes.get(flag).copied())
+        self.check_parse()?;
+        Ok(self.parsed.flag_usize(flag))
     }
 
     fn argument(&self, _command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
-        Ok(self.parsed.args.get(name).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.argument(name))
     }
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
-        Ok(self.parsed.args_vec.get(name).cloned().unwrap_or_default())
+        self.check_parse()?;
+        Ok(self.parsed.arguments(name))
+    }
+}
+
+/// Reconstruct a parse-stage [`CommandError`] so accessors can return it more
+/// than once from `&self` (the type is not `Clone` because it wraps engine/data
+/// errors, but the parse-stage variants carry only owned string data).
+fn clone_parse_error(e: &CommandError) -> CommandError {
+    match e {
+        CommandError::UnknownCommand { path } => {
+            CommandError::UnknownCommand { path: path.clone() }
+        }
+        CommandError::UnknownFlag { command, flag } => CommandError::UnknownFlag {
+            command: command.clone(),
+            flag: flag.clone(),
+        },
+        CommandError::InvalidFlagValue {
+            command,
+            flag,
+            reason,
+        } => CommandError::InvalidFlagValue {
+            command: command.clone(),
+            flag: flag.clone(),
+            reason: reason.clone(),
+        },
+        CommandError::MissingRequiredFlag { command, flag } => {
+            CommandError::MissingRequiredFlag {
+                command: command.clone(),
+                flag: flag.clone(),
+            }
+        }
+        CommandError::MissingRequiredArgument { command, argument } => {
+            CommandError::MissingRequiredArgument {
+                command: command.clone(),
+                argument: argument.clone(),
+            }
+        }
+        // parse_raw_args only produces the variants above; anything else is
+        // rendered to a stable string so the command still aborts cleanly.
+        other => CommandError::Other(other.to_string()),
     }
 }
 
@@ -1165,8 +1081,10 @@ mod tests {
     }
 
     #[test]
-    fn flag_bool_with_explicit_true_value() {
-        let f = make_frontend("chat", &["--background", "true"]);
+    fn flag_bool_presence_sets_true() {
+        // Bools are `SetTrue` (clap parity): presence implies true; no value
+        // token is consumed. `--background` is a real flag on `api start`.
+        let f = make_frontend("api start", &["--background"]);
         assert_eq!(
             f.flag_bool(&["api", "start"], "background").unwrap(),
             Some(true)
@@ -1174,38 +1092,42 @@ mod tests {
     }
 
     #[test]
-    fn flag_bool_with_explicit_false_value() {
-        let f = make_frontend("chat", &["--background", "false"]);
-        assert_eq!(
-            f.flag_bool(&["api", "start"], "background").unwrap(),
-            Some(false)
-        );
+    fn unknown_flag_surfaces_structured_error_from_accessor() {
+        // Catalogue-driven parsing rejects an undeclared flag rather than
+        // silently dropping it; the error surfaces on the first accessor call.
+        let f = make_frontend("exec prompt", &["--not-a-real-flag"]);
+        let err = f.flag_bool(&["exec", "prompt"], "yolo").unwrap_err();
+        assert!(matches!(err, CommandError::UnknownFlag { .. }));
     }
 
     // ─── flag_string ──────────────────────────────────────────────────────────
 
     #[test]
     fn flag_string_parses_value_after_flag() {
-        let f = make_frontend("chat", &["--session", "sess-123"]);
+        let f = make_frontend("exec prompt", &["--agent", "claude"]);
         assert_eq!(
-            f.flag_string(&["chat"], "session").unwrap().as_deref(),
-            Some("sess-123")
+            f.flag_string(&["exec", "prompt"], "agent")
+                .unwrap()
+                .as_deref(),
+            Some("claude")
         );
     }
 
     #[test]
     fn flag_string_parses_equals_syntax() {
-        let f = make_frontend("chat", &["--session=sess-456"]);
+        let f = make_frontend("exec prompt", &["--agent=claude"]);
         assert_eq!(
-            f.flag_string(&["chat"], "session").unwrap().as_deref(),
-            Some("sess-456")
+            f.flag_string(&["exec", "prompt"], "agent")
+                .unwrap()
+                .as_deref(),
+            Some("claude")
         );
     }
 
     #[test]
     fn flag_string_absent_returns_none() {
-        let f = make_frontend("chat", &[]);
-        assert_eq!(f.flag_string(&["chat"], "session").unwrap(), None);
+        let f = make_frontend("exec prompt", &[]);
+        assert_eq!(f.flag_string(&["exec", "prompt"], "agent").unwrap(), None);
     }
 
     // ─── flag_u16 ─────────────────────────────────────────────────────────────

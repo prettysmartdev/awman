@@ -167,9 +167,7 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     // a setup_state.json for the /status endpoint's disk fallback path so
     // that the failure reason is visible to clients.
     {
-        use crate::data::session_setup_event::{
-            SessionSetupError, SessionSetupState, SessionSetupStatus,
-        };
+        use crate::data::session_setup_event::{SessionSetupError, SessionSetupStatus};
         if let Ok(records) = store.list_sessions_with_in_progress_setup() {
             for rec in &records {
                 tracing::warn!(
@@ -179,30 +177,25 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
                 );
                 let _ = store.update_setup_status(&rec.id, "failed");
 
-                // Clean up any partial clone for remote sessions.
+                // Clean up any partial clone for remote sessions (Layer 1).
                 if rec.session_type == "remote" {
                     if let Some(cloned) = rec.cloned_path.as_deref() {
-                        let _ = std::fs::remove_dir_all(cloned);
+                        let _ = engines
+                            .git_engine
+                            .delete_directory(&std::path::PathBuf::from(cloned));
                     }
                 }
 
                 // Update or create setup_state.json so /status reflects the
-                // restart failure once the in-memory bus is gone.
-                let setup_path = api_paths.session_dir(&rec.id).join("setup_state.json");
-                let mut ss: SessionSetupState = std::fs::read_to_string(&setup_path)
-                    .ok()
-                    .and_then(|c| serde_json::from_str::<SessionSetupState>(&c).ok())
-                    .unwrap_or_default();
+                // restart failure once the in-memory bus is gone (Layer 0).
+                let mut ss = api_paths.read_setup_state(&rec.id).unwrap_or_default();
                 ss.status = SessionSetupStatus::Failed;
                 ss.current_stage = Some("Server restarted during session setup".to_string());
                 ss.error = Some(SessionSetupError {
                     stage: "server_restart".to_string(),
                     message: "Server restarted during session setup".to_string(),
                 });
-                if let Ok(json) = serde_json::to_string_pretty(&ss) {
-                    let _ = std::fs::create_dir_all(api_paths.session_dir(&rec.id));
-                    let _ = std::fs::write(&setup_path, json);
-                }
+                let _ = api_paths.save_setup_state(&rec.id, &ss);
             }
         }
     }

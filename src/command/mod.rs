@@ -8,8 +8,12 @@
 pub mod commands;
 pub mod dispatch;
 pub mod error;
+pub mod session_create;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
+pub use session_create::{
+    SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest, DEFAULT_REPO_URL_SCHEMES,
+};
 pub use dispatch::{
     BuiltCommand, CommandFrontend, CommandOutcome, Dispatch, DispatchFrontend, Engines,
     ParsedCommandBoxInput,

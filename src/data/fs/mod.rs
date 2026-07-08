@@ -4,6 +4,7 @@
 //! object here. Higher layers consume these types; they never call
 //! `std::fs::*` or `rusqlite::*` directly.
 
+pub mod api_command_log;
 pub mod api_db;
 pub mod api_paths;
 pub mod api_process;

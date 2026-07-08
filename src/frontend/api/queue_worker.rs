@@ -9,6 +9,7 @@ use super::command_frontend::ApiDispatchFrontend;
 use super::event_bus::EventBus;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::execution_event::EventPayload;
+use crate::data::fs::api_command_log::CommandLogWriter;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::Session;
@@ -85,9 +86,8 @@ impl QueueWorker {
             "Worker executing command"
         );
 
-        // Create command directory.
-        let cmd_dir = self.paths.command_dir(&session_id, &command_id);
-        if let Err(e) = tokio::fs::create_dir_all(&cmd_dir).await {
+        // Create command directory (Layer 0).
+        if let Err(e) = self.paths.prepare_command_dir(&session_id, &command_id) {
             tracing::error!(
                 command_id = %command_id,
                 error = %e,
@@ -104,9 +104,7 @@ impl QueueWorker {
             return;
         }
 
-        let log_path = cmd_dir.join("output.log");
-
-        // Write initial metadata.
+        // Write initial metadata (Layer 0).
         {
             let metadata = serde_json::json!({
                 "command_id": command_id,
@@ -116,50 +114,41 @@ impl QueueWorker {
                 "started_at": cmd.started_at,
                 "worker_id": self.worker_id,
             });
-            let meta_path = self.paths.command_metadata_path(&session_id, &command_id);
-            let _ = tokio::fs::write(
-                &meta_path,
-                serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-            )
-            .await;
+            let _ = self
+                .paths
+                .write_command_metadata(&session_id, &command_id, &metadata);
         }
 
         // Create EventBus for this command execution.
         let event_bus = Arc::new(EventBus::new(4096));
 
-        // Spawn logfile writer task.
+        // Spawn logfile writer task. The two log files are owned by a Layer 0
+        // writer so this frontend performs no filesystem calls of its own.
         {
             let mut log_rx = event_bus.subscribe();
-            let events_log_path = self.paths.command_events_log_path(&session_id, &command_id);
-            let output_log_path = log_path.clone();
+            let paths = self.paths.clone();
+            let session_id_for_log = session_id.clone();
+            let command_id_for_log = command_id.clone();
             tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let mut events_file = match tokio::fs::File::create(&events_log_path).await {
-                    Ok(f) => f,
+                let mut writer = match CommandLogWriter::create(
+                    &paths,
+                    &session_id_for_log,
+                    &command_id_for_log,
+                )
+                .await
+                {
+                    Ok(w) => w,
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to create events.log");
-                        return;
-                    }
-                };
-                let mut output_file = match tokio::fs::File::create(&output_log_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to create output.log");
+                        tracing::error!(error = %e, "Failed to create command log files");
                         return;
                     }
                 };
                 loop {
                     match log_rx.recv().await {
                         Ok(event) => {
-                            if let Ok(json) = serde_json::to_string(&event) {
-                                let _ = events_file.write_all(format!("{json}\n").as_bytes()).await;
-                            }
-                            if let Some(text) = event.payload.to_plain_text() {
-                                let _ = output_file.write_all(format!("{text}\n").as_bytes()).await;
-                            }
+                            writer.write_event(&event).await;
                             if matches!(event.payload, EventPayload::Done) {
-                                let _ = events_file.flush().await;
-                                let _ = output_file.flush().await;
+                                writer.flush().await;
                                 break;
                             }
                         }
@@ -317,12 +306,9 @@ impl QueueWorker {
                 "status": status,
                 "worker_id": self.worker_id,
             });
-            let meta_path = self.paths.command_metadata_path(&session_id, &command_id);
-            let _ = tokio::fs::write(
-                &meta_path,
-                serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-            )
-            .await;
+            let _ = self
+                .paths
+                .write_command_metadata(&session_id, &command_id, &metadata);
         }
 
         self.cleanup_event_bus(&command_id).await;

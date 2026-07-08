@@ -916,10 +916,22 @@ curl -s -X POST http://localhost:9876/v1/commands \
 Returns immediately with a command UUID — the command is **enqueued** and execution is asynchronous:
 
 ```json
-{ "command_id": "e5f6a7b8-..." }
+{
+  "command_id": "e5f6a7b8-...",
+  "flags_applied": { "yolo": true, "non_interactive": true }
+}
 ```
 
 The command begins executing as soon as a worker claims it from the queue. **At most one command per session runs at any given time** — commands within a session are processed sequentially in FIFO order. If a command is already running, subsequent commands are queued and wait their turn (they do not block the API request).
+
+**`flags_applied`:** Every `POST /v1/commands` response reports the same two API-profile flag defaults, so the behavior isn't a hidden surprise. They only take effect for commands that actually accept the corresponding flag (`chat`, `exec prompt`, `exec workflow`); for other subcommands the field is informational and doesn't change anything.
+
+| Flag | Behavior |
+|------|----------|
+| `non_interactive` | `true`. HTTP workers have no attached terminal, so a command that accepts `--non-interactive` always runs in print/batch mode — this cannot be turned off. |
+| `yolo` | `true` by default for a command that accepts `--yolo`. It's a default, not a forced override: if your request's `args` already specifies a value for the flag, yours is kept instead. See [Yolo Mode](06-yolo-mode.md) for what running with `--yolo` means — auto-approved actions, stuck-step auto-advance, and so on. |
+
+This has always been awman's behavior for commands dispatched through the API; `flags_applied` documents it explicitly rather than leaving it as an undocumented side effect of dispatch.
 
 Error responses:
 
@@ -979,6 +991,17 @@ Returns the current status and metadata for a command:
   "error": null
 }
 ```
+
+**Malformed `args`:** `POST /v1/commands` enqueues the command and returns 202 without validating the flags/positionals in `args` against the target command's catalogue — that check happens once a worker claims the command. If `args` contains a flag the command doesn't declare, or an invalid value for a typed flag (e.g. a non-numeric `--work-item`), the command still reaches `status: "error"` with `exit_code: 1` and a `result.error` describing the problem, for example:
+
+```json
+{
+  "exit_code": 1,
+  "error": "unknown flag 'not-a-real-flag' for command [\"exec\", \"prompt\"]"
+}
+```
+
+Poll `GET /v1/commands/{id}` (or the log stream) to see this — it is not returned synchronously from the `POST /v1/commands` call.
 
 #### Get command logs
 
@@ -1431,6 +1454,7 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | `GET /v1/sessions/:id/queue` — session has no commands | HTTP 200; returns `queue_depth: 0`, `running: null`, empty arrays for `queued` and `recent_completed` |
 | `GET /v1/sessions/:id/queue` — command is `pending` (queued but not yet claimed) | Appears in the `queued` array with a `position` indicating its place in the queue (0-indexed) |
 | `POST /v1/commands` with workflow file that doesn't exist | Command is enqueued; when the worker executes it, it fails with an error in the `result` field and status becomes `error` |
+| `POST /v1/commands` with an unknown flag or invalid flag value in `args` | Command is enqueued (202); the flags aren't checked against the command's catalogue until a worker claims it, at which point it fails with `status: "error"`, `exit_code: 1`, and a descriptive `result.error` |
 
 ---
 

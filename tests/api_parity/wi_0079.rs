@@ -679,7 +679,7 @@ async fn real_network_post_commands_enqueues_with_status_queued() {
         .header("x-awman-session", "sess-enqueue")
         .json(&serde_json::json!({
             "subcommand": "exec prompt",
-            "args": ["--prompt", "hello"]
+            "args": ["hello"]
         }))
         .send()
         .await
@@ -2170,7 +2170,7 @@ async fn real_network_post_after_delete_is_rejected() {
         .header("x-awman-session", sess_id)
         .json(&serde_json::json!({
             "subcommand": "exec prompt",
-            "args": ["--prompt", "hi"],
+            "args": ["hi"],
         }))
         .send()
         .await

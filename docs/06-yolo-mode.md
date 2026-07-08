@@ -40,6 +40,12 @@ This implies `--worktree` automatically (see below).
 
 ---
 
+## Default when dispatched through the API
+
+Commands submitted through the HTTP API (`POST /v1/commands`) run with `--yolo` applied by default for `chat`, `exec prompt`, and `exec workflow` — the server assumes unattended, fully autonomous execution unless your request already specifies a different value for the flag. This is a longstanding behavior of API mode, not something you opt into per request. The `POST /v1/commands` response includes a `flags_applied` field confirming which defaults were used; see [API Mode: Submit a command](09-api-mode.md#submit-a-command).
+
+---
+
 ## What `--yolo` does
 
 ### 1. Skips all agent permission prompts

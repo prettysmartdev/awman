@@ -696,8 +696,12 @@ const EXEC_PROMPT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "prompt",
+        // Greedy trailing positional: every remaining token joins into one
+        // prompt string. Declaring it here keeps the "join positionals with
+        // spaces" behavior spec-driven across all frontends instead of a
+        // per-frontend special case (work item 0097, Finding A).
         help: "The prompt text to send to the agent.",
-        kind: ArgumentKind::String,
+        kind: ArgumentKind::TrailingVarArgs,
         optional: true,
     }],
     flags: &EXEC_PROMPT_FLAGS,
@@ -901,8 +905,10 @@ const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "prompt",
+        // Greedy trailing positional (see EXEC_PROMPT): joins remaining tokens
+        // into one prompt string, spec-driven for every frontend.
         help: "The prompt text to send to the agent.",
-        kind: ArgumentKind::String,
+        kind: ArgumentKind::TrailingVarArgs,
         optional: false,
     }],
     flags: &REMOTE_EXEC_PROMPT_FLAGS,
@@ -1800,7 +1806,11 @@ mod tests {
         let prompt = cat.lookup(&["remote", "exec", "prompt"]).unwrap();
         assert_eq!(prompt.arguments.len(), 1);
         assert_eq!(prompt.arguments[0].name, "prompt");
-        assert!(matches!(prompt.arguments[0].kind, ArgumentKind::String));
+        // Greedy trailing positional so multi-word prompts join spec-driven.
+        assert!(matches!(
+            prompt.arguments[0].kind,
+            ArgumentKind::TrailingVarArgs
+        ));
     }
 
     // ─── Data-table tests ─────────────────────────────────────────────────────

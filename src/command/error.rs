@@ -108,6 +108,34 @@ pub enum CommandError {
     #[error("no API key configured; run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`")]
     ApiServerAuthMissing,
 
+    // ── Session creation (multi-session frontends: API, future desktop, …) ──
+    // Typed so that a frontend can map each to the right transport status
+    // (e.g. HTTP 400 vs 403) without inspecting the message string. Display
+    // text is kept byte-identical to the previous inline API responses.
+    #[error("session_type must be 'local' or 'remote'; got '{got}'")]
+    SessionInvalidType { got: String },
+
+    #[error("workdir is required when session_type is 'local'")]
+    SessionWorkdirRequired,
+
+    #[error("Cannot resolve path: {path}")]
+    SessionWorkdirUnresolvable { path: String },
+
+    #[error("Workdir '{requested}' is not in the allowlist. Allowed: {allowed:?}")]
+    SessionWorkdirNotAllowed {
+        requested: String,
+        allowed: Vec<String>,
+    },
+
+    #[error("repo_url is required when session_type is 'remote'")]
+    SessionRepoUrlRequired,
+
+    #[error("repo_url must be non-empty")]
+    SessionRepoUrlEmpty,
+
+    #[error("repo_url must use http(s), ssh, or git scheme")]
+    SessionRepoUrlInvalidScheme { url: String },
+
     // ── Remote ────────────────────────────────────────────────────────────
     #[error("no remote session id; pass --session <id> or run `awman remote session start`")]
     RemoteSessionMissing,

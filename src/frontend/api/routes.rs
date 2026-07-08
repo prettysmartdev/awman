@@ -20,11 +20,13 @@ use tower_http::trace::TraceLayer;
 
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::Engines;
+use crate::command::error::CommandError;
+use crate::command::session_create::{SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest};
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
-use crate::data::fs::api_db::SqliteSessionStore;
+use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
-use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus, SetupEventPayload};
+use crate::data::session_setup_event::{SessionSetupStatus, SetupEventPayload};
 use crate::frontend::api::event_bus::EventBus;
 use crate::frontend::api::session_setup::{log_session_setup, SessionSetupBus, TracingSetupSink};
 
@@ -174,6 +176,17 @@ fn error_json(msg: impl Into<String>) -> Json<ErrorResponse> {
     Json(ErrorResponse { error: msg.into() })
 }
 
+/// Map a session-creation validation error to its HTTP status. This is the
+/// ONLY session-creation logic that remains in the frontend — the transport
+/// mapping. An off-allowlist workdir is a 403 (the path exists but the caller
+/// is not permitted to use it); every other validation failure is a 400.
+fn session_create_error_status(err: &CommandError) -> StatusCode {
+    match err {
+        CommandError::SessionWorkdirNotAllowed { .. } => StatusCode::FORBIDDEN,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -286,109 +299,38 @@ async fn handle_create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Response {
-    let session_type = body
-        .session_type
-        .as_deref()
-        .unwrap_or("local")
-        .to_lowercase();
-
-    // Resolve the target workdir based on session type. For local sessions the
-    // workdir comes from the request body; for remote sessions we plan to clone
-    // into a server-managed path under the session directory.
     let session_id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
     let session_dir = state.paths.session_dir(&session_id);
 
-    let (resolved_workdir, cloned_path, repo_url, branch) = match session_type.as_str() {
-        "local" => {
-            let Some(ref workdir_in) = body.workdir else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    error_json("workdir is required when session_type is 'local'"),
-                )
-                    .into_response();
-            };
-            let requested = match std::fs::canonicalize(workdir_in) {
-                Ok(p) => p,
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        error_json(format!("Cannot resolve path: {workdir_in}")),
-                    )
-                        .into_response();
-                }
-            };
-            if !state.workdirs.contains(&requested) {
-                let allowed: Vec<String> = state
-                    .workdirs
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect();
-                return (
-                    StatusCode::FORBIDDEN,
-                    error_json(format!(
-                        "Workdir '{}' is not in the allowlist. Allowed: {:?}",
-                        requested.display(),
-                        allowed
-                    )),
-                )
-                    .into_response();
-            }
-            (requested, None, None, None)
-        }
-        "remote" => {
-            let Some(repo_url) = body.repo_url.clone() else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    error_json("repo_url is required when session_type is 'remote'"),
-                )
-                    .into_response();
-            };
-            if repo_url.trim().is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    error_json("repo_url must be non-empty"),
-                )
-                    .into_response();
-            }
-            // Validate URL scheme; reject `file:` schemes when the resulting
-            // path would escape the API root. We intentionally permit only
-            // http(s) and git(+ssh) URLs — the typical remote setup.
-            let lower = repo_url.to_lowercase();
-            let scheme_ok = lower.starts_with("http://")
-                || lower.starts_with("https://")
-                || lower.starts_with("git@")
-                || lower.starts_with("ssh://")
-                || lower.starts_with("git://");
-            if !scheme_ok {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    error_json("repo_url must use http(s), ssh, or git scheme"),
-                )
-                    .into_response();
-            }
-            let folder = repo_folder_from_url(&repo_url);
-            let cloned = session_dir.join(&folder);
-            (
-                cloned.clone(),
-                Some(cloned),
-                Some(repo_url),
-                body.branch.clone(),
-            )
-        }
-        other => {
+    // Validate and plan the session in Layer 2. The route only maps the typed
+    // result/error to an HTTP status + JSON envelope — no business logic here.
+    let request = SessionCreateRequest {
+        session_type: body.session_type,
+        workdir: body.workdir,
+        repo_url: body.repo_url,
+        branch: body.branch,
+    };
+    let policy = SessionCreatePolicy::new(state.workdirs.clone(), session_dir.clone());
+    let SessionCreatePlan {
+        session_type,
+        resolved_workdir,
+        cloned_path,
+        repo_url,
+        branch,
+    } = match request.validate(&policy) {
+        Ok(plan) => plan,
+        Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
-                error_json(format!(
-                    "session_type must be 'local' or 'remote'; got '{other}'"
-                )),
+                session_create_error_status(&e),
+                error_json(e.to_string()),
             )
                 .into_response();
         }
     };
 
-    // Create session storage directory.
-    if let Err(e) = tokio::fs::create_dir_all(session_dir.join("jobs")).await {
+    // Create session storage directories (Layer 0).
+    if let Err(e) = state.paths.prepare_session_dirs(&session_id) {
         tracing::error!(error = %e, "Failed to create session directory");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -396,10 +338,6 @@ async fn handle_create_session(
         )
             .into_response();
     }
-    // Legacy "commands" dir for backward compat with pre-WI-0079 clients.
-    let _ = tokio::fs::create_dir_all(session_dir.join("commands")).await;
-    let _ = tokio::fs::create_dir_all(session_dir.join("worktree")).await;
-    let _ = tokio::fs::create_dir_all(session_dir.join("agent-settings")).await;
 
     // Persist the session row with setup_status='initializing' BEFORE spawning
     // the setup task. If the server restarts mid-setup we want the cleanup
@@ -464,85 +402,6 @@ struct SessionSetupPlan {
     cloned_path: Option<std::path::PathBuf>,
     repo_url: Option<String>,
     branch: Option<String>,
-}
-
-/// Derive a safe folder name for the clone target from a repo URL.
-///
-/// The folder is used as the on-disk repo name under `<session>/`, which in
-/// turn drives the `awman-<repo>:latest` image tag (see `data::image_tags`).
-/// Returning a per-repo name avoids cross-session image collisions when the
-/// API server hosts multiple remote sessions.
-fn repo_folder_from_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
-    let safe: String = last
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .collect();
-    if safe.is_empty() || safe == "." || safe == ".." {
-        "repo".to_string()
-    } else {
-        safe
-    }
-}
-
-#[cfg(test)]
-mod repo_folder_tests {
-    use super::repo_folder_from_url;
-
-    #[test]
-    fn https_url_with_dot_git() {
-        assert_eq!(
-            repo_folder_from_url("https://github.com/cohix/somerepo.git"),
-            "somerepo"
-        );
-    }
-
-    #[test]
-    fn https_url_without_dot_git() {
-        assert_eq!(
-            repo_folder_from_url("https://github.com/cohix/somerepo"),
-            "somerepo"
-        );
-    }
-
-    #[test]
-    fn scp_style_ssh_url() {
-        assert_eq!(
-            repo_folder_from_url("git@github.com:cohix/somerepo.git"),
-            "somerepo"
-        );
-    }
-
-    #[test]
-    fn ssh_url() {
-        assert_eq!(
-            repo_folder_from_url("ssh://git@github.com/cohix/somerepo.git"),
-            "somerepo"
-        );
-    }
-
-    #[test]
-    fn trailing_slash_stripped() {
-        assert_eq!(
-            repo_folder_from_url("https://github.com/cohix/somerepo/"),
-            "somerepo"
-        );
-    }
-
-    #[test]
-    fn empty_falls_back_to_repo() {
-        assert_eq!(repo_folder_from_url(""), "repo");
-    }
-
-    #[test]
-    fn unsafe_chars_filtered() {
-        assert_eq!(
-            repo_folder_from_url("https://example.com/group/my repo!.git"),
-            "myrepo"
-        );
-    }
 }
 
 async fn run_session_setup(
@@ -936,11 +795,8 @@ async fn run_session_setup(
 
 async fn persist_setup_state(state: &AppState, session_id: &str, setup_bus: &SessionSetupBus) {
     let setup_state = setup_bus.snapshot();
-    let setup_path = state.paths.session_dir(session_id).join("setup_state.json");
-    if let Ok(json) = serde_json::to_string_pretty(&setup_state) {
-        if let Err(e) = tokio::fs::write(&setup_path, json).await {
-            tracing::error!(session_id = %session_id, error = %e, "Failed to persist setup_state.json");
-        }
+    if let Err(e) = state.paths.save_setup_state(session_id, &setup_state) {
+        tracing::error!(session_id = %session_id, error = %e, "Failed to persist setup_state.json");
     }
 }
 
@@ -1190,23 +1046,19 @@ async fn handle_get_session_status(
         .into_response();
     }
 
-    // Fall back to on-disk setup_state.json.
-    let setup_state_path = state.paths.session_dir(&id).join("setup_state.json");
-    match tokio::fs::read_to_string(&setup_state_path).await {
-        Ok(content) => match serde_json::from_str::<SessionSetupState>(&content) {
-            Ok(setup_state) => Json(serde_json::json!({
-                "session_id": id,
-                "status": setup_state.status,
-                "current_stage": setup_state.current_stage,
-                "current_ready_phase": setup_state.current_ready_phase,
-                "ready_step_statuses": setup_state.ready_step_statuses,
-                "ready_summary": setup_state.ready_summary,
-                "error": setup_state.error,
-            }))
-            .into_response(),
-            Err(_) => fallback_status_from_db(&state, &id).await,
-        },
-        Err(_) => fallback_status_from_db(&state, &id).await,
+    // Fall back to on-disk setup_state.json (Layer 0).
+    match state.paths.read_setup_state(&id) {
+        Some(setup_state) => Json(serde_json::json!({
+            "session_id": id,
+            "status": setup_state.status,
+            "current_stage": setup_state.current_stage,
+            "current_ready_phase": setup_state.current_ready_phase,
+            "ready_step_statuses": setup_state.ready_step_statuses,
+            "ready_summary": setup_state.ready_summary,
+            "error": setup_state.error,
+        }))
+        .into_response(),
+        None => fallback_status_from_db(&state, &id).await,
     }
 }
 
@@ -1230,20 +1082,17 @@ async fn resolve_setup_status(
         });
         return (is_ready, status_str, err_payload);
     }
-    // No bus. Try setup_state.json.
-    let setup_path = state.paths.session_dir(session_id).join("setup_state.json");
-    if let Ok(content) = tokio::fs::read_to_string(&setup_path).await {
-        if let Ok(ss) = serde_json::from_str::<SessionSetupState>(&content) {
-            let is_ready = matches!(ss.status, SessionSetupStatus::Ready);
-            let status_str = ss.status.as_str().to_string();
-            let err_payload = ss.error.as_ref().map(|e| {
-                serde_json::json!({
-                    "stage": e.stage,
-                    "message": e.message,
-                })
-            });
-            return (is_ready, status_str, err_payload);
-        }
+    // No bus. Try setup_state.json (Layer 0).
+    if let Some(ss) = state.paths.read_setup_state(session_id) {
+        let is_ready = matches!(ss.status, SessionSetupStatus::Ready);
+        let status_str = ss.status.as_str().to_string();
+        let err_payload = ss.error.as_ref().map(|e| {
+            serde_json::json!({
+                "stage": e.stage,
+                "message": e.message,
+            })
+        });
+        return (is_ready, status_str, err_payload);
     }
     // Last resort: sqlite session row.
     match state.store.get_session(session_id) {
@@ -1298,30 +1147,52 @@ async fn handle_create_command(
         }
     };
 
-    // Validate command is API-allowed via the typed catalogue check.
+    // Validate the command shape against the catalogue BEFORE touching session
+    // state. Both checks below are request-shape (400-class) errors derived
+    // entirely from the command catalogue — no per-command logic in the route.
     {
         let catalogue = CommandCatalogue::get();
         let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
-        if let Err(crate::command::error::CommandError::NotAvailableForFrontend {
-            command, ..
-        }) = catalogue.validate_for_frontend(FrontendKind::Api, &path_parts)
+
+        // (1) The command must be reachable via the API frontend.
+        if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
+            catalogue.validate_for_frontend(FrontendKind::Api, &path_parts)
         {
+            // The advertised alternatives are the catalogue's api-allowed
+            // commands, not a hand-maintained list that could drift.
+            let available: Vec<String> = catalogue
+                .api_allowed_commands()
+                .into_iter()
+                .map(|(parent, sub)| format!("{parent} {sub}"))
+                .collect();
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "command not available via API",
                     "blocked_command": command,
-                    "available": ["exec workflow", "exec prompt"],
+                    "available": available,
                 })),
             )
                 .into_response();
         }
+
+        // (2) The args must parse cleanly against the catalogue: an unknown
+        // flag, a bad flag value, or an unknown command produces a structured
+        // 400 here, rather than being enqueued and failing asynchronously in
+        // the worker when the dispatch accessors are later called.
+        if let Err(e) =
+            catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
+        {
+            return (StatusCode::BAD_REQUEST, error_json(e.to_string())).into_response();
+        }
     }
 
-    // Validate session exists and is in a state that accepts commands.
-    match state.store.get_session(&session_id) {
-        Ok(Some(s)) if s.status == "active" => {}
-        Ok(Some(s)) if s.status == "closing" => {
+    // Validate session exists and is in a state that accepts commands. The
+    // lifecycle classification lives in Layer 0 (on the store that owns the
+    // `status` column); the route only maps each outcome to an HTTP status.
+    match state.store.command_admission(&session_id) {
+        Ok(SessionCommandAdmission::Accepted) => {}
+        Ok(SessionCommandAdmission::Closing) => {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -1332,14 +1203,14 @@ async fn handle_create_command(
             )
                 .into_response();
         }
-        Ok(Some(_)) => {
+        Ok(SessionCommandAdmission::Closed) => {
             return (
                 StatusCode::NOT_FOUND,
                 error_json(format!("Session '{}' is closed", session_id)),
             )
                 .into_response();
         }
-        Ok(None) => {
+        Ok(SessionCommandAdmission::NotFound) => {
             return (
                 StatusCode::NOT_FOUND,
                 error_json(format!("Session '{}' not found", session_id)),
@@ -1382,8 +1253,7 @@ async fn handle_create_command(
     let command_id = uuid::Uuid::new_v4().to_string();
     let args_json = serde_json::to_string(&body.args).unwrap_or_else(|_| "[]".to_string());
 
-    let cmd_dir = state.paths.command_dir(&session_id, &command_id);
-    if let Err(e) = tokio::fs::create_dir_all(&cmd_dir).await {
+    if let Err(e) = state.paths.prepare_command_dir(&session_id, &command_id) {
         tracing::error!(error = %e, "Failed to create command directory");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1392,7 +1262,7 @@ async fn handle_create_command(
             .into_response();
     }
 
-    let log_path = cmd_dir.join("output.log");
+    let log_path = state.paths.command_log_path(&session_id, &command_id);
 
     if let Err(e) = state.store.enqueue_command(
         &command_id,
@@ -1516,14 +1386,10 @@ async fn handle_stream_command_logs(
     AxumPath(command_id): AxumPath<String>,
     Query(query): Query<CommandLogsQuery>,
 ) -> Response {
-    let (session_id, events_log_path, is_already_done) = match state.store.get_command(&command_id)
-    {
+    let (session_id, is_already_done) = match state.store.get_command(&command_id) {
         Ok(Some(c)) => {
             let done = matches!(c.status.as_str(), "done" | "error" | "cancelled");
-            let events_log = state
-                .paths
-                .command_events_log_path(&c.session_id, &command_id);
-            (c.session_id, events_log, done)
+            (c.session_id, done)
         }
         Ok(None) => {
             return (
@@ -1544,8 +1410,9 @@ async fn handle_stream_command_logs(
 
     // ?format=json — return the full events.log as a JSON array.
     if query.format.as_deref() == Some("json") {
-        let content = tokio::fs::read_to_string(&events_log_path)
-            .await
+        let content = state
+            .paths
+            .read_command_events_raw(&session_id, &command_id)
             .unwrap_or_default();
         let mut events = Vec::new();
         for line in content.lines() {
@@ -1581,12 +1448,15 @@ async fn handle_stream_command_logs(
 
     let state_for_task = Arc::clone(&state);
     let command_id_for_task = command_id.clone();
-    let events_log_for_replay = events_log_path.clone();
+    let session_id_for_task = session_id.clone();
 
     tokio::spawn(async move {
         // 1. Replay events.log from disk, recording the highest sequence.
         let mut last_replayed_seq: Option<u64> = None;
-        if let Ok(content) = tokio::fs::read_to_string(&events_log_path).await {
+        if let Some(content) = state_for_task
+            .paths
+            .read_command_events_raw(&session_id_for_task, &command_id_for_task)
+        {
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() {
@@ -1641,7 +1511,10 @@ async fn handle_stream_command_logs(
                     _ => false,
                 };
                 if cmd_terminal {
-                    if let Ok(content) = tokio::fs::read_to_string(&events_log_for_replay).await {
+                    if let Some(content) = state_for_task
+                        .paths
+                        .read_command_events_raw(&session_id_for_task, &command_id_for_task)
+                    {
                         for line in content.lines() {
                             let line = line.trim();
                             if line.is_empty() {
@@ -1878,12 +1751,11 @@ async fn handle_get_workflow(
         }
     };
 
-    let wf_path = state
+    match state
         .paths
-        .command_workflow_state_path(&session_id, &command_id);
-
-    match tokio::fs::read_to_string(&wf_path).await {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+        .read_command_workflow_state_raw(&session_id, &command_id)
+    {
+        Ok(Some(content)) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(val) => Json(val).into_response(),
             Err(e) => {
                 tracing::error!(error = %e, "Failed to parse workflow state");
@@ -1894,7 +1766,7 @@ async fn handle_get_workflow(
                     .into_response()
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             error_json("no workflow for this command"),
         )

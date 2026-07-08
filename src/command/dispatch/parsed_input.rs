@@ -245,9 +245,11 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse(r#"remote exec prompt "hello world""#, cat).unwrap();
         assert_eq!(parsed.path, vec!["remote", "exec", "prompt"]);
+        // `prompt` is a greedy trailing positional (TrailingVarArgs), so a
+        // single quoted token collects into a one-element Multi.
         assert!(matches!(
             parsed.arguments.get("prompt"),
-            Some(ArgValue::Single(s)) if s == "hello world"
+            Some(ArgValue::Multi(v)) if v == &["hello world".to_string()]
         ));
     }
 
@@ -280,11 +282,13 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse(r#"exec prompt "do something complex""#, cat).unwrap();
         assert_eq!(parsed.path, vec!["exec", "prompt"]);
+        // `prompt` is a greedy trailing positional: a single quoted token
+        // collects into a one-element Multi (the TUI frontend joins it back).
         match parsed.arguments.get("prompt") {
-            Some(ArgValue::Single(s)) => {
-                assert_eq!(s, "do something complex");
+            Some(ArgValue::Multi(v)) => {
+                assert_eq!(v, &["do something complex".to_string()]);
             }
-            other => panic!("expected Single prompt argument, got: {other:?}"),
+            other => panic!("expected Multi prompt argument, got: {other:?}"),
         }
     }
 

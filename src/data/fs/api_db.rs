@@ -32,6 +32,21 @@ pub struct SessionRecord {
     pub cloned_path: Option<String>,
 }
 
+/// Outcome of the session lifecycle guard for a newly-submitted command.
+/// Returned by [`SqliteSessionStore::command_admission`]; the frontend maps
+/// each variant to its transport-specific status and message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommandAdmission {
+    /// Session is `active` — accept the command.
+    Accepted,
+    /// No such session.
+    NotFound,
+    /// Session is draining (`closing`) and no longer accepts commands.
+    Closing,
+    /// Session is `closed`.
+    Closed,
+}
+
 /// Persistable command metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
@@ -241,6 +256,23 @@ impl SqliteSessionStore {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    /// Classify whether a session may accept a newly-submitted command, based
+    /// on its lifecycle state. This is the state-transition guard that used to
+    /// live inline in the API `POST /v1/commands` handler; it belongs on the
+    /// store that owns the `status` column so every frontend enforces it
+    /// identically. Frontends map the typed outcome to a transport status.
+    pub fn command_admission(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionCommandAdmission, DataError> {
+        Ok(match self.get_session(session_id)? {
+            Some(s) if s.status == "active" => SessionCommandAdmission::Accepted,
+            Some(s) if s.status == "closing" => SessionCommandAdmission::Closing,
+            Some(_) => SessionCommandAdmission::Closed,
+            None => SessionCommandAdmission::NotFound,
+        })
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>, DataError> {
