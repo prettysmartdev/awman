@@ -448,6 +448,13 @@ impl ReadyEngine {
 
                 ReadyPhase::CheckingLocalAgent
             }
+            // SECURITY EXCEPTION: this is the ONE sanctioned host-side agent
+            // execution in awman (see `aspec/architecture/security.md`). The
+            // agent binary runs on the host with a hardcoded greeting — never
+            // user input, repo content, or a working directory — to verify it
+            // is installed and authenticated, and to force it to refresh its
+            // auth token before credentials are mounted into containerized
+            // agents. Do not add other host-side agent invocations.
             ReadyPhase::CheckingLocalAgent => {
                 frontend.report_step_status("Check local agent", StepStatus::Running);
                 let agent_name = self.options.agent.as_str();
