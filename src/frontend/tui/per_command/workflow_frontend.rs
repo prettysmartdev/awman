@@ -17,7 +17,7 @@ use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{
     DialogRequest, DialogResponse, WorkflowControlBoardState, WorkflowStepErrorState,
 };
-use crate::frontend::tui::tabs::ParallelSlotEvent;
+use crate::frontend::tui::tabs::ContainerSlotEvent;
 
 impl WorkflowFrontend for TuiCommandFrontend {
     fn show_workflow_control_board(
@@ -235,16 +235,20 @@ impl WorkflowFrontend for TuiCommandFrontend {
         agent: &str,
         _model: Option<&str>,
     ) {
-        self.pty_reset_flag
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
         if let Ok(mut guard) = self.yolo_state.lock() {
             *guard = None;
         }
 
         if self.parallel_group_active {
+            // Parallel steps get their own fresh slot (with a fresh parser)
+            // via the Launched event — no PTY reset, which would wipe the
+            // currently-focused group slot's live content.
             self.recreate_parallel_container_io(&step.name);
         } else {
+            // Sequential steps reuse the backbone slot; flag its parser for
+            // a reset so the previous step's terminal content is cleared.
+            self.pty_reset_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.recreate_container_io();
         }
 
@@ -372,18 +376,21 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     // ── Parallel group callbacks (WI-0096) ───────────────────────────────
     // These publish lifecycle events into the shared queue; the TUI event
-    // loop drains it and maintains `Tab::parallel_slots`. Layer discipline:
+    // loop drains it and maintains `Tab::container_slots`. Layer discipline:
     // the frontend never inspects `active_steps` or makes scheduling
     // decisions — it only reacts to these engine callbacks.
 
     fn report_parallel_group_started(&mut self, _step_names: &[String]) {
         self.parallel_group_active = true;
-        self.pending_parallel_slot_io.clear();
+        self.pending_step_slot_io.clear();
+        // Tell the TUI to stash the sequential backbone slot while the
+        // group's per-step slots own the display.
+        self.push_container_slot_event(ContainerSlotEvent::GroupStarted);
     }
 
     fn report_parallel_step_launched(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
-        let io = self.pending_parallel_slot_io.remove(step_name);
-        self.push_parallel_slot_event(ParallelSlotEvent::Launched {
+        let io = self.pending_step_slot_io.remove(step_name);
+        self.push_container_slot_event(ContainerSlotEvent::Launched {
             step_name: step_name.to_string(),
             agent: agent.to_string(),
             model: model.map(|m| m.to_string()),
@@ -393,8 +400,8 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn report_parallel_step_dequeued(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
         // A queued step took a freed slot — same visual as a launch.
-        let io = self.pending_parallel_slot_io.remove(step_name);
-        self.push_parallel_slot_event(ParallelSlotEvent::Launched {
+        let io = self.pending_step_slot_io.remove(step_name);
+        self.push_container_slot_event(ContainerSlotEvent::Launched {
             step_name: step_name.to_string(),
             agent: agent.to_string(),
             model: model.map(|m| m.to_string()),
@@ -402,38 +409,45 @@ impl WorkflowFrontend for TuiCommandFrontend {
         });
     }
 
+    fn report_parallel_step_container(&mut self, step_name: &str, container_name: &str) {
+        self.push_container_slot_event(ContainerSlotEvent::ContainerName {
+            step_name: step_name.to_string(),
+            container_name: container_name.to_string(),
+        });
+    }
+
     fn report_parallel_step_exited(&mut self, step_name: &str, _exit_code: i32) {
-        self.push_parallel_slot_event(ParallelSlotEvent::Exited {
+        self.push_container_slot_event(ContainerSlotEvent::Exited {
             step_name: step_name.to_string(),
         });
     }
 
     fn report_parallel_group_finished(&mut self) {
         self.parallel_group_active = false;
-        self.pending_parallel_slot_io.clear();
-        self.push_parallel_slot_event(ParallelSlotEvent::GroupFinished);
+        self.pending_step_slot_io.clear();
+        self.push_container_slot_event(ContainerSlotEvent::GroupFinished);
     }
 
     fn report_parallel_step_stuck(&mut self, step_name: &str) {
-        self.push_parallel_slot_event(ParallelSlotEvent::Stuck {
+        self.push_container_slot_event(ContainerSlotEvent::Stuck {
             step_name: step_name.to_string(),
         });
     }
 
     fn report_parallel_step_unstuck(&mut self, step_name: &str) {
-        self.push_parallel_slot_event(ParallelSlotEvent::Unstuck {
+        self.push_container_slot_event(ContainerSlotEvent::Unstuck {
             step_name: step_name.to_string(),
         });
     }
 
     fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
-        self.push_parallel_slot_event(ParallelSlotEvent::YoloStarted {
+        self.push_container_slot_event(ContainerSlotEvent::YoloStarted {
             step_name: step_name.to_string(),
         });
     }
 
     fn parallel_step_yolo_countdown_finished(&mut self, step_name: &str) {
-        self.push_parallel_slot_event(ParallelSlotEvent::YoloFinished {
+        self.push_container_slot_event(ContainerSlotEvent::YoloFinished {
             step_name: step_name.to_string(),
         });
     }
@@ -805,6 +819,27 @@ mod tests {
             result,
             crate::engine::workflow::actions::NextAction::LaunchNext,
         );
+    }
+
+    #[test]
+    fn report_parallel_step_container_publishes_container_name_event() {
+        use crate::frontend::tui::tabs::ContainerSlotEvent;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.report_parallel_step_container("build", "awman-build-99");
+
+        let mut q = frontend.container_slot_events.lock().unwrap();
+        let event = q.pop_front().expect("an event must be queued");
+        match event {
+            ContainerSlotEvent::ContainerName {
+                step_name,
+                container_name,
+            } => {
+                assert_eq!(step_name, "build");
+                assert_eq!(container_name, "awman-build-99");
+            }
+            _ => panic!("expected ContainerName event"),
+        }
     }
 
     // ─── Yolo countdown tick tests ──────────────────────────────────────────

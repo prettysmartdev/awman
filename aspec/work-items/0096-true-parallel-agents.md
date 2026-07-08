@@ -138,68 +138,99 @@ fn set_parallel_step_stuck_sender(&mut self, _step_name: &str, _sender: Arc<broa
 
 The single-step path (`set_stuck_sender`, `report_container_exited`, etc.) continues to work unchanged for workflows where `max_concurrent` is 1 or where only one step is ever ready at a time.
 
-### 4. TUI — Multi-Container State
+### 4. TUI — Unified Container Slot State
 
 **File:** `src/frontend/tui/tabs.rs`
 
-Replace the single-container I/O fields on `Tab` with a `Vec<ParallelContainerSlot>`:
+There are NO single-container fields on `Tab`. `ContainerSlot` is the only
+container representation — a plain containerized command (`chat`,
+`exec prompt`) is a one-slot group, and a parallel workflow group is N slots:
 
 ```rust
-pub struct ParallelContainerSlot {
-    pub step_name: String,
+pub struct ContainerSlot {
+    pub step_name: String,   // empty for plain commands / sequential steps
     pub vt100_parser: vt100::Parser,
     pub region_scroll: RegionScrollEmulator,
     pub container_info: Option<ContainerInfo>,
     pub container_stdout_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
     pub container_stdin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     pub container_resize_tx: Option<mpsc::UnboundedSender<(u16, u16)>>,
+    pub agent_alt_screen: bool,        // per-slot terminal-mode tracking
+    pub agent_alternate_scroll: bool,
     pub stuck: bool,
     pub yolo_mode: bool,
-    pub yolo_state: SharedYoloState,
-    pub yolo_cancel_flag: SharedYoloCancelFlag,
-    pub stuck_rx: Option<broadcast::Receiver<StuckEvent>>,
+    ...
 }
 ```
 
 `Tab` holds:
 ```rust
-pub parallel_slots: Vec<ParallelContainerSlot>,
-pub focused_slot_idx: usize,   // which slot is Maximized
+pub container_slots: Vec<ContainerSlot>,   // 0 while idle, 1 for plain commands, N in a group
+pub focused_slot_idx: usize,               // which slot renders maximized
+pub dormant_slots: Vec<ContainerSlot>,     // sequential backbone, stashed during a group
 ```
 
-When `parallel_slots` is empty or has one entry, TUI behavior is unchanged. When multiple entries exist:
-- The slot at `focused_slot_idx` is Maximized; all others are Minimized.
-- `ContainerWindowState` on `Tab` still governs whether the focused container is shown at all (Ctrl-M hides everything).
-- Ctrl-S advances `focused_slot_idx` cyclically among active (non-exited) slots.
-
-The existing single-`vt100_parser` field and friends remain for non-workflow commands (`chat`, `exec`, etc.) and as the active-slot proxy for code paths that have not been updated yet. Add a `Tab::focused_slot_mut()` helper that returns `&mut ParallelContainerSlot` when slots exist and falls back to a shim using the legacy fields otherwise. This avoids a massive blast-radius refactor of all single-container code paths.
+- `spawn_command` installs the command's single slot (via `Tab::start_container`)
+  with the spawn-time I/O channels; sequential workflow steps reuse it (the
+  persistent stdout channel, `pty_reset_flag` parser reset, and shared
+  stdin/resize sender swaps all target this "backbone" slot).
+- A parallel group publishes `ContainerSlotEvent::GroupStarted`, which stashes
+  the backbone into `dormant_slots` (its stdout receiver must stay alive for
+  post-group sequential steps); `Launched`/`Exited` events add/evict per-step
+  slots; `GroupFinished` restores the backbone.
+- Ctrl-S advances `focused_slot_idx` cyclically among active slots.
+- All input routing (keyboard, mouse), rendering, stats polling, and resize
+  handling go through `container_slots` — there is no legacy fallback path.
+- Stuck/yolo tab coloring: while a group is active (`dormant_slots` non-empty)
+  the tab aggregates the slots' flags; otherwise the engine's broadcast channel
+  and the spawn-time yolo flag drive them, as for plain commands.
 
 ### 5. TUI — Container Window Rendering
 
 **File:** `src/frontend/tui/render.rs`
 
-When `parallel_slots.len() > 1`:
+`ContainerWindowState` selects the display shape, uniformly for 1..N slots:
 
-- The minimized-bar height grows from 1 to `N_minimized` rows (one row per minimized slot).
-- The maximized container window shrinks to `area.height - N_minimized - workflow_height`.
-- Render minimized slots as a stacked list at the bottom of the main area, above the status bar. Each row: `[step_name] agent · duration · status_glyph`.
-- Stuck minimized slots get a yellow border color on their row and a `⚠` prefix.
-- Yolo-countdown minimized slots flash purple/yellow using the same tick-based color the tab itself uses.
-- Ctrl-M still hides all containers (sets `ContainerWindowState::Hidden`). When Hidden, all minimized bars are also hidden.
-- Only the maximized slot receives keyboard input routed by the TUI event loop. Stdin bytes from the event loop are written to `parallel_slots[focused_slot_idx].container_stdin_tx`.
-
-When `parallel_slots.len() == 1` (or is empty), existing rendering is unchanged.
+- **Maximized**: the focused slot renders as the centered overlay; every other
+  slot renders as a 3-row rounded-border status bar stacked above the status
+  bar. Bar content: `🔒 agent [step_name] | container | cpu | mem | duration`
+  (the `[step_name]` segment is omitted when empty), using the slot's own
+  per-container stats. The focused slot has **no** bar; its step name,
+  container name, and live stats appear in the maximized window's title line
+  (`🔒 agent (runtime) — step_name` on the left, stats on the right; sequential
+  steps take the step name from the workflow view's current step).
+- **Minimized**: every slot renders as a status bar; no overlay. With one slot
+  this is exactly the classic single-container minimized bar.
+- **Hidden** (Ctrl-M off-state / post-exit): nothing; the grey post-exit
+  summary bar occupies the same layout slot when present.
+- The maximized container window shrinks to `area.height - 3·N_bars - workflow_height`.
+- Stuck slots' bars get a yellow border/text color and a `⚠` prefix;
+  yolo-countdown bars flash purple/yellow on the same per-second parity the
+  tab header uses.
+- Only the focused slot receives keyboard input. Mouse scroll (protocol
+  forwarding, alternate-scroll translation, and awman-side scrollback) likewise
+  routes to the focused slot's parser/stdin, with alt-screen/alternate-scroll
+  modes tracked per slot.
+- Each slot's vt100 parser and container PTY are kept in lockstep with the
+  maximized overlay's actual inner rect: sized on launch (never left at the
+  80x24 default) and re-synced every tick, so background containers are
+  already correctly laid out when Ctrl-S rotates them in.
+- Per-slot container stats: the engine publishes each parallel step's
+  container name via `report_parallel_step_container` right after launch (a
+  plain command's name arrives via the shared container-name slot); the TUI
+  polls stats per container (Docker and Apple runtimes both accept per-name
+  queries) and routes each sample to its slot by step name.
 
 ### 6. TUI — Ctrl-S Keybinding
 
 **File:** `src/frontend/tui/mod.rs` (or wherever key events are dispatched)
 
-Add `Ctrl-S` to the keybinding table. When pressed and `parallel_slots.len() > 1`:
+Add `Ctrl-S` to the keybinding table. When pressed and `container_slots.len() > 1`:
 - Advance `focused_slot_idx = (focused_slot_idx + 1) % active_slot_count`.
-- Send a `container_resize_tx` event on the newly-focused slot so its PTY adapts to the current terminal size.
+- Reset the container scrollback offset so the rotated-in slot starts at its live view. No manual resize is needed — the per-tick size sync (§5) keeps every slot's parser and PTY matched to the overlay already.
 - If `ContainerWindowState` is Minimized, switch to Maximized so the rotated container becomes visible.
 
-When `parallel_slots.len() <= 1`, Ctrl-S is a no-op (or can be passed through to the container if desired; default no-op is safer).
+When `container_slots.len() <= 1`, Ctrl-S is passed through to the container's PTY (some programs use it for flow control).
 
 ### 7. CLI — Lightweight Parallel TUI
 

@@ -198,15 +198,17 @@ pub struct LastContainerSummary {
     pub exit_code: i32,
 }
 
-/// One running container in a parallel workflow group (WI-0096 §4).
+/// One running container. This is THE container representation — a plain
+/// containerized command (`chat`, `exec prompt`) is simply a tab with one
+/// slot, and a parallel workflow group is a tab with N of them (WI-0096).
 ///
-/// Each slot owns its own PTY parser and I/O channels so several containers
-/// can run concurrently. The slot at `Tab::focused_slot_idx` is Maximized;
-/// the others render as one-row minimized status bars. When `parallel_slots`
-/// is empty (non-workflow commands, single-step workflows) the legacy
-/// single-container fields on `Tab` are used instead and behavior is
-/// unchanged.
-pub struct ParallelContainerSlot {
+/// Each slot owns its own PTY parser, terminal-mode flags, stats, and I/O
+/// channels. The slot at `Tab::focused_slot_idx` renders maximized; the
+/// others render as stacked minimized status bars.
+pub struct ContainerSlot {
+    /// Workflow step this container runs, or empty for non-workflow
+    /// commands and sequential workflow steps (whose step name comes from
+    /// the workflow view state instead).
     pub step_name: String,
     pub vt100_parser: vt100::Parser,
     pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
@@ -214,6 +216,13 @@ pub struct ParallelContainerSlot {
     pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
     pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
+    /// Whether the agent has requested the alternate screen buffer. Tracked
+    /// here (not via the vt100 parser) because `drain_container_output`
+    /// strips alternate-screen sequences before the parser sees them.
+    pub agent_alt_screen: bool,
+    /// Whether the agent has enabled "alternate scroll" mode (DECSET 1007),
+    /// tracked from the raw PTY output for the same reason.
+    pub agent_alternate_scroll: bool,
     pub stuck: bool,
     pub yolo_mode: bool,
     pub yolo_state: SharedYoloState,
@@ -221,16 +230,16 @@ pub struct ParallelContainerSlot {
     pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
 }
 
-pub struct ParallelSlotIo {
+pub struct ContainerSlotIo {
     pub stdout_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pub stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     pub resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
 }
 
-impl ParallelContainerSlot {
-    /// Create a fresh slot for a newly-launched parallel step. The PTY parser
-    /// starts at 80x24 and is resized to the real terminal when the slot is
-    /// focused; live I/O channels are attached later.
+impl ContainerSlot {
+    /// Create a fresh slot for a newly-launched container. The PTY parser
+    /// starts at 80x24 and is sized to the real overlay dimensions as soon
+    /// as they are known; live I/O channels are attached by the caller.
     pub fn new(step_name: String, agent_display_name: String, scrollback: usize) -> Self {
         Self {
             step_name,
@@ -247,6 +256,8 @@ impl ParallelContainerSlot {
             container_stdout_rx: None,
             container_stdin_tx: None,
             container_resize_tx: None,
+            agent_alt_screen: false,
+            agent_alternate_scroll: false,
             stuck: false,
             yolo_mode: false,
             yolo_state: Arc::new(Mutex::new(None)),
@@ -273,17 +284,27 @@ impl ParallelContainerSlot {
 }
 
 /// Lifecycle event published by the workflow frontend (engine thread) and
-/// drained by the TUI event loop to maintain `Tab::parallel_slots`
+/// drained by the TUI event loop to maintain `Tab::container_slots`
 /// (WI-0096 §12). Kept in a shared queue rather than mutating `Tab` directly
 /// because the frontend runs on the engine's tokio task while `Tab` lives on
 /// the TUI thread.
-pub enum ParallelSlotEvent {
+pub enum ContainerSlotEvent {
+    /// A parallel group is starting: the sequential "backbone" slot (the
+    /// command-level container plumbing that sequential steps reuse) goes
+    /// dormant while the group's per-step slots take over the display.
+    GroupStarted,
     /// A container in the group started running (initial launch or dequeued).
     Launched {
         step_name: String,
         agent: String,
         model: Option<String>,
-        io: Option<ParallelSlotIo>,
+        io: Option<ContainerSlotIo>,
+    },
+    /// The engine learned the step's actual container name (published right
+    /// after launch). Drives per-slot stats polling and the stats title.
+    ContainerName {
+        step_name: String,
+        container_name: String,
     },
     /// A container exited — evict its slot with no grey summary bar.
     Exited { step_name: String },
@@ -295,25 +316,23 @@ pub enum ParallelSlotEvent {
     YoloStarted { step_name: String },
     /// A container's yolo countdown ended (cancelled, expired, or advanced).
     YoloFinished { step_name: String },
-    /// The whole group drained; clear any remaining slots.
+    /// The whole group drained; clear any remaining group slots and restore
+    /// the dormant sequential backbone.
     GroupFinished,
 }
 
-/// Shared queue of [`ParallelSlotEvent`]s. Mirrors the other `SharedXxx`
+/// Shared queue of [`ContainerSlotEvent`]s. Mirrors the other `SharedXxx`
 /// slots: the workflow frontend pushes, the event loop drains.
-pub type SharedParallelSlotEvents = Arc<Mutex<std::collections::VecDeque<ParallelSlotEvent>>>;
+pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<ContainerSlotEvent>>>;
 
 /// Tab state — one per open tab.
 pub struct Tab {
     pub session: Session,
     pub execution_phase: ExecutionPhase,
-    pub vt100_parser: vt100::Parser,
     pub container_window_state: ContainerWindowState,
-    /// How many lines from the bottom to skip in the vt100 scrollback when
-    /// the container is Maximized. 0 = follow live output.
+    /// How many lines from the bottom to skip in the focused slot's vt100
+    /// scrollback when the container is Maximized. 0 = follow live output.
     pub container_scroll_offset: usize,
-    /// Live container metadata, populated while a containerized command runs.
-    pub container_info: Option<ContainerInfo>,
     /// Summary of the last container session, shown in a dashed-border bar
     /// below the exec window after the container exits.
     pub last_container_summary: Option<LastContainerSummary>,
@@ -357,22 +376,6 @@ pub struct Tab {
     pub workflow_strip_scroll_offset: usize,
     pub last_strip_rect: Option<Rect>,
     pub mouse_selection: Option<TextSelection>,
-    /// Whether the agent has requested the alternate screen buffer. Tracked
-    /// here (not via the vt100 parser) because `drain_container_output`
-    /// strips alternate-screen sequences before the parser sees them, so
-    /// `screen().alternate_screen()` always reports `false`.
-    pub agent_alt_screen: bool,
-    /// Whether the agent has enabled "alternate scroll" mode (DECSET 1007).
-    /// Agents like codex never enable real mouse tracking; they expect the
-    /// terminal to translate wheel events into arrow keys while the
-    /// alternate screen is active. The vt100 parser ignores mode 1007, so
-    /// it is tracked here from the raw PTY output.
-    pub agent_alternate_scroll: bool,
-    /// Emulates scrollback for top-anchored scroll regions (codex's inline
-    /// history insertion) that the vt100 parser would otherwise discard.
-    /// All container output is funneled through it on its way to
-    /// `vt100_parser`; reset alongside the parser.
-    pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
     pub workflow_agent_fallbacks: HashMap<String, String>,
     pub is_remote: bool,
     pub output_lines: Vec<String>,
@@ -382,19 +385,24 @@ pub struct Tab {
     /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
     pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
 
-    // ── Parallel container slots (WI-0096) ───────────────────────────────
-    /// Running containers of the current parallel workflow group. Empty for
-    /// non-workflow commands and single-step workflows, in which case the
-    /// legacy single-container fields above are used and behavior is
-    /// unchanged. When more than one slot exists, `focused_slot_idx` is
-    /// Maximized and the rest render as minimized status bars.
-    pub parallel_slots: Vec<ParallelContainerSlot>,
-    /// Index into `parallel_slots` of the Maximized (focused) slot. Cycled
-    /// by Ctrl-S. Always `0` when there are no parallel slots.
+    // ── Container slots ──────────────────────────────────────────────────
+    /// The tab's running containers. A plain containerized command is one
+    /// slot; a parallel workflow group is N of them. Empty while nothing
+    /// containerized is running. The slot at `focused_slot_idx` renders
+    /// maximized; the others render as stacked minimized status bars.
+    pub container_slots: Vec<ContainerSlot>,
+    /// Index into `container_slots` of the Maximized (focused) slot. Cycled
+    /// by Ctrl-S. Always `0` with a single slot.
     pub focused_slot_idx: usize,
-    /// Shared queue of parallel-slot lifecycle events published by the
-    /// workflow frontend; drained each tick to maintain `parallel_slots`.
-    pub parallel_slot_events: SharedParallelSlotEvents,
+    /// The sequential "backbone" slot(s), stashed while a parallel workflow
+    /// group runs. Sequential steps reuse the command-level stdout channel,
+    /// so the slot holding its receiver must stay alive across the group
+    /// and is restored when the group finishes. Non-empty exactly while a
+    /// parallel group is active.
+    pub dormant_slots: Vec<ContainerSlot>,
+    /// Shared queue of slot lifecycle events published by the workflow
+    /// frontend; drained each tick to maintain `container_slots`.
+    pub container_slot_events: SharedContainerSlotEvents,
     /// Set after a mid-workflow container exit closes the window: PTY bytes
     /// that were still in flight from the dead container must not re-open it
     /// via `drain_container_output`'s auto-open branch. Cleared when the next
@@ -403,12 +411,6 @@ pub struct Tab {
     pub suppress_container_auto_open: bool,
 
     // ── Async command plumbing ───────────────────────────────────────────
-    /// Event loop drains container stdout/stderr into the vt100 parser.
-    pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
-    /// Event loop forwards keystrokes to the container stdin.
-    pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    /// Event loop forwards terminal resizes to the container's PTY master.
-    pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
     /// Receives the command outcome once the spawned task finishes.
     pub command_result_rx: Option<std::sync::mpsc::Receiver<Result<CommandOutcome, CommandError>>>,
     /// Event loop polls for dialog requests from the command thread.
@@ -472,15 +474,12 @@ impl Drop for Tab {
 
 impl Tab {
     pub fn new(session: Session) -> Self {
-        let scrollback = session.effective_config().scrollback_lines();
         let git_root = session.git_root().to_path_buf();
         let mut tab = Self {
             session,
             execution_phase: ExecutionPhase::Idle,
-            vt100_parser: vt100::Parser::new(24, 80, scrollback),
             container_window_state: ContainerWindowState::Hidden,
             container_scroll_offset: 0,
-            container_info: None,
             last_container_summary: None,
             container_inner_area: None,
             container_rendered: false,
@@ -496,22 +495,17 @@ impl Tab {
             workflow_strip_scroll_offset: 0,
             last_strip_rect: None,
             mouse_selection: None,
-            agent_alt_screen: false,
-            agent_alternate_scroll: false,
-            region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator::new(),
             workflow_agent_fallbacks: HashMap::new(),
             is_remote: false,
             output_lines: Vec::new(),
             stuck: false,
             yolo_mode: false,
             stuck_rx: None,
-            parallel_slots: Vec::new(),
+            container_slots: Vec::new(),
             focused_slot_idx: 0,
-            parallel_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            dormant_slots: Vec::new(),
+            container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             suppress_container_auto_open: false,
-            container_stdout_rx: None,
-            container_stdin_tx: None,
-            container_resize_tx: None,
             command_result_rx: None,
             dialog_request_rx: None,
             dialog_response_tx: None,
@@ -602,123 +596,229 @@ impl Tab {
             }
         }
 
-        // WI-0096 §9: when parallel slots are active, aggregate the stuck /
-        // yolo indicators across all slots for tab coloring. `tab_color`
-        // reads `tab.stuck` / `tab.yolo_mode` unchanged.
-        if !self.parallel_slots.is_empty() {
-            self.stuck = self.parallel_slots.iter().any(|s| s.stuck);
-            self.yolo_mode = self.parallel_slots.iter().any(|s| s.yolo_mode);
+        // WI-0096 §9: while a parallel group is active (the sequential
+        // backbone is stashed in `dormant_slots`), aggregate the stuck /
+        // yolo indicators across the group's slots for tab coloring.
+        // Outside a group the broadcast channel above and the spawn-time
+        // yolo flag drive the indicators, exactly as for plain commands.
+        if !self.dormant_slots.is_empty() {
+            self.stuck = self.container_slots.iter().any(|s| s.stuck);
+            self.yolo_mode = self.container_slots.iter().any(|s| s.yolo_mode);
         }
     }
 
-    /// Number of active (non-exited) parallel slots. `0` for non-workflow /
-    /// single-container commands.
+    /// Number of active (non-exited) container slots. `1` for plain
+    /// containerized commands, `N` during a parallel workflow group, `0`
+    /// while nothing containerized runs.
     pub fn active_slot_count(&self) -> usize {
-        self.parallel_slots.len()
+        self.container_slots.len()
     }
 
-    /// Whether the tab is showing more than one parallel container. Multi-slot
-    /// chrome (minimized-bar stack, Ctrl-S switching) only activates here; with
-    /// zero or one slot the rendering is pixel-identical to the legacy path.
+    /// Whether the tab is showing more than one container. Ctrl-S slot
+    /// switching only activates here.
     pub fn has_multiple_slots(&self) -> bool {
-        self.parallel_slots.len() > 1
+        self.container_slots.len() > 1
     }
 
-    /// Mutable access to the currently-focused parallel slot.
-    ///
-    /// Returns `None` when there are no parallel slots — callers in that case
-    /// fall back to the legacy single-container fields on `Tab`. This mirrors
-    /// the spec's "focused_slot_mut() falls back to the legacy single-container
-    /// fields" while avoiding a blast-radius refactor: only new multi-slot code
-    /// calls this helper; existing single-container paths keep using the legacy
-    /// fields directly.
-    pub fn focused_slot_mut(&mut self) -> Option<&mut ParallelContainerSlot> {
-        self.parallel_slots.get_mut(self.focused_slot_idx)
+    /// Whether the container overlay is currently covering the execution
+    /// window: a slot exists and the display is Maximized. Minimized shows
+    /// every slot as a status bar (no overlay); Hidden shows nothing. Key
+    /// routing, mouse routing, and the execution-window renderer must all
+    /// agree with `render_frame` on this.
+    pub fn container_overlay_active(&self) -> bool {
+        self.container_window_state == ContainerWindowState::Maximized
+            && !self.container_slots.is_empty()
+    }
+
+    /// Mutable access to the currently-focused container slot. `None` while
+    /// nothing containerized is running.
+    pub fn focused_slot_mut(&mut self) -> Option<&mut ContainerSlot> {
+        self.container_slots.get_mut(self.focused_slot_idx)
     }
 
     /// Immutable counterpart to [`focused_slot_mut`](Self::focused_slot_mut).
-    pub fn focused_slot(&self) -> Option<&ParallelContainerSlot> {
-        self.parallel_slots.get(self.focused_slot_idx)
+    pub fn focused_slot(&self) -> Option<&ContainerSlot> {
+        self.container_slots.get(self.focused_slot_idx)
     }
 
-    /// Drain the shared parallel-slot event queue and update `parallel_slots`
+    /// Focused slot's vt100 parser. Panics when no slot exists — test-only
+    /// convenience for feeding PTY bytes and probing the grid.
+    #[cfg(test)]
+    pub fn focused_parser_mut(&mut self) -> &mut vt100::Parser {
+        let idx = self.focused_slot_idx;
+        &mut self.container_slots[idx].vt100_parser
+    }
+
+    /// Drain the shared parallel-slot event queue and update `container_slots`
     /// accordingly (WI-0096 §12). Events are processed in the order the engine
     /// emitted them, so an "exited then dequeued" pair in the same tick evicts
     /// the old slot before adding the new one — keeping the net slot count
     /// correct.
-    pub fn drain_parallel_slot_events(&mut self) {
-        let events: Vec<ParallelSlotEvent> = match self.parallel_slot_events.lock() {
+    pub fn drain_container_slot_events(&mut self) {
+        let events: Vec<ContainerSlotEvent> = match self.container_slot_events.lock() {
             Ok(mut q) => q.drain(..).collect(),
             Err(_) => return,
         };
         for event in events {
-            self.apply_parallel_slot_event(event);
+            self.apply_container_slot_event(event);
         }
     }
 
-    fn apply_parallel_slot_event(&mut self, event: ParallelSlotEvent) {
+    fn apply_container_slot_event(&mut self, event: ContainerSlotEvent) {
         match event {
-            ParallelSlotEvent::Launched {
+            ContainerSlotEvent::GroupStarted => {
+                // Stash the sequential backbone slot(s) for the duration of
+                // the group. Their stdout receivers must stay alive: later
+                // sequential steps send through the same persistent channel.
+                self.dormant_slots.append(&mut self.container_slots);
+                self.focused_slot_idx = 0;
+            }
+            ContainerSlotEvent::Launched {
                 step_name,
                 agent,
                 io,
                 ..
             } => {
-                if self.parallel_slots.iter().any(|s| s.step_name == step_name) {
+                if self
+                    .container_slots
+                    .iter()
+                    .any(|s| s.step_name == step_name)
+                {
                     return;
                 }
                 let scrollback = self.session.effective_config().scrollback_lines();
-                let mut slot = ParallelContainerSlot::new(step_name, agent, scrollback);
+                let mut slot = ContainerSlot::new(step_name, agent, scrollback);
                 if let Some(io) = io {
                     slot.container_stdout_rx = Some(io.stdout_rx);
                     slot.container_stdin_tx = Some(io.stdin_tx);
                     slot.container_resize_tx = Some(io.resize_tx);
                 }
-                self.parallel_slots.push(slot);
+                // Size the fresh 80x24 parser to the real overlay dimensions
+                // immediately and push the size to the container's PTY, so
+                // the agent never lays out against the default grid. The
+                // per-tick sync in `tick_all_tabs` keeps it correct after.
+                let size = self
+                    .container_inner_area
+                    .map(|r| (r.width, r.height))
+                    .or_else(|| {
+                        crossterm::terminal::size().ok().map(|(tc, tr)| {
+                            let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(
+                                tc,
+                                self.git_sidebar_state,
+                            );
+                            crate::frontend::tui::compute_container_inner_size(
+                                tc.saturating_sub(sidebar),
+                                tr,
+                            )
+                        })
+                    });
+                if let Some((cols, rows)) = size {
+                    slot.vt100_parser.screen_mut().set_size(rows, cols);
+                    if let Some(ref tx) = slot.container_resize_tx {
+                        let _ = tx.send((cols, rows));
+                    }
+                }
+                self.container_slots.push(slot);
             }
-            ParallelSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
-            ParallelSlotEvent::Stuck { step_name } => {
+            ContainerSlotEvent::ContainerName {
+                step_name,
+                container_name,
+            } => {
+                if let Some(info) = self
+                    .slot_mut(&step_name)
+                    .and_then(|s| s.container_info.as_mut())
+                {
+                    info.container_name = container_name;
+                    info.latest_stats = None;
+                }
+            }
+            ContainerSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
+            ContainerSlotEvent::Stuck { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.stuck = true;
                 }
             }
-            ParallelSlotEvent::Unstuck { step_name } => {
+            ContainerSlotEvent::Unstuck { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.stuck = false;
                 }
             }
-            ParallelSlotEvent::YoloStarted { step_name } => {
+            ContainerSlotEvent::YoloStarted { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.yolo_mode = true;
                 }
             }
-            ParallelSlotEvent::YoloFinished { step_name } => {
+            ContainerSlotEvent::YoloFinished { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.yolo_mode = false;
                 }
             }
-            ParallelSlotEvent::GroupFinished => {
-                self.parallel_slots.clear();
+            ContainerSlotEvent::GroupFinished => {
+                // Drop the group's slots and restore the sequential backbone
+                // so the next sequential step's output (sent through the
+                // persistent command-level channel) has a slot to land in.
+                self.container_slots.clear();
+                self.container_slots.append(&mut self.dormant_slots);
                 self.focused_slot_idx = 0;
             }
         }
     }
 
-    pub fn drain_parallel_slot_outputs(&mut self) {
-        for slot in &mut self.parallel_slots {
+    /// Drain pending PTY output from every slot into its vt100 parser.
+    ///
+    /// Auto-opens the container overlay to Maximized the first time bytes
+    /// arrive so the user sees the PTY output immediately without having to
+    /// manually cycle with Ctrl+M.
+    ///
+    /// Between sequential workflow steps the engine sets `pty_reset_flag`,
+    /// which reinitializes the focused slot's parser (clearing the previous
+    /// step's terminal content) before the new step's output is processed.
+    pub fn drain_container_output(&mut self) {
+        if self.pty_reset_flag.swap(false, Ordering::Relaxed) {
+            let scrollback = self.session.effective_config().scrollback_lines();
+            let focused_idx = self.focused_slot_idx;
+            if let Some(slot) = self.container_slots.get_mut(focused_idx) {
+                let (rows, cols) = slot.vt100_parser.screen().size();
+                slot.vt100_parser = vt100::Parser::new(rows, cols, scrollback);
+                slot.agent_alt_screen = false;
+                slot.agent_alternate_scroll = false;
+                slot.region_scroll.reset();
+            }
+            self.container_scroll_offset = 0;
+            self.container_rendered = false;
+            self.mouse_selection = None;
+            // A new step's container is launching — allow auto-open again.
+            self.suppress_container_auto_open = false;
+        }
+
+        let mut received_any = false;
+        for slot in &mut self.container_slots {
             let Some(rx) = slot.container_stdout_rx.as_mut() else {
                 continue;
             };
             while let Ok(bytes) = rx.try_recv() {
                 let filtered = strip_alternate_screen_sequences(&bytes);
+                if let Some(on) = filtered.alt_screen {
+                    slot.agent_alt_screen = on;
+                }
+                if let Some(on) = filtered.alternate_scroll {
+                    slot.agent_alternate_scroll = on;
+                }
                 slot.region_scroll
                     .process(&mut slot.vt100_parser, &filtered.bytes);
+                received_any = true;
             }
+        }
+        if received_any
+            && !self.suppress_container_auto_open
+            && self.container_window_state == ContainerWindowState::Hidden
+        {
+            self.container_window_state = ContainerWindowState::Maximized;
         }
     }
 
-    fn slot_mut(&mut self, step_name: &str) -> Option<&mut ParallelContainerSlot> {
-        self.parallel_slots
+    fn slot_mut(&mut self, step_name: &str) -> Option<&mut ContainerSlot> {
+        self.container_slots
             .iter_mut()
             .find(|s| s.step_name == step_name)
     }
@@ -730,14 +830,14 @@ impl Tab {
     /// and let the container window go Hidden.
     fn evict_slot(&mut self, step_name: &str) {
         let Some(pos) = self
-            .parallel_slots
+            .container_slots
             .iter()
             .position(|s| s.step_name == step_name)
         else {
             return;
         };
-        self.parallel_slots.remove(pos);
-        let len = self.parallel_slots.len();
+        self.container_slots.remove(pos);
+        let len = self.container_slots.len();
         if len == 0 {
             self.focused_slot_idx = 0;
             self.container_window_state = ContainerWindowState::Hidden;
@@ -758,22 +858,27 @@ impl Tab {
     /// No-op with zero or one slot. Returns the newly-focused slot's resize
     /// sender (if any) so the caller can push the current terminal size to it.
     pub fn cycle_focused_slot(&mut self) {
-        if self.parallel_slots.len() <= 1 {
+        if self.container_slots.len() <= 1 {
             return;
         }
-        self.focused_slot_idx = (self.focused_slot_idx + 1) % self.parallel_slots.len();
+        self.focused_slot_idx = (self.focused_slot_idx + 1) % self.container_slots.len();
         self.mouse_selection = None;
+        // The scrollback offset belongs to the overlay's current content;
+        // start the rotated-in slot at its live view.
+        self.container_scroll_offset = 0;
         // Un-minimize so the rotated container becomes visible.
         if self.container_window_state == ContainerWindowState::Minimized {
             self.container_window_state = ContainerWindowState::Maximized;
         }
     }
 
-    /// Activate the container overlay for a fresh PTY container session.
+    /// Install a fresh single container slot for a newly-spawned command,
+    /// replacing any previous slots. The slot's parser is sized to
+    /// `cols`x`rows` (the computed overlay inner size); I/O channels are
+    /// attached by the caller via [`focused_slot_mut`](Self::focused_slot_mut).
     ///
-    /// Resizes the vt100 parser to the container's inner area, resets
-    /// scrollback, and records `ContainerInfo` so the title bar can show the
-    /// agent name and live stats.
+    /// This is the N==1 case of the unified slot model: a plain containerized
+    /// command is simply a one-slot group.
     pub fn start_container(
         &mut self,
         agent_display_name: String,
@@ -781,27 +886,20 @@ impl Tab {
         cols: u16,
         rows: u16,
     ) {
-        self.container_window_state = ContainerWindowState::Maximized;
         self.container_scroll_offset = 0;
         self.container_rendered = false;
-        self.vt100_parser = vt100::Parser::new(
-            rows,
-            cols,
-            self.session.effective_config().scrollback_lines(),
-        );
         self.last_container_summary = None;
         self.mouse_selection = None;
-        self.agent_alt_screen = false;
-        self.agent_alternate_scroll = false;
-        self.region_scroll.reset();
-        self.container_info = Some(ContainerInfo {
-            agent_display_name,
-            container_name,
-            start_time: Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed: false,
-        });
+        let scrollback = self.session.effective_config().scrollback_lines();
+        let mut slot = ContainerSlot::new(String::new(), agent_display_name, scrollback);
+        slot.vt100_parser.screen_mut().set_size(rows, cols);
+        if let Some(info) = slot.container_info.as_mut() {
+            info.container_name = container_name;
+        }
+        self.container_slots.clear();
+        self.dormant_slots.clear();
+        self.focused_slot_idx = 0;
+        self.container_slots.push(slot);
     }
 
     /// Project name for the tab title, truncated to fit a `tab_width`-wide
@@ -917,76 +1015,6 @@ impl Tab {
         format!("{} ({}/{})", current_name, step_index, total)
     }
 
-    /// Drain pending container output into the vt100 parser.
-    ///
-    /// Auto-opens the container overlay to Maximized the first time bytes
-    /// arrive so the user sees the PTY output immediately without having to
-    /// manually cycle with Ctrl+M. Also ensures the parser is sized to match
-    /// the current terminal dimensions (prevents the PTY rendering at 80x24
-    /// until the first resize event).
-    ///
-    /// Between workflow steps the engine sets `pty_reset_flag`, which causes
-    /// this method to reinitialize the vt100 parser (clearing the old step's
-    /// terminal content) before processing the new step's output.
-    pub fn drain_container_output(&mut self) {
-        if let Some(ref mut rx) = self.container_stdout_rx {
-            // Check if the engine signalled a PTY reset (workflow step transition).
-            if self.pty_reset_flag.swap(false, Ordering::Relaxed) {
-                let (rows, cols) = self.vt100_parser.screen().size();
-                self.vt100_parser = vt100::Parser::new(
-                    rows,
-                    cols,
-                    self.session.effective_config().scrollback_lines(),
-                );
-                self.container_scroll_offset = 0;
-                self.container_rendered = false;
-                self.mouse_selection = None;
-                self.agent_alt_screen = false;
-                self.agent_alternate_scroll = false;
-                self.region_scroll.reset();
-                // A new step's container is launching — allow auto-open again.
-                self.suppress_container_auto_open = false;
-            }
-
-            let mut received_any = false;
-            while let Ok(bytes) = rx.try_recv() {
-                let filtered = strip_alternate_screen_sequences(&bytes);
-                if let Some(on) = filtered.alt_screen {
-                    self.agent_alt_screen = on;
-                }
-                if let Some(on) = filtered.alternate_scroll {
-                    self.agent_alternate_scroll = on;
-                }
-                self.region_scroll
-                    .process(&mut self.vt100_parser, &filtered.bytes);
-                received_any = true;
-            }
-            if received_any
-                && !self.suppress_container_auto_open
-                && self.container_window_state == ContainerWindowState::Hidden
-            {
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    let sidebar = crate::frontend::tui::git_sidebar::sidebar_width(
-                        cols,
-                        self.git_sidebar_state,
-                    );
-                    let (inner_cols, inner_rows) =
-                        crate::frontend::tui::compute_container_inner_size(
-                            cols.saturating_sub(sidebar),
-                            rows,
-                        );
-                    self.vt100_parser
-                        .screen_mut()
-                        .set_size(inner_rows, inner_cols);
-                    if let Some(ref tx) = self.container_resize_tx {
-                        let _ = tx.send((inner_cols, inner_rows));
-                    }
-                }
-                self.container_window_state = ContainerWindowState::Maximized;
-            }
-        }
-    }
-
     /// Push the container's terminal contents to the status log when the
     /// overlay never got a frame on screen (the agent exited within one
     /// event-loop tick of producing its first output). Without this, a
@@ -996,7 +1024,10 @@ impl Tab {
         if self.container_rendered {
             return;
         }
-        let contents = self.vt100_parser.screen().contents();
+        let Some(slot) = self.focused_slot() else {
+            return;
+        };
+        let contents = slot.vt100_parser.screen().contents();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
         if lines.is_empty() {
             return;
@@ -1018,12 +1049,15 @@ impl Tab {
 
     /// Tear down the container overlay state. Called when a containerized
     /// command finishes (exit, error, or task drop). Captures
-    /// `LastContainerSummary` from `container_info` (if any) so the post-exit
-    /// summary bar can show averaged stats and the exit code.
+    /// `LastContainerSummary` from the focused slot's `ContainerInfo` so the
+    /// post-exit summary bar can show averaged stats and the exit code. The
+    /// slot itself is left in place — mid-workflow closes reuse its info for
+    /// the next step's stats polling and title; `poll_command_completion`
+    /// clears the slots when the whole command is over.
     fn close_container_overlay(&mut self, exit_code: i32) {
         self.surface_unseen_container_output();
         if self.container_window_state != ContainerWindowState::Hidden {
-            if let Some(info) = self.container_info.take() {
+            if let Some(info) = self.focused_slot().and_then(|s| s.container_info.as_ref()) {
                 let elapsed = info.start_time.elapsed().as_secs();
                 let (avg_cpu, avg_memory) = if info.stats_history.is_empty() {
                     ("n/a".to_string(), "n/a".to_string())
@@ -1036,8 +1070,8 @@ impl Tab {
                     (format!("{:.1}%", cpu_avg), format!("{:.0}MiB", mem_avg))
                 };
                 self.last_container_summary = Some(LastContainerSummary {
-                    agent_display_name: info.agent_display_name,
-                    container_name: info.container_name,
+                    agent_display_name: info.agent_display_name.clone(),
+                    container_name: info.container_name.clone(),
                     avg_cpu,
                     avg_memory,
                     total_time: format_duration(elapsed),
@@ -1049,9 +1083,10 @@ impl Tab {
         self.container_inner_area = None;
         self.mouse_selection = None;
         self.container_scroll_offset = 0;
-        self.agent_alt_screen = false;
-        self.agent_alternate_scroll = false;
-        self.region_scroll.reset();
+        for slot in &mut self.container_slots {
+            slot.agent_alt_screen = false;
+            slot.agent_alternate_scroll = false;
+        }
         self.stuck = false;
         self.stuck_rx = None;
     }
@@ -1063,10 +1098,9 @@ impl Tab {
     /// The engine only publishes the exit code on real container death,
     /// never for a stuck-but-alive container or while a yolo countdown is
     /// still running, so taking the slot is the whole gate. The summary bar
-    /// is left behind (captured by `close_container_overlay`), and
-    /// `container_info` is kept alive because later workflow steps reuse it
-    /// for stats polling and the overlay title — matching the existing
-    /// step-transition behavior in `tick_all_tabs`.
+    /// is left behind (captured by `close_container_overlay`), and the slot
+    /// (with its `ContainerInfo`) is kept alive because later workflow steps
+    /// reuse it for stats polling and the overlay title.
     pub fn poll_container_exit(&mut self) {
         let exit_code = self
             .container_exit_shared
@@ -1079,9 +1113,7 @@ impl Tab {
         // Pull any final bytes into the parser first so the captured
         // scrollback (and `surface_unseen_container_output`) is complete.
         self.drain_container_output();
-        let info = self.container_info.clone();
         self.close_container_overlay(exit_code);
-        self.container_info = info;
         // Late bytes still in flight from the dead container must not
         // re-open the window; cleared when the next container launches.
         self.suppress_container_auto_open = true;
@@ -1127,14 +1159,9 @@ impl Tab {
                         exit_code,
                     };
                     self.close_container_overlay(exit_code);
-                    // The window may already be closed (mid-workflow container
-                    // exit), in which case the overlay-close above skipped the
-                    // take — the command is over, so drop the info regardless.
-                    self.container_info = None;
-                    self.command_result_rx = None;
-                    self.container_stdout_rx = None;
-                    self.container_stdin_tx = None;
-                    self.container_resize_tx = None;
+                    // The command is over — drop every slot (and any dormant
+                    // backbone) so the tab returns to the no-container state.
+                    self.clear_container_slots();
                 }
                 Ok(Err(err)) => {
                     let cmd_name = match &self.execution_phase {
@@ -1153,11 +1180,7 @@ impl Tab {
                         message: err_msg,
                     };
                     self.close_container_overlay(-1);
-                    self.container_info = None;
-                    self.command_result_rx = None;
-                    self.container_stdout_rx = None;
-                    self.container_stdin_tx = None;
-                    self.container_resize_tx = None;
+                    self.clear_container_slots();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Still running — nothing to do.
@@ -1188,14 +1211,20 @@ impl Tab {
                         message: err_msg,
                     };
                     self.close_container_overlay(-1);
-                    self.container_info = None;
-                    self.command_result_rx = None;
-                    self.container_stdout_rx = None;
-                    self.container_stdin_tx = None;
-                    self.container_resize_tx = None;
+                    self.clear_container_slots();
                 }
             }
         }
+    }
+
+    /// Drop every container slot (active and dormant) and the command result
+    /// channel. Called when the command task is over in any way — the tab
+    /// returns to the no-container state.
+    fn clear_container_slots(&mut self) {
+        self.container_slots.clear();
+        self.dormant_slots.clear();
+        self.focused_slot_idx = 0;
+        self.command_result_rx = None;
     }
 
     pub fn subcommand_label(&self) -> &str {
@@ -1433,6 +1462,17 @@ mod tests {
         Tab::new(make_test_session())
     }
 
+    /// Install a single container slot (as `spawn_command` would) and return
+    /// a sender feeding its PTY output channel.
+    fn attach_slot_stdout(tab: &mut Tab) -> tokio::sync::mpsc::UnboundedSender<Vec<u8>> {
+        if tab.container_slots.is_empty() {
+            tab.start_container("claude".into(), String::new(), 80, 24);
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.focused_slot_mut().unwrap().container_stdout_rx = Some(rx);
+        tx
+    }
+
     /// Tab whose working-dir basename is `name`, for project_name tests.
     /// Returns the TempDir so the directory outlives `Session::open`.
     fn make_named_tab(name: &str) -> (Tab, tempfile::TempDir) {
@@ -1497,6 +1537,7 @@ mod tests {
     fn container_exit_report_closes_window_and_leaves_summary() {
         let mut tab = make_tab();
         tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
         tab.container_rendered = true; // pretend a frame made it to screen
         *tab.container_exit_shared.lock().unwrap() = Some(137);
 
@@ -1510,8 +1551,10 @@ mod tests {
         assert_eq!(summary.exit_code, 137);
         assert_eq!(summary.container_name, "awman-abc");
         assert!(
-            tab.container_info.is_some(),
-            "container_info must survive so later workflow steps keep stats polling"
+            tab.focused_slot()
+                .and_then(|s| s.container_info.as_ref())
+                .is_some(),
+            "the slot's container_info must survive so later workflow steps keep stats polling"
         );
         assert!(
             tab.container_exit_shared.lock().unwrap().is_none(),
@@ -1523,6 +1566,7 @@ mod tests {
     fn poll_container_exit_is_noop_without_a_reported_exit() {
         let mut tab = make_tab();
         tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
 
         tab.poll_container_exit();
 
@@ -1536,9 +1580,10 @@ mod tests {
     fn late_bytes_after_container_exit_do_not_reopen_window() {
         let mut tab = make_tab();
         tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
         tab.container_rendered = true;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
+        tab.focused_slot_mut().unwrap().container_stdout_rx = Some(rx);
 
         *tab.container_exit_shared.lock().unwrap() = Some(0);
         tab.poll_container_exit();
@@ -1591,11 +1636,11 @@ mod tests {
         // screen height. Each "line\n" becomes one row of scrollback.
         for i in 0..500 {
             let s = format!("line {i}\r\n");
-            tab.vt100_parser.process(s.as_bytes());
+            tab.focused_parser_mut().process(s.as_bytes());
         }
         // Probe depth.
         let depth = {
-            let screen = tab.vt100_parser.screen_mut();
+            let screen = tab.focused_parser_mut().screen_mut();
             screen.set_scrollback(usize::MAX);
             let d = screen.scrollback();
             screen.set_scrollback(0);
@@ -1608,7 +1653,7 @@ mod tests {
         // Set offset to a value much larger than screen_rows. Pre-fix
         // (vt100 0.15.2) this would panic in debug; vt100-ctt 0.17 must
         // handle it safely.
-        let screen = tab.vt100_parser.screen_mut();
+        let screen = tab.focused_parser_mut().screen_mut();
         screen.set_scrollback(depth);
         let eff = screen.scrollback();
         assert_eq!(
@@ -2006,22 +2051,23 @@ mod tests {
     #[test]
     fn drain_container_output_tracks_alt_screen_and_alternate_scroll() {
         let mut tab = make_tab();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
+        let tx = attach_slot_stdout(&mut tab);
 
         tx.send(b"\x1b[?1049h\x1b[?1007h".to_vec()).unwrap();
         tab.drain_container_output();
-        assert!(tab.agent_alt_screen, "1049h must set agent_alt_screen");
+        let slot = tab.focused_slot().unwrap();
+        assert!(slot.agent_alt_screen, "1049h must set agent_alt_screen");
         assert!(
-            tab.agent_alternate_scroll,
+            slot.agent_alternate_scroll,
             "1007h must set agent_alternate_scroll"
         );
 
         tx.send(b"\x1b[?1007l\x1b[?1049l".to_vec()).unwrap();
         tab.drain_container_output();
-        assert!(!tab.agent_alt_screen, "1049l must clear agent_alt_screen");
+        let slot = tab.focused_slot().unwrap();
+        assert!(!slot.agent_alt_screen, "1049l must clear agent_alt_screen");
         assert!(
-            !tab.agent_alternate_scroll,
+            !slot.agent_alternate_scroll,
             "1007l must clear agent_alternate_scroll"
         );
     }
@@ -2038,11 +2084,9 @@ mod tests {
         // RegionScrollEmulator in the drain pipeline (vt100 alone discards
         // these rows).
         let mut tab = make_tab(); // 24x80 parser
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
+        let tx = attach_slot_stdout(&mut tab);
         // Steady-state: the overlay is already open and the parser sized
-        // (start_container). Skips drain's auto-open branch, which would
-        // resize the parser to the host terminal mid-test.
+        // (start_container). Skips drain's auto-open branch.
         tab.container_window_state = ContainerWindowState::Maximized;
 
         // Viewport occupies the bottom 6 rows (0-based top = row 18), so the
@@ -2057,7 +2101,7 @@ mod tests {
         tx.send(bytes).unwrap();
         tab.drain_container_output();
 
-        let screen = tab.vt100_parser.screen_mut();
+        let screen = tab.focused_parser_mut().screen_mut();
         screen.set_scrollback(usize::MAX);
         let depth = screen.scrollback();
         assert!(
@@ -2149,8 +2193,7 @@ mod tests {
     #[test]
     fn unrendered_container_output_is_surfaced_to_status_log() {
         let mut tab = make_tab();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
+        let tx = attach_slot_stdout(&mut tab);
 
         // The agent prints an error and dies before the renderer draws a
         // single frame — drain opens the overlay, poll closes it in the same
@@ -2177,8 +2220,7 @@ mod tests {
     #[test]
     fn rendered_container_output_is_not_duplicated_into_status_log() {
         let mut tab = make_tab();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
+        let tx = attach_slot_stdout(&mut tab);
 
         tx.send(b"normal session output\r\n".to_vec()).unwrap();
         tab.drain_container_output();
@@ -2197,15 +2239,18 @@ mod tests {
 
     // ── WI-0096 parallel-slot behavior ───────────────────────────────────────
 
-    fn slot(name: &str) -> ParallelContainerSlot {
-        ParallelContainerSlot::new(name.to_string(), "claude".to_string(), 1000)
+    fn slot(name: &str) -> ContainerSlot {
+        ContainerSlot::new(name.to_string(), "claude".to_string(), 1000)
     }
 
     #[test]
-    fn parallel_slots_aggregate_stuck_and_yolo_flags() {
+    fn container_slots_aggregate_stuck_and_yolo_flags() {
         let mut tab = make_tab();
-        tab.parallel_slots.push(slot("a"));
-        tab.parallel_slots.push(slot("b"));
+        tab.container_slots.push(slot("a"));
+        tab.container_slots.push(slot("b"));
+        // Slot-flag aggregation only runs while a parallel group is active,
+        // marked by the stashed sequential backbone.
+        tab.dormant_slots.push(slot(""));
 
         // All slots clear → aggregate is false.
         tab.drain_stuck_events();
@@ -2213,20 +2258,20 @@ mod tests {
         assert!(!tab.yolo_mode);
 
         // Any slot stuck → aggregate stuck is true.
-        tab.parallel_slots[1].stuck = true;
+        tab.container_slots[1].stuck = true;
         tab.drain_stuck_events();
         assert!(tab.stuck, "any stuck slot makes the tab aggregate stuck");
         assert!(!tab.yolo_mode);
 
         // Clear stuck, set yolo on the other slot → aggregate yolo is true.
-        tab.parallel_slots[1].stuck = false;
-        tab.parallel_slots[0].yolo_mode = true;
+        tab.container_slots[1].stuck = false;
+        tab.container_slots[0].yolo_mode = true;
         tab.drain_stuck_events();
         assert!(!tab.stuck);
         assert!(tab.yolo_mode, "any yolo slot makes the tab aggregate yolo");
 
         // Everything clear again → both false.
-        tab.parallel_slots[0].yolo_mode = false;
+        tab.container_slots[0].yolo_mode = false;
         tab.drain_stuck_events();
         assert!(!tab.stuck);
         assert!(!tab.yolo_mode);
@@ -2235,22 +2280,22 @@ mod tests {
     #[test]
     fn evicting_focused_slot_advances_focus_to_next_live_slot() {
         let mut tab = make_tab();
-        tab.parallel_slots.push(slot("a"));
-        tab.parallel_slots.push(slot("b"));
-        tab.parallel_slots.push(slot("c"));
+        tab.container_slots.push(slot("a"));
+        tab.container_slots.push(slot("b"));
+        tab.container_slots.push(slot("c"));
         tab.focused_slot_idx = 1; // focus "b"
 
-        tab.parallel_slot_events
+        tab.container_slot_events
             .lock()
             .unwrap()
-            .push_back(ParallelSlotEvent::Exited {
+            .push_back(ContainerSlotEvent::Exited {
                 step_name: "b".to_string(),
             });
-        tab.drain_parallel_slot_events();
+        tab.drain_container_slot_events();
 
         assert_eq!(tab.active_slot_count(), 2);
         assert!(
-            !tab.parallel_slots.iter().any(|s| s.step_name == "b"),
+            !tab.container_slots.iter().any(|s| s.step_name == "b"),
             "the exited slot must be gone"
         );
         assert_eq!(tab.focused_slot_idx, 1);
@@ -2264,18 +2309,18 @@ mod tests {
     #[test]
     fn evicting_slot_before_focused_shifts_index_down() {
         let mut tab = make_tab();
-        tab.parallel_slots.push(slot("a"));
-        tab.parallel_slots.push(slot("b"));
-        tab.parallel_slots.push(slot("c"));
+        tab.container_slots.push(slot("a"));
+        tab.container_slots.push(slot("b"));
+        tab.container_slots.push(slot("c"));
         tab.focused_slot_idx = 2; // focus "c"
 
-        tab.parallel_slot_events
+        tab.container_slot_events
             .lock()
             .unwrap()
-            .push_back(ParallelSlotEvent::Exited {
+            .push_back(ContainerSlotEvent::Exited {
                 step_name: "a".to_string(),
             });
-        tab.drain_parallel_slot_events();
+        tab.drain_container_slot_events();
 
         assert_eq!(tab.active_slot_count(), 2);
         assert_eq!(tab.focused_slot_idx, 1, "index shifts down by one");
@@ -2289,16 +2334,16 @@ mod tests {
     #[test]
     fn evicting_last_slot_hides_the_container_window() {
         let mut tab = make_tab();
-        tab.parallel_slots.push(slot("a"));
+        tab.container_slots.push(slot("a"));
         tab.container_window_state = ContainerWindowState::Maximized;
 
-        tab.parallel_slot_events
+        tab.container_slot_events
             .lock()
             .unwrap()
-            .push_back(ParallelSlotEvent::Exited {
+            .push_back(ContainerSlotEvent::Exited {
                 step_name: "a".to_string(),
             });
-        tab.drain_parallel_slot_events();
+        tab.drain_container_slot_events();
 
         assert_eq!(tab.active_slot_count(), 0);
         assert_eq!(tab.focused_slot_idx, 0);
@@ -2308,9 +2353,9 @@ mod tests {
     #[test]
     fn cycle_focused_slot_advances_cyclically_through_three_slots() {
         let mut tab = make_tab();
-        tab.parallel_slots.push(slot("a"));
-        tab.parallel_slots.push(slot("b"));
-        tab.parallel_slots.push(slot("c"));
+        tab.container_slots.push(slot("a"));
+        tab.container_slots.push(slot("b"));
+        tab.container_slots.push(slot("c"));
 
         assert_eq!(tab.focused_slot_idx, 0);
         tab.cycle_focused_slot();
@@ -2327,8 +2372,199 @@ mod tests {
     #[test]
     fn cycle_focused_slot_is_noop_with_a_single_slot() {
         let mut tab = make_tab();
-        tab.parallel_slots.push(slot("a"));
+        tab.container_slots.push(slot("a"));
         tab.cycle_focused_slot();
         assert_eq!(tab.focused_slot_idx, 0);
+    }
+
+    #[test]
+    fn cycle_focused_slot_resets_scrollback_to_live_view() {
+        let mut tab = make_tab();
+        tab.container_slots.push(slot("a"));
+        tab.container_slots.push(slot("b"));
+        tab.container_scroll_offset = 42;
+        tab.cycle_focused_slot();
+        assert_eq!(
+            tab.container_scroll_offset, 0,
+            "the rotated-in slot must start at its live view"
+        );
+    }
+
+    #[test]
+    fn launched_slot_parser_is_sized_to_the_overlay_not_80x24() {
+        let mut tab = make_tab();
+        // The renderer published the overlay's inner rect on a prior frame.
+        tab.container_inner_area = Some(ratatui::layout::Rect::new(1, 1, 150, 40));
+
+        let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        let (_stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.container_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ContainerSlotEvent::Launched {
+                step_name: "build".to_string(),
+                agent: "claude".to_string(),
+                model: None,
+                io: Some(ContainerSlotIo {
+                    stdout_rx,
+                    stdin_tx,
+                    resize_tx,
+                }),
+            });
+        tab.drain_container_slot_events();
+
+        let (rows, cols) = tab.container_slots[0].vt100_parser.screen().size();
+        assert_eq!(
+            (cols, rows),
+            (150, 40),
+            "the fresh slot parser must match the overlay, not the 80x24 default"
+        );
+        assert_eq!(
+            resize_rx.try_recv().ok(),
+            Some((150, 40)),
+            "the container PTY must receive the real size at launch"
+        );
+    }
+
+    #[test]
+    fn container_name_event_updates_the_matching_slot() {
+        let mut tab = make_tab();
+        tab.container_slots.push(slot("build"));
+        tab.container_slots.push(slot("test"));
+
+        tab.container_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ContainerSlotEvent::ContainerName {
+                step_name: "test".to_string(),
+                container_name: "awman-test-4242".to_string(),
+            });
+        tab.drain_container_slot_events();
+
+        assert_eq!(
+            tab.container_slots[1]
+                .container_info
+                .as_ref()
+                .unwrap()
+                .container_name,
+            "awman-test-4242"
+        );
+        assert!(
+            tab.container_slots[0]
+                .container_info
+                .as_ref()
+                .unwrap()
+                .container_name
+                .is_empty(),
+            "the other slot's name must be untouched"
+        );
+    }
+
+    #[test]
+    fn parallel_output_tracks_per_slot_alt_screen_flags() {
+        let mut tab = make_tab();
+        let mut s = slot("build");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        s.container_stdout_rx = Some(rx);
+        tab.container_slots.push(s);
+        tab.container_slots.push(slot("test"));
+
+        // Agent enables the alternate screen and alternate scroll (codex-style).
+        tx.send(b"\x1b[?1049h\x1b[?1007h".to_vec()).unwrap();
+        tab.drain_container_output();
+
+        assert!(tab.container_slots[0].agent_alt_screen);
+        assert!(tab.container_slots[0].agent_alternate_scroll);
+        assert!(
+            !tab.container_slots[1].agent_alt_screen,
+            "flags are per-slot, not shared"
+        );
+    }
+
+    #[test]
+    fn first_parallel_output_auto_opens_the_container_window() {
+        let mut tab = make_tab();
+        let mut s = slot("build");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        s.container_stdout_rx = Some(rx);
+        tab.container_slots.push(s);
+        assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
+
+        tx.send(b"hello from the agent".to_vec()).unwrap();
+        tab.drain_container_output();
+
+        assert_eq!(
+            tab.container_window_state,
+            ContainerWindowState::Maximized,
+            "a workflow starting directly with a parallel group must open the overlay"
+        );
+    }
+
+    #[test]
+    fn container_overlay_active_requires_a_slot_and_maximized() {
+        let mut tab = make_tab();
+        // No slots: never active, regardless of window state.
+        tab.container_window_state = ContainerWindowState::Maximized;
+        assert!(!tab.container_overlay_active());
+
+        // With a slot: only Maximized shows the overlay; Minimized renders
+        // every slot as a status bar instead.
+        tab.container_slots.push(slot("a"));
+        assert!(tab.container_overlay_active());
+        tab.container_window_state = ContainerWindowState::Minimized;
+        assert!(!tab.container_overlay_active());
+        tab.container_window_state = ContainerWindowState::Hidden;
+        assert!(!tab.container_overlay_active());
+    }
+
+    #[test]
+    fn group_started_stashes_backbone_and_group_finished_restores_it() {
+        let mut tab = make_tab();
+        // The command-level backbone slot (as spawn_command installs it).
+        tab.start_container("claude".into(), "awman-backbone".into(), 80, 24);
+
+        // Parallel group starts: the backbone goes dormant, group slots join.
+        {
+            let mut q = tab.container_slot_events.lock().unwrap();
+            q.push_back(ContainerSlotEvent::GroupStarted);
+            q.push_back(ContainerSlotEvent::Launched {
+                step_name: "a".into(),
+                agent: "claude".into(),
+                model: None,
+                io: None,
+            });
+            q.push_back(ContainerSlotEvent::Launched {
+                step_name: "b".into(),
+                agent: "codex".into(),
+                model: None,
+                io: None,
+            });
+        }
+        tab.drain_container_slot_events();
+        assert_eq!(tab.active_slot_count(), 2, "only the group slots display");
+        assert_eq!(tab.dormant_slots.len(), 1, "the backbone is stashed");
+
+        // Group drains and finishes: the backbone is restored.
+        {
+            let mut q = tab.container_slot_events.lock().unwrap();
+            q.push_back(ContainerSlotEvent::Exited {
+                step_name: "a".into(),
+            });
+            q.push_back(ContainerSlotEvent::Exited {
+                step_name: "b".into(),
+            });
+            q.push_back(ContainerSlotEvent::GroupFinished);
+        }
+        tab.drain_container_slot_events();
+        assert_eq!(tab.active_slot_count(), 1);
+        assert!(tab.dormant_slots.is_empty());
+        assert_eq!(
+            tab.focused_slot()
+                .and_then(|s| s.container_info.as_ref())
+                .map(|i| i.container_name.as_str()),
+            Some("awman-backbone"),
+            "the restored slot is the original backbone"
+        );
     }
 }

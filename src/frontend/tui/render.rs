@@ -34,14 +34,9 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
             tab.container_window_state,
             tab.last_container_summary.is_some(),
             tab.git_sidebar_state,
-            tab.parallel_slots.len(),
+            tab.container_slots.len(),
         )
     };
-
-    // WI-0096 §5: multi-container chrome activates only with more than one
-    // parallel slot. With zero or one slot, `multi_slot` is false and every
-    // branch below falls through to the legacy rendering — pixel-identical.
-    let multi_slot = slot_count > 1;
 
     // When the git sidebar is open (and wide enough), reserve the right ≤25%
     // of the frame for it; the execution/container windows shrink into the
@@ -56,26 +51,30 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         (area, None)
     };
 
-    let has_minimized_container = !multi_slot && container_state == ContainerWindowState::Minimized;
-    // Show the post-exit summary in the same slot as the minimized bar, but
-    // only when the container is Hidden (i.e. the previous run finished and
-    // we haven't started another).
-    let has_summary_bar = !multi_slot
-        && !has_minimized_container
-        && container_state == ContainerWindowState::Hidden
-        && has_summary;
-
-    // WI-0096 §5: one row per minimized (non-focused) slot, stacked above the
-    // status bar. Ctrl-M (Hidden) hides everything, including the bars.
-    let n_minimized_bars = if multi_slot && container_state != ContainerWindowState::Hidden {
-        (slot_count - 1) as u16
-    } else {
+    // Container display shape, unified across 1..N slots:
+    // - Maximized: the focused slot as an overlay + one bar per other slot.
+    // - Minimized: every slot as a bar, no overlay.
+    // - Hidden: nothing (the post-exit summary bar shows here, if any).
+    let show_overlay = container_state == ContainerWindowState::Maximized && slot_count > 0;
+    let n_minimized_bars = if slot_count == 0 {
         0
+    } else {
+        match container_state {
+            ContainerWindowState::Maximized => (slot_count - 1) as u16,
+            ContainerWindowState::Minimized => slot_count as u16,
+            ContainerWindowState::Hidden => 0,
+        }
     };
+    let minimized_bars_height = n_minimized_bars * container_view::PARALLEL_BAR_HEIGHT;
 
-    let extra_bar_height = if multi_slot {
-        n_minimized_bars
-    } else if has_minimized_container || has_summary_bar {
+    // Show the post-exit summary in the same layout slot as the minimized
+    // bars, but only when the container display is Hidden (i.e. the previous
+    // run finished and we haven't started another).
+    let has_summary_bar = container_state == ContainerWindowState::Hidden && has_summary;
+
+    let extra_bar_height = if n_minimized_bars > 0 {
+        minimized_bars_height
+    } else if has_summary_bar {
         3
     } else {
         0
@@ -95,12 +94,8 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     render_tab_bar(app, chunks[0], frame);
     render_execution_window(app, chunks[1], frame);
 
-    if multi_slot {
-        if n_minimized_bars > 0 {
-            container_view::render_parallel_minimized_bars(app.active_tab(), chunks[2], frame);
-        }
-    } else if has_minimized_container {
-        container_view::render_container_minimized(app.active_tab(), chunks[2], frame);
+    if n_minimized_bars > 0 {
+        container_view::render_container_bars(app.active_tab(), chunks[2], frame, show_overlay);
     } else if has_summary_bar {
         if let Some(summary) = app.active_tab().last_container_summary.as_ref() {
             container_view::render_container_summary(summary, chunks[2], frame);
@@ -126,28 +121,20 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     render_suggestion_row(app, chunks[6], frame);
 
     // Container maximized overlay (rendered on top of execution window only,
-    // not over the workflow strip or bottom chrome). Confined to the left
-    // chunk (`main_area`) so it never covers the git sidebar.
-    if multi_slot {
-        // The focused slot is shown maximized (the rest are the minimized
-        // bars). Ctrl-M (Hidden) hides everything. Its overlay reserves the
-        // minimized-bar rows at the bottom so it doesn't overlap them.
-        if container_state != ContainerWindowState::Hidden {
-            let tab = app.active_tab_mut();
-            tab.container_rendered = true;
-            container_view::render_container_maximized(
-                tab,
-                main_area,
-                workflow_height + n_minimized_bars,
-                frame,
-            );
-        }
-    } else if container_state == ContainerWindowState::Maximized {
+    // not over the workflow strip, minimized bars, or bottom chrome).
+    // Confined to the left chunk (`main_area`) so it never covers the git
+    // sidebar.
+    if show_overlay {
         let tab = app.active_tab_mut();
         // The overlay made it to the screen; close_container_overlay no
         // longer needs to replay its contents into the status log.
         tab.container_rendered = true;
-        container_view::render_container_maximized(tab, main_area, workflow_height, frame);
+        container_view::render_container_maximized(
+            tab,
+            main_area,
+            workflow_height + minimized_bars_height,
+            frame,
+        );
     }
 
     // Git sidebar (right chunk), when open and wide enough.
@@ -286,9 +273,10 @@ fn render_execution_window(app: &mut App, area: Rect, frame: &mut Frame) {
     let border_color = window_border_color(&tab.execution_phase, focused);
     let title = phase_label(&tab.execution_phase);
 
-    let container_maximized = tab.container_window_state == ContainerWindowState::Maximized;
+    let container_maximized = tab.container_overlay_active();
     // A selection only belongs to this window while the container overlay
-    // isn't covering it; when Maximized the selection is the overlay's.
+    // isn't covering it; when the overlay is active the selection is the
+    // overlay's.
     let selection = if container_maximized {
         None
     } else {

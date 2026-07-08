@@ -155,6 +155,11 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     ) {
     }
 
+    /// The engine learned a parallel step's actual container name (right
+    /// after the container launched). Frontends use it for per-container
+    /// stats polling and status-bar display.
+    fn report_parallel_step_container(&mut self, _step_name: &str, _container_name: &str) {}
+
     /// One container in a parallel group has exited.
     /// `evict` — the frontend should remove the status bar for this step
     /// entirely (not replace it with a grey summary bar).

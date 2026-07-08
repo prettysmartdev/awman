@@ -84,11 +84,10 @@ pub struct TuiCommandFrontend {
     pub(crate) tui_context_shared: SharedTuiContext,
     /// Shared queue of parallel-slot lifecycle events (WI-0096). The parallel
     /// workflow callbacks push here; the TUI event loop drains it to maintain
-    /// `Tab::parallel_slots`.
-    pub(crate) parallel_slot_events: crate::frontend::tui::tabs::SharedParallelSlotEvents,
+    /// `Tab::container_slots`.
+    pub(crate) container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
     pub(crate) parallel_group_active: bool,
-    pub(crate) pending_parallel_slot_io:
-        HashMap<String, crate::frontend::tui::tabs::ParallelSlotIo>,
+    pub(crate) pending_step_slot_io: HashMap<String, crate::frontend::tui::tabs::ContainerSlotIo>,
     /// Field name of the most recent config-dialog edit, so the re-presented
     /// table reopens with that row selected (the `config show` edit loop
     /// presents the dialog again after every save).
@@ -116,7 +115,7 @@ impl TuiCommandFrontend {
         active_worktree_path: SharedActiveWorktreePath,
         status_dashboard: SharedStatusDashboard,
         tui_context_shared: SharedTuiContext,
-        parallel_slot_events: crate::frontend::tui::tabs::SharedParallelSlotEvents,
+        container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
     ) -> Self {
         let stdout_tx = container_io.stdout.clone();
         Self {
@@ -141,9 +140,9 @@ impl TuiCommandFrontend {
             active_worktree_path,
             status_dashboard,
             tui_context_shared,
-            parallel_slot_events,
+            container_slot_events,
             parallel_group_active: false,
-            pending_parallel_slot_io: HashMap::new(),
+            pending_step_slot_io: HashMap::new(),
             last_config_edit_field: None,
         }
     }
@@ -199,9 +198,9 @@ impl TuiCommandFrontend {
             resize: Some(resize_rx),
             initial_size: Some(initial_size),
         });
-        self.pending_parallel_slot_io.insert(
+        self.pending_step_slot_io.insert(
             step_name.to_string(),
-            crate::frontend::tui::tabs::ParallelSlotIo {
+            crate::frontend::tui::tabs::ContainerSlotIo {
                 stdout_rx,
                 stdin_tx,
                 resize_tx,
@@ -211,11 +210,11 @@ impl TuiCommandFrontend {
 
     /// Push a parallel-slot lifecycle event into the shared queue for the
     /// TUI event loop to drain (WI-0096).
-    pub(crate) fn push_parallel_slot_event(
+    pub(crate) fn push_container_slot_event(
         &self,
-        event: crate::frontend::tui::tabs::ParallelSlotEvent,
+        event: crate::frontend::tui::tabs::ContainerSlotEvent,
     ) {
-        if let Ok(mut q) = self.parallel_slot_events.lock() {
+        if let Ok(mut q) = self.container_slot_events.lock() {
             q.push_back(event);
         }
     }

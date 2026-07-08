@@ -295,7 +295,7 @@ fn command_box_locked(app: &App) -> bool {
 fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     let ctx = if app.active_dialog.is_some() {
         FocusContext::Dialog
-    } else if app.active_tab().container_window_state == ContainerWindowState::Maximized
+    } else if app.active_tab().container_overlay_active()
         && matches!(
             app.active_tab().execution_phase,
             tabs::ExecutionPhase::Running { .. }
@@ -377,20 +377,11 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         && app.active_dialog.is_none()
         && app.active_tab().has_multiple_slots()
     {
-        let size = crossterm::terminal::size().ok();
         let tab = app.active_tab_mut();
         tab.cycle_focused_slot();
-        if let Some((term_cols, term_rows)) = size {
-            let sidebar = git_sidebar::sidebar_width(term_cols, tab.git_sidebar_state);
-            let left_cols = term_cols.saturating_sub(sidebar);
-            let (cols, rows) = compute_container_inner_size(left_cols, term_rows);
-            if let Some(slot) = tab.focused_slot_mut() {
-                slot.vt100_parser.screen_mut().set_size(rows, cols);
-                if let Some(ref tx) = slot.container_resize_tx {
-                    let _ = tx.send((cols, rows));
-                }
-            }
-        }
+        // No manual resize here: `tick_all_tabs` keeps every slot's parser
+        // and PTY in lockstep with the overlay's actual inner rect, so the
+        // rotated-in slot is already correctly sized.
         return;
     }
 
@@ -477,15 +468,7 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             // in; cycling swaps which window owns selections, so drop it.
             tab.mouse_selection = None;
             if tab.container_window_state != ContainerWindowState::Hidden {
-                if let Ok(size) = crossterm::terminal::size() {
-                    let sidebar = git_sidebar::sidebar_width(size.0, tab.git_sidebar_state);
-                    let left_cols = size.0.saturating_sub(sidebar);
-                    let (cols, rows) = compute_container_inner_size(left_cols, size.1);
-                    tab.vt100_parser.screen_mut().set_size(rows, cols);
-                    if let Some(ref tx) = tab.container_resize_tx {
-                        let _ = tx.send((cols, rows));
-                    }
-                }
+                resize_slots_to_terminal(tab);
             }
         }
         Action::ToggleGitSidebar => {
@@ -499,15 +482,7 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             // to the new width. This is needed even when the container is
             // Maximized (it fills the left chunk, not the whole frame).
             if tab.container_window_state != ContainerWindowState::Hidden {
-                if let Ok(size) = crossterm::terminal::size() {
-                    let sidebar = git_sidebar::sidebar_width(size.0, tab.git_sidebar_state);
-                    let left_cols = size.0.saturating_sub(sidebar);
-                    let (cols, rows) = compute_container_inner_size(left_cols, size.1);
-                    tab.vt100_parser.screen_mut().set_size(rows, cols);
-                    if let Some(ref tx) = tab.container_resize_tx {
-                        let _ = tx.send((cols, rows));
-                    }
-                }
+                resize_slots_to_terminal(tab);
             }
         }
         Action::WorkflowControl => {
@@ -797,14 +772,24 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
 
             let tab = app.active_tab_mut();
-            if tab.container_window_state == ContainerWindowState::Maximized {
-                let agent_wants_mouse = tab.vt100_parser.screen().mouse_protocol_mode()
-                    != vt100::MouseProtocolMode::None;
+            if tab.container_overlay_active() {
+                // The focused slot owns the overlay — read the agent's
+                // terminal modes from its parser. `container_overlay_active`
+                // guarantees a slot exists.
+                let (mouse_mode, alt_screen, alternate_scroll) = match tab.focused_slot() {
+                    Some(slot) => (
+                        slot.vt100_parser.screen().mouse_protocol_mode(),
+                        slot.agent_alt_screen,
+                        slot.agent_alternate_scroll,
+                    ),
+                    None => return,
+                };
+                let agent_wants_mouse = mouse_mode != vt100::MouseProtocolMode::None;
                 // Agents like codex never enable mouse tracking; they pair
                 // the alternate screen with alternate-scroll mode (DECSET
                 // 1007) and expect the terminal to translate wheel events
                 // into arrow keys. awman plays the terminal's role here.
-                let agent_wants_alt_scroll = tab.agent_alt_screen && tab.agent_alternate_scroll;
+                let agent_wants_alt_scroll = alt_screen && alternate_scroll;
                 let at_live_view = tab.container_scroll_offset == 0;
                 let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
 
@@ -824,7 +809,7 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => {
             let dialog_open = app.active_dialog.is_some();
             let tab = app.active_tab_mut();
-            if tab.container_window_state == ContainerWindowState::Maximized {
+            if tab.container_overlay_active() {
                 let inner = match tab.container_inner_area {
                     Some(r) => r,
                     None => return,
@@ -841,7 +826,12 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 let vt_col = mouse.column - inner.x;
                 let vt_row = mouse.row - inner.y;
                 let scroll = tab.container_scroll_offset;
-                let snapshot = capture_vt100_snapshot(&mut tab.vt100_parser, scroll);
+                // Snapshot the focused slot's grid (the overlay's content).
+                let focused_idx = tab.focused_slot_idx;
+                let Some(slot) = tab.container_slots.get_mut(focused_idx) else {
+                    return;
+                };
+                let snapshot = capture_vt100_snapshot(&mut slot.vt100_parser, scroll);
                 tab.mouse_selection = Some(tabs::TextSelection {
                     start_col: vt_col,
                     start_row: vt_row,
@@ -884,7 +874,7 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             let tab = app.active_tab_mut();
-            let inner = if tab.container_window_state == ContainerWindowState::Maximized {
+            let inner = if tab.container_overlay_active() {
                 tab.container_inner_area
             } else {
                 tab.exec_inner_area
@@ -1014,25 +1004,34 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
             let sidebar = git_sidebar::sidebar_width(cols, tab.git_sidebar_state);
             let left_cols = cols.saturating_sub(sidebar);
             let (inner_cols, inner_rows) = compute_container_inner_size(left_cols, rows);
-            tab.vt100_parser
-                .screen_mut()
-                .set_size(inner_rows, inner_cols);
-            // Forward the new size to the container's PTY master so its
-            // SIGWINCH handler reflows TUI apps inside the container.
-            if let Some(ref tx) = tab.container_resize_tx {
-                let _ = tx.send((inner_cols, inner_rows));
-            }
-            // WI-0096 edge case: broadcast the resize to every active parallel
-            // slot's PTY (not just the focused one) so each container tracks
-            // the real terminal size even while minimized.
-            for slot in &mut tab.parallel_slots {
-                slot.vt100_parser
-                    .screen_mut()
-                    .set_size(inner_rows, inner_cols);
-                if let Some(ref tx) = slot.container_resize_tx {
-                    let _ = tx.send((inner_cols, inner_rows));
-                }
-            }
+            resize_slots(tab, inner_cols, inner_rows);
+        }
+    }
+}
+
+/// Resize every slot's parser and PTY to the estimated overlay inner size
+/// for the current terminal dimensions. Broadcast to all slots (not just the
+/// focused one) so each container tracks the real size even while minimized;
+/// the per-tick sync in `tick_all_tabs` corrects any residual mismatch
+/// against the actually-rendered overlay rect. Forwarding the size to the
+/// PTY master triggers the SIGWINCH that reflows TUI apps inside the
+/// container.
+fn resize_slots_to_terminal(tab: &mut tabs::Tab) {
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let sidebar = git_sidebar::sidebar_width(cols, tab.git_sidebar_state);
+        let left_cols = cols.saturating_sub(sidebar);
+        let (inner_cols, inner_rows) = compute_container_inner_size(left_cols, rows);
+        resize_slots(tab, inner_cols, inner_rows);
+    }
+}
+
+fn resize_slots(tab: &mut tabs::Tab, inner_cols: u16, inner_rows: u16) {
+    for slot in &mut tab.container_slots {
+        slot.vt100_parser
+            .screen_mut()
+            .set_size(inner_rows, inner_cols);
+        if let Some(ref tx) = slot.container_resize_tx {
+            let _ = tx.send((inner_cols, inner_rows));
         }
     }
 }
@@ -1065,19 +1064,11 @@ fn compute_container_inner_size_with_extra(
 
 fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
     if let Some(bytes) = key_to_bytes(&key) {
-        let tab = app.active_tab_mut();
-        // WI-0096: with multiple parallel slots, route keystrokes (incl.
-        // Ctrl-C) only to the focused slot's PTY. When the focused slot has
-        // no dedicated stdin channel (or there are no slots), fall back to
-        // the legacy single-container channel.
-        if let Some(slot) = tab.focused_slot_mut() {
+        // Keystrokes (incl. Ctrl-C) go only to the focused slot's PTY.
+        if let Some(slot) = app.active_tab_mut().focused_slot_mut() {
             if let Some(tx) = slot.container_stdin_tx.as_ref() {
                 let _ = tx.send(bytes);
-                return;
             }
-        }
-        if let Some(ref tx) = tab.container_stdin_tx {
-            let _ = tx.send(bytes);
         }
     }
 }
@@ -3321,9 +3312,14 @@ mod tests {
     #[test]
     fn cycle_to_hidden_does_not_send_resize() {
         let mut app = make_app();
-        // Wire a resize channel to observe.
+        // Install a slot and wire its resize channel to observe.
         let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-        app.active_tab_mut().container_resize_tx = Some(resize_tx);
+        app.active_tab_mut()
+            .start_container("claude".into(), String::new(), 80, 24);
+        app.active_tab_mut()
+            .focused_slot_mut()
+            .unwrap()
+            .container_resize_tx = Some(resize_tx);
 
         // Start at Maximized, cycle → Minimized (not Hidden, resize expected on next test).
         app.active_tab_mut().container_window_state =
@@ -3368,8 +3364,12 @@ mod tests {
         // is explicitly set.
         app.active_tab_mut().container_window_state =
             crate::frontend::tui::tabs::ContainerWindowState::Hidden;
-        app.active_tab_mut().container_resize_tx = None; // no channel
-                                                         // Cycling from Hidden → Maximized — the resize send should not panic.
+        // Drop the slot's resize channel.
+        app.active_tab_mut()
+            .focused_slot_mut()
+            .unwrap()
+            .container_resize_tx = None;
+        // Cycling from Hidden → Maximized — the resize send should not panic.
         press_key(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
         assert_eq!(
             app.active_tab().container_window_state,
@@ -3485,15 +3485,17 @@ mod tests {
         }
     }
 
-    /// Set the active tab to Maximized with a known inner area and a wired
-    /// PTY stdin channel, then return the receiving end for assertions.
+    /// Install a container slot, set the active tab to Maximized with a
+    /// known inner area, and wire the slot's PTY stdin channel; returns the
+    /// receiving end for assertions.
     fn setup_container_tab(app: &mut App) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), String::new(), 80, 24);
         tab.container_window_state = crate::frontend::tui::tabs::ContainerWindowState::Maximized;
         // inner area starting at (5, 3) with size 80×24
         tab.container_inner_area = Some(Rect::new(5, 3, 80, 24));
-        tab.container_stdin_tx = Some(tx);
+        tab.focused_slot_mut().unwrap().container_stdin_tx = Some(tx);
         rx
     }
 
@@ -3524,7 +3526,9 @@ mod tests {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
         // Enable mouse tracking so agent_wants_mouse = true
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h");
         app.active_tab_mut().container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3543,7 +3547,9 @@ mod tests {
     fn scroll_in_scrollback_does_not_forward_to_pty() {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h");
         app.active_tab_mut().container_scroll_offset = 10; // user is scrolled back
 
         super::handle_mouse_event(
@@ -3562,7 +3568,9 @@ mod tests {
     fn scroll_at_live_view_with_mouse_tracking_forwards_to_pty() {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h");
         app.active_tab_mut().container_scroll_offset = 0;
 
         // coords (20, 10) are inside inner_area = Rect::new(5, 3, 80, 24)
@@ -3582,7 +3590,9 @@ mod tests {
     fn scroll_outside_inner_area_is_discarded() {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h");
         app.active_tab_mut().container_scroll_offset = 0;
 
         let before_offset = app.active_tab().container_scroll_offset;
@@ -3652,8 +3662,8 @@ mod tests {
         let mut rx = setup_container_tab(&mut app);
         // codex-style: alternate screen + alternate scroll, NO mouse tracking.
         let tab = app.active_tab_mut();
-        tab.agent_alt_screen = true;
-        tab.agent_alternate_scroll = true;
+        tab.focused_slot_mut().unwrap().agent_alt_screen = true;
+        tab.focused_slot_mut().unwrap().agent_alternate_scroll = true;
         tab.container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3682,8 +3692,8 @@ mod tests {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
         let tab = app.active_tab_mut();
-        tab.agent_alt_screen = false;
-        tab.agent_alternate_scroll = true;
+        tab.focused_slot_mut().unwrap().agent_alt_screen = false;
+        tab.focused_slot_mut().unwrap().agent_alternate_scroll = true;
         tab.container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3701,8 +3711,8 @@ mod tests {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
         let tab = app.active_tab_mut();
-        tab.agent_alt_screen = true;
-        tab.agent_alternate_scroll = true;
+        tab.focused_slot_mut().unwrap().agent_alt_screen = true;
+        tab.focused_slot_mut().unwrap().agent_alternate_scroll = true;
         tab.container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3720,9 +3730,9 @@ mod tests {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
         let tab = app.active_tab_mut();
-        tab.agent_alt_screen = true;
-        tab.agent_alternate_scroll = true;
-        tab.vt100_parser.process(b"\x1b[?1h"); // DECCKM: application cursor keys
+        tab.focused_slot_mut().unwrap().agent_alt_screen = true;
+        tab.focused_slot_mut().unwrap().agent_alternate_scroll = true;
+        tab.focused_parser_mut().process(b"\x1b[?1h"); // DECCKM: application cursor keys
         tab.container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3738,9 +3748,9 @@ mod tests {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
         let tab = app.active_tab_mut();
-        tab.agent_alt_screen = true;
-        tab.agent_alternate_scroll = true;
-        tab.vt100_parser.process(b"\x1b[?1000h"); // real mouse tracking too
+        tab.focused_slot_mut().unwrap().agent_alt_screen = true;
+        tab.focused_slot_mut().unwrap().agent_alternate_scroll = true;
+        tab.focused_parser_mut().process(b"\x1b[?1000h"); // real mouse tracking too
         tab.container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3763,8 +3773,12 @@ mod tests {
         let mut rx = setup_container_tab(&mut app);
         // SGR encoding: ESC[<button;col+1;row+1M — easy to verify exact coords.
         // inner_area = Rect::new(5, 3, 80, 24)
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1006h"); // SGR encoding
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h"); // enable mouse mode
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1006h"); // SGR encoding
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h"); // enable mouse mode
         app.active_tab_mut().container_scroll_offset = 0;
 
         // Terminal coords (10, 6) → vt_col = 10-5 = 5, vt_row = 6-3 = 3
@@ -3787,7 +3801,9 @@ mod tests {
     fn click_down_not_forwarded_to_pty_even_when_agent_tracks_mouse() {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h");
         app.active_tab_mut().container_scroll_offset = 0;
 
         super::handle_mouse_event(
@@ -3814,7 +3830,9 @@ mod tests {
     fn click_drag_not_forwarded_to_pty_even_when_agent_tracks_mouse() {
         let mut app = make_app();
         let mut rx = setup_container_tab(&mut app);
-        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut()
+            .focused_parser_mut()
+            .process(b"\x1b[?1000h");
         app.active_tab_mut().container_scroll_offset = 0;
 
         // Prime the selection so Drag has something to update

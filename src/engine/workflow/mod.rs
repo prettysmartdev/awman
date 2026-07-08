@@ -791,6 +791,10 @@ impl WorkflowEngine {
                 resolved_model.as_deref(),
             );
         }
+        // Published after the launch/dequeue event so the frontend's slot
+        // exists by the time the name arrives; drives per-container stats.
+        self.frontend
+            .report_parallel_step_container(&step.name, &execution.handle().name);
 
         // Forward this container's stuck broadcast into the unified fan-in
         // channel, tagged with the step name, so the select loop stays

@@ -11,11 +11,15 @@ use crate::frontend::tui::tabs::Tab;
 
 /// Scroll awman's own container scrollback (the path used when the agent
 /// has not enabled mouse tracking, or when Shift is held, or when the user
-/// is already scrolled back).
+/// is already scrolled back). The focused slot's parser holds the overlay's
+/// content and scrollback.
 pub(super) fn handle_container_scroll(tab: &mut Tab, is_up: bool) {
     if is_up {
+        let Some(slot) = tab.focused_slot_mut() else {
+            return;
+        };
         let max_scroll = {
-            let screen = tab.vt100_parser.screen_mut();
+            let screen = slot.vt100_parser.screen_mut();
             screen.set_scrollback(usize::MAX);
             let depth = screen.scrollback();
             screen.set_scrollback(0);
@@ -48,10 +52,15 @@ pub(super) fn forward_mouse_scroll_to_pty(tab: &mut Tab, mouse: &MouseEvent) {
     let vt_col = mouse.column - inner.x;
     let vt_row = mouse.row - inner.y;
 
-    let encoding = tab.vt100_parser.screen().mouse_protocol_encoding();
+    // The focused slot owns the overlay — encode against its parser's
+    // protocol and write to its stdin.
+    let Some(slot) = tab.focused_slot() else {
+        return;
+    };
+    let encoding = slot.vt100_parser.screen().mouse_protocol_encoding();
 
     if let Some(bytes) = encode_mouse_scroll(mouse.kind, vt_col, vt_row, encoding) {
-        if let Some(ref tx) = tab.container_stdin_tx {
+        if let Some(ref tx) = slot.container_stdin_tx {
             let _ = tx.send(bytes);
         }
     }
@@ -78,10 +87,14 @@ pub(super) fn forward_alt_scroll_to_pty(tab: &mut Tab, mouse: &MouseEvent) {
         return;
     }
 
-    let application_cursor = tab.vt100_parser.screen().application_cursor();
+    // Same focused-slot routing as `forward_mouse_scroll_to_pty`.
+    let Some(slot) = tab.focused_slot() else {
+        return;
+    };
+    let application_cursor = slot.vt100_parser.screen().application_cursor();
 
     if let Some(bytes) = encode_alt_scroll(mouse.kind, application_cursor) {
-        if let Some(ref tx) = tab.container_stdin_tx {
+        if let Some(ref tx) = slot.container_stdin_tx {
             let _ = tx.send(bytes);
         }
     }

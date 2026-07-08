@@ -67,13 +67,24 @@ pub struct App {
     pub needs_redraw: bool,
     pub command_dialog_active: bool,
     pub runtime_handle: tokio::runtime::Handle,
-    /// Receiver for asynchronous container stats results.
+    /// Receiver for asynchronous container stats results. The middle element
+    /// is the step name of the slot the sample was polled for (empty for the
+    /// single/backbone slot of a plain containerized command).
+    #[allow(clippy::type_complexity)]
     pub stats_rx: Option<
-        std::sync::mpsc::Receiver<(usize, crate::engine::agent_runtime::execution::AgentStats)>,
+        std::sync::mpsc::Receiver<(
+            usize,
+            String,
+            crate::engine::agent_runtime::execution::AgentStats,
+        )>,
     >,
     /// Sender cloned per stats query — kept alive so the channel stays open.
-    pub stats_tx:
-        std::sync::mpsc::Sender<(usize, crate::engine::agent_runtime::execution::AgentStats)>,
+    #[allow(clippy::type_complexity)]
+    pub stats_tx: std::sync::mpsc::Sender<(
+        usize,
+        String,
+        crate::engine::agent_runtime::execution::AgentStats,
+    )>,
     /// Tracks when the last stats query was dispatched so we don't spam.
     pub last_stats_poll: std::time::Instant,
 }
@@ -162,21 +173,6 @@ impl App {
         }
         tab.scroll_offset = 0;
 
-        // Reset the vt100 parser so the previous container's output is gone.
-        let (rows, cols) = tab.vt100_parser.screen().size();
-        tab.vt100_parser = vt100::Parser::new(
-            rows,
-            cols,
-            tab.session.effective_config().scrollback_lines(),
-        );
-        tab.container_scroll_offset = 0;
-        tab.container_rendered = false;
-        tab.mouse_selection = None;
-        tab.agent_alt_screen = false;
-        tab.agent_alternate_scroll = false;
-        tab.region_scroll.reset();
-        tab.last_container_summary = None;
-
         // Clear previous workflow state so the strip resets for the new command.
         // Also clear the strip hit-test rect so stale rects from a previous
         // workflow don't intercept mouse-scroll events meant for the container.
@@ -257,13 +253,9 @@ impl App {
             tab.active_worktree_path.clone(),
             tab.status_dashboard.clone(),
             tab.tui_context_shared.clone(),
-            tab.parallel_slot_events.clone(),
+            tab.container_slot_events.clone(),
         );
 
-        // Store the receiving/sending ends in the tab.
-        tab.container_stdout_rx = Some(stdout_rx);
-        tab.container_stdin_tx = Some(stdin_tx);
-        tab.container_resize_tx = Some(resize_tx);
         tab.command_result_rx = Some(result_rx);
         tab.dialog_request_rx = Some(dialog_req_rx);
         tab.dialog_response_tx = Some(dialog_resp_tx);
@@ -271,18 +263,26 @@ impl App {
         let command_name = parsed.path.join(" ");
         let agent_display = agent_name_from_parsed(&parsed, &tab.session);
 
-        // Pre-populate ContainerInfo so the overlay title bar can show the
-        // command name and elapsed time even before the engine reports the
-        // actual container's name. The engine may overwrite the container
-        // name later via `report_status`.
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: agent_display.clone(),
-            container_name: String::new(),
-            start_time: std::time::Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed,
-        });
+        // Install the command's container slot (the N==1 case of the unified
+        // slot model), replacing any slots from the previous command. Its
+        // `ContainerInfo` lets the overlay title show the agent name and
+        // elapsed time before the engine reports the actual container name;
+        // the parser starts at the computed overlay size so agents never lay
+        // out against an 80x24 default.
+        tab.start_container(
+            agent_display.clone(),
+            String::new(),
+            initial_size.0,
+            initial_size.1,
+        );
+        if let Some(slot) = tab.focused_slot_mut() {
+            slot.container_stdout_rx = Some(stdout_rx);
+            slot.container_stdin_tx = Some(stdin_tx);
+            slot.container_resize_tx = Some(resize_tx);
+            if let Some(info) = slot.container_info.as_mut() {
+                info.sandboxed = sandboxed;
+            }
+        }
         tab.suppress_container_auto_open = false;
 
         // Show the "Interactive Mode" banner for containerized commands.
@@ -377,69 +377,94 @@ impl App {
     pub fn tick_all_tabs(&mut self) {
         let active = self.active_tab;
         for tab in self.tabs.iter_mut() {
+            // Maintain container_slots before draining output (a Launched
+            // event may carry the channels the drain reads) and before
+            // aggregating stuck/yolo (drain_stuck_events reads slot flags).
+            tab.drain_container_slot_events();
             tab.drain_container_output();
             tab.poll_container_exit();
             tab.poll_command_completion();
-            // WI-0096: maintain parallel_slots before aggregating stuck/yolo
-            // (drain_stuck_events reads each slot's flags).
-            tab.drain_parallel_slot_events();
-            tab.drain_parallel_slot_outputs();
             tab.drain_stuck_events();
             // Restart the git poll task if the worktree path changed.
             tab.refresh_git_poll();
 
-            // TUI-4: Sync the vt100 parser size with the actual rendered
-            // container overlay dimensions. The overlay size varies with
-            // workflow strip height and other dynamic chrome; the initial
-            // `compute_container_inner_size` estimate may not match.
+            // TUI-4: keep every slot's parser and PTY in lockstep with the
+            // actual rendered overlay dimensions. The overlay size varies
+            // with workflow strip height and other dynamic chrome; the
+            // initial `compute_container_inner_size` estimate may not match.
+            // All slots render into the same maximized overlay when focused,
+            // so they all track the same size; syncing the background slots
+            // too means Ctrl-S never swaps in a stale grid.
             if tab.container_window_state
                 != crate::frontend::tui::tabs::ContainerWindowState::Hidden
             {
                 if let Some(inner) = tab.container_inner_area {
-                    let (vt_rows, vt_cols) = tab.vt100_parser.screen().size();
-                    if vt_cols != inner.width || vt_rows != inner.height {
-                        tab.vt100_parser
-                            .screen_mut()
-                            .set_size(inner.height, inner.width);
-                        if let Some(ref tx) = tab.container_resize_tx {
-                            let _ = tx.send((inner.width, inner.height));
+                    for slot in &mut tab.container_slots {
+                        let (vt_rows, vt_cols) = slot.vt100_parser.screen().size();
+                        if vt_cols != inner.width || vt_rows != inner.height {
+                            slot.vt100_parser
+                                .screen_mut()
+                                .set_size(inner.height, inner.width);
+                            if let Some(ref tx) = slot.container_resize_tx {
+                                let _ = tx.send((inner.width, inner.height));
+                            }
                         }
                     }
                 }
             }
 
             // Pick up the container name from the engine (set via
-            // `report_status(Running { container_name })`).
-            // Also handles workflow step transitions: the engine clears the
-            // shared name (setting it to None) then sets a new name when the
-            // next container reports Running. We must clear the tab's
-            // container_name so the new name gets picked up.
-            if let Some(ref mut info) = tab.container_info {
-                if let Ok(mut name_guard) = tab.container_name_shared.lock() {
-                    if let Some(name) = name_guard.take() {
+            // `report_status(Running { container_name })`) into the focused
+            // slot. Also handles sequential workflow step transitions: the
+            // engine clears the shared name then sets a new one when the
+            // next container reports Running. During a parallel group the
+            // backbone slot is dormant and per-slot names arrive via
+            // `ContainerSlotEvent::ContainerName` instead, so the shared
+            // name is left alone to avoid mislabeling a group slot.
+            if tab.dormant_slots.is_empty() {
+                let name = tab
+                    .container_name_shared
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take());
+                if let Some(name) = name {
+                    if let Some(info) = tab
+                        .focused_slot_mut()
+                        .and_then(|s| s.container_info.as_mut())
+                    {
                         info.container_name = name;
                         info.latest_stats = None;
-                        // A fresh container is running — let its output
-                        // auto-open the window again after a mid-workflow
-                        // container exit closed it.
-                        tab.suppress_container_auto_open = false;
                     }
+                    // A fresh container is running — let its output
+                    // auto-open the window again after a mid-workflow
+                    // container exit closed it.
+                    tab.suppress_container_auto_open = false;
                 }
             }
 
-            // Pick up new stdin/resize senders from workflow step transitions.
-            // When `recreate_container_io()` runs on the engine thread, it
-            // publishes new senders via the shared slots. We swap the tab's
-            // senders here so keystrokes and resize events reach the new
-            // container.
-            if let Ok(mut guard) = tab.stdin_tx_shared.lock() {
-                if let Some(new_tx) = guard.take() {
-                    tab.container_stdin_tx = Some(new_tx);
-                }
-            }
-            if let Ok(mut guard) = tab.resize_tx_shared.lock() {
-                if let Some(new_tx) = guard.take() {
-                    tab.container_resize_tx = Some(new_tx);
+            // Pick up new stdin/resize senders from sequential workflow step
+            // transitions. When `recreate_container_io()` runs on the engine
+            // thread, it publishes new senders via the shared slots; swap
+            // them into the focused (backbone) slot so keystrokes and resize
+            // events reach the new container.
+            let new_stdin = tab.stdin_tx_shared.lock().ok().and_then(|mut g| g.take());
+            let new_resize = tab.resize_tx_shared.lock().ok().and_then(|mut g| g.take());
+            if new_stdin.is_some() || new_resize.is_some() {
+                // These only come from the sequential path; if a parallel
+                // group is active the backbone is dormant — apply them there
+                // so they aren't lost (or misrouted to a group slot).
+                let target = if tab.dormant_slots.is_empty() {
+                    tab.focused_slot_mut()
+                } else {
+                    tab.dormant_slots.first_mut()
+                };
+                if let Some(slot) = target {
+                    if let Some(new_tx) = new_stdin {
+                        slot.container_stdin_tx = Some(new_tx);
+                    }
+                    if let Some(new_tx) = new_resize {
+                        slot.container_resize_tx = Some(new_tx);
+                    }
                 }
             }
         }
@@ -455,8 +480,8 @@ impl App {
                 .enumerate()
                 .map(|(i, t)| {
                     let container_name = t
-                        .container_info
-                        .as_ref()
+                        .focused_slot()
+                        .and_then(|s| s.container_info.as_ref())
                         .map(|info| info.container_name.clone())
                         .filter(|n| !n.is_empty());
                     let command_label = match &t.execution_phase {
@@ -481,18 +506,27 @@ impl App {
             }
         }
 
-        // Drain any completed stats results.
+        // Drain any completed stats results, routing each sample to the
+        // slot it was polled for (matched by step name; a stale sample whose
+        // slot has since exited is simply dropped).
         if let Some(ref rx) = self.stats_rx {
-            while let Ok((tab_idx, stats)) = rx.try_recv() {
-                if tab_idx < self.tabs.len() {
-                    if let Some(ref mut info) = self.tabs[tab_idx].container_info {
-                        info.stats_history
-                            .push((stats.cpu_percent, stats.memory_mb));
-                        if info.container_name.is_empty() {
-                            info.container_name = stats.name.clone();
-                        }
-                        info.latest_stats = Some(stats);
+            while let Ok((tab_idx, slot_step, stats)) = rx.try_recv() {
+                if tab_idx >= self.tabs.len() {
+                    continue;
+                }
+                let tab = &mut self.tabs[tab_idx];
+                let info = tab
+                    .container_slots
+                    .iter_mut()
+                    .find(|s| s.step_name == slot_step)
+                    .and_then(|s| s.container_info.as_mut());
+                if let Some(info) = info {
+                    info.stats_history
+                        .push((stats.cpu_percent, stats.memory_mb));
+                    if info.container_name.is_empty() {
+                        info.container_name = stats.name.clone();
                     }
+                    info.latest_stats = Some(stats);
                 }
             }
         }
@@ -513,40 +547,51 @@ impl App {
                 ) {
                     continue;
                 }
-                if tab.container_info.is_none() {
-                    continue;
-                }
-                let container_name = tab
-                    .container_info
-                    .as_ref()
-                    .map(|info| info.container_name.clone())
-                    .unwrap_or_default();
-                let runtime = self.engines.runtime.clone();
-                let tx = self.stats_tx.clone();
-                let tab_idx = i;
-                self.runtime_handle.spawn_blocking(move || {
-                    if !container_name.is_empty() {
-                        // Fast path: name is known, query stats directly.
-                        let handle = crate::data::session::AgentHandle {
-                            id: container_name.clone(),
-                            name: container_name,
-                            image_tag: String::new(),
-                            started_at: chrono::Utc::now(),
-                        };
-                        if let Ok(stats) = runtime.stats(&handle) {
-                            let _ = tx.send((tab_idx, stats));
-                        }
-                    } else {
-                        // Slow path: name unknown, list containers and pick the first.
-                        if let Ok(handles) = runtime.list_running_all() {
-                            if let Some(handle) = handles.first() {
-                                if let Ok(stats) = runtime.stats(handle) {
-                                    let _ = tx.send((tab_idx, stats));
+
+                // Poll every slot, tagging each query with the slot's step
+                // name so the drain routes the sample back to it. A slot
+                // whose container name is known (published by the engine per
+                // container) is queried directly; a sole slot whose name
+                // hasn't arrived yet falls back to listing running containers
+                // and picking the first.
+                let sole_slot = tab.container_slots.len() == 1;
+                for slot in &tab.container_slots {
+                    let Some(info) = slot.container_info.as_ref() else {
+                        continue;
+                    };
+                    let container_name = info.container_name.clone();
+                    if container_name.is_empty() && !sole_slot {
+                        continue;
+                    }
+                    let step_name = slot.step_name.clone();
+                    let runtime = self.engines.runtime.clone();
+                    let tx = self.stats_tx.clone();
+                    let tab_idx = i;
+                    self.runtime_handle.spawn_blocking(move || {
+                        if !container_name.is_empty() {
+                            // Fast path: name is known, query stats directly.
+                            let handle = crate::data::session::AgentHandle {
+                                id: container_name.clone(),
+                                name: container_name,
+                                image_tag: String::new(),
+                                started_at: chrono::Utc::now(),
+                            };
+                            if let Ok(stats) = runtime.stats(&handle) {
+                                let _ = tx.send((tab_idx, step_name, stats));
+                            }
+                        } else {
+                            // Slow path: name unknown, list containers and
+                            // pick the first.
+                            if let Ok(handles) = runtime.list_running_all() {
+                                if let Some(handle) = handles.first() {
+                                    if let Ok(stats) = runtime.stats(handle) {
+                                        let _ = tx.send((tab_idx, step_name, stats));
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -904,34 +949,32 @@ mod tests {
         tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
             command: "chat".into(),
         };
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: "Claude".into(),
-            container_name: "awman-test-1234".into(),
-            start_time: std::time::Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed: false,
-        });
-        assert!(app
-            .active_tab()
-            .container_info
-            .as_ref()
+        // The command's single slot, as spawn_command installs it.
+        tab.start_container("Claude".into(), "awman-test-1234".into(), 80, 24);
+        assert!(tab
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
             .unwrap()
             .latest_stats
             .is_none());
 
-        // Simulate a stats result arriving on the channel.
+        // Simulate a stats result arriving on the channel (empty step name =
+        // the single/backbone slot).
         let stats = crate::engine::agent_runtime::execution::AgentStats {
             name: "awman-test-1234".into(),
             cpu_percent: 42.5,
             memory_mb: 256.0,
         };
-        app.stats_tx.send((0, stats)).unwrap();
+        app.stats_tx.send((0, String::new(), stats)).unwrap();
 
         // tick_all_tabs drains the channel.
         app.tick_all_tabs();
 
-        let info = app.active_tab().container_info.as_ref().unwrap();
+        let tab = app.active_tab();
+        let info = tab
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
+            .unwrap();
         assert!(
             info.latest_stats.is_some(),
             "latest_stats must be populated after drain"
@@ -944,20 +987,49 @@ mod tests {
     }
 
     #[test]
+    fn stats_drain_routes_parallel_samples_to_the_right_slot() {
+        use crate::frontend::tui::tabs::ContainerSlot;
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+            command: "exec workflow".into(),
+        };
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+
+        let stats = crate::engine::agent_runtime::execution::AgentStats {
+            name: "awman-test-1".into(),
+            cpu_percent: 12.5,
+            memory_mb: 64.0,
+        };
+        app.stats_tx.send((0, "test".into(), stats)).unwrap();
+        app.tick_all_tabs();
+
+        let tab = app.active_tab();
+        let test_info = tab.container_slots[1].container_info.as_ref().unwrap();
+        assert_eq!(
+            test_info.latest_stats.as_ref().map(|s| s.cpu_percent),
+            Some(12.5),
+            "the sample must land on the slot it was polled for"
+        );
+        let build_info = tab.container_slots[0].container_info.as_ref().unwrap();
+        assert!(
+            build_info.latest_stats.is_none(),
+            "the other slot must be untouched"
+        );
+    }
+
+    #[test]
     fn container_name_picked_up_from_shared_state() {
         let mut app = make_app();
         let tab = app.active_tab_mut();
         tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
             command: "chat".into(),
         };
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: "Claude".into(),
-            container_name: String::new(),
-            start_time: std::time::Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed: false,
-        });
+        tab.start_container("Claude".into(), String::new(), 80, 24);
 
         // Simulate the engine reporting the container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
@@ -966,7 +1038,11 @@ mod tests {
 
         app.tick_all_tabs();
 
-        let info = app.active_tab().container_info.as_ref().unwrap();
+        let info = app
+            .active_tab()
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
+            .unwrap();
         assert_eq!(info.container_name, "awman-new-container");
     }
 
@@ -977,18 +1053,18 @@ mod tests {
         tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
             command: "exec workflow".into(),
         };
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: "Claude".into(),
-            container_name: "awman-old-container".into(),
-            start_time: std::time::Instant::now(),
-            latest_stats: Some(crate::engine::agent_runtime::execution::AgentStats {
+        tab.start_container("Claude".into(), "awman-old-container".into(), 80, 24);
+        if let Some(info) = tab
+            .focused_slot_mut()
+            .and_then(|s| s.container_info.as_mut())
+        {
+            info.latest_stats = Some(crate::engine::agent_runtime::execution::AgentStats {
                 name: "awman-old-container".into(),
                 cpu_percent: 10.0,
                 memory_mb: 100.0,
-            }),
-            stats_history: vec![(10.0, 100.0)],
-            sandboxed: false,
-        });
+            });
+            info.stats_history = vec![(10.0, 100.0)];
+        }
 
         // Simulate a workflow step transition reporting a new container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
@@ -997,7 +1073,11 @@ mod tests {
 
         app.tick_all_tabs();
 
-        let info = app.active_tab().container_info.as_ref().unwrap();
+        let info = app
+            .active_tab()
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
+            .unwrap();
         assert_eq!(info.container_name, "awman-step2-container");
         assert!(
             info.latest_stats.is_none(),
@@ -1010,9 +1090,7 @@ mod tests {
         use crate::engine::agent_runtime::execution::AgentStats;
         use crate::frontend::tui::tabs::ContainerInfo;
 
-        let mut app = make_app();
-        let tab = app.active_tab_mut();
-        tab.container_info = Some(ContainerInfo {
+        let info = ContainerInfo {
             agent_display_name: "Claude".into(),
             container_name: "awman-test".into(),
             start_time: std::time::Instant::now(),
@@ -1023,9 +1101,9 @@ mod tests {
             }),
             stats_history: Vec::new(),
             sandboxed: false,
-        });
+        };
 
-        let title = crate::frontend::tui::container_view::build_stats_title_for_test(tab);
+        let title = crate::frontend::tui::container_view::build_stats_title_from_info(&info);
         assert!(title.contains("42.5%"), "title must contain CPU: {title}");
         assert!(
             title.contains("256MiB"),

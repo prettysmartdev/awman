@@ -372,26 +372,32 @@ The window does **not** close while the container is still alive: a stuck agent 
 
 ## Parallel containers
 
-Workflow steps that don't depend on each other can run at the same time, each in its own container — see [Parallel Workflows](15-parallel-workflows.md) for how the engine decides what runs concurrently. When more than one container is running, the container window changes shape: one container is **focused** and shown maximized as usual, while the others render as a stack of one-row **minimized status bars** underneath it.
+Workflow steps that don't depend on each other can run at the same time, each in its own container — see [Parallel Workflows](15-parallel-workflows.md) for how the engine decides what runs concurrently. When more than one container is running, the container window changes shape: one container is **focused** and shown maximized as usual, while each of the others renders as a **minimized status bar** underneath it — the same rounded strip a single container shows when minimized, stacked one per background container. The maximized window's title also names the workflow step its container is running.
 
 ```
-╭─ 🔒 Claude Code (containerized) ── myproject | 5% | 200mb ──╮
-│                                                               │
-│  [focused container's output — full terminal emulation]      │
-│                                                               │
-╰───────────────────────────────────────────────────────────────╯
-[tests] codex · 45s · ●
-⚠ [docs] claude · 1m · ⚠
+╭─ 🔒 claude (containerized) — implement ─ awman-impl-1 | 5.0% | 200MiB | 2m ─╮
+│                                                                              │
+│  [focused container's output — full terminal emulation]                     │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ 🔒 codex [tests] | awman-tests-2 | 12.5% | 256MiB | 45s                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚠ 🔒 claude [docs] | awman-docs-3 | 0.1% | 64MiB | 1m                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
   Ctrl-S switch  ·  Ctrl-M toggle  ·  Ctrl-W workflow
 ```
 
-Each minimized bar reads `[step_name] agent · duration · status`:
+Each minimized bar reads `🔒 agent [step_name] | container | cpu | mem | duration` — the same live stats the maximized title shows, polled per container:
 
 | Appearance | Meaning |
 |---|---|
-| Green `●` | Container running normally |
+| Green border and text | Container running normally |
 | Yellow, `⚠` prefix | No output for more than 30 seconds — [stuck](05-workflows.md#stuck-steps) |
-| Flashing purple / yellow `●` | A [yolo](06-yolo-mode.md) auto-advance countdown is running for that container; the color alternates every second |
+| Flashing purple / yellow | A [yolo](06-yolo-mode.md) auto-advance countdown is running for that container; the color alternates every second |
+
+The focused container never shows a bar of its own — its step name, container name, and live stats are already in the maximized window's title line.
 
 Only the focused container receives keyboard input; the others keep running in the background regardless of which one is focused.
 
@@ -403,11 +409,15 @@ Ctrl-S only cycles focus when more than one container is currently running. With
 
 ### Ctrl-M with multiple containers
 
-**Ctrl-M** still cycles the container display, but with multiple parallel containers only its **Hidden** state changes what's on screen: the focused container and all the minimized bars stay visible through the Maximized and Minimized states, and disappear together only when the display is Hidden. The agents keep running while hidden — press **Ctrl-M** again to bring the whole group back into view.
+**Ctrl-M** cycles the container display exactly as it does for a single container, applied to the whole group:
+
+- **Maximized** — the focused container fills the overlay; every other container is a status bar underneath.
+- **Minimized** — the overlay closes and *every* container (the focused one included) collapses into the stack of status bars, leaving the execution window visible.
+- **Hidden** — nothing is shown. The agents keep running — press **Ctrl-M** again to bring the group back into view.
 
 To bring a background container to the front, press **Ctrl-S** until it's focused.
 
-This section only applies while a workflow has more than one container running at once. The rest of the time — including single-container commands like `chat` — the container window behaves exactly as described earlier in this section.
+A single container is just the one-container case of the same display: Maximized shows its overlay, Minimized shows its single status bar. There is no separate single-container behavior.
 
 ---
 
