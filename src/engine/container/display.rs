@@ -5,6 +5,11 @@
 
 /// Take a set of CLI args and return a display-safe version where `-e VAR=val`
 /// pairs have the value replaced with `***`.
+///
+/// The name-only form `-e VAR` (no `=`) carries no value in argv — the value
+/// is inherited from the CLI child's environment, so there is nothing to mask.
+/// It is rendered unchanged (`-e VAR`), matching the actual invocation. This is
+/// how agent credentials are transported (see `docker::build_run_argv`).
 pub fn mask_env_in_args(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut mask_next = false;
@@ -13,7 +18,8 @@ pub fn mask_env_in_args(args: &[String]) -> Vec<String> {
             if let Some(eq) = arg.find('=') {
                 out.push(format!("{}=***", &arg[..eq]));
             } else {
-                out.push("***".to_string());
+                // Name-only `-e VAR`: no value present in argv, nothing to mask.
+                out.push(arg.clone());
             }
             mask_next = false;
         } else if arg == "-e" {
@@ -78,5 +84,42 @@ mod tests {
         assert!(s.starts_with("docker "));
         assert!(s.contains("X=***"));
         assert!(!s.contains("X=1"));
+    }
+
+    // ── WI-0098 Finding A: name-only `-e KEY` credential form ─────────────────
+
+    #[test]
+    fn mask_env_name_only_form_rendered_unchanged() {
+        // The name-only `-e KEY` form (how agent credentials are transported)
+        // carries no value in argv, so there is nothing to mask — it renders
+        // verbatim. A `KEY=VALUE` pair in the same args is still masked.
+        let args: Vec<String> = vec![
+            "run",
+            "-e",
+            "ANTHROPIC_API_KEY", // credential: name only, no value present
+            "-e",
+            "LITERAL=shown-then-masked",
+            "img",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let masked = mask_env_in_args(&args);
+        assert_eq!(masked[2], "ANTHROPIC_API_KEY", "name-only form unchanged");
+        assert_eq!(masked[4], "LITERAL=***", "value form still masked");
+        assert_eq!(masked[5], "img");
+    }
+
+    #[test]
+    fn display_command_credential_name_only_shows_key_without_value() {
+        let args: Vec<String> = vec!["run", "-e", "SECRET_KEY", "img"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let s = display_command("docker", &args);
+        // The displayed command matches the real invocation: `-e SECRET_KEY`
+        // with no `=` and no value anywhere.
+        assert!(s.contains("-e SECRET_KEY"), "display: {s}");
+        assert!(!s.contains("SECRET_KEY="), "no value should be rendered: {s}");
     }
 }

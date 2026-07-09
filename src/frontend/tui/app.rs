@@ -209,7 +209,7 @@ impl App {
             Ok((cols, rows)) => {
                 let sidebar =
                     crate::frontend::tui::git_sidebar::sidebar_width(cols, tab.git_sidebar_state);
-                crate::frontend::tui::compute_container_inner_size(
+                crate::frontend::tui::event_loop::compute_container_inner_size(
                     cols.saturating_sub(sidebar),
                     rows,
                 )

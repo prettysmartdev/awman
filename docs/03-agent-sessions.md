@@ -367,7 +367,7 @@ If awman is launched outside of any Git repository, `status --watch` runs automa
 
 awman automatically passes your agent's credentials into the container — you never have to log in manually inside a container session.
 
-For Claude Code, awman reads the OAuth token from the macOS Keychain (service: `Claude Code-credentials`) and passes it into the container as the `CLAUDE_CODE_OAUTH_TOKEN` environment variable. Credentials are never mounted as files, and the token value is masked (`***`) in all displayed Docker commands.
+For Claude Code, awman reads the OAuth token from the macOS Keychain (service: `Claude Code-credentials`) and passes it into the container as the `CLAUDE_CODE_OAUTH_TOKEN` environment variable. Credentials are never mounted as files, and the token value is never shown in displayed Docker commands; the command renders a bare `-e CLAUDE_CODE_OAUTH_TOKEN`.
 
 | Agent | Auth mechanism |
 |-------|---------------|
