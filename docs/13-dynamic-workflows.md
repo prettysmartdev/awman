@@ -101,12 +101,16 @@ Add a `dynamicWorkflows` section to `.awman/config.json` to pin which agents and
       "codex": ["codex-mini-latest"]
     },
     "maxConcurrentSteps": 3,
-    "defaultLeader": "claude::claude-opus-4-8"
+    "defaultLeader": "claude::claude-opus-4-8",
+    "guidance": [
+      "Never spawn more than two agents in parallel.",
+      "Always include a validation step after each implementation step."
+    ]
   }
 }
 ```
 
-All three fields are optional and independent.
+All four fields are optional and independent.
 
 ### `agentsToModels`
 
@@ -140,6 +144,22 @@ Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), 
 
 Sets the repo-wide default leader agent and model, in the same `agent::model` format as `--leader` (see [Leader resolution order](#leader-resolution-order) above). Rejected at config-load time if the format is invalid, if either component is empty or has surrounding whitespace, or if the agent component isn't a valid agent name.
 
+### `guidance`
+
+A list of project-specific instructions the leader agent must always follow when it designs a workflow — constraints you'd otherwise have to repeat in every work item description (e.g. "never spawn more than two agents in parallel", "always include a validation step after each implementation step"). Each entry becomes one bullet in a "Developer Guidance" block injected into the leader prompt, right after the concurrency note:
+
+```
+## Developer Guidance
+You MUST follow these project-specific instructions when building the workflow:
+- Never spawn more than two agents in parallel.
+- Always include a validation step after each implementation step.
+```
+
+- Omitting the field, or leaving it an empty array (`[]`), skips the block entirely — the leader prompt is unchanged.
+- Each entry is capped at 1,000 characters and the array at 50 entries, since every entry is injected verbatim into the leader's prompt. Both caps are enforced when the config is loaded.
+- Whitespace-only entries are rejected when the config is loaded.
+- Each entry is rendered as exactly one bullet — any newlines inside an entry are flattened to spaces so a multi-line entry can't break the bullet list.
+
 ### Managing this config
 
 `dynamicWorkflows.defaultLeader` and `dynamicWorkflows.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog like any other repo field:
@@ -157,6 +177,22 @@ awman config set dynamicWorkflows.agentsToModels.claude ""   # remove the mappin
 ```
 
 In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`dynamicWorkflows.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-dynamicworkflowsagentstomodels). See [Configuration](07-configuration.md#reference) for the full field reference.
+
+`guidance` is managed one entry at a time, addressed by index on the command line:
+
+```sh
+awman config set dynamicWorkflows.guidance.0 "Never spawn more than two agents in parallel."
+awman config set dynamicWorkflows.guidance.1 "Always include a validation step after each implementation step."
+awman config set dynamicWorkflows.guidance.0 ""   # remove entry 0; remaining entries shift down and re-index
+```
+
+In `awman config show` and the TUI config dialog, the list appears as a summary row (`dynamicWorkflows.guidance`, showing the entry count or `(none)`) plus one editable row per entry (`dynamicWorkflows.guidance.<index>`). In the TUI:
+
+- **Ctrl+N** while a guidance row is selected appends a new entry — you only type the instruction text, since the index is assigned automatically.
+- Existing entries are edited inline like any other field.
+- Saving an **empty** value on an entry row removes it; remaining entries re-index automatically.
+
+See [Using the TUI](02-using-the-tui.md#developer-guidance-list-dynamicworkflowsguidance) for the walkthrough and [Configuration](07-configuration.md#reference) for the full field reference.
 
 ---
 
@@ -271,6 +307,10 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | `dynamicWorkflows.defaultLeader` is malformed | Rejected when the config is loaded, before any UI or workflow starts |
 | `--leader` and `dynamicWorkflows.defaultLeader` both set | `--leader` wins |
 | `--model` and `dynamicWorkflows.defaultLeader` both set, no `--leader` | `defaultLeader` controls the leader's model; `--model` still applies to the generated workflow's steps |
+| `dynamicWorkflows.guidance` is `[]` (empty array) | Treated as if unset; no guidance block is injected into the leader prompt |
+| A `dynamicWorkflows.guidance` entry exceeds 1,000 characters | Rejected when the config is loaded |
+| `dynamicWorkflows.guidance` has more than 50 entries | Rejected when the config is loaded |
+| A `dynamicWorkflows.guidance` entry is empty or whitespace-only | Rejected when the config is loaded |
 
 ---
 

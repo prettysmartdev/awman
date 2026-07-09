@@ -454,7 +454,7 @@ Press **Ctrl+,** from anywhere in the TUI to open the config dialog instantly �
 | **Enter** or **e** | Start editing the selected field inline |
 | **Enter** (while editing) | Save the new value to the focused scope's config file |
 | **Esc** (while editing) | Cancel the edit without saving |
-| **Ctrl+N** | Add a new agent→models mapping (see below) — the hint for it appears while an `agentsToModels` row is selected |
+| **Ctrl+N** | Add a new agent→models mapping or guidance entry (see below) — the hint for it appears while an `agentsToModels` or `guidance` row is selected |
 | **Esc** | Close the dialog |
 
 While editing, the value is edited inline in its table cell with a visible `|` cursor; **← / →**, **Home / End**, **Backspace**, and **Delete** work as expected. Values longer than the cell scroll horizontally so the cursor never leaves view. Row navigation is frozen until you save or cancel.
@@ -479,6 +479,17 @@ The agent→model map for [dynamic workflows](13-dynamic-workflows.md) is fully 
 - Saving an **empty** value on a per-agent row removes that agent's mapping (an agent cannot be mapped to zero models).
 
 The same per-agent entries work on the command line: `awman config set dynamicWorkflows.agentsToModels.claude "claude-opus-4-8, claude-sonnet-4-6"`.
+
+### Developer guidance list (`dynamicWorkflows.guidance`)
+
+The [leader guidance list](13-dynamic-workflows.md#guidance) — project-specific instructions the leader agent must follow whenever it designs a dynamic workflow — is also fully manageable from the dialog:
+
+- A summary row (`dynamicWorkflows.guidance`) always appears, showing how many entries are configured (or `(none)`).
+- Each entry gets its own row (`dynamicWorkflows.guidance.<index>`) whose text is edited inline like any other field.
+- **Ctrl+N** appends a new entry in a single step: type the instruction text and press **Enter**. **Esc** cancels. Unlike `agentsToModels`, there's no key to type first — the index is assigned automatically as the next position in the list.
+- Saving an **empty** value on an entry row removes it; the remaining entries shift down and re-index, and the row list refreshes to reflect the new indices.
+
+The same per-entry edits work on the command line: `awman config set dynamicWorkflows.guidance.0 "Never spawn more than two agents in parallel."`.
 
 ---
 

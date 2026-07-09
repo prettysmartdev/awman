@@ -30,7 +30,8 @@ Created by `awman init`; commit it so the whole team shares the same setup.
       "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
     },
     "maxConcurrentSteps": 3,
-    "defaultLeader": "claude::claude-opus-4-8"
+    "defaultLeader": "claude::claude-opus-4-8",
+    "guidance": ["Never spawn more than two agents in parallel."]
   }
 }
 ```
@@ -182,7 +183,11 @@ awman config set dynamicWorkflows.defaultLeader claude::claude-opus-4-8
 awman config set dynamicWorkflows.maxConcurrentSteps 3
 ```
 
-`dynamicWorkflows.agentsToModels` is set one agent at a time — `awman config set dynamicWorkflows.agentsToModels.<agentName> "model-a, model-b"` (an empty value removes the mapping), or inline in the TUI config dialog where **Ctrl+N** adds a new mapping. See [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) for the full reference.
+`dynamicWorkflows.agentsToModels` is set one agent at a time — `awman config set dynamicWorkflows.agentsToModels.<agentName> "model-a, model-b"` (an empty value removes the mapping), or inline in the TUI config dialog where **Ctrl+N** adds a new mapping.
+
+`dynamicWorkflows.guidance` is a list of instructions the leader agent must follow whenever it designs a workflow. It's set one entry at a time, addressed by index — `awman config set dynamicWorkflows.guidance.0 "Never spawn more than two agents in parallel."` (an empty value removes that entry and re-indexes the rest) — or inline in the TUI config dialog, where **Ctrl+N** appends a new entry.
+
+See [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) for the full reference.
 
 ### Custom Dockerfile path
 
@@ -259,6 +264,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `dynamicWorkflows.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Restricts a dynamic workflow's leader to this agent/model set — see [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per agent as `dynamicWorkflows.agentsToModels.<agentName>` (comma-separated; empty value removes) |
 | `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
 | `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
+| `dynamicWorkflows.guidance` | string array | (unset → no guidance block) | Project-specific instructions injected into the leader prompt as a bullet list — see [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per entry as `dynamicWorkflows.guidance.<index>` (empty value removes) |
 
 ### Global config fields (`$HOME/.awman/config.json`)
 
@@ -320,6 +326,7 @@ Value handling:
 - `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `maxConcurrentAgents`, `dynamicWorkflows.maxConcurrentSteps` — must be positive integers; `0` is rejected.
 - `agent`, `default_agent` — validated against the supported agent list.
 - `dynamicWorkflows.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).
+- `dynamicWorkflows.guidance.<index>` — a single free-form instruction string, capped at 1,000 characters and 50 entries total; empty or whitespace-only values are rejected on load and coerced to a removal when set via `config set`.
 - `envPassthrough` — removed; the error message points you to `env(VAR)` overlay entries.
 
 ### Environment variables

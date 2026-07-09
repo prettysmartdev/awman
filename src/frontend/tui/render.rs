@@ -1905,6 +1905,10 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
             ),
             Some("comma-separated model names".to_string()),
         ),
+        Some(dialogs::NewMapEntryPhase::GuidanceEntry) => (
+            format!("  New guidance entry: {}", edit_buffer()),
+            Some("a single instruction the leader must follow".to_string()),
+        ),
         None => match state.rows.get(state.selected) {
             Some(row) if editing_value => {
                 let scope = if state.edit_column == 0 {
@@ -2106,6 +2110,14 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
             key("Esc"),
             Span::raw("=cancel"),
         ]),
+        Some(dialogs::NewMapEntryPhase::GuidanceEntry) => Line::from(vec![
+            Span::styled("  New guidance entry", Style::default().fg(Color::Green)),
+            Span::raw("  |  "),
+            key("Enter"),
+            Span::raw("=save entry  "),
+            key("Esc"),
+            Span::raw("=cancel"),
+        ]),
         None if state.editing => Line::from(vec![
             Span::styled("  Editing", Style::default().fg(Color::Green)),
             Span::raw("  |  "),
@@ -2119,14 +2131,20 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
             Span::raw("=jump"),
         ]),
         None => {
-            // The Ctrl+N add-mapping hint only makes sense on the
-            // agentsToModels rows; elsewhere it is noise.
-            let on_mapping_row = state
-                .rows
-                .get(state.selected)
-                .map(|r| {
-                    r.field == "dynamicWorkflows.agentsToModels"
-                        || r.field.starts_with("dynamicWorkflows.agentsToModels.")
+            // The Ctrl+N add-entry hint only makes sense on the agentsToModels
+            // or guidance rows; elsewhere it is noise. The label differs so
+            // users know what will be added.
+            let selected_field = state.rows.get(state.selected).map(|r| r.field.as_str());
+            let on_mapping_row = selected_field
+                .map(|f| {
+                    f == "dynamicWorkflows.agentsToModels"
+                        || f.starts_with("dynamicWorkflows.agentsToModels.")
+                })
+                .unwrap_or(false);
+            let on_guidance_row = selected_field
+                .map(|f| {
+                    f == "dynamicWorkflows.guidance"
+                        || f.starts_with("dynamicWorkflows.guidance.")
                 })
                 .unwrap_or(false);
             let mut spans = vec![
@@ -2142,6 +2160,9 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
             if on_mapping_row {
                 spans.push(key("Ctrl+N"));
                 spans.push(Span::raw("=add model mapping  "));
+            } else if on_guidance_row {
+                spans.push(key("Ctrl+N"));
+                spans.push(Span::raw("=add entry  "));
             }
             spans.push(key("Esc"));
             spans.push(Span::raw("=close"));

@@ -1165,6 +1165,21 @@ async fn execute_prepared(
         .collect();
     let teardown_on_failure = workflow.teardown_on_failure;
     let engine_work_item_context = work_item_context.clone();
+    let workflow_overlays_for_factory = workflow.overlays.clone();
+    let active_workflow_context_permission = collect_all_overlay_specs(
+        &session,
+        cli_typed.clone(),
+        workflow_overlays_for_factory.as_deref(),
+        None,
+    )
+    .ok()
+    .and_then(|collected| {
+        collected
+            .context_overlays
+            .into_iter()
+            .find(|c| c.scope == crate::engine::overlay::ContextScope::Workflow)
+            .map(|c| c.permission)
+    });
     let (engine_result, step_counts) = {
         let proxy = WorkflowProxy(Arc::clone(&shared));
         let factory = CommandLayerFactory {
@@ -1174,7 +1189,7 @@ async fn execute_prepared(
             cli_typed_overlays: cli_typed.clone(),
             work_item_context,
             image_git_root: git_root_for_scope.clone(),
-            workflow_overlays: workflow.overlays.clone(),
+            workflow_overlays: workflow_overlays_for_factory,
         };
         let mut engine = match WorkflowEngine::resume(
             &session,
@@ -1198,6 +1213,7 @@ async fn execute_prepared(
             }
         };
         engine.set_yolo(yolo);
+        engine.set_workflow_context_permission(active_workflow_context_permission);
 
         // Warn if the workflow will commit but git identity is not configured.
         if teardown_steps.iter().any(|s| {
@@ -2002,6 +2018,7 @@ impl ExecWorkflowCommand {
             &leader_work_item_path.display().to_string(),
             &agents_section,
             max_concurrent_steps,
+            dynamic_cfg.as_ref().and_then(|d| d.guidance.as_deref()),
         );
 
         // Record the worktree's clean baseline so we can detect a leader that
@@ -3828,6 +3845,7 @@ prompt = "do something"
             "/workspace/aspec/work-items/0042-my-item.md",
             "  - claude",
             None,
+            None,
         );
         assert!(
             prompt.contains("0042"),
@@ -3843,6 +3861,7 @@ prompt = "do something"
             path,
             "  - claude",
             None,
+            None,
         );
         assert!(
             prompt.contains(path),
@@ -3854,7 +3873,7 @@ prompt = "do something"
     fn build_leader_prompt_substitutes_available_agents() {
         let agents = "  - claude\n  - maki";
         let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
-            "0042", "/path", agents, None,
+            "0042", "/path", agents, None, None,
         );
         assert!(
             prompt.contains("claude"),
@@ -3873,6 +3892,7 @@ prompt = "do something"
             "/workspace/aspec/work-items/0099-task.md",
             "  - claude",
             None,
+            None,
         );
         assert!(
             !prompt.contains("{{work_item_number}}"),
@@ -3890,6 +3910,78 @@ prompt = "do something"
             !prompt.contains("{{max_concurrent_steps_note}}"),
             "{{max_concurrent_steps_note}} must be substituted"
         );
+        assert!(
+            !prompt.contains("{{developer_guidance}}"),
+            "{{developer_guidance}} must be substituted"
+        );
+    }
+
+    // ── build_leader_prompt: developer guidance (WI-0099) ─────────────────────
+
+    #[test]
+    fn build_leader_prompt_includes_developer_guidance_section_when_present() {
+        let guidance = vec![
+            "never spawn more than two agents in parallel".to_string(),
+            "always include a validation step after each implementation step".to_string(),
+        ];
+        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0099",
+            "/path",
+            "  - claude",
+            None,
+            Some(&guidance),
+        );
+        assert!(
+            prompt.contains("## Developer Guidance"),
+            "prompt must include the Developer Guidance heading when guidance is present, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("- never spawn more than two agents in parallel"),
+            "prompt must render the first guidance entry as a bullet, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("- always include a validation step after each implementation step"),
+            "prompt must render the second guidance entry as a bullet, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_leader_prompt_omits_developer_guidance_section_when_none() {
+        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0099",
+            "/path",
+            "  - claude",
+            None,
+            None,
+        );
+        assert!(
+            !prompt.contains("## Developer Guidance"),
+            "prompt must omit the Developer Guidance section when guidance is None, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("{{developer_guidance}}"),
+            "no stray placeholder token must remain when guidance is None, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_leader_prompt_omits_developer_guidance_section_when_empty() {
+        let guidance: Vec<String> = Vec::new();
+        let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0099",
+            "/path",
+            "  - claude",
+            None,
+            Some(&guidance),
+        );
+        assert!(
+            !prompt.contains("## Developer Guidance"),
+            "prompt must omit the Developer Guidance section when guidance is empty, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("{{developer_guidance}}"),
+            "no stray placeholder token must remain when guidance is empty, got: {prompt}"
+        );
     }
 
     #[test]
@@ -3899,6 +3991,7 @@ prompt = "do something"
             "/path",
             "  - claude",
             Some(3),
+            None,
         );
         assert!(
             prompt.contains("maximum of 3 concurrent steps"),
@@ -3912,6 +4005,7 @@ prompt = "do something"
             "0042",
             "/path",
             "  - claude",
+            None,
             None,
         );
         assert!(
@@ -4759,6 +4853,7 @@ prompt = "do something useful"
             "/workspace/aspec/work-items/0042-item.md",
             &agents_section,
             dw.max_concurrent_steps,
+            dw.guidance.as_deref(),
         );
 
         assert!(
@@ -4772,6 +4867,56 @@ prompt = "do something useful"
         assert!(
             leader_prompt.contains("maximum of 2 concurrent steps"),
             "leader prompt must contain the maxConcurrentSteps advisory, got: {leader_prompt}"
+        );
+    }
+
+    #[test]
+    fn integration_dynamic_config_guidance_entries_appear_in_leader_prompt() {
+        // Mirrors the agentsToModels integration test above (WI-0099): load a
+        // real RepoConfig with two guidance entries and run it through
+        // build_leader_prompt, asserting both entries render as bullets.
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("config.json"),
+            r#"{
+                "dynamicWorkflows": {
+                    "guidance": [
+                        "never spawn more than two agents in parallel",
+                        "always include a validation step after each implementation step"
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let repo_config = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap();
+        let dw = repo_config
+            .dynamic_workflows
+            .clone()
+            .expect("dynamicWorkflows section must be present");
+
+        let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
+            "0099",
+            "/workspace/aspec/work-items/0099-item.md",
+            "  - claude",
+            dw.max_concurrent_steps,
+            dw.guidance.as_deref(),
+        );
+
+        assert!(
+            leader_prompt.contains("## Developer Guidance"),
+            "leader prompt must include the Developer Guidance heading, got: {leader_prompt}"
+        );
+        assert!(
+            leader_prompt.contains("- never spawn more than two agents in parallel"),
+            "leader prompt must contain the first guidance entry, got: {leader_prompt}"
+        );
+        assert!(
+            leader_prompt
+                .contains("- always include a validation step after each implementation step"),
+            "leader prompt must contain the second guidance entry, got: {leader_prompt}"
         );
     }
 

@@ -45,6 +45,7 @@ const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
     ("dynamicWorkflows.defaultLeader", FieldScope::RepoOnly),
     ("dynamicWorkflows.maxConcurrentSteps", FieldScope::RepoOnly),
     ("dynamicWorkflows.agentsToModels", FieldScope::RepoOnly),
+    ("dynamicWorkflows.guidance", FieldScope::RepoOnly),
 ];
 
 /// Field names that were removed in WI-0082 (overlay unification). Naming any
@@ -82,6 +83,22 @@ fn agents_to_models_entry_key(name: &str) -> Option<&str> {
     Some(key)
 }
 
+/// Dot-path prefix of per-index `dynamicWorkflows.guidance` entries (WI-0099).
+const GUIDANCE_PREFIX: &str = "dynamicWorkflows.guidance.";
+
+/// If `name` addresses a single guidance entry
+/// (`dynamicWorkflows.guidance.<index>`), return the parsed numeric index.
+/// The trailing segment must be a bare non-negative integer with no further
+/// dots — this is what keeps the numeric-index dot-path handling narrow to
+/// the guidance array rather than a general array facility.
+fn guidance_entry_index(name: &str) -> Option<usize> {
+    let idx = name.strip_prefix(GUIDANCE_PREFIX)?;
+    if idx.is_empty() || idx.contains('.') {
+        return None;
+    }
+    idx.parse::<usize>().ok()
+}
+
 /// Lexical validation for an `agentsToModels` key, mirroring
 /// `data::session::AgentName` (ASCII alphanumerics, `-`, `_`, length 1..=64).
 fn validate_agents_to_models_key(key: &str) -> Result<(), String> {
@@ -103,12 +120,14 @@ fn validate_agents_to_models_key(key: &str) -> Result<(), String> {
 /// Per-agent `agentsToModels` entries are valid even though they are not in
 /// the static table (the set of agents is user-defined).
 fn is_valid_field_name(name: &str) -> bool {
-    valid_field_names().contains(&name) || agents_to_models_entry_key(name).is_some()
+    valid_field_names().contains(&name)
+        || agents_to_models_entry_key(name).is_some()
+        || guidance_entry_index(name).is_some()
 }
 
 /// Look up the scope for a field name.
 fn field_scope(name: &str) -> Option<FieldScope> {
-    if agents_to_models_entry_key(name).is_some() {
+    if agents_to_models_entry_key(name).is_some() || guidance_entry_index(name).is_some() {
         return Some(FieldScope::RepoOnly);
     }
     VALID_CONFIG_FIELDS
@@ -154,6 +173,24 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
                 .map(|s| serde_json::Value::String(s.to_string()))
                 .collect(),
         ));
+    }
+    if guidance_entry_index(field).is_some() {
+        // A guidance entry is a single free-form instruction (it may contain
+        // commas, markdown, etc.), so it is NOT comma-split. An empty or
+        // whitespace-only value coerces to Null, which the config layer treats
+        // as "remove this array element".
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        if trimmed.chars().count() > crate::data::config::repo::GUIDANCE_MAX_ENTRY_LEN {
+            return Err(format!(
+                "guidance entry is {} characters; the maximum is {}",
+                trimmed.chars().count(),
+                crate::data::config::repo::GUIDANCE_MAX_ENTRY_LEN
+            ));
+        }
+        return Ok(serde_json::Value::String(trimmed.to_string()));
     }
     match field {
         "agent" | "default_agent" => {
@@ -217,6 +254,17 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
             Err(
                 "dynamicWorkflows.agentsToModels is a map; set one agent at a time, e.g. \
                  `awman config set dynamicWorkflows.agentsToModels.claude \"model-a, model-b\"`"
+                    .to_string(),
+            )
+        }
+        "dynamicWorkflows.guidance" => {
+            // The guidance array is edited one entry at a time by index; the
+            // bare field can't be set as a single string (it would fail
+            // RepoConfig deserialization). Point users at the per-index syntax.
+            Err(
+                "dynamicWorkflows.guidance is a list; set one entry at a time by index, e.g. \
+                 `awman config set dynamicWorkflows.guidance.0 \"never spawn more than two \
+                 agents in parallel\"`"
                     .to_string(),
             )
         }
@@ -399,7 +447,9 @@ const READ_ONLY_FIELDS: &[&str] = &["auto_agent_auth_accepted"];
 /// the summary row for the map itself (added in `collect_config_rows`) and
 /// awman-computed fields are read-only.
 fn is_read_only_field(name: &str) -> bool {
-    READ_ONLY_FIELDS.contains(&name) || name == "dynamicWorkflows.agentsToModels"
+    READ_ONLY_FIELDS.contains(&name)
+        || name == "dynamicWorkflows.agentsToModels"
+        || name == "dynamicWorkflows.guidance"
 }
 
 /// Per-scope writability for a field, derived from its scope. Read-only
@@ -422,6 +472,9 @@ fn config_field_hint(name: &str) -> Option<String> {
     if agents_to_models_entry_key(name).is_some() {
         return Some("comma-separated model names; save an empty value to remove".to_string());
     }
+    if guidance_entry_index(name).is_some() {
+        return Some("a single instruction; save an empty value to remove".to_string());
+    }
     match name {
         "agent" | "default_agent" => Some(format!("one of: {}", VALID_AGENT_VALUES.join(", "))),
         "auto_agent_auth_accepted" | "api.background" => Some("true or false".to_string()),
@@ -436,6 +489,11 @@ fn config_field_hint(name: &str) -> Option<String> {
         "dynamicWorkflows.agentsToModels" => {
             Some("press Ctrl+N to add an agent; edit per-agent rows inline".to_string())
         }
+        "dynamicWorkflows.guidance" => Some(
+            "press Ctrl+N to add a guidance entry; edit per-entry rows inline; save an empty \
+             value to remove"
+                .to_string(),
+        ),
         "yoloDisallowedTools" | "overlays" | "api.workDirs" => {
             Some("comma-separated list".to_string())
         }
@@ -477,9 +535,10 @@ pub fn collect_config_rows(
 ) -> Vec<ConfigFieldRow> {
     let mut rows: Vec<ConfigFieldRow> = Vec::new();
     for (name, _scope) in VALID_CONFIG_FIELDS {
-        // The agentsToModels map is expanded into one row per agent below rather
-        // than shown as a single unreadable JSON blob (WI-0095).
-        if *name == "dynamicWorkflows.agentsToModels" {
+        // The agentsToModels map and the guidance array are expanded into one
+        // row per entry below rather than shown as a single unreadable JSON
+        // blob (WI-0095, WI-0099).
+        if *name == "dynamicWorkflows.agentsToModels" || *name == "dynamicWorkflows.guidance" {
             continue;
         }
         let g = config_field_value(global, name);
@@ -530,6 +589,50 @@ pub fn collect_config_rows(
         for key in keys {
             let field = format!("dynamicWorkflows.agentsToModels.{key}");
             let value = map.get(key).map(render_models_value);
+            let value_hint = config_field_hint(&field);
+            rows.push(ConfigFieldRow {
+                field,
+                global_value: None,
+                repo_value: value.clone(),
+                effective_value: value,
+                kind: ConfigFieldKind::String,
+                read_only: false,
+                global_writable: false,
+                repo_writable: true,
+                value_hint,
+            });
+        }
+    }
+    // The leader-guidance array (WI-0099) gets a read-only summary row so the
+    // section is discoverable (and Ctrl+N works) even when empty, followed by
+    // one editable repo-only row per entry
+    // (`dynamicWorkflows.guidance.<index>`). Indices preserve config order.
+    let guidance = repo
+        .get("dynamicWorkflows")
+        .and_then(|dw| dw.get("guidance"))
+        .and_then(|g| g.as_array());
+    let guidance_summary = match guidance {
+        Some(arr) if !arr.is_empty() => {
+            let n = arr.len();
+            format!("{n} entr{}", if n == 1 { "y" } else { "ies" })
+        }
+        _ => "(none)".to_string(),
+    };
+    rows.push(ConfigFieldRow {
+        field: "dynamicWorkflows.guidance".to_string(),
+        global_value: None,
+        repo_value: Some(guidance_summary.clone()),
+        effective_value: Some(guidance_summary),
+        kind: ConfigFieldKind::String,
+        read_only: true,
+        global_writable: false,
+        repo_writable: false,
+        value_hint: config_field_hint("dynamicWorkflows.guidance"),
+    });
+    if let Some(arr) = guidance {
+        for (i, entry) in arr.iter().enumerate() {
+            let field = format!("dynamicWorkflows.guidance.{i}");
+            let value = entry.as_str().map(|s| s.to_string());
             let value_hint = config_field_hint(&field);
             rows.push(ConfigFieldRow {
                 field,
@@ -838,7 +941,13 @@ fn config_field_value(json: &serde_json::Value, field: &str) -> Option<String> {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = json;
     for part in &parts {
-        current = current.get(*part)?;
+        // A numeric segment indexes into an array (e.g. the
+        // dynamicWorkflows.guidance.<n> entries); everything else is an
+        // object key.
+        current = match current {
+            serde_json::Value::Array(arr) => arr.get(part.parse::<usize>().ok()?)?,
+            _ => current.get(*part)?,
+        };
     }
     Some(match current {
         serde_json::Value::String(s) => s.clone(),
@@ -866,10 +975,33 @@ fn apply_config_field(json: &mut serde_json::Value, field: &str, value: serde_js
     }
 }
 
-/// Remove a JSON field, supporting dot-notation for nested objects.
-/// Missing intermediate objects make this a no-op.
+/// Remove a JSON field, supporting dot-notation for nested objects and a
+/// trailing numeric segment that indexes into an array-of-strings field
+/// (e.g. `dynamicWorkflows.guidance.1`). Removing an array element via
+/// `Vec::remove` compacts the remaining elements, so subsequent entries are
+/// automatically re-indexed (WI-0099). Missing intermediate objects make this
+/// a no-op.
 fn remove_config_field(json: &mut serde_json::Value, field: &str) {
     let parts: Vec<&str> = field.split('.').collect();
+    let last = *parts.last().expect("split never yields an empty vec");
+    // Trailing numeric segment: remove the element from the parent array.
+    if let Ok(index) = last.parse::<usize>() {
+        if parts.len() >= 2 {
+            let mut current = json;
+            for part in &parts[..parts.len() - 1] {
+                match current.get_mut(*part) {
+                    Some(v) => current = v,
+                    None => return,
+                }
+            }
+            if let serde_json::Value::Array(arr) = current {
+                if index < arr.len() {
+                    arr.remove(index);
+                }
+            }
+            return;
+        }
+    }
     let mut current = json;
     for part in &parts[..parts.len() - 1] {
         match current.get_mut(*part) {
@@ -878,7 +1010,7 @@ fn remove_config_field(json: &mut serde_json::Value, field: &str) {
         }
     }
     if let serde_json::Value::Object(obj) = current {
-        obj.remove(*parts.last().expect("split never yields an empty vec"));
+        obj.remove(last);
     }
 }
 
@@ -886,6 +1018,18 @@ fn remove_config_field(json: &mut serde_json::Value, field: &str) {
 /// E.g. "work_items.dir" sets `json["work_items"]["dir"]`.
 fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json::Value) {
     let parts: Vec<&str> = field.split('.').collect();
+    // Trailing numeric segment: set (or append) an element in the parent
+    // array-of-strings field (e.g. `dynamicWorkflows.guidance.<n>`). An index
+    // at or past the current length appends, which is how the TUI Ctrl+N flow
+    // adds a new entry (WI-0099). Intermediate objects and the array itself
+    // are created on demand so guidance can be added to a config that has no
+    // `dynamicWorkflows` block yet.
+    if let Some(index) = parts.last().and_then(|p| p.parse::<usize>().ok()) {
+        if parts.len() >= 2 {
+            set_array_element(json, &parts[..parts.len() - 1], index, value);
+            return;
+        }
+    }
     if parts.len() == 1 {
         // Top-level field
         if let serde_json::Value::Object(obj) = json {
@@ -912,6 +1056,53 @@ fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json
                 }
             }
             current = current.get_mut(*part).expect("just inserted nested object");
+        }
+    }
+}
+
+/// Set or append an element in an array-of-strings field addressed by
+/// `array_path` (the dot-path segments up to and including the array field,
+/// e.g. `["dynamicWorkflows", "guidance"]`). Intermediate objects and the
+/// array are created on demand. `index >= len` appends; `index < len`
+/// overwrites in place. Used for the `dynamicWorkflows.guidance` array
+/// (WI-0099).
+fn set_array_element(
+    json: &mut serde_json::Value,
+    array_path: &[&str],
+    index: usize,
+    value: serde_json::Value,
+) {
+    let Some((array_field, obj_path)) = array_path.split_last() else {
+        return;
+    };
+    // Navigate (creating as needed) the object path that holds the array.
+    let mut current = json;
+    for part in obj_path {
+        if !current.get(*part).map(|v| v.is_object()).unwrap_or(false) {
+            if let serde_json::Value::Object(obj) = current {
+                obj.insert(
+                    part.to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+            } else {
+                return;
+            }
+        }
+        current = current.get_mut(*part).expect("just inserted nested object");
+    }
+    // Ensure the array field exists and is an array.
+    if !current.get(*array_field).map(|v| v.is_array()).unwrap_or(false) {
+        if let serde_json::Value::Object(obj) = current {
+            obj.insert(array_field.to_string(), serde_json::Value::Array(Vec::new()));
+        } else {
+            return;
+        }
+    }
+    if let Some(serde_json::Value::Array(arr)) = current.get_mut(*array_field) {
+        if index < arr.len() {
+            arr[index] = value;
+        } else {
+            arr.push(value);
         }
     }
 }
@@ -1036,6 +1227,85 @@ mod tests {
         );
         assert_eq!(json["work_items"]["dir"], "custom/dir");
         assert_eq!(json["work_items"]["template"], "tmpl.md");
+    }
+
+    // ── set_config_field: dynamicWorkflows.guidance array append (WI-0099) ────
+
+    #[test]
+    fn set_config_field_guidance_appends_to_new_array() {
+        let mut json = serde_json::json!({});
+        set_config_field(
+            &mut json,
+            "dynamicWorkflows.guidance.0",
+            serde_json::Value::String("first entry".into()),
+        );
+        assert_eq!(
+            json["dynamicWorkflows"]["guidance"],
+            serde_json::json!(["first entry"]),
+            "setting index 0 on an absent array must create it: {json}"
+        );
+    }
+
+    #[test]
+    fn set_config_field_guidance_appends_at_current_length() {
+        let mut json = serde_json::json!({
+            "dynamicWorkflows": {"guidance": ["first entry"]}
+        });
+        set_config_field(
+            &mut json,
+            "dynamicWorkflows.guidance.1",
+            serde_json::Value::String("second entry".into()),
+        );
+        assert_eq!(
+            json["dynamicWorkflows"]["guidance"],
+            serde_json::json!(["first entry", "second entry"]),
+            "index == current length must append, not overwrite: {json}"
+        );
+    }
+
+    #[test]
+    fn set_config_field_guidance_overwrites_in_place_when_index_in_range() {
+        let mut json = serde_json::json!({
+            "dynamicWorkflows": {"guidance": ["a", "b"]}
+        });
+        set_config_field(
+            &mut json,
+            "dynamicWorkflows.guidance.0",
+            serde_json::Value::String("a-edited".into()),
+        );
+        assert_eq!(
+            json["dynamicWorkflows"]["guidance"],
+            serde_json::json!(["a-edited", "b"]),
+            "index < length must overwrite in place: {json}"
+        );
+    }
+
+    // ── remove_config_field: dynamicWorkflows.guidance by index (WI-0099) ─────
+
+    #[test]
+    fn remove_config_field_guidance_by_index_compacts_and_reindexes() {
+        let mut json = serde_json::json!({
+            "dynamicWorkflows": {"guidance": ["a", "b", "c"]}
+        });
+        remove_config_field(&mut json, "dynamicWorkflows.guidance.1");
+        assert_eq!(
+            json["dynamicWorkflows"]["guidance"],
+            serde_json::json!(["a", "c"]),
+            "removing index 1 must leave a compact, re-indexed array: {json}"
+        );
+    }
+
+    #[test]
+    fn remove_config_field_guidance_out_of_range_index_is_noop() {
+        let mut json = serde_json::json!({
+            "dynamicWorkflows": {"guidance": ["a"]}
+        });
+        remove_config_field(&mut json, "dynamicWorkflows.guidance.5");
+        assert_eq!(
+            json["dynamicWorkflows"]["guidance"],
+            serde_json::json!(["a"]),
+            "an out-of-range index must not modify the array: {json}"
+        );
     }
 
     // ── validate_and_coerce ──────────────────────────────────────────────────
@@ -1163,6 +1433,64 @@ mod tests {
         );
     }
 
+    // ── validate_and_coerce: dynamicWorkflows.guidance (WI-0099) ────────────
+
+    #[test]
+    fn validate_and_coerce_rejects_bare_guidance_field() {
+        // The bare array field can't be set as a single string; the coerced
+        // string would fail RepoConfig deserialization and silently write
+        // nothing, so it must be rejected up front pointing at the per-index
+        // syntax.
+        let err = validate_and_coerce("dynamicWorkflows.guidance", "some instruction").unwrap_err();
+        assert!(
+            err.contains("dynamicWorkflows.guidance.0"),
+            "the list rejection must point at the per-index syntax, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_guidance_entry_valid() {
+        let v = validate_and_coerce(
+            "dynamicWorkflows.guidance.0",
+            "never spawn more than two agents in parallel",
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::Value::String("never spawn more than two agents in parallel".into())
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_guidance_entry_is_not_comma_split() {
+        // Unlike agentsToModels, a guidance entry is one free-form string that
+        // may itself contain commas.
+        let v = validate_and_coerce("dynamicWorkflows.guidance.0", "do X, then Y, then Z").unwrap();
+        assert_eq!(
+            v,
+            serde_json::Value::String("do X, then Y, then Z".into())
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_guidance_entry_empty_value_means_remove() {
+        let v = validate_and_coerce("dynamicWorkflows.guidance.0", "   ").unwrap();
+        assert!(
+            v.is_null(),
+            "an empty/whitespace-only guidance value must coerce to Null (entry removal), got: {v:?}"
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_guidance_entry_rejects_over_length_cap() {
+        let too_long = "a".repeat(crate::data::config::repo::GUIDANCE_MAX_ENTRY_LEN + 1);
+        let err = validate_and_coerce("dynamicWorkflows.guidance.0", &too_long).unwrap_err();
+        assert!(
+            err.contains("maximum"),
+            "an over-length guidance entry must be rejected, got: {err}"
+        );
+    }
+
     // ── per-agent field name validation / scope ─────────────────────────────
 
     #[test]
@@ -1177,6 +1505,21 @@ mod tests {
         // The bare map and deeper paths are not per-agent entries.
         assert!(agents_to_models_entry_key("dynamicWorkflows.agentsToModels").is_none());
         assert!(agents_to_models_entry_key("dynamicWorkflows.agentsToModels.a.b").is_none());
+    }
+
+    #[test]
+    fn guidance_entries_are_valid_repo_only_fields() {
+        assert!(is_valid_field_name("dynamicWorkflows.guidance.0"));
+        assert!(is_valid_field_name("dynamicWorkflows.guidance.41"));
+        assert_eq!(
+            field_scope("dynamicWorkflows.guidance.0"),
+            Some(FieldScope::RepoOnly)
+        );
+        // The bare array and non-numeric or dotted trailing segments are not
+        // per-index guidance entries.
+        assert!(guidance_entry_index("dynamicWorkflows.guidance").is_none());
+        assert!(guidance_entry_index("dynamicWorkflows.guidance.abc").is_none());
+        assert!(guidance_entry_index("dynamicWorkflows.guidance.0.1").is_none());
     }
 
     // ── updated_config (silent-save-failure fix) ─────────────────────────────
