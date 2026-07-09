@@ -462,6 +462,12 @@ fn spawn_pty_bridged_apple(
     for arg in &argv {
         cmd.arg(arg);
     }
+    // Agent credentials are passed as name-only `-e KEY` in argv; set their
+    // values on the `container` child's environment so the CLI resolves them
+    // without the secret ever touching the argument vector.
+    for (k, v) in &instance.options.agent_credentials {
+        cmd.env(k, v);
+    }
 
     let child = pair
         .slave
@@ -503,6 +509,12 @@ fn spawn_piped_apple(
 ) -> Result<AgentExecution, EngineError> {
     let mut cmd = Command::new("container");
     cmd.args(&argv);
+    // Agent credentials are passed as name-only `-e KEY` in argv; set their
+    // values on the `container` child's environment so the CLI resolves them
+    // without the secret ever touching the argument vector.
+    for (k, v) in &instance.options.agent_credentials {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

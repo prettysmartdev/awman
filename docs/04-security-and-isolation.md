@@ -25,7 +25,7 @@ Every time awman runs a container or sandbox command, the full CLI invocation is
 
 ```
 $ docker run --rm -it -v /home/user/myproject:/workspace -w /workspace \
-    -e CLAUDE_CODE_OAUTH_TOKEN=*** awman-myproject:latest claude "..."
+    -e CLAUDE_CODE_OAUTH_TOKEN -e GEMINI_API_KEY=*** awman-myproject:latest claude "..."
 ```
 
 For Docker Sandboxes, every `sbx` invocation is announced the same way:
@@ -36,7 +36,7 @@ Running: sbx secret set awman-ab12-claude anthropic (value piped via stdin)
 Running: sbx run awman-ab12-claude
 ```
 
-Credential values are masked, but everything else is visible. You can always see exactly what awman is doing.
+Credential values never appear in a printed command. Agent-managed credentials (like the Claude Code OAuth token) show as a bare `-e VAR_NAME` — the value is passed straight from awman's own environment to the container CLI's process, never through argv. Env vars you configure yourself (`env()` overlays, `envPassthrough`) still show as `VAR_NAME=***`. Everything else is visible in full. You can always see exactly what awman is doing.
 
 ---
 
@@ -358,11 +358,11 @@ $ docker build -t awman-myapp:latest -f Dockerfile.dev /path/to/repo
 $ docker run --rm -it \
     -v /path/to/repo:/workspace \
     -w /workspace \
-    -e CLAUDE_CODE_OAUTH_TOKEN=*** \
+    -e CLAUDE_CODE_OAUTH_TOKEN \
     awman-myapp:latest claude "Implement work item 0001..."
 ```
 
-With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — with sensitive values masked. Credential values are always masked across all runtimes.
+With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — without sensitive values. Credential values are never printed: agent-managed credentials render as a bare `-e VAR_NAME`, and user-configured environment overlays render as `VAR_NAME=***`.
 
 ---
 

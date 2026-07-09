@@ -20,7 +20,6 @@ use awman::data::error::DataError;
 use awman::data::migration;
 use awman::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use awman::engine::agent::AgentEngine;
-use awman::engine::agent_runtime;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
@@ -30,15 +29,12 @@ use awman::frontend::tui;
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    // WI-0082: `--mount-ssh` was removed in favour of `--overlay ssh()`.
-    // Intercept it before clap renders the generic "unexpected argument"
-    // message so the user sees a migration hint instead.
-    if std::env::args().any(|a| a == "--mount-ssh" || a.starts_with("--mount-ssh=")) {
-        eprintln!(
-            "error: --mount-ssh has been removed. Pass `--overlay ssh()` instead \
-             (or set `overlays = [\"ssh()\"]` in a per-step workflow entry). \
-             See `docs/09-overlays.md`."
-        );
+    // Retired flags (e.g. `--mount-ssh`) are intercepted before clap renders
+    // its generic "unexpected argument" message, so the user sees a migration
+    // hint instead. The removed-flag list and matching live in the catalogue;
+    // adding a future removal needs no `main.rs` change.
+    if let Some(hint) = CommandCatalogue::get().removed_flag_hint(std::env::args()) {
+        eprintln!("error: {hint}");
         return Ok(ExitCode::from(2));
     }
 
@@ -56,48 +52,23 @@ async fn main() -> Result<ExitCode> {
     }
 
     let global_config = GlobalConfig::load().unwrap_or_default();
-    // Set when the configured `runtime:` value is invalid and the TUI is
-    // about to start: the TUI boots just far enough to present a fatal
-    // modal with this message and quits on Enter.
-    let mut fatal_runtime_error: Option<String> = None;
-    let detected = match agent_runtime::detect(&global_config) {
-        Ok(d) => d,
-        Err(e @ awman::engine::error::EngineError::UnknownRuntime { .. }) => {
-            // An invalid (unrecognized) `runtime:` value is a fatal config
-            // error — never a silent Docker fallback. CLI invocations print
-            // the message and exit immediately; the bare-invocation TUI
-            // shows the same message in a startup modal instead, so it
-            // still constructs default engines (which it never exercises:
-            // the modal's only action is quit).
-            if matches.subcommand_name().is_some() {
+    // Runtime detection + the CLI/TUI fallback policy live on the Layer 2
+    // `Engines` type. `fatal_runtime_error` is `Some` only when the configured
+    // `runtime:` is invalid and the TUI is about to start: the TUI boots just
+    // far enough to present a fatal modal with this message and quits on Enter.
+    let path = cli::command_path_from_matches(&matches);
+    let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+    let (detected, fatal_runtime_error) =
+        match Engines::detect(CommandCatalogue::get(), &global_config, &path_refs) {
+            Ok(pair) => pair,
+            Err(e @ awman::engine::error::EngineError::UnknownRuntime { .. }) => {
                 eprintln!("awman: {e}");
                 return Ok(ExitCode::from(2));
             }
-            fatal_runtime_error = Some(e.to_string());
-            agent_runtime::detect(&GlobalConfig::default())
-                .context("failed to detect agent runtime")?
-        }
-        Err(e) => {
-            // A `runtime:` config string this host can't construct (e.g.
-            // `apple-containers` on Linux) must not lock the user out of
-            // `awman config` — the documented way to switch the runtime
-            // back. The catalogue decides which commands need a runtime;
-            // for the rest, warn and continue on the default Docker
-            // runtime, which config commands never touch.
-            let path = cli::command_path_from_matches(&matches);
-            let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
-            if CommandCatalogue::get().requires_runtime(&path_refs) {
+            Err(e) => {
                 return Err(anyhow::Error::new(e).context("failed to detect agent runtime"));
             }
-            eprintln!(
-                "warning: configured runtime is unavailable on this host ({e}); \
-                 continuing with the default Docker runtime so `awman config` \
-                 can update the setting"
-            );
-            agent_runtime::detect(&GlobalConfig::default())
-                .context("failed to detect agent runtime")?
-        }
-    };
+        };
     let runtime = detected.engine();
     let container_runtime = detected.container_runtime();
     let sandbox_runtime = detected.sandbox_runtime();

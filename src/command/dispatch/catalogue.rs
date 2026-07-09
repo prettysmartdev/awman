@@ -78,6 +78,20 @@ impl FlagSpec {
     }
 }
 
+/// Spec for a flag that once existed but has since been removed. Frontends
+/// scan raw argv for these *before* clap parses, so a user who passes a
+/// retired flag sees a migration hint instead of clap's generic
+/// "unexpected argument" error. Keeping the retired-flag knowledge here — next
+/// to the live [`FlagSpec`]s — means future removals never touch `main.rs`.
+#[derive(Debug, Clone, Copy)]
+pub struct RemovedFlagSpec {
+    /// The retired long flag, leading dashes included (e.g. `--mount-ssh`).
+    /// Matches both the bare form and the `--flag=value` form.
+    pub name: &'static str,
+    /// Migration guidance appended after "`<name>` has been removed.".
+    pub hint: &'static str,
+}
+
 /// The kind of an argument (positional value).
 #[derive(Debug, Clone, Copy)]
 pub enum ArgumentKind {
@@ -206,6 +220,28 @@ impl CommandCatalogue {
     /// the runtime.
     pub fn requires_runtime(&self, path: &[&str]) -> bool {
         !matches!(path.first(), Some(&"config"))
+    }
+
+    /// Scan a raw argv for any [removed flag](RemovedFlagSpec). Returns the
+    /// composed migration message ("`<flag>` has been removed. <hint>") for the
+    /// first removed flag found, or `None` when argv contains none. Frontends
+    /// call this before clap parsing so a retired flag surfaces the hint
+    /// instead of clap's generic "unexpected argument" error. Both the bare
+    /// `--flag` and the `--flag=value` forms are matched.
+    pub fn removed_flag_hint<I, S>(&self, args: I) -> Option<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for arg in args {
+            let arg = arg.as_ref();
+            for spec in REMOVED_FLAGS {
+                if arg == spec.name || arg.starts_with(&format!("{}=", spec.name)) {
+                    return Some(format!("{} has been removed. {}", spec.name, spec.hint));
+                }
+            }
+        }
+        None
     }
 
     /// Validate that a command path is reachable by the given frontend,
@@ -347,6 +383,18 @@ const ROOT: CommandSpec = CommandSpec {
 };
 
 const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
+
+/// Flags that have been removed. Scanned by [`CommandCatalogue::removed_flag_hint`]
+/// before clap parsing so retired flags yield a migration hint. Add an entry
+/// here when a flag is dropped; `main.rs` needs no changes.
+const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
+    // WI-0082: `--mount-ssh` was removed in favour of `--overlay ssh()`.
+    RemovedFlagSpec {
+        name: "--mount-ssh",
+        hint: "Pass `--overlay ssh()` instead (or set `overlays = [\"ssh()\"]` \
+               in a per-step workflow entry). See `docs/09-overlays.md`.",
+    },
+];
 
 // ── clean ─────────────────────────────────────────────────────────────────────
 
@@ -2232,5 +2280,46 @@ mod tests {
         assert_eq!(set.arguments.len(), 2);
         let names: Vec<&str> = set.arguments.iter().map(|a| a.name).collect();
         assert!(names.contains(&"field") && names.contains(&"value"));
+    }
+
+    // ── WI-0098 Finding B: removed-flag migration hints ───────────────────────
+
+    #[test]
+    fn removed_flag_hint_returns_hint_for_mount_ssh() {
+        let cat = CommandCatalogue::get();
+        let hint = cat
+            .removed_flag_hint(["chat", "--mount-ssh"])
+            .expect("--mount-ssh must yield a migration hint");
+        assert!(
+            hint.starts_with("--mount-ssh has been removed."),
+            "hint must name the removed flag; got: {hint}"
+        );
+        assert!(
+            hint.contains("ssh()") || hint.contains("--overlay"),
+            "hint must point at the `--overlay ssh()` replacement; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn removed_flag_hint_matches_value_form() {
+        let cat = CommandCatalogue::get();
+        // `--mount-ssh=x` (the `=`-bearing form) must be intercepted too.
+        let hint = cat
+            .removed_flag_hint(["chat", "--mount-ssh=x"])
+            .expect("--mount-ssh=x must yield the same migration hint");
+        assert!(hint.starts_with("--mount-ssh has been removed."));
+    }
+
+    #[test]
+    fn removed_flag_hint_none_for_live_flags() {
+        let cat = CommandCatalogue::get();
+        // Live flags and near-misses must not trigger a removed-flag hint.
+        assert!(cat
+            .removed_flag_hint(["chat", "--overlay", "ssh()"])
+            .is_none());
+        assert!(cat.removed_flag_hint(["chat", "--non-interactive"]).is_none());
+        // A flag that merely contains the removed name as a substring must not match.
+        assert!(cat.removed_flag_hint(["chat", "--mount-ssh-extra"]).is_none());
+        assert!(cat.removed_flag_hint(Vec::<String>::new()).is_none());
     }
 }

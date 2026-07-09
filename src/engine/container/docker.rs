@@ -510,6 +510,12 @@ fn spawn_pty_bridged_docker(
     for arg in &argv {
         cmd.arg(arg);
     }
+    // Agent credentials are passed as name-only `-e KEY` in argv; set their
+    // values on the docker child's environment so the CLI resolves them
+    // without the secret ever touching the argument vector.
+    for (k, v) in &instance.options.agent_credentials {
+        cmd.env(k, v);
+    }
 
     let child = pair
         .slave
@@ -551,6 +557,12 @@ fn spawn_piped_docker(
 ) -> Result<AgentExecution, EngineError> {
     let mut cmd = Command::new("docker");
     cmd.args(&argv);
+    // Agent credentials are passed as name-only `-e KEY` in argv; set their
+    // values on the docker child's environment so the CLI resolves them
+    // without the secret ever touching the argument vector.
+    for (k, v) in &instance.options.agent_credentials {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -780,10 +792,16 @@ pub(super) fn build_run_argv(
         args.push("-e".into());
         args.push(format!("{}={}", lit.key, lit.value));
     }
-    // Agent credentials are env-vars by another name.
-    for (k, v) in &options.agent_credentials {
+    // Agent credentials are env-vars by another name. Emit the NAME ONLY
+    // (`-e KEY`); the value is set on the spawned CLI child's own environment
+    // (see the spawn paths below) and the container-runtime CLI resolves a
+    // name-only `-e` from its process env. This keeps the secret value out of
+    // the argument vector, so it never appears in `ps` / `/proc/<pid>/cmdline`
+    // while the client process runs. Both the docker CLI and the Apple
+    // `container` CLI (which shares this argv builder) support this form.
+    for (k, _v) in &options.agent_credentials {
         args.push("-e".into());
-        args.push(format!("{k}={v}"));
+        args.push(k.clone());
     }
 
     // Allow Docker socket: mount and add docker group.
@@ -1310,5 +1328,123 @@ mod tests {
     #[test]
     fn parse_cpu_percent_strips_percent() {
         assert!((parse_cpu_percent("5.23%") - 5.23).abs() < 0.001);
+    }
+
+    // ── WI-0098 Finding A: agent credential values must never enter argv ──────
+    //
+    // `build_run_argv` emits credentials as the NAME-ONLY form `-e KEY`; the
+    // value is set on the spawned CLI child's own environment (see the spawn
+    // paths) so nothing secret is visible via `ps` / `/proc/<pid>/cmdline`.
+    // These tests assert the value is absent from the built argv while still
+    // being carried out-of-band on the resolved options (the source the spawn
+    // code feeds to `Command::env`). `build_run_argv` is shared verbatim by the
+    // Apple backend, so this coverage applies to both container backends.
+
+    fn credential_opts(pairs: &[(&str, &str)]) -> ResolvedContainerOptions {
+        resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::AgentCredentials {
+                env_vars: pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+        ])
+    }
+
+    #[test]
+    fn build_run_argv_agent_credentials_use_name_only_form() {
+        let resolved = credential_opts(&[("ANTHROPIC_API_KEY", "sk-secret-value")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        // The name-only `-e KEY` pair must be present.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY"),
+            "credential must be emitted as name-only `-e ANTHROPIC_API_KEY`; argv: {argv:?}"
+        );
+        // The secret value must appear nowhere in argv, in any form.
+        assert!(
+            !argv.iter().any(|a| a.contains("sk-secret-value")),
+            "credential VALUE must never appear in argv; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "ANTHROPIC_API_KEY=sk-secret-value"),
+            "the `KEY=VALUE` argv form must not be used for credentials; argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_credential_value_with_equals_stays_out_of_argv() {
+        // A value containing `=` must survive the env-inheritance path and must
+        // never leak into argv.
+        let resolved = credential_opts(&[("TOKEN", "a=b=c")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "TOKEN"),
+            "credential name must still be present as `-e TOKEN`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("a=b=c")),
+            "credential value containing `=` must not appear in argv; argv: {argv:?}"
+        );
+        // Carried out-of-band, verbatim, for the child-process env map.
+        assert_eq!(
+            resolved.agent_credentials,
+            vec![("TOKEN".to_string(), "a=b=c".to_string())],
+            "the value must be preserved verbatim on the options for `Command::env`"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_credential_value_with_newline_stays_out_of_argv() {
+        let resolved = credential_opts(&[("MULTILINE", "line1\nline2")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "MULTILINE"),
+            "credential name must be present as `-e MULTILINE`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains('\n')),
+            "no argv element may contain a newline from the credential value; argv: {argv:?}"
+        );
+        assert_eq!(
+            resolved.agent_credentials,
+            vec![("MULTILINE".to_string(), "line1\nline2".to_string())],
+            "the newline-bearing value must be preserved verbatim for `Command::env`"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_multiple_credentials_all_name_only() {
+        let resolved = credential_opts(&[("KEY_A", "aaa"), ("KEY_B", "bbb")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        for name in ["KEY_A", "KEY_B"] {
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+                "{name} must be emitted name-only; argv: {argv:?}"
+            );
+        }
+        for value in ["aaa", "bbb"] {
+            assert!(
+                !argv.iter().any(|a| a.contains(value)),
+                "credential value {value} must never appear in argv; argv: {argv:?}"
+            );
+        }
     }
 }

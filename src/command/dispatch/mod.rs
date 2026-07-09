@@ -47,8 +47,9 @@ use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind, FlagSpec};
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
 use crate::data::session::Session;
+use crate::data::config::global::GlobalConfig;
 use crate::engine::agent::AgentEngine;
-use crate::engine::agent_runtime::AgentRuntimeEngine;
+use crate::engine::agent_runtime::{self, AgentRuntimeEngine, DetectedRuntime};
 use crate::engine::auth::AuthEngine;
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
@@ -106,6 +107,67 @@ impl Engines {
                  (docker-sbx-experimental); set runtime to \"docker\" or \
                  \"apple-containers\" to use it here",
             ))
+    }
+
+    /// Agent-runtime detection with the documented CLI/TUI fallback policy,
+    /// lifted out of `main.rs` (WI-0098 Finding B) so Layer 4 stays pure
+    /// wiring. Picks the runtime named by `config`, applying three rules:
+    ///
+    /// * **Valid runtime** → `Ok((runtime, None))`.
+    /// * **Unknown `runtime:` string** — a fatal configuration error, never a
+    ///   silent Docker fallback. For a CLI invocation (`command_path`
+    ///   non-empty) the [`EngineError::UnknownRuntime`] is returned so the
+    ///   caller can print it and exit. For the bare-TUI invocation
+    ///   (`command_path` empty) inert default (Docker) engines are still
+    ///   constructed — the TUI boots only far enough to show a fatal modal —
+    ///   and the error text is returned as the second tuple field for that
+    ///   modal.
+    /// * **Runtime unavailable on this host** (e.g. `apple-containers` on
+    ///   Linux) → fatal only when the command `requires_runtime`; otherwise a
+    ///   warning is printed to stderr and detection falls back to the default
+    ///   Docker runtime, keeping `awman config` reachable to fix the setting.
+    ///
+    /// Returns the detected runtime handles paired with the optional TUI
+    /// fatal-modal message (`Some` only on the unknown-runtime TUI path).
+    /// `main` combines the returned [`DetectedRuntime`] with the
+    /// session-derived engines to assemble the full [`Engines`] bundle.
+    pub fn detect(
+        catalogue: &CommandCatalogue,
+        config: &GlobalConfig,
+        command_path: &[&str],
+    ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
+        match agent_runtime::detect(config) {
+            Ok(detected) => Ok((detected, None)),
+            Err(e @ EngineError::UnknownRuntime { .. }) => {
+                // Invalid `runtime:` is fatal. CLI invocations bubble the error
+                // up to be printed and exited on; the bare-TUI invocation
+                // constructs inert default engines (never exercised — the
+                // modal's only action is quit) and returns the message for the
+                // startup modal.
+                if !command_path.is_empty() {
+                    return Err(e);
+                }
+                let fallback = agent_runtime::detect(&GlobalConfig::default())?;
+                Ok((fallback, Some(e.to_string())))
+            }
+            Err(e) => {
+                // A configured runtime this host can't construct must not lock
+                // the user out of `awman config` — the documented way to switch
+                // the runtime back. The catalogue decides which commands need a
+                // runtime; for the rest, warn and continue on the default
+                // Docker runtime, which config commands never touch.
+                if catalogue.requires_runtime(command_path) {
+                    return Err(e);
+                }
+                eprintln!(
+                    "warning: configured runtime is unavailable on this host ({e}); \
+                     continuing with the default Docker runtime so `awman config` \
+                     can update the setting"
+                );
+                let fallback = agent_runtime::detect(&GlobalConfig::default())?;
+                Ok((fallback, None))
+            }
+        }
     }
 }
 
@@ -1581,6 +1643,109 @@ mod tests {
         assert!(
             matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
             "static exec workflow without path must return MissingRequiredArgument"
+        );
+    }
+
+    // ── WI-0098 Finding B: Engines::detect runtime-detection policy ───────────
+    //
+    // The three documented paths lifted out of `main.rs`: valid runtime, an
+    // unknown `runtime:` string (fatal for CLI, modal for TUI), and a runtime
+    // unavailable on this host (fatal only when the command requires a runtime).
+
+    fn config_with_runtime(runtime: Option<&str>) -> GlobalConfig {
+        GlobalConfig {
+            runtime: runtime.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn detect_valid_runtime_returns_runtime_and_no_modal_message() {
+        let cat = CommandCatalogue::get();
+        let cfg = config_with_runtime(Some("docker"));
+        let (detected, modal) = Engines::detect(cat, &cfg, &["status"])
+            .expect("a valid runtime must detect successfully");
+        assert_eq!(detected.engine().runtime_name(), "docker");
+        assert!(
+            modal.is_none(),
+            "no fatal-modal message on the valid-runtime path"
+        );
+    }
+
+    #[test]
+    fn detect_unknown_runtime_cli_returns_unknown_runtime_error() {
+        // A CLI invocation (non-empty command path) with a misspelled runtime is
+        // a fatal configuration error the caller prints and exits on.
+        let cat = CommandCatalogue::get();
+        let cfg = config_with_runtime(Some("totally-bogus-runtime"));
+        // `DetectedRuntime` is not `Debug`, so match rather than `expect_err`.
+        match Engines::detect(cat, &cfg, &["status"]) {
+            Err(EngineError::UnknownRuntime { .. }) => {}
+            Err(other) => panic!("expected UnknownRuntime, got {other:?}"),
+            Ok(_) => panic!("an unknown runtime must be an error for CLI invocations"),
+        }
+    }
+
+    #[test]
+    fn detect_unknown_runtime_tui_builds_default_engines_and_returns_modal_message() {
+        // The bare-TUI invocation (empty command path) must still construct inert
+        // default (Docker) engines so the fatal modal can render, and return the
+        // error text for that modal.
+        let cat = CommandCatalogue::get();
+        let cfg = config_with_runtime(Some("totally-bogus-runtime"));
+        let (detected, modal) = Engines::detect(cat, &cfg, &[])
+            .expect("the TUI path must still yield default engines");
+        assert_eq!(
+            detected.engine().runtime_name(),
+            "docker",
+            "the TUI fallback must be the default Docker runtime"
+        );
+        let msg = modal.expect("the TUI path must return a fatal-modal message");
+        assert!(
+            msg.contains("totally-bogus-runtime"),
+            "modal message must name the bad runtime; got: {msg}"
+        );
+    }
+
+    // The unavailable-on-host path needs a runtime that this host cannot
+    // construct. `apple-containers` is unavailable on every non-macOS host, so
+    // these two tests exercise the fatal-vs-warn branch there.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn detect_unavailable_runtime_is_fatal_when_command_requires_runtime() {
+        let cat = CommandCatalogue::get();
+        let cfg = config_with_runtime(Some("apple-containers"));
+        // `status` requires a runtime → the unavailable runtime is fatal.
+        assert!(cat.requires_runtime(&["status"]));
+        match Engines::detect(cat, &cfg, &["status"]) {
+            Err(EngineError::UnknownRuntime { .. }) => panic!(
+                "an unavailable (not unknown) runtime must not surface as UnknownRuntime"
+            ),
+            Err(_) => {}
+            Ok(_) => panic!(
+                "an unavailable runtime must be fatal for a runtime-requiring command"
+            ),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn detect_unavailable_runtime_warns_and_falls_back_when_command_allows() {
+        let cat = CommandCatalogue::get();
+        let cfg = config_with_runtime(Some("apple-containers"));
+        // `config` does not require a runtime → warn on stderr and fall back to
+        // the default Docker runtime so `awman config` stays reachable.
+        assert!(!cat.requires_runtime(&["config", "show"]));
+        let (detected, modal) = Engines::detect(cat, &cfg, &["config", "show"])
+            .expect("config commands must fall back rather than fail");
+        assert_eq!(
+            detected.engine().runtime_name(),
+            "docker",
+            "the fallback must be the default Docker runtime"
+        );
+        assert!(
+            modal.is_none(),
+            "the unavailable-but-tolerated path yields no TUI modal message"
         );
     }
 }

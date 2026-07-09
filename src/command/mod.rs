@@ -9,11 +9,13 @@ pub mod commands;
 pub mod dispatch;
 pub mod error;
 pub mod session_create;
+pub mod session_setup;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use session_create::{
     SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest, DEFAULT_REPO_URL_SCHEMES,
 };
+pub use session_setup::{SessionSetup, SessionSetupObserver};
 pub use dispatch::{
     BuiltCommand, CommandFrontend, CommandOutcome, Dispatch, DispatchFrontend, Engines,
     ParsedCommandBoxInput,
