@@ -380,14 +380,28 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             dialog_router::dismiss_dialog(app);
         }
         Action::NewMapEntry => {
-            // Ctrl+N in the config dialog: start the add-model-mapping flow
-            // (dynamicWorkflows.agentsToModels). No-op elsewhere.
+            // Ctrl+N in the config dialog: start an add-entry flow. On a
+            // guidance section row it starts the single-phase guidance entry
+            // flow; on an agentsToModels row it starts the two-phase
+            // key→value flow. No-op elsewhere.
             if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
                 if state.new_entry.is_none() {
-                    state.new_entry = Some(dialogs::NewMapEntryPhase::Key);
+                    let on_guidance_row = state
+                        .rows
+                        .get(state.selected)
+                        .map(|r| {
+                            r.field == "dynamicWorkflows.guidance"
+                                || r.field.starts_with("dynamicWorkflows.guidance.")
+                        })
+                        .unwrap_or(false);
+                    state.new_entry = Some(if on_guidance_row {
+                        dialogs::NewMapEntryPhase::GuidanceEntry
+                    } else {
+                        dialogs::NewMapEntryPhase::Key
+                    });
                     state.editing = true;
                     state.error = None;
-                    // Map entries are repo-scoped.
+                    // Both agentsToModels and guidance entries are repo-scoped.
                     state.edit_column = 1;
                     state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
                 }

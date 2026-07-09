@@ -36,6 +36,13 @@ impl ContextDirResolver {
         }
     }
 
+    /// The resolved awman home directory (`~/.awman` unless overridden).
+    /// Callers need this to invoke [`validate_context_path`] against a
+    /// resolved context path.
+    pub fn awman_home(&self) -> &Path {
+        &self.awman_home
+    }
+
     /// `~/.awman/context/global/`
     pub fn global_dir(&self) -> PathBuf {
         self.awman_home.join("context").join("global")

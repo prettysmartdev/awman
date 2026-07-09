@@ -43,7 +43,7 @@ The following agents are available in this project. Each agent is a Docker conta
 {{available_agents}}
 
 {{max_concurrent_steps_note}}
-
+{{developer_guidance}}
 When choosing agents for steps:
   - Any agent can perform general coding tasks (implement, test, review, document)
   - If only one agent is available, use it for all steps — multi-agent strategies described

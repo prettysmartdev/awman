@@ -414,6 +414,36 @@ setup:
 | `model` | string | no | Inherited from workflow | The model to use for remediation. If omitted, uses the workflow's default model or the `--model` flag value. |
 | `max_attempts` | integer | yes | — | Maximum number of remediation and retry cycles before the step fails permanently. Must be ≥ 1. |
 
+**Automatic failure output capture for teardown steps:**
+
+When a **teardown** step's `on_failure` remediation agent launches, awman automatically captures the failed command's full stdout and stderr and writes it to a file the agent can read — you don't need to describe the failure yourself or paste logs into `prompt`:
+
+- If the workflow has a writable `context(workflow)` overlay active (see [Overlays](08-overlays.md)), the file is written into that shared directory and shows up in the agent's container at `/awman/context/workflow/teardown-failure-<step-name>.txt`.
+- Otherwise, awman creates a dedicated directory for this workflow run and mounts it read-only in the remediation agent's container at `/awman/remediation/teardown-failure-<step-name>.txt`.
+- The step name is sanitized into a safe filename (special characters become `-`).
+- The file looks like:
+
+  ```
+  === FAILED COMMAND: cargo test ===
+
+  --- STDOUT ---
+  ...output, or "(empty)" if the command wrote nothing...
+
+  --- STDERR ---
+  ...output, or "(empty)" if the command wrote nothing...
+  ```
+
+  Output is capped at the last 100 KB per stream; anything beyond that is dropped with a truncation notice so a runaway command can't bloat the agent's context.
+- awman automatically prepends a note to the top of the remediation prompt telling the agent where the file is and to read it before attempting a fix — you don't need to reference the path in your own `on_failure.prompt`. You're still free to point at it explicitly for emphasis, e.g.:
+
+  ```toml
+  [teardown.on_failure]
+  prompt = "Read the captured stdout/stderr file first, then fix the root cause of the failure — don't just retry blindly."
+  max_attempts = 2
+  ```
+- If the same step fails again on a later retry attempt, the file is overwritten with that attempt's output, so the agent always sees the most recent failure, not a stale one.
+- This capture applies only to **teardown** steps; `on_failure` on **setup** steps behaves as before, with no automatic file.
+
 **Full example with custom agent and model:**
 
 ```toml
@@ -475,7 +505,7 @@ setup:
 
 **Best practices:**
 
-- **Be specific in your prompt:** The remediation agent doesn't automatically see logs unless you reference them. Include context about what failed and what the agent should try.
+- **Be specific in your prompt:** For teardown steps, the failed command's stdout/stderr is captured automatically (see above), but the agent still benefits from you describing what a good fix looks like. For setup steps, there's no automatic capture — include context about what failed and what the agent should try.
 - **Keep `max_attempts` small:** Each attempt retries the full step, so 2–3 attempts is usually sufficient.
 - **Use for fixable failures:** Remediation works best for transient issues, dependency problems, or test failures with clear causes. For structural errors, fail fast instead.
 - **Combine with `poll_ci`:** A common pattern is a teardown that tries to fix code, commits, pushes, then polls CI to verify the fix worked.
@@ -1200,6 +1230,8 @@ Steps that share the same `Depends-on` set form a **parallel group** and run con
 | `abort_on_failure = true` + `on_failure` block | Remediation loop runs first; only if all attempts fail does abort trigger |
 | Setup failure | Main workflow steps do not run; go directly to teardown (if `teardown_on_failure = true`) or exit |
 | Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort); same for `on_failure` remediation |
+| Teardown step with `on_failure` fails | Failed command's stdout/stderr is automatically captured to a file and referenced in the remediation agent's prompt — see [Automatic failure output capture](#step-remediation-with-on_failure) |
+| Retried teardown step fails again during remediation | The captured output file is overwritten with the latest attempt's stdout/stderr |
 | `checkout_create_branch` with no remote configured | Falls back to local branch creation from HEAD or specified `base` |
 | `run_script` step with non-existent path | Step fails with file-not-found error |
 | Setup interrupted and resumed | Full setup phase re-runs from the beginning; steps should be idempotent |

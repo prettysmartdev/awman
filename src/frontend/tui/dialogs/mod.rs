@@ -242,13 +242,17 @@ pub struct ConfigShowRejectedEdit {
     pub reason: String,
 }
 
-/// Phase of the Ctrl+N add-model-mapping flow in the config dialog.
+/// Phase of a Ctrl+N add-entry flow in the config dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewMapEntryPhase {
-    /// Typing the agent name (the new map key).
+    /// Typing the agent name (the new `agentsToModels` map key).
     Key,
     /// Typing the comma-separated model list for the confirmed key.
     Value { key: String },
+    /// Typing a new `dynamicWorkflows.guidance` entry (WI-0099). Single-phase:
+    /// only the instruction text is needed; its array index is assigned
+    /// automatically by appending.
+    GuidanceEntry,
 }
 
 #[derive(Debug)]

@@ -130,6 +130,23 @@ fn config_show_submit(app: &mut App) {
                     ));
                 }
             }
+            // Ctrl+N (single-phase): append a new guidance entry. The index is
+            // the current entry count, so the config layer appends it (WI-0099).
+            Some(NewMapEntryPhase::GuidanceEntry) => {
+                let value = state.editor.text.trim().to_string();
+                if value.is_empty() {
+                    toast = Some("Enter a guidance instruction, or press Esc to cancel".to_string());
+                } else {
+                    let next_index = state
+                        .rows
+                        .iter()
+                        .filter(|r| r.field.starts_with("dynamicWorkflows.guidance."))
+                        .count();
+                    response = Some(format!(
+                        "dynamicWorkflows.guidance.{next_index}\t{value}\trepo"
+                    ));
+                }
+            }
             None if state.editing => {
                 // Save the edited value: send "field\tvalue\tscope". The
                 // value is trimmed — stray whitespace would otherwise fail
@@ -189,6 +206,8 @@ fn config_show_begin_edit(app: &mut App) {
         if read_only {
             toast = Some(if field == "dynamicWorkflows.agentsToModels" {
                 "Press Ctrl+N to add a mapping, or edit a per-agent row below".to_string()
+            } else if field == "dynamicWorkflows.guidance" {
+                "Press Ctrl+N to add a guidance entry, or edit a per-entry row below".to_string()
             } else {
                 "This field is read-only".to_string()
             });

@@ -73,7 +73,20 @@ pub struct DynamicWorkflowsConfig {
     /// default leader spec in agent::model format; overridden by --leader flag
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_leader: Option<String>,
+    /// project-specific instructions the leader agent must follow when
+    /// generating a workflow file; rendered as a bullet list in the leader
+    /// prompt (WI-0099). `None` or `[]` injects no guidance block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<Vec<String>>,
 }
+
+/// Maximum number of `dynamicWorkflows.guidance` entries. Caps prompt bloat
+/// (WI-0099).
+pub const GUIDANCE_MAX_ENTRIES: usize = 50;
+
+/// Maximum length of a single `dynamicWorkflows.guidance` entry, in chars.
+/// Prevents one instruction from dominating the leader prompt (WI-0099).
+pub const GUIDANCE_MAX_ENTRY_LEN: usize = 1000;
 
 impl DynamicWorkflowsConfig {
     /// Layer 0 semantic validation, run by [`RepoConfig::load`] after
@@ -108,6 +121,29 @@ impl DynamicWorkflowsConfig {
                             "dynamicWorkflows.agentsToModels.{agent} contains an empty model name."
                         )));
                     }
+                }
+            }
+        }
+        if let Some(entries) = &self.guidance {
+            if entries.len() > GUIDANCE_MAX_ENTRIES {
+                return Err(DataError::Other(format!(
+                    "dynamicWorkflows.guidance has {} entries; the maximum is {GUIDANCE_MAX_ENTRIES}.",
+                    entries.len()
+                )));
+            }
+            for (i, entry) in entries.iter().enumerate() {
+                if entry.trim().is_empty() {
+                    return Err(DataError::Other(format!(
+                        "dynamicWorkflows.guidance[{i}] is empty or whitespace-only. \
+                         Remove it or provide a non-empty instruction."
+                    )));
+                }
+                if entry.chars().count() > GUIDANCE_MAX_ENTRY_LEN {
+                    return Err(DataError::Other(format!(
+                        "dynamicWorkflows.guidance[{i}] is {} characters; the maximum is \
+                         {GUIDANCE_MAX_ENTRY_LEN}.",
+                        entry.chars().count()
+                    )));
                 }
             }
         }
@@ -607,6 +643,142 @@ mod tests {
     fn dynamic_workflows_config_empty_object_deserializes_to_default() {
         let cfg: DynamicWorkflowsConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg, DynamicWorkflowsConfig::default());
+    }
+
+    // ─── guidance field deserialization (WI-0099) ────────────────────────────
+
+    #[test]
+    fn guidance_deserializes_with_valid_entries() {
+        let json = r#"{
+            "guidance": [
+                "never spawn more than two agents in parallel",
+                "always include a validation step after each implementation step"
+            ]
+        }"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.guidance,
+            Some(vec![
+                "never spawn more than two agents in parallel".to_string(),
+                "always include a validation step after each implementation step".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn guidance_deserializes_with_empty_array() {
+        let json = r#"{"guidance": []}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.guidance, Some(Vec::new()));
+    }
+
+    #[test]
+    fn guidance_deserializes_with_missing_field() {
+        let json = r#"{"maxConcurrentSteps": 2}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.guidance.is_none());
+    }
+
+    // ─── guidance validation (WI-0099) ───────────────────────────────────────
+
+    #[test]
+    fn guidance_validate_rejects_entry_over_length_cap() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(vec!["a".repeat(GUIDANCE_MAX_ENTRY_LEN + 1)]),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains(&GUIDANCE_MAX_ENTRY_LEN.to_string()),
+            "error must name the length cap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guidance_validate_rejects_whitespace_only_entry() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(vec!["   \t  ".to_string()]),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("empty or whitespace-only"),
+            "whitespace-only entries must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guidance_validate_rejects_array_over_count_cap() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(
+                (0..GUIDANCE_MAX_ENTRIES + 1)
+                    .map(|i| format!("entry {i}"))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains(&GUIDANCE_MAX_ENTRIES.to_string()),
+            "error must name the count cap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guidance_validate_accepts_valid_array() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(vec![
+                "never spawn more than two agents in parallel".to_string(),
+                "always run make test before finishing".to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn guidance_validate_accepts_empty_array() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn load_rejects_guidance_whitespace_only_entry_via_config_json() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"guidance": ["  "]}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("empty or whitespace-only"),
+            "error must explain the whitespace-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_guidance_valid_array_via_config_json() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"guidance": ["entry one", "entry two"]}}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.dynamic_workflows.and_then(|dw| dw.guidance),
+            Some(vec!["entry one".to_string(), "entry two".to_string()])
+        );
     }
 
     // ─── RepoConfig::load semantic validation (WI-0095) ──────────────────────

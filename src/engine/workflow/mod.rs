@@ -26,6 +26,7 @@ use crate::engine::agent_runtime::background::AgentExec;
 use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, CancelHandle, StuckEvent, KILLED_EXIT_CODE,
 };
+use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -189,6 +190,7 @@ pub struct WorkflowEngine {
     current_step_agent: Option<AgentName>,
     current_step_model: Option<String>,
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+    workflow_context_permission: Option<OverlayPermission>,
     yolo: bool,
     abort_on_failure_triggered: bool,
     last_exit_info: Option<AgentExitInfo>,
@@ -228,6 +230,8 @@ impl WorkflowEngine {
         overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
+        let workflow_context_permission =
+            workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
         let workflow_hash = compute_workflow_hash(&workflow);
         let work_item_number = work_item_context.as_ref().map(|c| c.number);
         let state = WorkflowState::new(
@@ -262,6 +266,7 @@ impl WorkflowEngine {
             current_step_agent: None,
             current_step_model: None,
             work_item_context,
+            workflow_context_permission,
             yolo: false,
             abort_on_failure_triggered: false,
             last_exit_info: None,
@@ -282,6 +287,12 @@ impl WorkflowEngine {
 
     pub fn set_yolo(&mut self, yolo: bool) {
         self.yolo = yolo;
+    }
+
+    /// Override the active workflow-context overlay permission after the command
+    /// layer has merged config/env/CLI/workflow overlay sources.
+    pub fn set_workflow_context_permission(&mut self, permission: Option<OverlayPermission>) {
+        self.workflow_context_permission = permission;
     }
 
     /// The focused step's live execution (the single running step, or the first
@@ -319,6 +330,8 @@ impl WorkflowEngine {
         overlay_engine: Arc<OverlayEngine>,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
+        let workflow_context_permission =
+            workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
         let store = WorkflowStateStore::new(session);
         let workflow_name = workflow_name_for(&workflow);
         let work_item_number = work_item_context.as_ref().map(|c| c.number);
@@ -395,6 +408,7 @@ impl WorkflowEngine {
             current_step_agent: None,
             current_step_model: None,
             work_item_context,
+            workflow_context_permission,
             yolo: false,
             abort_on_failure_triggered: false,
             last_exit_info: None,
@@ -2262,15 +2276,22 @@ impl WorkflowEngine {
 
             self.frontend.on_teardown_step_started(&desc);
 
-            let step_failed = self.run_single_teardown_step(step, idx, &mut container_for_step);
+            let outcome = self.run_single_teardown_step(step, idx, &mut container_for_step);
 
-            let ultimately_failed = if step_failed {
+            let ultimately_failed = if outcome.failed {
                 let rem = on_failure_configs
                     .get(idx)
                     .and_then(|c| c.as_ref())
                     .cloned();
                 if let Some(rem_config) = rem {
-                    !self.run_teardown_remediation(&rem_config, step, idx, &mut container_for_step)
+                    !self.run_teardown_remediation(
+                        &rem_config,
+                        step,
+                        idx,
+                        &outcome.stdout,
+                        &outcome.stderr,
+                        &mut container_for_step,
+                    )
                 } else {
                     true
                 }
@@ -2300,7 +2321,10 @@ impl WorkflowEngine {
     }
 
     /// Execute a shell command in a container for a setup/teardown step.
-    /// Returns `true` if the step failed, `false` if succeeded.
+    /// Returns a [`PhaseStepOutcome`] carrying the failure flag and, on
+    /// failure, the full captured stdout/stderr. The captured output is only
+    /// used by the teardown remediation path (Feature B); the setup path
+    /// discards it via [`PhaseStepOutcome::failed`].
     fn run_shell_phase_step(
         &mut self,
         container: &dyn AgentExec,
@@ -2308,7 +2332,7 @@ impl WorkflowEngine {
         env: Option<&std::collections::HashMap<String, String>>,
         phase: &str,
         idx: usize,
-    ) -> bool {
+    ) -> PhaseStepOutcome {
         let is_setup = phase == "setup";
         let result = match container.exec_streaming(command, env, &mut |line| {
             if is_setup {
@@ -2321,16 +2345,18 @@ impl WorkflowEngine {
             Err(e) => {
                 let error = e.to_string();
                 self.set_phase_step_failed(is_setup, idx, &error);
-                return true;
+                // The runtime never produced an ExecOutput, so stdout is empty
+                // and stderr carries the launch error for the failure file.
+                return PhaseStepOutcome::failed(String::new(), error);
             }
         };
 
         if result.exit_code != 0 {
             self.set_phase_step_failed(is_setup, idx, &result.stderr);
-            return true;
+            return PhaseStepOutcome::failed(result.stdout, result.stderr);
         }
 
-        false
+        PhaseStepOutcome::succeeded()
     }
 
     /// Record a phase step as failed in the persisted state. Does NOT notify
@@ -2426,7 +2452,10 @@ impl WorkflowEngine {
 
         let (command, env) = setup_step_to_shell(step);
         match container_for_step(idx) {
-            Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), "setup", idx),
+            Ok(c) => {
+                self.run_shell_phase_step(&*c, &command, env.as_ref(), "setup", idx)
+                    .failed
+            }
             Err(e) => {
                 self.set_phase_step_failed(true, idx, &e.to_string());
                 true
@@ -2434,13 +2463,15 @@ impl WorkflowEngine {
         }
     }
 
-    /// Execute a single teardown step. Returns `true` if failed.
+    /// Execute a single teardown step. Returns a [`PhaseStepOutcome`] carrying
+    /// the failure flag and, on failure, the captured stdout/stderr (threaded
+    /// to the remediation agent's failure file — Feature B).
     fn run_single_teardown_step<F>(
         &mut self,
         step: &crate::data::workflow_definition::TeardownStep,
         idx: usize,
         container_for_step: &mut F,
-    ) -> bool
+    ) -> PhaseStepOutcome
     where
         F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
@@ -2452,20 +2483,28 @@ impl WorkflowEngine {
             max_retries,
         } = step
         {
-            return self.run_poll_ci_phase_step(
+            let failed = self.run_poll_ci_phase_step(
                 interval_secs.unwrap_or(30),
                 max_retries.unwrap_or(10),
                 false,
                 idx,
             );
+            // PollCi produces no command stdout/stderr; surface the recorded
+            // error string as the failure content so the file is still useful.
+            return if failed {
+                PhaseStepOutcome::failed(String::new(), self.phase_step_failed_error(false, idx))
+            } else {
+                PhaseStepOutcome::succeeded()
+            };
         }
 
         let (command, env) = teardown_step_to_shell(step);
         match container_for_step(idx) {
             Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), "teardown", idx),
             Err(e) => {
-                self.set_phase_step_failed(false, idx, &e.to_string());
-                true
+                let error = e.to_string();
+                self.set_phase_step_failed(false, idx, &error);
+                PhaseStepOutcome::failed(String::new(), error)
             }
         }
     }
@@ -2498,7 +2537,7 @@ impl WorkflowEngine {
             self.frontend
                 .on_setup_step_fixing(&desc, attempt, config.max_attempts);
 
-            self.launch_on_failure_agent(config);
+            self.launch_on_failure_agent(config, None);
 
             self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
             let _ = self.persist();
@@ -2523,11 +2562,18 @@ impl WorkflowEngine {
     }
 
     /// Run on_failure remediation for a teardown step. Returns `true` if remediation succeeded.
+    ///
+    /// `stdout` / `stderr` carry the output of the failure that triggered this
+    /// remediation. Each retry that fails again overwrites the failure file
+    /// with its own fresh output, so the agent always sees the most recent
+    /// failure (Feature B).
     fn run_teardown_remediation<F>(
         &mut self,
         config: &crate::data::workflow_definition::RemediationConfig,
         step: &crate::data::workflow_definition::TeardownStep,
         idx: usize,
+        stdout: &str,
+        stderr: &str,
         container_for_step: &mut F,
     ) -> bool
     where
@@ -2536,6 +2582,8 @@ impl WorkflowEngine {
         use crate::data::workflow_state::PhaseStepStatus;
 
         let desc = self.state.teardown_step_states[idx].description.clone();
+        let mut cur_stdout = stdout.to_string();
+        let mut cur_stderr = stderr.to_string();
         for attempt in 1..=config.max_attempts {
             self.msg_info(format!(
                 "Step failed — launching on_failure agent (attempt {attempt}/{})...",
@@ -2550,18 +2598,29 @@ impl WorkflowEngine {
             self.frontend
                 .on_teardown_step_fixing(&desc, attempt, config.max_attempts);
 
-            self.launch_on_failure_agent(config);
+            self.launch_on_failure_agent(
+                config,
+                Some(TeardownFailureContext {
+                    step_name: &desc,
+                    stdout: &cur_stdout,
+                    stderr: &cur_stderr,
+                }),
+            );
 
             self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
             let _ = self.persist();
 
-            let still_failed = self.run_single_teardown_step(step, idx, container_for_step);
-            if !still_failed {
+            let outcome = self.run_single_teardown_step(step, idx, container_for_step);
+            if !outcome.failed {
                 self.msg_info(format!(
                     "on_failure remediation succeeded on attempt {attempt}"
                 ));
                 return true;
             }
+            // Retain the freshest failure output so the next attempt's file
+            // reflects this retry, not the original failure.
+            cur_stdout = outcome.stdout;
+            cur_stderr = outcome.stderr;
 
             if attempt == config.max_attempts {
                 self.msg_warning(format!(
@@ -2577,15 +2636,24 @@ impl WorkflowEngine {
     /// Launch the on_failure agent container and wait for it to complete.
     /// The agent's own exit code is ignored — only the subsequent retry
     /// determines success.
+    ///
+    /// When `failure` is `Some` (teardown remediation), the failed command's
+    /// stdout/stderr are written to a file mounted into the agent's container
+    /// and a preamble pointing the agent at that file is prepended to the
+    /// remediation prompt (Feature B). Setup remediation passes `None`.
     fn launch_on_failure_agent(
         &mut self,
         config: &crate::data::workflow_definition::RemediationConfig,
+        failure: Option<TeardownFailureContext<'_>>,
     ) {
+        // Owned so it does not hold a borrow on `self.workflow` across the
+        // `&mut self` call to `prepare_teardown_failure_file` below.
         let agent_name_str = config
             .agent
             .as_deref()
             .or(self.workflow.agent.as_deref())
-            .unwrap_or("claude");
+            .unwrap_or("claude")
+            .to_string();
         let model = config
             .model
             .as_deref()
@@ -2593,7 +2661,7 @@ impl WorkflowEngine {
             .map(|s| s.to_string())
             .or_else(|| self.effective_config.model());
 
-        let agent_name = match crate::data::session::AgentName::new(agent_name_str) {
+        let agent_name = match crate::data::session::AgentName::new(&agent_name_str) {
             Ok(a) => a,
             Err(e) => {
                 self.msg_warning(format!("on_failure: invalid agent name: {e}"));
@@ -2601,13 +2669,29 @@ impl WorkflowEngine {
             }
         };
 
+        // Feature B: capture the failed command's output into a file the agent
+        // can read, and (when needed) an extra read-only mount. A write failure
+        // degrades gracefully — the agent still launches, just without the hint.
+        let artifacts = failure
+            .as_ref()
+            .and_then(|f| self.prepare_teardown_failure_file(f));
+
+        let prompt = match &artifacts {
+            Some(a) => a.prepend_preamble(&config.prompt),
+            None => config.prompt.clone(),
+        };
+        let extra_overlays = artifacts
+            .as_ref()
+            .and_then(|a| a.extra_overlay.clone())
+            .map(|o| vec![o]);
+
         let synthetic_step = WorkflowStep {
             name: "__on_failure__".to_string(),
             depends_on: Vec::new(),
-            prompt_template: config.prompt.clone(),
-            agent: Some(agent_name_str.to_string()),
+            prompt_template: prompt,
+            agent: Some(agent_name_str.clone()),
             model: model.clone(),
-            overlays: None,
+            overlays: extra_overlays,
             abort_on_failure: false,
         };
 
@@ -2626,7 +2710,7 @@ impl WorkflowEngine {
         // factory's `take_io` find no channels and fail.
         self.frontend.report_step_interactive_launch(
             &synthetic_step,
-            agent_name_str,
+            &agent_name_str,
             model.as_deref(),
         );
 
@@ -2657,6 +2741,116 @@ impl WorkflowEngine {
         }
     }
 
+    /// Whether this workflow declares a writable `context(workflow)` overlay.
+    ///
+    /// When true, `~/.awman/context/workflows/{invocation}/` is already mounted
+    /// read-write at `/awman/context/workflow` in every agent container, so the
+    /// teardown-failure file can be written there directly. A read-only
+    /// (`context(workflow:ro)`) declaration returns `false` so the ephemeral
+    /// read-only remediation mount is used instead (Feature B edge case).
+    ///
+    /// The command layer overrides this after merging config/env/CLI/workflow
+    /// overlays, so this reflects the active context overlay set.
+    fn workflow_context_overlay_writable(&self) -> bool {
+        matches!(
+            self.workflow_context_permission,
+            Some(OverlayPermission::ReadWrite)
+        )
+    }
+
+    /// Write the teardown-failure output file and resolve its mount, returning
+    /// the artifacts needed to point the remediation agent at it. Returns
+    /// `None` on any failure (directory or file write) after logging a
+    /// warning — remediation then proceeds without the file hint, never
+    /// aborting (Feature B edge cases).
+    fn prepare_teardown_failure_file(
+        &mut self,
+        failure: &TeardownFailureContext<'_>,
+    ) -> Option<TeardownFailureArtifacts> {
+        use crate::data::fs::context_dirs::{validate_context_path, ContextDirResolver};
+
+        let resolver = match ContextDirResolver::from_process_env() {
+            Ok(r) => r,
+            Err(e) => {
+                self.msg_warning(format!(
+                    "on_failure: could not resolve context directory, launching agent without \
+                     failure output: {e}"
+                ));
+                return None;
+            }
+        };
+
+        // The host directory is deterministic for this invocation whether or
+        // not context(workflow) is declared — always the workflow context dir.
+        let host_dir = resolver.workflow_dir(self.state.invocation_id);
+
+        // Decide the container-visible location. When context(workflow) is
+        // active and writable the directory is already mounted read-write at
+        // /awman/context/workflow; otherwise mount the (ephemeral) directory
+        // read-only at /awman/remediation.
+        let use_writable_workflow_overlay = self.workflow_context_overlay_writable();
+        let container_path: &'static str = if use_writable_workflow_overlay {
+            TEARDOWN_FAILURE_OVERLAY_CONTAINER_PATH
+        } else {
+            TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH
+        };
+
+        // Create the directory (idempotent when the overlay already exists).
+        if let Err(e) = std::fs::create_dir_all(&host_dir) {
+            self.msg_warning(format!(
+                "on_failure: could not create directory {}, launching agent without failure \
+                 output: {e}",
+                host_dir.display()
+            ));
+            return None;
+        }
+
+        // Security: the resolved path must stay under ~/.awman/context/.
+        if let Err(e) = validate_context_path(resolver.awman_home(), &host_dir) {
+            self.msg_warning(format!(
+                "on_failure: refusing to write failure output outside the context root: {e}"
+            ));
+            return None;
+        }
+
+        let sanitized = sanitize_step_name_for_filename(failure.step_name);
+        let filename = format!("teardown-failure-{sanitized}.txt");
+        let file_path = host_dir.join(&filename);
+        let contents =
+            format_teardown_failure_file(failure.step_name, failure.stdout, failure.stderr);
+        if let Err(e) = std::fs::write(&file_path, contents) {
+            self.msg_warning(format!(
+                "on_failure: could not write failure output to {}, launching agent without it: {e}",
+                file_path.display()
+            ));
+            return None;
+        }
+
+        let extra_overlay = if use_writable_workflow_overlay {
+            None
+        } else if self.workflow_context_permission == Some(OverlayPermission::ReadOnly) {
+            Some(format!(
+                "{}:{}/{}:ro",
+                file_path.display(),
+                TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH,
+                filename
+            ))
+        } else {
+            Some(format!(
+                "{}:{}:ro",
+                host_dir.display(),
+                TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH
+            ))
+        };
+
+        Some(TeardownFailureArtifacts {
+            container_path,
+            filename,
+            step_name: failure.step_name.to_string(),
+            extra_overlay,
+        })
+    }
+
     /// Mark the workflow as fully finished. Called by the orchestrator after
     /// the main phase completes when no teardown phase will run (so the state
     /// reflects completion rather than lingering in `Main`).
@@ -2666,6 +2860,176 @@ impl WorkflowEngine {
         self.persist()?;
         Ok(())
     }
+}
+
+/// Container path where the failure file is visible when a writable
+/// `context(workflow)` overlay is active (already mounted read-write).
+const TEARDOWN_FAILURE_OVERLAY_CONTAINER_PATH: &str = "/awman/context/workflow";
+/// Container path for the one-off read-only remediation mount used when no
+/// writable `context(workflow)` overlay is active.
+const TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH: &str = "/awman/remediation";
+/// Per-stream truncation cap (~100 KB). Only the tail is retained since the
+/// most recent output is the most relevant to a failure.
+const TEARDOWN_STREAM_TRUNCATE_BYTES: usize = 100 * 1024;
+
+/// Outcome of a setup/teardown shell step: whether it failed, plus the
+/// captured stdout/stderr (populated on failure, used only by the teardown
+/// remediation failure file — Feature B). Kept deliberately narrow rather
+/// than storing a full `ExecOutput` in `PhaseStepStatus`.
+struct PhaseStepOutcome {
+    failed: bool,
+    stdout: String,
+    stderr: String,
+}
+
+impl PhaseStepOutcome {
+    fn succeeded() -> Self {
+        Self {
+            failed: false,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn failed(stdout: String, stderr: String) -> Self {
+        Self {
+            failed: true,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// The captured output of a failed teardown command, passed into
+/// `launch_on_failure_agent` so it can materialize the remediation failure
+/// file (Feature B).
+struct TeardownFailureContext<'a> {
+    step_name: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+/// Resolved artifacts after successfully writing the teardown-failure file.
+struct TeardownFailureArtifacts {
+    /// Container path of the directory holding the file.
+    container_path: &'static str,
+    /// The written file's name (`teardown-failure-<sanitized>.txt`).
+    filename: String,
+    /// The original (unsanitized) step name, for the prompt preamble.
+    step_name: String,
+    /// A one-off `host:container:ro` overlay to add to the synthetic step, or
+    /// `None` when the writable `context(workflow)` overlay already mounts it.
+    extra_overlay: Option<String>,
+}
+
+impl TeardownFailureArtifacts {
+    /// Prepend the fixed system-prompt preamble pointing the agent at the
+    /// failure file to the user's remediation prompt.
+    fn prepend_preamble(&self, user_prompt: &str) -> String {
+        format!(
+            "The full output (stdout and stderr) of the failed teardown step \"{step}\" has been\n\
+             written to {path}/{file}.\n\
+             Read that file first to understand the failure before attempting a fix.\n\
+             \n\
+             ---\n\
+             \n\
+             {user_prompt}",
+            step = self.step_name,
+            path = self.container_path,
+            file = self.filename,
+        )
+    }
+}
+
+fn workflow_context_permission_from_overlay_strings(
+    overlays: Option<&[String]>,
+) -> Option<OverlayPermission> {
+    let overlays = overlays?;
+    for entry in overlays {
+        for token in entry.split(',') {
+            let token = token.trim();
+            let Some(inner) = token
+                .strip_prefix("context(")
+                .and_then(|s| s.strip_suffix(')'))
+            else {
+                continue;
+            };
+            let mut parts = inner.splitn(2, ':');
+            let scope = parts.next().unwrap_or("").trim();
+            if scope != "workflow" {
+                continue;
+            }
+            return match parts.next().map(str::trim).unwrap_or("rw") {
+                "ro" => Some(OverlayPermission::ReadOnly),
+                _ => Some(OverlayPermission::ReadWrite),
+            };
+        }
+    }
+    None
+}
+
+/// Sanitize a step name into a safe filename component: non-alphanumeric
+/// characters (including `/`, `\`, `..`, spaces, and shell metacharacters)
+/// become `-`, and the result is truncated to 64 characters.
+fn sanitize_step_name_for_filename(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(64);
+    if out.is_empty() {
+        out.push_str("step");
+    }
+    out
+}
+
+/// Retain the last [`TEARDOWN_STREAM_TRUNCATE_BYTES`] of a stream, prefixing a
+/// truncation notice when content was dropped. Truncation respects UTF-8
+/// character boundaries.
+fn truncate_stream(content: &str) -> String {
+    if content.len() <= TEARDOWN_STREAM_TRUNCATE_BYTES {
+        return content.to_string();
+    }
+    let start = content.len() - TEARDOWN_STREAM_TRUNCATE_BYTES;
+    // Advance to the next char boundary so we never slice mid-codepoint.
+    let start = (start..content.len())
+        .find(|&i| content.is_char_boundary(i))
+        .unwrap_or(content.len());
+    format!(
+        "[... output truncated, showing last {} KB ...]\n{}",
+        TEARDOWN_STREAM_TRUNCATE_BYTES / 1024,
+        &content[start..]
+    )
+}
+
+/// Format the teardown-failure file body in the fixed Feature B layout,
+/// substituting `(empty)` for blank streams and truncating oversized output.
+fn format_teardown_failure_file(step_name: &str, stdout: &str, stderr: &str) -> String {
+    let render = |s: &str| -> String {
+        if s.is_empty() {
+            "(empty)".to_string()
+        } else {
+            truncate_stream(s)
+        }
+    };
+    format!(
+        "=== FAILED COMMAND: {step_name} ===\n\
+         \n\
+         --- STDOUT ---\n\
+         {stdout}\n\
+         \n\
+         --- STDERR ---\n\
+         {stderr}\n",
+        step_name = step_name,
+        stdout = render(stdout),
+        stderr = render(stderr),
+    )
 }
 
 /// Hash a workflow's steps + title to detect drift.
@@ -5396,6 +5760,887 @@ mod tests {
                     PhaseStepStatus::Failed { .. }
                 ),
                 "step must end as Failed after exhausted remediation"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── Feature B (WI-0099): teardown failure output capture — unit tests ───
+
+    #[test]
+    fn sanitize_step_name_replaces_path_separators_and_dots() {
+        let out = sanitize_step_name_for_filename("run_shell: ../../etc/passwd");
+        assert!(
+            !out.contains('/'),
+            "must not contain path separators: {out}"
+        );
+        assert!(!out.contains(".."), "must not contain '..': {out}");
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must only contain safe filename characters: {out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_step_name_replaces_spaces_and_shell_metacharacters() {
+        let out = sanitize_step_name_for_filename("rm -rf $(whoami); echo `id` && true");
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must only contain safe filename characters: {out}"
+        );
+        assert!(!out.contains(' '));
+        assert!(!out.contains('$'));
+        assert!(!out.contains('('));
+        assert!(!out.contains(';'));
+        assert!(!out.contains('`'));
+    }
+
+    #[test]
+    fn sanitize_step_name_replaces_backslashes_and_colons() {
+        let out = sanitize_step_name_for_filename(r"C:\Users\evil\payload");
+        assert!(!out.contains('\\'));
+        assert!(!out.contains(':'));
+    }
+
+    #[test]
+    fn sanitize_step_name_truncates_to_64_chars() {
+        let long_name = "a".repeat(100);
+        let out = sanitize_step_name_for_filename(&long_name);
+        assert_eq!(out.len(), 64, "must be truncated to the 64-char cap: {out}");
+        assert!(out.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn sanitize_step_name_empty_falls_back_to_step() {
+        assert_eq!(sanitize_step_name_for_filename(""), "step");
+    }
+
+    #[test]
+    fn sanitize_step_name_preserves_already_safe_names() {
+        assert_eq!(
+            sanitize_step_name_for_filename("build-frontend_v2"),
+            "build-frontend_v2"
+        );
+    }
+
+    #[test]
+    fn sanitize_step_name_handles_unicode_without_panicking() {
+        let out = sanitize_step_name_for_filename("café/日本語 build");
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must only contain safe filename characters: {out}"
+        );
+        assert!(out.starts_with("caf"));
+    }
+
+    #[test]
+    fn truncate_stream_leaves_short_content_untouched() {
+        let content = "short output\nwith a few lines";
+        assert_eq!(truncate_stream(content), content);
+    }
+
+    #[test]
+    fn truncate_stream_exactly_at_cap_is_untouched() {
+        let content = "z".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES);
+        assert_eq!(truncate_stream(&content), content);
+    }
+
+    #[test]
+    fn truncate_stream_keeps_last_bytes_with_notice() {
+        let filler = "x".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES + 500);
+        let content = format!("HEAD-MARKER{filler}TAIL-MARKER");
+        let out = truncate_stream(&content);
+        assert!(
+            out.starts_with("[... output truncated, showing last"),
+            "must prefix a truncation notice: {out}"
+        );
+        assert!(
+            !out.contains("HEAD-MARKER"),
+            "the dropped head must not appear: {out}"
+        );
+        assert!(out.ends_with("TAIL-MARKER"));
+    }
+
+    #[test]
+    fn truncate_stream_respects_utf8_char_boundaries() {
+        // '€' is 3 bytes; repeating it so the cut point would otherwise land
+        // mid-codepoint must not panic and must yield valid UTF-8.
+        let filler = "€".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES / 3 + 10);
+        let content = format!("{filler}END");
+        let out = truncate_stream(&content);
+        assert!(out.ends_with("END"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_basic_content() {
+        let out =
+            format_teardown_failure_file("run_shell: cargo test", "out content", "err content");
+        assert_eq!(
+            out,
+            "=== FAILED COMMAND: run_shell: cargo test ===\n\n\
+             --- STDOUT ---\nout content\n\n\
+             --- STDERR ---\nerr content\n"
+        );
+    }
+
+    #[test]
+    fn format_teardown_failure_file_empty_stdout_uses_placeholder() {
+        let out = format_teardown_failure_file("step", "", "some stderr");
+        assert!(out.contains("--- STDOUT ---\n(empty)\n"));
+        assert!(out.contains("some stderr"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_empty_stderr_uses_placeholder() {
+        let out = format_teardown_failure_file("step", "some stdout", "");
+        assert!(out.contains("some stdout"));
+        assert!(out.contains("--- STDERR ---\n(empty)\n"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_both_empty_uses_placeholders_for_both() {
+        let out = format_teardown_failure_file("step", "", "");
+        assert!(out.contains("--- STDOUT ---\n(empty)\n"));
+        assert!(out.contains("--- STDERR ---\n(empty)\n"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_truncates_oversized_stream() {
+        let big = "y".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES + 1000);
+        let out = format_teardown_failure_file("step", &big, "");
+        assert!(out.contains("output truncated"));
+        assert!(
+            !out.contains(&big),
+            "raw oversized content must not appear verbatim in the file"
+        );
+    }
+
+    #[test]
+    fn prepend_preamble_overlay_path_references_correct_file_and_user_prompt() {
+        let artifacts = TeardownFailureArtifacts {
+            container_path: TEARDOWN_FAILURE_OVERLAY_CONTAINER_PATH,
+            filename: "teardown-failure-run-shell--cargo-test.txt".to_string(),
+            step_name: "run_shell: cargo test".to_string(),
+            extra_overlay: None,
+        };
+        let out = artifacts.prepend_preamble("Fix the bug.");
+        assert!(out.contains("failed teardown step \"run_shell: cargo test\""));
+        assert!(out.contains("/awman/context/workflow/teardown-failure-run-shell--cargo-test.txt"));
+        assert!(out.contains("Read that file first"));
+        assert!(
+            out.contains("---\n\nFix the bug."),
+            "user prompt must follow the '---' separator: {out}"
+        );
+    }
+
+    #[test]
+    fn prepend_preamble_ephemeral_path_references_remediation_mount() {
+        let artifacts = TeardownFailureArtifacts {
+            container_path: TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH,
+            filename: "teardown-failure-step.txt".to_string(),
+            step_name: "step".to_string(),
+            extra_overlay: Some("/host/dir:/awman/remediation:ro".to_string()),
+        };
+        let out = artifacts.prepend_preamble("Custom prompt");
+        assert!(out.contains("/awman/remediation/teardown-failure-step.txt"));
+        assert!(out.trim_end().ends_with("Custom prompt"));
+    }
+
+    fn make_engine_with_workflow_overlays(
+        tmp: &tempfile::TempDir,
+        overlays: Option<Vec<String>>,
+    ) -> WorkflowEngine {
+        let session = make_session(tmp);
+        let mut workflow = make_workflow(
+            Some("wf-overlay"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        workflow.overlays = overlays;
+        make_engine(
+            &session,
+            workflow,
+            FakeAgentExecutionFactory::always_success(),
+            [],
+        )
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_when_no_overlays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(&tmp, None);
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_true_for_default_rw_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine =
+            make_engine_with_workflow_overlays(&tmp, Some(vec!["context(workflow)".to_string()]));
+        assert!(engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_true_for_explicit_rw_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec!["context(workflow:rw)".to_string()]),
+        );
+        assert!(engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_for_readonly_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec!["context(workflow:ro)".to_string()]),
+        );
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_for_unrelated_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine =
+            make_engine_with_workflow_overlays(&tmp, Some(vec!["context(repo)".to_string()]));
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_true_within_comma_separated_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec!["context(repo), context(workflow)".to_string()]),
+        );
+        assert!(engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_when_only_readonly_across_multiple_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec![
+                "context(repo)".to_string(),
+                "context(workflow:ro)".to_string(),
+            ]),
+        );
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_uses_active_permission_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine_with_workflow_overlays(&tmp, None);
+        assert!(!engine.workflow_context_overlay_writable());
+
+        engine.set_workflow_context_permission(Some(OverlayPermission::ReadWrite));
+        assert!(
+            engine.workflow_context_overlay_writable(),
+            "a workflow context overlay supplied by config/env/CLI must be treated as active"
+        );
+
+        engine.set_workflow_context_permission(Some(OverlayPermission::ReadOnly));
+        assert!(
+            !engine.workflow_context_overlay_writable(),
+            "read-only workflow context must not be treated as writable"
+        );
+    }
+
+    // ── Feature B (WI-0099): teardown failure output capture — integration ──
+    //
+    // `prepare_teardown_failure_file` resolves the host directory via
+    // `ContextDirResolver::from_process_env()`, which reads the *real* process
+    // environment (there is no test-injectable `EnvSnapshot` seam on that call
+    // path). These tests therefore pin `AWMAN_CONFIG_HOME` to a temp dir for
+    // their duration. `ENV_LOCK` serializes that mutation across test threads
+    // and `EnvVarGuard` restores the previous value on drop (even on panic) —
+    // mirrors the pattern already used in `command::commands::clean::tests`.
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// `(step name, resolved prompt, overlays)` recorded per `execution_for_step` call.
+    type RecordedStepCall = (String, String, Option<Vec<String>>);
+
+    /// Records every synthetic step handed to `execution_for_step` — name,
+    /// resolved prompt, and overlays — so tests can assert on the
+    /// `launch_on_failure_agent` prompt hint and mount decision without a
+    /// live container runtime.
+    struct StepRecordingFactory {
+        inner: Arc<FakeAgentExecutionFactory>,
+        step_calls: Arc<Mutex<Vec<RecordedStepCall>>>,
+    }
+
+    impl StepRecordingFactory {
+        fn new(inner: Arc<FakeAgentExecutionFactory>) -> (Self, Arc<Mutex<Vec<RecordedStepCall>>>) {
+            let step_calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    inner,
+                    step_calls: Arc::clone(&step_calls),
+                },
+                step_calls,
+            )
+        }
+    }
+
+    impl AgentExecutionFactory for StepRecordingFactory {
+        fn execution_for_step(
+            &self,
+            step: &WorkflowStep,
+            session: &Session,
+            runtime: &WorkflowRuntimeContext,
+        ) -> Result<AgentExecution, EngineError> {
+            self.step_calls.lock().unwrap().push((
+                step.name.clone(),
+                step.prompt_template.clone(),
+                step.overlays.clone(),
+            ));
+            self.inner.execution_for_step(step, session, runtime)
+        }
+
+        fn inject_prompt(
+            &self,
+            execution: &AgentExecution,
+            prompt: &str,
+        ) -> Result<Option<()>, EngineError> {
+            self.inner.inject_prompt(execution, prompt)
+        }
+    }
+
+    // Teardown failure WITH an active, writable `context(workflow)` overlay:
+    // the file must land in the overlay's existing host path and the prompt
+    // hint must reference the already-mounted `/awman/context/workflow/...`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_with_active_context_workflow_overlay_writes_into_it() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-overlay-active"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let overlay = OverlayEngine::with_auth_resolver(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+            );
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+                Arc::new(GitEngine::new()),
+                Arc::new(overlay),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "cargo test".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("stdout content".into(), "stderr content".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: cargo test");
+            let file_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            let content = std::fs::read_to_string(&file_path).unwrap_or_else(|e| {
+                panic!("expected failure file at {}: {e}", file_path.display())
+            });
+            assert!(content.contains("=== FAILED COMMAND: run_shell: cargo test ==="));
+            assert!(content.contains("stdout content"));
+            assert!(content.contains("stderr content"));
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must have been launched");
+            let expected_hint = format!("/awman/context/workflow/teardown-failure-{sanitized}.txt");
+            assert!(
+                on_failure_call.1.contains(expected_hint.as_str()),
+                "prompt must reference the overlay path: {}",
+                on_failure_call.1
+            );
+            assert!(
+                on_failure_call.2.is_none(),
+                "context(workflow) overlay is already mounted; no extra overlay expected"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // A read-only `context(workflow:ro)` overlay must not be treated as the
+    // writable destination. The failure file is still written host-side under
+    // the workflow context directory, but the remediation hint uses
+    // `/awman/remediation/...`; the extra mount targets the file itself so the
+    // existing read-only context directory mount is not deduplicated away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_with_readonly_context_workflow_overlay_uses_remediation_mount() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-overlay-readonly"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow:ro)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let overlay = OverlayEngine::with_auth_resolver(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+            );
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+                Arc::new(GitEngine::new()),
+                Arc::new(overlay),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "cargo test".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("ro out".into(), "ro err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: cargo test");
+            let filename = format!("teardown-failure-{sanitized}.txt");
+            let file_path = host_dir.join(&filename);
+            let content = std::fs::read_to_string(&file_path).unwrap_or_else(|e| {
+                panic!("expected failure file at {}: {e}", file_path.display())
+            });
+            assert!(content.contains("ro out"));
+            assert!(content.contains("ro err"));
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must have been launched");
+            let expected_hint = format!("/awman/remediation/{filename}");
+            assert!(
+                on_failure_call.1.contains(expected_hint.as_str()),
+                "prompt must reference the remediation path: {}",
+                on_failure_call.1
+            );
+            let expected_overlay =
+                format!("{}:/awman/remediation/{filename}:ro", file_path.display());
+            assert_eq!(
+                on_failure_call.2,
+                Some(vec![expected_overlay]),
+                "read-only context fallback must mount the failure file at /awman/remediation"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // Teardown failure WITHOUT a `context(workflow)` overlay: an ephemeral
+    // directory is used, mounted read-only at /awman/remediation, and the
+    // prompt hint references that mount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_without_context_workflow_overlay_uses_ephemeral_mount() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            // No `context(workflow)` declared.
+            let workflow = make_workflow(
+                Some("wf-overlay-absent"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let overlay = OverlayEngine::with_auth_resolver(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+            );
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+                Arc::new(GitEngine::new()),
+                Arc::new(overlay),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "deploy".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("out".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            assert!(
+                host_dir.starts_with(awman_home_path.join("context").join("workflows")),
+                "ephemeral dir must live under ~/.awman/context/workflows/: {}",
+                host_dir.display()
+            );
+            let sanitized = sanitize_step_name_for_filename("run_shell: deploy");
+            let file_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            assert!(
+                file_path.exists(),
+                "failure file must be written to the ephemeral dir: {}",
+                file_path.display()
+            );
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must have been launched");
+            let expected_hint = format!("/awman/remediation/teardown-failure-{sanitized}.txt");
+            assert!(
+                on_failure_call.1.contains(expected_hint.as_str()),
+                "prompt must reference the ephemeral mount path: {}",
+                on_failure_call.1
+            );
+            let expected_overlay = format!("{}:/awman/remediation:ro", host_dir.display());
+            assert_eq!(
+                on_failure_call.2,
+                Some(vec![expected_overlay]),
+                "a one-off read-only overlay must be attached when context(workflow) is absent"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // A second (and third) teardown failure during multi-attempt remediation
+    // must overwrite the failure file with the latest output, not the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_retry_overwrites_file_with_latest_output() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-retry-overwrite"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, _step_calls) = StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let overlay = OverlayEngine::with_auth_resolver(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+            );
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+                Arc::new(GitEngine::new()),
+                Arc::new(overlay),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "flaky".into(),
+                env: None,
+            }];
+            // Initial failure, first retry fails again with different output,
+            // second retry succeeds.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("first-out".into(), "first-err".into(), 1),
+                ("second-out".into(), "second-err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(2))];
+
+            let (_aborted, any_failed) = engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+            assert!(
+                !any_failed,
+                "the second retry succeeds so the step must not remain failed"
+            );
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: flaky");
+            let file_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            let content = std::fs::read_to_string(&file_path).unwrap();
+
+            assert!(
+                content.contains("second-out") && content.contains("second-err"),
+                "file must reflect the latest failure: {content}"
+            );
+            assert!(
+                !content.contains("first-out") && !content.contains("first-err"),
+                "stale output from the first failure must be overwritten: {content}"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // A write failure (e.g. disk full, permission error) must degrade
+    // gracefully: the remediation agent still launches, using the
+    // unmodified `on_failure.prompt` with no dangling file reference.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_write_error_degrades_gracefully() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-write-failure"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, msgs) = MessageCapturingFrontend::new();
+            let overlay = OverlayEngine::with_auth_resolver(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+            );
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+                Arc::new(GitEngine::new()),
+                Arc::new(overlay),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            // Pre-create the target file path AS A DIRECTORY so the production
+            // `std::fs::write` call fails deterministically (EISDIR) without
+            // relying on permission bits, which don't block root in CI/dev
+            // containers.
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: flaky");
+            let conflicting_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            std::fs::create_dir_all(&conflicting_path).unwrap();
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "flaky".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("out".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must still launch despite the write failure");
+            assert_eq!(
+                on_failure_call.1, "Fix the broken step.",
+                "prompt must be the unmodified config prompt with no file hint: {}",
+                on_failure_call.1
+            );
+            assert!(
+                !on_failure_call.1.contains("teardown-failure"),
+                "prompt must not reference a file that failed to write"
+            );
+            assert!(
+                on_failure_call.2.is_none(),
+                "no overlay should be attached when the file write failed"
+            );
+
+            let warnings = msgs.lock().unwrap().clone();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|m| m.level == crate::data::message::MessageLevel::Warning
+                        && m.text.contains("could not write failure output")),
+                "must warn about the write failure: {warnings:?}"
             );
         })
         .await

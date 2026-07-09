@@ -390,3 +390,258 @@ fn ctrl_n_with_existing_agent_jumps_to_that_row_for_editing() {
     assert_eq!(state.editor.text, "claude-opus-4-8");
 }
 
+// ─── ConfigShow guidance rows (WI-0099) ──────────────────────────────────
+
+#[test]
+fn enter_on_guidance_summary_row_points_at_ctrl_n() {
+    let mut app = make_app();
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row(
+            "dynamicWorkflows.guidance",
+            "",
+            "2 entries",
+            true,
+            false,
+            false,
+        )]),
+    );
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(
+        app.status_bar.text,
+        "Press Ctrl+N to add a guidance entry, or edit a per-entry row below",
+        "the guidance summary row must steer users to Ctrl+N / per-entry rows"
+    );
+    assert!(app.active_dialog.is_some(), "dialog must stay open");
+}
+
+#[test]
+fn enter_on_guidance_row_starts_inline_edit_in_repo_column() {
+    let mut app = make_app();
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row(
+            "dynamicWorkflows.guidance.0",
+            "",
+            "never spawn more than two agents in parallel",
+            false,
+            false,
+            true,
+        )]),
+    );
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+        panic!("dialog must stay open in edit mode");
+    };
+    assert!(state.editing, "guidance rows must be inline-editable");
+    assert_eq!(state.edit_column, 1, "edit must snap to the Repo column");
+    assert_eq!(
+        state.editor.text, "never spawn more than two agents in parallel",
+        "the editor must be seeded with the current entry text"
+    );
+}
+
+#[test]
+fn enter_while_editing_guidance_entry_sends_response() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row(
+            "dynamicWorkflows.guidance.0",
+            "",
+            "old instruction",
+            false,
+            false,
+            true,
+        )]),
+    );
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // start editing
+    if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+        state.editor.set_text("new instruction");
+    }
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save
+
+    let resp = rx.try_recv().expect("save must send a dialog response");
+    match resp {
+        DialogResponse::Text(s) => assert_eq!(
+            s, "dynamicWorkflows.guidance.0\tnew instruction\trepo",
+            "editing an existing entry must send the field\\tvalue\\trepo response"
+        ),
+        other => panic!("expected Text response, got {other:?}"),
+    }
+}
+
+#[test]
+fn enter_while_editing_guidance_entry_to_empty_value_sends_removal_response() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row(
+            "dynamicWorkflows.guidance.0",
+            "",
+            "never spawn more than two agents in parallel",
+            false,
+            false,
+            true,
+        )]),
+    );
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // start editing
+    if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
+        state.editor.set_text("");
+    }
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save
+
+    let resp = rx.try_recv().expect("save must send a dialog response");
+    match resp {
+        DialogResponse::Text(s) => assert_eq!(
+            s, "dynamicWorkflows.guidance.0\t\trepo",
+            "an empty value must be sent through unfiltered; the config layer coerces \
+             empty guidance values to removal"
+        ),
+        other => panic!("expected Text response, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctrl_n_on_guidance_row_starts_guidance_entry_phase() {
+    use crate::frontend::tui::dialogs::NewMapEntryPhase;
+
+    let mut app = make_app();
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row(
+            "dynamicWorkflows.guidance",
+            "",
+            "(none)",
+            true,
+            false,
+            false,
+        )]),
+    );
+
+    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+    let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+        panic!("dialog must stay open");
+    };
+    assert_eq!(
+        state.new_entry,
+        Some(NewMapEntryPhase::GuidanceEntry),
+        "Ctrl+N on a guidance row must start the single-phase guidance entry flow"
+    );
+    assert!(state.editing, "text input must route to the inline editor");
+    assert_eq!(state.edit_column, 1, "guidance entries are repo-scoped");
+}
+
+#[test]
+fn ctrl_n_guidance_flow_sends_repo_scoped_append_response() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![
+            config_row(
+                "dynamicWorkflows.guidance",
+                "",
+                "2 entries",
+                true,
+                false,
+                false,
+            ),
+            config_row(
+                "dynamicWorkflows.guidance.0",
+                "",
+                "first entry",
+                false,
+                false,
+                true,
+            ),
+            config_row(
+                "dynamicWorkflows.guidance.1",
+                "",
+                "second entry",
+                false,
+                false,
+                true,
+            ),
+        ]),
+    );
+
+    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    for c in "third entry".chars() {
+        press_char(&mut app, c);
+    }
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // save
+
+    let resp = rx.try_recv().expect("saving the new entry must respond");
+    match resp {
+        DialogResponse::Text(s) => assert_eq!(
+            s, "dynamicWorkflows.guidance.2\tthird entry\trepo",
+            "the new entry must append at the current entry count"
+        ),
+        other => panic!("expected Text response, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctrl_n_guidance_flow_empty_value_shows_toast_and_stays_in_phase() {
+    use crate::frontend::tui::dialogs::NewMapEntryPhase;
+
+    let mut app = make_app();
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row(
+            "dynamicWorkflows.guidance",
+            "",
+            "(none)",
+            true,
+            false,
+            false,
+        )]),
+    );
+
+    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE); // submit with no text
+
+    let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+        panic!("dialog must stay open");
+    };
+    assert_eq!(
+        state.new_entry,
+        Some(NewMapEntryPhase::GuidanceEntry),
+        "an empty entry must keep the flow open rather than sending a response"
+    );
+    assert!(
+        app.status_bar.text.contains("Enter a guidance instruction"),
+        "the status bar must prompt for input: {}",
+        app.status_bar.text
+    );
+}
+
+#[test]
+fn ctrl_n_on_non_guidance_row_still_starts_agent_key_flow() {
+    use crate::frontend::tui::dialogs::NewMapEntryPhase;
+
+    let mut app = make_app();
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(vec![config_row("agent", "claude", "", false, true, true)]),
+    );
+
+    press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+    let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+        panic!("dialog must stay open");
+    };
+    assert_eq!(
+        state.new_entry,
+        Some(NewMapEntryPhase::Key),
+        "Ctrl+N away from a guidance row must keep the agentsToModels two-phase flow"
+    );
+}
+
