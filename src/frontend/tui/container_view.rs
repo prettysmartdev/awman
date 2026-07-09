@@ -264,6 +264,20 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
         (Color::Green, "")
     };
 
+    // While yoloing (and not shown maximized — see `render_container_bars`'
+    // `skip_focused`), show the same countdown the per-slot modal would, so
+    // the user can see time-to-auto-advance without switching focus to it.
+    let yolo_suffix = if slot.yolo_mode {
+        slot.yolo_state
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|s| format!(" | Yolo in {}s", s.remaining_secs))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     // `🔒 {agent} [{step}] | {container} | {cpu} | {mem} | {dur}`, with the
     // `[step]` segment omitted for slots that aren't a parallel workflow
     // step (plain commands, sequential steps).
@@ -278,11 +292,12 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
         format!(" [{}]", slot.step_name)
     };
     let content = format!(
-        "{}\u{1F512} {}{} | {}",
+        "{}\u{1F512} {}{} | {}{}",
         prefix,
         slot.agent_name(),
         step_segment,
-        stats_title.trim()
+        stats_title.trim(),
+        yolo_suffix
     );
 
     let block = Block::default()
@@ -638,6 +653,40 @@ mod tests {
         assert!(
             text.contains('\u{26a0}'),
             "a stuck minimized bar shows the ⚠ glyph: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_yolo_bar_shows_countdown_text() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        let mut yoloing = slot("test");
+        yoloing.yolo_mode = true;
+        *yoloing.yolo_state.lock().unwrap() = Some(crate::frontend::tui::tabs::YoloState {
+            step_name: "test".into(),
+            remaining_secs: 7,
+        });
+        tab.container_slots.push(yoloing);
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 80, 4);
+        assert!(
+            text.contains("Yolo in 7s"),
+            "a yoloing minimized bar shows its remaining time: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_non_yolo_bar_has_no_countdown_text() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        tab.container_slots.push(slot("test"));
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 80, 4);
+        assert!(
+            !text.contains("Yolo in"),
+            "a non-yoloing minimized bar shows no countdown: {text}"
         );
     }
 }

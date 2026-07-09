@@ -441,12 +441,36 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn parallel_step_yolo_countdown_started(&mut self, step_name: &str) {
+        let cancel_flag: crate::frontend::tui::tabs::SharedYoloCancelFlag =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.pending_parallel_yolo_cancel
+            .insert(step_name.to_string(), cancel_flag.clone());
         self.push_container_slot_event(ContainerSlotEvent::YoloStarted {
             step_name: step_name.to_string(),
+            cancel_flag,
         });
     }
 
+    fn parallel_step_yolo_countdown_tick(
+        &mut self,
+        step_name: &str,
+        remaining: Duration,
+        _total: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        if let Some(flag) = self.pending_parallel_yolo_cancel.get(step_name) {
+            if flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Ok(YoloTickOutcome::Cancel);
+            }
+        }
+        self.push_container_slot_event(ContainerSlotEvent::YoloTick {
+            step_name: step_name.to_string(),
+            remaining_secs: remaining.as_secs(),
+        });
+        Ok(YoloTickOutcome::Continue)
+    }
+
     fn parallel_step_yolo_countdown_finished(&mut self, step_name: &str) {
+        self.pending_parallel_yolo_cancel.remove(step_name);
         self.push_container_slot_event(ContainerSlotEvent::YoloFinished {
             step_name: step_name.to_string(),
         });
@@ -935,6 +959,142 @@ mod tests {
         assert!(frontend.yolo_state.lock().unwrap().is_some());
         frontend.yolo_countdown_finished("build");
         assert!(frontend.yolo_state.lock().unwrap().is_none());
+    }
+
+    // ─── Parallel-group yolo countdown tests ────────────────────────────────
+
+    #[test]
+    fn parallel_yolo_started_publishes_yolo_started_event_with_cancel_flag() {
+        use crate::frontend::tui::tabs::ContainerSlotEvent;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.parallel_step_yolo_countdown_started("build");
+
+        assert!(
+            frontend.pending_parallel_yolo_cancel.contains_key("build"),
+            "a cancel flag must be stashed for later ticks"
+        );
+
+        let mut q = frontend.container_slot_events.lock().unwrap();
+        let event = q.pop_front().expect("an event must be queued");
+        match event {
+            ContainerSlotEvent::YoloStarted {
+                step_name,
+                cancel_flag,
+            } => {
+                assert_eq!(step_name, "build");
+                assert!(
+                    std::sync::Arc::ptr_eq(
+                        &cancel_flag,
+                        frontend.pending_parallel_yolo_cancel.get("build").unwrap()
+                    ),
+                    "the event must carry the SAME Arc stashed for tick checks"
+                );
+            }
+            _ => panic!("expected YoloStarted event"),
+        }
+    }
+
+    #[test]
+    fn parallel_yolo_tick_publishes_yolo_tick_event_by_default() {
+        use crate::engine::workflow::actions::YoloTickOutcome;
+        use crate::frontend::tui::tabs::ContainerSlotEvent;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.parallel_step_yolo_countdown_started("build");
+        // Drain the YoloStarted event pushed above so this test only
+        // inspects the tick's own event.
+        frontend.container_slot_events.lock().unwrap().clear();
+
+        let result = frontend
+            .parallel_step_yolo_countdown_tick(
+                "build",
+                Duration::from_secs(17),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(result, YoloTickOutcome::Continue);
+
+        let mut q = frontend.container_slot_events.lock().unwrap();
+        let event = q.pop_front().expect("an event must be queued");
+        match event {
+            ContainerSlotEvent::YoloTick {
+                step_name,
+                remaining_secs,
+            } => {
+                assert_eq!(step_name, "build");
+                assert_eq!(remaining_secs, 17);
+            }
+            _ => panic!("expected YoloTick event"),
+        }
+    }
+
+    #[test]
+    fn parallel_yolo_tick_returns_cancel_when_slots_own_flag_is_set() {
+        use crate::engine::workflow::actions::YoloTickOutcome;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.parallel_step_yolo_countdown_started("build");
+        frontend
+            .pending_parallel_yolo_cancel
+            .get("build")
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = frontend
+            .parallel_step_yolo_countdown_tick(
+                "build",
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(result, YoloTickOutcome::Cancel);
+    }
+
+    #[test]
+    fn parallel_yolo_tick_for_unrelated_step_does_not_affect_others() {
+        use crate::engine::workflow::actions::YoloTickOutcome;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.parallel_step_yolo_countdown_started("build");
+        frontend.parallel_step_yolo_countdown_started("test");
+        frontend
+            .pending_parallel_yolo_cancel
+            .get("build")
+            .unwrap()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // "test"'s countdown must keep ticking even though "build" was
+        // cancelled — independent per-step, per WI-0096 §9.
+        let result = frontend
+            .parallel_step_yolo_countdown_tick(
+                "test",
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(result, YoloTickOutcome::Continue);
+    }
+
+    #[test]
+    fn parallel_yolo_finished_removes_cancel_flag_and_publishes_event() {
+        use crate::frontend::tui::tabs::ContainerSlotEvent;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.parallel_step_yolo_countdown_started("build");
+        frontend.container_slot_events.lock().unwrap().clear();
+
+        frontend.parallel_step_yolo_countdown_finished("build");
+        assert!(!frontend.pending_parallel_yolo_cancel.contains_key("build"));
+
+        let mut q = frontend.container_slot_events.lock().unwrap();
+        let event = q.pop_front().expect("an event must be queued");
+        match event {
+            ContainerSlotEvent::YoloFinished { step_name } => {
+                assert_eq!(step_name, "build");
+            }
+            _ => panic!("expected YoloFinished event"),
+        }
     }
 
     #[test]

@@ -49,11 +49,11 @@ pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, 
             let b_q = sh_quote(branch);
             let cmd = match base {
                 Some(base) => format!(
-                    "git fetch origin 2>/dev/null; git checkout -B {b_q} {base_q} 2>/dev/null || git checkout {b_q} && git pull origin {b_q} 2>/dev/null || true",
+                    "git fetch origin 2>/dev/null; git checkout {b_q} 2>/dev/null || git checkout -b {b_q} {base_q}",
                     base_q = sh_quote(base),
                 ),
                 None => format!(
-                    "git fetch origin 2>/dev/null; git checkout {b_q} 2>/dev/null && git pull origin {b_q} 2>/dev/null || git checkout -b {b_q}"
+                    "git fetch origin 2>/dev/null; git checkout {b_q} 2>/dev/null || git checkout -b {b_q}"
                 ),
             };
             (cmd, None)
@@ -292,7 +292,10 @@ mod tests {
             base: Some("main".to_string()),
         };
         let (cmd, _) = setup_step_to_shell(&step);
-        assert!(cmd.contains("git checkout -B 'feature/x' 'main'"));
+        assert_eq!(
+            cmd,
+            "git fetch origin 2>/dev/null; git checkout 'feature/x' 2>/dev/null || git checkout -b 'feature/x' 'main'"
+        );
     }
 
     #[test]
@@ -302,8 +305,10 @@ mod tests {
             base: None,
         };
         let (cmd, _) = setup_step_to_shell(&step);
-        assert!(cmd.contains("git checkout 'feature/x'"));
-        assert!(cmd.contains("git checkout -b 'feature/x'"));
+        assert_eq!(
+            cmd,
+            "git fetch origin 2>/dev/null; git checkout 'feature/x' 2>/dev/null || git checkout -b 'feature/x'"
+        );
     }
 
     #[test]

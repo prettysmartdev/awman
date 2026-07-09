@@ -597,11 +597,23 @@ impl App {
 
         // Engine-driven yolo countdown: the engine sets yolo_state via the
         // frontend trait; the TUI renders it as a non-modal overlay dialog.
-        let yolo_snapshot = self.tabs[active]
-            .yolo_state
-            .lock()
-            .ok()
-            .and_then(|g| g.clone());
+        //
+        // During a parallel group (`dormant_slots` non-empty) yolo countdowns
+        // are per-slot: only the slot actually rendered maximized gets the
+        // modal here — other yoloing slots show their countdown in the
+        // minimized bar instead (`render_one_minimized_bar`). Rotating the
+        // focus with Ctrl-S onto/off of a yoloing slot naturally opens/closes
+        // the modal on the next tick since this is recomputed fresh each time.
+        let active_tab = &self.tabs[active];
+        let yolo_snapshot = if active_tab.dormant_slots.is_empty() {
+            active_tab.yolo_state.lock().ok().and_then(|g| g.clone())
+        } else if active_tab.container_overlay_active() {
+            active_tab
+                .focused_slot()
+                .and_then(|s| s.yolo_state.lock().ok().and_then(|g| g.clone()))
+        } else {
+            None
+        };
         if let Some(state) = yolo_snapshot {
             if !self.command_dialog_active {
                 self.active_dialog = Some(Dialog::WorkflowYoloCountdown(
@@ -1019,6 +1031,91 @@ mod tests {
         assert!(
             build_info.latest_stats.is_none(),
             "the other slot must be untouched"
+        );
+    }
+
+    #[test]
+    fn tick_all_tabs_shows_yolo_modal_for_focused_slot_in_parallel_group() {
+        use crate::frontend::tui::tabs::{ContainerSlot, ContainerWindowState, YoloState};
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        // A parallel group is active: the backbone is stashed in
+        // `dormant_slots` and the group's own slots are in `container_slots`.
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+        tab.focused_slot_idx = 1; // "test" is the maximized slot
+        tab.container_window_state = ContainerWindowState::Maximized;
+        *tab.container_slots[1].yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "test".into(),
+            remaining_secs: 12,
+        });
+
+        app.tick_all_tabs();
+
+        match &app.active_dialog {
+            Some(Dialog::WorkflowYoloCountdown(state)) => {
+                assert_eq!(state.step_name, "test");
+                assert_eq!(state.remaining_secs, 12);
+            }
+            _ => panic!("expected WorkflowYoloCountdown for the focused slot"),
+        }
+    }
+
+    #[test]
+    fn tick_all_tabs_hides_yolo_modal_when_yoloing_slot_is_not_focused() {
+        use crate::frontend::tui::tabs::{ContainerSlot, ContainerWindowState, YoloState};
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+        tab.focused_slot_idx = 0; // "build" is maximized; "test" is a bar
+        tab.container_window_state = ContainerWindowState::Maximized;
+        *tab.container_slots[1].yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "test".into(),
+            remaining_secs: 12,
+        });
+
+        app.tick_all_tabs();
+
+        assert!(
+            app.active_dialog.is_none(),
+            "the countdown for a non-focused slot belongs in its minimized bar, not a modal"
+        );
+    }
+
+    #[test]
+    fn tick_all_tabs_hides_yolo_modal_when_group_is_minimized() {
+        use crate::frontend::tui::tabs::{ContainerSlot, ContainerWindowState, YoloState};
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+        tab.focused_slot_idx = 0;
+        // Nothing is rendered maximized while Minimized — every slot is a bar.
+        tab.container_window_state = ContainerWindowState::Minimized;
+        *tab.container_slots[0].yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "test".into(),
+            remaining_secs: 12,
+        });
+
+        app.tick_all_tabs();
+
+        assert!(
+            app.active_dialog.is_none(),
+            "no slot is maximized, so no modal should show"
         );
     }
 

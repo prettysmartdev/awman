@@ -344,6 +344,23 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         }
     }
 
+    // Ctrl-S also rotates the focused parallel container while the yolo
+    // countdown modal is open on it, mirroring the Ctrl-A/D tab-switch
+    // carve-out above (a modal shouldn't block the one navigation action
+    // that lets the user check on/dismiss a sibling container). The modal is
+    // dismissed here; `tick_all_tabs` re-derives it next tick from whichever
+    // slot is now focused, so it reopens automatically on rotating back to a
+    // slot whose countdown is still running.
+    if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_)))
+        && key.code == KeyCode::Char('s')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && app.active_tab().has_multiple_slots()
+    {
+        app.active_dialog = None;
+        app.active_tab_mut().cycle_focused_slot();
+        return;
+    }
+
     // TUI-3: In MultilineInput dialogs, bare Enter inserts a newline while
     // Ctrl+Enter submits. The generic keymap maps Enter → SubmitCommand for
     // all dialogs, so we intercept here where we can inspect the dialog type.
@@ -618,9 +635,17 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 }
             }
             if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
-                app.active_tab()
-                    .yolo_cancel_flag
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let tab = app.active_tab();
+                if tab.dormant_slots.is_empty() {
+                    tab.yolo_cancel_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                } else if let Some(slot) = tab.focused_slot() {
+                    // Parallel group: the modal is only ever shown for the
+                    // focused slot (see `tick_all_tabs`), so cancel that
+                    // slot's countdown rather than the tab-level one.
+                    slot.yolo_cancel_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 app.active_dialog = None;
                 return;
             }
@@ -2304,6 +2329,97 @@ mod tests {
             app.active_tab().container_window_state,
             before,
             "Ctrl+M must not cycle container window while a dialog is open"
+        );
+    }
+
+    // ─── Yolo countdown modal + parallel container rotation ──────────────────
+
+    fn push_parallel_slots(app: &mut App) {
+        use crate::frontend::tui::tabs::ContainerSlot;
+        let tab = app.active_tab_mut();
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+    }
+
+    #[test]
+    fn ctrl_s_cycles_focused_slot_while_yolo_modal_is_open() {
+        use crate::frontend::tui::dialogs::WorkflowYoloCountdownState;
+
+        let mut app = make_app();
+        push_parallel_slots(&mut app);
+        app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
+            step_name: "build".into(),
+            remaining_secs: 30,
+        }));
+
+        press_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            app.active_tab().focused_slot_idx,
+            1,
+            "Ctrl-S must still rotate the focused slot while the modal is open"
+        );
+        assert!(
+            app.active_dialog.is_none(),
+            "the modal is dismissed here; tick_all_tabs re-derives it for the new focus"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_with_single_slot_leaves_yolo_modal_open() {
+        use crate::frontend::tui::dialogs::WorkflowYoloCountdownState;
+
+        let mut app = make_app();
+        // A plain (sequential) yolo countdown: no parallel group, one slot.
+        app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
+            step_name: "build".into(),
+            remaining_secs: 30,
+        }));
+
+        press_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert!(
+            app.active_dialog.is_some(),
+            "with no parallel group to rotate, Ctrl-S must not swallow the modal"
+        );
+    }
+
+    #[test]
+    fn esc_on_parallel_yolo_modal_cancels_the_focused_slots_flag_only() {
+        use crate::frontend::tui::dialogs::WorkflowYoloCountdownState;
+
+        let mut app = make_app();
+        push_parallel_slots(&mut app);
+        app.active_tab_mut().focused_slot_idx = 1; // "test" is focused
+        app.active_dialog = Some(Dialog::WorkflowYoloCountdown(WorkflowYoloCountdownState {
+            step_name: "test".into(),
+            remaining_secs: 5,
+        }));
+
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.active_dialog.is_none());
+        assert!(
+            app.active_tab().container_slots[1]
+                .yolo_cancel_flag
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the focused slot's own cancel flag must be set"
+        );
+        assert!(
+            !app.active_tab().container_slots[0]
+                .yolo_cancel_flag
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the non-focused sibling's cancel flag must be untouched"
+        );
+        assert!(
+            !app.active_tab()
+                .yolo_cancel_flag
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the tab-level (sequential-path) flag is unrelated here"
         );
     }
 

@@ -395,9 +395,9 @@ Each minimized bar reads `🔒 agent [step_name] | container | cpu | mem | durat
 |---|---|
 | Green border and text | Container running normally |
 | Yellow, `⚠` prefix | No output for more than 30 seconds — [stuck](05-workflows.md#stuck-steps) |
-| Flashing purple / yellow | A [yolo](06-yolo-mode.md) auto-advance countdown is running for that container; the color alternates every second |
+| Flashing purple / yellow, `Yolo in Ns` | A [yolo](06-yolo-mode.md) auto-advance countdown is running for that container; the color alternates every second and the bar shows the seconds remaining |
 
-The focused container never shows a bar of its own — its step name, container name, and live stats are already in the maximized window's title line.
+The focused container never shows a bar of its own — its step name, container name, and live stats are already in the maximized window's title line. If the *focused* container is the one counting down, its countdown appears as the same modal dialog a single container shows (see [Yolo Mode](06-yolo-mode.md#4-auto-advances-stuck-workflow-steps)) instead of a minimized bar, since there's no bar for the focused container to show it in.
 
 Only the focused container receives keyboard input; the others keep running in the background regardless of which one is focused.
 
@@ -406,6 +406,8 @@ Only the focused container receives keyboard input; the others keep running in t
 Press **Ctrl-S** to move focus to the next running container. The newly-focused container swaps into the maximized window and is resized to match the current terminal dimensions; the container it replaces drops into the minimized stack.
 
 Ctrl-S only cycles focus when more than one container is currently running. With a single container, Ctrl-S has no special effect and is passed through to the container's PTY as usual (some programs use it for flow control).
+
+**With a yolo countdown modal open:** Ctrl-S still rotates focus, exactly as it does otherwise — a modal on one container never blocks you from checking on its siblings. The modal closes when you rotate away; if the container you rotate back to is still counting down, its modal reopens automatically (the countdown itself is never paused or restarted by rotating focus, since each container's timer runs independently in the background — see [Stuck and yolo behavior, per container](15-parallel-workflows.md#stuck-and-yolo-behavior-per-container)).
 
 ### Ctrl-M with multiple containers
 

@@ -312,8 +312,21 @@ pub enum ContainerSlotEvent {
     Stuck { step_name: String },
     /// A stuck container recovered.
     Unstuck { step_name: String },
-    /// A container's yolo countdown started.
-    YoloStarted { step_name: String },
+    /// A container's yolo countdown started. `cancel_flag` is the same
+    /// `Arc` the engine-side frontend checks each tick — stashed on the slot
+    /// so the TUI event loop can request cancellation (Esc on the per-slot
+    /// countdown modal) without a lookup back into the engine thread.
+    YoloStarted {
+        step_name: String,
+        cancel_flag: SharedYoloCancelFlag,
+    },
+    /// A per-second countdown update for a slot's yolo timer, mirroring the
+    /// sequential path's `yolo_countdown_tick`. Drives both the minimized-bar
+    /// countdown text and the per-slot modal shown when the slot is focused.
+    YoloTick {
+        step_name: String,
+        remaining_secs: u64,
+    },
     /// A container's yolo countdown ended (cancelled, expired, or advanced).
     YoloFinished { step_name: String },
     /// The whole group drained; clear any remaining group slots and restore
@@ -672,6 +685,12 @@ impl Tab {
                 // sequential steps send through the same persistent channel.
                 self.dormant_slots.append(&mut self.container_slots);
                 self.focused_slot_idx = 0;
+                // Evict any lingering summary bar (e.g. killed leader or the
+                // previous group's last exited container) and unblock
+                // auto-open so the first output from the new group's
+                // containers immediately maximizes the window.
+                self.last_container_summary = None;
+                self.suppress_container_auto_open = false;
             }
             ContainerSlotEvent::Launched {
                 step_name,
@@ -743,14 +762,34 @@ impl Tab {
                     slot.stuck = false;
                 }
             }
-            ContainerSlotEvent::YoloStarted { step_name } => {
+            ContainerSlotEvent::YoloStarted {
+                step_name,
+                cancel_flag,
+            } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.yolo_mode = true;
+                    slot.yolo_cancel_flag = cancel_flag;
+                }
+            }
+            ContainerSlotEvent::YoloTick {
+                step_name,
+                remaining_secs,
+            } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    if let Ok(mut guard) = slot.yolo_state.lock() {
+                        *guard = Some(YoloState {
+                            step_name,
+                            remaining_secs,
+                        });
+                    }
                 }
             }
             ContainerSlotEvent::YoloFinished { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.yolo_mode = false;
+                    if let Ok(mut guard) = slot.yolo_state.lock() {
+                        *guard = None;
+                    }
                 }
             }
             ContainerSlotEvent::GroupFinished => {
@@ -1604,6 +1643,54 @@ mod tests {
         tx.send(b"next step output".to_vec()).unwrap();
         tab.drain_container_output();
         assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
+    }
+
+    // ── GroupStarted resets stuck summary bar and unblocks auto-open ──────
+
+    #[test]
+    fn group_started_evicts_summary_bar_and_unblocks_auto_open() {
+        let mut tab = make_tab();
+        tab.start_container("claude".into(), "awman-leader".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.container_rendered = true;
+
+        // Leader is killed — leaves a red summary bar and suppresses auto-open.
+        *tab.container_exit_shared.lock().unwrap() = Some(137);
+        tab.poll_container_exit();
+        assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
+        assert!(tab.last_container_summary.is_some());
+        assert!(tab.suppress_container_auto_open);
+
+        // Engine fires GroupStarted for the first parallel group.
+        tab.apply_container_slot_event(ContainerSlotEvent::GroupStarted);
+        assert!(
+            tab.last_container_summary.is_none(),
+            "GroupStarted must evict the stuck summary bar"
+        );
+        assert!(
+            !tab.suppress_container_auto_open,
+            "GroupStarted must unblock auto-open for new group containers"
+        );
+
+        // First container in the new group launches and produces output.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.apply_container_slot_event(ContainerSlotEvent::Launched {
+            step_name: "build".to_string(),
+            agent: "claude".to_string(),
+            model: None,
+            io: Some(crate::frontend::tui::tabs::ContainerSlotIo {
+                stdout_rx: rx,
+                stdin_tx: tokio::sync::mpsc::unbounded_channel().0,
+                resize_tx: tokio::sync::mpsc::unbounded_channel().0,
+            }),
+        });
+        tx.send(b"building...".to_vec()).unwrap();
+        tab.drain_container_output();
+        assert_eq!(
+            tab.container_window_state,
+            ContainerWindowState::Maximized,
+            "first output from the new group must auto-open the window"
+        );
     }
 
     #[test]
@@ -2566,5 +2653,69 @@ mod tests {
             Some("awman-backbone"),
             "the restored slot is the original backbone"
         );
+    }
+
+    #[test]
+    fn yolo_started_shares_cancel_flag_and_tick_updates_slot_state() {
+        let mut tab = make_tab();
+        tab.container_slots.push(slot("a"));
+        tab.container_slots.push(slot("b"));
+
+        let cancel_flag: SharedYoloCancelFlag = Arc::new(AtomicBool::new(false));
+        {
+            let mut q = tab.container_slot_events.lock().unwrap();
+            q.push_back(ContainerSlotEvent::YoloStarted {
+                step_name: "b".into(),
+                cancel_flag: cancel_flag.clone(),
+            });
+            q.push_back(ContainerSlotEvent::YoloTick {
+                step_name: "b".into(),
+                remaining_secs: 42,
+            });
+        }
+        tab.drain_container_slot_events();
+
+        let b = tab
+            .container_slots
+            .iter()
+            .find(|s| s.step_name == "b")
+            .unwrap();
+        assert!(b.yolo_mode, "yolo_mode set on the ticking slot only");
+        assert_eq!(
+            b.yolo_state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.remaining_secs),
+            Some(42)
+        );
+        // The slot's cancel flag is the SAME Arc the engine-side frontend
+        // holds, so setting it here (as Esc does) is visible to the engine's
+        // next `parallel_step_yolo_countdown_tick` check.
+        assert!(Arc::ptr_eq(&b.yolo_cancel_flag, &cancel_flag));
+
+        let a = tab
+            .container_slots
+            .iter()
+            .find(|s| s.step_name == "a")
+            .unwrap();
+        assert!(!a.yolo_mode, "sibling slot is untouched");
+        assert!(a.yolo_state.lock().unwrap().is_none());
+
+        // Finishing clears both the flag and the displayed countdown.
+        {
+            let mut q = tab.container_slot_events.lock().unwrap();
+            q.push_back(ContainerSlotEvent::YoloFinished {
+                step_name: "b".into(),
+            });
+        }
+        tab.drain_container_slot_events();
+        let b = tab
+            .container_slots
+            .iter()
+            .find(|s| s.step_name == "b")
+            .unwrap();
+        assert!(!b.yolo_mode);
+        assert!(b.yolo_state.lock().unwrap().is_none());
     }
 }

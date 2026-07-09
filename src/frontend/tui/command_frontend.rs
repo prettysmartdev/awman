@@ -88,6 +88,13 @@ pub struct TuiCommandFrontend {
     pub(crate) container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
     pub(crate) parallel_group_active: bool,
     pub(crate) pending_step_slot_io: HashMap<String, crate::frontend::tui::tabs::ContainerSlotIo>,
+    /// Per-step cancel flags for in-flight parallel yolo countdowns, keyed by
+    /// step name. Created in `parallel_step_yolo_countdown_started`, shared
+    /// with the slot via `ContainerSlotEvent::YoloStarted` so the TUI event
+    /// loop can request cancellation (Esc on the per-slot countdown modal);
+    /// checked and removed in `parallel_step_yolo_countdown_tick` /
+    /// `_finished`.
+    pub(crate) pending_parallel_yolo_cancel: HashMap<String, SharedYoloCancelFlag>,
     /// Field name of the most recent config-dialog edit, so the re-presented
     /// table reopens with that row selected (the `config show` edit loop
     /// presents the dialog again after every save).
@@ -143,6 +150,7 @@ impl TuiCommandFrontend {
             container_slot_events,
             parallel_group_active: false,
             pending_step_slot_io: HashMap::new(),
+            pending_parallel_yolo_cancel: HashMap::new(),
             last_config_edit_field: None,
         }
     }
