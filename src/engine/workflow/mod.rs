@@ -26,6 +26,7 @@ use crate::engine::agent_runtime::background::AgentExec;
 use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, CancelHandle, StuckEvent, KILLED_EXIT_CODE,
 };
+use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
@@ -161,6 +162,18 @@ struct ActiveParallelStep {
     /// This container's stuck broadcast sender (published to the frontend so it
     /// can subscribe per-slot).
     stuck_sender: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    /// The container's name, retained so a failure log can be named after it
+    /// once the execution has been consumed by its wait future.
+    container_name: String,
+    /// Rolling buffer of this container's recent combined stdout/stderr,
+    /// extracted from the execution at launch so it outlives the wait future.
+    /// `None` for runtimes without a byte-stream bridge (e.g. sandbox-class).
+    output_tail: Option<Arc<OutputTail>>,
+    /// Set when awman itself terminated this container (yolo auto-advance, WCB
+    /// abort/pause/finish, stuck cancel, startup-grace kill, abort_on_failure
+    /// peer kill). A non-zero exit on an awman-killed container is expected and
+    /// must NOT produce a failure log.
+    awman_killed: bool,
     /// Whether this step is currently marked stuck (non-yolo stuck handling).
     stuck: bool,
     /// When a per-step yolo countdown is running, the instant it expires.
@@ -218,6 +231,85 @@ impl WorkflowEngine {
                 level: crate::data::message::MessageLevel::Success,
                 text: text.into(),
             });
+    }
+    fn msg_error(&mut self, text: impl Into<String>) {
+        self.frontend
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Error,
+                text: text.into(),
+            });
+    }
+
+    /// Persist a failed step container's buffered output to
+    /// `~/.awman/logs/{workflow-id}-{step-name}-{container-name}.log` and point
+    /// the user at the file. Called only when a step container exits non-zero
+    /// on its own (awman did not kill it). Best-effort: a resolve/write failure
+    /// downgrades to a warning rather than derailing the workflow.
+    fn dump_container_failure_log(
+        &mut self,
+        step_name: &str,
+        container_name: &str,
+        tail: &OutputTail,
+        exit_code: i32,
+    ) {
+        let contents = tail.snapshot_text();
+        let paths = match crate::data::fs::WorkflowLogPaths::from_env(self.session.env()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.msg_warning(format!(
+                    "Step '{step_name}' container '{container_name}' exited with code \
+                     {exit_code}, but the log directory could not be resolved to save its \
+                     output: {e}"
+                ));
+                return;
+            }
+        };
+        match paths.write_container_log(
+            self.state.invocation_id,
+            step_name,
+            container_name,
+            &contents,
+        ) {
+            Ok(path) => self.msg_error(format!(
+                "Step '{step_name}' container '{container_name}' exited with code {exit_code}. \
+                 Recent output saved to {}",
+                path.display()
+            )),
+            Err(e) => self.msg_warning(format!(
+                "Step '{step_name}' container '{container_name}' exited with code {exit_code}, \
+                 but writing its output log failed: {e}"
+            )),
+        }
+    }
+
+    /// If a just-finished step container failed on its own (non-zero exit that
+    /// awman did not cause) and a captured output tail exists, flush it to a
+    /// failure log. Reads the slot for `step_name` if it is still present.
+    fn maybe_dump_step_failure(&mut self, step_name: &str, exit_code: i32) {
+        if exit_code == 0 {
+            return;
+        }
+        let dump = self
+            .active_steps
+            .iter()
+            .find(|s| s.step_name == step_name)
+            .filter(|s| !s.awman_killed)
+            .and_then(|s| {
+                s.output_tail
+                    .clone()
+                    .map(|tail| (s.container_name.clone(), tail))
+            });
+        if let Some((container_name, tail)) = dump {
+            self.dump_container_failure_log(step_name, &container_name, &tail, exit_code);
+        }
+    }
+
+    /// Mark the focused (single-step) container as awman-killed so a subsequent
+    /// non-zero exit is treated as expected and produces no failure log.
+    fn mark_focused_killed(&mut self) {
+        if let Some(s) = self.active_steps.first_mut() {
+            s.awman_killed = true;
+        }
     }
 
     pub fn new(
@@ -678,6 +770,9 @@ impl WorkflowEngine {
                         continue;
                     }
                     let exit = result?;
+                    // Persist the buffered output on a genuine failure before the
+                    // slot (which owns the tail + container name) is removed.
+                    self.maybe_dump_step_failure(&name, exit.exit_code);
                     self.remove_active_step(&name);
                     self.last_exit_info = Some(exit.clone());
 
@@ -787,6 +882,8 @@ impl WorkflowEngine {
 
         let stuck_sender = execution.stuck_sender();
         let cancel_handle = execution.cancel_handle();
+        let container_name = execution.handle().name.clone();
+        let output_tail = execution.output_tail();
 
         // Publish the per-step stuck sender so the frontend can subscribe for
         // this specific container's status bar.
@@ -842,6 +939,9 @@ impl WorkflowEngine {
             execution: None,
             cancel_handle,
             stuck_sender,
+            container_name,
+            output_tail,
+            awman_killed: false,
             stuck: false,
             yolo_deadline: None,
             agent: resolved_agent,
@@ -898,7 +998,12 @@ impl WorkflowEngine {
             }
             StuckEvent::StartupGraceExpired => {
                 // The bridge already killed the container; its wait future will
-                // resolve and be finalized as a failure. Nothing to do here.
+                // resolve and be finalized as a failure. Mark the slot as
+                // awman-killed so the drain loop suppresses the failure log for
+                // this expected kill.
+                if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                    s.awman_killed = true;
+                }
             }
         }
     }
@@ -1194,11 +1299,16 @@ impl WorkflowEngine {
         self.persist()?;
 
         let stuck_sender = execution.stuck_sender();
+        let container_name = execution.handle().name.clone();
+        let output_tail = execution.output_tail();
         self.active_steps = vec![ActiveParallelStep {
             step_name: step.name.clone(),
             execution: Some(execution),
             cancel_handle: None,
             stuck_sender,
+            container_name,
+            output_tail,
+            awman_killed: false,
             stuck: false,
             yolo_deadline: None,
             agent: resolved_agent.clone(),
@@ -1219,6 +1329,10 @@ impl WorkflowEngine {
         // The step's container has actually terminated (wait() resolved) —
         // tell the frontend so it can tear down any live container UI.
         self.frontend.report_container_exited(exit.exit_code);
+
+        // On a genuine (non-awman-kill) container failure, persist the buffered
+        // output tail so the user can debug what went wrong.
+        self.maybe_dump_step_failure(step_name, exit.exit_code);
 
         let (status, step_state) = if exit.exit_code == 0 {
             (WorkflowStepStatus::Succeeded, StepState::Succeeded)
@@ -1309,7 +1423,9 @@ impl WorkflowEngine {
                             // window. The bridge already invoked the cancel
                             // callback to kill it; surface a warning and let
                             // wait_rx resolve naturally so finalize_step
-                            // records the failure.
+                            // records the failure. This is an awman-initiated
+                            // kill, so mark the slot to suppress a failure log.
+                            self.mark_focused_killed();
                             self.msg_warning(format!(
                                 "Step '{}' produced no output before its startup grace expired; killing container",
                                 step_name,
@@ -1387,6 +1503,10 @@ impl WorkflowEngine {
         &mut self,
         cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
     ) {
+        // Mark before cancelling so that if the container's wait future later
+        // reaches finalize_step, the exit is treated as an expected kill and no
+        // failure log is written.
+        self.mark_focused_killed();
         if let Some(ch) = cancel_handle {
             let _ = ch.cancel();
             self.frontend.report_container_exited(KILLED_EXIT_CODE);
@@ -2038,6 +2158,7 @@ impl WorkflowEngine {
                     name: step.name.clone(),
                     agent,
                     model,
+                    has_step_override: step.agent.is_some() || step.model.is_some(),
                     status,
                     depends_on: step.depends_on.clone(),
                     max_concurrent: self.max_concurrent,
@@ -3158,6 +3279,11 @@ mod tests {
         pub inject_call_count: AtomicUsize,
         pub recorded_contexts: Mutex<Vec<WorkflowRuntimeContext>>,
         inject_result: Option<()>,
+        /// When set, each produced execution carries an output tail pre-filled
+        /// with these lines (exercises the container failure-log path).
+        tail_lines: Option<Vec<String>>,
+        /// Container name stamped on each produced execution's handle.
+        container_name: String,
     }
 
     impl FakeAgentExecutionFactory {
@@ -3168,6 +3294,8 @@ mod tests {
                 inject_call_count: AtomicUsize::new(0),
                 recorded_contexts: Mutex::new(Vec::new()),
                 inject_result: None,
+                tail_lines: None,
+                container_name: "fake-container".to_string(),
             }
         }
 
@@ -3178,6 +3306,20 @@ mod tests {
         fn with_inject_support(exit_codes: impl IntoIterator<Item = i32>) -> Self {
             Self {
                 inject_result: Some(()),
+                ..Self::new(exit_codes)
+            }
+        }
+
+        /// Produce executions whose output tail is pre-filled with `lines` and
+        /// whose container handle is named `container_name`.
+        fn with_output_tail(
+            exit_codes: impl IntoIterator<Item = i32>,
+            container_name: &str,
+            lines: impl IntoIterator<Item = &'static str>,
+        ) -> Self {
+            Self {
+                tail_lines: Some(lines.into_iter().map(|s| s.to_string()).collect()),
+                container_name: container_name.to_string(),
                 ..Self::new(exit_codes)
             }
         }
@@ -3203,10 +3345,24 @@ mod tests {
             let handle = AgentHandle {
                 id: format!("fake-{}", self.execution_call_count.load(Ordering::Relaxed)),
                 image_tag: "fake-image:latest".into(),
-                name: "fake-container".into(),
+                name: self.container_name.clone(),
                 started_at: now,
             };
-            Ok(AgentExecution::finished(handle, info))
+            match &self.tail_lines {
+                Some(lines) => {
+                    let tail = OutputTail::with_default_capacity();
+                    for line in lines {
+                        tail.push_bytes(line.as_bytes());
+                        tail.push_bytes(b"\n");
+                    }
+                    Ok(AgentExecution::finished_with_tail(
+                        handle,
+                        info,
+                        Some(Arc::new(tail)),
+                    ))
+                }
+                None => Ok(AgentExecution::finished(handle, info)),
+            }
         }
 
         fn inject_prompt(
@@ -3227,6 +3383,26 @@ mod tests {
             tmp.path().to_path_buf(),
             &resolver,
             SessionOpenOptions::default(),
+        )
+        .unwrap()
+    }
+
+    /// Session whose env snapshot pins `AWMAN_CONFIG_HOME` to `home`, so the
+    /// engine resolves `~/.awman/logs/` under a temp dir instead of the real
+    /// home — no process-global env mutation, no cross-test races.
+    fn make_session_with_home(tmp: &tempfile::TempDir, home: &std::path::Path) -> Session {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(EnvSnapshot::with_overrides([(
+                    AWMAN_CONFIG_HOME,
+                    home.to_str().unwrap(),
+                )])),
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -3429,6 +3605,126 @@ mod tests {
             outcome.status,
             WorkflowStepStatus::Failed { exit_code: 1 }
         ));
+    }
+
+    #[tokio::test]
+    async fn failing_container_writes_output_log_and_error_message() {
+        use crate::data::message::MessageLevel;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = make_session_with_home(&tmp, home.path());
+        let workflow = make_workflow(
+            Some("wf-log"),
+            Some("claude"),
+            vec![make_step("build", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::with_output_tail(
+            [1],
+            "awman-build-xyz",
+            ["compiling project", "error: it exploded"],
+        );
+        let (frontend, messages) = MessageCapturingFrontend::new();
+        let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+        let invocation_id = engine.state().invocation_id;
+        let outcome = engine.step_once().await.unwrap();
+        assert!(matches!(
+            outcome.status,
+            WorkflowStepStatus::Failed { exit_code: 1 }
+        ));
+
+        // The buffered output must be persisted to the per-container log file.
+        let paths = crate::data::fs::WorkflowLogPaths::at_home(home.path());
+        let log_path = paths.container_log_path(invocation_id, "build", "awman-build-xyz");
+        assert!(
+            log_path.exists(),
+            "failure log must be written at {}",
+            log_path.display()
+        );
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("compiling project"), "log body: {body:?}");
+        assert!(body.contains("error: it exploded"), "log body: {body:?}");
+
+        // An Error-level message must point the user at the log file.
+        let messages = messages.lock().unwrap();
+        let err = messages
+            .iter()
+            .find(|m| m.level == MessageLevel::Error)
+            .expect("an Error message must be emitted on container failure");
+        assert!(
+            err.text.contains(&log_path.display().to_string()),
+            "error message must name the log path: {}",
+            err.text
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_container_writes_no_failure_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = make_session_with_home(&tmp, home.path());
+        let workflow = make_workflow(
+            Some("wf-ok"),
+            Some("claude"),
+            vec![make_step("build", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::with_output_tail(
+            [0],
+            "awman-build-ok",
+            ["all good"],
+        );
+        let mut engine = make_engine(&session, workflow, factory, []);
+
+        engine.step_once().await.unwrap();
+
+        let paths = crate::data::fs::WorkflowLogPaths::at_home(home.path());
+        assert!(
+            !paths.logs_dir().exists(),
+            "a clean (exit 0) container must not create the logs directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn awman_killed_container_writes_no_failure_log() {
+        // A non-zero exit on a container awman itself killed is expected and
+        // must NOT produce a failure log.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = make_session_with_home(&tmp, home.path());
+        let workflow = make_workflow(
+            Some("wf-killed"),
+            Some("claude"),
+            vec![make_step("build", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+
+        // Simulate a live slot that awman killed, carrying buffered output.
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        let tail = OutputTail::with_default_capacity();
+        tail.push_bytes(b"some output before the kill\n");
+        engine.active_steps.push(ActiveParallelStep {
+            step_name: "build".to_string(),
+            execution: None,
+            cancel_handle: None,
+            stuck_sender: Arc::new(tx),
+            container_name: "awman-build-killed".to_string(),
+            output_tail: Some(Arc::new(tail)),
+            awman_killed: true,
+            stuck: false,
+            yolo_deadline: None,
+            agent: AgentName::new("claude").unwrap(),
+            model: None,
+        });
+
+        engine.maybe_dump_step_failure("build", KILLED_EXIT_CODE);
+
+        let paths = crate::data::fs::WorkflowLogPaths::at_home(home.path());
+        assert!(
+            !paths.logs_dir().exists(),
+            "an awman-killed container must not produce a failure log"
+        );
     }
 
     #[tokio::test]
@@ -3790,6 +4086,7 @@ mod tests {
                     handle,
                     backend,
                     std::sync::Arc::new(stuck_tx),
+                    None,
                 ))
             } else {
                 let now = Utc::now();
@@ -7145,6 +7442,9 @@ mod tests {
                 execution: None,
                 cancel_handle: None,
                 stuck_sender: Arc::new(tx),
+                container_name: format!("container-{name}"),
+                output_tail: None,
+                awman_killed: false,
                 stuck: false,
                 yolo_deadline: None,
                 agent: AgentName::new("claude").unwrap(),

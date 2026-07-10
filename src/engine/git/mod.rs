@@ -518,13 +518,30 @@ impl GitEngine {
         Ok(())
     }
 
+    /// Merge `branch` into the current branch. With `squash: true` this stages
+    /// the changes via `git merge --squash` and commits `Implement <branch>`;
+    /// with `squash: false` it runs a plain `git merge`, preserving the
+    /// branch's individual commits (fast-forwarding when possible).
+    /// Returns `EngineError::MergeConflict` when the merge fails.
     pub fn merge_branch_logged(
         &self,
         git_root: &Path,
         branch: &str,
         worktree_path: &Path,
+        squash: bool,
         sink: &mut dyn UserMessageSink,
     ) -> Result<(), EngineError> {
+        if !squash {
+            let message = format!("Merge {branch}");
+            let output = run_git_logged(&["merge", "-m", &message, branch], git_root, sink)?;
+            if !output.status.success() {
+                return Err(EngineError::MergeConflict {
+                    branch: branch.to_string(),
+                    worktree_path: worktree_path.to_path_buf(),
+                });
+            }
+            return Ok(());
+        }
         let output = run_git_logged(&["merge", "--squash", branch], git_root, sink)?;
         if !output.status.success() {
             return Err(EngineError::MergeConflict {

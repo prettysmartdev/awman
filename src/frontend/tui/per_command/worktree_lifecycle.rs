@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend,
+    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
@@ -150,15 +150,21 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         }
     }
 
-    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError> {
-        let response = self.ask_dialog(DialogRequest::YesNo {
-            title: "Squash merge?".into(),
-            body: format!("Squash-merge branch '{branch}' into main branch?"),
+    fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError> {
+        let response = self.ask_dialog(DialogRequest::Custom {
+            title: "Merge mode".into(),
+            body: format!("How should branch '{branch}' be merged into the main branch?"),
+            keys: vec![
+                ('m', "Merge (no squash)".into()),
+                ('s', "Squash".into()),
+                ('l', "Leave branch alone".into()),
+            ],
         })?;
-        Ok(matches!(
-            response,
-            DialogResponse::Yes | DialogResponse::Char('y')
-        ))
+        Ok(match response {
+            DialogResponse::Char('m') => WorktreeMergeMode::Merge,
+            DialogResponse::Char('s') => WorktreeMergeMode::Squash,
+            _ => WorktreeMergeMode::LeaveBranch,
+        })
     }
 
     fn confirm_worktree_cleanup(

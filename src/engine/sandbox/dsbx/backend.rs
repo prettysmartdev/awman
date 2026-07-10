@@ -552,10 +552,13 @@ fn spawn_pty_bridged(
         output: bridge.output,
         sink: frontend,
     };
+    // Sandbox-class runtimes have no container output tail; failure-log capture
+    // is a container-paradigm feature.
     Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        None,
     ))
 }
 
@@ -613,6 +616,7 @@ fn spawn_piped(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        None,
     ))
 }
 

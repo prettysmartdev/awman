@@ -479,6 +479,9 @@ fn bridge_config_for(
         stuck_timeout,
         container_start_delay: std::time::Duration::ZERO,
         cancel_on_grace_expired: Some(cancel),
+        output_tail: std::sync::Arc::new(
+            crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
+        ),
     }
 }
 
@@ -542,6 +545,7 @@ fn spawn_pty_bridged_docker(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        Some(bridge.output_tail),
     ))
 }
 
@@ -606,6 +610,7 @@ fn spawn_piped_docker(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        Some(bridge.output_tail),
     ))
 }
 

@@ -62,38 +62,35 @@ awman exec workflow path/to/workflow.toml --worktree
 3. The agent container mounts the worktree instead of your repo root
 4. After the agent exits, you choose what to do with the branch
 
-### Post-run options (command mode)
+### Post-run options
 
-When a worktree run completes (or is aborted), the worktree is preserved on disk:
-
-```
-Worktree branch `awman/work-item-0030` is ready. Merge into current branch? [y/n/s]
-```
+When a worktree run completes (or is aborted), the worktree is preserved on disk and awman asks what to do with it:
 
 | Key | Action |
 |-----|--------|
-| `y` | Merge into current branch (`git merge --no-ff`), remove worktree and branch |
-| `n` | Discard — remove worktree and delete branch |
-| `s` | Keep worktree and branch for manual review; prints the path |
+| `m` | Merge into the current branch (opens the merge-mode prompt below) |
+| `d` | Discard — remove worktree and delete branch |
+| `k` | Keep worktree and branch for manual review; prints the path |
 
 If you abort the workflow (Ctrl+C or the **Abort** action in the workflow control board), awman shows the same merge/discard dialog. The worktree is never automatically deleted on abort — your completed steps' changes are preserved and ready for review.
 
-### Post-run dialog (TUI mode)
+### Merge modes
 
-```
-╭─── Worktree: Merge or Discard? ───────────────────────╮
-│                                                        │
-│  Branch 'awman/work-item-0030' completed.               │
-│  (or was aborted — changes preserved on disk)         │
-│                                                        │
-│  [m/y] Merge into current branch                       │
-│  [d]   Discard (delete branch + worktree)              │
-│  [s/Esc] Keep worktree branch as-is                    │
-│                                                        │
-╰────────────────────────────────────────────────────────╯
-```
+Choosing **Merge** asks how the branch should be integrated:
 
-The same dialog appears whether the workflow completed successfully or was aborted. Your partially completed work is preserved, allowing you to review, manually continue, or discard as you choose.
+| Key | Mode | Effect |
+|-----|------|--------|
+| `m` | Merge (no squash) | Plain `git merge` — the branch's individual commits are preserved (fast-forwards when possible) |
+| `s` | Squash | `git merge --squash` followed by a single commit `Implement <branch>` |
+| `l` | Leave branch alone | No merge; the worktree and branch are kept as-is |
+
+Whichever mode you pick — including *Leave branch alone* — awman then checks for uncommitted files in the worktree and offers to commit them, so nothing on the branch is left dangling. After a successful merge (squash or not), awman offers to clean up the worktree and delete the branch.
+
+The same dialogs appear whether the workflow completed successfully or was aborted, and in both CLI and TUI mode. Your partially completed work is preserved, allowing you to review, manually continue, or discard as you choose.
+
+### Setup steps in worktree runs
+
+If the workflow defines a `checkout_create_branch` setup step, it is **skipped with a warning** when running in a worktree — the run is already isolated on its own branch, so creating another branch inside the worktree is redundant. This is not an error; the remaining setup steps run normally.
 
 ### Interrupted runs
 

@@ -430,6 +430,9 @@ fn bridge_config_for(
         stuck_timeout,
         container_start_delay: crate::engine::container::timing::APPLE_CONTAINER_START_DELAY,
         cancel_on_grace_expired: Some(cancel),
+        output_tail: std::sync::Arc::new(
+            crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
+        ),
     }
 }
 
@@ -494,6 +497,7 @@ fn spawn_pty_bridged_apple(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        Some(bridge.output_tail),
     ))
 }
 
@@ -554,6 +558,7 @@ fn spawn_piped_apple(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        Some(bridge.output_tail),
     ))
 }
 

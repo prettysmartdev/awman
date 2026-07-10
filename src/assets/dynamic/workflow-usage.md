@@ -96,6 +96,9 @@ type = "checkout_create_branch"
 branch = "feature/my-feature"
 # base = "main"   # Optional. Branch to base off. Defaults to current HEAD.
 ```
+Note: dynamic workflows always run inside an isolated worktree, which is
+already on its own branch — this step would be skipped with a warning.
+Do not include it in dynamic workflows.
 
 ### `pull_branch`
 Pull a remote branch.

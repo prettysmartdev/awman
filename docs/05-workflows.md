@@ -263,7 +263,7 @@ Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each s
 | Type | Fields | Description |
 |------|--------|-------------|
 | `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
-| `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. |
+| `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. **Skipped when the workflow runs in an isolated worktree** (`--worktree`, or implied by `--yolo`/`--dynamic`): the run is already on its own branch, so awman skips the step with a warning instead of failing. |
 | `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
@@ -1080,6 +1080,18 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 | **✗** (Red, bold) | Step encountered an error |
 | **🔧** (Magenta, bold) | Step failed and remediation is in progress (on_failure agent running) |
 
+### Agent and model labels
+
+When a step declares its own `agent` and/or `model`, the box shows the resolved **`agent/model`** on its top border (for example `claude/opus-4-8`) so you can see at a glance which agent and model will run each step:
+
+```
+ ╭claude/opus-4-8──╮   ╭gemini───────────╮
+ │ ● implement     │ → │ ○ review        │
+ ╰─────────────────╯   ╰─────────────────╯
+```
+
+Steps that declare **neither** an `agent` nor a `model` field inherit the project-default agent and model, so they carry no label — an unlabelled box always means "project defaults". If a step overrides only one of the two, the label shows just that part. The label is truncated to fit narrow boxes.
+
 ### Remediation in progress
 
 When a setup or teardown step fails and has an `on_failure` block, the step status changes to **🔧** (remediating) while the agent runs. The workflow status indicator shows which remediation attempt is in progress (e.g., "attempt 1 of 2"). After the agent completes, the original step is automatically retried. The status returns to **●** (running) for the retry.
@@ -1117,6 +1129,31 @@ When a running workflow step produces no output for **30 seconds**, the engine i
 Stuck detection fires independently per tab — background tabs detect and report stuck state to their own engine. In yolo mode, background tabs show a live countdown in the tab bar. See [Yolo Mode — Background yolo countdown](06-yolo-mode.md#background-yolo-countdown).
 
 **Active-tab suppression:** If you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even if the container is silent. The timer starts only once both the container and the user have been idle for 30 seconds. Background tabs are always checked using output time alone.
+
+---
+
+## Container failure logs
+
+While a workflow runs, awman keeps a rolling buffer of the **last ~100 lines** of combined stdout/stderr for each step's container. If a step container exits with a **non-zero exit code that awman did not cause**, awman writes that buffer to a log file and prints an error telling you where it went:
+
+```
+Step 'build' container 'awman-quick-brown-fox' exited with code 1. Recent output saved to /home/you/.awman/logs/9f8c…-build-awman-quick-brown-fox.log
+```
+
+The log path follows the pattern:
+
+```
+~/.awman/logs/{workflow-id}-{step-name}-{container-name}.log
+```
+
+- `{workflow-id}` is the workflow's invocation id (a UUID), so re-runs never overwrite each other.
+- `{step-name}` and `{container-name}` identify exactly which step and container failed — useful when several steps run in parallel.
+
+This gives you the container's final output for debugging even after the TUI has scrolled it away or the container has been removed.
+
+**When a log is *not* written:** awman only writes a failure log when the container failed on its own. Containers that awman itself stops — yolo auto-advance, control-board **Abort**/**Pause**/**Finish**, a stuck-step cancel, `abort_on_failure` killing sibling steps, or a startup-grace kill — exit as *expected*, so no log is written for them. Sandbox-class runtimes (`docker-sbx-experimental`) don't use the container I/O bridge and don't produce these logs.
+
+The `~/.awman/logs/` directory is created on demand and is never cleaned automatically; delete old logs whenever you like.
 
 ---
 

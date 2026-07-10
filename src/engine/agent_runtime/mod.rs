@@ -24,6 +24,7 @@ pub mod background;
 pub mod capabilities;
 pub mod execution;
 pub mod frontend;
+pub mod output_tail;
 
 pub use background::{AgentExec, ExecOutput};
 pub use capabilities::{Capabilities, DindSupport};
@@ -31,6 +32,7 @@ pub use execution::{
     AgentExecution, AgentExitInfo, AgentHandle, AgentHandlePreview, AgentInstance, AgentStats,
     CancelHandle, StuckEvent,
 };
+pub use output_tail::{OutputTail, DEFAULT_OUTPUT_TAIL_LINES};
 pub use frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 
 /// Common option carrier between Layer 2 and the runtime tier. Layer 2

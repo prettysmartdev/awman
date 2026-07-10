@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend,
+    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
@@ -140,13 +140,17 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         })
     }
 
-    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError> {
+    fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError> {
         if !stdin_is_tty() {
-            return Ok(false);
+            return Ok(WorktreeMergeMode::LeaveBranch);
         }
-        eprintln!("awman: squash-merge {branch} into HEAD? [y/n]");
-        let ch = read_line_or_default('n');
-        Ok(matches!(ch, 'y' | 'Y'))
+        eprintln!("awman: merge {branch} into HEAD?");
+        eprintln!("  [m] merge (no squash) / [s] squash / [l] leave branch alone");
+        Ok(match read_line_or_default('l') {
+            'm' | 'M' => WorktreeMergeMode::Merge,
+            's' | 'S' => WorktreeMergeMode::Squash,
+            _ => WorktreeMergeMode::LeaveBranch,
+        })
     }
 
     fn confirm_worktree_cleanup(

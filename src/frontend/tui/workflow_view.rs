@@ -95,7 +95,7 @@ pub fn render_workflow_strip(
             }
             let box_area = Rect::new(box_x, row_y, box_w, 3);
 
-            let (label, style) = match row {
+            let (label, style, title) = match row {
                 ColumnRow::Step { step, queued } => {
                     let is_current = state
                         .current_step
@@ -109,18 +109,35 @@ pub fn render_workflow_strip(
                     } else {
                         step.name.clone()
                     };
-                    step_box_label_and_style(&name, &step.status, is_current, box_w)
+                    let (label, style) =
+                        step_box_label_and_style(&name, &step.status, is_current, box_w);
+                    let title = step_agent_model_title(
+                        step.agent.as_deref(),
+                        step.model.as_deref(),
+                        box_w,
+                    );
+                    (label, style, title)
                 }
                 ColumnRow::Collapsed { step, extra } => {
                     let name = format!("{} (+{} completed)", step.name, extra);
-                    step_box_label_and_style(&name, &step.status, false, box_w)
+                    // A collapsed row summarizes several completed siblings that
+                    // may have run under different agents/models, so it carries
+                    // no single agent/model label.
+                    let (label, style) = step_box_label_and_style(&name, &step.status, false, box_w);
+                    (label, style, None)
                 }
             };
 
-            let block = Block::default()
+            let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(style);
+            if let Some(title) = title {
+                block = block.title(Span::styled(
+                    title,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             let para = Paragraph::new(label).block(block).style(style);
             frame.render_widget(para, box_area);
 
@@ -362,6 +379,37 @@ fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepVie
     columns
 }
 
+/// Build the top-border title for a step box — the `agent/model` the step will
+/// run under (e.g. `claude/opus-4-8`).
+///
+/// Returns `None` when the step declares neither an agent nor a model: such a
+/// step inherits the project-default agent AND model, so there is nothing that
+/// distinguishes it and the box gets no title. When only one of the two is
+/// known, just that part is shown. The result is truncated with an ellipsis to
+/// fit `box_width`.
+fn step_agent_model_title(
+    agent: Option<&str>,
+    model: Option<&str>,
+    box_width: u16,
+) -> Option<String> {
+    let text = match (agent, model) {
+        (None, None) => return None,
+        (Some(a), Some(m)) => format!("{a}/{m}"),
+        (Some(a), None) => a.to_string(),
+        (None, Some(m)) => m.to_string(),
+    };
+
+    // Leave the two rounded corners of the top border untouched.
+    let max_chars = (box_width as usize).saturating_sub(2).max(1);
+    let title = if text.chars().count() > max_chars {
+        let trunc: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{trunc}\u{2026}")
+    } else {
+        text
+    };
+    Some(title)
+}
+
 /// Compute the label text + style for a step box.
 ///
 /// Status → glyph + color:
@@ -554,6 +602,46 @@ mod tests {
         assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 
+    // ── step_agent_model_title ────────────────────────────────────────────────
+
+    #[test]
+    fn agent_model_title_none_when_neither_declared() {
+        // No agent and no model → the step inherits the project defaults and
+        // gets no title.
+        assert_eq!(step_agent_model_title(None, None, 40), None);
+    }
+
+    #[test]
+    fn agent_model_title_shows_agent_slash_model() {
+        assert_eq!(
+            step_agent_model_title(Some("claude"), Some("opus-4-8"), 40),
+            Some("claude/opus-4-8".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_model_title_agent_only() {
+        assert_eq!(
+            step_agent_model_title(Some("claude"), None, 40),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_model_title_model_only() {
+        assert_eq!(
+            step_agent_model_title(None, Some("opus-4-8"), 40),
+            Some("opus-4-8".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_model_title_truncates_to_box_width() {
+        let title = step_agent_model_title(Some("claude"), Some("opus-4-8"), 8).unwrap();
+        assert!(title.chars().count() <= 6, "title should fit box_width - 2");
+        assert!(title.contains('\u{2026}'));
+    }
+
     #[test]
     fn step_box_label_truncates_long_name() {
         let (label, _) = step_box_label_and_style("very-long-step-name", "pending", false, 12);
@@ -626,6 +714,52 @@ mod tests {
         let rows = build_column_rows(&col, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], ColumnRow::Step { .. }));
+    }
+
+    // ── strip renders agent/model title on the box border ───────────────────
+
+    fn render_strip_text(v: &WorkflowViewState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_workflow_strip(v, frame.area(), frame, 0))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn strip_shows_agent_model_title_for_overridden_step() {
+        let mut s = step("build", "running", vec![]);
+        s.agent = Some("claude".into());
+        s.model = Some("opus-4-8".into());
+        let v = view(vec![s]);
+        let text = render_strip_text(&v, 40, 3);
+        assert!(
+            text.contains("claude/opus-4-8"),
+            "expected agent/model title on the box border, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn strip_omits_title_for_default_step() {
+        // Neither agent nor model declared → box carries no agent/model title.
+        let v = view(vec![step("build", "running", vec![])]);
+        let text = render_strip_text(&v, 40, 3);
+        assert!(
+            !text.contains('/'),
+            "default step should have no agent/model title, got:\n{text}"
+        );
     }
 
     #[test]

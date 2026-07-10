@@ -34,6 +34,18 @@ pub enum PostWorkflowWorktreeAction {
     Keep,
 }
 
+/// How the worktree branch should be integrated once the user picks the
+/// Merge action in the post-workflow dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeMergeMode {
+    /// Plain `git merge` — preserves the branch's individual commits.
+    Merge,
+    /// `git merge --squash` followed by a single commit.
+    Squash,
+    /// Leave the branch (and worktree) alone.
+    LeaveBranch,
+}
+
 /// Prebuilt dialog content for the post-workflow worktree-action prompt.
 ///
 /// Built by the command layer (which queries the git engine for the target
@@ -90,7 +102,7 @@ pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
         suggested_message: &str,
     ) -> Result<Option<String>, CommandError>;
 
-    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError>;
+    fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError>;
 
     fn confirm_worktree_cleanup(&mut self, branch: &str, path: &Path)
         -> Result<bool, CommandError>;
@@ -238,6 +250,9 @@ impl WorktreeLifecycle {
         let action = frontend.ask_post_workflow_action(&prompt)?;
         match action {
             PostWorkflowWorktreeAction::Merge => {
+                let mode = frontend.ask_merge_mode(&self.branch)?;
+                // The commit-uncommitted step runs for every mode — including
+                // LeaveBranch — so nothing on the branch is left dangling.
                 let files = self
                     .git_engine
                     .uncommitted_files_logged(&self.worktree_path, frontend)?;
@@ -252,14 +267,19 @@ impl WorktreeLifecycle {
                             .commit_all_logged(&self.worktree_path, &msg, frontend)?;
                     }
                 }
-                if !frontend.confirm_squash_merge(&self.branch)? {
-                    frontend.report_worktree_kept(&self.worktree_path, &self.branch);
-                    return Ok(());
-                }
+                let squash = match mode {
+                    WorktreeMergeMode::LeaveBranch => {
+                        frontend.report_worktree_kept(&self.worktree_path, &self.branch);
+                        return Ok(());
+                    }
+                    WorktreeMergeMode::Squash => true,
+                    WorktreeMergeMode::Merge => false,
+                };
                 match self.git_engine.merge_branch_logged(
                     &self.git_root,
                     &self.branch,
                     &self.worktree_path,
+                    squash,
                     frontend,
                 ) {
                     Ok(()) => {
@@ -340,7 +360,7 @@ mod tests {
         existing_worktree_response: ExistingWorktreeDecision,
         post_workflow_action: PostWorkflowWorktreeAction,
         commit_before_merge_response: Option<String>,
-        confirm_squash_merge_response: bool,
+        merge_mode_response: WorktreeMergeMode,
         confirm_cleanup_response: bool,
 
         messages: Vec<UserMessage>,
@@ -357,7 +377,7 @@ mod tests {
                 existing_worktree_response: ExistingWorktreeDecision::Resume,
                 post_workflow_action: PostWorkflowWorktreeAction::Keep,
                 commit_before_merge_response: None,
-                confirm_squash_merge_response: true,
+                merge_mode_response: WorktreeMergeMode::Squash,
                 confirm_cleanup_response: true,
                 messages: vec![],
                 worktree_created_calls: vec![],
@@ -413,8 +433,8 @@ mod tests {
             Ok(self.commit_before_merge_response.clone())
         }
 
-        fn confirm_squash_merge(&mut self, _branch: &str) -> Result<bool, CommandError> {
-            Ok(self.confirm_squash_merge_response)
+        fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
+            Ok(self.merge_mode_response)
         }
 
         fn confirm_worktree_cleanup(
@@ -857,7 +877,7 @@ mod tests {
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
-        fe.confirm_squash_merge_response = true;
+        fe.merge_mode_response = WorktreeMergeMode::Squash;
         fe.confirm_cleanup_response = true;
         let result = lifecycle.finalize(&mut fe, false).await;
         assert!(result.is_ok(), "finalize(Merge) must return Ok: {result:?}");
@@ -891,7 +911,7 @@ mod tests {
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
         fe.commit_before_merge_response = Some("pre-merge commit".to_string());
-        fe.confirm_squash_merge_response = true;
+        fe.merge_mode_response = WorktreeMergeMode::Squash;
         fe.confirm_cleanup_response = true;
         let result = lifecycle.finalize(&mut fe, false).await;
         assert!(
@@ -899,6 +919,114 @@ mod tests {
             "finalize with pre-merge commit must succeed: {result:?}"
         );
         assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_merge_no_squash_preserves_branch_commits() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let branch = "awman/merge-nosquash-branch";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        std::fs::write(wt_path.join("work.txt"), "done").unwrap();
+        engine
+            .commit_all(&wt_path, "work done in worktree")
+            .unwrap();
+
+        let lifecycle = WorktreeLifecycle::new_for_test(
+            engine,
+            git_root.clone(),
+            wt_path.clone(),
+            branch.to_string(),
+        );
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
+        fe.merge_mode_response = WorktreeMergeMode::Merge;
+        fe.confirm_cleanup_response = true;
+        let result = lifecycle.finalize(&mut fe, false).await;
+        assert!(
+            result.is_ok(),
+            "finalize(Merge, no squash) must return Ok: {result:?}"
+        );
+        // A plain merge preserves the branch's own commit — the subject must
+        // appear in the target branch's log (a squash would rewrite it to
+        // "Implement <branch>").
+        let out = SysCmd::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(&git_root)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            log.lines().any(|l| l == "work done in worktree"),
+            "branch commit must survive a no-squash merge; log:\n{log}"
+        );
+        assert!(
+            !wt_path.exists(),
+            "worktree must be removed after merge + cleanup"
+        );
+        assert_eq!(fe.discarded_calls.len(), 1);
+        assert!(fe.merge_conflict_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_merge_leave_branch_still_commits_uncommitted_and_keeps() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let branch = "awman/leave-branch";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        // Leave an uncommitted file in the worktree.
+        std::fs::write(wt_path.join("uncommitted.txt"), "not committed").unwrap();
+
+        let lifecycle = WorktreeLifecycle::new_for_test(
+            engine.clone(),
+            git_root.clone(),
+            wt_path.clone(),
+            branch.to_string(),
+        );
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
+        fe.merge_mode_response = WorktreeMergeMode::LeaveBranch;
+        fe.commit_before_merge_response = Some("tidy up branch".to_string());
+        let before = git_log_count(&wt_path);
+        let result = lifecycle.finalize(&mut fe, false).await;
+        assert!(
+            result.is_ok(),
+            "finalize(LeaveBranch) must return Ok: {result:?}"
+        );
+        // The commit-uncommitted step must still run even though the branch
+        // is left alone.
+        let after = git_log_count(&wt_path);
+        assert_eq!(
+            after,
+            before + 1,
+            "uncommitted files must be committed on the branch"
+        );
+        assert!(
+            engine.uncommitted_files(&wt_path).unwrap().is_empty(),
+            "worktree must be clean after the commit step"
+        );
+        assert!(wt_path.exists(), "worktree must be kept");
+        assert_eq!(fe.kept_calls.len(), 1);
+        assert!(fe.discarded_calls.is_empty());
+        // Nothing was merged into the target branch.
+        let out = SysCmd::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(&git_root)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !log.contains("tidy up branch"),
+            "commit must land on the worktree branch only; log:\n{log}"
+        );
     }
 
     #[tokio::test]
@@ -949,8 +1077,11 @@ mod tests {
                 self.inner
                     .ask_worktree_commit_before_merge(branch, files, suggested_message)
             }
-            fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError> {
-                self.inner.confirm_squash_merge(branch)
+            fn ask_merge_mode(
+                &mut self,
+                branch: &str,
+            ) -> Result<WorktreeMergeMode, CommandError> {
+                self.inner.ask_merge_mode(branch)
             }
             fn confirm_worktree_cleanup(
                 &mut self,
@@ -1024,7 +1155,7 @@ mod tests {
         );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.post_workflow_action = PostWorkflowWorktreeAction::Merge;
-        fe.confirm_squash_merge_response = true;
+        fe.merge_mode_response = WorktreeMergeMode::Squash;
         let result = lifecycle.finalize(&mut fe, false).await;
         assert!(result.is_ok(), "merge conflict must return Ok: {result:?}");
         assert_eq!(

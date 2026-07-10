@@ -1005,7 +1005,7 @@ async fn execute_prepared(
     frontend: Box<dyn ExecWorkflowCommandFrontend>,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
     let PreparedRun {
-        workflow,
+        mut workflow,
         workflow_path,
         work_item_context,
         cli_typed,
@@ -1019,6 +1019,14 @@ async fn execute_prepared(
         issue_temp_file: _issue_temp_file,
     } = prepared;
     let mut frontend = frontend;
+
+    // When the run is inside an isolated worktree (--worktree, or implied by
+    // --yolo/--dynamic), any `checkout_create_branch` setup step is redundant:
+    // the worktree already put the run on its own branch. Skip-and-warn, not
+    // a failure.
+    if worktree_path.is_some() {
+        skip_checkout_branch_steps_in_worktree(&mut workflow, frontend.as_mut());
+    }
 
     // 5b. Detect a persisted workflow-state file and ask the user whether
     //     to resume it or delete it and start fresh. The check uses the
@@ -2452,6 +2460,31 @@ fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
     });
 }
 
+/// Remove every `checkout_create_branch` setup step from `workflow`, emitting
+/// a Warning for each one removed. Called only when the run executes inside an
+/// isolated worktree — the worktree already put the run on its own branch, so
+/// creating/checking out another branch there is redundant (and would move the
+/// worktree off the branch the post-workflow merge dialog operates on).
+fn skip_checkout_branch_steps_in_worktree(
+    workflow: &mut Workflow,
+    sink: &mut dyn UserMessageSink,
+) {
+    use crate::data::workflow_definition::SetupStep;
+    workflow.setup.retain(|entry| match &entry.step {
+        SetupStep::CheckoutCreateBranch { branch, .. } => {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!(
+                    "skipping checkout_create_branch setup step (branch '{branch}'): \
+                     the workflow is already running on an isolated worktree branch"
+                ),
+            });
+            false
+        }
+        _ => true,
+    });
+}
+
 /// Emit a Warning for each setup/teardown entry that names `context(workflow)`
 /// in its overlay list. Workflow step progression state is not available
 /// during those phases, so the dynamic prompt fields will be empty.
@@ -2955,8 +2988,14 @@ mod tests {
         ) -> Result<Option<String>, CommandError> {
             Ok(None)
         }
-        fn confirm_squash_merge(&mut self, _branch: &str) -> Result<bool, CommandError> {
-            Ok(false)
+        fn ask_merge_mode(
+            &mut self,
+            _branch: &str,
+        ) -> Result<
+            crate::command::commands::worktree_lifecycle::WorktreeMergeMode,
+            CommandError,
+        > {
+            Ok(crate::command::commands::worktree_lifecycle::WorktreeMergeMode::LeaveBranch)
         }
         fn confirm_worktree_cleanup(
             &mut self,
@@ -3384,6 +3423,81 @@ prompt = "do something"
             teardown_on_failure: false,
             overlays: None,
         }
+    }
+
+    #[test]
+    fn skip_checkout_branch_steps_removes_only_checkout_entries_and_warns() {
+        use crate::data::workflow_definition::{SetupStep, SetupStepEntry};
+        let mut wf = make_workflow(None, &[None]);
+        wf.setup = vec![
+            SetupStepEntry {
+                overlays: None,
+                abort_on_failure: false,
+                on_failure: None,
+                step: SetupStep::CheckoutCreateBranch {
+                    branch: "feature/x".into(),
+                    base: None,
+                },
+            },
+            SetupStepEntry {
+                overlays: None,
+                abort_on_failure: false,
+                on_failure: None,
+                step: SetupStep::RunShell {
+                    command: "echo hi".into(),
+                    env: None,
+                },
+            },
+            SetupStepEntry {
+                overlays: None,
+                abort_on_failure: false,
+                on_failure: None,
+                step: SetupStep::CheckoutCreateBranch {
+                    branch: "feature/y".into(),
+                    base: Some("main".into()),
+                },
+            },
+        ];
+        let mut fe = FakeExecWorkflowFrontend::new();
+        skip_checkout_branch_steps_in_worktree(&mut wf, &mut fe);
+        assert_eq!(wf.setup.len(), 1, "only the run_shell entry must remain");
+        assert!(matches!(wf.setup[0].step, SetupStep::RunShell { .. }));
+        let warnings: Vec<&UserMessage> = fe
+            .messages
+            .iter()
+            .filter(|m| m.level == MessageLevel::Warning)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per skipped checkout_create_branch step"
+        );
+        assert!(warnings[0].text.contains("checkout_create_branch"));
+        assert!(warnings[0].text.contains("feature/x"));
+        assert!(warnings[1].text.contains("feature/y"));
+        assert!(
+            warnings[0].text.contains("worktree"),
+            "warning must explain the worktree isolation reason"
+        );
+    }
+
+    #[test]
+    fn skip_checkout_branch_steps_no_op_without_checkout_entries() {
+        use crate::data::workflow_definition::{SetupStep, SetupStepEntry};
+        let mut wf = make_workflow(None, &[None]);
+        wf.setup = vec![SetupStepEntry {
+            overlays: None,
+            abort_on_failure: false,
+            on_failure: None,
+            step: SetupStep::RunShell {
+                command: "echo hi".into(),
+                env: None,
+            },
+        }];
+        let mut fe = FakeExecWorkflowFrontend::new();
+        skip_checkout_branch_steps_in_worktree(&mut wf, &mut fe);
+        assert_eq!(wf.setup.len(), 1);
+        assert!(fe.messages.is_empty(), "no warnings when nothing skipped");
     }
 
     #[test]

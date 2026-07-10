@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
+use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::error::EngineError;
 
 /// Shared last-activity timestamp. Updated by reader threads on every byte
@@ -41,6 +42,11 @@ pub(crate) struct BridgeConfig {
     /// this to force the container to exit so callers' `wait()` futures
     /// resolve with a failure status.
     pub cancel_on_grace_expired: Option<CancelFn>,
+    /// Rolling buffer of the container's recent combined stdout/stderr. The
+    /// reader threads append every byte chunk here (in addition to forwarding
+    /// it to the frontend) so a failure log can be written if the container
+    /// exits unexpectedly.
+    pub output_tail: Arc<OutputTail>,
 }
 
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
@@ -50,6 +56,9 @@ pub(crate) struct BridgeResult {
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
     pub stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    /// The rolling output tail the reader threads feed — stored in
+    /// `AgentExecution` so the workflow engine can read it after `wait()`.
+    pub output_tail: Arc<OutputTail>,
 }
 
 fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
@@ -190,10 +199,13 @@ pub(crate) fn bridge_pty(
     // If the frontend's stdout sink dies (drain task panics or exits early),
     // we keep draining the PTY but discard bytes — the container must not be
     // backpressured by a dead sink. Activity tracking continues so stuck
-    // detection reflects what the container is actually emitting.
+    // detection reflects what the container is actually emitting. The output
+    // tail is fed unconditionally (even after the sink dies) so a failure log
+    // always reflects what the container really printed.
     let stdout_tx = io.stdout;
     let act = Arc::clone(&activity);
     let fb = Arc::clone(&first_byte);
+    let tail = Arc::clone(&config.output_tail);
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
@@ -203,6 +215,7 @@ pub(crate) fn bridge_pty(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     update_activity(&act, &fb);
+                    tail.push_bytes(&buf[..n]);
                     if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                         sink_open = false;
                     }
@@ -259,6 +272,7 @@ pub(crate) fn bridge_pty(
         BridgeResult {
             stdin_injector: stdin_tx,
             stuck_tx,
+            output_tail: config.output_tail,
         },
     ))
 }
@@ -289,6 +303,7 @@ pub(crate) fn bridge_piped(
         let stdout_tx = io.stdout;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
+        let tail = Arc::clone(&config.output_tail);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -299,6 +314,7 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         update_activity(&act, &fb);
+                        tail.push_bytes(&buf[..n]);
                         if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -309,10 +325,12 @@ pub(crate) fn bridge_piped(
     }
 
     // stderr reader thread — same drain-after-sink-dies semantics as stdout.
+    // Feeds the same tail as stdout so the buffer holds combined output.
     if let Some(child_stderr) = child.stderr.take() {
         let stderr_tx = io.stderr;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
+        let tail = Arc::clone(&config.output_tail);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
@@ -323,6 +341,7 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         update_activity(&act, &fb);
+                        tail.push_bytes(&buf[..n]);
                         if sink_open && stderr_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -362,6 +381,7 @@ pub(crate) fn bridge_piped(
     BridgeResult {
         stdin_injector: stdin_tx,
         stuck_tx,
+        output_tail: config.output_tail,
     }
 }
 
@@ -700,6 +720,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
             },
         );
         // Non-interactive flow: drop the engine's stdin handle so the writer
@@ -756,6 +777,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
             },
         );
         drop(bridge.stdin_injector);
@@ -811,6 +833,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
             },
         );
         // Drop the engine's stdin sender so `cat` sees EOF after the payload.
@@ -886,6 +909,7 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
             },
         );
         drop(bridge.stdin_injector);

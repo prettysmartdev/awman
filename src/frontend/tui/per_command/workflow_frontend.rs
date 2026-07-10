@@ -213,12 +213,22 @@ impl WorkflowFrontend for TuiCommandFrontend {
                 guard.get_or_insert_with(crate::frontend::tui::tabs::WorkflowViewState::default);
             view.steps = steps
                 .iter()
-                .map(|s| crate::frontend::tui::tabs::WorkflowStepView {
-                    name: s.name.clone(),
-                    status: workflow_status_str(&s.status).to_string(),
-                    agent: Some(s.agent.clone()),
-                    model: s.model.clone(),
-                    depends_on: s.depends_on.clone(),
+                .map(|s| {
+                    // Only surface agent/model on the strip when the step itself
+                    // declares one — otherwise it inherits the project defaults
+                    // and gets no label (WI: workflow-strip agent/model labels).
+                    let (agent, model) = if s.has_step_override {
+                        (Some(s.agent.clone()), s.model.clone())
+                    } else {
+                        (None, None)
+                    };
+                    crate::frontend::tui::tabs::WorkflowStepView {
+                        name: s.name.clone(),
+                        status: workflow_status_str(&s.status).to_string(),
+                        agent,
+                        model,
+                        depends_on: s.depends_on.clone(),
+                    }
                 })
                 .collect();
             view.current_step = steps

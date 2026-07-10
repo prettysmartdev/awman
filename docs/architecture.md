@@ -662,6 +662,10 @@ Global skills live at `$HOME/.awman/skills/` (or `$AWMAN_CONFIG_HOME/skills/`). 
 
 Typed access to global and per-repo workflow directories. Same structure as `SkillDirs`: global at `$HOME/.awman/workflows/`, per-repo at `<git_root>/.awman/workflows/`.
 
+#### `WorkflowLogPaths` (`fs/log_dirs.rs`)
+
+Resolves and writes per-container failure logs under `$HOME/.awman/logs/` (or `$AWMAN_CONFIG_HOME/logs/`). When a workflow step's container exits with a non-zero code that awman did not cause, the engine hands this type the buffered output tail and a `(workflow-id, step-name, container-name)` identity; it sanitises the name components, ensures the directory exists, and writes `{workflow-id}-{step-name}-{container-name}.log`. All filesystem access for the feature stays in Layer 0; the engine never touches `std::fs`.
+
 #### `OverlayPathResolver` (`fs/overlay_paths.rs`)
 
 Resolves overlay host paths from raw user input. Path *mounting* into containers is Layer 1; path *resolution* is Layer 0.
@@ -1057,7 +1061,9 @@ impl GitEngine {
     pub fn create_worktree(&self, git_root, worktree_path, branch) -> Result<(), EngineError>;
     pub fn remove_worktree(&self, git_root, worktree_path) -> Result<(), EngineError>;
 
-    // Merge strategy: git merge --squash <branch> + git commit -m "Implement <branch>"
+    // Merge strategies:
+    //   squash: git merge --squash <branch> + git commit -m "Implement <branch>"
+    //   plain:  git merge -m "Merge <branch>" <branch> (preserves branch commits)
     pub fn merge_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError>;
     pub fn commit_all(&self, path: &Path, message: &str) -> Result<(), EngineError>;
     pub fn delete_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError>;
@@ -1811,6 +1817,8 @@ pub enum PreWorktreeDecision {
 pub enum ExistingWorktreeDecision { Resume, Recreate }
 
 pub enum PostWorkflowWorktreeAction { Merge, Discard, Keep }
+
+pub enum WorktreeMergeMode { Merge /* no squash */, Squash, LeaveBranch }
 ```
 
 #### `WorktreeLifecycleFrontend` trait
@@ -1824,7 +1832,7 @@ pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
     fn report_worktree_created(&mut self, path: &Path, branch: &str);
     fn ask_post_workflow_action(&mut self, branch: &str, had_error: bool) -> Result<PostWorkflowWorktreeAction, CommandError>;
     fn ask_worktree_commit_before_merge(&mut self, branch: &str, files: &[String]) -> Result<Option<String>, CommandError>;
-    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError>;
+    fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError>;
     fn confirm_worktree_cleanup(&mut self, branch: &str, path: &Path) -> Result<bool, CommandError>;
     fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, git_root: &Path);
     fn report_worktree_discarded(&mut self, branch: &str);
@@ -1859,7 +1867,7 @@ impl WorktreeLifecycle {
 
 `prepare` steps: check for existing worktree → if exists call `ask_existing_worktree` (Resume or Recreate); check for uncommitted files → if present call `ask_pre_worktree_uncommitted_files`; create worktree; report.
 
-`finalize` steps: call `ask_post_workflow_action`; on Merge → optional commit → squash-merge → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
+`finalize` steps: call `ask_post_workflow_action`; on Merge → `ask_merge_mode` (plain merge / squash / leave branch alone) → optional commit of uncommitted files (runs for every mode, including LeaveBranch) → merge per mode → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
 
 Merge conflicts are non-fatal: `finalize` catches `EngineError::MergeConflict`, calls `report_merge_conflict`, and returns `Ok(())`. The user resolves the conflict manually.
 

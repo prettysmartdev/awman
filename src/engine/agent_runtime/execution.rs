@@ -7,6 +7,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::engine::agent_runtime::frontend::AgentFrontend;
+use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::error::EngineError;
 
 pub use crate::data::session::AgentHandle;
@@ -80,6 +81,12 @@ pub struct AgentExecution {
     handle: AgentHandle,
     inner: ExecutionState,
     stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    /// Rolling buffer of the container's recent combined stdout/stderr, fed by
+    /// the I/O bridge. `None` for paradigms without a byte-stream bridge (e.g.
+    /// sandbox-class runtimes) and for the inert/test constructor. The workflow
+    /// engine reads this after `wait()` to persist a failure log when a
+    /// container exits unexpectedly.
+    output_tail: Option<Arc<OutputTail>>,
 }
 
 enum ExecutionState {
@@ -136,11 +143,13 @@ impl AgentExecution {
         handle: AgentHandle,
         backend: Box<dyn ExecutionBackend>,
         stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+        output_tail: Option<Arc<OutputTail>>,
     ) -> Self {
         Self {
             handle,
             inner: ExecutionState::Running(backend),
             stuck_tx,
+            output_tail,
         }
     }
 
@@ -152,7 +161,28 @@ impl AgentExecution {
             handle,
             inner: ExecutionState::Finished(info),
             stuck_tx: Arc::new(tx),
+            output_tail: None,
         }
+    }
+
+    /// Shared handle to this execution's rolling output tail, if the runtime
+    /// captures one. Cloneable and readable after `wait()` resolves.
+    pub fn output_tail(&self) -> Option<Arc<OutputTail>> {
+        self.output_tail.clone()
+    }
+
+    /// Construct a pre-finished execution carrying an output tail. Test-only:
+    /// lets engine tests exercise the container failure-log path without a live
+    /// runtime.
+    #[cfg(test)]
+    pub(crate) fn finished_with_tail(
+        handle: AgentHandle,
+        info: AgentExitInfo,
+        output_tail: Option<Arc<OutputTail>>,
+    ) -> Self {
+        let mut execution = Self::finished(handle, info);
+        execution.output_tail = output_tail;
+        execution
     }
 
     pub fn handle(&self) -> &AgentHandle {

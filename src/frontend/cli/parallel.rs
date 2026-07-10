@@ -38,7 +38,7 @@ use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, Workf
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend,
+    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
@@ -366,8 +366,8 @@ impl WorktreeLifecycleFrontend for CliParallelFrontend {
             .ask_worktree_commit_before_merge(branch, files, suggested_message)
     }
 
-    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError> {
-        self.inner.confirm_squash_merge(branch)
+    fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError> {
+        self.inner.ask_merge_mode(branch)
     }
 
     fn confirm_worktree_cleanup(

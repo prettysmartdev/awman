@@ -39,7 +39,7 @@ use crate::command::commands::specs::SpecsCommandFrontend;
 use crate::command::commands::status::StatusCommandFrontend;
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
-    WorktreeLifecycleFrontend,
+    WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::projections::raw_args::ParsedArgs;
@@ -877,8 +877,9 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         Ok(Some(suggested_message.to_string()))
     }
 
-    fn confirm_squash_merge(&mut self, _branch: &str) -> Result<bool, CommandError> {
-        Ok(true)
+    fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
+        // Headless API runs keep the historical behaviour: squash merge.
+        Ok(WorktreeMergeMode::Squash)
     }
 
     fn confirm_worktree_cleanup(

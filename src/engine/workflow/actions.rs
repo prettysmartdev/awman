@@ -153,6 +153,10 @@ pub struct WorkflowStepProgressInfo {
     pub agent: String,
     /// Resolved model, if any.
     pub model: Option<String>,
+    /// Whether the step itself declares an `agent` or `model` field. When
+    /// `false`, the resolved `agent`/`model` above come entirely from the
+    /// project defaults, so the strip renders no agent/model label for the step.
+    pub has_step_override: bool,
     pub status: WorkflowStepStatus,
     /// Steps this one depends on. Drives the topological column grouping in
     /// the workflow strip renderer.
