@@ -36,9 +36,10 @@ impl WorkflowStateStore {
     /// Resolve the on-disk path for the state of a given workflow.
     pub fn state_path(&self, work_item: Option<u32>, workflow_name: &str) -> PathBuf {
         let repo_hash = &sha256_hex(&self.git_root.to_string_lossy())[..8];
+        let name = sanitize_name_for_filename(workflow_name);
         let filename = match work_item {
-            Some(wi) => format!("{repo_hash}-{wi:04}-{workflow_name}.json"),
-            None => format!("{repo_hash}-{workflow_name}.json"),
+            Some(wi) => format!("{repo_hash}-{wi:04}-{name}.json"),
+            None => format!("{repo_hash}-{name}.json"),
         };
         self.dir().join(filename)
     }
@@ -103,6 +104,35 @@ impl WorkflowStateStore {
         }
         Ok(())
     }
+}
+
+/// Sanitize a workflow name/title into a filesystem-safe filename component.
+///
+/// A workflow's name is derived from its human-readable title, which may
+/// legitimately contain path separators (`/`), spaces, or other characters
+/// that are unsafe in a filename — e.g. a dynamic leader emitting the title
+/// `"issue-triage across Rust/TS/Python"`. Embedding such a name directly in a
+/// state filename turns the `/` into directory separators and makes
+/// `std::fs::write` fail with `No such file or directory`. Only ASCII
+/// alphanumerics, `-`, and `_` survive; every other character becomes `-`.
+/// Both state stores must sanitize identically so save and load agree on the
+/// path.
+pub fn sanitize_name_for_filename(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(64);
+    if out.is_empty() {
+        out.push_str("workflow");
+    }
+    out
 }
 
 /// Compute the SHA-256 hash of `data`, returned as a lowercase hex string.
@@ -238,6 +268,33 @@ mod tests {
             name1, name2,
             "different git roots should yield different state filenames"
         );
+    }
+
+    #[test]
+    fn sanitize_name_replaces_path_unsafe_characters() {
+        assert_eq!(
+            sanitize_name_for_filename("Rust/TS/Python"),
+            "Rust-TS-Python"
+        );
+        assert_eq!(sanitize_name_for_filename("a b/c"), "a-b-c");
+        assert_eq!(sanitize_name_for_filename("keep-_ok123"), "keep-_ok123");
+        assert_eq!(sanitize_name_for_filename(""), "workflow");
+        let traversal = sanitize_name_for_filename("../../etc/passwd");
+        assert!(!traversal.contains('/'), "got {traversal}");
+        assert!(!traversal.contains(".."), "got {traversal}");
+    }
+
+    #[test]
+    fn save_with_path_unsafe_name_stays_flat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let inv = make_invocation("wf/with/slashes and spaces");
+        let path = store.save(&inv).unwrap();
+        assert_eq!(
+            path.parent().unwrap(),
+            tmp.path().join(".awman").join("workflows"),
+        );
+        assert!(store.load(None, "wf/with/slashes and spaces").is_ok());
     }
 
     // ─── validate_resume_compatibility ───────────────────────────────────────

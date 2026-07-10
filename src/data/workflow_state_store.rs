@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::error::DataError;
-use crate::data::fs::workflow_state::sha256_hex;
+use crate::data::fs::workflow_state::{sanitize_name_for_filename, sha256_hex};
 use crate::data::session::Session;
 use crate::data::workflow_state::WorkflowState;
 
@@ -40,9 +40,10 @@ impl WorkflowStateStore {
 
     fn filename_for(&self, work_item: Option<u32>, workflow_name: &str) -> PathBuf {
         let repo_hash = &sha256_hex(&self.git_root.to_string_lossy())[..8];
+        let name = sanitize_name_for_filename(workflow_name);
         let filename = match work_item {
-            Some(wi) => format!("{repo_hash}-{wi:04}-{workflow_name}.json"),
-            None => format!("{repo_hash}-{workflow_name}.json"),
+            Some(wi) => format!("{repo_hash}-{wi:04}-{name}.json"),
+            None => format!("{repo_hash}-{name}.json"),
         };
         self.dir().join(filename)
     }
@@ -184,5 +185,34 @@ mod tests {
         let loaded = store.load(Some(42), "implement").unwrap().unwrap();
         assert_eq!(loaded.work_item, Some(42));
         assert_eq!(loaded.workflow_name, "implement");
+    }
+
+    #[test]
+    fn save_with_path_unsafe_workflow_name_stays_flat_and_round_trips() {
+        // A dynamic leader can emit a title with slashes/spaces. The state
+        // file must land directly in .awman/workflows/ (not a nested dir)
+        // and load must resolve the same sanitized path.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let name = "0008/issue-triage across Rust/TS/Python";
+        let mut s = fresh_state(name);
+        s.work_item = Some(8);
+
+        let path = store.save(&s).unwrap();
+        assert!(path.exists(), "state file should have been written");
+        assert_eq!(
+            path.parent().unwrap(),
+            tmp.path().join(".awman").join("workflows"),
+            "path-unsafe name must not create nested directories"
+        );
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert!(!filename.contains('/'), "filename={filename}");
+
+        let loaded = store.load(Some(8), name).unwrap().unwrap();
+        assert_eq!(loaded.work_item, Some(8));
+        assert_eq!(
+            loaded.workflow_name, name,
+            "the raw name is preserved in state"
+        );
     }
 }

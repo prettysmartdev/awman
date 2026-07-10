@@ -1844,6 +1844,30 @@ enum LeaderDriveOutcome {
     Advanced,
     /// The user aborted the dynamic invocation.
     Aborted,
+    /// The user paused at the leader step — stop cleanly (no error) and leave
+    /// the worktree in place so re-running resumes with a fresh leader.
+    Paused,
+    /// The user asked (via the Workflow Control Board) to restart the leader
+    /// agent from scratch. The caller relaunches a fresh leader with the
+    /// original prompt.
+    Restart,
+}
+
+/// Outcome of the Workflow Control Board while it is driven from the dynamic
+/// leader phase (there is no `WorkflowEngine` yet, so the leader loop maps the
+/// returned [`NextAction`] onto these leader-scoped choices).
+enum LeaderControlOutcome {
+    /// Right arrow — kill the leader and start the generated workflow.
+    StartWorkflow,
+    /// Up arrow — restart the leader agent from scratch.
+    Restart,
+    /// Ctrl-C / `[a]` — abort the dynamic invocation with an error.
+    Abort,
+    /// `[p]` — kill the leader and stop cleanly; resumable by re-running.
+    Pause,
+    /// Esc, or any action that is not meaningful before a workflow exists —
+    /// close the board and keep waiting on the leader.
+    Dismiss,
 }
 
 impl ExecWorkflowCommand {
@@ -2037,9 +2061,19 @@ impl ExecWorkflowCommand {
         let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
             Arc::new(Mutex::new(frontend));
 
+        // ── Wire an engine request channel so Ctrl-W opens the Workflow
+        //    Control Board during the leader phase (the leader runs without a
+        //    `WorkflowEngine`, so nothing else installs a sender). Registering
+        //    it here makes the shared `engine_tx_shared` slot the TUI reads
+        //    non-empty; the leader select loops below drain the receiver. The
+        //    real engine overwrites this sender once the generated workflow
+        //    starts.
+        let (engine_tx, mut engine_rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
+        shared.lock().unwrap().set_engine_sender(engine_tx);
+
         // ── Leader + repair loop (WI-0092 §9). ──────────────────────────────
         let mut attempt = 0usize;
-        let mut current_prompt = leader_prompt;
+        let mut current_prompt = leader_prompt.clone();
         let validated_workflow = loop {
             let label = if attempt == 0 {
                 "leader".to_string()
@@ -2057,12 +2091,46 @@ impl ExecWorkflowCommand {
                     leader_context_overlays.clone(),
                     leader_system_prompt.clone(),
                     &label,
+                    &mut engine_rx,
                 )
                 .await?;
-            if matches!(drive, LeaderDriveOutcome::Aborted) {
-                return Err(CommandError::Other(
-                    "dynamic workflow aborted during the leader step".into(),
-                ));
+            match drive {
+                LeaderDriveOutcome::Advanced => {}
+                LeaderDriveOutcome::Aborted => {
+                    return Err(CommandError::Other(
+                        "dynamic workflow aborted during the leader step".into(),
+                    ));
+                }
+                LeaderDriveOutcome::Paused => {
+                    // Clean stop at the leader step — no error, worktree left in
+                    // place. Re-running the command starts a fresh leader.
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!(
+                            "Dynamic workflow paused at the leader step. Re-run \
+                             `awman exec workflow --dynamic --work-item {wi_number}` to resume \
+                             with a fresh leader."
+                        ),
+                    });
+                    return Ok(ExecWorkflowOutcome {
+                        workflow: format!("dynamic-{wi_number:04}"),
+                        exit_code: None,
+                        worktree_used: true,
+                    });
+                }
+                LeaderDriveOutcome::Restart => {
+                    // Discard any partial workflow.toml and relaunch a fresh
+                    // leader with the original prompt (the repair budget resets
+                    // — a user restart is not a validation failure).
+                    let _ = std::fs::remove_file(&generated_path);
+                    attempt = 0;
+                    current_prompt = leader_prompt.clone();
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: "Restarting the dynamic workflow leader agent…".into(),
+                    });
+                    continue;
+                }
             }
 
             // Mutation guard: the leader may only write under the context dir.
@@ -2169,6 +2237,7 @@ impl ExecWorkflowCommand {
         context_overlays: Vec<crate::engine::overlay::ContextOverlay>,
         system_prompt: Option<String>,
         label: &str,
+        engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
     ) -> Result<LeaderDriveOutcome, CommandError> {
         use crate::engine::agent_runtime::execution::{StuckEvent, KILLED_EXIT_CODE};
 
@@ -2255,6 +2324,7 @@ impl ExecWorkflowCommand {
                                 &shared,
                                 &mut wait_rx,
                                 &mut stuck_rx,
+                                engine_rx,
                                 label,
                             )
                             .await
@@ -2284,6 +2354,15 @@ impl ExecWorkflowCommand {
                                         .report_container_exited(KILLED_EXIT_CODE);
                                     break LeaderDriveOutcome::Aborted;
                                 }
+                                // Ctrl-W during the countdown: cancel the
+                                // countdown and open the WCB in its place.
+                                LeaderCountdownOutcome::ShowControlBoard => {
+                                    let choice = show_leader_control_board(&shared, label);
+                                    match apply_leader_control_outcome(choice, &cancel, &shared) {
+                                        Some(o) => break o,
+                                        None => continue,
+                                    }
+                                }
                             }
                         }
                         Ok(StuckEvent::Unstuck) => continue,
@@ -2303,6 +2382,17 @@ impl ExecWorkflowCommand {
                         }
                     }
                 }
+                // Ctrl-W while the leader is actively running (not stuck): open
+                // the Workflow Control Board on request.
+                Some(req) = engine_rx.recv() => {
+                    if let EngineRequest::OpenControlBoard { .. } = req {
+                        let choice = show_leader_control_board(&shared, label);
+                        match apply_leader_control_outcome(choice, &cancel, &shared) {
+                            Some(o) => break o,
+                            None => continue,
+                        }
+                    }
+                }
             }
         };
 
@@ -2311,6 +2401,75 @@ impl ExecWorkflowCommand {
         g.replay_queued();
         Ok(outcome)
     }
+}
+
+/// Build a leader-scoped Workflow Control Board, present it, and map the user's
+/// choice onto a [`LeaderControlOutcome`]. Because the leader phase has no
+/// `WorkflowEngine`/`WorkflowState`, a synthetic single-step state is
+/// constructed so the shared `show_workflow_control_board` renderer has a
+/// running step to name.
+fn show_leader_control_board(
+    shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    label: &str,
+) -> LeaderControlOutcome {
+    use crate::data::workflow_state::{StepState, WorkflowState};
+
+    let mut state = WorkflowState::new(label.to_string(), &[], String::new(), None);
+    state.set_status(label, StepState::Running { container_id: None });
+
+    // `can_dismiss` keeps the full diamond board (not the lightweight step
+    // confirm) and enables the Esc/Dismiss + Pause footer. Only the actions
+    // meaningful before a workflow exists are offered.
+    let available = AvailableActions {
+        can_launch_next: true,
+        launch_next_label: Some("Start dynamic workflow".to_string()),
+        can_restart_current_step: true,
+        can_abort: true,
+        can_dismiss: true,
+        ..Default::default()
+    };
+
+    let action = shared
+        .lock()
+        .unwrap()
+        .show_workflow_control_board(&state, &available);
+
+    match action {
+        Ok(NextAction::LaunchNext) => LeaderControlOutcome::StartWorkflow,
+        Ok(NextAction::RestartCurrentStep) => LeaderControlOutcome::Restart,
+        Ok(NextAction::Abort) => LeaderControlOutcome::Abort,
+        Ok(NextAction::Pause) => LeaderControlOutcome::Pause,
+        // Dismiss, or any action not valid before a workflow exists
+        // (Continue/CancelToPrevious/Finish), just closes the board.
+        Ok(_) | Err(_) => LeaderControlOutcome::Dismiss,
+    }
+}
+
+/// Apply a leader-phase WCB choice: for every terminal choice, kill the leader
+/// container (reporting the exit) and return the drive outcome to break the
+/// leader loop with; `None` means Dismiss — keep the leader running.
+fn apply_leader_control_outcome(
+    outcome: LeaderControlOutcome,
+    cancel: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
+    shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+) -> Option<LeaderDriveOutcome> {
+    use crate::engine::agent_runtime::execution::KILLED_EXIT_CODE;
+
+    let drive = match outcome {
+        LeaderControlOutcome::StartWorkflow => LeaderDriveOutcome::Advanced,
+        LeaderControlOutcome::Restart => LeaderDriveOutcome::Restart,
+        LeaderControlOutcome::Abort => LeaderDriveOutcome::Aborted,
+        LeaderControlOutcome::Pause => LeaderDriveOutcome::Paused,
+        LeaderControlOutcome::Dismiss => return None,
+    };
+    if let Some(c) = cancel {
+        let _ = c.cancel();
+    }
+    shared
+        .lock()
+        .unwrap()
+        .report_container_exited(KILLED_EXIT_CODE);
+    Some(drive)
 }
 
 /// Result of the leader yolo countdown.
@@ -2324,6 +2483,8 @@ enum LeaderCountdownOutcome {
     Recovered,
     /// The user aborted.
     Abort,
+    /// The user pressed Ctrl-W — cancel the countdown and open the WCB.
+    ShowControlBoard,
 }
 
 /// Drive the 60-second yolo countdown for the leader step, reusing the same
@@ -2336,6 +2497,7 @@ async fn run_leader_yolo_countdown(
     stuck_rx: &mut tokio::sync::broadcast::Receiver<
         crate::engine::agent_runtime::execution::StuckEvent,
     >,
+    engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
     step_name: &str,
 ) -> LeaderCountdownOutcome {
     use crate::engine::agent_runtime::execution::StuckEvent;
@@ -2373,6 +2535,11 @@ async fn run_leader_yolo_countdown(
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
+            }
+            Some(req) = engine_rx.recv() => {
+                if let EngineRequest::OpenControlBoard { .. } = req {
+                    break LeaderCountdownOutcome::ShowControlBoard;
                 }
             }
             _ = tokio::time::sleep(tick) => {
@@ -5147,5 +5314,52 @@ prompt = "do something useful"
         // awman exec workflow --dynamic --work-item 42 in a test repo with a
         // stubbed leader agent produces and executes a valid workflow.
         todo!("end-to-end dynamic workflow test")
+    }
+
+    /// The leader-phase Workflow Control Board maps each `NextAction` returned
+    /// by the frontend onto the correct leader-scoped outcome (right arrow =
+    /// start workflow, up = restart, Ctrl-C/Pause = abort, everything else =
+    /// dismiss).
+    #[test]
+    fn leader_control_board_maps_actions() {
+        fn outcome_for(action: NextAction) -> LeaderControlOutcome {
+            let mut fe = FakeExecWorkflowFrontend::new();
+            fe.next_action_response = action;
+            let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
+                Arc::new(Mutex::new(Box::new(fe)));
+            show_leader_control_board(&shared, "leader")
+        }
+
+        assert!(matches!(
+            outcome_for(NextAction::LaunchNext),
+            LeaderControlOutcome::StartWorkflow
+        ));
+        assert!(matches!(
+            outcome_for(NextAction::RestartCurrentStep),
+            LeaderControlOutcome::Restart
+        ));
+        assert!(matches!(
+            outcome_for(NextAction::Abort),
+            LeaderControlOutcome::Abort
+        ));
+        assert!(matches!(
+            outcome_for(NextAction::Pause),
+            LeaderControlOutcome::Pause
+        ));
+        assert!(matches!(
+            outcome_for(NextAction::Dismiss),
+            LeaderControlOutcome::Dismiss
+        ));
+        // Actions with no meaning before a workflow exists just close the board.
+        assert!(matches!(
+            outcome_for(NextAction::CancelToPreviousStep),
+            LeaderControlOutcome::Dismiss
+        ));
+        assert!(matches!(
+            outcome_for(NextAction::ContinueInCurrentContainer {
+                prompt: String::new()
+            }),
+            LeaderControlOutcome::Dismiss
+        ));
     }
 }
