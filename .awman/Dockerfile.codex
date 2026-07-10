@@ -25,6 +25,15 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ENTRYPOINT []
 CMD ["/bin/bash"]
 
+# ── Runtime prerequisites ─────────────────────────────────────────────────────
+# Codex sandboxes command execution on Linux with bubblewrap and treats it as a
+# hard prerequisite; without the `bwrap` binary on PATH, sandboxed exec fails.
+# The base image does not ship it, so install it here (as root, before dropping
+# to the runtime user) and prune apt lists to keep the layer small.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── Install agent binary ──────────────────────────────────────────────────────
 # Codex CLI is installed via OpenAI's official installer, which fetches the
 # correct prebuilt binary for the current architecture. The installer drops the
@@ -53,4 +62,5 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
-RUN test -x "$(command -v codex)"
+RUN test -x "$(command -v codex)" \
+    && test -x "$(command -v bwrap)"
