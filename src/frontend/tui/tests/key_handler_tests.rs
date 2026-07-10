@@ -51,7 +51,6 @@ fn tab_with_no_suggestions_leaves_input_unchanged() {
     assert_eq!(app.command_input.text, "zzzzz");
 }
 
-
 // ─── Focus switching ──────────────────────────────────────────────────────
 
 #[test]
@@ -70,7 +69,6 @@ fn esc_in_execution_window_returns_focus_to_command_box() {
     assert_eq!(app.focus, Focus::CommandBox);
 }
 
-
 // ─── Text input (non-dialog) ──────────────────────────────────────────────
 
 #[test]
@@ -85,7 +83,6 @@ fn empty_command_submit_does_not_set_execution_phase() {
     );
 }
 
-
 // ─── Toggle status log ────────────────────────────────────────────────────
 
 #[test]
@@ -96,7 +93,6 @@ fn l_in_execution_window_toggles_status_log() {
     press_char(&mut app, 'l');
     assert_ne!(app.tabs[app.active_tab].status_log_collapsed, initial);
 }
-
 
 // ─── WorkflowControlBoard arrow keys ─────────────────────────────────────
 
@@ -231,7 +227,6 @@ fn wcb_esc_sends_dismissed() {
     assert!(matches!(resp, DialogResponse::Dismissed));
 }
 
-
 // ─── Command box locked during Running ────────────────────────────────────
 
 #[test]
@@ -279,7 +274,6 @@ fn submit_command_blocked_while_running() {
     ));
 }
 
-
 // ─── q with empty box opens QuitConfirm ──────────────────────────────────
 
 #[test]
@@ -302,18 +296,16 @@ fn q_with_nonempty_command_box_inserts_char() {
     assert!(app.active_dialog.is_none());
 }
 
-
 // ─── Any key in Done/Error execution window refocuses command box ─────────
 
 #[test]
 fn any_unhandled_key_in_done_execution_window_refocuses_command_box() {
     let mut app = make_app();
     app.focus = Focus::ExecutionWindow;
-    app.tabs[app.active_tab].execution_phase =
-        crate::frontend::tui::tabs::ExecutionPhase::Done {
-            command: "chat".into(),
-            exit_code: 0,
-        };
+    app.tabs[app.active_tab].execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Done {
+        command: "chat".into(),
+        exit_code: 0,
+    };
     // Press a key that maps to Action::None in execution window context
     press_char(&mut app, 'x');
     assert_eq!(
@@ -327,11 +319,10 @@ fn any_unhandled_key_in_done_execution_window_refocuses_command_box() {
 fn any_unhandled_key_in_error_execution_window_refocuses_command_box() {
     let mut app = make_app();
     app.focus = Focus::ExecutionWindow;
-    app.tabs[app.active_tab].execution_phase =
-        crate::frontend::tui::tabs::ExecutionPhase::Error {
-            command: "chat".into(),
-            message: "failed".into(),
-        };
+    app.tabs[app.active_tab].execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Error {
+        command: "chat".into(),
+        message: "failed".into(),
+    };
     press_char(&mut app, 'z');
     assert_eq!(app.focus, Focus::CommandBox);
 }
@@ -351,7 +342,6 @@ fn unhandled_key_in_running_execution_window_does_not_refocus() {
         "focus must not change during Running"
     );
 }
-
 
 // ─── Ctrl+W workflow control ──────────────────────────────────────────────
 
@@ -446,7 +436,6 @@ fn ctrl_w_in_step_confirm_escalates_to_wcb() {
     );
 }
 
-
 // ─── ContainerWindow cycle / resize ──────────────────────────────────────
 
 #[test]
@@ -516,7 +505,6 @@ fn cycle_to_hidden_does_not_send_resize() {
         crate::frontend::tui::tabs::ContainerWindowState::Maximized,
     );
 }
-
 
 // ─── Workflow strip scroll ────────────────────────────────────────────────
 
@@ -606,7 +594,6 @@ fn scroll_clamped_at_bounds() {
         "scrolling up at offset=0 must not underflow"
     );
 }
-
 
 // ─── Panic log ────────────────────────────────────────────────────────────
 

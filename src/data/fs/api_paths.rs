@@ -215,11 +215,7 @@ impl ApiPaths {
     }
 
     /// Create the output directory for a single command run.
-    pub fn prepare_command_dir(
-        &self,
-        session_id: &str,
-        command_id: &str,
-    ) -> Result<(), DataError> {
+    pub fn prepare_command_dir(&self, session_id: &str, command_id: &str) -> Result<(), DataError> {
         let dir = self.command_dir(session_id, command_id);
         std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))
     }
@@ -384,7 +380,10 @@ mod tests {
                 "prepare_session_dirs must create {sub}/"
             );
         }
-        assert_eq!(paths.session_worktree_dir("s"), session_dir.join("worktree"));
+        assert_eq!(
+            paths.session_worktree_dir("s"),
+            session_dir.join("worktree")
+        );
         assert_eq!(
             paths.session_agent_settings_dir("s"),
             session_dir.join("agent-settings")
@@ -404,7 +403,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = ApiPaths::from_root(tmp.path());
 
-        paths.prepare_command_dir("s", "c").expect("prepare command dir");
+        paths
+            .prepare_command_dir("s", "c")
+            .expect("prepare command dir");
         assert!(paths.command_dir("s", "c").is_dir());
         // Idempotent.
         paths.prepare_command_dir("s", "c").expect("idempotent");

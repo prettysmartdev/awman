@@ -120,6 +120,9 @@ mod tests {
         // The displayed command matches the real invocation: `-e SECRET_KEY`
         // with no `=` and no value anywhere.
         assert!(s.contains("-e SECRET_KEY"), "display: {s}");
-        assert!(!s.contains("SECRET_KEY="), "no value should be rendered: {s}");
+        assert!(
+            !s.contains("SECRET_KEY="),
+            "no value should be rendered: {s}"
+        );
     }
 }

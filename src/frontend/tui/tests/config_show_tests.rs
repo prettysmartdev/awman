@@ -274,7 +274,6 @@ fn esc_cancels_edit_and_clears_rejection_error() {
     );
 }
 
-
 // ─── ConfigShow Ctrl+N add-mapping flow ──────────────────────────────────
 
 #[test]
@@ -410,8 +409,7 @@ fn enter_on_guidance_summary_row_points_at_ctrl_n() {
     press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     assert_eq!(
-        app.status_bar.text,
-        "Press Ctrl+N to add a guidance entry, or edit a per-entry row below",
+        app.status_bar.text, "Press Ctrl+N to add a guidance entry, or edit a per-entry row below",
         "the guidance summary row must steer users to Ctrl+N / per-entry rows"
     );
     assert!(app.active_dialog.is_some(), "dialog must stay open");
@@ -644,4 +642,3 @@ fn ctrl_n_on_non_guidance_row_still_starts_agent_key_flow() {
         "Ctrl+N away from a guidance row must keep the agentsToModels two-phase flow"
     );
 }
-

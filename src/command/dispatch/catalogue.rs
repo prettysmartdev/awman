@@ -2317,9 +2317,13 @@ mod tests {
         assert!(cat
             .removed_flag_hint(["chat", "--overlay", "ssh()"])
             .is_none());
-        assert!(cat.removed_flag_hint(["chat", "--non-interactive"]).is_none());
+        assert!(cat
+            .removed_flag_hint(["chat", "--non-interactive"])
+            .is_none());
         // A flag that merely contains the removed name as a substring must not match.
-        assert!(cat.removed_flag_hint(["chat", "--mount-ssh-extra"]).is_none());
+        assert!(cat
+            .removed_flag_hint(["chat", "--mount-ssh-extra"])
+            .is_none());
         assert!(cat.removed_flag_hint(Vec::<String>::new()).is_none());
     }
 }

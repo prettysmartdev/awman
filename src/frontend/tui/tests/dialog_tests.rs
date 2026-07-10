@@ -15,7 +15,6 @@ fn quit_confirm_y_sets_should_quit() {
     assert!(app.active_dialog.is_none());
 }
 
-
 // ─── FatalError dialog (invalid runtime config) ───────────────────────────
 
 fn fatal_error_dialog() -> Dialog {
@@ -81,7 +80,6 @@ fn quit_confirm_esc_dismisses() {
     assert!(!app.should_quit);
 }
 
-
 // ─── CloseTabConfirm dialog ───────────────────────────────────────────────
 
 #[test]
@@ -116,7 +114,6 @@ fn close_tab_confirm_n_cancels() {
     assert_eq!(app.tabs.len(), initial_len);
 }
 
-
 // ─── YesNo command dialog ─────────────────────────────────────────────────
 
 #[test]
@@ -150,7 +147,6 @@ fn yes_no_command_dialog_n_sends_no_response() {
     assert!(matches!(response, DialogResponse::No));
 }
 
-
 // ─── Command dialog Esc sends Dismissed ──────────────────────────────────
 
 #[test]
@@ -167,7 +163,6 @@ fn esc_on_command_dialog_sends_dismissed() {
     let response = rx.try_recv().unwrap();
     assert!(matches!(response, DialogResponse::Dismissed));
 }
-
 
 // ─── MountScope dialog ────────────────────────────────────────────────────
 
@@ -215,7 +210,6 @@ fn mount_scope_a_sends_char_a() {
     let response = rx.try_recv().unwrap();
     assert!(matches!(response, DialogResponse::Char('a')));
 }
-
 
 // ─── Custom dialog key filtering ────────────────────────────────────────
 
@@ -285,7 +279,6 @@ fn ctrl_m_in_dialog_does_not_cycle_container() {
     );
 }
 
-
 // ─── KindSelect command dialog ────────────────────────────────────────────
 
 #[test]
@@ -326,7 +319,6 @@ fn kind_select_digit_3_sends_index_2() {
     assert!(matches!(response, DialogResponse::Index(2)));
 }
 
-
 // ─── WorkflowStepError dialog ─────────────────────────────────────────────
 
 #[test]
@@ -358,7 +350,6 @@ fn workflow_step_error_a_sends_char_a() {
     let response = rx.try_recv().unwrap();
     assert!(matches!(response, DialogResponse::Char('a')));
 }
-
 
 // ─── ListPicker scroll ────────────────────────────────────────────────────
 
@@ -407,7 +398,6 @@ fn list_picker_enter_sends_selected_index() {
     let response = rx.try_recv().unwrap();
     assert!(matches!(response, DialogResponse::Index(2)));
 }
-
 
 // ─── Dialog Home/End/Delete ───────────────────────────────────────────────
 
@@ -469,4 +459,3 @@ fn delete_in_text_input_dialog_removes_char_at_cursor() {
         panic!("dialog should still be open");
     }
 }
-

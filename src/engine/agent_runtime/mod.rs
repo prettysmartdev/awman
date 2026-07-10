@@ -32,8 +32,8 @@ pub use execution::{
     AgentExecution, AgentExitInfo, AgentHandle, AgentHandlePreview, AgentInstance, AgentStats,
     CancelHandle, StuckEvent,
 };
-pub use output_tail::{OutputTail, DEFAULT_OUTPUT_TAIL_LINES};
 pub use frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+pub use output_tail::{OutputTail, DEFAULT_OUTPUT_TAIL_LINES};
 
 /// Common option carrier between Layer 2 and the runtime tier. Layer 2
 /// constructs whichever variant matches the runtime paradigm it's targeting

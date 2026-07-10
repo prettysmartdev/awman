@@ -24,8 +24,7 @@ use crate::command::error::CommandError;
 /// URL schemes accepted for `remote` session repository URLs. Bare paths and
 /// `file:` URLs are intentionally excluded — a remote session must reference a
 /// genuinely remote repository.
-pub const DEFAULT_REPO_URL_SCHEMES: &[&str] =
-    &["http://", "https://", "git@", "ssh://", "git://"];
+pub const DEFAULT_REPO_URL_SCHEMES: &[&str] = &["http://", "https://", "git@", "ssh://", "git://"];
 
 /// A frontend-agnostic request to create a session. Field shapes mirror the
 /// API's `CreateSessionRequest` body but carry no transport concerns.
@@ -440,7 +439,10 @@ mod validate_tests {
                 .unwrap_or_else(|e| panic!("accepted scheme {url} must validate; got {e:?}"));
             assert_eq!(plan.session_type, "remote");
             assert_eq!(plan.repo_url.as_deref(), Some(url));
-            assert!(plan.cloned_path.is_some(), "remote plan must plan a clone path");
+            assert!(
+                plan.cloned_path.is_some(),
+                "remote plan must plan a clone path"
+            );
             assert_eq!(plan.branch.as_deref(), Some("main"));
         }
     }

@@ -3669,11 +3669,8 @@ mod tests {
             Some("claude"),
             vec![make_step("build", &[], None)],
         );
-        let factory = FakeAgentExecutionFactory::with_output_tail(
-            [0],
-            "awman-build-ok",
-            ["all good"],
-        );
+        let factory =
+            FakeAgentExecutionFactory::with_output_tail([0], "awman-build-ok", ["all good"]);
         let mut engine = make_engine(&session, workflow, factory, []);
 
         engine.step_once().await.unwrap();

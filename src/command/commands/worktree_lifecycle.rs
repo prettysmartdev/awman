@@ -1077,10 +1077,7 @@ mod tests {
                 self.inner
                     .ask_worktree_commit_before_merge(branch, files, suggested_message)
             }
-            fn ask_merge_mode(
-                &mut self,
-                branch: &str,
-            ) -> Result<WorktreeMergeMode, CommandError> {
+            fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError> {
                 self.inner.ask_merge_mode(branch)
             }
             fn confirm_worktree_cleanup(

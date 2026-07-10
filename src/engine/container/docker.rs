@@ -1415,7 +1415,9 @@ mod tests {
             "credential VALUE must never appear in argv; argv: {argv:?}"
         );
         assert!(
-            !argv.iter().any(|a| a == "ANTHROPIC_API_KEY=sk-secret-value"),
+            !argv
+                .iter()
+                .any(|a| a == "ANTHROPIC_API_KEY=sk-secret-value"),
             "the `KEY=VALUE` argv form must not be used for credentials; argv: {argv:?}"
         );
     }

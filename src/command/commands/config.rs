@@ -1091,9 +1091,16 @@ fn set_array_element(
         current = current.get_mut(*part).expect("just inserted nested object");
     }
     // Ensure the array field exists and is an array.
-    if !current.get(*array_field).map(|v| v.is_array()).unwrap_or(false) {
+    if !current
+        .get(*array_field)
+        .map(|v| v.is_array())
+        .unwrap_or(false)
+    {
         if let serde_json::Value::Object(obj) = current {
-            obj.insert(array_field.to_string(), serde_json::Value::Array(Vec::new()));
+            obj.insert(
+                array_field.to_string(),
+                serde_json::Value::Array(Vec::new()),
+            );
         } else {
             return;
         }
@@ -1466,10 +1473,7 @@ mod tests {
         // Unlike agentsToModels, a guidance entry is one free-form string that
         // may itself contain commas.
         let v = validate_and_coerce("dynamicWorkflows.guidance.0", "do X, then Y, then Z").unwrap();
-        assert_eq!(
-            v,
-            serde_json::Value::String("do X, then Y, then Z".into())
-        );
+        assert_eq!(v, serde_json::Value::String("do X, then Y, then Z".into()));
     }
 
     #[test]

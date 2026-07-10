@@ -22,9 +22,7 @@ mod render_tests;
 fn make_engines() -> crate::command::dispatch::Engines {
     let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
     let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-        crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
-            "/tmp",
-        )),
+        crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from("/tmp")),
     ));
     let git_engine = Arc::new(crate::engine::git::GitEngine::new());
     let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(

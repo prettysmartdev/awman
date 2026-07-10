@@ -9,12 +9,7 @@ use super::*;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-fn make_mouse_event(
-    kind: MouseEventKind,
-    col: u16,
-    row: u16,
-    mods: KeyModifiers,
-) -> MouseEvent {
+fn make_mouse_event(kind: MouseEventKind, col: u16, row: u16, mods: KeyModifiers) -> MouseEvent {
     MouseEvent {
         kind,
         column: col,
@@ -400,7 +395,6 @@ fn click_drag_not_forwarded_to_pty_even_when_agent_tracks_mouse() {
     );
 }
 
-
 // ─── Execution window text selection ──────────────────────────────────────
 
 /// Give the active tab a published execution-window inner area and a
@@ -585,8 +579,9 @@ fn exec_copy_selection_uses_grid_snapshot() {
         end_row: 1,
         snapshot: grid,
     });
-    let text =
-        crate::frontend::tui::key_handler::extract_selection_text(app.active_tab().mouse_selection.as_ref().unwrap());
+    let text = crate::frontend::tui::key_handler::extract_selection_text(
+        app.active_tab().mouse_selection.as_ref().unwrap(),
+    );
     assert_eq!(text, "hi\nyo");
 }
 
@@ -615,4 +610,3 @@ fn cycle_container_window_clears_selection() {
          are relative to the window it started in"
     );
 }
-

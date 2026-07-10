@@ -325,7 +325,6 @@ impl Tab {
         self.container_slots.push(slot);
     }
 
-
     /// Drop every container slot (active and dormant) and the command result
     /// channel. Called when the command task is over in any way — the tab
     /// returns to the no-container state.

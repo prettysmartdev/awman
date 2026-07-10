@@ -21,7 +21,9 @@ use tower_http::trace::TraceLayer;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::command::session_create::{SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest};
+use crate::command::session_create::{
+    SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest,
+};
 use crate::command::session_setup::{SessionSetup, SessionSetupObserver};
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
 use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
@@ -321,11 +323,7 @@ async fn handle_create_session(
     let plan = match request.validate(&policy) {
         Ok(plan) => plan,
         Err(e) => {
-            return (
-                session_create_error_status(&e),
-                error_json(e.to_string()),
-            )
-                .into_response();
+            return (session_create_error_status(&e), error_json(e.to_string())).into_response();
         }
     };
 

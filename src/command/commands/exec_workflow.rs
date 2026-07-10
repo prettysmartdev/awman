@@ -2465,10 +2465,7 @@ fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
 /// isolated worktree — the worktree already put the run on its own branch, so
 /// creating/checking out another branch there is redundant (and would move the
 /// worktree off the branch the post-workflow merge dialog operates on).
-fn skip_checkout_branch_steps_in_worktree(
-    workflow: &mut Workflow,
-    sink: &mut dyn UserMessageSink,
-) {
+fn skip_checkout_branch_steps_in_worktree(workflow: &mut Workflow, sink: &mut dyn UserMessageSink) {
     use crate::data::workflow_definition::SetupStep;
     workflow.setup.retain(|entry| match &entry.step {
         SetupStep::CheckoutCreateBranch { branch, .. } => {
@@ -2991,10 +2988,8 @@ mod tests {
         fn ask_merge_mode(
             &mut self,
             _branch: &str,
-        ) -> Result<
-            crate::command::commands::worktree_lifecycle::WorktreeMergeMode,
-            CommandError,
-        > {
+        ) -> Result<crate::command::commands::worktree_lifecycle::WorktreeMergeMode, CommandError>
+        {
             Ok(crate::command::commands::worktree_lifecycle::WorktreeMergeMode::LeaveBranch)
         }
         fn confirm_worktree_cleanup(

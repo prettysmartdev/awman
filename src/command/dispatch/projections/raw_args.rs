@@ -175,11 +175,7 @@ fn flag_default_to_parsed(value: &FlagDefault) -> Option<ParsedFlag> {
 /// Apply the frontend profile's flag defaults to an already-parsed argv. Only
 /// flags the command actually declares are touched, so commands without the
 /// flag are left untouched.
-fn apply_frontend_defaults(
-    parsed: &mut ParsedArgs,
-    spec: &CommandSpec,
-    frontend: FrontendKind,
-) {
+fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend: FrontendKind) {
     for entry in frontend_flag_defaults(frontend) {
         let Some(flag_spec) = spec.find_flag(entry.flag) else {
             continue;
@@ -414,11 +410,13 @@ fn apply_flag(
         }
         FlagKind::U16 => {
             let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            let n = val.parse::<u16>().map_err(|_| CommandError::InvalidFlagValue {
-                command: path.iter().map(|s| s.to_string()).collect(),
-                flag: flag_spec.long.to_string(),
-                reason: format!("'{val}' is not a valid integer (0..=65535)"),
-            })?;
+            let n = val
+                .parse::<u16>()
+                .map_err(|_| CommandError::InvalidFlagValue {
+                    command: path.iter().map(|s| s.to_string()).collect(),
+                    flag: flag_spec.long.to_string(),
+                    reason: format!("'{val}' is not a valid integer (0..=65535)"),
+                })?;
             flags.insert(key, ParsedFlag::U16(n));
             Ok(next)
         }
@@ -570,11 +568,7 @@ mod tests {
     #[test]
     fn api_profile_forces_non_interactive_and_defaults_yolo() {
         let p = cat()
-            .parse_raw_args_with_profile(
-                &["exec", "prompt"],
-                &argv(&["hi"]),
-                FrontendKind::Api,
-            )
+            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("non-interactive"), Some(true));
         assert_eq!(p.flag_bool("yolo"), Some(true));
@@ -588,11 +582,7 @@ mod tests {
         // present, so yolo stays unset and dispatch sees a coherent request.
         // non-interactive stays forced regardless.
         let p = cat()
-            .parse_raw_args_with_profile(
-                &["exec", "prompt"],
-                &argv(&["--plan"]),
-                FrontendKind::Api,
-            )
+            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--plan"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("plan"), Some(true));
         assert_eq!(p.flag_bool("non-interactive"), Some(true));
@@ -603,11 +593,7 @@ mod tests {
     #[test]
     fn cli_and_tui_profiles_apply_no_overrides() {
         let p = cat()
-            .parse_raw_args_with_profile(
-                &["exec", "prompt"],
-                &argv(&["hi"]),
-                FrontendKind::Cli,
-            )
+            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Cli)
             .unwrap();
         // No profile override: non-interactive/yolo are absent unless supplied.
         assert_eq!(p.flag_bool("non-interactive"), None);
@@ -616,9 +602,7 @@ mod tests {
 
     #[test]
     fn unknown_command_path_is_structured_error() {
-        let err = cat()
-            .parse_raw_args(&["nope"], &argv(&[]))
-            .unwrap_err();
+        let err = cat().parse_raw_args(&["nope"], &argv(&[])).unwrap_err();
         assert!(matches!(err, CommandError::UnknownCommand { .. }));
     }
 
@@ -636,11 +620,7 @@ mod tests {
         // yolo is an overridable default, so if the request already set it the
         // profile must not clobber it.
         let p = cat()
-            .parse_raw_args_with_profile(
-                &["exec", "prompt"],
-                &argv(&["--yolo"]),
-                FrontendKind::Api,
-            )
+            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--yolo"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("yolo"), Some(true));
     }

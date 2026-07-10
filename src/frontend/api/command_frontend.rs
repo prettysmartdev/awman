@@ -107,9 +107,11 @@ impl ApiDispatchFrontend {
     /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
         let path: Vec<&str> = subcommand.split_whitespace().collect();
-        let (parsed, parse_error) = match CommandCatalogue::get()
-            .parse_raw_args_with_profile(&path, args, FrontendKind::Api)
-        {
+        let (parsed, parse_error) = match CommandCatalogue::get().parse_raw_args_with_profile(
+            &path,
+            args,
+            FrontendKind::Api,
+        ) {
             Ok(parsed) => (parsed, None),
             Err(e) => (ParsedArgs::default(), Some(e)),
         };
@@ -317,12 +319,10 @@ fn clone_parse_error(e: &CommandError) -> CommandError {
             flag: flag.clone(),
             reason: reason.clone(),
         },
-        CommandError::MissingRequiredFlag { command, flag } => {
-            CommandError::MissingRequiredFlag {
-                command: command.clone(),
-                flag: flag.clone(),
-            }
-        }
+        CommandError::MissingRequiredFlag { command, flag } => CommandError::MissingRequiredFlag {
+            command: command.clone(),
+            flag: flag.clone(),
+        },
         CommandError::MissingRequiredArgument { command, argument } => {
             CommandError::MissingRequiredArgument {
                 command: command.clone(),

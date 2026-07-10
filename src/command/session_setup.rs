@@ -29,9 +29,7 @@ use crate::command::dispatch::Engines;
 use crate::command::session_create::SessionCreatePlan;
 use crate::data::message::UserMessageSink;
 use crate::data::ready_summary::ReadySummary;
-use crate::data::session::{
-    Session, SessionOpenOptions, SessionType, StaticGitRootResolver,
-};
+use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRootResolver};
 use crate::data::session_setup_event::SessionSetupStatus;
 use crate::engine::error::EngineError;
 use crate::engine::ready::frontend::ReadyFrontend;
@@ -221,7 +219,9 @@ impl SessionSetup {
                 })
                 .await
                 .unwrap_or_else(|join_err| {
-                    Err(EngineError::Git(format!("branch task panicked: {join_err}")))
+                    Err(EngineError::Git(format!(
+                        "branch task panicked: {join_err}"
+                    )))
                 });
                 match branch_result {
                     Ok(disposition) => {
@@ -296,14 +296,11 @@ impl SessionSetup {
             if let Some(cloned_path) = self.plan.cloned_path.clone() {
                 let repo_url = self.plan.repo_url.clone().unwrap_or_default();
                 let branch = self.plan.branch.clone().unwrap_or_default();
-                session
-                    .write()
-                    .await
-                    .set_session_type(SessionType::Remote {
-                        repo_url,
-                        branch,
-                        cloned_path,
-                    });
+                session.write().await.set_session_type(SessionType::Remote {
+                    repo_url,
+                    branch,
+                    cloned_path,
+                });
             }
         }
 
@@ -458,7 +455,9 @@ mod tests {
     fn test_engines() -> Engines {
         let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
         let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from("/tmp")),
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
+                "/tmp",
+            )),
         ));
         let git_engine = Arc::new(crate::engine::git::GitEngine::new());
         let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
@@ -506,12 +505,7 @@ mod tests {
             resolved_workdir: cloned_path.clone(),
             cloned_path: Some(cloned_path.clone()),
             // A path that does not exist → `git clone` fails immediately.
-            repo_url: Some(
-                root.path()
-                    .join("no-such-repo.git")
-                    .display()
-                    .to_string(),
-            ),
+            repo_url: Some(root.path().join("no-such-repo.git").display().to_string()),
             branch: None,
         };
 
@@ -525,7 +519,9 @@ mod tests {
             "the partially-cloned directory must be deleted on clone failure"
         );
         // The clone stage was entered and the failure was surfaced for `clone`.
-        assert!(observer.statuses.contains(&SessionSetupStatus::CloningRepository));
+        assert!(observer
+            .statuses
+            .contains(&SessionSetupStatus::CloningRepository));
         assert_eq!(
             observer.failures.len(),
             1,

@@ -44,7 +44,10 @@ use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 /// Build an `AppState` with the given workdir allowlist (empty by default).
-fn make_app_state_with_workdirs(root: &std::path::Path, workdirs: Vec<std::path::PathBuf>) -> Arc<AppState> {
+fn make_app_state_with_workdirs(
+    root: &std::path::Path,
+    workdirs: Vec<std::path::PathBuf>,
+) -> Arc<AppState> {
     let paths = ApiPaths::from_root(root);
     paths.ensure_root().expect("ensure_root");
     let store = SqliteSessionStore::open(paths.root()).expect("open sqlite");
@@ -143,11 +146,18 @@ async fn real_network_create_session_invalid_type_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status().as_u16(), 400, "unknown session_type must be 400");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "unknown session_type must be 400"
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable): current wording mentions the allowed values.
     assert!(
-        body["error"].as_str().unwrap_or("").contains("session_type must be"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("session_type must be"),
         "got {body}"
     );
 
@@ -175,7 +185,10 @@ async fn real_network_create_session_local_missing_workdir_returns_400() {
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable).
     assert!(
-        body["error"].as_str().unwrap_or("").contains("workdir is required"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("workdir is required"),
         "got {body}"
     );
 
@@ -211,7 +224,10 @@ async fn real_network_create_session_local_noncanonical_workdir_returns_400() {
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable).
     assert!(
-        body["error"].as_str().unwrap_or("").contains("Cannot resolve path"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Cannot resolve path"),
         "got {body}"
     );
 
@@ -253,7 +269,10 @@ async fn real_network_create_session_local_offallowlist_workdir_returns_403() {
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable).
     assert!(
-        body["error"].as_str().unwrap_or("").contains("not in the allowlist"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not in the allowlist"),
         "got {body}"
     );
 
@@ -315,7 +334,10 @@ async fn real_network_create_session_remote_missing_repo_url_returns_400() {
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable).
     assert!(
-        body["error"].as_str().unwrap_or("").contains("repo_url is required"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("repo_url is required"),
         "got {body}"
     );
 
@@ -495,7 +517,10 @@ async fn real_network_create_command_missing_session_header_returns_400() {
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable).
     assert!(
-        body["error"].as_str().unwrap_or("").contains("x-awman-session"),
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("x-awman-session"),
         "got {body}"
     );
 
@@ -657,7 +682,14 @@ async fn real_network_create_command_session_not_ready_returns_409() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full("notready-sess", "/work", &ts, "running_ready", "local", None)
+        .insert_session_full(
+            "notready-sess",
+            "/work",
+            &ts,
+            "running_ready",
+            "local",
+            None,
+        )
         .unwrap();
 
     let resp = reqwest::Client::new()
@@ -668,11 +700,7 @@ async fn real_network_create_command_session_not_ready_returns_409() {
         .await
         .unwrap();
 
-    assert_eq!(
-        resp.status().as_u16(),
-        409,
-        "not-ready session must be 409"
-    );
+    assert_eq!(resp.status().as_u16(), 409, "not-ready session must be 409");
     let body: serde_json::Value = resp.json().await.unwrap();
     // TEXT-ASSERTION (relaxable).
     assert!(
@@ -714,7 +742,11 @@ async fn real_network_create_command_active_ready_session_returns_202() {
     assert!(body["command_id"].as_str().is_some(), "got {body}");
     // Finding D: the API frontend forces yolo + non_interactive to true and
     // advertises this in flags_applied. This pins the CURRENT policy location.
-    assert_eq!(body["flags_applied"]["yolo"], serde_json::json!(true), "got {body}");
+    assert_eq!(
+        body["flags_applied"]["yolo"],
+        serde_json::json!(true),
+        "got {body}"
+    );
     assert_eq!(
         body["flags_applied"]["non_interactive"],
         serde_json::json!(true),
@@ -739,7 +771,9 @@ async fn real_network_create_command_active_ready_session_returns_202() {
 fn parse_args_exec_prompt_joins_positionals_with_spaces() {
     let f = make_frontend("exec prompt", &["hello", "brave", "world"]);
     assert_eq!(
-        f.argument(&["exec", "prompt"], "prompt").unwrap().as_deref(),
+        f.argument(&["exec", "prompt"], "prompt")
+            .unwrap()
+            .as_deref(),
         Some("hello brave world"),
         "exec prompt must join positionals with single spaces"
     );
@@ -750,7 +784,9 @@ fn parse_args_exec_prompt_joins_positionals_with_spaces() {
 fn parse_args_exec_prompt_single_positional() {
     let f = make_frontend("exec prompt", &["solo"]);
     assert_eq!(
-        f.argument(&["exec", "prompt"], "prompt").unwrap().as_deref(),
+        f.argument(&["exec", "prompt"], "prompt")
+            .unwrap()
+            .as_deref(),
         Some("solo")
     );
 }
@@ -761,7 +797,9 @@ fn parse_args_exec_prompt_single_positional() {
 fn parse_args_exec_workflow_maps_first_positional() {
     let f = make_frontend("exec workflow", &["build.toml", "ignored"]);
     assert_eq!(
-        f.argument(&["exec", "workflow"], "workflow").unwrap().as_deref(),
+        f.argument(&["exec", "workflow"], "workflow")
+            .unwrap()
+            .as_deref(),
         Some("build.toml")
     );
     assert_eq!(
@@ -775,7 +813,9 @@ fn parse_args_exec_workflow_maps_first_positional() {
 fn parse_args_specs_amend_maps_work_item() {
     let f = make_frontend("specs amend", &["0097", "extra"]);
     assert_eq!(
-        f.argument(&["specs", "amend"], "work_item").unwrap().as_deref(),
+        f.argument(&["specs", "amend"], "work_item")
+            .unwrap()
+            .as_deref(),
         Some("0097")
     );
 }
@@ -816,7 +856,8 @@ fn parse_args_remote_exec_workflow_maps_first_positional() {
         Some("deploy.toml")
     );
     assert_eq!(
-        f.flag_path(&["remote", "exec", "workflow"], "workflow").unwrap(),
+        f.flag_path(&["remote", "exec", "workflow"], "workflow")
+            .unwrap(),
         Some(std::path::PathBuf::from("deploy.toml"))
     );
 }

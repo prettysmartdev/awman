@@ -1047,8 +1047,7 @@ pub(super) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
                 .unwrap_or(false);
             let on_guidance_row = selected_field
                 .map(|f| {
-                    f == "dynamicWorkflows.guidance"
-                        || f.starts_with("dynamicWorkflows.guidance.")
+                    f == "dynamicWorkflows.guidance" || f.starts_with("dynamicWorkflows.guidance.")
                 })
                 .unwrap_or(false);
             let mut spans = vec![

@@ -689,7 +689,8 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(
-            err.to_string().contains(&GUIDANCE_MAX_ENTRY_LEN.to_string()),
+            err.to_string()
+                .contains(&GUIDANCE_MAX_ENTRY_LEN.to_string()),
             "error must name the length cap, got: {err}"
         );
     }

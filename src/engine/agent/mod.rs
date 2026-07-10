@@ -995,8 +995,9 @@ mod tests {
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
         assert!(
-            opts.iter()
-                .any(|o| matches!(o, ContainerOption::SeededPrompt(p) if p == "implement the work item")),
+            opts.iter().any(
+                |o| matches!(o, ContainerOption::SeededPrompt(p) if p == "implement the work item")
+            ),
             "opencode must still carry the seeded prompt"
         );
         assert!(

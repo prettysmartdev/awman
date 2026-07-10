@@ -674,8 +674,7 @@ fn codex_inline_history_insertion_lands_in_scrollback() {
 // ── Agent exit-code reporting and fast-exit output capture ──────────
 
 fn finish_with_chat_outcome(tab: &mut Tab, exit_code: Option<i32>) {
-    let (result_tx, result_rx) =
-        std::sync::mpsc::channel::<Result<CommandOutcome, CommandError>>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<CommandOutcome, CommandError>>();
     tab.command_result_rx = Some(result_rx);
     tab.execution_phase = ExecutionPhase::Running {
         command: "chat".into(),

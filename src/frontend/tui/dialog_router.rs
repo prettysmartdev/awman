@@ -135,7 +135,8 @@ fn config_show_submit(app: &mut App) {
             Some(NewMapEntryPhase::GuidanceEntry) => {
                 let value = state.editor.text.trim().to_string();
                 if value.is_empty() {
-                    toast = Some("Enter a guidance instruction, or press Esc to cancel".to_string());
+                    toast =
+                        Some("Enter a guidance instruction, or press Esc to cancel".to_string());
                 } else {
                     let next_index = state
                         .rows

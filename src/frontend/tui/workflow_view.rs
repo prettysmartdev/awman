@@ -111,11 +111,8 @@ pub fn render_workflow_strip(
                     };
                     let (label, style) =
                         step_box_label_and_style(&name, &step.status, is_current, box_w);
-                    let title = step_agent_model_title(
-                        step.agent.as_deref(),
-                        step.model.as_deref(),
-                        box_w,
-                    );
+                    let title =
+                        step_agent_model_title(step.agent.as_deref(), step.model.as_deref(), box_w);
                     (label, style, title)
                 }
                 ColumnRow::Collapsed { step, extra } => {
@@ -123,7 +120,8 @@ pub fn render_workflow_strip(
                     // A collapsed row summarizes several completed siblings that
                     // may have run under different agents/models, so it carries
                     // no single agent/model label.
-                    let (label, style) = step_box_label_and_style(&name, &step.status, false, box_w);
+                    let (label, style) =
+                        step_box_label_and_style(&name, &step.status, false, box_w);
                     (label, style, None)
                 }
             };
@@ -133,10 +131,7 @@ pub fn render_workflow_strip(
                 .border_type(BorderType::Rounded)
                 .border_style(style);
             if let Some(title) = title {
-                block = block.title(Span::styled(
-                    title,
-                    Style::default().fg(Color::DarkGray),
-                ));
+                block = block.title(Span::styled(title, Style::default().fg(Color::DarkGray)));
             }
             let para = Paragraph::new(label).block(block).style(style);
             frame.render_widget(para, box_area);

@@ -31,11 +31,7 @@ const API_SOURCE_FILES: &[&str] = &[
 /// Read one `src/frontend/api/<file>` and drop the trailing `#[cfg(test)]`
 /// module so only runtime code is scanned.
 fn read_runtime_source(file: &str) -> String {
-    let path = format!(
-        "{}/src/frontend/api/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        file
-    );
+    let path = format!("{}/src/frontend/api/{}", env!("CARGO_MANIFEST_DIR"), file);
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     match src.find("#[cfg(test)]") {
         Some(idx) => src[..idx].to_string(),

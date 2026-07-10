@@ -186,7 +186,11 @@ mod tests {
         let blob = vec![b'x'; MAX_LINE_BYTES * 2 + 10];
         tail.push_bytes(&blob);
         let snap = tail.snapshot();
-        assert!(snap.len() <= 3, "must respect line capacity, got {}", snap.len());
+        assert!(
+            snap.len() <= 3,
+            "must respect line capacity, got {}",
+            snap.len()
+        );
     }
 
     #[test]

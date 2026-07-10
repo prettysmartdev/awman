@@ -165,7 +165,9 @@ impl TuiCommandFrontend {
         let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
 
         let initial_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows),
+            Ok((cols, rows)) => {
+                crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows)
+            }
             Err(_) => (80u16, 24u16),
         };
 
@@ -194,7 +196,9 @@ impl TuiCommandFrontend {
         let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
 
         let initial_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows),
+            Ok((cols, rows)) => {
+                crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows)
+            }
             Err(_) => (80u16, 24u16),
         };
 

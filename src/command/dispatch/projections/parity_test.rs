@@ -298,15 +298,25 @@ fn edge_flag_equals_and_space_forms_parity() {
     let cat = CommandCatalogue::get();
     let path = ["exec", "prompt"];
 
-    let spaced = cat.parse_raw_args(&path, &to_vec(&["--agent", "claude"])).unwrap();
-    let equals = cat.parse_raw_args(&path, &to_vec(&["--agent=claude"])).unwrap();
+    let spaced = cat
+        .parse_raw_args(&path, &to_vec(&["--agent", "claude"]))
+        .unwrap();
+    let equals = cat
+        .parse_raw_args(&path, &to_vec(&["--agent=claude"]))
+        .unwrap();
     assert_eq!(spaced.flag_string("agent").as_deref(), Some("claude"));
     assert_eq!(equals.flag_string("agent").as_deref(), Some("claude"));
 
     let clap_spaced = clap_leaf(cat, &path, &["--agent", "claude"]);
     let clap_equals = clap_leaf(cat, &path, &["--agent=claude"]);
-    assert_eq!(clap_spaced.get_one::<String>("agent").map(String::as_str), Some("claude"));
-    assert_eq!(clap_equals.get_one::<String>("agent").map(String::as_str), Some("claude"));
+    assert_eq!(
+        clap_spaced.get_one::<String>("agent").map(String::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        clap_equals.get_one::<String>("agent").map(String::as_str),
+        Some("claude")
+    );
 }
 
 /// A repeated `VecString` flag accumulates in order, identically to clap.
@@ -413,7 +423,10 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
     let err = cat
         .parse_raw_args(&["api", "start"], &to_vec(&["--port", "not-a-number"]))
         .unwrap_err();
-    assert!(matches!(err, CommandError::InvalidFlagValue { .. }), "got {err:?}");
+    assert!(
+        matches!(err, CommandError::InvalidFlagValue { .. }),
+        "got {err:?}"
+    );
     assert!(cat
         .build_clap_command()
         .try_get_matches_from(["awman", "api", "start", "--port", "not-a-number"])
@@ -421,9 +434,15 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
 
     // Bad enum value → InvalidFlagValue; clap also rejects.
     let err = cat
-        .parse_raw_args(&["remote", "session", "start"], &to_vec(&["--type", "banana"]))
+        .parse_raw_args(
+            &["remote", "session", "start"],
+            &to_vec(&["--type", "banana"]),
+        )
         .unwrap_err();
-    assert!(matches!(err, CommandError::InvalidFlagValue { .. }), "got {err:?}");
+    assert!(
+        matches!(err, CommandError::InvalidFlagValue { .. }),
+        "got {err:?}"
+    );
     assert!(cat
         .build_clap_command()
         .try_get_matches_from(["awman", "remote", "session", "start", "--type", "banana"])
@@ -433,7 +452,10 @@ fn coercion_errors_produce_typed_errors_and_clap_rejects() {
     let err = cat
         .parse_raw_args(&["config", "get"], &to_vec(&["--definitely-not-a-flag"]))
         .unwrap_err();
-    assert!(matches!(err, CommandError::UnknownFlag { .. }), "got {err:?}");
+    assert!(
+        matches!(err, CommandError::UnknownFlag { .. }),
+        "got {err:?}"
+    );
     assert!(cat
         .build_clap_command()
         .try_get_matches_from(["awman", "config", "get", "--definitely-not-a-flag"])

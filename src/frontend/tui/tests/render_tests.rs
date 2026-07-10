@@ -81,8 +81,8 @@ fn render_frame_open_allocates_at_most_a_quarter_to_the_sidebar() {
     app.active_tab_mut().git_sidebar_state = GitSidebarState::Open;
     let width = 80u16;
     let buf = render_app(&mut app, width, 24);
-    let sidebar_x = has_green_sidebar_corner(&buf)
-        .expect("open sidebar must render a green rounded border");
+    let sidebar_x =
+        has_green_sidebar_corner(&buf).expect("open sidebar must render a green rounded border");
     let sidebar_width = width - sidebar_x;
     assert!(
         sidebar_width <= width / 4,
@@ -165,4 +165,3 @@ fn status_bar_omits_summary_when_none() {
         "no diff summary must be shown when the summary is None"
     );
 }
-

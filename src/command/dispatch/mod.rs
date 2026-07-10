@@ -45,9 +45,9 @@ use crate::command::commands::status::{StatusCommand, StatusCommandFlags, Status
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind, FlagSpec};
 use crate::command::error::CommandError;
+use crate::data::config::global::GlobalConfig;
 use crate::data::message::UserMessageSink;
 use crate::data::session::Session;
-use crate::data::config::global::GlobalConfig;
 use crate::engine::agent::AgentEngine;
 use crate::engine::agent_runtime::{self, AgentRuntimeEngine, DetectedRuntime};
 use crate::engine::auth::AuthEngine;
@@ -1693,8 +1693,8 @@ mod tests {
         // error text for that modal.
         let cat = CommandCatalogue::get();
         let cfg = config_with_runtime(Some("totally-bogus-runtime"));
-        let (detected, modal) = Engines::detect(cat, &cfg, &[])
-            .expect("the TUI path must still yield default engines");
+        let (detected, modal) =
+            Engines::detect(cat, &cfg, &[]).expect("the TUI path must still yield default engines");
         assert_eq!(
             detected.engine().runtime_name(),
             "docker",
@@ -1718,13 +1718,11 @@ mod tests {
         // `status` requires a runtime → the unavailable runtime is fatal.
         assert!(cat.requires_runtime(&["status"]));
         match Engines::detect(cat, &cfg, &["status"]) {
-            Err(EngineError::UnknownRuntime { .. }) => panic!(
-                "an unavailable (not unknown) runtime must not surface as UnknownRuntime"
-            ),
+            Err(EngineError::UnknownRuntime { .. }) => {
+                panic!("an unavailable (not unknown) runtime must not surface as UnknownRuntime")
+            }
             Err(_) => {}
-            Ok(_) => panic!(
-                "an unavailable runtime must be fatal for a runtime-requiring command"
-            ),
+            Ok(_) => panic!("an unavailable runtime must be fatal for a runtime-requiring command"),
         }
     }
 
