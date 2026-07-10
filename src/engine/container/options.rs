@@ -135,6 +135,12 @@ pub enum ContainerOption {
     EnvPassthrough(EnvVar),
     EnvLiteral(EnvLiteral),
     SeededPrompt(String),
+    /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
+    /// opencode `--prompt <text>`). Absent means the prompt is appended as a
+    /// trailing positional argv arg, which is what most agents expect. Emitted
+    /// alongside `SeededPrompt` by `build_options` when the agent matrix's
+    /// `interactive_seed_delivery` is `Flag`.
+    InteractiveSeedFlag(String),
     Interactive(bool),
     AllowDocker(bool),
     Yolo(YoloMode),
@@ -206,6 +212,11 @@ pub struct ResolvedContainerOptions {
     pub env_passthrough: Vec<EnvVar>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
+    /// the prompt is appended as a trailing positional argv arg. When `Some`,
+    /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
+    /// since opencode treats a bare positional as a project directory).
+    pub interactive_seed_flag: Option<String>,
     pub interactive: bool,
     pub allow_docker: bool,
     pub yolo: YoloMode,
@@ -259,6 +270,7 @@ impl ResolvedContainerOptions {
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::AllowDocker(v) => self.allow_docker = v,
             ContainerOption::Yolo(v) => self.yolo = v,

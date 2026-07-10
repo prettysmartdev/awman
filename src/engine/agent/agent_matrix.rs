@@ -61,6 +61,10 @@ pub struct AgentMatrix {
     pub allowed_tools_flag: Option<&'static str>,
     /// How model is delivered (`--model NAME` for most).
     pub model_flag: ModelFlagDelivery,
+    /// How a seeded prompt is delivered in interactive mode (positional for
+    /// most; a dedicated flag for agents whose bare positional means something
+    /// else — e.g. opencode `--prompt`).
+    pub interactive_seed_delivery: InteractiveSeedDelivery,
     /// Whether the agent supports mid-session prompt injection over its
     /// already-running container's stdin. Used by the workflow engine to
     /// decide between reusing a long-lived container (when `true`) and
@@ -91,6 +95,28 @@ pub enum ModelFlagDelivery {
     Unsupported,
 }
 
+/// How a seeded initial prompt is delivered when launching in *interactive*
+/// mode.
+///
+/// Most agents accept the prompt as a trailing positional argument to the bare
+/// interactive entrypoint (e.g. `claude "<prompt>"`). A few cannot: opencode's
+/// bare command treats a positional as a *project directory* (`opencode
+/// [project]`), so passing a prompt there makes opencode `open()` the prompt as
+/// a path — which fails with `ENAMETOOLONG` for any real prompt and crashes the
+/// container. Those agents declare a dedicated flag instead (opencode
+/// `--prompt <text>`).
+///
+/// This only governs interactive delivery. Non-interactive runs use the
+/// agent's `non_interactive_flag` entrypoint shape (e.g. `opencode run`) and
+/// receive the prompt over stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveSeedDelivery {
+    /// Append the prompt as the final positional argv argument.
+    Positional,
+    /// Deliver the prompt as a flag pair: `<flag> <text>`.
+    Flag(&'static str),
+}
+
 /// Which Docker Sandbox kit kind awman emits for this agent.
 ///
 /// Consulted only by the sbx kit emitter and launcher (`src/engine/sandbox/
@@ -118,6 +144,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: Some("--disallowedTools"),
             allowed_tools_flag: Some("--allowedTools"),
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Append,
             system_prompt_flag: Some("--append-system-prompt-file"),
@@ -137,6 +164,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             // codex takes the system prompt as `--config developer_instructions=<text>`.
             system_prompt_delivery: SystemPromptMode::AppendInline {
@@ -155,6 +183,10 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            // opencode's bare command treats a positional as a project dir, so a
+            // seeded prompt must go through `--prompt <text>`; a positional
+            // prompt makes opencode `open()` the prompt as a path (ENAMETOOLONG).
+            interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt"),
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::AgentsMd,
             system_prompt_flag: None,
@@ -170,6 +202,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Unsupported,
             system_prompt_flag: None,
@@ -185,6 +218,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::EnvFile {
                 var: "GEMINI_SYSTEM_MD",
@@ -202,6 +236,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::EnvFile {
                 var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS",
@@ -219,6 +254,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Unsupported,
             system_prompt_flag: None,
@@ -234,6 +270,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Replace,
             system_prompt_flag: Some("--system"),
@@ -263,6 +300,10 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::Unsupported,
+            // agy accepts `--prompt-interactive`/`-i` for an interactive seed,
+            // but awman has always seeded it positionally; keep that behavior
+            // until the flag form is verified end-to-end.
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::AddDir { flag: "--add-dir" },
             system_prompt_flag: None,
@@ -330,6 +371,35 @@ mod tests {
     fn opencode_plan_unsupported() {
         let m = matrix_for("opencode").unwrap();
         assert!(m.plan_flag.is_none());
+    }
+
+    #[test]
+    fn opencode_interactive_seed_uses_prompt_flag() {
+        let m = matrix_for("opencode").unwrap();
+        assert_eq!(
+            m.interactive_seed_delivery,
+            InteractiveSeedDelivery::Flag("--prompt"),
+            "opencode must seed interactive prompts via `--prompt`; a bare \
+             positional is a project dir and opencode open()s it (ENAMETOOLONG)"
+        );
+    }
+
+    #[test]
+    fn only_opencode_uses_a_seed_flag_others_are_positional() {
+        for a in SUPPORTED_AGENTS {
+            let m = matrix_for(a).unwrap();
+            match a {
+                &"opencode" => assert!(matches!(
+                    m.interactive_seed_delivery,
+                    InteractiveSeedDelivery::Flag(_)
+                )),
+                _ => assert_eq!(
+                    m.interactive_seed_delivery,
+                    InteractiveSeedDelivery::Positional,
+                    "{a} must seed interactive prompts positionally"
+                ),
+            }
+        }
     }
 
     #[test]

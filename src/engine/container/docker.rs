@@ -929,11 +929,18 @@ pub(super) fn build_run_argv(
         args.push(container_path.display().to_string());
     }
 
-    // Interactive + seeded prompt: pass the prompt as the final positional arg
-    // so the agent receives it as its initial task. Stdin stays inherited.
-    // Non-interactive + seeded prompt is handled via stdin piping at spawn time.
+    // Interactive + seeded prompt: deliver the prompt so the agent receives it
+    // as its initial task. Most agents take it as the final positional arg;
+    // agents that declare an `interactive_seed_flag` (e.g. opencode `--prompt`)
+    // take it as a flag pair, because their bare positional means something else
+    // (opencode treats it as a project directory and `open()`s it → ENAMETOOLONG).
+    // Stdin stays inherited. Non-interactive + seeded prompt is handled via
+    // stdin piping at spawn time.
     if options.interactive {
         if let Some(prompt) = &options.seeded_prompt {
+            if let Some(flag) = &options.interactive_seed_flag {
+                args.push(flag.clone());
+            }
             args.push(prompt.clone());
         }
     }
@@ -1234,6 +1241,37 @@ mod tests {
             argv.last().map(|s| s.as_str()),
             Some("hello"),
             "seeded prompt must be last positional arg"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_interactive_seed_flag_delivers_prompt_via_flag_not_positional() {
+        // opencode-shaped delivery: a seed flag is present, so the prompt must
+        // be emitted as `<flag> <text>` rather than a bare positional (which
+        // opencode would treat as a project dir and open() → ENAMETOOLONG).
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+            ContainerOption::SeededPrompt("do the task".into()),
+            ContainerOption::InteractiveSeedFlag("--prompt".into()),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--prompt" && w[1] == "do the task"),
+            "seed flag must deliver the prompt as `--prompt <text>`; got {argv:?}"
+        );
+        // The prompt must never appear as a lone positional immediately after
+        // the image (which is what breaks opencode).
+        let img_idx = argv.iter().position(|a| a == "img:latest").unwrap();
+        assert_ne!(
+            argv.get(img_idx + 1).map(|s| s.as_str()),
+            Some("do the task"),
+            "prompt must not be a bare positional after the image; got {argv:?}"
         );
     }
 

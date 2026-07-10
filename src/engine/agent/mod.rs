@@ -271,9 +271,17 @@ impl AgentEngine {
             options.push(ContainerOption::AgentModeFlags(mode_flags));
         }
 
-        // Initial prompt (seeded into the container's stdin).
+        // Initial prompt. In interactive mode most agents receive it as a
+        // trailing positional arg; agents whose bare positional means something
+        // else (opencode: a project dir) declare a delivery flag in the matrix.
+        // Non-interactive runs pipe it over stdin regardless.
         if let Some(prompt) = run.initial_prompt.as_ref() {
             options.push(ContainerOption::SeededPrompt(prompt.clone()));
+            if let agent_matrix::InteractiveSeedDelivery::Flag(flag) =
+                matrix.interactive_seed_delivery
+            {
+                options.push(ContainerOption::InteractiveSeedFlag(flag.to_string()));
+            }
         }
 
         // Model flag.
@@ -973,6 +981,46 @@ mod tests {
         assert!(
             has_flag,
             "NonInteractivePrintFlag 'run' must be present for crush"
+        );
+    }
+
+    #[test]
+    fn build_options_opencode_seeded_prompt_emits_interactive_seed_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("opencode").unwrap();
+        let run = AgentRunOptions {
+            initial_prompt: Some("implement the work item".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+        assert!(
+            opts.iter()
+                .any(|o| matches!(o, ContainerOption::SeededPrompt(p) if p == "implement the work item")),
+            "opencode must still carry the seeded prompt"
+        );
+        assert!(
+            opts.iter()
+                .any(|o| matches!(o, ContainerOption::InteractiveSeedFlag(f) if f == "--prompt")),
+            "opencode must emit InteractiveSeedFlag(--prompt) alongside the seeded prompt"
+        );
+    }
+
+    #[test]
+    fn build_options_claude_seeded_prompt_has_no_interactive_seed_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            initial_prompt: Some("do it".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, ContainerOption::InteractiveSeedFlag(_))),
+            "claude seeds positionally and must not emit an InteractiveSeedFlag"
         );
     }
 
