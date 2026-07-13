@@ -667,7 +667,7 @@ mod tests {
         // A parallel group of 5 where 3 are completed collapses the completed
         // ones into a single "(+N completed)" summary at the top, followed by
         // the still-active siblings.
-        let steps = vec![
+        let steps = [
             step("a", "done", vec![]),
             step("b", "done", vec![]),
             step("c", "done", vec![]),
@@ -704,7 +704,7 @@ mod tests {
     fn sequential_column_never_collapses() {
         // A single-step column is not a parallel group, so a lone completed
         // step is rendered as its own box, never collapsed.
-        let steps = vec![step("only", "done", vec![])];
+        let steps = [step("only", "done", vec![])];
         let col: Vec<&WorkflowStepView> = steps.iter().collect();
         let rows = build_column_rows(&col, None);
         assert_eq!(rows.len(), 1);
@@ -761,7 +761,7 @@ mod tests {
     fn column_rows_mark_steps_beyond_max_concurrent_as_queued() {
         // With max_concurrent = 2, pending siblings past the second are marked
         // queued (rendered with a `·` prefix).
-        let steps = vec![
+        let steps = [
             step("a", "running", vec![]),
             step("b", "running", vec![]),
             step("c", "pending", vec![]),
