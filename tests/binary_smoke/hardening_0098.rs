@@ -104,7 +104,13 @@ fn mount_ssh_value_form_exits_exactly_2() {
 fn invalid_runtime_config_is_fatal_for_cli_with_exit_2() {
     let repo = make_git_repo();
     // Global config lives at `$HOME/.awman/config.json`; point HOME at the temp
-    // repo so this test never touches the developer's real config.
+    // repo so this test never touches the developer's real config. Crucially,
+    // pin `AWMAN_CONFIG_HOME` (highest-precedence config-home override) at that
+    // same dir: without it, an ambient `AWMAN_CONFIG_HOME`/`XDG_CONFIG_HOME` on
+    // the runner would shadow `$HOME/.awman`, the bad-runtime config would be
+    // ignored, and `awman status` would fall through to a real `docker ps` —
+    // which blocks indefinitely on a slow/wedged daemon (the CI hang) instead
+    // of hitting the fast invalid-runtime fatal this test asserts.
     let awman_dir = repo.path().join(".awman");
     std::fs::create_dir_all(&awman_dir).expect("create .awman");
     std::fs::write(
@@ -116,6 +122,8 @@ fn invalid_runtime_config_is_fatal_for_cli_with_exit_2() {
     let output = awman()
         .current_dir(repo.path())
         .env("HOME", repo.path())
+        .env("AWMAN_CONFIG_HOME", &awman_dir)
+        .env_remove("XDG_CONFIG_HOME")
         .arg("status")
         .output()
         .expect("failed to run awman");
@@ -152,6 +160,10 @@ fn valid_runtime_config_show_succeeds() {
     let output = awman()
         .current_dir(repo.path())
         .env("HOME", repo.path())
+        // Pin the config home so an ambient override on the runner can't shadow
+        // the `docker` runtime we just wrote (see the invalid-runtime test).
+        .env("AWMAN_CONFIG_HOME", &awman_dir)
+        .env_remove("XDG_CONFIG_HOME")
         .args(["config", "show"])
         .output()
         .expect("failed to run awman");
