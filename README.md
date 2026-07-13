@@ -40,7 +40,7 @@ The installer detects your platform and puts `awman` on your `PATH`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.10.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.11.0`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/awman/releases):
 
@@ -274,11 +274,13 @@ awman ready [--refresh]                # verify environment; rebuild Dockerfile.
 awman chat [--agent <name>] [--plan] [--auto] [--yolo]
 awman exec prompt "<prompt>" [--issue <ref>]   # run a one-off prompt in a container
 awman exec workflow <path> [--work-item <nnnn> | --issue <ref>] [--yolo] [--worktree]
+awman exec workflow --dynamic --work-item <nnnn> [--leader <agent::model>]   # let a leader agent design the workflow
 awman new spec [--interview] [--issue <ref>]   # create a work item (optionally from a GitHub issue)
 awman new workflow [--interview]       # create a workflow file
 awman new skill [--interview]          # create a skill file
 awman specs amend <nnnn>               # update a spec to match what was built
 awman status [--watch]                 # dashboard of all running agent containers
+awman clean [--dry-run] [--yes]        # remove stopped containers, stale images, and completed workflow data
 awman config show                      # view all config values
 awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
 awman api status                       # check if the API server is running
@@ -308,6 +310,9 @@ All commands work in both TUI mode (without the `awman` prefix) and CLI mode. AP
 - [Remote Mode](docs/10-remote-mode.md)
 - [GitHub Integration](docs/11-github-integration.md)
 - [Runtimes](docs/12-runtimes.md)
+- [Dynamic Workflows](docs/13-dynamic-workflows.md)
+- [Cleaning Up](docs/14-cleaning-up.md)
+- [Parallel Workflows](docs/15-parallel-workflows.md)
 - [Architecture](docs/architecture.md)
 
 ---
