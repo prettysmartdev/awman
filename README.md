@@ -62,8 +62,6 @@ sudo make install
 
 </details>
 
-> **Upgrading from amux?** This tool was previously named `amux`. The install script will offer to clean it up, but if you use another method, delete old copies of `amux`. All config will migrate automatically. Change your `AMUX_*` env vars to `AWMAN_*` and you're done.
-
 ---
 
 ## Quick Start
@@ -101,7 +99,10 @@ If a running agent gets stuck or completes its task, its tab turns yellow so you
 
 A workflow breaks complex work into phases — for example, plan → implement → review → docs. Each phase is a separate agent session. You review the output between phases and decide whether to continue, retry, or redirect.
 
-Workflows are TOML or YAML files in your repo. They can include setup and teardown phases to prepare the environment and handle post-workflow actions like committing, pushing, and opening PRs:
+Workflows are TOML or YAML files in your repo. They can include setup and teardown phases to prepare the environment and handle post-workflow actions like committing, pushing, and opening PRs.
+
+![workflows screenshot](./docs/blog/images/dynamic-workflows.png)
+
 
 ```toml
 title = "Implement Feature"
