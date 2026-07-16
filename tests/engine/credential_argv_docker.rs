@@ -145,19 +145,23 @@ fn docker_credential_value_absent_from_proc_cmdline_during_launch() {
     let mut checked = false;
     for _ in 0..30 {
         match std::fs::read(&cmdline_path) {
+            // An empty cmdline is a transient, non-informative state: the kernel
+            // clears it during `execve`, and a process that has exited but not
+            // yet been reaped (a zombie — we only `wait()` below) also reads back
+            // empty. Skip these rounds rather than asserting on them.
+            Ok(bytes) if bytes.is_empty() => {}
             Ok(bytes) => {
-                checked = true;
                 let joined = String::from_utf8_lossy(&bytes);
                 assert!(
                     !joined.contains(value),
                     "credential VALUE leaked into {cmdline_path}: {joined:?}"
                 );
                 // The name-only `-e KEY` form should be visible — confirms we
-                // inspected the right (credential-carrying) invocation.
-                assert!(
-                    joined.contains(key),
-                    "expected the name-only `-e {key}` in cmdline: {joined:?}"
-                );
+                // inspected the right (credential-carrying) invocation. Only a
+                // read that shows it counts as having exercised the assertion.
+                if joined.contains(key) {
+                    checked = true;
+                }
             }
             // Client already exited between spawn and read — nothing to assert.
             Err(_) => break,
