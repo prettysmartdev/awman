@@ -169,9 +169,17 @@ impl SbxCommand {
 
         if let Some(bytes) = &self.stdin {
             if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(bytes)
-                    .map_err(|e| EngineError::Sandbox(format!("write sbx stdin: {e}")))?;
+                // The child can exit before it finishes reading stdin — e.g. an
+                // `sbx secret set` that bails with "not logged in" and never
+                // consumes the piped secret. That closes the read end and the
+                // write surfaces as BrokenPipe. It is not our error to report:
+                // the child's exit code and stderr are authoritative, so swallow
+                // it and let `wait_with_output` below surface the real failure.
+                if let Err(e) = stdin.write_all(bytes) {
+                    if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(EngineError::Sandbox(format!("write sbx stdin: {e}")));
+                    }
+                }
                 // Drop closes the pipe so the child sees EOF.
             }
         }

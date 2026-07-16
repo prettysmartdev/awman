@@ -38,10 +38,19 @@ pub(super) mod test_support {
     pub fn with_fake_sbx<F: FnOnce()>(script: &str, f: F) {
         let tmp = tempfile::tempdir().unwrap();
         write_fake_sbx(tmp.path(), script);
-        let _guard = PATH_LOCK.lock().unwrap();
+        // Recover a poisoned lock instead of propagating the poison: if one
+        // test panics while holding it, the panic itself is that test's
+        // failure — it must not cascade a `PoisonError` into every other dsbx
+        // test and bury the real cause.
+        let _guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{orig}", tmp.path().display()));
-        f();
+        // Restore PATH even if `f()` panics, so the global mutation never leaks
+        // into a later test; then re-raise so the panic is still the failure.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         std::env::set_var("PATH", orig);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
