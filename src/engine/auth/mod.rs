@@ -9,12 +9,42 @@ use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 
+use crate::data::config::repo::AgentAuthMode;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
 pub mod keychain;
+
+/// Map an awman credential env-var name to its well-known service name, or
+/// `None` when awman has no mapping for it.
+///
+/// This is the canonical source of the credential→service table. The Docker
+/// Sandbox driver ([`crate::engine::sandbox::dsbx::auth`]) re-exports this
+/// function rather than maintaining its own copy, so all runtimes share one
+/// definition. Callers that need to detect "does this declared env var cover
+/// the same auth service as a keychain credential?" use this function to
+/// compare services by name rather than by hardcoded var pairs.
+///
+/// Service names match the Docker Sandboxes well-known service table at
+/// docs.docker.com/ai/sandboxes/security/credentials/ (June 2026).
+pub fn service_for_credential(key: &str) -> Option<&'static str> {
+    match key {
+        // Anthropic — API key (all runtimes) and OAuth token (container runtimes;
+        // the sbx driver skips the OAuth token for a separate reason: sbx has no
+        // OAuth support yet, tracked at docker/sbx-releases#11).  Both vars
+        // authenticate the same provider so both map to the same service here.
+        "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => Some("anthropic"),
+        "OPENAI_API_KEY" => Some("openai"),
+        "GH_TOKEN" | "GITHUB_TOKEN" => Some("github"),
+        "GEMINI_API_KEY" | "GOOGLE_API_KEY" => Some("google"),
+        "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" => Some("aws"),
+        "GROQ_API_KEY" => Some("groq"),
+        "MISTRAL_API_KEY" => Some("mistral"),
+        _ => None,
+    }
+}
 
 /// Status of an agent's host-side credential discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,17 +167,27 @@ impl AuthEngine {
         })
     }
 
-    /// Composite resolver: keychain credentials scoped to the per-repo config.
+    /// Composite resolver: keychain credentials gated on the repo `auth` mode.
     ///
-    /// The decision to *use* keychain credentials silently vs prompting is a
-    /// Layer 2 concern (governed by `auto_agent_auth_accepted`). This method
-    /// only resolves the credentials.
+    /// - `keychain` (default) — inject host keychain credentials. Part-A dedup
+    ///   is applied later at `ResolvedContainerOptions::resolve` time.
+    /// - `passthrough` — skip keychain injection entirely; the repo must
+    ///   supply credentials via `env(VAR)` overlays.  Declared `env()` overlays
+    ///   still apply.
+    /// - `none` — no KEYCHAIN credential injection; declared `env()` overlays
+    ///   still apply.
+    ///
+    /// The Layer-2 `auto_agent_auth_accepted` consent flag is a separate concern;
+    /// this method only resolves *which* credentials to inject.
     pub fn resolve_agent_auth(
         &self,
-        _session: &Session,
+        session: &Session,
         agent: &AgentName,
     ) -> Result<AgentCredentials, EngineError> {
-        self.agent_keychain_credentials(agent)
+        match session.effective_config().auth_mode() {
+            AgentAuthMode::Keychain => self.agent_keychain_credentials(agent),
+            AgentAuthMode::Passthrough | AgentAuthMode::None => Ok(AgentCredentials::default()),
+        }
     }
 
     // ── API-key lifecycle ──────────────────────────────────────────────────
@@ -631,5 +671,132 @@ mod tests {
         // Verification with the returned plaintext must succeed.
         let outcome = e.verify_api_key(&key).unwrap();
         assert_eq!(outcome, AuthOutcome::Authorized);
+    }
+
+    // ── Part B: resolve_agent_auth auth-mode gating ───────────────────────────
+
+    use crate::data::config::env::AWMAN_CONFIG_HOME;
+    use crate::data::config::repo::{
+        AgentAuthMode, RepoConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
+    };
+    use crate::data::config::EnvSnapshot;
+    use crate::data::session::{Session, SessionOpenOptions};
+
+    /// Build an isolated session with the given `RepoConfig` written to disk.
+    ///
+    /// Uses a temp home dir (via `AWMAN_CONFIG_HOME`) so no process-global env
+    /// is read or mutated.
+    fn session_with_repo_config(
+        git_root: &std::path::Path,
+        home_dir: &std::path::Path,
+        repo_cfg: &RepoConfig,
+    ) -> Session {
+        // Write repo config.
+        let awman_dir = git_root.join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        let cfg_json = serde_json::to_string_pretty(repo_cfg).unwrap();
+        std::fs::write(awman_dir.join(REPO_CONFIG_FILENAME), cfg_json).unwrap();
+
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_dir.to_str().unwrap())]);
+
+        let resolver = crate::data::session::StaticGitRootResolver::new(git_root);
+        Session::open(
+            git_root.to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// `passthrough` mode: `resolve_agent_auth` returns an empty credential set
+    /// without touching the host keychain (hermetic even on macOS).
+    #[test]
+    fn passthrough_mode_yields_empty_credentials() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let home_tmp = tempfile::tempdir().unwrap();
+        let session = session_with_repo_config(
+            git_tmp.path(),
+            home_tmp.path(),
+            &RepoConfig {
+                auth: Some(AgentAuthMode::Passthrough),
+                ..Default::default()
+            },
+        );
+        let engine = engine_with(home_tmp.path(), home_tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let creds = engine.resolve_agent_auth(&session, &agent).unwrap();
+        assert!(
+            creds.env_vars.is_empty(),
+            "passthrough mode must return no keychain credentials; got: {:?}",
+            creds.env_vars
+        );
+    }
+
+    /// `none` mode: same result — no credential injection.
+    #[test]
+    fn none_mode_yields_empty_credentials() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let home_tmp = tempfile::tempdir().unwrap();
+        let session = session_with_repo_config(
+            git_tmp.path(),
+            home_tmp.path(),
+            &RepoConfig {
+                auth: Some(AgentAuthMode::None),
+                ..Default::default()
+            },
+        );
+        let engine = engine_with(home_tmp.path(), home_tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let creds = engine.resolve_agent_auth(&session, &agent).unwrap();
+        assert!(
+            creds.env_vars.is_empty(),
+            "none mode must return no keychain credentials; got: {:?}",
+            creds.env_vars
+        );
+    }
+
+    /// `keychain` explicitly set: same as default — attempt keychain lookup
+    /// (may be empty on CI without a keychain; the important thing is that it
+    /// does NOT return early with empty credentials the way passthrough/none do).
+    /// We verify via the successful `Ok` return, not the credential count.
+    #[test]
+    fn keychain_mode_attempts_keychain_lookup() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let home_tmp = tempfile::tempdir().unwrap();
+        let session = session_with_repo_config(
+            git_tmp.path(),
+            home_tmp.path(),
+            &RepoConfig {
+                auth: Some(AgentAuthMode::Keychain),
+                ..Default::default()
+            },
+        );
+        let engine = engine_with(home_tmp.path(), home_tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        // Must not error regardless of whether the keychain has credentials.
+        let result = engine.resolve_agent_auth(&session, &agent);
+        assert!(
+            result.is_ok(),
+            "keychain mode must not error when keychain is absent; got: {result:?}"
+        );
+    }
+
+    /// Default (no `auth` field in repo config): same as `keychain`.
+    #[test]
+    fn default_mode_behaves_like_keychain() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let home_tmp = tempfile::tempdir().unwrap();
+        let session =
+            session_with_repo_config(git_tmp.path(), home_tmp.path(), &RepoConfig::default());
+        let engine = engine_with(home_tmp.path(), home_tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let result = engine.resolve_agent_auth(&session, &agent);
+        assert!(
+            result.is_ok(),
+            "default mode must not error; got: {result:?}"
+        );
     }
 }

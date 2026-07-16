@@ -202,6 +202,93 @@ pub enum ContainerOption {
     },
 }
 
+/// Injection-time dedup: drop any entry from `agent_credentials` whose
+/// credential key maps to the same provider service as a key already declared
+/// in `env_passthrough` or `env_literal`, **and whose host value is actually
+/// resolvable**.
+///
+/// Mirrors the rationale of the sbx path's `CLAUDE_CODE_OAUTH_TOKEN` silent
+/// skip ([`crate::engine::sandbox::dsbx::auth::inject_credentials`]):
+/// when the harness has **declared** an env var (via `env(VAR)`) that already
+/// authenticates the same provider, the keychain OAuth token is redundant and
+/// its presence causes the container to receive two conflicting credentials for
+/// the same service.
+///
+/// An `env_passthrough` entry only counts as "covering" a service when its host
+/// value is actually set — mirroring `build_run_argv`'s own emission gate
+/// (`if let Ok(value) = std::env::var(name)`).  A declared but unset passthrough
+/// var does NOT suppress a keychain credential, because the passthrough will emit
+/// nothing and the container would otherwise receive zero credentials for that
+/// service.  `env_literal` entries always carry a value and always count.
+///
+/// `lookup_env` abstracts the host env lookup so that callers in tests can
+/// supply a hermetic closure instead of reading `std::env::var` directly.
+///
+/// If dedup would drop the **last** remaining credential for a service, a
+/// `log::warn!` is emitted so the situation is never silent.
+///
+/// Example: harness declares `env(ANTHROPIC_API_KEY)` → service "anthropic";
+/// keychain resolves `CLAUDE_CODE_OAUTH_TOKEN` → also service "anthropic";
+/// host has `ANTHROPIC_API_KEY` set → the passthrough will be emitted →
+/// `CLAUDE_CODE_OAUTH_TOKEN` is dropped from `agent_credentials`.
+///
+/// Counter-example: same declaration but `ANTHROPIC_API_KEY` is NOT set on the
+/// host → the passthrough emits nothing → `CLAUDE_CODE_OAUTH_TOKEN` is retained.
+pub(crate) fn dedup_credentials_by_declared_env(
+    agent_credentials: &mut Vec<(String, String)>,
+    env_passthrough: &[EnvVar],
+    env_literal: &[EnvLiteral],
+    lookup_env: &dyn Fn(&str) -> Option<String>,
+) {
+    // Collect the set of provider services already covered by declared env vars
+    // that will actually be emitted to the container:
+    //   - env_passthrough: only when the host value is set (and non-empty).
+    //   - env_literal: always (they carry an explicit value).
+    let covered_services: Vec<&'static str> = env_passthrough
+        .iter()
+        .filter(|v| lookup_env(v.0.as_str()).is_some_and(|val| !val.is_empty()))
+        .map(|v| v.0.as_str())
+        .chain(env_literal.iter().map(|l| l.key.as_str()))
+        .filter_map(crate::engine::auth::service_for_credential)
+        .collect();
+
+    if covered_services.is_empty() {
+        return;
+    }
+
+    // Before dropping, check whether this dedup would leave any service with
+    // zero credentials.  If so, warn — the outcome is intentional (the literal
+    // or resolvable passthrough will cover it), but it should never be silent.
+    for service in &covered_services {
+        let service_creds_before: Vec<_> = agent_credentials
+            .iter()
+            .filter(|(k, _)| crate::engine::auth::service_for_credential(k) == Some(service))
+            .collect();
+        if !service_creds_before.is_empty() {
+            tracing::warn!(
+                dropped_keys = ?service_creds_before
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>(),
+                service = service,
+                "awman: dropping keychain credential(s) for service because the repo \
+                 declared an env var that covers the same provider; the container will \
+                 receive credentials via the declared env overlay.",
+            );
+        }
+    }
+
+    // Retain only credentials whose service is NOT already covered by a
+    // harness-declared env var that will be emitted to the container.
+    agent_credentials.retain(|(key, _)| {
+        match crate::engine::auth::service_for_credential(key) {
+            Some(service) => !covered_services.contains(&service),
+            // Credential with no known service mapping — retain unconditionally.
+            None => true,
+        }
+    });
+}
+
 /// Resolved option bag — all options merged into a single struct that the
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
@@ -258,6 +345,16 @@ impl ResolvedContainerOptions {
         for opt in options {
             r.ingest(opt)?;
         }
+        // Part A: drop agent_credentials that duplicate a service already covered
+        // by a harness-declared env var.  Applies to ALL container runtimes.
+        // Production callers pass the real host-env lookup; tests inject a
+        // hermetic closure to avoid mutating process-global state.
+        dedup_credentials_by_declared_env(
+            &mut r.agent_credentials,
+            &r.env_passthrough,
+            &r.env_literal,
+            &|name| std::env::var(name).ok(),
+        );
         r.validate()?;
         Ok(r)
     }
@@ -408,5 +505,218 @@ mod tests {
         let resolved = result.expect("from_iter should succeed");
         // Multiple overlay entries accumulate — dedup is caller's responsibility.
         assert_eq!(resolved.overlays.len(), 3);
+    }
+
+    // ── Part A: injection-time credential dedup (resolve-level, env_literal path) ──
+
+    /// `env_literal` (always-valued) coverage → same-service keychain credential
+    /// is dropped.  This goes through `resolve()` because env_literal entries
+    /// always have a value — no host lookup needed.
+    #[test]
+    fn declared_anthropic_env_literal_drops_oauth_token_from_agent_credentials() {
+        let resolved = ResolvedContainerOptions::resolve([
+            ContainerOption::EnvLiteral(EnvLiteral {
+                key: "ANTHROPIC_API_KEY".into(),
+                value: "sk-ant-key-literal".into(),
+            }),
+            ContainerOption::AgentCredentials {
+                env_vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into())],
+            },
+        ])
+        .expect("resolve must succeed");
+
+        assert!(
+            resolved.agent_credentials.is_empty(),
+            "ANTHROPIC_API_KEY via env_literal must still trigger dedup; \
+             got: {:?}",
+            resolved.agent_credentials
+        );
+    }
+
+    /// When agent_credentials is empty the dedup is a no-op (no panic, no error).
+    #[test]
+    fn dedup_with_empty_agent_credentials_is_noop() {
+        // Use env_literal so the test is hermetic (no host-env lookup).
+        let resolved =
+            ResolvedContainerOptions::resolve([ContainerOption::EnvLiteral(EnvLiteral {
+                key: "ANTHROPIC_API_KEY".into(),
+                value: "sk-key".into(),
+            })])
+            .expect("resolve must succeed");
+        assert!(resolved.agent_credentials.is_empty());
+    }
+
+    // ── Part A: dedup_credentials_by_declared_env unit tests (injectable lookup) ──
+    //
+    // All of these pass a hermetic closure as `lookup_env` so no process-global
+    // std::env mutation is needed.  The closure mimics the subset of env vars
+    // that would be set on the host in each scenario.
+
+    /// declared env(ANTHROPIC_API_KEY) that IS set on host + keychain OAuth →
+    /// OAuth dropped (the passthrough will be emitted; no need for two creds).
+    #[test]
+    fn dedup_fn_drops_oauth_when_anthropic_passthrough_set_on_host() {
+        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
+        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
+        // Simulate: ANTHROPIC_API_KEY is set on the host.
+        let lookup = |name: &str| -> Option<String> {
+            if name == "ANTHROPIC_API_KEY" {
+                Some("sk-ant-api-key".into())
+            } else {
+                None
+            }
+        };
+        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
+        assert!(
+            creds.is_empty(),
+            "OAuth must be dropped when ANTHROPIC_API_KEY is set on host; got: {creds:?}"
+        );
+    }
+
+    /// declared env(ANTHROPIC_API_KEY) that is NOT set on host + keychain OAuth →
+    /// OAuth retained (passthrough emits nothing; dropping it would leave zero
+    /// credentials for the 'anthropic' service).
+    #[test]
+    fn dedup_fn_retains_oauth_when_anthropic_passthrough_declared_but_unset() {
+        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
+        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
+        // Simulate: ANTHROPIC_API_KEY is NOT set on the host.
+        let lookup = |_name: &str| -> Option<String> { None };
+        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
+        assert_eq!(
+            creds.len(),
+            1,
+            "OAuth must be retained when the declared passthrough var is unset on host; \
+             got: {creds:?}"
+        );
+    }
+
+    /// No declared anthropic var → cloud harness path — keychain OAuth is
+    /// retained regardless of host env.
+    #[test]
+    fn dedup_fn_retains_oauth_when_no_anthropic_declared() {
+        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
+        let pt = vec![EnvVar("OPENAI_API_KEY".into())]; // covers openai, not anthropic
+                                                        // Even if OPENAI_API_KEY is set, it doesn't cover the anthropic service.
+        let lookup = |name: &str| -> Option<String> {
+            if name == "OPENAI_API_KEY" {
+                Some("sk-openai".into())
+            } else {
+                None
+            }
+        };
+        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
+        assert_eq!(
+            creds.len(),
+            1,
+            "no anthropic declared → OAuth must be retained"
+        );
+    }
+
+    /// env_literal (always-valued) coverage → same-service credential dropped.
+    #[test]
+    fn dedup_fn_handles_env_literal_source() {
+        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
+        let lit = vec![EnvLiteral {
+            key: "ANTHROPIC_API_KEY".into(),
+            value: "literal-key".into(),
+        }];
+        // lookup_env is irrelevant for literals but must be provided.
+        let lookup = |_: &str| -> Option<String> { None };
+        dedup_credentials_by_declared_env(&mut creds, &[], &lit, &lookup);
+        assert!(
+            creds.is_empty(),
+            "env_literal coverage must also trigger dedup"
+        );
+    }
+
+    /// No declared vars → no dedup, regardless of host env.
+    #[test]
+    fn dedup_fn_retains_credential_when_no_declared_vars() {
+        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
+        let lookup = |_: &str| -> Option<String> { None };
+        dedup_credentials_by_declared_env(&mut creds, &[], &[], &lookup);
+        assert_eq!(creds.len(), 1, "no declared vars → no dedup");
+    }
+
+    /// A credential with no known service mapping is never dropped by the dedup.
+    #[test]
+    fn dedup_fn_unmapped_credential_is_never_dropped() {
+        let mut creds = vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into()),
+            ("MY_CUSTOM_INTERNAL_TOKEN".into(), "custom".into()),
+        ];
+        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
+        let lookup = |name: &str| -> Option<String> {
+            if name == "ANTHROPIC_API_KEY" {
+                Some("sk-ant".into())
+            } else {
+                None
+            }
+        };
+        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
+        // OAuth (anthropic) dropped; custom (no mapping) retained.
+        assert!(
+            !creds.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
+            "OAuth must be dropped when anthropic passthrough is set"
+        );
+        assert!(
+            creds.iter().any(|(k, _)| k == "MY_CUSTOM_INTERNAL_TOKEN"),
+            "unmapped credential must survive dedup; got: {creds:?}"
+        );
+    }
+
+    /// When keychain credential's OWN name equals the declared passthrough var
+    /// (e.g. declared env(ANTHROPIC_API_KEY) + keychain returns ANTHROPIC_API_KEY
+    /// itself), the keychain entry is dropped because both map to service
+    /// "anthropic" and the passthrough is set on host.
+    #[test]
+    fn dedup_fn_drops_when_credential_name_equals_declared_var() {
+        let mut creds = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-from-keychain".into())];
+        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
+        // Passthrough is set on host (perhaps to a different value).
+        let lookup = |name: &str| -> Option<String> {
+            if name == "ANTHROPIC_API_KEY" {
+                Some("sk-ant-from-env".into())
+            } else {
+                None
+            }
+        };
+        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
+        assert!(
+            creds.is_empty(),
+            "credential whose own name equals the declared var must be dropped; \
+             got: {creds:?}"
+        );
+    }
+
+    /// Multi-service: declared var covers service X (anthropic), credential for
+    /// service Y (openai) is retained.
+    #[test]
+    fn dedup_fn_multi_service_declared_x_retains_credential_for_y() {
+        let mut creds = vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok-anthropic".into()),
+            ("OPENAI_API_KEY".into(), "tok-openai".into()),
+        ];
+        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
+        // Only anthropic passthrough is set on host.
+        let lookup = |name: &str| -> Option<String> {
+            if name == "ANTHROPIC_API_KEY" {
+                Some("sk-ant".into())
+            } else {
+                None
+            }
+        };
+        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
+        // Anthropic OAuth dropped; OpenAI retained (different service, not declared).
+        assert!(
+            !creds.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
+            "anthropic OAuth must be dropped"
+        );
+        assert!(
+            creds.iter().any(|(k, _)| k == "OPENAI_API_KEY"),
+            "openai credential must be retained (covers service 'openai', not declared); \
+             got: {creds:?}"
+        );
     }
 }
