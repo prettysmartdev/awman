@@ -17,22 +17,10 @@ use crate::engine::container::options::{EnvLiteral, EnvVar};
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::dsbx::spawn::SbxCommand;
 
-/// Map an awman credential env-var name to its `sbx` well-known service name,
-/// or `None` when awman has no mapping for it. Matches the service table in
-/// the Docker Sandboxes credentials docs
-/// (docs.docker.com/ai/sandboxes/security/credentials/, June 2026).
-pub(super) fn service_for_credential(key: &str) -> Option<&'static str> {
-    match key {
-        "ANTHROPIC_API_KEY" => Some("anthropic"),
-        "OPENAI_API_KEY" => Some("openai"),
-        "GH_TOKEN" | "GITHUB_TOKEN" => Some("github"),
-        "GEMINI_API_KEY" | "GOOGLE_API_KEY" => Some("google"),
-        "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" => Some("aws"),
-        "GROQ_API_KEY" => Some("groq"),
-        "MISTRAL_API_KEY" => Some("mistral"),
-        _ => None,
-    }
-}
+/// Re-export the shared service→credential mapping so the dsbx module (and its
+/// tests via `use super::*`) can use it without a long path. The canonical
+/// definition lives in [`crate::engine::auth::service_for_credential`].
+pub(super) use crate::engine::auth::service_for_credential;
 
 /// Allowlist of provider auth env vars accepted via `env(VAR)` overlays for
 /// launch-time auto-auth, per agent. Only mixin-kit agents participate —
@@ -368,9 +356,12 @@ fn listing_mentions_service(stdout: &str, service: &str) -> bool {
 /// `CLAUDE_CODE_OAUTH_TOKEN` is the one silent exception: the keychain
 /// resolver always surfaces it when the user is logged in to Claude Code, but
 /// sbx has no OAuth-token support yet (docker/sbx-releases#11), so it can
-/// never be injected. Auth still works without it — via an `ANTHROPIC_API_KEY`
-/// env() overlay ([`auto_auth_env_overlays`]) or `/login` inside the sandbox —
-/// and the missing-auth case already gets its own warning from
+/// never be injected. The service mapping in [`service_for_credential`] maps
+/// it to "anthropic" for dedup purposes on other runtimes — but the sbx
+/// driver skips it unconditionally (key-name check before the service lookup).
+/// Auth still works without it — via an `ANTHROPIC_API_KEY` env() overlay
+/// ([`auto_auth_env_overlays`]) or `/login` inside the sandbox — and the
+/// missing-auth case already gets its own warning from
 /// [`auto_auth_env_overlays`], so warning here on every launch is pure noise.
 pub(super) fn inject_credentials(
     creds: &[(String, String)],
@@ -378,12 +369,17 @@ pub(super) fn inject_credentials(
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
     for (key, value) in creds {
+        // Sbx has no OAuth-token support yet; skip unconditionally.  See the
+        // doc comment above.  Key-name check takes precedence over the service
+        // mapping so this remains correct even though service_for_credential
+        // now maps CLAUDE_CODE_OAUTH_TOKEN → "anthropic" for dedup use by
+        // other runtimes.
+        if key == "CLAUDE_CODE_OAUTH_TOKEN" {
+            continue;
+        }
         match service_for_credential(key) {
             Some(service) => {
                 set_secret(service, value, sandbox, sink)?;
-            }
-            None if key == "CLAUDE_CODE_OAUTH_TOKEN" => {
-                // Silently skipped — see the doc comment above.
             }
             None => {
                 sink.write_message(crate::data::message::UserMessage {
@@ -409,6 +405,13 @@ mod tests {
     fn known_services_map() {
         assert_eq!(
             service_for_credential("ANTHROPIC_API_KEY"),
+            Some("anthropic")
+        );
+        // OAuth token maps to anthropic for injection-time dedup on container
+        // runtimes.  The sbx driver skips it via a key-name guard before
+        // reaching this table (sbx has no OAuth support yet).
+        assert_eq!(
+            service_for_credential("CLAUDE_CODE_OAUTH_TOKEN"),
             Some("anthropic")
         );
         assert_eq!(service_for_credential("OPENAI_API_KEY"), Some("openai"));
@@ -534,6 +537,9 @@ mod tests {
     fn all_credential_table_entries_have_expected_service_names() {
         let table: &[(&str, &str)] = &[
             ("ANTHROPIC_API_KEY", "anthropic"),
+            // OAuth token: maps to anthropic for dedup; sbx skips it via
+            // key-name guard before reaching this table.
+            ("CLAUDE_CODE_OAUTH_TOKEN", "anthropic"),
             ("OPENAI_API_KEY", "openai"),
             ("GH_TOKEN", "github"),
             ("GITHUB_TOKEN", "github"),

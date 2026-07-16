@@ -208,6 +208,24 @@ awman config set yoloDisallowedTools ""                # set an empty list
 
 An empty repo list actively overrides a non-empty global list. To stop overriding, remove the field from the repo config file. See [Yolo Mode](06-yolo-mode.md).
 
+### Control credential injection (`auth` mode)
+
+By default awman injects host keychain credentials into agent containers
+(`keychain` mode). Two alternatives are available for harnesses that supply
+credentials through other means:
+
+```json
+{ "auth": "passthrough" }
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `keychain` (default) | Inject host keychain credentials. When the repo also declares `env(ANTHROPIC_API_KEY)` (or another credential that covers the same provider) **and that variable is set on the host**, the keychain OAuth token for that provider is automatically suppressed at injection time — the container receives exactly one set of credentials per provider. If the declared passthrough var is not set on the host, the keychain credential is retained so the container is not left with zero credentials for that provider. |
+| `passthrough` | No KEYCHAIN credential injection; declared `env()` overlays still apply. Supply credentials via `env(VAR)` overlays. |
+| `none` | No KEYCHAIN credential injection; declared `env()` overlays still apply. |
+
+Set `auth` in `.awman/config.json` directly (it is not settable via `config set`). The field is per-repo only — cloud harnesses that do not declare an anthropic env var remain on the default `keychain` path and continue to receive keychain OAuth unaffected.
+
 ---
 
 ## Runtimes
@@ -265,6 +283,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
 | `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
 | `dynamicWorkflows.guidance` | string array | (unset → no guidance block) | Project-specific instructions injected into the leader prompt as a bullet list — see [Dynamic Workflows](13-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per entry as `dynamicWorkflows.guidance.<index>` (empty value removes) |
+| `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 
 ### Global config fields (`$HOME/.awman/config.json`)
 

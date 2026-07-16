@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::GlobalConfig;
-use crate::data::config::repo::RepoConfig;
+use crate::data::config::repo::{AgentAuthMode, RepoConfig};
 use crate::data::config::{DEFAULT_AGENT_STUCK_TIMEOUT_SECS, DEFAULT_SCROLLBACK_LINES};
 
 /// Merged view of every configuration source, in precedence order.
@@ -221,6 +221,20 @@ impl EffectiveConfig {
         }
         self.global.max_concurrent_agents
     }
+
+    /// Effective credential injection mode (repo > built-in default `keychain`).
+    ///
+    /// `passthrough` skips keychain injection entirely; `none` disables keychain
+    /// injection; `keychain` (default) injects host keychain creds, subject to
+    /// injection-time dedup of any repo-declared env vars.
+    ///
+    /// Single-layer resolution (repo only, no global flag override) is a
+    /// deliberate conservative choice: a credential toggle must be an explicit
+    /// per-repo decision, not silently inherited from a global default that the
+    /// operator may not realize is set.
+    pub fn auth_mode(&self) -> AgentAuthMode {
+        self.repo.auth.unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -229,7 +243,7 @@ mod tests {
     use crate::data::config::env::{
         EnvSnapshot, AWMAN_API_KEY, AWMAN_REMOTE_ADDR, AWMAN_REMOTE_SESSION,
     };
-    use crate::data::config::repo::{ApiConfig, RemoteConfig};
+    use crate::data::config::repo::{AgentAuthMode, ApiConfig, RemoteConfig};
     use std::time::Duration;
 
     fn make_effective(
@@ -900,5 +914,75 @@ mod tests {
             GlobalConfig::default(),
         );
         assert_eq!(ec.effective_max_concurrent_agents(), None);
+    }
+
+    // ── Part B: auth_mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_mode_default_is_keychain() {
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(
+            ec.auth_mode(),
+            AgentAuthMode::Keychain,
+            "default auth mode must be keychain"
+        );
+    }
+
+    #[test]
+    fn auth_mode_passthrough_from_repo() {
+        let repo = RepoConfig {
+            auth: Some(AgentAuthMode::Passthrough),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo,
+            GlobalConfig::default(),
+        );
+        assert_eq!(
+            ec.auth_mode(),
+            AgentAuthMode::Passthrough,
+            "passthrough set in repo config must be effective"
+        );
+    }
+
+    #[test]
+    fn auth_mode_none_from_repo() {
+        let repo = RepoConfig {
+            auth: Some(AgentAuthMode::None),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo,
+            GlobalConfig::default(),
+        );
+        assert_eq!(
+            ec.auth_mode(),
+            AgentAuthMode::None,
+            "none set in repo config must be effective"
+        );
+    }
+
+    #[test]
+    fn auth_mode_keychain_explicitly_set_in_repo() {
+        let repo = RepoConfig {
+            auth: Some(AgentAuthMode::Keychain),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo,
+            GlobalConfig::default(),
+        );
+        assert_eq!(ec.auth_mode(), AgentAuthMode::Keychain);
     }
 }
