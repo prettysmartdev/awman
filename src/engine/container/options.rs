@@ -471,13 +471,13 @@ impl ResolvedContainerOptions {
             &mut r.agent_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &|name| std::env::var(name).ok(),
+            &crate::data::config::env::host_var,
         );
         dedup_refreshable_by_declared_env(
             &mut r.refreshable_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &|name| std::env::var(name).ok(),
+            &crate::data::config::env::host_var,
         )?;
         r.validate()?;
         Ok(r)
@@ -869,6 +869,53 @@ mod tests {
             "openai credential must be retained (covers service 'openai', not declared); \
              got: {creds:?}"
         );
+    }
+
+    /// `resolve()`'s production closure is `host_var` (overlay first, then
+    /// the process environment) — the squad daemon is the one caller whose
+    /// covering value can *only* ever come from the overlay, since a daemon
+    /// process never inherits the shell that created the task. Dedup must
+    /// behave identically either way: with the process value absent
+    /// entirely, a value supplied purely through the daemon overlay must
+    /// still cover the service and drop the redundant keychain credential.
+    #[test]
+    fn dedup_is_unchanged_when_the_covering_value_comes_from_the_daemon_overlay() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_daemon_overlay(DaemonEnvMap::new());
+
+        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let mut overlay = DaemonEnvMap::new();
+        overlay.insert("ANTHROPIC_API_KEY", "sk-from-overlay");
+        set_daemon_overlay(overlay);
+
+        let resolved = ResolvedContainerOptions::resolve([
+            ContainerOption::EnvPassthrough(EnvVar("ANTHROPIC_API_KEY".into())),
+            ContainerOption::AgentCredentials {
+                env_vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into())],
+            },
+        ])
+        .expect("resolve must succeed");
+
+        assert!(
+            resolved.agent_credentials.is_empty(),
+            "dedup must trigger when the covering value comes from the overlay alone \
+             (the process env has none); got: {:?}",
+            resolved.agent_credentials
+        );
+
+        set_daemon_overlay(DaemonEnvMap::new());
+        match prev {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
     }
 
     // ─── WI-0107: refreshable (file) dedup — INV-9 + MEDIUM-8 fail-closed ─────

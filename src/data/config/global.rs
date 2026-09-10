@@ -249,6 +249,7 @@ mod tests {
                 max_concurrent_evaluations: Some(2),
                 default_leader: Some("claude::claude-opus-4-8".to_string()),
                 guidance: Some(vec!["Keep changes focused.".to_string()]),
+                env_persistence: None,
             }),
             remote: Some(RemoteConfig {
                 default_addr: Some("http://localhost:7777".to_string()),

@@ -844,6 +844,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     }
 }
 

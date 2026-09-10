@@ -26,6 +26,7 @@ use crate::data::config::{EnvSnapshot, GlobalConfig};
 use crate::data::fs::{RunDetail, RunId, RunStatus, SquadPaths, Task, TaskStore};
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::engine::container::naming::parse_squad_task_slug;
+use crate::engine::squad::env_state::DaemonEnvState;
 use crate::engine::squad::launcher::prepare_run_log_dir;
 
 use super::evaluator::{EvaluationOutcome, EvaluationRequest, RunProgress, TaskEvaluator};
@@ -88,6 +89,10 @@ pub struct SquadScheduler {
     /// containers on the scheduler tick. It is optional so deterministic
     /// scheduler unit tests do not need a container runtime fixture.
     runtime: Option<Arc<dyn AgentRuntimeEngine>>,
+    /// The daemon's payload-environment state (WI 0116 §4), consulted once per
+    /// run to record which declared `env()` names had no value when the run
+    /// opened. Optional so deterministic scheduler unit tests need no daemon.
+    env_state: Option<Arc<DaemonEnvState>>,
     /// The wake cadence. Always [`TICK_INTERVAL`] in production; tests shorten
     /// it so multi-tick behaviour (the concurrency bound, live config re-read)
     /// is observable without a 30-second wait.
@@ -109,8 +114,16 @@ impl SquadScheduler {
             status: Arc::new(Mutex::new(SchedulerStatus::default())),
             failure_counts: Arc::new(Mutex::new(HashMap::new())),
             runtime: None,
+            env_state: None,
             tick_interval: TICK_INTERVAL,
         }
+    }
+
+    /// Share the daemon's payload-environment state, so each run records the
+    /// declared `env()` names it started without (WI 0116 §4b).
+    pub fn with_env_state(mut self, env_state: Arc<DaemonEnvState>) -> Self {
+        self.env_state = Some(env_state);
+        self
     }
 
     /// Override the wake cadence. Production never calls this; it exists so a
@@ -236,7 +249,26 @@ impl SquadScheduler {
                     continue;
                 }
             };
-            let run_id = match self.store.start_run(&task.id, None, started_at) {
+            // Snapshotted here, at run start, and never rewritten: the point is
+            // to explain the environment this run's containers actually started
+            // with, so a push landing mid-run must not retro-edit the record.
+            // A run with unmet names *proceeds* — every existing task was
+            // created under the old silent-drop behaviour and some legitimately
+            // treat a variable as optional, so failing them closed would be a
+            // regression dressed as a fix. The gain is that the omission is
+            // visible instead of silent.
+            let unmet_env = match &self.env_state {
+                Some(state) => {
+                    let unmet = state.unmet_for_task(&task);
+                    state.note_unmet_at_run_start(&task.name, &unmet);
+                    unmet
+                }
+                None => Vec::new(),
+            };
+            let run_id = match self
+                .store
+                .start_run_with_env(&task.id, None, started_at, &unmet_env)
+            {
                 Ok(run_id) => run_id,
                 Err(error) => {
                     tracing::warn!("squad: failed to open run row for {:?}: {error}", task.name);
@@ -802,6 +834,7 @@ mod tests {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            unmet_env: Vec::new(),
         };
         store.create(&configured).unwrap();
         configured.id = "id-nightly".into();

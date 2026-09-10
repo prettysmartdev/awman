@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::command::commands::http_core::HttpCore;
+use crate::command::commands::squad::env_sync;
 use crate::command::commands::squad::gateway::{RemoteTaskGateway, TaskGateway};
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::catalogue::GatewayNeed;
@@ -159,7 +160,27 @@ impl SquadGatewayResolver {
     /// Mint a fresh key and restart the daemon onto it.
     pub async fn refresh_key(&self) -> Result<RemoteTaskGateway, CommandError> {
         let endpoint = self.inner.refresh_key().await?;
-        Self::gateway_for_endpoint(endpoint)
+        Self::synced_gateway(endpoint).await
+    }
+
+    /// Build a gateway and bring the daemon's payload environment up to date
+    /// through it (WI 0116 §4a).
+    ///
+    /// Every path that yields a *keyed* gateway to a running daemon goes
+    /// through here — both the already-running and the freshly-spawned branch —
+    /// so a long-lived daemon picks up a rotated token from the next command
+    /// without a restart. What actually happens is a coverage *check*: the
+    /// daemon reports a digest per name it holds, and nothing is sent unless a
+    /// value genuinely differs. Steady state costs one small GET and puts no
+    /// secret on the wire.
+    ///
+    /// Deliberately not called from [`Self::gateway_from_meta`] or
+    /// [`Self::probe_gateway`]: `awman squad status` and the TUI's 10-second
+    /// indicator poller use those, and neither should be pushing anything.
+    async fn synced_gateway(endpoint: SquadEndpoint) -> Result<RemoteTaskGateway, CommandError> {
+        let gateway = Self::gateway_for_endpoint(endpoint)?;
+        env_sync::sync_env(&gateway, false).await;
+        Ok(gateway)
     }
 
     /// A gateway to the daemon named by its endpoint sidecar, if one exists.
@@ -182,7 +203,7 @@ impl SquadGatewayResolver {
     /// A gateway to a running daemon, starting one only when needed.
     pub async fn ensure_running(&self) -> Result<RemoteTaskGateway, CommandError> {
         let endpoint = self.inner.ensure_running().await?;
-        Self::gateway_for_endpoint(endpoint)
+        Self::synced_gateway(endpoint).await
     }
 
     // ── Dispatch-facing resolution (WI 0113 F-04) ─────────────────────────
@@ -255,7 +276,7 @@ impl SquadGatewayResolver {
             .ensure_running()
             .await
             .map_err(SquadStartError::from_engine)?;
-        self.startup_from_endpoint(endpoint)
+        self.startup_from_endpoint(endpoint).await
     }
 
     /// Mint a fresh key, restart the daemon onto it, and return what an
@@ -268,7 +289,7 @@ impl SquadGatewayResolver {
             .refresh_key()
             .await
             .map_err(SquadStartError::from_engine)?;
-        self.startup_from_endpoint(endpoint)
+        self.startup_from_endpoint(endpoint).await
     }
 
     /// Whether squad can run at all under these engines.
@@ -302,7 +323,7 @@ impl SquadGatewayResolver {
             .await
     }
 
-    fn startup_from_endpoint(
+    async fn startup_from_endpoint(
         &self,
         endpoint: SquadEndpoint,
     ) -> Result<SquadStartup, SquadStartError> {
@@ -316,7 +337,10 @@ impl SquadGatewayResolver {
             return Err(SquadStartError::KeyMissing);
         }
         let key_setup = SquadKeySetup::from_key_state(&key_state, &self.env);
-        let gateway = Self::gateway_for_endpoint(endpoint)
+        // A frontend opening a squad view is a keyed connection to a running
+        // daemon like any other, so it syncs too (WI 0116 §4a).
+        let gateway = Self::synced_gateway(endpoint)
+            .await
             .map_err(|error| SquadStartError::Other(error.to_string()))?;
         Ok(SquadStartup {
             gateway: Arc::new(gateway) as Arc<dyn TaskGateway>,

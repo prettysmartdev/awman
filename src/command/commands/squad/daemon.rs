@@ -239,8 +239,24 @@ async fn run_start(
         Ok(handles) => frontend.serve_squad_daemon(handles).await,
         Err(error) => Err(error),
     };
-    let _ = process.clear_meta();
-    let _ = guard.release();
+    // Tear down only what this process still owns. `awman squad stop` sends
+    // SIGTERM and releases the pidfile and the endpoint sidecar *immediately*,
+    // without waiting for the process to go — so by the time a busy machine
+    // gets this daemon here, the next command may already have started a
+    // successor that claimed both files. Clearing them unconditionally deletes
+    // the successor's, and the command after *that*, finding no pidfile,
+    // starts a third daemon with an empty payload environment: every `env()`
+    // value the successor was just handed is silently gone, and a task that
+    // reported `set` a moment ago reports `unmet` again.
+    //
+    // The pidfile is the claim on this daemon root, so it is the ownership
+    // token for both files. The sidecar goes first, while the claim is still
+    // demonstrably ours.
+    let me = std::process::id();
+    if process.owns_pidfile(me).unwrap_or(false) {
+        let _ = process.clear_meta();
+    }
+    let _ = guard.release_owned_by(me);
     result?;
     let _ = paths;
     Ok(SquadDaemonOutcome::Started {
@@ -377,6 +393,11 @@ async fn run_status(process: &DaemonProcess) -> Result<SquadDaemonOutcome, Comma
         active_count: 0,
         last_tick: None,
         in_flight: 0,
+        // Read from the process sidecar, not from a daemon: there is nobody to
+        // ask about persistence or coverage here, and reporting a guess would
+        // be worse than reporting nothing.
+        env_persistence: String::new(),
+        unmet_env: Vec::new(),
     }))
 }
 

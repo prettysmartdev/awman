@@ -81,6 +81,17 @@ impl DSbxSessionConfig {
 
         // Non-sensitive env config only. Credential-class values are excluded
         // here and routed through `sbx secret set` / proxy management instead.
+        //
+        // Deliberately `std::env::var`, **not** `host_var`: this map is written
+        // in the clear to `<workspace>/.awman/session.json`, and the only thing
+        // keeping a value out of it is the `is_credential_like` *name*
+        // heuristic. Reading through the daemon overlay would make a value a
+        // squad client pushed over the socket eligible for a plaintext file the
+        // moment its name did not happen to contain TOKEN/SECRET/PASSWORD. Squad
+        // admits only container-tier runtimes today, so nothing reaches here
+        // from a daemon — but that is an admission check in an unrelated module,
+        // and this file must not depend on it. This process's own environment is
+        // the only correct source for a writer like this one.
         let mut env_config = Map::new();
         for envvar in &options.env_passthrough {
             if is_credential_like(&envvar.0) {
@@ -179,6 +190,46 @@ mod tests {
         assert_eq!(env["LOG_LEVEL"], json!("debug"));
         let serialized = serde_json::to_string(&v).unwrap();
         assert!(!serialized.contains("sk-secret"));
+    }
+
+    /// Remediation of review-security F12.
+    ///
+    /// `env_config` is written in the clear to `<workspace>/.awman/session.json`
+    /// and is gated only by a name heuristic. A value the squad daemon holds in
+    /// its in-memory overlay must therefore never be eligible for it, whatever
+    /// an unrelated runtime-admission check elsewhere happens to allow today.
+    #[test]
+    fn a_name_held_only_in_the_daemon_overlay_never_reaches_the_plaintext_session_file() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+        use crate::engine::container::options::EnvVar;
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A name with no credential-ish substring, so the heuristic is not what
+        // is being tested.
+        let name = "AWMAN_TEST_SBX_OVERLAY_ONLY";
+        std::env::remove_var(name);
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-only-value")]));
+
+        let v = DSbxSessionConfig::build_value(&resolve(vec![SandboxOption::EnvPassthrough(
+            EnvVar(name.into()),
+        )]));
+
+        assert!(
+            v["env_config"].get(name).is_none(),
+            "a value present only in the daemon overlay must not be written: {v}"
+        );
+        assert!(
+            !serde_json::to_string(&v)
+                .unwrap()
+                .contains("overlay-only-value"),
+            "and it must not appear anywhere else in the file either: {v}"
+        );
+
+        set_daemon_overlay(DaemonEnvMap::new());
     }
 
     #[test]

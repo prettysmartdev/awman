@@ -11,14 +11,20 @@ use crate::frontend::tui::tabs::squad_state::SquadSnapshot;
 
 /// Minimum card size, in cells, per WI 0106 Part 5 ("generous size and
 /// spacing"). The grid reflows its column count to keep every card at least
-/// this wide as the tab is resized; card height is fixed.
+/// this wide as the tab is resized; card height is [`grid_card_height`].
 const CARD_MIN_WIDTH: u16 = 30;
-/// Two border rows plus the five body rows a card carries: the `Description`
-/// label, the description itself, and the `Last run` / `Outcome` / `Next`
-/// pairs. The description gets a whole row of its own rather than sharing one
-/// with its label, because on a minimum-width card an inline `Description: `
-/// would leave under half the row for the text it introduces.
+/// Two border rows plus the five body rows a card always carries: the
+/// `Description` label, the description itself, and the `Last run` / `Outcome`
+/// / `Next` pairs. The description gets a whole row of its own rather than
+/// sharing one with its label, because on a minimum-width card an inline
+/// `Description: ` would leave under half the row for the text it introduces.
 const CARD_MIN_HEIGHT: u16 = 7;
+/// The extra body row a card needs for WI 0116 §6b's `Env` line. Applied to
+/// *every* card in the grid, but only when some task in the grid actually has
+/// an unmet variable: cards must stay a uniform height (they are laid out on
+/// shared rows), and a permanently taller card would cost every user a row of
+/// vertical space to carry a flag almost none of them ever raise.
+const CARD_ENV_ROW_HEIGHT: u16 = 1;
 const CARD_COL_SPACING: u16 = 2;
 const CARD_ROW_SPACING: u16 = 1;
 
@@ -139,7 +145,8 @@ fn render_task_grid(tasks: &[Task], selected: usize, area: Rect, frame: &mut Fra
     }
 
     let columns = grid_columns_for_width(area.width);
-    let row_cell = CARD_MIN_HEIGHT + CARD_ROW_SPACING;
+    let card_height = grid_card_height(tasks);
+    let row_cell = card_height + CARD_ROW_SPACING;
     let visible_rows = ((area.height / row_cell) as usize).max(1);
     let rows_total = tasks.len().div_ceil(columns);
 
@@ -157,7 +164,7 @@ fn render_task_grid(tasks: &[Task], selected: usize, area: Rect, frame: &mut Fra
     let end_row = (start_row + visible_rows).min(rows_total);
 
     let row_constraints: Vec<Constraint> = (start_row..end_row)
-        .map(|_| Constraint::Length(CARD_MIN_HEIGHT))
+        .map(|_| Constraint::Length(card_height))
         .collect();
     let row_areas = Layout::vertical(row_constraints)
         .spacing(CARD_ROW_SPACING)
@@ -192,6 +199,23 @@ fn render_task_grid(tasks: &[Task], selected: usize, area: Rect, frame: &mut Fra
     }
 
     columns
+}
+
+/// The height every card in the grid renders at: [`CARD_MIN_HEIGHT`], plus one
+/// row when any task in `tasks` carries an unmet `env()` name.
+///
+/// Measured across the whole grid rather than per card because cards share
+/// layout rows — a taller card in one column would leave a ragged row — and
+/// because a card that grew only when affected would shift its neighbours
+/// every time the daemon's coverage changed. With no unmet variable anywhere,
+/// which is the common case, the grid is laid out exactly as it was before
+/// WI 0116.
+fn grid_card_height(tasks: &[Task]) -> u16 {
+    if tasks.iter().any(|task| !task.unmet_env.is_empty()) {
+        CARD_MIN_HEIGHT + CARD_ENV_ROW_HEIGHT
+    } else {
+        CARD_MIN_HEIGHT
+    }
 }
 
 /// The width every card in the grid renders at: an even share of the grid
@@ -364,7 +388,7 @@ fn render_task_card(task: &Task, is_selected: bool, area: Rect, frame: &mut Fram
     // the buffer. Values are truncated explicitly (with an ellipsis) to the
     // width their label leaves, so the cut is visible rather than a silent
     // clip.
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             "Description",
             Style::default().fg(Color::DarkGray),
@@ -377,6 +401,21 @@ fn render_task_card(task: &Task, is_selected: bool, area: Rect, frame: &mut Fram
         labelled_card_line("Outcome", last_run_outcome(task), inner.width),
         labelled_card_line("Next", &next, inner.width),
     ];
+    // WI 0116 §6b: one more labelled row when the daemon has no value for one
+    // of this task's `env()` names, and no row at all otherwise.
+    //
+    // Deliberately NOT a `CardStatus` variant. That precedence table answers
+    // "what is this task's run state" and is documented and tested as such; an
+    // unmet variable is orthogonal — a *paused* task can have one too — so
+    // overloading the card colour would make two unrelated facts compete for
+    // one channel. A labelled row states the fact without taking the colour.
+    if !task.unmet_env.is_empty() {
+        lines.push(labelled_card_line(
+            "Env",
+            &format!("\u{26a0} {} unmet", task.unmet_env.join(", ")),
+            inner.width,
+        ));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -509,6 +548,7 @@ mod tests {
             last_run_at: has_run.then_some(now),
             trigger_requested_at: triggered.then_some(now),
             last_run_status,
+            unmet_env: Vec::new(),
         }
     }
 
@@ -649,5 +689,75 @@ mod tests {
         );
         // Width-aware: wide characters count as two cells.
         assert_eq!(truncate_to_width("日本語テスト", 5), "日本\u{2026}");
+    }
+
+    // ─── WI 0116 §6b: the card's `Env` row and the height it costs ──────────
+
+    fn task_with_unmet(unmet: &[&str]) -> Task {
+        Task {
+            unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
+            ..task_with(TaskStatus::Active, None, false, false)
+        }
+    }
+
+    /// The extra row is measured across the **whole grid**, because cards share
+    /// layout rows: one affected task grows every card by one, so the grid does
+    /// not reflow every time the daemon's coverage changes.
+    #[test]
+    fn the_grid_grows_one_row_when_any_task_has_an_unmet_name() {
+        use super::{grid_card_height, CARD_MIN_HEIGHT};
+        let clean = [task_with_unmet(&[]), task_with_unmet(&[])];
+        assert_eq!(
+            grid_card_height(&clean),
+            CARD_MIN_HEIGHT,
+            "with nothing unmet anywhere the grid lays out exactly as it did \
+             before WI 0116"
+        );
+        let mixed = [task_with_unmet(&[]), task_with_unmet(&["AWS_PROFILE"])];
+        assert_eq!(
+            grid_card_height(&mixed),
+            CARD_MIN_HEIGHT + 1,
+            "one affected task grows every card, so the cards stay uniform"
+        );
+        assert_eq!(grid_card_height(&[]), CARD_MIN_HEIGHT);
+    }
+
+    /// **The `Env` row is not a `CardStatus` variant and must not become one.**
+    ///
+    /// That precedence table answers "what is this task's run state"; an unmet
+    /// variable is orthogonal — a *paused* task can have one too — so
+    /// overloading the card colour would make two unrelated facts compete for
+    /// one channel. Every row of the table answers identically with and
+    /// without an unmet name.
+    #[test]
+    fn an_unmet_env_name_never_changes_the_card_status() {
+        use TaskStatus::{Active, Paused};
+        for (base, expected) in [
+            (task_with(Paused, None, false, false), CardStatus::Paused),
+            (
+                task_with(Active, Some(RunStatus::Running), true, false),
+                CardStatus::Running,
+            ),
+            (
+                task_with(Active, Some(RunStatus::Failed), true, false),
+                CardStatus::Failed,
+            ),
+            (task_with(Active, None, false, false), CardStatus::NeverRun),
+            (
+                task_with(Active, Some(RunStatus::WorkflowExecuted), true, false),
+                CardStatus::Active,
+            ),
+        ] {
+            let unmet = Task {
+                unmet_env: vec!["AWS_PROFILE".to_string()],
+                ..base.clone()
+            };
+            assert_eq!(card_status(&base), expected);
+            assert_eq!(
+                card_status(&unmet),
+                expected,
+                "an unmet variable must not move the card's colour"
+            );
+        }
     }
 }

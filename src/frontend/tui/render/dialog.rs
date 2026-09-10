@@ -939,6 +939,15 @@ fn render_squad_detail(state: &dialogs::SquadDetailState, area: Rect, frame: &mu
             &c.updated_at.format("%Y-%m-%d %H:%M").to_string(),
         ),
     ]);
+    // WI 0116 §6b — the same standing marker the card carries, in the field
+    // block that already reads as a labelled record. Absent when there is
+    // nothing to say, so the modal is unchanged for a fully-covered task.
+    if !c.unmet_env.is_empty() {
+        fields.push(squad_field_line(
+            "Env",
+            &format!("\u{26a0} {} unmet", c.unmet_env.join(", ")),
+        ));
+    }
     let field_h = fields.len() as u16;
 
     let chunks = Layout::vertical([
@@ -1076,15 +1085,25 @@ fn render_squad_run_history(
     frame: &mut Frame,
 ) {
     use crate::data::fs::task_store::RunStatus;
+    // WI 0116 §6e — the names that were unmet when each run started, recorded
+    // on the run row and shown here so a run that behaved oddly last Tuesday
+    // can still be explained. The column appears only when some run in the
+    // history actually carries one: measured over every run rather than the
+    // visible window, so scrolling never reshapes the table.
+    let show_unmet = runs.iter().any(|r| !r.unmet_env.is_empty());
     let header_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let header = Row::new(vec![
+    let mut header_cells = vec![
         Cell::from("Started").style(header_style),
         Cell::from("Status").style(header_style),
         Cell::from("Finished").style(header_style),
         Cell::from("Error").style(header_style),
-    ]);
+    ];
+    if show_unmet {
+        header_cells.push(Cell::from("Unmet env").style(header_style));
+    }
+    let header = Row::new(header_cells);
     let rows: Vec<Row> = runs
         .iter()
         .skip(scroll)
@@ -1102,20 +1121,31 @@ fn render_squad_run_history(
                 .map(|f| f.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| "\u{2014}".to_string());
             let error = r.error.clone().unwrap_or_default();
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(started),
                 Cell::from(status),
                 Cell::from(finished),
                 Cell::from(error),
-            ])
+            ];
+            if show_unmet {
+                cells.push(Cell::from(if r.unmet_env.is_empty() {
+                    "\u{2014}".to_string()
+                } else {
+                    format!("\u{26a0} {}", r.unmet_env.join(", "))
+                }));
+            }
+            Row::new(cells)
         })
         .collect();
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(17),
         Constraint::Length(14),
         Constraint::Length(17),
         Constraint::Min(6),
     ];
+    if show_unmet {
+        widths.push(Constraint::Min(9));
+    }
     let table = Table::new(rows, widths).header(header);
     frame.render_widget(table, area);
 }

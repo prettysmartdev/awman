@@ -233,6 +233,7 @@ async fn task_creation_under_sandbox_runtime_is_rejected_with_the_same_error() {
         docker_engines,
         status_handle.clone(),
         awman::data::fs::SquadPaths::from_root(tmp.path().join("squad")),
+        std::sync::Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
     );
     docker_gateway
         .create(CreateTask {
@@ -261,6 +262,7 @@ async fn task_creation_under_sandbox_runtime_is_rejected_with_the_same_error() {
         sandbox_engines,
         status_handle,
         awman::data::fs::SquadPaths::from_root(tmp.path().join("squad")),
+        std::sync::Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
     );
     let err = sandbox_gateway
         .create(CreateTask {

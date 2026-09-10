@@ -209,6 +209,7 @@ fn fake_task(name: &str) -> crate::data::fs::task_store::Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     }
 }
 
@@ -1172,6 +1173,8 @@ fn the_squad_indicator_is_pinned_to_the_right_of_the_bottom_row_in_every_state()
         (SquadIndicator::NotRunning, Color::DarkGray),
         (SquadIndicator::Unreachable, Color::Yellow),
         (SquadIndicator::Failed, Color::Red),
+        // WI 0116 §6c: the seventh state, sharing `Unreachable`'s yellow.
+        (SquadIndicator::EnvUnmet, Color::Yellow),
         (SquadIndicator::Running, Color::Blue),
         (SquadIndicator::Healthy, Color::Green),
     ] {

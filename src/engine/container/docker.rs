@@ -689,6 +689,44 @@ impl ExecutionBackend for AttachExecution {
     }
 }
 
+/// The declared `env()` passthrough names that actually resolve on this host,
+/// paired with their values.
+///
+/// This is the one place the passthrough gate is decided, so `build_run_argv`
+/// (which emits the name-only `-e NAME`) and the spawn paths in `process.rs`
+/// (which set the value on the child's environment) can never disagree about
+/// which names are being passed through.
+///
+/// Resolution goes through [`host_var`](crate::data::config::env::host_var), so
+/// a squad daemon sees values pushed into its in-memory overlay as well as its
+/// own process environment. A name that resolves to `Some("")` is still
+/// included: that is bit-for-bit today's `std::env::var(..).is_ok()` gate, and
+/// changing it would silently alter CLI/TUI behaviour for a variable that is
+/// deliberately set to the empty string.
+pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+    options
+        .env_passthrough
+        .iter()
+        .filter(|envvar| is_env_var_name(&envvar.0))
+        .filter_map(|envvar| {
+            crate::data::config::env::host_var(&envvar.0).map(|value| (envvar.0.clone(), value))
+        })
+        .collect()
+}
+
+/// Whether a passthrough name is a usable environment variable name.
+///
+/// `env()` validates this at the front door, but a task created before that
+/// validation existed still carries whatever it was given, and these names now
+/// reach `Command::env` on the spawn paths: a `=` there produces a malformed
+/// environment entry rather than a passthrough, and a NUL fails the spawn
+/// outright. Such a name could never have worked, so dropping it is not a
+/// behaviour change anyone can depend on.
+fn is_env_var_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Translate `ResolvedContainerOptions` into a `docker run` argv (without the
 /// leading `docker` binary).
 pub(super) fn build_run_argv(
@@ -759,14 +797,30 @@ pub(super) fn build_run_argv(
         ));
     }
 
-    // Env passthrough — only emit when the variable is set on the host.
-    for envvar in &options.env_passthrough {
-        if let Ok(value) = std::env::var(&envvar.0) {
-            args.push("-e".into());
-            args.push(format!("{}={}", envvar.0, value));
-        }
+    // Env passthrough — only emit when the variable resolves on the host. Like
+    // the credential block just below, this is name-only (`-e NAME`): argv is
+    // world-readable through `/proc/<pid>/cmdline` (or `ps`), so a host value
+    // that may be a secret must never be written into it. The value reaches the
+    // container the way an agent credential's does — it is set on the spawned
+    // CLI child's own environment (see [`resolve_env_passthrough`] and the
+    // spawn paths in `process.rs`), and the container-runtime CLI resolves a
+    // name-only `-e` from its own process env.
+    //
+    // The gate is `host_var`, not `std::env::var`: inside the squad daemon a
+    // task's `env()` value arrives over the authenticated socket and lives in
+    // the Layer 0 daemon overlay, never in the daemon's real process
+    // environment. Gating on `std::env::var` there emits no `-e` at all and the
+    // container starts silently without the variable — the regression WI 0116
+    // exists to end. Injecting the resolved value onto the child is what makes
+    // the overlay case work, because ambient inheritance cannot.
+    for (name, _) in resolve_env_passthrough(options) {
+        args.push("-e".into());
+        args.push(name);
     }
-    // Env literals.
+    // Env literals — unlike env_passthrough above, these keep the `KEY=VALUE`
+    // form. Literal values are constants awman itself supplies (e.g.
+    // `COPILOT_OFFLINE=true`), never a user secret, so there is nothing here
+    // that argv's world-readability could expose.
     for lit in &options.env_literal {
         args.push("-e".into());
         args.push(format!("{}={}", lit.key, lit.value));
@@ -1175,22 +1229,146 @@ mod tests {
 
     #[test]
     fn build_run_argv_env_passthrough_only_when_set() {
+        use crate::engine::container::options::EnvLiteral;
+
         std::env::set_var("AWMAN_TEST_ENV_DOCKER", "v1");
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
             ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_ENV_DOCKER".into())),
             ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_NEVER_SET_DOCKER".into())),
+            ContainerOption::EnvLiteral(EnvLiteral {
+                key: "MY_KEY".into(),
+                value: "my_value".into(),
+            }),
         ]);
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
         );
-        assert!(argv.contains(&"AWMAN_TEST_ENV_DOCKER=v1".to_string()));
-        assert!(!argv
-            .iter()
-            .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "AWMAN_TEST_ENV_DOCKER"),
+            "passthrough must be emitted as name-only `-e AWMAN_TEST_ENV_DOCKER`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "AWMAN_TEST_ENV_DOCKER=v1"),
+            "the passthrough value must never ride argv as NAME=VALUE; argv: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")),
+            "an unset passthrough name must emit nothing at all; argv: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"),
+            "a literal must still be emitted as -e KEY=VALUE, unlike passthrough; argv: {argv:?}"
+        );
         std::env::remove_var("AWMAN_TEST_ENV_DOCKER");
+    }
+
+    /// WI 0116 §1/D1 — the regression this work item exists to end.
+    ///
+    /// A squad daemon holds a task's `env()` value in the Layer 0 overlay, not
+    /// in its own process environment. Gating the `-e` on `std::env::var`
+    /// emitted nothing at all there, so the container started silently without
+    /// the variable. The gate is `host_var`, so the name must be emitted; the
+    /// value must be reachable through `resolve_env_passthrough` (which the
+    /// spawn paths set on the child) and must never appear in argv.
+    #[test]
+    fn build_run_argv_passes_through_a_name_held_only_in_the_daemon_overlay() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Unique name, and explicitly *not* in the process environment: this is
+        // the daemon's situation exactly.
+        let name = "AWMAN_TEST_DOCKER_OVERLAY_ONLY";
+        std::env::remove_var(name);
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
+
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar(name.into())),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+            "a name held only in the daemon overlay must still emit `-e {name}`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("overlay-secret")),
+            "the overlay value must never reach argv; argv: {argv:?}"
+        );
+        assert_eq!(
+            resolve_env_passthrough(&resolved),
+            vec![(name.to_string(), "overlay-secret".to_string())],
+            "the spawn paths take the value from here and set it on the child",
+        );
+
+        set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    /// A task created before `env()` validated its argument still carries
+    /// whatever it was given, and these names now reach `Command::env` on the
+    /// spawn paths (review-security F11).
+    #[test]
+    fn resolve_env_passthrough_drops_a_name_that_is_not_an_environment_variable_name() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The overlay, not the process environment: the OS itself refuses to
+        // set a variable whose name contains `=`, which is part of why such a
+        // name must never become a `Command::env` key.
+        let bad = "AWMAN_TEST_DOCKER=INVALID";
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(bad, "v")]));
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar(bad.into())),
+        ]);
+        assert!(
+            resolve_env_passthrough(&resolved).is_empty(),
+            "a malformed key must never reach Command::env"
+        );
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(!argv.iter().any(|a| a.contains(bad)), "argv: {argv:?}");
+        set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    /// D15 — `Some("")` still emits, for bit-for-bit parity with the old
+    /// `std::env::var(..).is_ok()` gate. Only the *push* path treats an empty
+    /// value as absent.
+    #[test]
+    fn resolve_env_passthrough_keeps_a_variable_set_to_the_empty_string() {
+        let name = "AWMAN_TEST_DOCKER_EMPTY_PASSTHROUGH";
+        std::env::set_var(name, "");
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar(name.into())),
+        ]);
+        assert_eq!(
+            resolve_env_passthrough(&resolved),
+            vec![(name.to_string(), String::new())]
+        );
+        std::env::remove_var(name);
     }
 
     #[test]

@@ -4128,7 +4128,7 @@ fn collect_single_entry_overlays(
 
     let mut env = std::collections::HashMap::new();
     for var_name in &collected.env_passthrough {
-        if let Ok(val) = std::env::var(var_name) {
+        if let Some(val) = crate::data::config::env::host_var(var_name) {
             env.insert(var_name.clone(), val);
         }
     }

@@ -3,7 +3,7 @@
 //! An app-level poller — independent of the squad tab, which may never have
 //! been opened, and of the tab's own `SquadTaskPoller`, which fetches only
 //! while that tab is focused — probes the squad daemon every ten seconds and
-//! publishes one of six states. The renderer paints a coloured `●` for it on
+//! publishes one of seven states. The renderer paints a coloured `●` for it on
 //! every tab. The poller holds no policy: [`classify`] is the whole decision
 //! and is a pure function.
 
@@ -38,6 +38,12 @@ pub enum SquadIndicator {
     Unreachable,
     /// Reachable, and at least one task's most recent run failed.
     Failed,
+    /// Reachable, nothing failed, and at least one task declares an `env()`
+    /// variable the daemon has no value for (WI 0116 §6c).
+    ///
+    /// This is *per-task* coverage and nothing else. In particular a keychain
+    /// **persistence fallback never lands here** — see [`classify`].
+    EnvUnmet,
     /// Reachable, and at least one task is executing right now.
     Running,
     /// Reachable, nothing failed, nothing running.
@@ -51,6 +57,24 @@ pub type SharedSquadIndicator = Arc<Mutex<SquadIndicator>>;
 /// pidfile answer; `probe` is the task list the daemon returned, or why it
 /// did not. Pure, so every row of the state table is unit-tested without a
 /// daemon.
+///
+/// Precedence is `Unreachable` > `Failed` > `EnvUnmet` > `Running` >
+/// `Healthy`. `EnvUnmet` beats blue for the same reason red does — an unmet
+/// variable is persistent and actionable, while a running task is transient —
+/// and loses to red because a failed run is the more urgent fact, and is
+/// frequently *caused* by the unmet variable the user will meet on arriving at
+/// the tab either way.
+///
+/// **Deliberately not here: the keychain-persistence fallback.** On headless
+/// Linux and on Windows that fallback is the expected steady state, so wiring
+/// it in would pin the indicator yellow forever on those platforms — and an
+/// indicator that is always yellow teaches users to ignore it, which costs more
+/// than the warning gains. Persistence state belongs in `squad status` and
+/// `awman squad env`, where it is sought deliberately; this indicator is
+/// reserved for per-task unmet variables, a condition that is always someone's
+/// to fix and that goes away when they fix it. `DaemonStatus.env_persistence`
+/// is not a parameter of this function for exactly that reason — please do not
+/// "fix" it by adding one.
 pub fn classify(daemon_running: bool, probe: Result<&[Task], &CommandError>) -> SquadIndicator {
     if !daemon_running {
         return SquadIndicator::NotRunning;
@@ -66,6 +90,12 @@ pub fn classify(daemon_running: bool, probe: Result<&[Task], &CommandError>) -> 
         .any(|task| task.last_run_status == Some(RunStatus::Failed))
     {
         return SquadIndicator::Failed;
+    }
+    // Yellow beats blue, for the same reason red does. The data rides on the
+    // task list this poller already fetches, so the seventh state costs no
+    // second round trip.
+    if tasks.iter().any(|task| !task.unmet_env.is_empty()) {
+        return SquadIndicator::EnvUnmet;
     }
     if tasks
         .iter()
@@ -160,6 +190,7 @@ mod tests {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status,
+            unmet_env: Vec::new(),
         }
     }
 
@@ -228,5 +259,140 @@ mod tests {
             task("d", None),
         ];
         assert_eq!(classify(true, Ok(&tasks)), SquadIndicator::Healthy);
+    }
+
+    /// A task with `unmet_env` set — the WI 0116 §6c input. The unmet names
+    /// ride on the very `Task` the poller's one `list` call already returns.
+    fn task_with_unmet(name: &str, last_run_status: Option<RunStatus>, unmet: &[&str]) -> Task {
+        Task {
+            unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
+            ..task(name, last_run_status)
+        }
+    }
+
+    /// WI 0116 §6c: the seventh state. One task with an uncovered `env()` name
+    /// is enough, whatever the rest of the grid looks like.
+    #[test]
+    fn a_task_with_an_unmet_env_name_is_env_unmet() {
+        let tasks = [
+            task("clean", Some(RunStatus::WorkflowExecuted)),
+            task_with_unmet("deploy", None, &["AWS_PROFILE"]),
+        ];
+        assert_eq!(classify(true, Ok(&tasks)), SquadIndicator::EnvUnmet);
+    }
+
+    /// Red still beats yellow: a failed run is the more urgent fact, and it is
+    /// frequently *caused* by the unmet variable the user meets on arriving at
+    /// the tab either way.
+    #[test]
+    fn a_failed_task_with_an_unmet_env_name_is_still_failed() {
+        let tasks = [task_with_unmet(
+            "deploy",
+            Some(RunStatus::Failed),
+            &["AWS_PROFILE"],
+        )];
+        assert_eq!(classify(true, Ok(&tasks)), SquadIndicator::Failed);
+        // …including when the failure and the unmet name are on different
+        // tasks, which is the shape the precedence table actually describes.
+        let split = [
+            task("other", Some(RunStatus::Failed)),
+            task_with_unmet("deploy", None, &["AWS_PROFILE"]),
+        ];
+        assert_eq!(classify(true, Ok(&split)), SquadIndicator::Failed);
+    }
+
+    /// **The precedence change, and the row most likely to be got backwards.**
+    /// Yellow beats blue for the same reason red does: an unmet variable is
+    /// persistent and actionable, a running task is transient and will show
+    /// itself on the next tick.
+    #[test]
+    fn a_running_task_with_an_unmet_env_name_is_env_unmet_not_running() {
+        let same_task = [task_with_unmet(
+            "deploy",
+            Some(RunStatus::Running),
+            &["AWS_PROFILE"],
+        )];
+        assert_eq!(
+            classify(true, Ok(&same_task)),
+            SquadIndicator::EnvUnmet,
+            "an unmet variable outranks a run in flight"
+        );
+        let split = [
+            task("busy", Some(RunStatus::Running)),
+            task_with_unmet("deploy", None, &["AWS_PROFILE"]),
+        ];
+        assert_eq!(classify(true, Ok(&split)), SquadIndicator::EnvUnmet);
+    }
+
+    /// An unreachable daemon outranks everything reachable, including the new
+    /// state: a daemon that cannot answer cannot have reported coverage, so a
+    /// yellow `EnvUnmet` would be describing stale data.
+    #[test]
+    fn an_unreachable_daemon_outranks_env_unmet_whatever_the_last_answer_said() {
+        for error in [
+            CommandError::RemoteTimeout,
+            CommandError::RemoteConnectionRefused("refused".into()),
+            CommandError::RemoteHttpStatus {
+                status: 401,
+                body: "Invalid API key.".into(),
+            },
+        ] {
+            assert_eq!(
+                classify(true, Err(&error)),
+                SquadIndicator::Unreachable,
+                "{error}"
+            );
+        }
+        // And a daemon that is not running at all is grey, not yellow.
+        let tasks = [task_with_unmet("deploy", None, &["AWS_PROFILE"])];
+        assert_eq!(classify(false, Ok(&tasks)), SquadIndicator::NotRunning);
+    }
+
+    /// **The deliberate exclusion in §6c, asserted so nobody "fixes" it.**
+    ///
+    /// A keychain-persistence fallback is not an input to this function at all
+    /// — `DaemonStatus.env_persistence` is not a parameter — so a daemon that
+    /// cannot reach a keychain, with every task fully covered, stays `Healthy`.
+    /// On headless Linux and on Windows that fallback is the *expected steady
+    /// state*; wiring it in here would pin the indicator yellow forever on
+    /// those platforms, and an always-yellow indicator teaches users to ignore
+    /// it. Persistence state belongs in `squad status` and `awman squad env`,
+    /// where it is sought deliberately.
+    #[test]
+    fn a_persistence_fallback_with_no_unmet_task_variable_leaves_the_indicator_healthy() {
+        // Exactly the state a headless Linux box is in: the daemon reports
+        // `unavailable(secret-tool not found)` on `/v1/status`, and every task
+        // has its values because the shell pushed them this session.
+        let tasks = [
+            task_with_unmet("nightly", Some(RunStatus::WorkflowExecuted), &[]),
+            task_with_unmet("deploy", None, &[]),
+        ];
+        assert_eq!(
+            classify(true, Ok(&tasks)),
+            SquadIndicator::Healthy,
+            "a persistence fallback must never colour this indicator"
+        );
+    }
+
+    /// The data rides on the task list the poller already fetches: an empty
+    /// `unmet_env` is the same input shape as before WI 0116, and every
+    /// pre-existing row of the table still answers the same way.
+    #[test]
+    fn an_empty_unmet_env_changes_none_of_the_pre_wi_0116_rows() {
+        assert_eq!(classify(true, Ok(&[])), SquadIndicator::Healthy);
+        assert_eq!(
+            classify(
+                true,
+                Ok(&[task_with_unmet("a", Some(RunStatus::Running), &[])])
+            ),
+            SquadIndicator::Running
+        );
+        assert_eq!(
+            classify(
+                true,
+                Ok(&[task_with_unmet("a", Some(RunStatus::Failed), &[])])
+            ),
+            SquadIndicator::Failed
+        );
     }
 }

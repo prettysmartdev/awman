@@ -15,8 +15,10 @@ use crate::command::commands::squad::commands::resolved_git_root;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::data::config::env::DaemonEnvMap;
 use crate::data::config::global::GlobalConfig;
 use crate::data::config::repo::SquadConfig;
+use crate::data::fs::daemon_env::env_overlay_names;
 use crate::data::fs::task_store::{
     MountScope, Run, Task, TaskStatus, TaskStore, TaskUpdate, TaskWorkspace,
 };
@@ -24,6 +26,7 @@ use crate::data::fs::SquadPaths;
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::naming::validate_task_slug;
+use crate::engine::squad::env_state::{DaemonEnvState, RequiredEnvEntry};
 use crate::engine::squad::SchedulerStatus;
 
 /// The `--workspace` value selecting the durable per-task workspace. One
@@ -187,6 +190,93 @@ pub struct DaemonStatus {
     pub active_count: usize,
     pub last_tick: Option<DateTime<Utc>>,
     pub in_flight: usize,
+    /// Where the daemon persists its payload environment (WI 0116 §5a):
+    /// `"keychain"`, `"none"`, or `"unavailable(<reason>)"`.
+    ///
+    /// Reported here so `awman squad status` can name a degraded daemon
+    /// without anyone reading a log file — it appends `; env persistence
+    /// <state>` for exactly the `unavailable(...)` case, since `keychain` is
+    /// the healthy default and `none` is the user's own opt-out. A string
+    /// rather than the typed [`EnvPersistence`] because the `unavailable(...)`
+    /// reason is open-ended and every consumer only ever displays it.
+    ///
+    /// Deliberately *not* on `Task`, so it can never reach the TUI indicator's
+    /// `classify`: a keychain that stopped working is not a task-health
+    /// problem, and colouring the squad dot for it would bury the states that
+    /// are (CONTRACT §5).
+    ///
+    /// [`EnvPersistence`]: crate::data::fs::daemon_env::EnvPersistence
+    #[serde(default)]
+    pub env_persistence: String,
+    /// Required, non-optional env names the daemon has no value for, sorted.
+    /// Empty on the common path, which is why the CLI one-liner only mentions
+    /// it when it is not.
+    #[serde(default)]
+    pub unmet_env: Vec<String>,
+}
+
+/// The daemon's `required_env`, with a salted digest per name it holds.
+///
+/// This is the *check* every squad command performs and almost none act on: a
+/// client compares each digest against one it computes from its own value and
+/// sends nothing when they match. No value is ever in this response.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct EnvCoverage {
+    /// The daemon's per-lifetime salt, 64 lowercase hex characters.
+    ///
+    /// It makes digests incomparable across daemons and machines, and rotating
+    /// it per lifetime stops a restarted daemon having stale digests trusted
+    /// against it. It does *not* protect the digests from the caller that
+    /// receives this response, which holds both — see `env_state`'s module
+    /// documentation for what that does and does not mean.
+    pub salt: String,
+    /// [`DaemonStatus::env_persistence`]'s value, so `awman squad env` needs
+    /// only this one call.
+    pub persistence: String,
+    pub required: Vec<RequiredEnvEntry>,
+}
+
+/// Hand-written so no future `debug!(?coverage)` can put the salt in a log —
+/// the same defence [`DaemonEnvMap`] and `Salt` already have. The entries carry
+/// digests and names, never values, so they print in full.
+impl std::fmt::Debug for EnvCoverage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvCoverage")
+            .field("salt", &"<redacted>")
+            .field("persistence", &self.persistence)
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
+/// One push: the three states a client can report per required name.
+///
+/// `Debug` is derived and still safe — [`DaemonEnvMap`]'s own `Debug` prints
+/// names only — which is the point of the type. This body deliberately does not
+/// travel through the `{subcommand, args}` envelope of `/v1/commands`:
+/// CLI-arg-shaped strings drift into tracing spans and error text, a typed body
+/// with a redacting `Debug` does not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnvPush {
+    /// Names the client has. Each replaces whatever the daemon holds.
+    #[serde(default)]
+    pub vars: DaemonEnvMap,
+    /// Names the client was asked for and cannot supply. **Never a deletion**:
+    /// "I don't have it" is not "nobody should have it".
+    #[serde(default)]
+    pub absent: Vec<String>,
+}
+
+/// What a push is answered with: names only, and the fresh coverage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnvPushResponse {
+    /// Names whose value the daemon took.
+    pub accepted: Vec<String>,
+    /// Names in `vars` the daemon did not take because they are not in
+    /// `required_env`. An empty value is *not* listed here — it counts as
+    /// absent, which is reported nowhere.
+    pub ignored: Vec<String>,
+    pub coverage: EnvCoverage,
 }
 
 #[async_trait]
@@ -209,6 +299,26 @@ pub trait TaskGateway: Send + Sync {
     /// gateways implement the transport-specific lookup below.
     async fn workflow_state(&self, _task: &str) -> Result<Option<WorkflowState>, CommandError> {
         Ok(None)
+    }
+
+    /// The daemon's `required_env` with a salted digest per held name (§4a).
+    ///
+    /// Defaulted so the many small test gateways in this tree stay
+    /// source-compatible; an empty coverage plans no push, which is the correct
+    /// behaviour for a gateway that has no daemon behind it.
+    async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
+        Ok(EnvCoverage::default())
+    }
+
+    /// Merge a client's values into the daemon's overlay (§4b).
+    async fn push_env(&self, _push: EnvPush) -> Result<EnvPushResponse, CommandError> {
+        Ok(EnvPushResponse::default())
+    }
+
+    /// Remove the persisted keychain item (§5c). `false` when there is no
+    /// keychain backend to clear.
+    async fn clear_env_store(&self) -> Result<bool, CommandError> {
+        Ok(false)
     }
 }
 
@@ -247,6 +357,15 @@ impl TaskGateway for SharedTaskGateway {
     async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
         self.0.workflow_state(task).await
     }
+    async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
+        self.0.env_coverage().await
+    }
+    async fn push_env(&self, push: EnvPush) -> Result<EnvPushResponse, CommandError> {
+        self.0.push_env(push).await
+    }
+    async fn clear_env_store(&self) -> Result<bool, CommandError> {
+        self.0.clear_env_store().await
+    }
 }
 
 /// Daemon-only gateway. All persistent-task validation belongs here.
@@ -260,6 +379,9 @@ pub struct LocalTaskGateway {
     /// would let the two disagree whenever the daemon was started with an
     /// explicit root.
     paths: SquadPaths,
+    /// The daemon's payload-environment metadata (WI 0116 §4). Shared with the
+    /// scheduler, which reads the same coverage when it opens a run row.
+    env_state: Arc<DaemonEnvState>,
 }
 
 impl LocalTaskGateway {
@@ -268,12 +390,135 @@ impl LocalTaskGateway {
         engines: Engines,
         status: Arc<Mutex<SchedulerStatus>>,
         paths: SquadPaths,
+        env_state: Arc<DaemonEnvState>,
     ) -> Self {
         Self {
             store,
             engines,
             status,
             paths,
+            env_state,
+        }
+    }
+
+    /// Recompute `required_env` from the task store and the daemon's own
+    /// configuration.
+    ///
+    /// Deliberately **not cached**: it is computed on demand so it tracks tasks
+    /// being added and removed, which is also what garbage-collects a value
+    /// whose last declaring task has gone (§4b). The union is
+    ///
+    /// * every `env(NAME)` across the task store, attributed to the task that
+    ///   declares it;
+    /// * every `env(NAME)` in the daemon's own global config and
+    ///   `AWMAN_OVERLAYS`, attributed to *every* task because those overlays
+    ///   apply to every run;
+    /// * the fixed host-side names ([`HOST_SIDE_ENV_NAMES`]), attributed to no
+    ///   task and never counted as unmet.
+    ///
+    /// `TaskStore` stays daemon-only, so a client never reads any of this — it
+    /// asks for the answer over the socket.
+    pub async fn refresh_required_env(&self) -> Result<(), CommandError> {
+        let tasks = self.store.list()?;
+        self.refresh_required_env_from(&tasks).await;
+        Ok(())
+    }
+
+    /// [`Self::refresh_required_env`] over a task list the caller already has.
+    ///
+    /// `list` and `status` both read every task anyway, and the indicator
+    /// poller calls one of them every ten seconds; re-reading the store here
+    /// would double that query for no new information.
+    ///
+    /// The `set_required` half runs on the blocking pool: garbage-collecting a
+    /// name rewrites the keychain item, and that call is capped at five
+    /// seconds. Parking a runtime worker for five seconds on a locked or
+    /// D-Bus-less keychain would stop `/v1/status` answering — the endpoint the
+    /// indicator poller and `awman squad status` both need — and an
+    /// authenticated client can drive it. The bootstrap already treats the
+    /// store this way; the request path must too.
+    async fn refresh_required_env_from(&self, tasks: &[Task]) {
+        let required = self.required_env_map(tasks);
+        let state = Arc::clone(&self.env_state);
+        let now = Utc::now();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || state.set_required(required, now)).await
+        {
+            tracing::debug!(error = %error, "squad env: coverage refresh task failed");
+        }
+    }
+
+    /// Which names the daemon requires, and which tasks ask for each. Pure map
+    /// building over an already-loaded task list plus the daemon-wide sources.
+    fn required_env_map(&self, tasks: &[Task]) -> BTreeMap<String, Vec<String>> {
+        let mut task_names: Vec<String> = tasks.iter().map(|task| task.name.clone()).collect();
+        task_names.sort();
+
+        let mut required: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for task in tasks {
+            for name in env_overlay_names(&task.overlays) {
+                required.entry(name).or_default().push(task.name.clone());
+            }
+        }
+        for name in self.daemon_wide_env_names() {
+            required.insert(name, task_names.clone());
+        }
+        required
+    }
+
+    /// `env(NAME)` from the daemon's own overlay sources — its global config
+    /// and `AWMAN_OVERLAYS` — which apply to every run rather than to one task.
+    ///
+    /// A config that fails to load contributes nothing rather than failing the
+    /// request: coverage is advisory, and a malformed global file already
+    /// surfaces loudly on the scheduler's own tick.
+    fn daemon_wide_env_names(&self) -> Vec<String> {
+        let mut specs: Vec<String> = Vec::new();
+        if let Ok(config) = GlobalConfig::load() {
+            specs.extend(config.overlays.unwrap_or_default());
+        }
+        // `AWMAN_OVERLAYS` is one comma-separated string of specs; `env(NAME)`
+        // never contains a comma, so splitting first is lossless.
+        if let Some(raw) =
+            crate::data::config::env::host_var(crate::data::config::env::AWMAN_OVERLAYS)
+        {
+            specs.extend(raw.split(',').map(|spec| spec.trim().to_string()));
+        }
+        env_overlay_names(&specs)
+    }
+
+    /// Stamp the derived `unmet_env` marker onto tasks on their way out.
+    ///
+    /// One pass over an already-loaded list: the indicator poller's single
+    /// `list` call stays a single call, exactly as `last_run_status` riding on
+    /// the task row keeps it one.
+    fn with_unmet_env(&self, mut tasks: Vec<Task>) -> Vec<Task> {
+        for task in &mut tasks {
+            task.unmet_env = self.env_state.unmet_for_task(task);
+        }
+        tasks
+    }
+
+    fn with_unmet_env_one(&self, mut task: Task) -> Task {
+        task.unmet_env = self.env_state.unmet_for_task(&task);
+        task
+    }
+
+    /// Recompute coverage, logging rather than failing when the store cannot be
+    /// read. A command must not fail because the daemon could not refresh an
+    /// advisory list.
+    async fn refresh_required_env_best_effort(&self) {
+        if let Err(error) = self.refresh_required_env().await {
+            tracing::debug!(error = %error, "squad env: could not refresh required_env");
+        }
+    }
+
+    /// The coverage response, computed fresh.
+    fn coverage(&self) -> EnvCoverage {
+        EnvCoverage {
+            salt: self.env_state.salt().to_hex(),
+            persistence: self.env_state.persistence().to_string(),
+            required: self.env_state.entries(),
         }
     }
 
@@ -529,8 +774,14 @@ impl TaskGateway for LocalTaskGateway {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            unmet_env: Vec::new(),
         };
         self.store.create(&task)?;
+        // The new task may have brought a new `env()` name with it, so the
+        // required set is recomputed before the marker is derived — this is the
+        // earliest and most actionable moment to tell the user (§6a).
+        self.refresh_required_env_best_effort().await;
+        let task = self.with_unmet_env_one(task);
         tracing::info!(
             task = %task.name,
             repo_scope = %task.repo_scope.display(),
@@ -610,16 +861,24 @@ impl TaskGateway for LocalTaskGateway {
             overlays = updated.overlays.len(),
             "squad task edited"
         );
-        Ok(updated)
+        // An edit can add or drop an `env()` name; dropping the last one that
+        // named a value is what garbage-collects it.
+        self.refresh_required_env_best_effort().await;
+        Ok(self.with_unmet_env_one(updated))
     }
 
     async fn list(&self) -> Result<Vec<Task>, CommandError> {
-        Ok(self.store.list()?)
+        // One store read serves both the refresh and the response, so the
+        // indicator poller's single `list` per tick stays a single query.
+        let tasks = self.store.list()?;
+        self.refresh_required_env_from(&tasks).await;
+        Ok(self.with_unmet_env(tasks))
     }
 
     async fn get(&self, name: &str) -> Result<Task, CommandError> {
         self.store
             .get(name)?
+            .map(|task| self.with_unmet_env_one(task))
             .ok_or_else(|| CommandError::Other(format!("task {name:?} was not found")))
     }
 
@@ -674,6 +933,10 @@ impl TaskGateway for LocalTaskGateway {
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         if self.store.delete(name)? {
             tracing::info!(task = %name, "squad administrator removed task");
+            // Removing the last task that named a variable is the one
+            // unambiguous signal that nothing needs its value any more, and
+            // this is where that is noticed.
+            self.refresh_required_env_best_effort().await;
             Ok(())
         } else {
             Err(CommandError::Other(format!("task {name:?} was not found")))
@@ -682,6 +945,9 @@ impl TaskGateway for LocalTaskGateway {
 
     async fn status(&self) -> Result<DaemonStatus, CommandError> {
         let tasks = self.store.list()?;
+        self.refresh_required_env_from(&tasks).await;
+        let env_persistence = self.env_state.persistence().to_string();
+        let unmet_env = self.env_state.unmet_names();
         let status = self.status.lock().expect("scheduler status mutex poisoned");
         Ok(DaemonStatus {
             running: true,
@@ -694,7 +960,55 @@ impl TaskGateway for LocalTaskGateway {
                 .count(),
             last_tick: status.last_tick,
             in_flight: status.in_flight,
+            env_persistence,
+            unmet_env,
         })
+    }
+
+    async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
+        // Recomputed first, never cached, so the answer tracks tasks being
+        // added and removed since the last command.
+        self.refresh_required_env_best_effort().await;
+        Ok(self.coverage())
+    }
+
+    async fn push_env(&self, push: EnvPush) -> Result<EnvPushResponse, CommandError> {
+        self.refresh_required_env_best_effort().await;
+        // `apply_push` writes the accepted values through to the keychain, a
+        // call capped at five seconds. Doing that inline would park a runtime
+        // worker for the whole cap on a locked keychain, once per push, which
+        // an authenticated client can drive concurrently.
+        let state = Arc::clone(&self.env_state);
+        let now = Utc::now();
+        let (accepted, ignored) =
+            tokio::task::spawn_blocking(move || state.apply_push(push.vars, &push.absent, now))
+                .await
+                .map_err(|error| {
+                    CommandError::Other(format!("squad env push task failed: {error}"))
+                })?;
+        if !accepted.is_empty() {
+            // Names only. This line exists so an operator can see that a
+            // rotation landed; a value must never reach it.
+            tracing::info!(names = ?accepted, "squad env: accepted pushed values");
+        }
+        Ok(EnvPushResponse {
+            accepted,
+            ignored,
+            coverage: self.coverage(),
+        })
+    }
+
+    async fn clear_env_store(&self) -> Result<bool, CommandError> {
+        // Unlike a failed store write this never degrades the daemon, so a
+        // client could re-drive it indefinitely — five seconds of a parked
+        // runtime worker per call if the keychain is wedged.
+        let state = Arc::clone(&self.env_state);
+        let cleared = tokio::task::spawn_blocking(move || state.clear_store())
+            .await
+            .map_err(|error| {
+                CommandError::Other(format!("squad env clear task failed: {error}"))
+            })?;
+        Ok(cleared?)
     }
 
     async fn workflow_state(&self, name: &str) -> Result<Option<WorkflowState>, CommandError> {
@@ -865,6 +1179,45 @@ impl TaskGateway for RemoteTaskGateway {
         serde_json::from_value(response.body).map_err(|error| {
             CommandError::RemoteTransport(format!("invalid squad daemon status: {error}"))
         })
+    }
+
+    /// `GET /v1/daemon/env` — a dedicated typed route, never the
+    /// `{subcommand, args}` command envelope.
+    async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
+        let response = self.core.get(&["daemon", "env"]).await?;
+        serde_json::from_value(response.body).map_err(|error| {
+            CommandError::RemoteTransport(format!("invalid squad env coverage: {error}"))
+        })
+    }
+
+    /// `POST /v1/daemon/env`.
+    ///
+    /// The body is the only place in squad's client where a payload value
+    /// travels, and it travels as a typed JSON object rather than as argv-shaped
+    /// strings. The response carries names, never values, so an error path here
+    /// cannot echo a secret either.
+    async fn push_env(&self, push: EnvPush) -> Result<EnvPushResponse, CommandError> {
+        let response = self
+            .core
+            .post_command(
+                &["daemon", "env"],
+                &[("vars", json!(push.vars)), ("absent", json!(push.absent))],
+                &[],
+            )
+            .await?;
+        serde_json::from_value(response.body).map_err(|error| {
+            CommandError::RemoteTransport(format!("invalid squad env push response: {error}"))
+        })
+    }
+
+    /// `DELETE /v1/daemon/env`.
+    async fn clear_env_store(&self) -> Result<bool, CommandError> {
+        let response = self.core.delete(&["daemon", "env"]).await?;
+        Ok(response
+            .body
+            .get("cleared")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
     }
 
     async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
@@ -1040,5 +1393,37 @@ mod tests {
         assert_eq!(stored.agent, Some(Some("claude".to_string())));
         assert_eq!(stored.model, Some(None));
         assert_eq!(stored.overlays, Some(vec!["env(TOKEN)".to_string()]));
+    }
+
+    /// Remediation of review-security F6 (latent half) / review-adversarial F11.
+    ///
+    /// `Salt` redacts itself, but `EnvCoverage` carries the salt as a plain
+    /// `String`, so a derived `Debug` would put it in any log line that ever
+    /// formatted a coverage response. Names and digests stay visible: they are
+    /// what makes such a line useful, and neither is a value.
+    #[test]
+    fn env_coverage_debug_redacts_the_salt_and_keeps_the_names() {
+        let coverage = EnvCoverage {
+            salt: "ab".repeat(32),
+            persistence: "keychain".to_string(),
+            required: vec![RequiredEnvEntry {
+                name: "GITHUB_TOKEN".to_string(),
+                optional: true,
+                required_by: Vec::new(),
+                required_since: Utc::now(),
+                last_provided_at: None,
+                unmet_since: None,
+                source: None,
+                digest: Some("0123456789abcdef".to_string()),
+            }],
+        };
+        let rendered = format!("{coverage:?}");
+        assert!(
+            !rendered.contains(&"ab".repeat(32)),
+            "the salt must never render: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("GITHUB_TOKEN"), "{rendered}");
+        assert!(rendered.contains("0123456789abcdef"), "{rendered}");
     }
 }

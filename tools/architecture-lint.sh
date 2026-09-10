@@ -150,6 +150,95 @@ if [ -n "$allow_matches" ]; then
     done
 fi
 
+# WI 0116 §5 guard: a keychain payload value must never become a `Command`
+# argument (world-readable via `/proc/<pid>/cmdline` / `ps`). The write path
+# instead pipes an `add-generic-password ... -w <envelope>` line to `security
+# -i` on stdin — `security_add_generic_password_script` in
+# src/data/fs/daemon_env.rs is the ONLY place `add-generic-password` may appear
+# in src/, apart from the round-trip test that asserts on the line it produces
+# (src/engine/auth/keychain.rs). If it shows up anywhere else, either a second
+# builder has been added (drifting from the one audited for
+# shell-metacharacter safety) or — worse — someone put it directly into a
+# `Command::arg`.
+#
+# The allowlist is by PATH, not by position within a file. An earlier version
+# scanned only up to a file's `#[cfg(test)] mod tests` line; Rust accepts items
+# *after* a test module, so anything placed there was invisible to the guard.
+KEYCHAIN_ARGV_ALLOWED='^('"$SRC"'/data/fs/daemon_env\.rs|'"$SRC"'/engine/auth/keychain\.rs)$'
+add_generic_password_matches=$(
+    grep -rl 'add-generic-password' "$SRC" 2>/dev/null | grep -Ev "$KEYCHAIN_ARGV_ALLOWED" || true
+)
+if [ -n "$add_generic_password_matches" ]; then
+    echo ""
+    echo "architecture-lint: 'add-generic-password' found outside its one allowed builder (src/data/fs/daemon_env.rs) and its round-trip test (src/engine/auth/keychain.rs):"
+    echo "$add_generic_password_matches" | while IFS= read -r f; do
+        display="${f#"$REPO_ROOT/"}"
+        echo "VIOLATION [keychain-argv]: $display"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
+# The second half of the same invariant: `-w ` must never be formatted with a
+# runtime value outside that builder. `security find-generic-password ... -w`
+# with NO argument is the legitimate *read* form (keychain.rs) and stays
+# allowed; what is forbidden is a `-w` immediately followed by an interpolated
+# value, in either the argv shape (`.arg("-w").arg(value)`, `args(["-w", v])`)
+# or the string shape (`-w {…}` inside a `format!`).
+#
+# The argv shape is checked everywhere but the builder — that is the realistic
+# regression, someone reaching for `-w <value>` in a `Command`. The string shape
+# additionally excuses keychain.rs, whose round-trip test asserts on the exact
+# stdin line the builder produces and must quote it to do so.
+#
+# `.arg("-w")` and its value are commonly written on separate lines, so the
+# argv check reads each file with awk rather than grepping line by line: a bare
+# `cmd.arg("-w");` whose next statement is not another `.arg(` is the read form
+# and stays legal.
+w_value_argv=$(
+    while IFS= read -r -d '' f; do
+        awk -v file="$f" '
+            { line[NR] = $0 }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    l = line[i]
+                    if (l ~ /"-w"[[:space:]]*,[[:space:]]*[a-z_&*]/) {
+                        printf "%s:%d:%s\n", file, i, l
+                        continue
+                    }
+                    if (l !~ /\.arg\("-w"\)/) continue
+                    if (l ~ /\.arg\("-w"\)[[:space:]]*\.arg\(/) {
+                        printf "%s:%d:%s\n", file, i, l
+                        continue
+                    }
+                    j = i + 1
+                    while (j <= NR && line[j] ~ /^[[:space:]]*$/) j++
+                    if (j <= NR && line[j] ~ /^[[:space:]]*\.arg\(/) {
+                        printf "%s:%d:%s\n", file, i, l
+                    }
+                }
+            }
+        ' "$f"
+    done < <(find "$SRC" -name '*.rs' -print0) \
+        | grep -Ev '^('"$SRC"'/data/fs/daemon_env\.rs):' || true
+)
+w_value_string=$(
+    grep -rn -- '-w {' "$SRC" 2>/dev/null \
+        | grep -Ev '^('"$SRC"'/data/fs/daemon_env\.rs|'"$SRC"'/engine/auth/keychain\.rs):' || true
+)
+w_value_matches=$(printf '%s\n%s' "$w_value_argv" "$w_value_string" | grep -v '^$' || true)
+if [ -n "$w_value_matches" ]; then
+    echo ""
+    echo "architecture-lint: a '-w' argument is formatted with a runtime value outside src/data/fs/daemon_env.rs; a keychain value must ride stdin, never argv:"
+    echo "$w_value_matches" | while IFS= read -r line; do
+        file_and_line="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        display="${file_and_line#"$REPO_ROOT/"}"
+        echo "VIOLATION [keychain-argv-w]: $display:$lineno"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
 # Report results.
 if [ -s "$VIOLATION_FILE" ]; then
     count=$(wc -l < "$VIOLATION_FILE" | tr -d ' ')

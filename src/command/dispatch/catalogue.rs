@@ -1057,6 +1057,7 @@ const SQUAD: CommandSpec = CommandSpec {
         &SQUAD_RESUME,
         &SQUAD_TRIGGER,
         &SQUAD_ATTACH,
+        &SQUAD_ENV,
     ],
 };
 
@@ -1621,6 +1622,74 @@ const SQUAD_ATTACH: CommandSpec = CommandSpec {
     }],
     api_allowed: false,
     build: crate::command::dispatch::build::squad_attach,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+/// `squad env` — the one home for the daemon's env coverage (WI 0116 §6d).
+///
+/// `api_allowed: false` is deliberate and is a security property, not an
+/// oversight: an API-allowed leaf can be driven through the `/v1/commands`
+/// `{subcommand, args}` envelope, where CLI-arg-shaped strings drift into
+/// tracing spans and error text. Payload values must never travel that way, so
+/// the whole leaf stays off the API front door. The daemon's own typed
+/// `/v1/daemon/env` route is the only way env data crosses the socket.
+const SQUAD_ENV: CommandSpec = CommandSpec {
+    name: "env",
+    aliases: &[],
+    help: "Show which env() values the squad daemon has, and where they came from.",
+    long_help: Some(
+        "Report every environment variable the squad daemon needs — the union of every \
+         env(NAME) overlay across the task store, the daemon's own config and \
+         AWMAN_OVERLAYS — with whether the daemon currently holds a value, where that \
+         value came from (this shell, a previous push, or the OS keychain at startup), \
+         and how long any missing one has been missing.\n\n\
+         Values are never printed: this command reports only whether one is present. \
+         Running it with no flag also performs the ordinary coverage check, which sends \
+         a value only when it actually differs from what the daemon holds. --push \
+         re-sends every value this shell has regardless, which is what to reach for \
+         after rotating a token. --clear removes the daemon's persisted keychain item; \
+         the running daemon keeps the values it already holds.",
+    ),
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "push",
+            short: None,
+            help: "Push every required value this shell has, whether or not it differs.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear",
+            short: None,
+            help: "Remove the daemon's persisted keychain item.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "json",
+            short: None,
+            help: "Emit JSON output.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: false,
+    build: crate::command::dispatch::build::squad,
     gateway_need: GatewayNeed::Running,
     requires_container_tier: true,
     subcommands: &[],

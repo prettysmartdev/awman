@@ -89,6 +89,15 @@ pub struct Task {
     /// `None` means the task has never run.
     #[serde(default)]
     pub last_run_status: Option<RunStatus>,
+    /// Declared `env(NAME)` values the squad daemon has no value for (WI 0116).
+    ///
+    /// Derived, never stored — exactly like [`last_run_status`](Self::last_run_status),
+    /// and for the same reason: the task grid marks every affected card, and
+    /// asking the daemon per card would be an N+1 across its HTTP surface. The
+    /// store always reads this as empty; the daemon's gateway fills it from
+    /// `DaemonEnvState` on the way out.
+    #[serde(default)]
+    pub unmet_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +302,17 @@ pub struct Run {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// The declared `env(NAME)` values that had no value when this run opened
+    /// (WI 0116 §4b, escalation point 3).
+    ///
+    /// Unlike [`Task::unmet_env`] this one *is* stored: it is the only place the
+    /// information is retained historically, so a run that behaved oddly last
+    /// Tuesday can still be explained. A run with unmet names proceeds — every
+    /// existing task was created under the old silent-drop behaviour and some
+    /// legitimately treat a variable as optional — so this is a record, never a
+    /// gate.
+    #[serde(default)]
+    pub unmet_env: Vec<String>,
 }
 
 /// SQLite-backed task store. The squad daemon is its only constructor.
@@ -373,6 +393,11 @@ impl TaskStore {
         // a daemon restart, so a task triggered while the daemon was down is
         // still evaluated when it comes back.
         Self::add_column_if_missing(conn, "squad_tasks", "trigger_requested_at", "TEXT")?;
+        // The env() names that had no value when the run opened, as a JSON
+        // array of names — never values. `NULL` (a row written before this
+        // column existed) decodes to an empty list, so an upgraded database
+        // reports "nothing known to be missing" rather than an error.
+        Self::add_column_if_missing(conn, "squad_runs", "unmet_env", "TEXT")?;
         Ok(())
     }
 
@@ -624,12 +649,34 @@ impl TaskStore {
         session_id: Option<&str>,
         started_at: DateTime<Utc>,
     ) -> Result<RunId, DataError> {
+        self.start_run_with_env(task_id, session_id, started_at, &[])
+    }
+
+    /// Open a run row, recording the declared `env()` names the daemon had no
+    /// value for at the moment it opened (WI 0116 §4b).
+    ///
+    /// The list is a snapshot: a push landing later in the run does not rewrite
+    /// it, because the point is to explain the environment the run's containers
+    /// actually started with.
+    pub fn start_run_with_env(
+        &self,
+        task_id: &str,
+        session_id: Option<&str>,
+        started_at: DateTime<Utc>,
+        unmet_env: &[String],
+    ) -> Result<RunId, DataError> {
         let id = RunId::new();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO squad_runs (id, task_id, status, session_id, started_at)
-             VALUES (?1, ?2, 'running', ?3, ?4)",
-            params![id.as_str(), task_id, session_id, timestamp(started_at)],
+            "INSERT INTO squad_runs (id, task_id, status, session_id, started_at, unmet_env)
+             VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
+            params![
+                id.as_str(),
+                task_id,
+                session_id,
+                timestamp(started_at),
+                encode_names(unmet_env)?,
+            ],
         )?;
         // Opening the run is what honours a pending `squad trigger`, so the
         // request is cleared here and not in the scheduler: a trigger fires
@@ -703,7 +750,7 @@ impl TaskStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT r.id, r.task_id, r.status, r.workflow_path, r.workflow_state_path,
-                    r.session_id, r.started_at, r.finished_at, r.error
+                    r.session_id, r.started_at, r.finished_at, r.error, r.unmet_env
              FROM squad_runs r
              JOIN squad_tasks c ON c.id = r.task_id
              WHERE c.name = ?1
@@ -723,7 +770,7 @@ impl TaskStore {
         let raw = conn
             .query_row(
                 "SELECT id, task_id, status, workflow_path, workflow_state_path, session_id, started_at,
-                        finished_at, error
+                        finished_at, error, unmet_env
                  FROM squad_runs WHERE task_id = ?1 AND status = 'running'
                  ORDER BY started_at DESC LIMIT 1",
                 [task_id],
@@ -813,6 +860,9 @@ fn task_from_raw(raw: RawTask) -> Result<Task, DataError> {
             .as_deref()
             .map(RunStatus::from_db)
             .transpose()?,
+        // Derived by the daemon's gateway, never by the store: there is no
+        // column behind it and there deliberately is not one.
+        unmet_env: Vec::new(),
     })
 }
 
@@ -835,6 +885,7 @@ struct RawRun {
     started_at: String,
     finished_at: Option<String>,
     error: Option<String>,
+    unmet_env: Option<String>,
 }
 
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RawRun> {
@@ -848,6 +899,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RawRun> {
         started_at: row.get(6)?,
         finished_at: row.get(7)?,
         error: row.get(8)?,
+        unmet_env: row.get(9)?,
     })
 }
 
@@ -862,6 +914,7 @@ fn run_from_raw(raw: RawRun) -> Result<Run, DataError> {
         started_at: timestamp_parse(&raw.started_at)?,
         finished_at: timestamp_parse_opt(raw.finished_at)?,
         error: raw.error,
+        unmet_env: decode_names(raw.unmet_env.as_deref())?,
     })
 }
 
@@ -882,6 +935,23 @@ fn decode_overlays(value: Option<&str>) -> Result<Vec<String>, DataError> {
         Some(raw) => serde_json::from_str(raw).map_err(|error| {
             DataError::Other(format!("invalid squad task overlays {raw:?}: {error}"))
         }),
+    }
+}
+
+/// Encode a list of *names* (never values) for a JSON-array column.
+fn encode_names(value: &[String]) -> Result<String, DataError> {
+    serde_json::to_string(value)
+        .map_err(|error| DataError::Other(format!("encoding squad run env names: {error}")))
+}
+
+/// Decode a JSON-array-of-names column. `NULL` — a row written before the
+/// column existed — decodes to an empty list rather than an error.
+fn decode_names(value: Option<&str>) -> Result<Vec<String>, DataError> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(raw) if raw.trim().is_empty() => Ok(Vec::new()),
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| DataError::Other(format!("invalid squad run env names: {error}"))),
     }
 }
 
@@ -928,6 +998,7 @@ mod tests {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            unmet_env: Vec::new(),
         }
     }
 

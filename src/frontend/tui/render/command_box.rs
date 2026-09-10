@@ -285,13 +285,20 @@ fn squad_indicator_spans(app: &App, available: u16) -> Vec<Span<'static>> {
 
 /// The indicator colour for each daemon-health state (WI 0112). `Unknown`
 /// renders exactly like `NotRunning`.
+///
+/// `EnvUnmet` (WI 0116 §6c) shares `Unreachable`'s yellow, and that is a
+/// decision rather than a collision: both mean "needs a look, not broken", they
+/// cannot co-occur — an unreachable daemon cannot report coverage — and
+/// `Unreachable` outranks `EnvUnmet` in `classify` anyway. An eighth colour to
+/// separate two states that never appear together would cost more than it
+/// explains.
 pub(crate) fn squad_indicator_color(
     state: crate::frontend::tui::squad_indicator::SquadIndicator,
 ) -> Color {
     use crate::frontend::tui::squad_indicator::SquadIndicator;
     match state {
         SquadIndicator::Unknown | SquadIndicator::NotRunning => Color::DarkGray,
-        SquadIndicator::Unreachable => Color::Yellow,
+        SquadIndicator::Unreachable | SquadIndicator::EnvUnmet => Color::Yellow,
         SquadIndicator::Failed => Color::Red,
         SquadIndicator::Running => Color::Blue,
         SquadIndicator::Healthy => Color::Green,
@@ -328,5 +335,44 @@ pub(super) fn status_level_color(level: &crate::data::message::MessageLevel) -> 
         MessageLevel::Warning => Color::Yellow,
         MessageLevel::Error => Color::Red,
         MessageLevel::Success => Color::Green,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::squad_indicator_color;
+    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    use ratatui::style::Color;
+
+    /// WI 0116 §6c: the colour map, pinned independently of where the `●`
+    /// lands on the bottom row (that placement is covered in
+    /// `frontend::tui::tests::render_tests`).
+    ///
+    /// `EnvUnmet` shares `Unreachable`'s yellow deliberately: both mean "needs
+    /// a look, not broken", they cannot co-occur — an unreachable daemon
+    /// cannot have reported coverage — and `Unreachable` outranks `EnvUnmet`
+    /// in `classify` anyway. An eighth colour separating two states that never
+    /// appear together would cost more than it explains.
+    #[test]
+    fn env_unmet_is_yellow_and_no_other_state_moved() {
+        assert_eq!(
+            squad_indicator_color(SquadIndicator::EnvUnmet),
+            Color::Yellow
+        );
+        assert_eq!(
+            squad_indicator_color(SquadIndicator::Unreachable),
+            Color::Yellow
+        );
+        assert_eq!(
+            squad_indicator_color(SquadIndicator::Unknown),
+            Color::DarkGray
+        );
+        assert_eq!(
+            squad_indicator_color(SquadIndicator::NotRunning),
+            Color::DarkGray
+        );
+        assert_eq!(squad_indicator_color(SquadIndicator::Failed), Color::Red);
+        assert_eq!(squad_indicator_color(SquadIndicator::Running), Color::Blue);
+        assert_eq!(squad_indicator_color(SquadIndicator::Healthy), Color::Green);
     }
 }

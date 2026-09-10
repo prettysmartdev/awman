@@ -93,8 +93,9 @@ database; see [API server and squad daemon](09-api-and-remote-mode.md#api-server
 | `maxConcurrentEvaluations` | positive integer | `2` | Maximum number of task evaluations running at once |
 | `defaultLeader` | string (`agent::model`) | unset | Default agent and model for evaluations when a task does not specify them |
 | `guidance` | non-empty string array | unset | Instructions added to every task evaluation and generated workflow |
+| `envPersistence` | `"keychain"` \| `"none"` | `"keychain"` | Where the daemon persists the values it holds for `env()` overlays across an OS-initiated restart (launchd/systemd), so a task's variables don't have to be pushed again from a live shell after one. `"none"` opts out entirely — nothing is persisted anywhere, matching squad's behaviour before this setting existed. See [Squad: Task environment values](12-squad.md#task-environment-values) |
 
-All four keys are optional. Configuration is rejected when
+All five keys are optional. Configuration is rejected when
 `maxConcurrentEvaluations` is zero; an `agentsToModels` entry has no models or
 contains an empty model name; `defaultLeader` is not exactly two non-empty
 components in `agent::model` form, has surrounding whitespace in either
@@ -102,6 +103,17 @@ component, or uses an invalid agent name; or `guidance` has an empty or
 whitespace-only entry. A `guidance` list may contain at most 50 entries, and
 each entry is limited to 1,000 characters. Agent names use ASCII letters,
 digits, `-`, and `_`, and are 1–64 characters long.
+
+`envPersistence` describes the daemon process itself, not any one task, so —
+like `maxConcurrentEvaluations` — only the value in the **global** `squad`
+block takes effect; a per-task `config.json` cannot override it. If the
+keychain is configured but unusable on this machine (no keychain backend, a
+missing `secret-tool`, a locked collection, or a probe that fails or times
+out), the daemon falls back to persisting nothing for that run rather than
+failing to start — `awman squad status` and `awman squad env` report the
+fallback and the reason as `persistence: unavailable(<reason>)`. An explicit
+`"none"` is never probed for and never produces that fallback message,
+because it's a deliberate choice rather than a degradation.
 
 #### Per-task squad settings
 
@@ -121,9 +133,10 @@ means anything for a task — and is held to the same validation rules:
 
 A field the task sets wins for that task; a field it omits is inherited from the
 global block, so a task can narrow its agent pool while keeping the standing
-`guidance` every task gets. `maxConcurrentEvaluations` is the exception: it
-bounds the whole daemon, so it is always read from the global block and ignored
-in a task file.
+`guidance` every task gets. `maxConcurrentEvaluations` and `envPersistence`
+are the exceptions: both describe the daemon process as a whole rather than
+any one task, so each is always read from the global block and ignored in a
+task file.
 
 The file is optional, and awman writes it for you when you answer the agent and
 model questions during `awman squad add` — see [Choosing a task's agents and

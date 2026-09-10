@@ -144,6 +144,17 @@ async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, S
         dangerously_skip_auth: true,
     };
 
+    // The stored keychain item is a single fixed `awman-squad`/`daemon-env`
+    // pair, not keyed by storage root, so an isolated `AWMAN_CONFIG_HOME` does
+    // not isolate it. Opt this daemon out explicitly rather than letting the
+    // default overwrite the item a real daemon on this machine is using.
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"squad":{"envPersistence":"none"}}"#,
+    )
+    .unwrap();
+
     let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
     std::env::set_var("AWMAN_CONFIG_HOME", root);
 
@@ -399,4 +410,249 @@ async fn a_pre_migration_install_starts_squad_gains_its_tables_and_keeps_api_row
     );
 
     handle.abort();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WI 0116 — the regression the whole work item exists for.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use std::sync::Mutex as StdMutex;
+
+use awman::command::commands::squad::env_sync;
+use awman::command::commands::squad::gateway::{RemoteTaskGateway, TaskGateway};
+use awman::command::commands::HttpCore;
+use awman::data::fs::daemon_env::env_overlay_names;
+use awman::data::message::{UserMessage, UserMessageSink};
+use awman::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+use awman::engine::container::options::ResolvedContainerOptions;
+use awman::engine::container::options::{
+    ContainerName, ContainerOption, Entrypoint, EnvVar, ImageRef,
+};
+
+/// The variable the E2E task declares. Distinctive enough that a scan of the
+/// container's output cannot match by accident.
+const E2E_ENV_NAME: &str = "AWMAN_SQUAD_E2E_TOKEN";
+const E2E_ENV_VALUE: &str = "wi0116-value-that-must-reach-the-container";
+
+/// Captures the container's stdout. The non-interactive (piped, no PTY) spawn
+/// path streams it here, which is how the test reads what `printenv` printed
+/// *inside* the container.
+#[derive(Clone, Default)]
+struct CapturedStdout(Arc<StdMutex<Vec<u8>>>);
+
+impl CapturedStdout {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+struct CapturingFrontend {
+    captured: CapturedStdout,
+}
+
+impl UserMessageSink for CapturingFrontend {
+    fn write_message(&mut self, _msg: UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+impl AgentFrontend for CapturingFrontend {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
+
+    fn take_io(&mut self) -> AgentIo {
+        let (stdout, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        let buffer = self.captured.0.clone();
+        tokio::spawn(async move {
+            while let Some(chunk) = stdout_rx.recv().await {
+                buffer.lock().unwrap().extend_from_slice(&chunk);
+            }
+        });
+        tokio::spawn(async move { while stderr_rx.recv().await.is_some() {} });
+
+        AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            // Non-interactive: piped stdio, no PTY.
+            resize: None,
+            initial_size: None,
+        }
+    }
+
+    fn grace_timeout(&self) -> Duration {
+        Duration::from_secs(15)
+    }
+    fn stuck_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+}
+
+/// **E2E: a squad task's `env(VAR)` value reaches its container.**
+///
+/// This is the regression the whole of WI 0116 exists for, and the shape of the
+/// test is the shape of the bug:
+///
+/// 1. A squad task declaring `env(AWMAN_SQUAD_E2E_TOKEN)` is created against a
+///    live daemon.
+/// 2. A shell that **has** the variable exported runs the ordinary client sync
+///    (`env_sync::sync_env`, the exact call `SquadGatewayResolver` makes before
+///    every command). The daemon takes the value into its overlay.
+/// 3. The variable is then removed from the process environment, so the value
+///    lives **only** in the daemon's in-memory overlay — precisely the state a
+///    real background daemon is in, where `std::env::var` cannot see it and
+///    `data::config::env::host_var` can.
+/// 4. The task's declared overlay is resolved into container options through
+///    the production path and a container is launched. It must print the value.
+///
+/// **This test must fail against `main`, and it must fail against any tree
+/// whose `-e` gate still reads `std::env::var`** — the container is launched
+/// with no `-e NAME` at all in that case and `printenv` finds nothing. It is
+/// the one assertion that distinguishes "the daemon knows the value" (which
+/// every other test in this work item covers) from "the container gets it"
+/// (which is what a user asked for).
+///
+/// Gated on Docker exactly like the rest of this tree's live-backend tests, and
+/// named with `docker` so `make test-fast`'s `--skip docker` filter excludes it;
+/// `make test-full` includes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
+    if !tool_available("docker", "info") {
+        eprintln!(
+            "SKIP: Docker daemon not available — \
+             run `make test-full` on a host with Docker to include this test"
+        );
+        return;
+    }
+    if !tool_available("git", "--version") {
+        eprintln!("SKIP: git not available");
+        return;
+    }
+    if !Command::new("docker")
+        .args(["pull", "alpine:latest"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: docker pull alpine:latest failed (no network?)");
+        return;
+    }
+
+    let _env_guard = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    let (daemon, base) = start_daemon(tmp.path()).await;
+
+    // ── 1. a task that declares the variable ────────────────────────────────
+    let (code, created) = curl_command(
+        &base,
+        "squad add",
+        &[
+            "--name",
+            "env-e2e",
+            "--description",
+            "declares an env() overlay",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--interval",
+            "3600",
+            "--mount-scope",
+            "gitroot",
+            "--overlay",
+            &format!("env({E2E_ENV_NAME})"),
+        ],
+    )
+    .await;
+    assert_eq!(code, 200, "squad add must succeed: {created}");
+    assert_eq!(
+        created["unmet_env"],
+        serde_json::json!([E2E_ENV_NAME]),
+        "the daemon has no value yet, and says so — and creates the task anyway"
+    );
+
+    // ── 2. the launching shell has it exported, and syncs ───────────────────
+    std::env::set_var(E2E_ENV_NAME, E2E_ENV_VALUE);
+    let gateway = RemoteTaskGateway::new(HttpCore::new(&base, "v1", None).unwrap());
+    let report = env_sync::sync_env(&gateway, false).await;
+    assert_eq!(
+        report.pushed,
+        vec![E2E_ENV_NAME.to_string()],
+        "the ordinary client sync must arm the daemon: {report:?}"
+    );
+
+    // ── 3. the shell goes away; only the daemon's overlay holds it ──────────
+    std::env::remove_var(E2E_ENV_NAME);
+    assert!(
+        std::env::var(E2E_ENV_NAME).is_err(),
+        "the discriminator: the process environment no longer has it"
+    );
+    assert_eq!(
+        awman::data::config::env::host_var(E2E_ENV_NAME).as_deref(),
+        Some(E2E_ENV_VALUE),
+        "…but the daemon overlay does, which is exactly the state a background \
+         daemon's container launch runs in"
+    );
+
+    // ── 4. launch a container the way a task's overlays say to ──────────────
+    let task = gateway.get("env-e2e").await.expect("the task");
+    let declared = env_overlay_names(&task.overlays);
+    assert_eq!(
+        declared,
+        vec![E2E_ENV_NAME.to_string()],
+        "the container options are built from the task's own declaration"
+    );
+
+    let name = format!("awman-wi0116-e2e-{}", uuid::Uuid::new_v4());
+    let options = ResolvedContainerOptions::resolve([
+        ContainerOption::Image(ImageRef::new("alpine:latest")),
+        ContainerOption::Name(ContainerName::new(name.clone())),
+        ContainerOption::EnvPassthrough(EnvVar(declared[0].clone())),
+        ContainerOption::Interactive(false),
+        ContainerOption::Entrypoint(Entrypoint::new([
+            "sh",
+            "-c",
+            &format!("printenv {E2E_ENV_NAME} || echo AWMAN_E2E_MISSING"),
+        ])),
+    ])
+    .expect("the option set must resolve");
+
+    let captured = CapturedStdout::default();
+    let runtime = ContainerRuntime::docker();
+    let instance = runtime.build(options).expect("build must succeed");
+    let mut execution = instance
+        .run_with_frontend(Box::new(CapturingFrontend {
+            captured: captured.clone(),
+        }))
+        .expect("the container must start");
+    let exit = tokio::time::timeout(Duration::from_secs(90), execution.wait())
+        .await
+        .expect("the container must finish within 90s")
+        .expect("waiting on the container must succeed");
+
+    // Best-effort cleanup; `--rm` normally handles it.
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let printed = captured.text();
+    assert_eq!(exit.exit_code, 0, "the container ran: {printed}");
+    assert!(
+        printed.contains(E2E_ENV_VALUE),
+        "THE WI 0116 REGRESSION: a squad task's `env({E2E_ENV_NAME})` value did not \
+         reach its container. The value is in the daemon's overlay (asserted \
+         above) but the container was launched without it — the `-e` gate in \
+         `src/engine/container/docker.rs` still reads `std::env::var`, which \
+         cannot see the overlay, and nothing injects the resolved value into \
+         the spawned CLI child's environment. Container output was: {printed:?}"
+    );
+
+    daemon.abort();
 }

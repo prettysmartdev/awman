@@ -254,7 +254,7 @@ pub(in crate::engine::sandbox) fn run_interactive(
         &name,
         &options.env_passthrough,
         &options.env_literal,
-        &|key| std::env::var(key).ok(),
+        &crate::data::config::env::host_var,
         &auth::secret_registered_for_service,
         &mut *frontend,
     )

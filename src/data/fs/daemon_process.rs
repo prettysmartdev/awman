@@ -90,6 +90,28 @@ impl DaemonProcess {
         clear_pid(&self.paths.pid_file())
     }
 
+    /// Remove the PID file **only while it still names `pid`**, reporting
+    /// whether it did.
+    ///
+    /// The pidfile is the claim on a daemon root, so it is also the one
+    /// ownership token an exiting daemon can check. `awman squad stop` sends
+    /// SIGTERM and releases the pidfile immediately, without waiting for the
+    /// process to go: by the time the dying daemon reaches its own teardown a
+    /// *successor* may already have claimed the root. An unconditional
+    /// [`release_pidfile`](Self::release_pidfile) there deletes the
+    /// successor's claim, and the next command — finding no pidfile — starts a
+    /// third daemon that inherits none of the payload environment the
+    /// successor was just handed.
+    pub fn release_pidfile_owned_by(&self, pid: u32) -> Result<bool, DataError> {
+        clear_pid_owned_by(&self.paths.pid_file(), pid)
+    }
+
+    /// Whether the pidfile currently names `pid` — that is, whether this
+    /// process still holds the claim on the daemon root.
+    pub fn owns_pidfile(&self, pid: u32) -> Result<bool, DataError> {
+        Ok(self.read_pid()? == Some(pid))
+    }
+
     /// Spawn the daemon binary in the background, returning the child PID.
     /// Threads this daemon's unit name / plist label / log path through, so
     /// two daemons never collide on the systemd unit or the launchd plist.
@@ -213,6 +235,22 @@ pub(crate) fn clear_pid(pid_path: &Path) -> Result<(), DataError> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(DataError::io(pid_path, e)),
+    }
+}
+
+/// `clear_pid`, but only when the file still names `pid`. `Ok(false)` — and no
+/// removal — when it is absent, unreadable, or names somebody else.
+pub(crate) fn clear_pid_owned_by(pid_path: &Path, pid: u32) -> Result<bool, DataError> {
+    // A pidfile we cannot parse is not one we can claim to own, so it is left
+    // exactly where it is: `running_pid` already reports it, and guessing here
+    // would delete a file this process has no evidence about.
+    match read_pid(pid_path) {
+        Ok(Some(existing)) if existing == pid => {
+            clear_pid(pid_path)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(_) => Ok(false),
     }
 }
 
@@ -405,12 +443,30 @@ pub(crate) fn spawn_background(
 /// `docker`) and none of awman's path overrides. A daemon started without
 /// those overrides resolves a different storage root than the process waiting
 /// for it, then publishes its endpoint somewhere that process never looks.
+/// A `systemd --user` unit has the same problem: its environment is systemd's
+/// own minimal template, not the invoking shell's.
 ///
-/// `AWMAN_API_KEY` / `AWMAN_SQUAD_KEY` are deliberately absent: this list is
-/// serialized into a plist on disk, and a bearer key belongs in neither a file
-/// nor a process listing. The daemon authenticates against the key *hash* it
-/// reads from the storage root, so it needs no key of its own.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// This is the **bootstrap class** — values the daemon needs before it can
+/// open its storage root or start listening. **`FORWARDED_ENV` is a
+/// non-secret allowlist, and nothing that could hold a secret may ever be
+/// added to it.** `AWMAN_API_KEY` / `AWMAN_SQUAD_KEY` are deliberately absent:
+/// this list is serialized into a plist on disk and passed as `--setenv`
+/// arguments on a visible `systemd-run` invocation, and a bearer key belongs
+/// in none of those places. The daemon authenticates against the key *hash*
+/// it reads from the storage root, so it needs no key of its own. Secrets a
+/// task needs at run time (the **payload class** — `env(VAR)` overlay values)
+/// never travel this way; they are pushed over the authenticated loopback
+/// socket after the daemon is already listening and held only in memory (and,
+/// optionally, the OS keychain).
+///
+/// What each of [`spawn_background`]'s three paths forwards from this list:
+/// - `try_systemd_run` (Linux): one `--setenv=NAME=VALUE` argv element per
+///   entry `forwarded_env()` returns, built by [`systemd_run_argv`].
+/// - `try_launchd` (macOS): the same entries as the plist's
+///   `EnvironmentVariables` dict, built by [`render_launchd_plist`].
+/// - `double_fork_spawn` (fallback, all platforms): forwards nothing from
+///   this list explicitly — the child inherits the full process environment,
+///   which already is a superset of it.
 const FORWARDED_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -420,10 +476,12 @@ const FORWARDED_ENV: &[&str] = &[
     crate::data::config::env::AWMAN_SQUAD_ROOT,
     crate::data::config::env::XDG_CONFIG_HOME,
     crate::data::config::env::XDG_DATA_HOME,
+    crate::data::config::env::AWMAN_OVERLAYS,
+    crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS,
+    crate::data::config::env::AWMAN_LAUNCH_MODE,
 ];
 
 /// The subset of [`FORWARDED_ENV`] actually set in this process, in list order.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn forwarded_env() -> Vec<(String, String)> {
     FORWARDED_ENV
         .iter()
@@ -445,6 +503,47 @@ fn note_in_log(log_path: &Path, message: &str) {
     }
 }
 
+/// Pure argv builder for `systemd-run` (the program name itself is not
+/// included; the caller supplies it to `Command::new`).
+///
+/// Layout: `--user`, `--unit=<unit_name>`, the two `StandardOutput`/
+/// `StandardError` append-to-log properties, one `--setenv=NAME=VALUE` per
+/// entry of `env` in order, `--`, the binary path, then `args`.
+///
+/// Each `--setenv=NAME=VALUE` is built as a single `String` and later handed
+/// to `Command::args` as one argv element — never assembled into or run
+/// through a shell — so a `VALUE` containing `=`, spaces, or other
+/// shell-significant characters reaches systemd-run intact with no escaping
+/// needed.
+pub(crate) fn systemd_run_argv(
+    binary_path: &Path,
+    args: &[String],
+    unit_name: &str,
+    log_path: &Path,
+    env: &[(String, String)],
+) -> Vec<String> {
+    let log = log_path.to_string_lossy();
+    let mut argv = vec![
+        "--user".to_string(),
+        format!("--unit={unit_name}"),
+        // Without these the unit's output goes to the journal, and the log
+        // file the startup-failure message points the user at stays empty
+        // forever. `append:` needs systemd 240+; on anything older
+        // systemd-run refuses the property and the caller falls through to
+        // the plain spawn, which logs to the same file itself.
+        format!("--property=StandardOutput=append:{log}"),
+        format!("--property=StandardError=append:{log}"),
+    ];
+    argv.extend(
+        env.iter()
+            .map(|(name, value)| format!("--setenv={name}={value}")),
+    );
+    argv.push("--".to_string());
+    argv.push(binary_path.to_string_lossy().into_owned());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
 #[cfg(target_os = "linux")]
 fn try_systemd_run(
     binary_path: &Path,
@@ -462,22 +561,9 @@ fn try_systemd_run(
         _ => return Ok(None),
     }
 
-    // Without these the unit's output goes to the journal, and the log file the
-    // startup-failure message points the user at stays empty forever.
-    // `append:` needs systemd 240+; on anything older systemd-run refuses the
-    // property and we fall through to the plain spawn, which logs to the same
-    // file itself.
-    let log = log_path.to_string_lossy();
+    let argv = systemd_run_argv(binary_path, args, unit_name, log_path, &forwarded_env());
     let mut cmd = std::process::Command::new("systemd-run");
-    cmd.args([
-        "--user".to_string(),
-        format!("--unit={unit_name}"),
-        format!("--property=StandardOutput=append:{log}"),
-        format!("--property=StandardError=append:{log}"),
-        "--".to_string(),
-    ])
-    .arg(binary_path)
-    .args(args);
+    cmd.args(&argv);
 
     let output = cmd
         .output()
@@ -711,6 +797,8 @@ fn ensure_private_log(log_path: &Path) -> Result<(), DataError> {
 /// a file that `ensure_private_log` had just created empty and nothing would
 /// ever write to. The daemon logs to stderr (see `init_tracing`), so wiring
 /// both streams to the log file is what makes a failed start explain itself.
+///
+/// No `FORWARDED_ENV` handling needed here: full process-environment inheritance already covers that bootstrap-class allowlist.
 fn double_fork_spawn(
     binary_path: &Path,
     args: &[String],
@@ -906,6 +994,167 @@ mod tests {
         assert!(!FORWARDED_ENV.contains(&AWMAN_API_KEY));
         assert!(FORWARDED_ENV.contains(&"PATH"));
         assert!(FORWARDED_ENV.contains(&crate::data::config::env::AWMAN_SQUAD_ROOT));
+        // WI 0116 §2: the payload's own overlay spec now rides the bootstrap
+        // class too, so a daemon started by systemd/launchd resolves the
+        // same overlays the shell that ran `squad start` would have.
+        assert!(FORWARDED_ENV.contains(&crate::data::config::env::AWMAN_OVERLAYS));
+    }
+
+    /// `forwarded_env()` must emit only the names actually set in this
+    /// process, and in `FORWARDED_ENV`'s own order — not insertion order of
+    /// whichever happen to be set, and not alphabetical.
+    #[test]
+    fn forwarded_env_returns_only_set_names_in_list_order() {
+        use crate::data::config::env::{
+            AWMAN_LAUNCH_MODE, AWMAN_MAX_CONCURRENT_AGENTS, AWMAN_OVERLAYS,
+        };
+
+        let prev_overlays = std::env::var(AWMAN_OVERLAYS).ok();
+        let prev_agents = std::env::var(AWMAN_MAX_CONCURRENT_AGENTS).ok();
+        let prev_launch = std::env::var(AWMAN_LAUNCH_MODE).ok();
+
+        std::env::remove_var(AWMAN_OVERLAYS);
+        std::env::set_var(AWMAN_MAX_CONCURRENT_AGENTS, "7");
+        std::env::remove_var(AWMAN_LAUNCH_MODE);
+
+        let result = forwarded_env();
+
+        assert!(
+            !result.iter().any(|(n, _)| n == AWMAN_OVERLAYS),
+            "an unset name must not appear at all: {result:?}"
+        );
+        assert!(
+            !result.iter().any(|(n, _)| n == AWMAN_LAUNCH_MODE),
+            "an unset name must not appear at all: {result:?}"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|(n, v)| n == AWMAN_MAX_CONCURRENT_AGENTS && v == "7"),
+            "a set name must appear with its value: {result:?}"
+        );
+
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        let expected_order: Vec<&str> = FORWARDED_ENV
+            .iter()
+            .copied()
+            .filter(|candidate| names.contains(candidate))
+            .collect();
+        assert_eq!(
+            names, expected_order,
+            "forwarded_env() must preserve FORWARDED_ENV's own order"
+        );
+
+        match prev_overlays {
+            Some(v) => std::env::set_var(AWMAN_OVERLAYS, v),
+            None => std::env::remove_var(AWMAN_OVERLAYS),
+        }
+        match prev_agents {
+            Some(v) => std::env::set_var(AWMAN_MAX_CONCURRENT_AGENTS, v),
+            None => std::env::remove_var(AWMAN_MAX_CONCURRENT_AGENTS),
+        }
+        match prev_launch {
+            Some(v) => std::env::set_var(AWMAN_LAUNCH_MODE, v),
+            None => std::env::remove_var(AWMAN_LAUNCH_MODE),
+        }
+    }
+
+    /// `systemd_run_argv` is the pure builder `try_systemd_run` now delegates
+    /// to on Linux. One `--setenv=NAME=VALUE` element per forwarded name, in
+    /// the order given, and — because it is one `String` handed straight to
+    /// `Command::args` with no shell involved — a value containing `=`,
+    /// spaces and a colon reaches it as a single unmodified argv element.
+    #[test]
+    fn systemd_run_argv_emits_one_setenv_per_forwarded_name_in_order_with_tricky_value_intact() {
+        let env = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/u".to_string()),
+            (
+                crate::data::config::env::AWMAN_OVERLAYS.to_string(),
+                "env(A),dir(/x y:/z)".to_string(),
+            ),
+        ];
+        let argv = systemd_run_argv(
+            Path::new("/usr/local/bin/awman"),
+            &["squad".to_string(), "start".to_string()],
+            "io.awman.squad",
+            Path::new("/home/u/.awman/squad/awman.log"),
+            &env,
+        );
+
+        let setenv: Vec<&String> = argv.iter().filter(|a| a.starts_with("--setenv=")).collect();
+        assert_eq!(
+            setenv,
+            vec![
+                &"--setenv=PATH=/usr/bin".to_string(),
+                &"--setenv=HOME=/home/u".to_string(),
+                &"--setenv=AWMAN_OVERLAYS=env(A),dir(/x y:/z)".to_string(),
+            ],
+            "one element per name, in order, with '=', spaces and ':' intact: {argv:?}"
+        );
+
+        let dd = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(
+            &argv[dd + 1..],
+            &["/usr/local/bin/awman", "squad", "start"],
+            "the trailing tail must survive regardless of env contents: {argv:?}"
+        );
+    }
+
+    /// A daemon with nothing to forward still produces a well-formed argv:
+    /// no stray `--setenv` elements, and the `-- binary args` tail intact.
+    #[test]
+    fn systemd_run_argv_with_no_env_emits_no_setenv_elements() {
+        let argv = systemd_run_argv(
+            Path::new("/usr/local/bin/awman"),
+            &[],
+            "io.awman.api",
+            Path::new("/tmp/awman.log"),
+            &[],
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("--setenv=")), "{argv:?}");
+        let dd = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[dd + 1..], &["/usr/local/bin/awman"]);
+    }
+
+    /// `render_launchd_plist` is fed `forwarded_env()`'s output verbatim, so
+    /// the names WI 0116 added to `FORWARDED_ENV` must reach the plist the
+    /// same way the pre-existing ones already do.
+    #[test]
+    fn the_launchd_plist_carries_the_wi_0116_forwarded_names() {
+        let plist = render_launchd_plist(
+            "io.awman.squad",
+            Path::new("/usr/local/bin/awman"),
+            &["squad".to_string(), "start".to_string()],
+            Path::new("/tmp/awman.log"),
+            &[
+                (
+                    crate::data::config::env::AWMAN_OVERLAYS.to_string(),
+                    "env(DEPLOY_TOKEN)".to_string(),
+                ),
+                (
+                    crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS.to_string(),
+                    "4".to_string(),
+                ),
+                (
+                    crate::data::config::env::AWMAN_LAUNCH_MODE.to_string(),
+                    "stdio".to_string(),
+                ),
+            ],
+            None,
+        );
+        assert!(plist.contains("<key>AWMAN_OVERLAYS</key>"), "{plist}");
+        assert!(
+            plist.contains("<string>env(DEPLOY_TOKEN)</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<key>AWMAN_MAX_CONCURRENT_AGENTS</key>"),
+            "{plist}"
+        );
+        assert!(plist.contains("<string>4</string>"), "{plist}");
+        assert!(plist.contains("<key>AWMAN_LAUNCH_MODE</key>"), "{plist}");
+        assert!(plist.contains("<string>stdio</string>"), "{plist}");
     }
 
     /// The diagnostic explaining why the OS process manager was skipped is the
@@ -1007,6 +1256,59 @@ mod tests {
         assert_eq!(d.read_pid().unwrap(), Some(4242));
         d.release_pidfile().unwrap();
         assert_eq!(d.read_pid().unwrap(), None);
+    }
+
+    /// The shutdown path's release: a daemon that still holds the claim drops
+    /// it, exactly as the unconditional release would.
+    #[test]
+    fn release_pidfile_owned_by_drops_our_own_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = api_daemon(tmp.path());
+        d.claim_pidfile(4242).unwrap();
+        assert!(d.owns_pidfile(4242).unwrap());
+        assert!(d.release_pidfile_owned_by(4242).unwrap(), "ours to release");
+        assert_eq!(d.read_pid().unwrap(), None);
+    }
+
+    /// The reason the ownership check exists. `awman squad stop` releases the
+    /// pidfile as soon as it has signalled, so a successor can claim the root
+    /// while the old daemon is still on its way out. That daemon's teardown
+    /// must leave the successor's claim — and therefore its endpoint sidecar —
+    /// alone, or the next command starts a *third* daemon holding none of the
+    /// payload environment the successor was handed.
+    #[test]
+    fn release_pidfile_owned_by_leaves_a_successors_claim_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = api_daemon(tmp.path());
+        // The stopper released our pidfile; the successor claimed it.
+        d.claim_pidfile(777).unwrap();
+
+        assert!(!d.owns_pidfile(4242).unwrap(), "not ours any more");
+        assert!(
+            !d.release_pidfile_owned_by(4242).unwrap(),
+            "a dying daemon must report that it had nothing to release"
+        );
+        assert_eq!(
+            d.read_pid().unwrap(),
+            Some(777),
+            "the successor's claim must survive its predecessor's teardown"
+        );
+    }
+
+    /// Nothing to own is not something to delete, and neither is a pidfile
+    /// this process cannot even parse.
+    #[test]
+    fn release_pidfile_owned_by_is_a_no_op_on_an_absent_or_unreadable_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = api_daemon(tmp.path());
+        assert!(!d.release_pidfile_owned_by(4242).unwrap(), "nothing there");
+
+        std::fs::write(d.paths().pid_file(), "not-a-pid").unwrap();
+        assert!(!d.release_pidfile_owned_by(4242).unwrap(), "not parseable");
+        assert!(
+            d.paths().pid_file().exists(),
+            "an unparseable pidfile is left for running_pid to report on"
+        );
     }
 
     #[test]

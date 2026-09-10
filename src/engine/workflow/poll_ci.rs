@@ -26,8 +26,10 @@ pub fn fetch_ci_status(git_root: &Path) -> Result<CiStatus, EngineError> {
         return fetch_via_gh(&branch, &head_sha, git_root);
     }
 
-    let token = match std::env::var("GITHUB_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
+    // Host-supplied, so it must come through the daemon overlay when squad is
+    // the caller: the daemon does not inherit the shell that created the task.
+    let token = match crate::data::config::env::host_var(crate::data::config::env::GITHUB_TOKEN) {
+        Some(t) if !t.is_empty() => t,
         _ => {
             return Err(EngineError::Other(
                 "poll_ci: neither `gh` CLI (authenticated) nor GITHUB_TOKEN env var is available; \

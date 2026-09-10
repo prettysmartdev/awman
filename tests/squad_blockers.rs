@@ -67,6 +67,7 @@ fn sample_task(name: &str) -> Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     }
 }
 
@@ -118,6 +119,8 @@ impl TaskGateway for RecordingGateway {
             active_count: 0,
             last_tick: None,
             in_flight: 0,
+            env_persistence: "none".into(),
+            unmet_env: Vec::new(),
         })
     }
 }

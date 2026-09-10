@@ -6,7 +6,7 @@ awman creates and manages various resources — Docker containers, workflow data
 
 ## What gets removed
 
-`awman clean` targets five categories of resources:
+`awman clean` targets six categories of resources:
 
 1. **Stopped containers** — Docker containers from previous awman runs that have exited or died. These typically remain on disk even after they complete, and can accumulate quickly if you run many workflows.
 
@@ -17,6 +17,8 @@ awman creates and manages various resources — Docker containers, workflow data
 4. **Dangling images** — Awman-labeled Docker images that Docker reports as dangling, usually because a newer build replaced the same tag. If Docker refuses to remove an image because a container still references it, awman reports that item as a deletion error and continues.
 
 5. **Pre-migration database backup** — The retained `awman.db.pre-migration` backup from an automatic database migration (and any matching SQLite sidecar backups). The live database at `~/.awman/data/awman.db` is never removed or modified by `awman clean`.
+
+6. **Squad daemon environment** — The OS keychain item (`awman-squad` / `daemon-env`) in which the squad daemon persists the values it holds for tasks' `env()` names, so a daemon the OS restarts comes back already armed. Offered whenever the item exists, listed as "squad daemon environment (awman-squad/daemon-env, OS keychain)". Not a file: it is removed through `security` (macOS) or `secret-tool` (Linux). This is the only category that is not on disk, and the only one that may hold a secret — see [Squad: Persisting values across a restart](12-squad.md#persisting-values-across-a-restart). Removing it does **not** disturb a running daemon, which keeps the values it already holds in memory; it removes only what a future restart would have read back. On a platform with no keychain, or with `secret-tool` not installed, there is nothing to find and the category is simply absent.
 
 ---
 
@@ -184,6 +186,7 @@ Select `[Yes]` to proceed or `[No]` to abort. The `--yes` flag also skips this d
 - **Per-item failures don't stop the process.** If one container fails to delete, the command continues and reports all failures at the end.
 - **Context directories are verified.** A global context directory is only deleted if it matches a terminal workflow in the current repo or carries an explicit `completed` marker.
 - **Docker-unavailable is not an error.** If the container runtime is unreachable, filesystem cleanup still runs, and the exit code is 0 if those deletions succeed.
+- **A keychain that can't be reached is not an error either.** The probe for the squad daemon's stored environment is capped, so it can never hang the command; a platform with no keychain, a missing `secret-tool`, or a locked collection all resolve to "nothing to offer".
 
 ---
 

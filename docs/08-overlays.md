@@ -83,6 +83,15 @@ env(GITHUB_TOKEN), env(ANTHROPIC_API_KEY)
 
 If the named variable is not set on your host, it is silently absent from the container environment — this is not an error. This lets you list optional variables that may only be set in some contexts (CI vs. local development).
 
+For a squad task, "your host" means something different: the value is
+resolved by the **squad daemon**, not by whatever shell ran `awman squad add`
+or `awman squad edit`. The daemon is a long-lived background process, so it
+needs its own copy of any `env(VAR)` name a task declares, kept in sync as
+your shells come and go. See [Squad: Task environment
+values](12-squad.md#task-environment-values) for how a value reaches the
+daemon, what it means when the daemon doesn't have one yet, and how to check
+or fix that with `awman squad env`.
+
 **Example use case:**
 ```toml
 [[teardown]]

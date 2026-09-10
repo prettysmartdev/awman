@@ -128,6 +128,10 @@ fn every_squad_subcommand_has_the_contract_shape() {
         // nothing to configure, and it deliberately changes no stored field.
         ("trigger", vec!["name"], vec![]),
         ("attach", vec!["name"], vec!["container"]),
+        // WI 0116 §6d: `squad env` reports coverage, pushes, and clears the
+        // stored item. No short forms, no aliases, and neither flag implies
+        // the other.
+        ("env", vec![], vec!["clear", "json", "push"]),
     ];
 
     for (name, arguments, flags) in expected {
@@ -144,7 +148,7 @@ fn every_squad_subcommand_has_the_contract_shape() {
         expected_flags.sort_unstable();
         assert_eq!(flag_names(&path), expected_flags, "flags for squad {name}");
         assert!(
-            command.api_allowed || name == "attach",
+            command.api_allowed || name == "attach" || name == "env",
             "unexpected API policy for squad {name}"
         );
     }
@@ -210,4 +214,29 @@ fn squad_add_interval_defaults_to_six_hours_but_accepts_an_explicit_five_minutes
         add.get_one::<String>("interval").map(String::as_str),
         Some("5m")
     );
+}
+
+/// WI 0116 §6d. `squad env` is deliberately **not** API-allowed: it reports on
+/// this shell's own coverage relative to a daemon, which is a local question,
+/// and admitting it through the `/v1/commands` front door would make the leaf
+/// remotely reachable. Its `GatewayNeed` is `Running`, exactly like `squad
+/// list`, so it starts a daemon when none is up rather than reporting "nothing
+/// required" against a daemon that does not exist.
+#[test]
+fn squad_env_is_local_only_and_needs_a_running_daemon() {
+    use awman::command::dispatch::catalogue::GatewayNeed;
+
+    let env = cat().lookup(&["squad", "env"]).expect("squad env exists");
+    assert!(
+        !env.api_allowed,
+        "`squad env` must not be reachable over the API"
+    );
+    assert!(matches!(env.gateway_need, GatewayNeed::Running));
+    // Spelled in full, no short forms — neither flag may collide with, or
+    // shadow, the other.
+    for flag in ["push", "clear", "json"] {
+        let flag = env.find_flag(flag).unwrap_or_else(|| panic!("--{flag}"));
+        assert_eq!(flag.short, None, "`squad env` takes no short forms");
+        assert!(matches!(flag.kind, FlagKind::Bool));
+    }
 }

@@ -75,7 +75,15 @@ impl SquadDaemonHandles {
             engines.clone(),
             engine.scheduler_handle(),
             squad_paths,
+            engine.env_state(),
         ));
+        // Compute `required_env` once at boot so the first client to check
+        // coverage learns what this daemon wants — including for tasks created
+        // before it started — without waiting for a task mutation. Best-effort:
+        // an advisory list must never fail a daemon start.
+        if let Err(error) = gateway.refresh_required_env().await {
+            tracing::debug!(error = %error, "squad env: initial required_env refresh failed");
+        }
 
         let cwd = std::env::current_dir().map_err(|error| {
             CommandError::Other(format!("cannot resolve squad working directory: {error}"))

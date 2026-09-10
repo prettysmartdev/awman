@@ -43,6 +43,7 @@ fn squad_config_round_trips_through_global_config_using_squad_json_key() {
             max_concurrent_evaluations: Some(3),
             default_leader: Some("codex::gpt-5".into()),
             guidance: Some(vec!["Keep the patch focused.".into()]),
+            env_persistence: None,
         }),
         ..GlobalConfig::default()
     };

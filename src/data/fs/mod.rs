@@ -9,6 +9,7 @@ pub mod api_db;
 pub mod api_paths;
 pub mod auth_paths;
 pub mod context_dirs;
+pub mod daemon_env;
 pub mod daemon_guard;
 pub mod daemon_paths;
 pub mod daemon_process;
@@ -28,6 +29,9 @@ pub use api_db::{CommandRecord, SessionRecord, SqliteSessionStore};
 pub use api_paths::ApiPaths;
 pub use auth_paths::{AgentAuthPaths, AuthPathResolver};
 pub use context_dirs::ContextDirResolver;
+pub use daemon_env::{
+    DaemonEnvStore, EnvPersistence, EnvPersistenceSetting, FallbackReason, NoStore,
+};
 pub use daemon_guard::{AcquireError, DaemonGuard, DaemonKind};
 pub use daemon_paths::DaemonPaths;
 pub use daemon_process::{DaemonProcess, ServerMeta, Termination};

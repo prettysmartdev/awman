@@ -306,6 +306,206 @@ rather than silently rewriting the task with its own values.
 
 ---
 
+## Task environment values
+
+A task's `env(VAR)` overlay (see [Overlays](08-overlays.md#overlay-types)) names a
+host environment variable the squad daemon must hand to that task's
+containers. Squad tracks, for every such name across every task, whether it
+currently holds a value, and warns you when it doesn't.
+
+### How the daemon gets its environment
+
+The squad daemon is a long-lived background process — often started once, at
+login or the first time any `awman squad` command needed it, and left running
+for days. Like any other process, it doesn't see a variable you `export` in a
+shell afterward; nothing does, short of restarting it.
+
+Instead, any `awman squad` command that needs a working daemon — `add`,
+`edit`, `list`, `show`, `trigger`, `pause`/`resume`, `remove`, `attach`, and
+`squad env` itself, as well as opening the squad tab — first compares what the
+daemon already holds against what your current shell can see, and pushes
+anything new or different before doing its own work. Nothing is ever re-sent
+once the daemon already has it: both sides compare a digest, never the value
+itself, so this happens on every command at effectively no cost once your
+shell is caught up. The digest is a salted hash the daemon publishes per name
+it holds, over the daemon's authenticated local socket; it is what lets a
+client tell "the daemon already has this exact value" from "it has a different
+one" without either side putting a secret on the wire. This is why exporting a
+variable and then running *any*
+squad command — not just `awman squad env --push` — is enough for the daemon
+to pick it up on the very next command that reaches it.
+
+The one exception is `awman squad status`: it's a lightweight liveness probe
+and deliberately pushes nothing, so checking status never has the side effect
+of arming a task.
+
+### The "daemon has no value for" warning
+
+`squad add` and `squad edit` print this once, right after creating or
+updating a task, if the task you just defined declares an `env()` name the
+daemon doesn't currently have a value for:
+
+```
+⚠ Task "nightly-triage" was created, but the squad daemon has no value for ANTHROPIC_KEY.
+
+  Its containers will start without it until it is supplied. To fix:
+      read -rs ANTHROPIC_KEY && export ANTHROPIC_KEY      # in any shell; keeps it out of shell history
+      awman squad env --push       # or just run any awman squad command
+
+  Check state at any time with `awman squad env`.
+Created task nightly-triage.
+```
+
+It's a warning, not a rejection — the task above **is** created, and the same
+warning fires (with "updated" in place of "created") from `squad edit`. The
+task's containers simply start without that variable until one is supplied.
+It never fires for a name the daemon treats as optional (currently only
+`GITHUB_TOKEN`, which the daemon itself reads for its own use rather than a
+task declaring it), so a machine that legitimately has no GitHub token is
+never nagged about it.
+
+To clear it, export the missing variable in any shell and run any
+`awman squad` command — or run `awman squad env --push` if you want to be
+sure the push happens right away, rather than waiting for the next command
+you'd run anyway.
+
+### `awman squad env`
+
+Reports every `env()` name the daemon needs, across every task, the daemon's
+own config, and `AWMAN_OVERLAYS`: whether it currently has a value, where that
+value came from, and how long a missing one has been missing. It starts the
+daemon if one isn't already running, the same as `squad list`.
+
+```sh
+awman squad env
+```
+
+```
+Daemon env coverage (persistence: keychain)
+
+  NAME           STATE       SOURCE      SINCE
+  ANTHROPIC_KEY  ✓ set       this shell  —
+  AWS_PROFILE    ⚠ unmet     —           just now
+  GITHUB_TOKEN   · optional  —           —
+
+  AWS_PROFILE is required by task "deploy-preview".
+  Export it and run `awman squad env --push`.
+```
+
+No value is ever printed — only whether one is present, and, when one is,
+which of `this shell`, `pushed` (an earlier push, from this or another
+shell), or `keychain` (loaded from persisted storage at daemon startup) it
+came from. The trailing "is required by" block lists every unmet name and the
+task(s) that need it, and is omitted entirely once nothing is unmet.
+
+| Flag | Description |
+|------|-------------|
+| `--push` | Push every required value your current shell has, whether or not the daemon already matches it — the flag to reach for right after rotating a token. |
+| `--clear` | Remove whatever the daemon has persisted to the OS keychain. Leaves the running daemon's in-memory values untouched — see [Persisting values across a restart](#persisting-values-across-a-restart) below. |
+| `--json` | Machine-readable output, same envelope as `list`/`show`/`status`. |
+
+`--push` re-sends every required name your shell has and re-reads the table,
+so a row you just fixed shows the update immediately:
+
+```sh
+AWS_PROFILE=preview awman squad env --push
+```
+
+```
+Daemon env coverage (persistence: keychain)
+
+  NAME           STATE       SOURCE      SINCE
+  ANTHROPIC_KEY  ✓ set       pushed      —
+  AWS_PROFILE    ✓ set       this shell  —
+  GITHUB_TOKEN   · optional  —           —
+```
+
+`--clear` removes the persisted keychain item and says so as a second line
+between the header and the table, but leaves every row's `STATE` exactly as
+it was — clearing what's *stored* must not disarm a daemon that's running
+fine:
+
+```sh
+awman squad env --clear
+```
+
+```
+Daemon env coverage (persistence: keychain)
+
+  Stored env item removed. The running daemon keeps the values it already holds.
+
+  NAME           STATE       SOURCE  SINCE
+  ANTHROPIC_KEY  ✓ set       pushed  —
+  AWS_PROFILE    ✓ set       pushed  —
+  GITHUB_TOKEN   · optional  —       —
+```
+
+If nothing was stored to begin with, that line instead reads
+`No stored env item to remove (this daemon persists nothing).`
+
+### Persisting values across a restart
+
+By default (`squad.envPersistence: "keychain"` — see [Configuration: Squad
+daemon configuration](07-configuration.md#squad-daemon-configuration)), squad
+stores the values it holds for `env()` names in the OS keychain, so a daemon
+the OS restarts on your behalf — launchd at login, systemd after a crash —
+comes back already armed instead of needing every task's variables pushed
+again from a live shell. A pushed value always overwrites a stored one; the
+keychain is only a cold-start hint, never the source of truth for a running
+daemon.
+
+Know what the keychain does and does not defend against before leaving this
+on. It protects the stored values against **other users** on the machine, and
+against an offline copy of the disk while the keychain is locked. It does
+**not** protect them against a process running as *you*: anything under your
+own account can read the item back with `security find-generic-password -s
+awman-squad -a daemon-env -w` (macOS) or `secret-tool lookup service
+awman-squad account daemon-env` (Linux), with no prompt. That unprompted read
+is exactly what lets the daemon come back armed without asking you for
+anything at login. If that trade isn't one you want on a particular machine,
+set `squad.envPersistence` to `"none"` there.
+
+One name is stored that no task asked for: `GITHUB_TOKEN`. The daemon reads it
+for its own use, so any shell that exports it supplies it on the next `awman
+squad` command, and it is persisted like any other held value — even on a
+machine where you have never created a task. `awman squad env` lists it, and
+`squad.envPersistence: "none"` (or `awman squad env --clear`) removes it.
+
+If the keychain isn't usable — `secret-tool` not installed, a locked login
+keychain, no keychain backend on the platform, or a keychain call that fails
+outright — the daemon falls back to persisting nothing rather than failing to
+start. `awman squad env` reports this in its header as
+`persistence: unavailable(<reason>)`, and `awman squad status` appends
+`; env persistence unavailable(<reason>)` to its one-line summary so you see
+it without having to go looking. This isn't a failure: squad keeps
+working exactly as it did before persistence existed, and every regular
+`awman squad` command still resupplies the daemon as described above — the
+only thing lost is a value surviving an OS-initiated restart. If you'd rather
+never see the fallback and never have anything persisted, set
+`squad.envPersistence` to `"none"` explicitly; an explicit `"none"` is never
+warned about.
+
+To remove a stored item, `awman clean` is the recommended route: it
+discovers the daemon's stored keychain item — listed as "Squad daemon
+environment" — alongside everything else it offers to remove, and clearing
+it is one of the choices in its confirmation summary; see [Cleaning
+Up](13-cleaning-up.md). This only removes what a future restart would read
+back — it does not touch what the *running* daemon currently holds in
+memory.
+
+If you need to remove it without going through awman, the manual commands
+are:
+
+```sh
+# macOS
+security delete-generic-password -s awman-squad -a daemon-env
+
+# Linux
+secret-tool clear service awman-squad account daemon-env
+```
+
+---
+
 ## The squad tab
 
 Rather than being a separate program, your squad gets a dedicated, singleton
@@ -381,7 +581,14 @@ The task name is the card's title; every value below it carries a grey label:
 `not triggered`, `failed`, `interrupted`, `running`, or `never run`), and
 `Next` is the next scheduled evaluation — which reads `paused` while the task
 is paused, and `triggered — next tick` while a [trigger](#triggering-a-task-now)
-is waiting to be honoured. Cards reflow as the terminal
+is waiting to be honoured. A task that declares an `env(VAR)` name the daemon
+doesn't currently have a value for gets one more line, appended after `Next`:
+`Env: ⚠ VARNAME unmet` (several names are comma-joined). The row is absent
+whenever nothing is unmet, and it's informational only — it doesn't change
+the card's colour; see [Task environment values](#task-environment-values)
+above and [Card colours](#card-colours) below. The same line appears in the
+task's detail modal (**Enter**) and in its run history when a past run had an
+unmet name at the time it started. Cards reflow as the terminal
 is resized, at most three to a row, so a card is always at least a third of the
 tab's width and its description summary stays readable on a wide terminal. Use
 the arrow keys to move in two dimensions, including across the final partially
@@ -406,7 +613,7 @@ focus to that tab's command box.
 | Key | Action |
 |-----|--------|
 | **↑ / ↓ / ← / →** | Move between task cards |
-| **Enter** | Open a detail modal for the selected task — description, workspace, mount scope, interval, overlays, agent/model, timestamps, and run history |
+| **Enter** | Open a detail modal for the selected task — description, workspace, mount scope, interval, overlays, agent/model, unmet `env()` values, timestamps, and run history |
 | **a** | Attach to the task's currently running container(s) — see [Attaching](#attaching-to-a-running-task) |
 | **n** | Create a new task |
 | **e** | Edit the selected task (the creation interview, prefilled) |
@@ -466,12 +673,24 @@ seconds:
 | Grey | No squad daemon is running |
 | Yellow | A daemon is running but this awman cannot get an answer from it — no bearer key for it (see [Authenticating to the daemon](#authenticating-to-the-daemon)), a connection refused, a timeout, or any other error |
 | Red | Reachable, and some task's most recent run failed |
+| Yellow | Reachable, nothing failed, and some task has an `env()` name the daemon doesn't currently hold a value for — see [Task environment values](#task-environment-values) |
 | Blue | Reachable, and a task is executing right now |
-| Green | Reachable, nothing failed, nothing running |
+| Green | Reachable, nothing failed, nothing running, nothing unmet |
 
 Red wins over blue when both apply: a failure needs attention and persists,
-while a running task is transient. The indicator is only a summary — open the
-squad tab (or run `awman squad list`) to see which task.
+while a running task is transient. An unmet variable ranks below a failure
+but above a running task, for the same reason: it needs attention and
+persists across ticks. Yellow is deliberately shared between "can't reach
+the daemon" and "some task has an unmet variable" — both mean "worth a
+look, not broken" — and the two can never actually coincide, since an
+unreachable daemon has no way to report what's unmet in the first place. A
+persisted-storage fallback (see [Persisting values across a
+restart](#persisting-values-across-a-restart)) never turns this indicator
+yellow by itself — only an actual unmet name does — because that fallback is
+the ordinary steady state on headless Linux and on Windows, and a
+permanently yellow indicator would just teach you to ignore it. The
+indicator is only a summary — open the squad tab (or run `awman squad list`
+/ `awman squad env`) to see which task or name.
 
 ---
 

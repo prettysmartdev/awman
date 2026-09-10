@@ -160,3 +160,15 @@ path = "tests/squad_blockers.rs"
 [[test]]
 name = "squad_auth_key"
 path = "tests/squad_auth_key.rs"
+
+[[test]]
+name = "squad_env_sync"
+path = "tests/squad_env_sync.rs"
+
+[[test]]
+name = "squad_env_cli"
+path = "tests/squad_env_cli.rs"
+
+[[test]]
+name = "squad_env_daemon"
+path = "tests/squad_env_daemon.rs"

@@ -376,7 +376,25 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
             if args.contains(',') {
                 return Err("env() takes one argument; use separate env() calls for multiple vars".to_string());
             }
-            Ok(TypedOverlay::Env(args.to_string()))
+            // The argument becomes an environment variable *name*: it is emitted
+            // as `-e NAME` and, for a squad daemon, set on the spawned container
+            // CLI's own environment via `Command::env`. A name containing `=`
+            // would produce a malformed entry there rather than a passthrough,
+            // and one containing a NUL would fail the spawn. Refusing it at the
+            // front door means a bad task is rejected when it is created rather
+            // than discovered at its first scheduled run, hours later.
+            let name = args;
+            let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                return Err(format!(
+                    "env() argument {name:?} is not a valid environment variable name \
+                     (letters, digits and underscore, not starting with a digit)"
+                ));
+            }
+            Ok(TypedOverlay::Env(name.to_string()))
         }
         "context" => {
             if args.is_empty() {
@@ -759,6 +777,60 @@ pub fn warn_legacy_config(
             level: crate::data::message::MessageLevel::Warning,
             text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
         });
+    }
+}
+
+#[cfg(test)]
+mod env_overlay_parser_tests {
+    use super::*;
+
+    #[test]
+    fn env_accepts_an_ordinary_environment_variable_name() {
+        for name in ["GITHUB_TOKEN", "_private", "AWS_PROFILE2", "X"] {
+            assert_eq!(
+                parse_overlay_list(&format!("env({name})")).unwrap(),
+                vec![TypedOverlay::Env(name.to_string())],
+                "{name} is a perfectly ordinary variable name"
+            );
+        }
+    }
+
+    /// Remediation of review-security F11. The argument becomes an environment
+    /// variable *name*: `-e NAME` in argv and, for a squad daemon, a
+    /// `Command::env` key on the spawned container CLI. A `=` there makes a
+    /// malformed entry instead of a passthrough and a NUL fails the spawn, so a
+    /// bad name is refused when the task is created rather than discovered at
+    /// its first scheduled run.
+    #[test]
+    fn env_rejects_a_name_that_is_not_an_environment_variable_name() {
+        for bad in [
+            "FOO=bar",
+            "2FOO",
+            "FOO BAR",
+            "FOO-BAR",
+            "FOO\u{0}BAR",
+            "FOO.BAR",
+        ] {
+            let err = parse_overlay_list(&format!("env({bad})")).unwrap_err_or_else_name(bad);
+            assert!(
+                err.contains("not a valid environment variable name"),
+                "env({bad}) must be refused by name, not by accident; got: {err}"
+            );
+        }
+    }
+
+    /// A helper that reports the offending input when the parse unexpectedly
+    /// succeeds, since a silent `unwrap_err` panic names nothing.
+    trait UnwrapErrNamed {
+        fn unwrap_err_or_else_name(self, input: &str) -> String;
+    }
+    impl UnwrapErrNamed for Result<Vec<TypedOverlay>, String> {
+        fn unwrap_err_or_else_name(self, input: &str) -> String {
+            match self {
+                Ok(parsed) => panic!("env({input}) must not parse; got {parsed:?}"),
+                Err(e) => e,
+            }
+        }
     }
 }
 

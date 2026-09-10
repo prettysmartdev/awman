@@ -256,6 +256,17 @@ impl DaemonGuard {
     pub fn release(&self) -> Result<(), DataError> {
         self.this_process().release_pidfile()
     }
+
+    /// Release this daemon's pidfile **only while it still names `pid`**,
+    /// reporting whether it did.
+    ///
+    /// What a shutting-down daemon must use. Between the stop request and the
+    /// dying daemon's own teardown, a successor can claim the root; releasing
+    /// unconditionally would drop the successor's claim. See
+    /// [`DaemonProcess::release_pidfile_owned_by`].
+    pub fn release_owned_by(&self, pid: u32) -> Result<bool, DataError> {
+        self.this_process().release_pidfile_owned_by(pid)
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +336,35 @@ mod tests {
             other => panic!("expected cross-daemon error, got {other:?}"),
         }
         squad_guard.release().unwrap();
+    }
+
+    /// A daemon on its way out must not evict the successor that claimed the
+    /// root while it was still shutting down — `awman squad stop` releases the
+    /// pidfile the moment it has signalled, so that overlap is ordinary, not
+    /// exotic. Losing the successor's claim costs the *next* command a third
+    /// daemon with an empty payload environment.
+    #[test]
+    fn release_owned_by_never_removes_a_successors_claim() {
+        let api = tempfile::tempdir().unwrap();
+        let squad = tempfile::tempdir().unwrap();
+        let env = env_for(api.path(), squad.path());
+        let guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap();
+
+        let me = std::process::id();
+        guard.acquire(me).unwrap();
+        assert!(guard.release_owned_by(me).unwrap(), "ours to release");
+
+        // The successor claims the root; the predecessor's teardown arrives late.
+        guard.acquire(me).unwrap();
+        let predecessor = me + 1;
+        assert!(
+            !guard.release_owned_by(predecessor).unwrap(),
+            "a late teardown owns nothing"
+        );
+        let pid_file = SquadPaths::from_env(&env).unwrap().daemon().pid_file();
+        assert!(pid_file.exists(), "the successor keeps its claim");
+
+        guard.release_owned_by(me).unwrap();
     }
 
     #[test]

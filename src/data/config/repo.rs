@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
+use crate::data::fs::daemon_env::EnvPersistenceSetting;
 
 /// Optional live credential-refresh settings. This intentionally remains a
 /// sibling of the scalar `auth` setting so existing configuration files keep
@@ -86,6 +87,12 @@ pub struct SquadConfig {
     pub default_leader: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guidance: Option<Vec<String>>,
+    /// Where the squad daemon persists the payload environment its tasks name
+    /// with `env(VAR)` overlays (WI 0116 §5). Absent means
+    /// [`EnvPersistenceSetting::Keychain`] — a squad daemon exists to run
+    /// unattended, so surviving an OS-initiated restart is the normal case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_persistence: Option<EnvPersistenceSetting>,
 }
 
 impl SquadConfig {
@@ -113,6 +120,18 @@ impl SquadConfig {
         self.max_concurrent_evaluations.unwrap_or(2)
     }
 
+    /// The effective persistence backend for this daemon. Absent means
+    /// keychain: default-on persistence is what lets a task scheduled for 3am
+    /// on a machine nobody has touched since yesterday still have its values.
+    ///
+    /// There is deliberately no `validate()` check for this field. It is a
+    /// closed enum, so serde already rejects any spelling other than
+    /// `"keychain"` / `"none"` when the config file is parsed, with the path
+    /// attached — a later check could only restate that.
+    pub fn env_persistence_or_default(&self) -> EnvPersistenceSetting {
+        self.env_persistence.unwrap_or_default()
+    }
+
     /// Layer this block over `base`, field by field: a field this block sets
     /// wins, a field it omits is inherited (WI 0110).
     ///
@@ -137,6 +156,9 @@ impl SquadConfig {
                 .clone()
                 .or_else(|| base.default_leader.clone()),
             guidance: self.guidance.clone().or_else(|| base.guidance.clone()),
+            // Persistence describes the daemon process, not a task, so — like
+            // `maxConcurrentEvaluations` — it is always the base's.
+            env_persistence: base.env_persistence,
         }
     }
 }
@@ -1101,6 +1123,7 @@ mod tests {
             max_concurrent_evaluations: Some(3),
             default_leader: Some("claude::claude-opus-4-8".to_string()),
             guidance: Some(vec!["Use focused workflows.".to_string()]),
+            env_persistence: None,
         };
         config.validate().unwrap();
         let serialized = serde_json::to_value(&config).unwrap();
@@ -1145,6 +1168,7 @@ mod tests {
             max_concurrent_evaluations: Some(4),
             default_leader: Some("claude::claude-opus-4-8".to_string()),
             guidance: Some(vec!["Keep changes focused.".to_string()]),
+            env_persistence: None,
         };
         let task = SquadConfig {
             agents_to_models: Some(HashMap::from([(
@@ -1204,7 +1228,45 @@ mod tests {
             max_concurrent_evaluations: Some(2),
             default_leader: Some("claude::claude-opus-4-8".to_string()),
             guidance: Some(vec!["Be careful.".to_string()]),
+            env_persistence: None,
         };
         assert_eq!(SquadConfig::default().layered_over(&global), global);
+    }
+
+    /// WI 0116 §2.3: the default is keychain, and it must hold independently
+    /// of `#[derive(Default)]` — a future reader swapping the derive for a
+    /// hand-written `Default` that picks `None` must not silently flip the
+    /// default persistence behaviour without a test noticing.
+    #[test]
+    fn env_persistence_defaults_to_keychain_when_the_config_omits_it() {
+        let omitted = SquadConfig::default();
+        assert_eq!(omitted.env_persistence, None);
+        assert_eq!(
+            omitted.env_persistence_or_default(),
+            EnvPersistenceSetting::Keychain
+        );
+
+        // And the layered form keeps inheriting it as `None` (→ still
+        // Keychain via the accessor), exactly like maxConcurrentEvaluations.
+        let task = SquadConfig::default();
+        let effective = task.layered_over(&omitted);
+        assert_eq!(effective.env_persistence, None);
+        assert_eq!(
+            effective.env_persistence_or_default(),
+            EnvPersistenceSetting::Keychain
+        );
+
+        // An explicit "none" must round-trip through serde with the
+        // struct-level camelCase rename (no per-field #[serde(rename)]).
+        let explicit_none = SquadConfig {
+            env_persistence: Some(EnvPersistenceSetting::None),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&explicit_none).unwrap();
+        assert_eq!(json.get("envPersistence").unwrap(), "none");
+        assert_eq!(
+            explicit_none.env_persistence_or_default(),
+            EnvPersistenceSetting::None
+        );
     }
 }

@@ -2,6 +2,7 @@ pub mod attach;
 pub mod commands;
 pub mod daemon;
 pub mod daemon_runtime;
+pub mod env_sync;
 pub mod evaluation;
 pub mod gateway;
 pub mod runtime_guard;

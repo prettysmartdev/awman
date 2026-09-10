@@ -125,51 +125,14 @@ pub(super) fn default_start_background(
     overlays: &[OverlaySpec],
 ) -> Result<String, EngineError> {
     let name = crate::engine::container::naming::generate_container_name();
-    let workdir_str = workdir.display().to_string();
+    let args = build_start_background_argv(&name, image, workdir, env, overlays);
 
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        name.clone(),
-        "--label".into(),
-        "awman=true".into(),
-        "-w".into(),
-        workdir_str.clone(),
-    ];
-
-    // Mount the working directory as read-write.
-    args.push("-v".into());
-    args.push(format!("{ws}:{ws}", ws = workdir_str));
-
-    // Apply overlay mounts.
-    for overlay in overlays {
-        args.push("-v".into());
-        let suffix = match overlay.permission {
-            crate::engine::container::options::OverlayPermission::ReadOnly => ":ro",
-            crate::engine::container::options::OverlayPermission::ReadWrite => "",
-        };
-        args.push(format!(
-            "{}:{}{}",
-            overlay.host_path.display(),
-            overlay.container_path.display(),
-            suffix,
-        ));
-    }
-
-    // Env vars set at start time — inherited by all subsequent exec calls.
+    let mut command = Command::new(cli_bin);
+    command.args(&args);
     for (k, v) in env {
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
+        command.env(k, v);
     }
-
-    // Image and idle entrypoint.
-    args.push(image.to_string());
-    args.push("sleep".into());
-    args.push("infinity".into());
-
-    let output = Command::new(cli_bin)
-        .args(&args)
+    let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -209,6 +172,73 @@ pub(super) fn default_start_background(
     }
 }
 
+/// The `run -d` argv for a background container, without the leading CLI
+/// binary. Split out from [`default_start_background`] so the "no value in
+/// argv" rule is unit-testable without a container runtime.
+pub(super) fn build_start_background_argv(
+    name: &str,
+    image: &str,
+    workdir: &Path,
+    env: &HashMap<String, String>,
+    overlays: &[OverlaySpec],
+) -> Vec<String> {
+    let workdir_str = workdir.display().to_string();
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        name.to_string(),
+        "--label".into(),
+        "awman=true".into(),
+        "-w".into(),
+        workdir_str.clone(),
+    ];
+
+    // Mount the working directory as read-write.
+    args.push("-v".into());
+    args.push(format!("{ws}:{ws}", ws = workdir_str));
+
+    // Apply overlay mounts.
+    for overlay in overlays {
+        args.push("-v".into());
+        let suffix = match overlay.permission {
+            crate::engine::container::options::OverlayPermission::ReadOnly => ":ro",
+            crate::engine::container::options::OverlayPermission::ReadWrite => "",
+        };
+        args.push(format!(
+            "{}:{}{}",
+            overlay.host_path.display(),
+            overlay.container_path.display(),
+            suffix,
+        ));
+    }
+
+    // Env vars set at start time — inherited by all subsequent exec calls.
+    //
+    // Name-only (`-e NAME`), never `-e NAME=VALUE`: this map is resolved
+    // through `host_var`, so inside the squad daemon it carries the values a
+    // client pushed for a task's `env()` overlays. argv is world-readable via
+    // `/proc/<pid>/cmdline` and `ps`, so a value that may be a secret must
+    // never be written into it. The value is set on the spawned CLI child's own
+    // environment instead, and both the docker CLI and the Apple `container`
+    // CLI resolve a name-only `-e` from their own process env — the same rule
+    // `build_run_argv` applies to `env_passthrough` and agent credentials.
+    let mut env_names: Vec<&String> = env.keys().collect();
+    env_names.sort();
+    for k in env_names {
+        args.push("-e".into());
+        args.push(k.clone());
+    }
+
+    // Image and idle entrypoint.
+    args.push(image.to_string());
+    args.push("sleep".into());
+    args.push("infinity".into());
+
+    args
+}
+
 pub(super) fn default_exec_in_background(
     cli_bin: &str,
     container_id: &str,
@@ -219,6 +249,13 @@ pub(super) fn default_exec_in_background(
     let mut args = vec!["exec".to_string()];
     args.extend(["-w".to_string(), working_dir.to_string()]);
 
+    // Unlike `build_start_background_argv`, this keeps the `KEY=VALUE` form.
+    // The only values that reach here are step-declared workflow env
+    // (`setup_step_to_shell`), which are literals from the repo's own workflow
+    // file, never a host-supplied `env()` value. If a caller ever needs to pass
+    // a host value through here, it must switch to the name-only form and set
+    // the value on the spawned CLI child's environment the way
+    // `default_start_background` does — argv is world-readable.
     if let Some(env_map) = env {
         for (k, v) in env_map {
             args.push("-e".to_string());
@@ -258,6 +295,13 @@ pub(super) fn default_exec_in_background_streaming(
     let mut args = vec!["exec".to_string()];
     args.extend(["-w".to_string(), working_dir.to_string()]);
 
+    // Unlike `build_start_background_argv`, this keeps the `KEY=VALUE` form.
+    // The only values that reach here are step-declared workflow env
+    // (`setup_step_to_shell`), which are literals from the repo's own workflow
+    // file, never a host-supplied `env()` value. If a caller ever needs to pass
+    // a host value through here, it must switch to the name-only form and set
+    // the value on the spawned CLI child's environment the way
+    // `default_start_background` does — argv is world-readable.
     if let Some(env_map) = env {
         for (k, v) in env_map {
             args.push("-e".to_string());
@@ -511,6 +555,60 @@ mod tests {
             kill_events,
             vec!["kill[bg-test]"],
             "explicit kill marks the container killed; Drop must not call again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod argv_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// WI 0116 §4 invariant 6 — no payload value is ever a `Command` argument.
+    ///
+    /// The setup/teardown env map is resolved through `host_var`, so inside the
+    /// squad daemon it carries values a client pushed for a task's `env()`
+    /// overlays. `-e NAME=VALUE` here would publish them in
+    /// `/proc/<pid>/cmdline` for the lifetime of the `docker run` child.
+    #[test]
+    fn background_run_argv_emits_env_names_only_and_never_a_value() {
+        let mut env = HashMap::new();
+        env.insert("NPM_TOKEN".to_string(), "npm-s3cr3t".to_string());
+        env.insert("AWS_PROFILE".to_string(), "prod".to_string());
+
+        let argv =
+            build_start_background_argv("ctr", "img:latest", &PathBuf::from("/ws"), &env, &[]);
+
+        for name in ["NPM_TOKEN", "AWS_PROFILE"] {
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+                "`-e {name}` must be emitted name-only; argv: {argv:?}"
+            );
+        }
+        for value in ["npm-s3cr3t", "prod"] {
+            assert!(
+                !argv.iter().any(|a| a.contains(value)),
+                "no argv element may contain the value {value:?}; argv: {argv:?}"
+            );
+        }
+    }
+
+    /// An empty map must not perturb the argv at all — the pre-0116 shape for a
+    /// step that declares no env.
+    #[test]
+    fn background_run_argv_with_no_env_carries_no_e_flag() {
+        let argv = build_start_background_argv(
+            "ctr",
+            "img:latest",
+            &PathBuf::from("/ws"),
+            &HashMap::new(),
+            &[],
+        );
+        assert!(!argv.iter().any(|a| a == "-e"), "argv: {argv:?}");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("infinity"),
+            "the idle entrypoint stays last; argv: {argv:?}"
         );
     }
 }

@@ -13,11 +13,15 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::global::GlobalConfig;
+use crate::data::fs::daemon_env::{DaemonEnvStore, EnvPersistence, EnvPersistenceSetting, NoStore};
 use crate::data::fs::daemon_process::ServerMeta;
 use crate::data::fs::{DataPaths, SquadPaths, TaskStore};
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::engine::auth::AuthMode;
 use crate::engine::error::EngineError;
+use crate::engine::squad::env_state::{DaemonEnvState, Salt};
+use crate::engine::squad::env_store;
 use crate::engine::squad::scheduler::{SchedulerStatus, SquadScheduler};
 use crate::engine::squad::supervisor::squad_process;
 use crate::engine::squad::TaskEvaluator;
@@ -65,6 +69,9 @@ pub struct SquadDaemonEngine {
     bind_addr: SocketAddr,
     auth_mode: AuthMode,
     dangerously_skip_auth: bool,
+    /// The daemon's payload-environment metadata (WI 0116 §4), shared with the
+    /// scheduler and with Layer 2's local gateway.
+    env_state: Arc<DaemonEnvState>,
 }
 
 impl SquadDaemonEngine {
@@ -124,9 +131,69 @@ impl SquadDaemonEngine {
             }
         }
 
+        // WI 0116 §5: resolve the env-persistence backend once, here, before
+        // the scheduler can tick — but after everything that must happen for
+        // the daemon to be a daemon at all. Both the probe and the load are
+        // capped and best-effort: a locked keychain must not be able to delay
+        // `listen`, and it is never an error that fails a start.
+        let squad_config = GlobalConfig::load_with(&env)
+            .unwrap_or_default()
+            .squad
+            .unwrap_or_default();
+        let setting = squad_config.env_persistence_or_default();
+        let resolved = tokio::task::spawn_blocking(move || env_store::resolve(&squad_config))
+            .await
+            .unwrap_or_else(|_| env_store::ResolvedEnvStore {
+                store: Box::new(NoStore) as Box<dyn DaemonEnvStore>,
+                fallback: None,
+                probed: None,
+            });
+        let env_store::ResolvedEnvStore {
+            store: env_store,
+            fallback,
+            probed,
+        } = resolved;
+        let persistence = match (&fallback, setting) {
+            (Some(reason), _) => EnvPersistence::Unavailable(reason.to_string()),
+            (None, EnvPersistenceSetting::None) => EnvPersistence::None,
+            (None, EnvPersistenceSetting::Keychain) => EnvPersistence::Keychain,
+        };
+        let env_state = Arc::new(DaemonEnvState::new(env_store, persistence, Salt::random()));
+        // Exactly one warning per daemon lifetime, at startup only. A daemon
+        // writes on every push, so warning per attempt would bury the very log
+        // `awman squad logs` prints. An explicit `envPersistence: "none"`
+        // produces no reason and therefore no line: a choice is never nagged
+        // about.
+        if let Some(reason) = fallback {
+            tracing::warn!("{}", reason.startup_warning());
+        }
+        {
+            // The probe above already read the item, and `probed` carries what
+            // it read. That keeps startup to one capped keychain call rather
+            // than two — both of which happen before `listen`, so on a slow
+            // keychain two of them could exceed the supervisor's ten-second
+            // wait and make `ensure_running` report a daemon that was seconds
+            // from being up. `spawn_blocking` stays: `probed` is `None`
+            // whenever the probe had no usable answer, and that path still
+            // reaches the store.
+            let loading = Arc::clone(&env_state);
+            let loaded = tokio::task::spawn_blocking(move || loading.load_from_store(probed))
+                .await
+                .unwrap_or(None);
+            if let Some(loaded) = loaded {
+                if !loaded.is_empty() {
+                    tracing::info!(
+                        names = ?loaded.names(),
+                        "squad env: restored values from the OS keychain"
+                    );
+                }
+            }
+        }
+
         let scheduler =
             SquadScheduler::new(store.clone(), squad_paths.clone(), evaluator, env.clone())
-                .with_runtime(runtime.clone());
+                .with_runtime(runtime.clone())
+                .with_env_state(Arc::clone(&env_state));
         let status = scheduler.status_handle();
 
         let auth_mode = AuthMode::resolve_for_daemon(
@@ -149,12 +216,18 @@ impl SquadDaemonEngine {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
             auth_mode,
             dangerously_skip_auth,
+            env_state,
         })
     }
 
     /// The daemon's task store.
     pub fn store(&self) -> Arc<TaskStore> {
         self.store.clone()
+    }
+
+    /// The daemon's payload-environment state, for Layer 2's local gateway.
+    pub fn env_state(&self) -> Arc<DaemonEnvState> {
+        Arc::clone(&self.env_state)
     }
 
     /// The scheduler's shared liveness counters, for the daemon's status route.
@@ -363,6 +436,7 @@ mod tests {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            unmet_env: Vec::new(),
         }
     }
 

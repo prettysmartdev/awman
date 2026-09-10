@@ -96,6 +96,7 @@ fn task(name: &str, interval_secs: u64) -> Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     }
 }
 

@@ -60,6 +60,23 @@ pub struct CleanPath {
     pub label: String,
 }
 
+/// The squad daemon's stored payload environment in the OS keychain
+/// (WI 0116 §5c).
+///
+/// Not a path: the item lives in the OS keychain and is removed through
+/// `security` / `secret-tool` rather than by unlinking a file. The keychain
+/// protects it against other users on the machine and against an offline copy
+/// of the disk while locked — not against a process running as this user, which
+/// can read it back unprompted. That is the trade `docs/12-squad.md` states,
+/// and it is why the item is offered here at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanKeychainItem {
+    pub service: String,
+    pub account: String,
+    /// Human-readable description for the confirmation summary.
+    pub label: String,
+}
+
 /// The full set of items discovered for cleanup, grouped by category.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CleanSummary {
@@ -71,6 +88,10 @@ pub struct CleanSummary {
     /// by awman; the live database at `DataPaths::db_path()` is never a
     /// candidate here.
     pub pre_migration_backups: Vec<CleanPath>,
+    /// The squad daemon's stored env payload, when one exists. Squad persists
+    /// `env(VAR)` values to the keychain by default so a daemon the OS
+    /// restarted still has them, and this is the recommended way to undo that.
+    pub squad_daemon_env: Vec<CleanKeychainItem>,
     pub images: Vec<CleanImage>,
     /// Whether the container runtime was reachable during discovery. When
     /// `false`, the container/image categories were skipped.
@@ -84,6 +105,7 @@ impl CleanSummary {
             + self.repo_workflows.len()
             + self.context_dirs.len()
             + self.pre_migration_backups.len()
+            + self.squad_daemon_env.len()
             + self.images.len()
     }
 
@@ -129,6 +151,15 @@ impl CleanSummary {
             ));
             for b in &self.pre_migration_backups {
                 lines.push(format!("  - {}", b.label));
+            }
+        }
+        if !self.squad_daemon_env.is_empty() {
+            lines.push(format!(
+                "Squad daemon environment ({}):",
+                self.squad_daemon_env.len()
+            ));
+            for item in &self.squad_daemon_env {
+                lines.push(format!("  - {}", item.label));
             }
         }
         if !self.images.is_empty() {
@@ -403,6 +434,14 @@ impl CleanCommand {
         // explicitly excluded so this rule can never touch it.
         discover_pre_migration_backups(sink, &mut summary);
 
+        // ─── Category 6: the squad daemon's stored environment ───────────────
+        //
+        // Squad persists the values named by `env(VAR)` overlays to the OS
+        // keychain by default, so a daemon the OS restarted at login still has
+        // them. `awman clean` is the recommended way to undo that; the probe is
+        // capped and a platform with no keychain simply finds nothing.
+        discover_squad_daemon_env(&mut summary);
+
         summary
     }
 
@@ -466,7 +505,21 @@ impl CleanCommand {
             }
         }
 
-        // 5. Dangling images (last, so container references are gone).
+        // 5. The squad daemon's stored environment.
+        use crate::data::fs::daemon_env::DaemonEnvStore;
+        for item in &summary.squad_daemon_env {
+            match crate::engine::squad::env_store::KeychainStore::new().clear() {
+                Ok(()) => result.deleted += 1,
+                Err(e) => {
+                    result.errors += 1;
+                    result
+                        .error_details
+                        .push(format!("keychain {}/{}: {e}", item.service, item.account));
+                }
+            }
+        }
+
+        // 6. Dangling images (last, so container references are gone).
         if let Some(runtime) = self.engines.container_runtime.as_ref() {
             for img in &summary.images {
                 match runtime.remove_image(&img.id) {
@@ -646,6 +699,31 @@ fn discover_pre_migration_backups(sink: &mut dyn CleanCommandFrontend, summary: 
         }
     };
     collect_pre_migration_backups(&api_paths, summary);
+}
+
+/// Offer squad's stored daemon-env keychain item when one exists.
+///
+/// Presence, not readability: an item whose payload no longer parses is exactly
+/// the kind of leftover a user wants removed. A platform with no keychain, an
+/// uninstalled `secret-tool`, or a locked collection all resolve to "nothing to
+/// offer" — `clean` is not the place to explain a keychain problem, and the
+/// probe is capped so it can never hang the command.
+fn discover_squad_daemon_env(summary: &mut CleanSummary) {
+    use crate::data::fs::daemon_env::{DAEMON_ENV_ACCOUNT, DAEMON_ENV_SERVICE};
+    use crate::engine::squad::env_store::KeychainStore;
+
+    if !KeychainStore::platform_supported() {
+        return;
+    }
+    if KeychainStore::new().item_present().unwrap_or(false) {
+        summary.squad_daemon_env.push(CleanKeychainItem {
+            service: DAEMON_ENV_SERVICE.to_string(),
+            account: DAEMON_ENV_ACCOUNT.to_string(),
+            label: format!(
+                "squad daemon environment ({DAEMON_ENV_SERVICE}/{DAEMON_ENV_ACCOUNT}, OS keychain)"
+            ),
+        });
+    }
 }
 
 /// The pure half of the rule, so the never-touch-the-live-database guarantee is
@@ -850,6 +928,7 @@ mod tests {
                 path: PathBuf::from("/api/awman.db.pre-migration"),
                 label: "awman.db.pre-migration".into(),
             }],
+            squad_daemon_env: Vec::new(),
             images: vec![CleanImage {
                 id: "img1".into(),
                 repo_tag: "t".into(),
@@ -945,6 +1024,7 @@ mod tests {
                 path: PathBuf::from("/api/awman.db.pre-migration"),
                 label: "awman.db.pre-migration".into(),
             }],
+            squad_daemon_env: Vec::new(),
             images: vec![CleanImage {
                 id: "i1".into(),
                 repo_tag: "tag:1".into(),

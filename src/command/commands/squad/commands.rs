@@ -10,18 +10,21 @@ use crate::command::commands::squad::daemon::{
     SquadDaemonCommand, SquadDaemonOutcome, SquadDaemonSubcommand, SquadLogsFlags, SquadStartFlags,
     SquadStatusFlags, SquadStopFlags,
 };
+use crate::command::commands::squad::env_sync::sync_env;
 use crate::command::commands::squad::gateway::{
-    CreateTask, DaemonStatus, TaskDetail, TaskGateway, UpdateTask, DEFAULT_RUN_HISTORY_LIMIT,
-    DEFAULT_WORKSPACE_FLAG_VALUE,
+    CreateTask, DaemonStatus, EnvCoverage, TaskDetail, TaskGateway, UpdateTask,
+    DEFAULT_RUN_HISTORY_LIMIT, DEFAULT_WORKSPACE_FLAG_VALUE,
 };
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
+use crate::data::config::env::host_var;
 use crate::data::config::global::GlobalConfig;
 use crate::data::fs::task_store::{MountScope, Task, TaskStatus, TaskWorkspace};
 use crate::data::fs::SquadPaths;
-use crate::data::message::UserMessageSink;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::git::GitEngine;
+use crate::engine::squad::env_state::{coverage_digest, EnvSource, Salt};
 
 /// The two workspace choices offered at task creation.
 ///
@@ -287,6 +290,53 @@ pub enum SquadSubcommand {
     /// backoff say. Carries only the task name: a trigger has nothing to
     /// configure, and deliberately changes no stored schedule.
     Trigger(String),
+    /// The whole picture of the daemon's env coverage (WI 0116 §6d).
+    ///
+    /// Bare, it reports; `push` forces a push of every locally-present
+    /// required name (the ordinary path only sends what actually differs);
+    /// `clear` removes the persisted keychain item. Values are never printed
+    /// under any combination — only whether one is present.
+    Env {
+        push: bool,
+        clear: bool,
+    },
+}
+
+/// One row of `awman squad env` — a required name and what the daemon has for
+/// it. **No field here can hold a value**, which is the point: the whole
+/// command reports presence, never content.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvReportRow {
+    pub name: String,
+    /// `"set"` (the daemon holds a value), `"unmet"` (it does not and the name
+    /// counts), or `"optional"` (a host-side name the daemon wants but never
+    /// counts as unmet — see `HOST_SIDE_ENV_NAMES`).
+    pub state: String,
+    /// `"this shell"`, `"pushed"`, `"keychain"`, or `"—"` when nothing is held.
+    ///
+    /// The three held cases look identical without this column and decide
+    /// something quite different: whether restarting the daemon loses the
+    /// value, and whether this shell would re-supply it if it did.
+    pub source: String,
+    /// `unmet_since`, so "just typo'd it" and "broken for three days" are
+    /// distinguishable at a glance.
+    pub unmet_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Task names that declare this variable, sorted.
+    pub required_by: Vec<String>,
+}
+
+/// What `awman squad env` answers with.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvReport {
+    /// `"keychain"`, `"none"`, or `"unavailable(<reason>)"`, rendered verbatim.
+    pub persistence: String,
+    /// `Some` only for `--clear`: whether a stored item was actually removed.
+    /// `false` means there was no keychain backend to clear, which is not an
+    /// error on a headless Linux box or on Windows.
+    pub cleared: Option<bool>,
+    /// One row per required name, in the order the daemon reported them
+    /// (sorted by name).
+    pub rows: Vec<EnvReportRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,6 +375,9 @@ pub enum SquadOutcome {
         /// `None` means the directory was kept (declined) or absent.
         removed_dir: Option<PathBuf>,
     },
+    /// The daemon's env coverage (WI 0116 §6d). Names, states and timestamps
+    /// only — never a value.
+    Env(EnvReport),
     Ok,
 }
 
@@ -388,6 +441,10 @@ impl SquadCommand {
             "pause" => SquadSubcommand::Pause(ctx.args.require("name")?),
             "resume" => SquadSubcommand::Resume(ctx.args.require("name")?),
             "trigger" => SquadSubcommand::Trigger(ctx.args.require("name")?),
+            "env" => SquadSubcommand::Env {
+                push: ctx.flags.bool("push"),
+                clear: ctx.flags.bool("clear"),
+            },
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
         Ok(Self::new(sub, ctx.boxed_gateway(), ctx.engines.clone()))
@@ -556,6 +613,12 @@ impl Command for SquadCommand {
                         status.active_count = live.active_count;
                         status.last_tick = live.last_tick;
                         status.in_flight = live.in_flight;
+                        // Both are daemon-only facts (WI 0116 §5a, §6b): the
+                        // pidfile sidecar cannot know either, and leaving them
+                        // at their defaults would silently report full
+                        // coverage for a daemon that just said otherwise.
+                        status.env_persistence = live.env_persistence;
+                        status.unmet_env = live.unmet_env;
                     }
                 }
                 Ok(SquadOutcome::Status(status))
@@ -595,7 +658,9 @@ impl Command for SquadCommand {
                                 engines.git_engine.as_ref(),
                             )?,
                         };
-                        Ok(SquadOutcome::Task(gateway.create(req).await?))
+                        let task = gateway.create(req).await?;
+                        warn_unmet_env(frontend.as_mut(), &task, TaskChange::Created);
+                        Ok(SquadOutcome::Task(task))
                     }
                     SquadSubcommand::Edit {
                         name,
@@ -622,7 +687,9 @@ impl Command for SquadCommand {
                                  --agent-models or a --clear-* flag), or use --interview"
                             )));
                         }
-                        Ok(SquadOutcome::Updated(gateway.update(&name, update).await?))
+                        let task = gateway.update(&name, update).await?;
+                        warn_unmet_env(frontend.as_mut(), &task, TaskChange::Updated);
+                        Ok(SquadOutcome::Updated(task))
                     }
                     SquadSubcommand::List => Ok(SquadOutcome::Tasks(gateway.list().await?)),
                     SquadSubcommand::Show(name) => {
@@ -655,6 +722,29 @@ impl Command for SquadCommand {
                     SquadSubcommand::Trigger(name) => {
                         gateway.trigger(&name).await?;
                         Ok(SquadOutcome::Triggered { name })
+                    }
+                    SquadSubcommand::Env { push, clear } => {
+                        // `--clear` first: the report that follows then shows
+                        // the state the user is left in rather than the one
+                        // they asked to leave. Clearing removes only what is
+                        // *stored* — the running daemon keeps its overlay, so
+                        // opting out of persistence never disarms a daemon
+                        // that is working fine.
+                        let cleared = if clear {
+                            Some(gateway.clear_env_store().await?)
+                        } else {
+                            None
+                        };
+                        // The bare form needs no push of its own: every keyed
+                        // gateway has already run `sync_env(force = false)` in
+                        // `SquadGatewayResolver`, so the digests are current by
+                        // the time this command body runs. `--push` is the one
+                        // case that re-sends regardless of digest.
+                        if push {
+                            sync_env(gateway.as_ref(), true).await;
+                        }
+                        let coverage = gateway.env_coverage().await?;
+                        Ok(SquadOutcome::Env(env_report(&coverage, cleared)))
                     }
                     _ => unreachable!("daemon commands handled above"),
                 }
@@ -1292,6 +1382,113 @@ fn remove_task_dir(
     }
 }
 
+/// Which half of §6a's warning applies: `squad add` or `squad edit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskChange {
+    Created,
+    Updated,
+}
+
+impl TaskChange {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+        }
+    }
+}
+
+/// §6a — the one moment of truth, at the point of action.
+///
+/// The gateway runs in the daemon, so `task.unmet_env` is an authoritative
+/// answer by the time the task comes back: these are the `env(NAME)` names the
+/// daemon has no usable value for. One `Warning` is written to the frontend's
+/// message sink, so the CLI and the TUI render the same text without either
+/// composing its own.
+///
+/// **The task is created.** This is a warning, never a rejection: the value may
+/// legitimately arrive later, and refusing to create a task because the current
+/// shell is under-equipped would lose the user their task — its own kind of
+/// silent failure. Nothing here repeats on a timer and nothing prompts (§6f).
+fn warn_unmet_env(frontend: &mut dyn SquadCommandFrontend, task: &Task, change: TaskChange) {
+    let Some(first) = task.unmet_env.first() else {
+        return;
+    };
+    let names = task.unmet_env.join(", ");
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Warning,
+        text: format!(
+            "\u{26a0} Task \"{name}\" was {verb}, but the squad daemon has no value for {names}.\n\
+             \n  \
+             Its containers will start without it until it is supplied. To fix:\n      \
+             read -rs {first} && export {first}      # in any shell; keeps it out of shell history\n      \
+             awman squad env --push       # or just run any awman squad command\n\
+             \n  \
+             Check state at any time with `awman squad env`.",
+            name = task.name,
+            verb = change.verb(),
+        ),
+    });
+}
+
+/// Turn the daemon's coverage into §6d's report.
+///
+/// Pure over the coverage plus this process's own environment, so the whole
+/// table is decided in one place and neither frontend has to reason about
+/// digests. The only thing this shell's values are used for is the `SOURCE`
+/// column's `this shell` case — a digest comparison, never a printed value.
+fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
+    let salt = Salt::from_hex(&coverage.salt);
+    let rows = coverage
+        .required
+        .iter()
+        .map(|entry| {
+            let held = entry.source.is_some();
+            let state = if held {
+                "set"
+            } else if entry.optional {
+                // Wanted, but never counted against anyone: a machine with no
+                // GITHUB_TOKEN must not read as permanently broken.
+                "optional"
+            } else {
+                "unmet"
+            };
+            // "this shell" outranks the daemon's own answer for a held value:
+            // it says the value here matches the value there, so a restart
+            // would be re-armed by the next command from this terminal. That
+            // is what the user needs to know, and the comparison never moves
+            // a value anywhere — only a digest of one.
+            let from_this_shell = match (&salt, &entry.digest) {
+                (Some(salt), Some(digest)) => host_var(&entry.name)
+                    .filter(|value| !value.is_empty())
+                    .is_some_and(|value| &coverage_digest(salt, &entry.name, &value) == digest),
+                _ => false,
+            };
+            let source = if from_this_shell {
+                "this shell"
+            } else {
+                match entry.source {
+                    Some(EnvSource::Pushed) => "pushed",
+                    Some(EnvSource::Keychain) => "keychain",
+                    None => "\u{2014}",
+                }
+            };
+            EnvReportRow {
+                name: entry.name.clone(),
+                state: state.to_string(),
+                source: source.to_string(),
+                unmet_since: entry.unmet_since,
+                required_by: entry.required_by.clone(),
+            }
+        })
+        .collect();
+    EnvReport {
+        persistence: coverage.persistence.clone(),
+        cleared,
+        rows,
+    }
+}
+
 fn daemon_outcome(value: SquadDaemonOutcome) -> Result<SquadOutcome, CommandError> {
     Ok(match value {
         SquadDaemonOutcome::Started {
@@ -1307,4 +1504,144 @@ fn daemon_outcome(value: SquadDaemonOutcome) -> Result<SquadOutcome, CommandErro
         SquadDaemonOutcome::Status(status) => SquadOutcome::Status(status),
         SquadDaemonOutcome::Logs { log_path } => SquadOutcome::Logs { log_path },
     })
+}
+
+#[cfg(test)]
+mod unmet_env_warning_tests {
+    use super::*;
+    use chrono::Utc;
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::data::fs::task_store::{MountScope, TaskStatus};
+    use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+
+    /// Records everything the command writes to the frontend's message sink.
+    /// Both the CLI and the TUI implement this sink, which is exactly why the
+    /// warning is composed here and not in either frontend: they render the
+    /// same bytes.
+    #[derive(Clone, Default)]
+    struct RecordingFrontend {
+        messages: Arc<Mutex<Vec<UserMessage>>>,
+    }
+
+    impl UserMessageSink for RecordingFrontend {
+        fn write_message(&mut self, message: UserMessage) {
+            self.messages.lock().unwrap().push(message);
+        }
+        fn replay_queued(&mut self) {}
+    }
+
+    #[async_trait]
+    impl SquadCommandFrontend for RecordingFrontend {}
+
+    fn task(name: &str, unmet: &[&str]) -> Task {
+        let now = Utc::now();
+        Task {
+            id: name.into(),
+            name: name.into(),
+            description: "a task".into(),
+            repo_scope: PathBuf::from("/repo"),
+            mount_scope: MountScope::GitRoot,
+            overlays: vec!["env(ANTHROPIC_KEY)".into()],
+            interval_secs: 600,
+            status: TaskStatus::Active,
+            agent: None,
+            model: None,
+            backoff_until: None,
+            created_at: now,
+            updated_at: now,
+            last_run_at: None,
+            trigger_requested_at: None,
+            last_run_status: None,
+            unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn warn(task: &Task, change: TaskChange) -> Vec<UserMessage> {
+        let mut frontend = RecordingFrontend::default();
+        let recorded = frontend.messages.clone();
+        warn_unmet_env(&mut frontend, task, change);
+        let messages = recorded.lock().unwrap().clone();
+        messages
+    }
+
+    /// §6a, `squad add`. The exact template, including its indentation — the
+    /// work item's own spacing, kept verbatim so the CLI and the TUI cannot
+    /// drift apart.
+    #[test]
+    fn creating_a_task_that_names_an_unset_variable_warns_with_the_exact_text() {
+        let messages = warn(
+            &task("nightly-triage", &["ANTHROPIC_KEY"]),
+            TaskChange::Created,
+        );
+
+        assert_eq!(messages.len(), 1, "exactly one message, never a repetition");
+        assert_eq!(messages[0].level, MessageLevel::Warning);
+        assert_eq!(
+            messages[0].text,
+            "\u{26a0} Task \"nightly-triage\" was created, but the squad daemon has no value \
+             for ANTHROPIC_KEY.\n\n  Its containers will start without it until it is \
+             supplied. To fix:\n      read -rs ANTHROPIC_KEY && export ANTHROPIC_KEY      # in any shell; \
+             keeps it out of shell history\n      \
+             awman squad env --push       # or just run any awman squad command\n\n  \
+             Check state at any time with `awman squad env`."
+        );
+    }
+
+    /// The same warning with the `squad edit` verb, and `{first_name}` is the
+    /// first of the joined names.
+    #[test]
+    fn editing_a_task_warns_with_the_updated_verb_and_joins_several_names() {
+        let messages = warn(
+            &task("nightly-triage", &["NPM_TOKEN", "AWS_PROFILE"]),
+            TaskChange::Updated,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].text.starts_with(
+                "\u{26a0} Task \"nightly-triage\" was updated, but the squad \
+                              daemon has no value for NPM_TOKEN, AWS_PROFILE."
+            ),
+            "{:?}",
+            messages[0].text
+        );
+        assert!(
+            messages[0]
+                .text
+                .contains("read -rs NPM_TOKEN && export NPM_TOKEN"),
+            "the supply line names the first of them: {:?}",
+            messages[0].text
+        );
+    }
+
+    /// **The warning is a warning, never a rejection.** `warn_unmet_env`
+    /// returns nothing and can fail nothing: the caller has already created or
+    /// updated the task by the time it runs, and goes on to return it. Refusing
+    /// to create a task because the current shell is under-equipped would lose
+    /// the user their task — its own kind of silent failure.
+    #[test]
+    fn the_warning_returns_nothing_and_can_refuse_nothing() {
+        let task = task("nightly-triage", &["ANTHROPIC_KEY"]);
+        let messages = warn(&task, TaskChange::Created);
+        // The only effect is one message; the task is untouched and is what
+        // `SquadOutcome::Task` carries back to the frontend.
+        assert_eq!(messages.len(), 1);
+        assert_eq!(task.unmet_env, vec!["ANTHROPIC_KEY".to_string()]);
+        let outcome = SquadOutcome::Task(task.clone());
+        match outcome {
+            SquadOutcome::Task(returned) => assert_eq!(returned.name, "nightly-triage"),
+            other => panic!("creation yields the created task: {other:?}"),
+        }
+    }
+
+    /// A fully covered task says nothing at all — and neither does an
+    /// `optional` host-side name, because the daemon never puts one on
+    /// `unmet_env` in the first place.
+    #[test]
+    fn nothing_is_written_when_the_returned_task_has_no_unmet_name() {
+        assert!(warn(&task("nightly-triage", &[]), TaskChange::Created).is_empty());
+        assert!(warn(&task("nightly-triage", &[]), TaskChange::Updated).is_empty());
+    }
 }

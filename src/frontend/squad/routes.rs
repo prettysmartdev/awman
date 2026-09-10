@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,6 +17,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::command::commands::squad::commands::SquadOutcome;
 use crate::command::commands::squad::daemon_runtime::SquadWorkflowLookup;
+use crate::command::commands::squad::gateway::EnvPush;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::{CommandOutcome, Dispatch};
 use crate::frontend::api::command_frontend::ApiDispatchFrontend;
@@ -35,6 +37,19 @@ pub fn build_router(state: Arc<SquadAppState>) -> Router {
     Router::new()
         .route("/v1/commands", post(handle_command))
         .route("/v1/status", get(handle_status))
+        // WI 0116 §4. A **dedicated typed route**, deliberately not the
+        // `{subcommand, args: Vec<String>}` envelope of `/v1/commands`:
+        // CLI-arg-shaped strings drift into tracing spans and error text, a
+        // typed body whose `Debug` prints names only does not. It sits behind
+        // the same `auth_middleware` as everything else, so a daemon started
+        // with `--dangerously-skip-auth` follows whatever that mode decides and
+        // no new auth surface is introduced.
+        .route(
+            "/v1/daemon/env",
+            get(handle_env_coverage)
+                .post(handle_env_push)
+                .delete(handle_env_clear),
+        )
         .route("/v1/tasks/{name}/workflow", get(handle_workflow))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -138,6 +153,15 @@ fn squad_outcome_response(outcome: SquadOutcome) -> Response {
         SquadOutcome::Logs { log_path } => {
             Json(serde_json::json!({ "log_path": log_path })).into_response()
         }
+        // `squad env` is `api_allowed: false`, so the front door above never
+        // admits it and this arm exists only to keep the match exhaustive.
+        // Answering with the report anyway would quietly make the leaf
+        // API-reachable, which is exactly what its catalogue flag refuses.
+        SquadOutcome::Env(_) => (
+            StatusCode::NOT_FOUND,
+            error_json("squad env is not available over the API"),
+        )
+            .into_response(),
     }
 }
 
@@ -149,6 +173,73 @@ async fn handle_status(State(state): State<Arc<SquadAppState>>) -> Response {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_json("Failed to read daemon status"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /v1/daemon/env` — the daemon's `required_env` with a salted digest per
+/// name it holds. Names and digests only; no endpoint ever returns a value, so
+/// a compromised bearer key cannot read secrets back out of the daemon.
+async fn handle_env_coverage(State(state): State<Arc<SquadAppState>>) -> Response {
+    match state.handles.gateway().env_coverage().await {
+        Ok(coverage) => Json(coverage).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "squad: failed to read env coverage");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to read daemon env coverage"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `POST /v1/daemon/env` — a per-name merge, never a whole-map replace.
+///
+/// The extractor's rejection is caught rather than returned: axum's default
+/// `JsonDataError` text quotes the offending input, which for this one route is
+/// the payload. A fixed message is the only safe answer, and it is why the
+/// handler takes a `Result` instead of a bare `Json<EnvPush>`.
+async fn handle_env_push(
+    State(state): State<Arc<SquadAppState>>,
+    body: Result<Json<EnvPush>, JsonRejection>,
+) -> Response {
+    let Ok(Json(push)) = body else {
+        // No body echo, no serde message, no value — not even in the log.
+        tracing::warn!("squad: rejected a malformed daemon env push");
+        return (
+            StatusCode::BAD_REQUEST,
+            error_json("malformed daemon env request"),
+        )
+            .into_response();
+    };
+    match state.handles.gateway().push_env(push).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "squad: failed to apply env push");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to apply daemon env push"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `DELETE /v1/daemon/env` — remove the persisted keychain item (§5c).
+///
+/// The in-memory overlay is deliberately untouched: removing what is stored
+/// must not disarm a daemon that is running fine.
+async fn handle_env_clear(State(state): State<Arc<SquadAppState>>) -> Response {
+    match state.handles.gateway().clear_env_store().await {
+        Ok(cleared) => Json(serde_json::json!({ "cleared": cleared })).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "squad: failed to clear stored env");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to clear the stored daemon env"),
             )
                 .into_response()
         }

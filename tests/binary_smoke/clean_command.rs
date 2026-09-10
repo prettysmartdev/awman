@@ -25,6 +25,37 @@ fn git_init(path: &Path) {
         .expect("git init");
 }
 
+/// A `PATH` value that shadows the OS keychain binaries with stubs that report
+/// "nothing there", so a subprocess `awman clean` can never see — let alone
+/// delete — the developer's real `awman-squad`/`daemon-env` keychain item.
+///
+/// That item is a single fixed service/account pair by design (`awman clean`
+/// must find it whatever storage root the daemon used), which is exactly why an
+/// isolated `AWMAN_CONFIG_HOME` does not isolate it. `KeychainStore` shells out
+/// to `security` (macOS) and `secret-tool` (Linux) by bare name, so putting a
+/// stub earlier on `PATH` is enough: `item_present()` then answers `false` and
+/// the category is never offered, on any host.
+///
+/// Returns `(guard_dir, path_value)`; the directory must outlive the command.
+#[cfg(unix)]
+fn keychain_free_path() -> (tempfile::TempDir, std::ffi::OsString) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("shim dir");
+    for name in ["security", "secret-tool"] {
+        let stub = dir.path().join(name);
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("write keychain stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod keychain stub");
+    }
+    let mut value = std::ffi::OsString::from(dir.path());
+    if let Some(existing) = std::env::var_os("PATH") {
+        value.push(":");
+        value.push(existing);
+    }
+    (dir, value)
+}
+
 /// Open `/dev/null` for reading (detaches stdin from any TTY).
 fn null_stdin() -> Stdio {
     let file = std::fs::OpenOptions::new()
@@ -147,10 +178,12 @@ fn clean_non_tty_stdin_without_yes_aborts() {
 
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean");
@@ -190,10 +223,12 @@ fn clean_nothing_to_clean_exits_zero_with_no_tty() {
     git_init(repo.path());
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean");
@@ -221,10 +256,12 @@ fn clean_dry_run_lists_items_and_deletes_nothing() {
     write_workflow_state(&wf_dir, "abcd1234-wf.json", true);
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean", "--dry-run"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean --dry-run");
@@ -264,10 +301,12 @@ fn clean_dry_run_nothing_to_clean_exits_zero() {
     git_init(repo.path());
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean", "--dry-run"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean --dry-run (empty)");
@@ -303,10 +342,12 @@ fn clean_yes_deletes_completed_workflow_and_preserves_pending() {
     write_workflow_state(&wf_dir, "pending.json", false);
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean", "--yes"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean --yes");
@@ -334,10 +375,12 @@ fn clean_yes_empty_repo_exits_zero() {
     git_init(repo.path());
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean", "--yes"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean --yes (empty)");
@@ -372,10 +415,12 @@ fn clean_removes_pre_migration_backups_and_preserves_live_database() {
     let live_bytes = b"live database must survive clean".to_vec();
     std::fs::write(&live_path, &live_bytes).unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean", "--yes"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean");
@@ -407,10 +452,12 @@ fn clean_dry_run_and_yes_deletes_nothing() {
     write_workflow_state(&wf_dir, "done.json", true);
     let home = tempfile::tempdir().unwrap();
 
+    let (_keychain_dir, keychain_path) = keychain_free_path();
     let out = Command::new(awman_bin())
         .args(["clean", "--dry-run", "--yes"])
         .current_dir(repo.path())
         .env("AWMAN_CONFIG_HOME", home.path())
+        .env("PATH", &keychain_path)
         .stdin(null_stdin())
         .output()
         .expect("awman clean --dry-run --yes");
@@ -424,4 +471,29 @@ fn clean_dry_run_and_yes_deletes_nothing() {
         wf_dir.join("done.json").exists(),
         "dry-run must not delete files even when --yes is also passed"
     );
+}
+
+/// The shim must actually shadow the host's keychain binaries, or every test
+/// that relies on it silently reaches the developer's real keychain item again.
+///
+/// Resolution is checked the way the `awman` child does it — through a shell
+/// whose own `PATH` is the value we hand the subprocess — rather than through
+/// this test process's `PATH`.
+#[test]
+#[cfg(unix)]
+fn the_keychain_shim_shadows_the_real_keychain_binaries() {
+    let (dir, path) = keychain_free_path();
+    for name in ["security", "secret-tool"] {
+        let out = Command::new("/bin/sh")
+            .args(["-c", &format!("command -v {name}")])
+            .env("PATH", &path)
+            .output()
+            .expect("resolve the shimmed binary");
+        let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            resolved,
+            dir.path().join(name).display().to_string(),
+            "`{name}` must resolve to the stub, not to the host's own binary"
+        );
+    }
 }

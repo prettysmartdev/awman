@@ -25,6 +25,8 @@
 //! [`TaskStore::due_for_evaluation`]: crate::data::fs::TaskStore::due_for_evaluation
 
 pub mod daemon;
+pub mod env_state;
+pub mod env_store;
 pub mod evaluator;
 pub mod key_setup;
 pub mod launcher;

@@ -162,6 +162,7 @@ fn fake_task(name: &str) -> Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     }
 }
 
@@ -517,4 +518,75 @@ fn closing_the_squad_tab_mid_attach_removes_it_stops_polling_and_leaves_the_cont
         cancel.is_cancelled(),
         "closing the squad tab must cancel its task poller"
     );
+}
+
+// ─── WI 0116 §6b: the card's `Env` row ──────────────────────────────────────
+
+/// A task carrying `unmet_env`, exactly as the daemon puts it on the wire —
+/// the field rides the poller's existing `list()` response, so nothing in
+/// `squad_poll.rs` or `squad_state.rs` had to change to carry it.
+fn fake_task_with_unmet(name: &str, unmet: &[&str]) -> Task {
+    Task {
+        unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
+        ..fake_task(name)
+    }
+}
+
+/// Rendered through the card's existing labelled-record style, appended after
+/// `Next:` — the same grey-label/default-value shape as `Last run:` and
+/// `Outcome:`, not a bare padded label.
+#[test]
+fn a_task_with_an_unmet_env_name_renders_an_env_row_on_its_card() {
+    let mut app = make_squad_only_app();
+    {
+        let state = app.tabs[0].squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![fake_task_with_unmet("deploy-preview", &["GITHUB_TOKEN"])];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(
+        text.contains("Env: \u{26a0} GITHUB_TOKEN unmet"),
+        "the card must state the unmet name in the labelled-record style: {text}"
+    );
+}
+
+/// Several names are `, `-joined on the one row.
+#[test]
+fn several_unmet_names_join_with_commas_on_the_card() {
+    let mut app = make_squad_only_app();
+    {
+        let state = app.tabs[0].squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![fake_task_with_unmet(
+            "deploy-preview",
+            &["AWS_PROFILE", "NPM_TOKEN"],
+        )];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(
+        text.contains("Env: \u{26a0} AWS_PROFILE, NPM_TOKEN unmet"),
+        "{text}"
+    );
+}
+
+/// With full coverage the card is the pre-WI-0116 card: no row at all, and the
+/// grid lays out at its original height.
+#[test]
+fn a_task_with_full_coverage_renders_no_env_row_at_all() {
+    let mut app = make_squad_only_app();
+    {
+        let state = app.tabs[0].squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![fake_task_with_unmet("deploy-preview", &[])];
+        snap.loaded = true;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(text.contains("deploy-preview"), "{text}");
+    assert!(!text.contains("Env:"), "no unmet name means no row: {text}");
+    assert!(!text.contains('\u{26a0}'), "{text}");
 }

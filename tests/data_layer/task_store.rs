@@ -37,6 +37,7 @@ fn task(name: &str, now: chrono::DateTime<Utc>) -> Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     }
 }
 
@@ -109,6 +110,7 @@ fn squad_schema_and_workspace_overlay_fields_round_trip() {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        unmet_env: Vec::new(),
     };
     store.create(&stored).unwrap();
 
@@ -156,6 +158,7 @@ async fn malformed_task_overlay_is_rejected_before_store_or_workspace_write() {
         test_engines(tmp.path()),
         Arc::new(Mutex::new(SchedulerStatus::default())),
         paths.clone(),
+        Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
     );
     let request = CreateTask {
         name: "bad-overlay".into(),
@@ -193,6 +196,7 @@ fn due_for_evaluation_applies_pause_backoff_interval_and_running_filters() {
     let due_elapsed = Task {
         last_run_at: Some(now - Duration::seconds(301)),
         last_run_status: None,
+        unmet_env: Vec::new(),
         ..task("elapsed", now)
     };
     let paused = Task {
@@ -207,6 +211,7 @@ fn due_for_evaluation_applies_pause_backoff_interval_and_running_filters() {
         interval_secs: 3600,
         last_run_at: Some(now - Duration::seconds(10)),
         last_run_status: None,
+        unmet_env: Vec::new(),
         ..task("interval", now)
     };
     let running = task("running", now);
@@ -349,6 +354,7 @@ async fn task_store_crud_is_exercised_through_daemon_gateway() {
         test_engines(tmp.path()),
         Arc::new(Mutex::new(SchedulerStatus::default())),
         awman::data::fs::SquadPaths::from_root(tmp.path().join("squad")),
+        Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
     );
     let request = || CreateTask {
         name: "issue-triage".into(),
@@ -485,6 +491,7 @@ async fn a_custom_workspace_below_a_repository_root_is_a_plain_directory_and_nev
         test_engines(tmp.path()),
         Arc::new(Mutex::new(SchedulerStatus::default())),
         awman::data::fs::SquadPaths::from_root(tmp.path().join("squad")),
+        Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
     );
 
     // The repository root itself keeps its captured scope and is
@@ -616,6 +623,7 @@ fn edit_fixture(
         test_engines(tmp.path()),
         Arc::new(Mutex::new(SchedulerStatus::default())),
         paths.clone(),
+        Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
     );
     (store, gateway, paths)
 }
@@ -870,6 +878,7 @@ async fn a_task_config_layers_over_the_global_squad_block() {
         default_leader: Some("claude::claude-opus-4-8".to_string()),
         guidance: Some(vec!["Keep changes focused.".to_string()]),
         max_concurrent_evaluations: Some(3),
+        env_persistence: None,
     };
 
     gateway.create(editable_task("inheritor")).await.unwrap();

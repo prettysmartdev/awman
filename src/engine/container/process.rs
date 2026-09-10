@@ -294,11 +294,15 @@ pub(super) struct SpawnRequest {
 }
 
 /// Common `<bin> <argv>` setup: the child command with the agent credentials
-/// on its environment.
+/// and the resolved `env()` passthrough values on its environment.
 ///
-/// Agent credentials are passed as name-only `-e KEY` in argv; their values are
-/// set on the child CLI's environment so the CLI resolves them without the
-/// secret ever touching the argument vector.
+/// Both are passed as name-only `-e KEY` in argv; their values are set on the
+/// child CLI's environment so the CLI resolves them without the secret ever
+/// touching the argument vector.
+///
+/// The passthrough values must be injected explicitly rather than relying on
+/// ambient inheritance: inside the squad daemon they come from the Layer 0
+/// daemon overlay, not from the daemon's own process environment.
 fn piped_command(
     cli: ContainerCli,
     argv: &[String],
@@ -307,6 +311,9 @@ fn piped_command(
     let mut cmd = Command::new(cli.bin);
     cmd.args(argv);
     for (k, v) in &options.agent_credentials {
+        cmd.env(k, v);
+    }
+    for (k, v) in super::docker::resolve_env_passthrough(options) {
         cmd.env(k, v);
     }
     cmd.stdin(Stdio::piped());
@@ -383,10 +390,16 @@ pub(super) fn spawn_pty_bridged(
     for arg in &argv {
         cmd.arg(arg);
     }
-    // Agent credentials are passed as name-only `-e KEY` in argv; set their
-    // values on the child's environment so the CLI resolves them without the
-    // secret ever touching the argument vector.
+    // Agent credentials and the resolved `env()` passthrough values are passed
+    // as name-only `-e KEY` in argv; set their values on the child's
+    // environment so the CLI resolves them without the secret ever touching the
+    // argument vector. The passthrough values cannot rely on ambient
+    // inheritance — inside the squad daemon they live in the Layer 0 overlay,
+    // not in the daemon's own process environment.
     for (k, v) in &instance.options.agent_credentials {
+        cmd.env(k, v);
+    }
+    for (k, v) in super::docker::resolve_env_passthrough(&instance.options) {
         cmd.env(k, v);
     }
 
@@ -923,5 +936,55 @@ mod tests {
             }
             other => panic!("expected ContainerRuntimeUnavailable, got {other:?}"),
         }
+    }
+
+    /// WI 0116 §1/D1, the second half of the fix: `build_run_argv` emits the
+    /// name only, so something has to put the value where the container CLI can
+    /// find it. Inside the squad daemon that value lives in the Layer 0 overlay
+    /// and *not* in the daemon's own environment, so ambient inheritance —
+    /// which is what carried a passthrough before WI 0116 — cannot reach it.
+    #[test]
+    fn piped_command_carries_the_passthrough_value_on_the_child_never_in_argv() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+        use crate::engine::container::options::EnvVar;
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let name = "AWMAN_TEST_PROCESS_OVERLAY_ONLY";
+        std::env::remove_var(name);
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
+
+        let options = resolve(vec![
+            ContainerOption::Image(crate::engine::container::options::ImageRef::new(
+                "img:latest",
+            )),
+            ContainerOption::EnvPassthrough(EnvVar(name.into())),
+        ]);
+        let argv = vec!["run".to_string(), "-e".to_string(), name.to_string()];
+        let cmd = piped_command(ContainerCli::DOCKER, &argv, &options);
+
+        let injected: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert!(
+            injected.contains(&(name.to_string(), "overlay-secret".to_string())),
+            "the value must be set on the child's environment; got {injected:?}"
+        );
+        assert!(
+            !cmd.get_args()
+                .any(|a| a.to_string_lossy().contains("overlay-secret")),
+            "and it must never appear in argv"
+        );
+
+        set_daemon_overlay(DaemonEnvMap::new());
     }
 }
