@@ -23,7 +23,7 @@ anyhow = "1"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-dirs = "6"
+dirs = "7"
 portable-pty = "0.9"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
