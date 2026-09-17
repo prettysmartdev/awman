@@ -515,6 +515,10 @@ fn note_in_log(log_path: &Path, message: &str) {
 /// through a shell — so a `VALUE` containing `=`, spaces, or other
 /// shell-significant characters reaches systemd-run intact with no escaping
 /// needed.
+///
+/// Only `try_systemd_run` (Linux-only) calls this outside of tests; it stays
+/// compiled on every platform so the unit tests exercise it everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn systemd_run_argv(
     binary_path: &Path,
     args: &[String],
