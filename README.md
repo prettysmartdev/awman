@@ -40,7 +40,7 @@ The installer detects your platform and puts `awman` on your `PATH`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.11.1`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.12.0`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/awman/releases):
 
@@ -113,6 +113,8 @@ awman exec workflow ./aspec/workflows/implement-pr.toml --work-item 0027
 ```
 
 The `--work-item` is optional: pass one to substitute a spec you've written into the prompts, or leave it off. See [Workflows](docs/05-workflows.md) for the full file format, template variables, and the control board.
+
+When a step's agent dies, the workflow doesn't. The control board opens with the failure attached so you can retry the step, step back to the one before it, step over it, or pause — and a paused run picks up from a named step the next time you start it. Unattended runs (squad, the API server) retry a failed step once on their own before giving up.
 
 <details>
 <summary>A complete workflow file</summary>
@@ -215,6 +217,18 @@ awman remote exec workflow aspec/workflows/implement-pr.toml --work-item 0027 --
 
 Remote commands run in containers with the same isolation as local ones, and every input, output, and log is kept on the server under `~/.awman/api/` for auditing. The HTTP API is available directly to any client too. See [API & Remote Mode](docs/09-api-and-remote-mode.md).
 
+### Curate your skills library
+
+Build up a library of the skills your agents should have on hand — the ones you write, plus published libraries you pull in from GitHub — and mount exactly what a given session needs:
+
+```sh
+awman new skill --pull github.com/obra/superpowers
+awman chat --overlay "skill(superpowers)"                # the whole library
+awman chat --overlay "skill(superpowers/brainstorming)"  # one skill from it
+```
+
+`awman new skill --pull <name>` refreshes a library already in your collection, and `--pull-all` refreshes every one of them, so the set stays current as upstream evolves. Pulled libraries live under `~/.awman/skills/.library/` and your own skills under `~/.awman/skills/<name>/` — separate shelves, one library, the same `skill()` syntax over both. See [Pulled skill libraries](docs/03-agent-sessions.md#pulled-skill-libraries).
+
 ### Start from a GitHub issue
 
 Point `new spec`, `exec workflow`, or `exec prompt` at an issue with `--issue` — no local work item file needed:
@@ -234,7 +248,7 @@ A bare number resolves against the repo's GitHub remote; `owner/repo#84` and ful
 Every agent runs inside a container built from `Dockerfile.dev` — agents never touch your host machine directly.
 
 - Only the current Git repository is mounted into the container by default
-- Credentials are passed as environment variables and masked in displayed commands — never written to files inside containers
+- Credentials are passed as environment variables and masked in displayed commands. Claude Code is the exception: it gets an awman-authored credential file holding the access token only, kept refreshed for as long as the session runs — your OAuth refresh token never leaves the host
 - Overlays are the only way in: opt a session into SSH keys, env vars, extra directories, or your skills library, one at a time
 - awman itself is a statically compiled Rust binary — nothing running in a container can modify it
 
@@ -250,13 +264,14 @@ Docker, Apple Containers (macOS 26+), and Docker Sandboxes (`docker-sbx-experime
 awman                                  # open the TUI
 awman init [--agent <name>]            # set up a project
 awman ready [--refresh]                # verify environment; rebuild Dockerfile.dev
-awman chat [--agent <name>] [--plan] [--auto] [--yolo]
+awman chat [--agent <name>] [--plan] [--auto] [--yolo] [--launch-mode <stdio|acp>]
 awman exec prompt "<prompt>" [--issue <ref>]   # run a one-off prompt in a container
 awman exec workflow <path> [--work-item <nnnn> | --issue <ref>] [--yolo] [--worktree]
 awman exec workflow --dynamic --work-item <nnnn> [--leader <agent::model>]   # let a leader agent design the workflow
 awman new spec [--interview] [--issue <ref>]   # create a work item (optionally from a GitHub issue)
 awman new workflow [--interview]       # create a workflow file
 awman new skill [--interview]          # create a skill file
+awman new skill --pull <repo> | --pull-all     # pull or refresh a published skills library from GitHub
 awman specs amend <nnnn>               # update a spec to match what was built
 awman status [--watch]                 # dashboard of all running agent containers
 awman clean [--dry-run] [--yes]        # remove stopped containers, stale images, and completed workflow data
@@ -265,7 +280,11 @@ awman squad                            # open your squad's TUI tab
 awman squad start [--background]       # put your squad on duty (starts the squad daemon)
 awman squad add --name <name> --description <text> [--interval <dur>]   # create a new task for your squad to tackle
 awman squad trigger <name>             # have your squad tackle a task now, ignoring its schedule
-awman squad list | show <name> | pause <name> | resume <name> | remove <name>
+awman squad cancel <name>              # stop the run a task has in progress
+awman squad attach <name>              # attach to a task's running container
+awman squad env [--push | --clear]     # report which env() values your squad's daemon holds
+awman squad list | show <name> | edit <name> | pause <name> | resume <name> | remove <name>
+awman squad stop | status | logs       # squad daemon lifecycle
 awman api start [--port <n>]           # start the HTTP API server (generates API key on first run)
 awman api status | kill                # check or stop the API server
 awman remote session start --workdir <dir>     # create a session on a remote server

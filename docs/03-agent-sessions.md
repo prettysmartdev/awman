@@ -518,7 +518,7 @@ Writes to `~/.awman/skills/<name>/SKILL.md` instead of the current repo. Use thi
 
 ### Pulled skill libraries
 
-You can pull a published skills library from GitHub into your global skills store:
+Your global skills store isn't limited to skills you write. Published libraries can be pulled into it from GitHub and curated alongside your own, so one collection covers both:
 
 ```sh
 awman new skill --pull https://github.com/obra/superpowers
