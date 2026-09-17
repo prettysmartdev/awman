@@ -291,6 +291,10 @@ pub trait TaskGateway: Send + Sync {
     /// Ask for `name` to be evaluated on the next scheduler tick, whatever its
     /// interval and backoff would otherwise say.
     async fn trigger(&self, name: &str) -> Result<(), CommandError>;
+    /// Stop `name`'s in-progress run: its evaluation is abandoned, every
+    /// container it started is stopped, and the run is recorded as
+    /// `canceled`. An error when the task has no run in progress.
+    async fn cancel(&self, name: &str) -> Result<(), CommandError>;
     async fn delete(&self, name: &str) -> Result<(), CommandError>;
     async fn status(&self) -> Result<DaemonStatus, CommandError>;
     /// Read the state of the task's currently running workflow, if any.
@@ -347,6 +351,9 @@ impl TaskGateway for SharedTaskGateway {
     }
     async fn trigger(&self, name: &str) -> Result<(), CommandError> {
         self.0.trigger(name).await
+    }
+    async fn cancel(&self, name: &str) -> Result<(), CommandError> {
+        self.0.cancel(name).await
     }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         self.0.delete(name).await
@@ -932,6 +939,26 @@ impl TaskGateway for LocalTaskGateway {
         Ok(())
     }
 
+    /// Signal the scheduler to abandon `name`'s in-flight evaluation.
+    ///
+    /// Returns as soon as the signal is sent: the scheduler records the run as
+    /// `canceled` and then stops the task's containers, which can take a few
+    /// seconds per container and is not worth holding the request open for.
+    async fn cancel(&self, name: &str) -> Result<(), CommandError> {
+        let task = self
+            .store
+            .get(name)?
+            .ok_or_else(|| CommandError::Other(format!("task {name:?} was not found")))?;
+        let run_id = self
+            .status
+            .lock()
+            .expect("scheduler status mutex poisoned")
+            .cancel_run(&task.id)
+            .ok_or_else(|| CommandError::Other(format!("task {name:?} has no run in progress")))?;
+        tracing::info!(task = %name, run_id = %run_id, "squad administrator canceled run");
+        Ok(())
+    }
+
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         if self.store.delete(name)? {
             tracing::info!(task = %name, "squad administrator removed task");
@@ -1168,6 +1195,11 @@ impl TaskGateway for RemoteTaskGateway {
     }
     async fn trigger(&self, name: &str) -> Result<(), CommandError> {
         self.command::<serde_json::Value>("squad trigger", vec![name.into()])
+            .await
+            .map(|_| ())
+    }
+    async fn cancel(&self, name: &str) -> Result<(), CommandError> {
+        self.command::<serde_json::Value>("squad cancel", vec![name.into()])
             .await
             .map(|_| ())
     }

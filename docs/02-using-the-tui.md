@@ -665,12 +665,18 @@ cards; selection remains on the same task when the number of columns changes.
 Press **Enter** to open a task's details. The modal includes the task's
 workspace, mount scope, interval, overlays, agent/model, timestamps, and run
 history. Its footer repeats the available actions: **a** attach, **e** edit,
-**t** trigger, **p** pause, **r** resume, **d** delete, and **Esc** close. These
-actions apply to the task shown by the modal.
+**t** trigger, **c** cancel, **p** pause, **r** resume, **d** delete, and **Esc** close. These
+actions apply to the task shown by the modal. **t**, **c**, **p**, and **d** open a
+`[y]es / [n]o` confirmation before acting, whether pressed on a card or in the
+modal.
 
 Press **t** to evaluate a task now rather than waiting for its interval. It
 changes nothing about the task's schedule — see
 [Triggering a task now](12-squad.md#triggering-a-task-now).
+
+Press **c** to cancel a task's run in progress: its agents are stopped and the
+run is recorded as `canceled` — see
+[Canceling a run in progress](12-squad.md#canceling-a-run-in-progress).
 
 When a squad action fails, the reason appears in red in the hint bar directly
 above the command box.

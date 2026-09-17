@@ -91,9 +91,10 @@ Once created, manage it with the rest of the CRUD subcommands:
 
 ```sh
 awman squad list                   # table of every task
-awman squad show issue-triage      # description, schedule, and run history
+awman squad show issue-triage      # description, schedule, and run history (with verdict reasons)
 awman squad edit issue-triage      # change it — see below
 awman squad trigger issue-triage   # evaluate it now, ignoring its schedule
+awman squad cancel issue-triage    # stop the run in progress
 awman squad pause issue-triage     # stop evaluating it without deleting it
 awman squad resume issue-triage
 awman squad remove issue-triage    # delete it
@@ -172,7 +173,29 @@ While a trigger is pending, the task's card in the TUI reads
 `trigger_requested_at` timestamp.
 
 In the TUI, **t** triggers the selected task from the card grid, and from
-inside a task's detail modal.
+inside a task's detail modal, after a `[y]es / [n]o` confirmation.
+
+### Canceling a run in progress
+
+`awman squad cancel <name>` stops the run a task is executing right now —
+whether its leader is still deciding or its generated workflow is already
+running:
+
+```sh
+awman squad cancel issue-triage
+# Canceled the in-progress run of task issue-triage; its containers are being stopped.
+```
+
+The run is recorded as `canceled` in the task's
+[run history](#run-history) straight away, and every agent container the run
+started — the evaluation leader and any workflow steps — is stopped, which
+takes a few seconds per container. A cancel is your decision, not a failure, so
+it never backs the task off: the task keeps its schedule and is evaluated again
+when it is next due. A task with no run in progress is refused with a message
+saying so.
+
+In the TUI, **c** cancels the selected task's run from the card grid, and from
+inside a task's detail modal, after a `[y]es / [n]o` confirmation.
 
 ### Choosing a task's agents and models
 
@@ -589,7 +612,7 @@ The task name is the card's title; every value below it carries a grey label:
 ```
 
 `Outcome` is what the last run actually did (`workflow executed`,
-`not triggered`, `failed`, `interrupted`, `running`, or `never run`), and
+`not triggered`, `failed`, `interrupted`, `canceled`, `running`, or `never run`), and
 `Next` is the next scheduled evaluation — which reads `paused` while the task
 is paused, and `triggered — next tick` while a [trigger](#triggering-a-task-now)
 is waiting to be honoured. A task that declares an `env(VAR)` name the daemon
@@ -629,15 +652,17 @@ focus to that tab's command box.
 | **a** | Attach to the task's currently running container(s) — see [Attaching](#attaching-to-a-running-task) |
 | **n** | Create a new task |
 | **e** | Edit the selected task (the creation interview, prefilled) |
-| **t** | Trigger the selected task — evaluate it on the next tick, ignoring its schedule |
-| **p** | Pause the selected task |
+| **t** | Trigger the selected task — evaluate it on the next tick, ignoring its schedule (asks for confirmation first) |
+| **c** | [Cancel](#canceling-a-run-in-progress) the selected task's run in progress (asks for confirmation first) |
+| **p** | Pause the selected task (asks for confirmation first) |
 | **r** | Resume the selected task |
 | **d** | Remove the selected task (opens a `[y]es / [n]o` confirmation first) |
 
 The detail modal includes the same task-scoped action hints: **h** history,
-**a** attach, **e** edit, **t** trigger, **p** pause, **r** resume, **d**
+**a** attach, **e** edit, **t** trigger, **c** cancel, **p** pause, **r** resume, **d**
 delete, and **Esc** close. Those keys act on the task shown in the modal, even
-if the underlying card list has changed.
+if the underlying card list has changed. **t**, **c**, **p**, and **d** ask for
+confirmation before acting, from the modal and from the card grid alike.
 
 ### Run history
 
@@ -652,9 +677,13 @@ place:
   and **Esc**.
 
 The table lists each run's start time, outcome (`running`, `not triggered`,
-`executed`, `failed`, `interrupted`), finish time, and error, plus an
-`Unmet env` column when any run in the history started with an unmet `env()`
-name. **↑ / ↓** and **PgUp / PgDn** scroll it. A task that has never run says
+`executed`, `failed`, `interrupted`, `canceled`), the reason the evaluation leader gave for
+its verdict (why the task did or didn't trigger — kept even when the run later
+fails or is canceled; `—` when it gave none or the
+run never reached a verdict), finish time, and error, plus an `Unmet env`
+column when any run in the history started with an unmet `env()` name. The
+modal widens to fit a long reason or error, up to the terminal's width. `awman
+squad show` prints the same `Reason` column. **↑ / ↓** and **PgUp / PgDn** scroll it. A task that has never run says
 so instead of showing an empty table. Like the detail modal, the history keeps
 refreshing from the daemon while it is open.
 

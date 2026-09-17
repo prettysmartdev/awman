@@ -226,6 +226,31 @@ pub fn decide_leader_outcome(
     }
 }
 
+/// Give a failed run the reason from its verdict file, when the leader wrote
+/// a readable one before the run failed.
+///
+/// Every failure path — a crashing leader, a workflow that never validated,
+/// an execution error — funnels through here, so the reason is recorded no
+/// matter where the run went wrong. A missing or unparseable verdict simply
+/// leaves the reason empty; the failure's own error already says why.
+pub fn with_verdict_reason_on_failure(
+    outcome: EvaluationOutcome,
+    run_log_dir: &Path,
+) -> EvaluationOutcome {
+    match outcome {
+        EvaluationOutcome::Failed {
+            error,
+            reason: None,
+        } => EvaluationOutcome::Failed {
+            error,
+            reason: read_verdict(run_log_dir)
+                .ok()
+                .and_then(|verdict| verdict.reason),
+        },
+        outcome => outcome,
+    }
+}
+
 /// Resolve the leader agent/model for one task.
 ///
 /// Precedence, highest first:
@@ -540,6 +565,9 @@ impl LocalTaskEvaluator {
         let generated_path = request.task_dir.join("workflow.toml");
         let mut repair = WorkflowRepairLoop::new(generated_path.clone(), prompt);
 
+        // The first attempt's verdict reason, kept for the run row once the
+        // workflow has run. Repair attempts never re-decide, so never replace it.
+        let mut verdict_reason: Option<String> = None;
         let workflow = loop {
             let label = repair.label();
             tracing::info!(
@@ -616,7 +644,10 @@ impl LocalTaskEvaluator {
                     log_path = %log_path.display(),
                     "squad evaluation leader failed: {error}"
                 );
-                return Ok(EvaluationOutcome::Failed { error });
+                return Ok(EvaluationOutcome::Failed {
+                    error,
+                    reason: None,
+                });
             }
 
             // The leader's verdict for *this* run is the authority on whether
@@ -645,7 +676,10 @@ impl LocalTaskEvaluator {
                             log_path = %log_path.display(),
                             "squad evaluation produced no usable verdict: {error}"
                         );
-                        return Ok(EvaluationOutcome::Failed { error });
+                        return Ok(EvaluationOutcome::Failed {
+                            error,
+                            reason: None,
+                        });
                     }
                     VerdictDecision::NotTriggered { reason } => {
                         tracing::info!(
@@ -655,7 +689,7 @@ impl LocalTaskEvaluator {
                             stale_workflow_present = generated_path.exists(),
                             "squad evaluation decided not triggered"
                         );
-                        return Ok(EvaluationOutcome::NotTriggered);
+                        return Ok(EvaluationOutcome::NotTriggered { reason });
                     }
                     VerdictDecision::RunGeneratedWorkflow { reason } => {
                         tracing::info!(
@@ -664,6 +698,7 @@ impl LocalTaskEvaluator {
                             reason = reason.as_deref().unwrap_or("(none given)"),
                             "squad evaluation decided triggered"
                         );
+                        verdict_reason = reason;
                     }
                 }
             }
@@ -675,7 +710,10 @@ impl LocalTaskEvaluator {
             )) {
                 RepairDecision::Accepted(workflow) => break *workflow,
                 RepairDecision::Exhausted(message) => {
-                    return Ok(EvaluationOutcome::Failed { error: message });
+                    return Ok(EvaluationOutcome::Failed {
+                        error: message,
+                        reason: None,
+                    });
                 }
                 RepairDecision::Retry { attempt, error } => {
                     tracing::warn!(
@@ -780,6 +818,7 @@ impl LocalTaskEvaluator {
         );
 
         Ok(EvaluationOutcome::WorkflowExecuted {
+            reason: verdict_reason,
             workflow_path: generated_path,
             workflow_state_path: Some(state_path),
             exit_code: outcome.exit_code,
@@ -891,14 +930,16 @@ impl LocalTaskEvaluator {
 #[async_trait]
 impl TaskEvaluator for LocalTaskEvaluator {
     async fn evaluate(&self, request: EvaluationRequest) -> EvaluationOutcome {
-        match self.evaluate_inner(&request).await {
+        let outcome = match self.evaluate_inner(&request).await {
             Ok(outcome) => outcome,
             // Never panic and never propagate: the scheduler records the error
             // and grows the task's backoff.
             Err(error) => EvaluationOutcome::Failed {
                 error: error.to_string(),
+                reason: None,
             },
-        }
+        };
+        with_verdict_reason_on_failure(outcome, &request.run_log_dir)
     }
 }
 
@@ -1511,6 +1552,46 @@ mod tests {
             "a fresh triggered verdict proceeds to validate the workflow.toml \
              on disk, whether the leader rewrote it or reused an earlier run's"
         );
+    }
+
+    /// A failed run keeps whatever reason the leader's verdict gave, whether
+    /// the failure came before or after the verdict was acted on.
+    #[test]
+    fn a_failed_run_keeps_the_verdict_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::engine::squad::verdict_path(tmp.path()),
+            r#"{"triggered": true, "reason": "3 new issues"}"#,
+        )
+        .unwrap();
+        let failed = with_verdict_reason_on_failure(
+            EvaluationOutcome::Failed {
+                error: "workflow failed validation".into(),
+                reason: None,
+            },
+            tmp.path(),
+        );
+        assert!(matches!(
+            failed,
+            EvaluationOutcome::Failed { reason: Some(ref r), .. } if r == "3 new issues"
+        ));
+    }
+
+    /// No verdict on disk leaves a failure's reason empty rather than failing.
+    #[test]
+    fn a_failure_without_a_verdict_has_no_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let failed = with_verdict_reason_on_failure(
+            EvaluationOutcome::Failed {
+                error: "leader crashed".into(),
+                reason: None,
+            },
+            tmp.path(),
+        );
+        assert!(matches!(
+            failed,
+            EvaluationOutcome::Failed { reason: None, .. }
+        ));
     }
 
     #[test]

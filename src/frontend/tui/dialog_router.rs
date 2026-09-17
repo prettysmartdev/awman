@@ -3,7 +3,7 @@
 //! ConfigShow dialog's inline-edit and add-mapping flows.
 
 use super::app::App;
-use super::dialogs::{self, Dialog, DialogResponse};
+use super::dialogs::{self, Dialog, DialogResponse, SquadConfirmAction};
 use super::key_handler;
 
 /// Dismiss the active dialog, sending Dismissed to the command thread if needed.
@@ -472,6 +472,22 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             }
         }
 
+        // `y` dispatches the confirmed trigger/cancel/pause through the
+        // ordinary Layer-2 path; `n`/`Esc` dismisses without acting.
+        Some(Dialog::SquadActionConfirm { action, name }) => {
+            let (action, name) = (*action, name.clone());
+            match c {
+                'y' | 'Y' => {
+                    app.active_dialog = None;
+                    key_handler::squad_dispatch_by_name(app, action.subcommand(), &name);
+                }
+                'n' | 'N' => {
+                    app.active_dialog = None;
+                }
+                _ => {}
+            }
+        }
+
         // ── Command-originated dialogs ───────────────────────────────
         Some(Dialog::YesNo { .. }) if is_command => match c {
             'y' => {
@@ -589,8 +605,7 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
                     crate::frontend::tui::squad_attach::start_squad_attach(app, &name);
                 }
                 'p' => {
-                    key_handler::squad_dispatch_by_name(app, "pause", &name);
-                    app.active_dialog = None;
+                    key_handler::confirm_squad_action(app, SquadConfirmAction::Pause, name);
                 }
                 'r' => {
                     key_handler::squad_dispatch_by_name(app, "resume", &name);
@@ -600,8 +615,12 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
                 // schedule — the modal's counterpart to `t` on the grid, and
                 // scoped to the modal's task like every other key here.
                 't' => {
-                    key_handler::squad_dispatch_by_name(app, "trigger", &name);
-                    app.active_dialog = None;
+                    key_handler::confirm_squad_action(app, SquadConfirmAction::Trigger, name);
+                }
+                // Stop this task's in-progress run — the modal's counterpart
+                // to `c` on the grid.
+                'c' => {
+                    key_handler::confirm_squad_action(app, SquadConfirmAction::Cancel, name);
                 }
                 // WI 0110: edit the task the modal is showing, not the list's
                 // current selection — the same scoping the other four keys use.

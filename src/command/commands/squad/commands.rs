@@ -290,6 +290,8 @@ pub enum SquadSubcommand {
     /// backoff say. Carries only the task name: a trigger has nothing to
     /// configure, and deliberately changes no stored schedule.
     Trigger(String),
+    /// Stop a task's in-progress run and record it as canceled.
+    Cancel(String),
     /// The whole picture of the daemon's env coverage (WI 0116 §6d).
     ///
     /// Bare, it reports; `push` forces a push of every locally-present
@@ -364,6 +366,10 @@ pub enum SquadOutcome {
     /// [`SquadOutcome::Ok`] so "triggered" is never rendered as a bare
     /// success with nothing to say.
     Triggered {
+        name: String,
+    },
+    /// A task whose in-progress run `squad cancel` stopped.
+    Canceled {
         name: String,
     },
     /// A task as it stands after `squad edit` (WI 0110). Distinct from
@@ -442,6 +448,7 @@ impl SquadCommand {
             "pause" => SquadSubcommand::Pause(ctx.args.require("name")?),
             "resume" => SquadSubcommand::Resume(ctx.args.require("name")?),
             "trigger" => SquadSubcommand::Trigger(ctx.args.require("name")?),
+            "cancel" => SquadSubcommand::Cancel(ctx.args.require("name")?),
             "env" => SquadSubcommand::Env {
                 push: ctx.flags.bool("push"),
                 clear: ctx.flags.bool("clear"),
@@ -723,6 +730,10 @@ impl Command for SquadCommand {
                     SquadSubcommand::Trigger(name) => {
                         gateway.trigger(&name).await?;
                         Ok(SquadOutcome::Triggered { name })
+                    }
+                    SquadSubcommand::Cancel(name) => {
+                        gateway.cancel(&name).await?;
+                        Ok(SquadOutcome::Canceled { name })
                     }
                     SquadSubcommand::Env { push, clear } => {
                         // `--clear` first: the report that follows then shows

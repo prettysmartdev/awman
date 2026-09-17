@@ -127,6 +127,7 @@ fn every_squad_subcommand_has_the_contract_shape() {
         // `trigger` carries no flags: an out-of-schedule evaluation has
         // nothing to configure, and it deliberately changes no stored field.
         ("trigger", vec!["name"], vec![]),
+        ("cancel", vec!["name"], vec![]),
         ("attach", vec!["name"], vec!["container"]),
         // WI 0116 §6d: `squad env` reports coverage, pushes, and clears the
         // stored item. No short forms, no aliases, and neither flag implies

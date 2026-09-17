@@ -122,6 +122,7 @@ fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
         // `squad trigger` is API-allowed for the same reason `pause`/`resume`
         // are: the remote gateway reaches the daemon by re-executing it.
         ("squad", "trigger"),
+        ("squad", "cancel"),
     ];
     assert_eq!(
         allowed.as_slice(),

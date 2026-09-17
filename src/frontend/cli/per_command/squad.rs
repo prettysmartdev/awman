@@ -64,6 +64,7 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
                     let mut row = vec![
                         run.started_at.to_rfc3339(),
                         format!("{:?}", run.status).to_lowercase(),
+                        run.reason.clone().unwrap_or_else(|| "—".into()),
                         run.finished_at
                             .map(|time| time.to_rfc3339())
                             .unwrap_or_else(|| "—".into()),
@@ -80,9 +81,16 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
                 })
                 .collect::<Vec<_>>();
             let run_headers: &[&str] = if show_unmet {
-                &["Started", "Status", "Finished", "Error", "Unmet env"]
+                &[
+                    "Started",
+                    "Status",
+                    "Reason",
+                    "Finished",
+                    "Error",
+                    "Unmet env",
+                ]
             } else {
-                &["Started", "Status", "Finished", "Error"]
+                &["Started", "Status", "Reason", "Finished", "Error"]
             };
             let workspace = if task.uses_worktree() {
                 format!("{} (worktree-isolated)", task.repo_scope.display())
@@ -133,6 +141,11 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
         // scheduler does not make.
         SquadOutcome::Triggered { name } => Some(format!(
             "Triggered task {name}; it will be evaluated on the next scheduler tick."
+        )),
+        // The daemon records the run as `canceled` straight away; stopping its
+        // containers takes a few seconds each, so say that it is under way.
+        SquadOutcome::Canceled { name } => Some(format!(
+            "Canceled the in-progress run of task {name}; its containers are being stopped."
         )),
         SquadOutcome::Ok => None,
         SquadOutcome::Status(status) => {
@@ -401,6 +414,7 @@ mod tests {
             started_at: at(10),
             finished_at: Some(at(20)),
             error: Some("boom".into()),
+            reason: Some("3 new issues".into()),
             unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -634,6 +648,26 @@ mod tests {
             !rendered.contains("Unmet env"),
             "the column appears only when some run in the window carries one: {rendered}"
         );
+    }
+
+    /// The leader verdict's reason is a column right after the run status.
+    #[test]
+    fn squad_show_renders_the_verdict_reason_after_the_status() {
+        let mut quiet = run(&[]);
+        quiet.reason = None;
+        let rendered = text(&SquadOutcome::Detail(TaskDetail {
+            task: task("deploy-preview", &[]),
+            runs: vec![run(&[]), quiet],
+        }));
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("Started"))
+            .expect("run table header");
+        let status_at = header.find("Status").unwrap();
+        let reason_at = header.find("Reason").expect("a Reason column");
+        let error_at = header.find("Error").unwrap();
+        assert!(status_at < reason_at && reason_at < error_at, "{header}");
+        assert!(rendered.contains("3 new issues"), "{rendered}");
     }
 
     // ─── §6d: the `awman squad env` table ───────────────────────────────────

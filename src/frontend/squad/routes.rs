@@ -132,7 +132,7 @@ fn squad_outcome_response(outcome: SquadOutcome) -> Response {
         SquadOutcome::Removed { name, .. } => {
             Json(serde_json::json!({ "name": name })).into_response()
         }
-        SquadOutcome::Triggered { name } => {
+        SquadOutcome::Triggered { name } | SquadOutcome::Canceled { name } => {
             Json(serde_json::json!({ "name": name })).into_response()
         }
         SquadOutcome::Ok => Json(serde_json::json!({})).into_response(),

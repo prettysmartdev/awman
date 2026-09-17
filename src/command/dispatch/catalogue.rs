@@ -1056,6 +1056,7 @@ const SQUAD: CommandSpec = CommandSpec {
         &SQUAD_PAUSE,
         &SQUAD_RESUME,
         &SQUAD_TRIGGER,
+        &SQUAD_CANCEL,
         &SQUAD_ATTACH,
         &SQUAD_ENV,
     ],
@@ -1594,6 +1595,24 @@ const SQUAD_TRIGGER: CommandSpec = CommandSpec {
          its interval says and whatever backoff is outstanding. The task's interval is \
          not changed: the trigger fires exactly one evaluation, after which the task \
          returns to its normal schedule. A paused task is refused — resume it first.",
+    ),
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+const SQUAD_CANCEL: CommandSpec = CommandSpec {
+    name: "cancel",
+    aliases: &[],
+    help: "Cancel a squad task's in-progress run.",
+    long_help: Some(
+        "Stop the run a squad task is executing right now: its evaluation is abandoned, \
+         every agent container it started is stopped, and the run is recorded as \
+         canceled in the task's history. The task keeps its schedule and is evaluated \
+         again when next due. Fails when the task has no run in progress.",
     ),
     arguments: &[SQUAD_NAME_ARGUMENT],
     flags: &[],

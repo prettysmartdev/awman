@@ -151,6 +151,13 @@ pub enum Dialog {
     SquadRemoveConfirm {
         name: String,
     },
+    /// Confirmation before triggering, cancelling or pausing a squad task
+    /// from the card grid or the detail modal. `y` dispatches the action's
+    /// `squad <subcommand> <name>`; `n`/`Esc` dismisses.
+    SquadActionConfirm {
+        action: SquadConfirmAction,
+        name: String,
+    },
     /// Confirmation before starting a squad daemon that is not already running
     /// (WI 0110). Opening the squad tab starts a long-lived background
     /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
@@ -277,6 +284,54 @@ pub struct AgentAuthState {
 pub struct SquadDetailState {
     pub name: String,
     pub task: crate::data::fs::task_store::Task,
+}
+
+/// A squad task action that asks for confirmation before it is dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SquadConfirmAction {
+    Trigger,
+    Cancel,
+    Pause,
+}
+
+impl SquadConfirmAction {
+    /// The `squad` subcommand the action dispatches.
+    pub fn subcommand(self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Cancel => "cancel",
+            Self::Pause => "pause",
+        }
+    }
+
+    /// The dialog title.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Trigger => "Trigger task",
+            Self::Cancel => "Cancel run",
+            Self::Pause => "Pause task",
+        }
+    }
+
+    /// The question the dialog asks about task `name`.
+    pub fn question(self, name: &str) -> String {
+        match self {
+            Self::Trigger => format!("Evaluate task \"{name}\" on the next tick?"),
+            Self::Cancel => {
+                format!("Cancel the in-progress run of task \"{name}\" and stop its agents?")
+            }
+            Self::Pause => format!("Pause task \"{name}\"?"),
+        }
+    }
+
+    /// The label for the `y` key.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Cancel => "cancel run",
+            Self::Pause => "pause",
+        }
+    }
 }
 
 /// State for the squad run-history modal. `name` is the task whose runs are

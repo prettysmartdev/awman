@@ -70,6 +70,33 @@ pub struct SchedulerStatus {
     pub tick_count: u64,
     /// How many evaluations are executing right now.
     pub in_flight: usize,
+    /// One cancellation handle per in-flight evaluation, keyed by task id.
+    /// `squad cancel` fires it; the evaluation removes its own entry when it
+    /// ends, however it ends.
+    pub cancellations: HashMap<String, RunCancellation>,
+}
+
+/// The handle `squad cancel` uses to stop one in-flight evaluation.
+#[derive(Debug, Clone)]
+pub struct RunCancellation {
+    /// The run this handle stops, so a finishing run never removes the handle
+    /// of a newer run for the same task.
+    pub run_id: RunId,
+    token: CancellationToken,
+}
+
+impl SchedulerStatus {
+    /// Cancel the in-flight run of the task with id `task_id`, returning the
+    /// run it cancelled, or `None` when nothing is running for that task.
+    ///
+    /// Only signals: the evaluation itself records the run as `canceled` and
+    /// stops the task's containers, because it is the one holding the
+    /// evaluation to drop.
+    pub fn cancel_run(&self, task_id: &str) -> Option<RunId> {
+        let cancellation = self.cancellations.get(task_id)?;
+        cancellation.token.cancel();
+        Some(cancellation.run_id.clone())
+    }
 }
 
 /// The always-on task scheduler.
@@ -85,8 +112,9 @@ pub struct SquadScheduler {
     /// `backoff_until` persists in SQLite and keeps the task parked until
     /// it elapses.
     failure_counts: Arc<Mutex<HashMap<String, u32>>>,
-    /// The production daemon's runtime, used only to report currently-running
-    /// containers on the scheduler tick. It is optional so deterministic
+    /// The production daemon's runtime, used to report currently-running
+    /// containers on the scheduler tick and to stop a canceled run's
+    /// containers. It is optional so deterministic
     /// scheduler unit tests do not need a container runtime fixture.
     runtime: Option<Arc<dyn AgentRuntimeEngine>>,
     /// The daemon's payload-environment state (WI 0116 §4), consulted once per
@@ -327,7 +355,20 @@ impl SquadScheduler {
                 }
             };
             adjust_in_flight(&self.status, 1);
+            let cancel = CancellationToken::new();
+            self.status
+                .lock()
+                .expect("scheduler status poisoned")
+                .cancellations
+                .insert(
+                    task.id.clone(),
+                    RunCancellation {
+                        run_id: run_id.clone(),
+                        token: cancel.clone(),
+                    },
+                );
 
+            let runtime = self.runtime.clone();
             let store = Arc::clone(&self.store);
             let evaluator = Arc::clone(&self.evaluator);
             let status = Arc::clone(&self.status);
@@ -348,6 +389,8 @@ impl SquadScheduler {
                     guidance,
                     agents_to_models,
                     default_leader,
+                    cancel,
+                    runtime,
                 })
                 .await;
             });
@@ -482,6 +525,10 @@ struct EvaluateArgs {
     guidance: Option<Vec<String>>,
     agents_to_models: Option<HashMap<String, Vec<String>>>,
     default_leader: Option<String>,
+    /// Fired by `squad cancel`; also registered in `status.cancellations`.
+    cancel: CancellationToken,
+    /// Used to stop the task's containers when the run is cancelled.
+    runtime: Option<Arc<dyn AgentRuntimeEngine>>,
 }
 
 /// Open a run row, delegate evaluation, record the terminal status, and adjust
@@ -500,28 +547,43 @@ async fn evaluate_task(args: EvaluateArgs) {
         guidance,
         agents_to_models,
         default_leader,
+        cancel,
+        runtime,
     } = args;
 
-    // The tick already incremented `in_flight` and opened the run row; this
-    // guard restores the counter even if the evaluation panics or returns early.
+    // The tick already incremented `in_flight`, registered the cancellation
+    // handle and opened the run row; this guard undoes the first two even if
+    // the evaluation panics or returns early.
     let _guard = InFlightGuard {
         status: Arc::clone(&status),
+        task_id: task.id.clone(),
+        run_id: run_id.clone(),
     };
 
-    let outcome = evaluator
-        .evaluate(EvaluationRequest {
-            task: task.clone(),
-            run_id: run_id.clone(),
-            task_dir,
-            run_log_dir: run_log_dir.clone(),
-            guidance,
-            agents_to_models,
-            default_leader,
-            progress: Arc::new(StoreRunProgress {
-                store: Arc::clone(&store),
-            }),
-        })
-        .await;
+    let evaluation = evaluator.evaluate(EvaluationRequest {
+        task: task.clone(),
+        run_id: run_id.clone(),
+        task_dir,
+        run_log_dir: run_log_dir.clone(),
+        guidance,
+        agents_to_models,
+        default_leader,
+        progress: Arc::new(StoreRunProgress {
+            store: Arc::clone(&store),
+        }),
+    });
+    // `biased`: once a cancel has been asked for it wins, even if the
+    // evaluation would also be ready — stopping its containers below would
+    // otherwise surface as a failed run racing the cancellation.
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        outcome = evaluation => Some(outcome),
+    };
+    let Some(outcome) = outcome else {
+        finish_canceled_run(&store, &task, &run_id, &run_log_dir, runtime).await;
+        return;
+    };
 
     let (run_status, detail, failed) = classify(&outcome, &run_log_dir);
     let finished_at = Utc::now();
@@ -593,7 +655,7 @@ async fn evaluate_task(args: EvaluateArgs) {
 
 fn outcome_name(outcome: &EvaluationOutcome) -> &'static str {
     match outcome {
-        EvaluationOutcome::NotTriggered => "not_triggered",
+        EvaluationOutcome::NotTriggered { .. } => "not_triggered",
         EvaluationOutcome::WorkflowExecuted { .. } => "workflow_executed",
         EvaluationOutcome::Failed { .. } => "failed",
     }
@@ -615,8 +677,16 @@ fn classify(
     run_log_dir: &std::path::Path,
 ) -> (RunStatus, RunDetail, bool) {
     match outcome {
-        EvaluationOutcome::NotTriggered => (RunStatus::NotTriggered, RunDetail::default(), false),
+        EvaluationOutcome::NotTriggered { reason } => (
+            RunStatus::NotTriggered,
+            RunDetail {
+                reason: reason.clone(),
+                ..Default::default()
+            },
+            false,
+        ),
         EvaluationOutcome::WorkflowExecuted {
+            reason,
             workflow_path,
             workflow_state_path,
             exit_code,
@@ -637,16 +707,18 @@ fn classify(
                             run_log_dir.display()
                         )
                     }),
+                    reason: reason.clone(),
                 },
                 workflow_failed,
             )
         }
-        EvaluationOutcome::Failed { error } => (
+        EvaluationOutcome::Failed { error, reason } => (
             RunStatus::Failed,
             RunDetail {
                 workflow_path: None,
                 workflow_state_path: None,
                 error: Some(error.clone()),
+                reason: reason.clone(),
             },
             true,
         ),
@@ -669,15 +741,114 @@ fn adjust_in_flight(status: &Arc<Mutex<SchedulerStatus>>, delta: isize) {
     }
 }
 
-/// Restores `in_flight` on drop, so a panic or early return in an evaluation
-/// task never leaks the counter.
+/// Record a cancelled run and stop every container still running for its task.
+///
+/// The evaluation future has already been dropped by the time this runs, so
+/// nothing is left to start new containers; the ones already started — the
+/// leader and any generated-workflow steps, all carrying the task's squad name
+/// — are stopped here. A cancel is the user's decision, not a failure, so the
+/// task's backoff and failure streak are left exactly as they were.
+async fn finish_canceled_run(
+    store: &TaskStore,
+    task: &Task,
+    run_id: &RunId,
+    run_log_dir: &std::path::Path,
+    runtime: Option<Arc<dyn AgentRuntimeEngine>>,
+) {
+    tracing::info!(
+        task = %task.name,
+        run_id = %run_id,
+        status = ?RunStatus::Canceled,
+        "squad task run canceled"
+    );
+    if let Err(error) = store.finish_run(
+        run_id,
+        RunStatus::Canceled,
+        &RunDetail {
+            // A leader that already wrote its verdict before the cancel keeps
+            // its reason on the record.
+            reason: super::verdict::read_verdict(run_log_dir)
+                .ok()
+                .and_then(|verdict| verdict.reason),
+            ..Default::default()
+        },
+        Utc::now(),
+    ) {
+        tracing::warn!(
+            "squad: failed to record canceled run for {:?}: {error}",
+            task.name
+        );
+    }
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let task_name = task.name.clone();
+    let stopped = tokio::task::spawn_blocking(move || stop_task_containers(&*runtime, &task_name))
+        .await
+        .unwrap_or(0);
+    tracing::info!(
+        task = %task.name,
+        run_id = %run_id,
+        stopped,
+        "squad stopped the canceled run's containers"
+    );
+}
+
+/// Stop every running container that belongs to `task_name`, returning how
+/// many were stopped. Failures are logged and skipped so one stubborn
+/// container never leaves the rest running.
+///
+/// Matches on the parsed task slug rather than the bare name prefix: task
+/// `deploy`'s prefix is also a prefix of task `deploy-preview`'s containers.
+fn stop_task_containers(runtime: &dyn AgentRuntimeEngine, task_name: &str) -> usize {
+    let prefix = format!(
+        "{}{task_name}-",
+        crate::engine::container::naming::SQUAD_NAME_PREFIX
+    );
+    let handles = match runtime.list_running_with_name_prefix(&prefix) {
+        Ok(handles) => handles,
+        Err(error) => {
+            tracing::warn!(task = %task_name, error = %error, "squad: failed to list containers to cancel");
+            return 0;
+        }
+    };
+    let mut stopped = 0;
+    for handle in handles
+        .iter()
+        .filter(|handle| parse_squad_task_slug(&handle.name) == Some(task_name))
+    {
+        match runtime.stop(handle) {
+            Ok(()) => stopped += 1,
+            Err(error) => tracing::warn!(
+                task = %task_name,
+                container = %handle.name,
+                error = %error,
+                "squad: failed to stop a canceled run's container"
+            ),
+        }
+    }
+    stopped
+}
+
+/// Restores `in_flight` and removes the run's cancellation handle on drop, so
+/// a panic or early return in an evaluation task never leaks either.
 struct InFlightGuard {
     status: Arc<Mutex<SchedulerStatus>>,
+    task_id: String,
+    run_id: RunId,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         adjust_in_flight(&self.status, -1);
+        let mut status = self.status.lock().expect("scheduler status poisoned");
+        if status
+            .cancellations
+            .get(&self.task_id)
+            .is_some_and(|cancellation| cancellation.run_id == self.run_id)
+        {
+            status.cancellations.remove(&self.task_id);
+        }
     }
 }
 
@@ -702,6 +873,7 @@ mod tests {
 
     fn executed(exit_code: Option<i32>) -> EvaluationOutcome {
         EvaluationOutcome::WorkflowExecuted {
+            reason: Some("new issues".to_string()),
             workflow_path: "/c/workflow.toml".into(),
             workflow_state_path: Some("/state.json".into()),
             exit_code,
@@ -711,15 +883,22 @@ mod tests {
     #[test]
     fn classify_maps_each_outcome() {
         let log_dir = std::path::Path::new("/runs/r1");
-        let (status, detail, failed) = classify(&EvaluationOutcome::NotTriggered, log_dir);
+        let (status, detail, failed) = classify(
+            &EvaluationOutcome::NotTriggered {
+                reason: Some("nothing new".to_string()),
+            },
+            log_dir,
+        );
         assert_eq!(status, RunStatus::NotTriggered);
         assert!(!failed);
         assert!(detail.error.is_none());
+        assert_eq!(detail.reason.as_deref(), Some("nothing new"));
 
         let (status, detail, failed) = classify(&executed(Some(0)), log_dir);
         assert_eq!(status, RunStatus::WorkflowExecuted);
         assert!(!failed);
         assert!(detail.error.is_none());
+        assert_eq!(detail.reason.as_deref(), Some("new issues"));
         assert_eq!(
             detail.workflow_path.as_deref(),
             Some("/c/workflow.toml".as_ref())
@@ -732,12 +911,14 @@ mod tests {
         let (status, detail, failed) = classify(
             &EvaluationOutcome::Failed {
                 error: "boom".to_string(),
+                reason: Some("3 new issues".to_string()),
             },
             log_dir,
         );
         assert_eq!(status, RunStatus::Failed);
         assert!(failed);
         assert_eq!(detail.error.as_deref(), Some("boom"));
+        assert_eq!(detail.reason.as_deref(), Some("3 new issues"));
     }
 
     /// WI 0112 Part 6: a generated workflow that exited non-zero is a failed

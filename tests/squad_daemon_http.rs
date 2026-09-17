@@ -35,7 +35,7 @@ struct NeverTriggeredEvaluator;
 #[async_trait::async_trait]
 impl TaskEvaluator for NeverTriggeredEvaluator {
     async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
-        EvaluationOutcome::NotTriggered
+        EvaluationOutcome::NotTriggered { reason: None }
     }
 }
 
@@ -336,6 +336,7 @@ impl TaskEvaluator for WorkflowInFlightEvaluator {
         self.release.notified().await;
 
         EvaluationOutcome::WorkflowExecuted {
+            reason: None,
             workflow_path,
             workflow_state_path: Some(state_path),
             exit_code: Some(0),

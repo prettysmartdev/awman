@@ -368,6 +368,9 @@ impl TaskGateway for RecordingGateway {
     async fn trigger(&self, _name: &str) -> Result<(), CommandError> {
         unimplemented!("not exercised by this test")
     }
+    async fn cancel(&self, _name: &str) -> Result<(), CommandError> {
+        unimplemented!("not exercised by this test")
+    }
     async fn delete(&self, _name: &str) -> Result<(), CommandError> {
         unimplemented!("not exercised by this test")
     }

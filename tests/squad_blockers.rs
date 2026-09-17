@@ -106,6 +106,9 @@ impl TaskGateway for RecordingGateway {
     async fn trigger(&self, _name: &str) -> Result<(), CommandError> {
         Ok(())
     }
+    async fn cancel(&self, _name: &str) -> Result<(), CommandError> {
+        Ok(())
+    }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         self.deleted.lock().unwrap().push(name.to_string());
         Ok(())
@@ -567,6 +570,9 @@ impl TaskGateway for SharedRecording {
     }
     async fn trigger(&self, name: &str) -> Result<(), CommandError> {
         self.0.trigger(name).await
+    }
+    async fn cancel(&self, name: &str) -> Result<(), CommandError> {
+        self.0.cancel(name).await
     }
     async fn delete(&self, name: &str) -> Result<(), CommandError> {
         self.0.delete(name).await

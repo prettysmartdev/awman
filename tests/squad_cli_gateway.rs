@@ -158,6 +158,7 @@ impl TaskGateway for RecordingGateway {
             started_at: chrono::Utc::now(),
             finished_at: None,
             error: None,
+            reason: None,
             unmet_env: Vec::new(),
         }])
     }
@@ -175,6 +176,11 @@ impl TaskGateway for RecordingGateway {
 
     async fn trigger(&self, name: &str) -> Result<(), CommandError> {
         self.push(format!("trigger:{name}"));
+        Ok(())
+    }
+
+    async fn cancel(&self, name: &str) -> Result<(), CommandError> {
+        self.push(format!("cancel:{name}"));
         Ok(())
     }
 
@@ -355,6 +361,7 @@ async fn cli_crud_uses_exactly_one_gateway_call_and_no_frontend_validation() {
             "squad trigger recorded",
             vec!["trigger:recorded".to_string()],
         ),
+        ("squad cancel recorded", vec!["cancel:recorded".to_string()]),
     ];
 
     for (raw, expected) in cases {
@@ -646,7 +653,7 @@ impl awman::engine::squad::TaskEvaluator for NeverTriggeredEvaluator {
         &self,
         _request: awman::engine::squad::EvaluationRequest,
     ) -> awman::engine::squad::EvaluationOutcome {
-        awman::engine::squad::EvaluationOutcome::NotTriggered
+        awman::engine::squad::EvaluationOutcome::NotTriggered { reason: None }
     }
 }
 

@@ -64,6 +64,8 @@ pub enum Action {
     SquadResume,
     /// t — evaluate the selected task now, ignoring its schedule.
     SquadTrigger,
+    /// c — cancel the selected task's in-progress run.
+    SquadCancel,
     /// d — remove the selected task (opens a confirmation first).
     SquadDelete,
     /// Left — move the card grid selection one column left.
@@ -200,6 +202,7 @@ fn map_squad_list_key(key: KeyEvent, ctrl: bool) -> Action {
         KeyCode::Char('p') if !ctrl => Action::SquadPause,
         KeyCode::Char('r') if !ctrl => Action::SquadResume,
         KeyCode::Char('t') if !ctrl => Action::SquadTrigger,
+        KeyCode::Char('c') if !ctrl => Action::SquadCancel,
         KeyCode::Char('d') if !ctrl => Action::SquadDelete,
         KeyCode::Char('y') if ctrl => Action::CopySelection,
         _ => Action::None,

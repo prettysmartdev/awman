@@ -237,6 +237,8 @@ pub enum RunStatus {
     WorkflowExecuted,
     Failed,
     Interrupted,
+    /// Stopped by `squad cancel` while it was in progress.
+    Canceled,
 }
 
 impl RunStatus {
@@ -247,6 +249,7 @@ impl RunStatus {
             Self::WorkflowExecuted => "workflow_executed",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
+            Self::Canceled => "canceled",
         }
     }
 
@@ -257,6 +260,7 @@ impl RunStatus {
             "workflow_executed" => Ok(Self::WorkflowExecuted),
             "failed" => Ok(Self::Failed),
             "interrupted" => Ok(Self::Interrupted),
+            "canceled" => Ok(Self::Canceled),
             _ => Err(DataError::Other(format!(
                 "invalid squad run status {value:?}"
             ))),
@@ -270,6 +274,8 @@ pub struct RunDetail {
     pub workflow_path: Option<PathBuf>,
     pub workflow_state_path: Option<PathBuf>,
     pub error: Option<String>,
+    /// The `reason` the leader gave in its verdict file, when it gave one.
+    pub reason: Option<String>,
 }
 
 /// The mutable columns of a task, as a partial write (WI 0110).
@@ -302,6 +308,10 @@ pub struct Run {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// The `reason` the leader wrote alongside its verdict for this run.
+    /// `None` when the run never reached a verdict or the leader gave none.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// The declared `env(NAME)` values that had no value when this run opened
     /// (WI 0116 §4b, escalation point 3).
     ///
@@ -398,6 +408,9 @@ impl TaskStore {
         // column existed) decodes to an empty list, so an upgraded database
         // reports "nothing known to be missing" rather than an error.
         Self::add_column_if_missing(conn, "squad_runs", "unmet_env", "TEXT")?;
+        // The leader verdict's free-text `reason`. `NULL` for rows written
+        // before this column existed and for runs that never reached a verdict.
+        Self::add_column_if_missing(conn, "squad_runs", "reason", "TEXT")?;
         Ok(())
     }
 
@@ -702,14 +715,16 @@ impl TaskStore {
         let conn = self.lock();
         Ok(conn.execute(
             "UPDATE squad_runs
-             SET status = ?1, workflow_path = ?2, workflow_state_path = ?3, error = ?4, finished_at = ?5
-             WHERE id = ?6 AND status = 'running'",
+             SET status = ?1, workflow_path = ?2, workflow_state_path = ?3, error = ?4, finished_at = ?5,
+                 reason = ?6
+             WHERE id = ?7 AND status = 'running'",
             params![
                 status.as_db(),
                 path_opt(detail.workflow_path.as_deref()),
                 path_opt(detail.workflow_state_path.as_deref()),
                 detail.error,
                 timestamp(finished_at),
+                detail.reason,
                 run_id.as_str(),
             ],
         )? > 0)
@@ -750,7 +765,7 @@ impl TaskStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT r.id, r.task_id, r.status, r.workflow_path, r.workflow_state_path,
-                    r.session_id, r.started_at, r.finished_at, r.error, r.unmet_env
+                    r.session_id, r.started_at, r.finished_at, r.error, r.unmet_env, r.reason
              FROM squad_runs r
              JOIN squad_tasks c ON c.id = r.task_id
              WHERE c.name = ?1
@@ -770,7 +785,7 @@ impl TaskStore {
         let raw = conn
             .query_row(
                 "SELECT id, task_id, status, workflow_path, workflow_state_path, session_id, started_at,
-                        finished_at, error, unmet_env
+                        finished_at, error, unmet_env, reason
                  FROM squad_runs WHERE task_id = ?1 AND status = 'running'
                  ORDER BY started_at DESC LIMIT 1",
                 [task_id],
@@ -886,6 +901,7 @@ struct RawRun {
     finished_at: Option<String>,
     error: Option<String>,
     unmet_env: Option<String>,
+    reason: Option<String>,
 }
 
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RawRun> {
@@ -900,6 +916,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RawRun> {
         finished_at: row.get(7)?,
         error: row.get(8)?,
         unmet_env: row.get(9)?,
+        reason: row.get(10)?,
     })
 }
 
@@ -914,6 +931,7 @@ fn run_from_raw(raw: RawRun) -> Result<Run, DataError> {
         started_at: timestamp_parse(&raw.started_at)?,
         finished_at: timestamp_parse_opt(raw.finished_at)?,
         error: raw.error,
+        reason: raw.reason,
         unmet_env: decode_names(raw.unmet_env.as_deref())?,
     })
 }
@@ -1062,5 +1080,28 @@ mod tests {
         assert!(!store
             .finish_run(&run_id, RunStatus::Failed, &RunDetail::default(), now)
             .unwrap());
+    }
+
+    #[test]
+    fn finish_run_records_the_verdict_reason_in_the_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
+        store.migrate().unwrap();
+        let now = Utc::now();
+        let task = task("reasoned", now);
+        store.create(&task).unwrap();
+        let run_id = store.start_run(&task.id, None, now).unwrap();
+        let detail = RunDetail {
+            reason: Some("no new issues since the last run".into()),
+            ..Default::default()
+        };
+        assert!(store
+            .finish_run(&run_id, RunStatus::NotTriggered, &detail, now)
+            .unwrap());
+        let runs = store.runs_for("reasoned", 10).unwrap();
+        assert_eq!(
+            runs[0].reason.as_deref(),
+            Some("no new issues since the last run")
+        );
     }
 }

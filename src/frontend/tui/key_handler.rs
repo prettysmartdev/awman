@@ -659,7 +659,7 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 .as_ref()
                 .and_then(|state| state.selected_name());
             if let Some(name) = name {
-                squad_dispatch_by_name(app, "pause", &name);
+                confirm_squad_action(app, dialogs::SquadConfirmAction::Pause, name);
             }
         }
         Action::SquadResume => {
@@ -679,7 +679,17 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 .as_ref()
                 .and_then(|state| state.selected_name());
             if let Some(name) = name {
-                squad_dispatch_by_name(app, "trigger", &name);
+                confirm_squad_action(app, dialogs::SquadConfirmAction::Trigger, name);
+            }
+        }
+        Action::SquadCancel => {
+            let name = app
+                .active_tab()
+                .squad
+                .as_ref()
+                .and_then(|state| state.selected_name());
+            if let Some(name) = name {
+                confirm_squad_action(app, dialogs::SquadConfirmAction::Cancel, name);
             }
         }
         Action::SquadDelete => {
@@ -908,6 +918,17 @@ fn handle_command_submit(app: &mut App) {
 /// `pub(super)` so the detail modal's action tooltip (`dialog_router.rs`) can
 /// reuse it against the task the modal is showing, rather than the list's
 /// current selection.
+/// Ask before dispatching a trigger, cancel or pause for `name`. Replaces
+/// whatever dialog is open (the detail modal, when pressed from there); `y`
+/// in the confirmation dispatches the action.
+pub(super) fn confirm_squad_action(
+    app: &mut App,
+    action: dialogs::SquadConfirmAction,
+    name: String,
+) {
+    app.active_dialog = Some(Dialog::SquadActionConfirm { action, name });
+}
+
 pub(super) fn squad_dispatch_by_name(app: &mut App, subcommand: &str, name: &str) {
     let mut arguments = std::collections::BTreeMap::new();
     arguments.insert(

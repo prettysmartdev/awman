@@ -193,6 +193,7 @@ impl TaskEvaluator for RepairExhaustedEvaluator {
         // shared loop.
         EvaluationOutcome::Failed {
             error: REPAIR_EXHAUSTED_MESSAGE.to_string(),
+            reason: None,
         }
     }
 }

@@ -916,6 +916,7 @@ fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
         started_at: chrono::Utc::now(),
         finished_at: None,
         error: Some("boom".into()),
+        reason: Some("no new issues".into()),
         unmet_env: Vec::new(),
     };
 
@@ -943,7 +944,7 @@ fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
             text.contains("run history: issue-triage"),
             "the history modal must title itself with its task: {text}"
         );
-        for column in ["Started", "Status", "Finished", "Error"] {
+        for column in ["Started", "Status", "Reason", "Finished", "Error"] {
             assert!(
                 text.contains(column),
                 "the history modal must render the {column:?} column: {text}"
@@ -958,6 +959,55 @@ fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
             "from_detail={from_detail} must hint {expected:?}: {text}"
         );
     }
+}
+
+/// The leader verdict's reason gets its own history column right after the
+/// status, and the modal grows wide enough to show a long one in full.
+#[test]
+fn the_squad_history_modal_shows_the_verdict_reason_in_full() {
+    use crate::data::fs::task_store::{Run, RunStatus};
+    let reason =
+        "no new issues were opened against the repository since the previous evaluation ran";
+    let run = Run {
+        id: "run-1".into(),
+        task_id: "issue-triage".into(),
+        status: RunStatus::NotTriggered,
+        workflow_path: None,
+        workflow_state_path: None,
+        session_id: None,
+        started_at: chrono::Utc::now(),
+        finished_at: Some(chrono::Utc::now()),
+        error: None,
+        reason: Some(reason.into()),
+        unmet_env: Vec::new(),
+    };
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.active_dialog = Some(Dialog::SquadTaskHistory(
+        crate::frontend::tui::dialogs::SquadHistoryState {
+            name: "issue-triage".to_string(),
+            runs: vec![run],
+            scroll: 0,
+            from_detail: false,
+        },
+    ));
+
+    let text = buffer_text(&render_app(&mut app, 220, 30));
+    assert!(
+        text.contains(reason),
+        "a wide terminal must show the whole reason: {text}"
+    );
+    let header = text
+        .lines()
+        .find(|line| line.contains("Started"))
+        .expect("the history table header");
+    let status_at = header.find("Status").unwrap();
+    let reason_at = header.find("Reason").expect("a Reason column");
+    let error_at = header.find("Error").unwrap();
+    assert!(
+        status_at < reason_at && reason_at < error_at,
+        "Reason sits after Status and before Error: {header}"
+    );
 }
 
 /// On a terminal too short for the whole field block, the row that says how to
@@ -985,6 +1035,10 @@ fn the_squad_modals_keep_their_key_hint_row_on_a_short_terminal() {
     assert!(
         text.contains("esc close"),
         "the detail modal's tooltip must survive a short terminal: {text}"
+    );
+    assert!(
+        text.contains("c cancel") && text.contains("d delete"),
+        "a tooltip too long for one row wraps rather than dropping actions: {text}"
     );
 
     app.active_dialog = Some(Dialog::SquadTaskHistory(
@@ -1684,4 +1738,46 @@ fn control_board_without_a_failure_keeps_its_ordinary_title() {
     assert!(text.contains("Workflow Control"), "{text}");
     assert!(!text.contains("step failed"), "{text}");
     assert!(text.contains("Restart current step"), "{text}");
+}
+
+/// On a terminal with room for it, the detail modal is wide enough that every
+/// action hint sits on one row.
+#[test]
+fn the_squad_detail_modal_fits_every_hint_on_one_row() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    let task = fake_task("issue-triage");
+    app.active_dialog = Some(Dialog::SquadTaskDetail(
+        crate::frontend::tui::dialogs::SquadDetailState {
+            name: "issue-triage".to_string(),
+            task,
+        },
+    ));
+    let text = buffer_text(&render_app(&mut app, 140, 40));
+    assert!(
+        text.lines().any(|line| line.contains("h history")
+            && line.contains("c cancel")
+            && line.contains("esc close")),
+        "every hint must share one row: {text}"
+    );
+}
+
+/// The trigger/cancel/pause confirmation names its task and its keys.
+#[test]
+fn the_squad_action_confirmation_names_the_task_and_its_keys() {
+    use crate::frontend::tui::dialogs::SquadConfirmAction;
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.active_dialog = Some(Dialog::SquadActionConfirm {
+        action: SquadConfirmAction::Cancel,
+        name: "issue-triage".to_string(),
+    });
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(text.contains("Cancel run"), "{text}");
+    assert!(
+        text.contains("Cancel the in-progress run of task \"issue-triage\""),
+        "{text}"
+    );
+    assert!(text.contains("[y] cancel run"), "{text}");
+    assert!(text.contains("[n / Esc] back"), "{text}");
 }

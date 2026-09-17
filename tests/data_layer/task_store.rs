@@ -999,3 +999,92 @@ async fn triggering_leaves_the_tasks_schedule_and_every_other_field_untouched() 
         "the last-run timestamp still says when the task last actually ran"
     );
 }
+
+/// `squad cancel` against a live scheduler: the in-flight evaluation is
+/// abandoned, the run is recorded `canceled` with no backoff, and a second
+/// cancel — with nothing left running — is refused.
+#[tokio::test]
+async fn cancel_stops_an_in_flight_run_and_records_it_as_canceled() {
+    use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use awman::engine::squad::{
+        EvaluationOutcome, EvaluationRequest, SquadScheduler, TaskEvaluator,
+    };
+
+    struct NeverFinishes;
+
+    #[async_trait::async_trait]
+    impl TaskEvaluator for NeverFinishes {
+        async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
+            std::future::pending::<()>().await;
+            unreachable!("a pending evaluation never completes")
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = DataPaths::at_root(tmp.path().join("data")).db_path();
+    let store = Arc::new(TaskStore::open(&db).unwrap());
+    store.migrate().unwrap();
+    let paths = awman::data::fs::SquadPaths::from_root(tmp.path().join("squad"));
+    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+    store.create(&task("long-run", Utc::now())).unwrap();
+
+    let scheduler = SquadScheduler::new(store.clone(), paths.clone(), Arc::new(NeverFinishes), env)
+        .with_tick_interval(std::time::Duration::from_millis(50));
+    let status = scheduler.status_handle();
+    let gateway = LocalTaskGateway::new(
+        store.clone(),
+        test_engines(tmp.path()),
+        status.clone(),
+        paths,
+        Arc::new(awman::engine::squad::env_state::DaemonEnvState::without_store()),
+    );
+
+    let error = gateway.cancel("long-run").await.unwrap_err();
+    assert!(error.to_string().contains("no run in progress"), "{error}");
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let handle = tokio::spawn(scheduler.run(shutdown.clone()));
+
+    let runs_with = |wanted: RunStatus| {
+        let store = store.clone();
+        async move {
+            for _ in 0..100 {
+                let runs = store.runs_for("long-run", 10).unwrap();
+                if runs.first().is_some_and(|run| run.status == wanted) {
+                    return runs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the run never reached {wanted:?}");
+        }
+    };
+    runs_with(RunStatus::Running).await;
+
+    gateway.cancel("long-run").await.unwrap();
+    let runs = runs_with(RunStatus::Canceled).await;
+    assert_eq!(runs.len(), 1, "cancel must not start another run");
+    assert!(runs[0].finished_at.is_some());
+    assert!(runs[0].error.is_none());
+
+    // The evaluation's bookkeeping is released and no backoff was set.
+    for _ in 0..100 {
+        if status.lock().unwrap().in_flight == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(status.lock().unwrap().in_flight, 0);
+    assert!(status.lock().unwrap().cancellations.is_empty());
+    assert!(store
+        .get("long-run")
+        .unwrap()
+        .unwrap()
+        .backoff_until
+        .is_none());
+
+    let error = gateway.cancel("long-run").await.unwrap_err();
+    assert!(error.to_string().contains("no run in progress"), "{error}");
+
+    shutdown.cancel();
+    handle.await.unwrap();
+}

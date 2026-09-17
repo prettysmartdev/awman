@@ -80,10 +80,15 @@ pub enum EvaluationOutcome {
     /// The agent read the task as not met (or was uncertain — the leader
     /// defaults to "not triggered" on a low-confidence read). No workflow was
     /// generated or executed.
-    NotTriggered,
+    NotTriggered {
+        /// The `reason` from the leader's verdict file, recorded on the run row.
+        reason: Option<String>,
+    },
     /// The task was met, a valid `workflow.toml` was produced, and the
     /// workflow ran.
     WorkflowExecuted {
+        /// The `reason` from the leader's verdict file, recorded on the run row.
+        reason: Option<String>,
         /// The validated `workflow.toml` the leader produced.
         workflow_path: PathBuf,
         /// The engine's persisted `WorkflowState` file, recorded on the run row
@@ -95,7 +100,12 @@ pub enum EvaluationOutcome {
     /// Evaluation failed — the agent could not run, workflow generation
     /// exhausted its repair attempts, or execution errored. The scheduler
     /// records the error and grows an exponential backoff.
-    Failed { error: String },
+    Failed {
+        error: String,
+        /// The `reason` from the leader's verdict file when the leader wrote
+        /// one before the run failed, recorded on the run row.
+        reason: Option<String>,
+    },
 }
 
 /// The seam the scheduler calls for every due task. Layer 2 provides the

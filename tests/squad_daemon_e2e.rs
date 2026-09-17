@@ -40,7 +40,7 @@ struct NeverTriggeredEvaluator;
 #[async_trait::async_trait]
 impl TaskEvaluator for NeverTriggeredEvaluator {
     async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
-        EvaluationOutcome::NotTriggered
+        EvaluationOutcome::NotTriggered { reason: None }
     }
 }
 

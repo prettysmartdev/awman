@@ -1041,18 +1041,6 @@ fn squad_list_n_dispatches_squad_add_interview() {
 }
 
 #[test]
-fn squad_list_p_dispatches_pause() {
-    let mut app = make_app();
-    push_squad_tab(&mut app);
-    set_squad_tasks(&mut app, &["task-a"]);
-    press_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
-    assert!(
-        app.active_tab().command_result_rx.is_some(),
-        "'p' in the squad list must dispatch `squad pause`"
-    );
-}
-
-#[test]
 fn squad_list_r_dispatches_resume() {
     let mut app = make_app();
     push_squad_tab(&mut app);
@@ -1273,26 +1261,6 @@ fn open_squad_detail(app: &mut App, name: &str) {
 /// the modal keeps showing its own task while the list reflows or the poller
 /// reorders it.
 #[test]
-fn squad_detail_modal_p_pauses_the_task_the_modal_is_showing() {
-    let mut app = make_app();
-    push_squad_tab(&mut app);
-    set_squad_tasks(&mut app, &["task-a", "task-b"]);
-    // The grid selection stays on task-a; the modal is showing task-b.
-    open_squad_detail(&mut app, "task-b");
-
-    press_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
-
-    assert!(
-        app.active_dialog.is_none(),
-        "acting from the modal must close it"
-    );
-    assert!(
-        app.active_tab().command_result_rx.is_some(),
-        "'p' in the modal must dispatch `squad pause`, exactly as the list key does"
-    );
-}
-
-#[test]
 fn squad_detail_modal_r_resumes_and_d_confirms_against_the_modals_task() {
     let mut app = make_app();
     push_squad_tab(&mut app);
@@ -1361,6 +1329,7 @@ fn set_squad_runs(app: &mut App, task: &str, count: usize) {
             started_at: chrono::Utc::now(),
             finished_at: None,
             error: None,
+            reason: None,
             unmet_env: Vec::new(),
         })
         .collect();
@@ -1708,29 +1677,6 @@ fn opening_the_squad_tab_refuses_a_sandbox_runtime_without_asking_to_start_a_dae
 // ─── `t` — evaluate a task now, ignoring its schedule ───────────────────────
 
 #[test]
-fn squad_list_t_triggers_the_selected_task() {
-    let mut app = make_app();
-    push_squad_tab(&mut app);
-    set_squad_tasks(&mut app, &["task-a", "task-b"]);
-    // Select the second card, so a wrong dispatch would name the wrong task.
-    if let Some(state) = app.active_tab_mut().squad.as_mut() {
-        state.selected = 1;
-    }
-
-    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
-
-    assert!(
-        app.active_tab().command_result_rx.is_some(),
-        "'t' in the squad list must dispatch `squad trigger`"
-    );
-    assert!(
-        app.active_dialog.is_none(),
-        "triggering asks nothing: it changes no stored schedule and starts \
-         nothing that is not already scheduled to happen"
-    );
-}
-
-#[test]
 fn squad_list_t_is_a_noop_when_the_list_is_empty() {
     let mut app = make_app();
     push_squad_tab(&mut app);
@@ -1750,20 +1696,15 @@ fn ctrl_t_on_the_squad_tab_still_opens_a_new_tab_rather_than_triggering() {
     );
 }
 
+/// Ctrl-C keeps its global meaning on the squad tab; only plain `c` cancels.
 #[test]
-fn squad_detail_modal_t_triggers_the_modals_task() {
-    let mut app = make_app();
-    push_squad_tab(&mut app);
-    set_squad_tasks(&mut app, &["task-a", "task-b"]);
-
-    open_squad_detail(&mut app, "task-b");
-    press_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
-
-    assert!(app.active_dialog.is_none(), "'t' closes the modal");
-    assert!(
-        app.active_tab().command_result_rx.is_some(),
-        "'t' in the modal must dispatch `squad trigger`, exactly as the list key does"
-    );
+fn ctrl_c_on_the_squad_tab_does_not_cancel_a_run() {
+    use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
+    let key = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(!matches!(
+        map_key(key, FocusContext::SquadList),
+        Action::SquadCancel
+    ));
 }
 
 /// Accepting the daemon-start confirmation must not freeze the TUI.
@@ -2151,4 +2092,102 @@ fn detaching_a_squad_attach_session_refocuses_the_grid_on_the_next_tick() {
     app.tick_all_tabs();
     assert!(app.active_tab().container_slots.is_empty());
     assert_eq!(app.focus, Focus::ExecutionWindow);
+}
+
+// ─── `t` / `c` / `p` ask for confirmation first ─────────────────────────────
+
+/// The key opened a confirmation for `action` on `name` and dispatched nothing
+/// yet; `y` then dispatches it and closes the dialog.
+fn assert_confirms_then_dispatches(
+    app: &mut App,
+    action: crate::frontend::tui::dialogs::SquadConfirmAction,
+    name: &str,
+) {
+    match &app.active_dialog {
+        Some(Dialog::SquadActionConfirm {
+            action: asked,
+            name: asked_name,
+        }) => {
+            assert_eq!(*asked, action);
+            assert_eq!(
+                asked_name, name,
+                "the confirmation must name the right task"
+            );
+        }
+        _ => panic!("{action:?} must open Dialog::SquadActionConfirm"),
+    }
+    assert!(
+        app.active_tab().command_result_rx.is_none(),
+        "nothing may be dispatched before the user confirms"
+    );
+
+    press_key(app, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert!(app.active_dialog.is_none(), "'y' closes the confirmation");
+    assert!(
+        app.active_tab().command_result_rx.is_some(),
+        "'y' must dispatch `squad {}`",
+        action.subcommand()
+    );
+}
+
+#[test]
+fn squad_list_t_c_p_confirm_before_acting_on_the_selected_task() {
+    use crate::frontend::tui::dialogs::SquadConfirmAction::{Cancel, Pause, Trigger};
+    for (key, action) in [('t', Trigger), ('c', Cancel), ('p', Pause)] {
+        let mut app = make_app();
+        push_squad_tab(&mut app);
+        set_squad_tasks(&mut app, &["task-a", "task-b"]);
+        // Select the second card, so a wrong dispatch would name the wrong task.
+        if let Some(state) = app.active_tab_mut().squad.as_mut() {
+            state.selected = 1;
+        }
+        press_key(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+        assert_confirms_then_dispatches(&mut app, action, "task-b");
+    }
+}
+
+/// The detail modal's keys confirm for the task the modal is showing, not the
+/// grid's selection — the two can differ while the list reflows.
+#[test]
+fn squad_detail_modal_t_c_p_confirm_before_acting_on_the_modals_task() {
+    use crate::frontend::tui::dialogs::SquadConfirmAction::{Cancel, Pause, Trigger};
+    for (key, action) in [('t', Trigger), ('c', Cancel), ('p', Pause)] {
+        let mut app = make_app();
+        push_squad_tab(&mut app);
+        set_squad_tasks(&mut app, &["task-a", "task-b"]);
+        open_squad_detail(&mut app, "task-b");
+        press_key(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+        assert_confirms_then_dispatches(&mut app, action, "task-b");
+    }
+}
+
+/// `n` and Esc back out of the confirmation without dispatching anything.
+#[test]
+fn declining_a_squad_action_confirmation_dispatches_nothing() {
+    for decline in [KeyCode::Char('n'), KeyCode::Esc] {
+        let mut app = make_app();
+        push_squad_tab(&mut app);
+        set_squad_tasks(&mut app, &["task-a"]);
+        press_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.active_dialog,
+            Some(Dialog::SquadActionConfirm { .. })
+        ));
+        press_key(&mut app, decline, KeyModifiers::NONE);
+        assert!(app.active_dialog.is_none(), "{decline:?} closes it");
+        assert!(
+            app.active_tab().command_result_rx.is_none(),
+            "{decline:?} must not dispatch the action"
+        );
+    }
+}
+
+#[test]
+fn squad_list_plain_c_maps_to_cancel() {
+    use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
+    let plain = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(matches!(
+        map_key(plain, FocusContext::SquadList),
+        Action::SquadCancel
+    ));
 }
