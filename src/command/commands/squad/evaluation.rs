@@ -25,8 +25,11 @@ use crate::command::commands::exec_workflow::{
     LeaderSpec,
 };
 use crate::command::commands::mount_scope::MountScopeDecision;
+use crate::command::commands::squad::overlay_summary::overlay_inventory;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
-use crate::command::commands::Command;
+use crate::command::commands::{
+    collect_all_overlay_specs, parse_overlay_list, CollectedOverlays, Command,
+};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::env::EnvSnapshot;
@@ -493,6 +496,12 @@ impl LocalTaskEvaluator {
             )?;
         }
 
+        // The overlay set is collected once, here, and reused for the prompt
+        // and for every launch below — so the inventory the leader is shown is
+        // literally the set its container is started with, not a second
+        // resolution that could drift from it (WI 0117).
+        let collected = collect_task_overlays(&session, task)?;
+
         // `guidance` is additive and never overridden by a task, so it is
         // rendered into every leader prompt regardless of which level supplied
         // the agent and model.
@@ -501,6 +510,7 @@ impl LocalTaskEvaluator {
             &task.description,
             "/workspace",
             &agents_section,
+            &overlay_inventory(&collected),
             &format!("{RUN_DIR_CONTAINER_PATH}/{VERDICT_FILE_NAME}"),
             request.guidance.as_deref(),
         );
@@ -547,9 +557,8 @@ impl LocalTaskEvaluator {
                 agent.as_str(),
                 &request.task_dir,
                 &request.run_log_dir,
-                &session,
-                task,
-            )?;
+                &collected,
+            );
             let exit = launcher
                 .run_leader(
                     LeaderRunSpec {
@@ -797,37 +806,20 @@ impl LocalTaskEvaluator {
         agent: &str,
         task_dir: &Path,
         run_log_dir: &Path,
-        session: &Session,
-        task: &Task,
-    ) -> Result<AgentRunOptions, CommandError> {
-        // Task overlays enter through the same slot `--overlay` uses, so they
-        // combine with global config, repo config and `AWMAN_OVERLAYS` under
-        // the existing precedence and collision rules rather than a second set
-        // invented for squad.
-        let mut cli_typed = Vec::new();
-        for spec in &task.overlays {
-            cli_typed.extend(crate::command::commands::parse_overlay_list(spec).map_err(
-                |reason| CommandError::InvalidOverlaySpec {
-                    spec: spec.clone(),
-                    reason,
-                },
-            )?);
-        }
-        let collected =
-            crate::command::commands::collect_all_overlay_specs(session, cli_typed, None, None)?;
-
+        collected: &CollectedOverlays,
+    ) -> AgentRunOptions {
         // The run directory is a structural, always-on mount, not a
         // user-specified overlay: it is how the leader reports its verdict for
         // this run, and its container path is fixed and documented so the
         // prompt can name it outright.
-        let mut directory_overlays = collected.directories;
+        let mut directory_overlays = collected.directories.clone();
         directory_overlays.push(crate::engine::overlay::DirectorySpec {
             host: run_log_dir.to_string_lossy().into_owned(),
             container: RUN_DIR_CONTAINER_PATH.to_string(),
             permission: OverlayPermission::ReadWrite,
         });
 
-        Ok(AgentRunOptions {
+        AgentRunOptions {
             yolo: Some(YoloMode::Enabled),
             non_interactive: false,
             initial_prompt: Some(prompt.to_string()),
@@ -839,11 +831,11 @@ impl LocalTaskEvaluator {
             env_passthrough: if collected.env_passthrough.is_empty() {
                 None
             } else {
-                Some(collected.env_passthrough)
+                Some(collected.env_passthrough.clone())
             },
             directory_overlays,
             include_all_skills: collected.include_all_skills,
-            named_skills: collected.named_skills,
+            named_skills: collected.named_skills.clone(),
             context_overlays: vec![ContextOverlay {
                 scope: ContextScope::Workflow,
                 host_path: task_dir.to_path_buf(),
@@ -851,7 +843,7 @@ impl LocalTaskEvaluator {
                 permission: OverlayPermission::ReadWrite,
             }],
             ..Default::default()
-        })
+        }
     }
 
     /// The engine's `WorkflowStateStore` file for the run that is about to
@@ -922,6 +914,30 @@ impl TaskEvaluator for LocalTaskEvaluator {
 /// the leader or its workflow wrote.
 fn directory_workspace_state_path(run_log_dir: &Path, workflow_name: &str) -> PathBuf {
     EngineWorkflowStateStore::at_git_root(run_log_dir.to_path_buf()).state_path(None, workflow_name)
+}
+
+/// The task's fully-merged overlay set: its own `overlays` on top of the
+/// standing global-config, repo-config and `AWMAN_OVERLAYS` sources.
+///
+/// Task overlays enter through the same slot `--overlay` uses, so they combine
+/// under the existing precedence and collision rules rather than a second set
+/// invented for squad. The result is used twice — to launch the leader, and to
+/// tell the leader in its prompt what it actually has — and both must come from
+/// this one resolution so they cannot disagree (WI 0117).
+fn collect_task_overlays(
+    session: &Session,
+    task: &Task,
+) -> Result<CollectedOverlays, CommandError> {
+    let mut cli_typed = Vec::new();
+    for spec in &task.overlays {
+        cli_typed.extend(parse_overlay_list(spec).map_err(|reason| {
+            CommandError::InvalidOverlaySpec {
+                spec: spec.clone(),
+                reason,
+            }
+        })?);
+    }
+    collect_all_overlay_specs(session, cli_typed, None, None)
 }
 
 /// The flags a squad-generated workflow always run with: interactive PTY mode
@@ -1311,6 +1327,7 @@ mod tests {
                 &task.description,
                 "/workspace",
                 &format!("  - {}", leader.agent),
+                &Default::default(),
                 "/awman/squad/run/verdict.json",
                 Some(&guidance),
             );
@@ -1322,6 +1339,46 @@ mod tests {
             );
             assert!(prompt.contains("issue-triage"));
         }
+    }
+
+    /// WI 0117: the overlay inventory reaches the leader intact, and the
+    /// template keeps no unreplaced slot after the new one was added.
+    #[test]
+    fn the_overlay_inventory_is_substituted_into_the_leader_prompt() {
+        let collected = CollectedOverlays {
+            directories: vec![crate::engine::overlay::DirectorySpec {
+                host: "~/.ssh".into(),
+                container: "/root/.ssh".into(),
+                permission: OverlayPermission::ReadOnly,
+            }],
+            env_passthrough: vec!["GITHUB_TOKEN".into()],
+            ..Default::default()
+        };
+        let prompt = build_squad_leader_prompt(
+            "issue-triage",
+            "when a new issue is opened, draft a plan",
+            "/workspace",
+            "  - claude",
+            &overlay_inventory(&collected),
+            "/awman/squad/run/verdict.json",
+            None,
+        );
+        assert!(
+            prompt.contains("- `/root/.ssh` (read-only) — from host `~/.ssh`"),
+            "the leader must be told which directories it has, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("GITHUB_TOKEN"),
+            "the leader must be told which env names its task declares, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("### Host directories") && prompt.contains("### Skills"),
+            "the template must supply the inventory's headings, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("{{"),
+            "no template slot may survive substitution, got: {prompt}"
+        );
     }
 
     #[test]

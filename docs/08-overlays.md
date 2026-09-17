@@ -90,7 +90,10 @@ needs its own copy of any `env(VAR)` name a task declares, kept in sync as
 your shells come and go. See [Squad: Task environment
 values](12-squad.md#task-environment-values) for how a value reaches the
 daemon, what it means when the daemon doesn't have one yet, and how to check
-or fix that with `awman squad env`.
+or fix that with `awman squad env`. A squad task's leader agent is shown in its
+prompt which of the task's `env()` names the daemon actually holds a value for
+— see [Squad: What the leader agent is told about
+them](12-squad.md#what-the-leader-agent-is-told-about-them).
 
 **Example use case:**
 ```toml

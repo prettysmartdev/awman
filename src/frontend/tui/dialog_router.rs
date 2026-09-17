@@ -347,11 +347,14 @@ pub(super) fn handle_dialog_scroll(app: &mut App, direction: i32) {
                 *selected = (*selected + step).min(len - 1);
             }
         }
-        Some(Dialog::SquadTaskDetail(state)) => {
+        Some(Dialog::SquadTaskHistory(state)) => {
             if direction < 0 {
                 state.scroll = state.scroll.saturating_sub(step);
             } else {
-                state.scroll = state.scroll.saturating_add(step);
+                // Never scroll the last run off the top: the final row stays
+                // reachable, and an over-long press cannot leave the table
+                // blank.
+                state.scroll = (state.scroll + step).min(state.runs.len().saturating_sub(1));
             }
         }
         Some(Dialog::ConfigShow(state)) => {
@@ -572,12 +575,15 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         // WI 0106 Part 5: the detail modal's action tooltip — attach/pause/
         // resume/remove, scoped to the specific task the modal is showing
         // (`state.name`), never the list's current selection (which may have
-        // moved since the modal was opened). Esc still dismisses and the
-        // arrow/page keys still scroll the run history via
-        // `handle_dialog_scroll`; only these four chars are new.
+        // moved since the modal was opened). Esc still dismisses.
         Some(Dialog::SquadTaskDetail(state)) => {
             let name = state.name.clone();
             match c {
+                // The history replaces this modal rather than stacking over
+                // it, and Esc there comes straight back here.
+                'h' => {
+                    key_handler::open_squad_history(app, &name, true);
+                }
                 'a' => {
                     app.active_dialog = None;
                     crate::frontend::tui::squad_attach::start_squad_attach(app, &name);
@@ -631,7 +637,11 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         }
 
         // ── Non-interactive / fallback dialogs ─────────────────────
-        Some(Dialog::Loading { .. })
+        // The history modal is read-only: the arrow/page keys scroll it via
+        // `handle_dialog_scroll` and Esc leaves it. Per-task actions stay in
+        // the detail modal, so no char key is silently overloaded here.
+        Some(Dialog::SquadTaskHistory(_))
+        | Some(Dialog::Loading { .. })
         | Some(Dialog::ListPicker { .. })
         | Some(Dialog::KindSelect { .. })
         | Some(Dialog::YesNo { .. })

@@ -48,8 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::config::env::{daemon_overlay_snapshot, update_daemon_overlay, DaemonEnvMap};
 use crate::data::error::DataError;
 use crate::data::fs::daemon_env::{
-    call_with_cap, env_overlay_names, DaemonEnvStore, EnvPersistence, NoStore, HOST_SIDE_ENV_NAMES,
-    KEYCHAIN_CALL_CAP,
+    call_with_cap, env_overlay_names, DaemonEnvStore, EnvPersistence, NoStore, KEYCHAIN_CALL_CAP,
 };
 use crate::data::fs::task_store::Task;
 
@@ -158,13 +157,10 @@ pub enum EnvSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequiredEnvEntry {
     pub name: String,
-    /// Wanted, but never counted as unmet: the host-side names the daemon reads
-    /// on its own behalf ([`HOST_SIDE_ENV_NAMES`]). Otherwise every daemon on a
-    /// machine with no `GITHUB_TOKEN` would sit permanently warned about one.
-    pub optional: bool,
-    /// Task names that declare this variable, sorted. Empty for a host-side
-    /// name; every task's name for one that comes from the daemon's own config
-    /// or `AWMAN_OVERLAYS`, since those apply to every run.
+    /// Task names that declare this variable, sorted. Every task's name for one
+    /// that comes from the daemon's own config or `AWMAN_OVERLAYS`, since those
+    /// apply to every run. Never empty: a name is in `required_env` only
+    /// because something declared it.
     pub required_by: Vec<String>,
     /// When the name first entered `required_env` in this daemon's lifetime.
     pub required_since: DateTime<Utc>,
@@ -174,7 +170,7 @@ pub struct RequiredEnvEntry {
     ///
     /// Stamped when a name first becomes *required* while uncovered — never
     /// when a push happens to omit it — so a typo'd `env(GTIHUB_TOKEN)` reads
-    /// as long-unmet rather than newly-unmet. `None` when covered or optional.
+    /// as long-unmet rather than newly-unmet. `None` when covered.
     pub unmet_since: Option<DateTime<Utc>>,
     /// Where the held value came from. `None` when the daemon holds none.
     pub source: Option<EnvSource>,
@@ -188,7 +184,6 @@ pub struct RequiredEnvEntry {
 /// is called, so they can never go stale.
 #[derive(Debug, Clone)]
 struct StoredEntry {
-    optional: bool,
     required_by: Vec<String>,
     required_since: DateTime<Utc>,
     last_provided_at: Option<DateTime<Utc>>,
@@ -357,17 +352,18 @@ impl DaemonEnvState {
 
     /// Replace the required set.
     ///
-    /// `required` maps each name to the task names that declare it; the
-    /// host-side names ([`HOST_SIDE_ENV_NAMES`]) are added automatically as
-    /// optional. A name that has *left* the set is the one unambiguous signal
-    /// that nothing needs its value any more, so it is removed from the overlay
+    /// `required` maps each name to the task names that declare it, and is the
+    /// whole of the required set: every name is there because a task's
+    /// `env(NAME)` overlay, the daemon's own config, or `AWMAN_OVERLAYS` asked
+    /// for it. No name is seeded on the daemon's own behalf, so no name is
+    /// exempt from the unmet reporting the rest of §6 is built on.
+    ///
+    /// A name that has *left* the set is the one unambiguous signal that
+    /// nothing needs its value any more, so it is removed from the overlay
     /// here — and only here — and the store is rewritten to garbage-collect it.
     /// An `absent` report never removes anything.
     pub fn set_required(&self, required: BTreeMap<String, Vec<String>>, now: DateTime<Utc>) {
         let mut wanted: BTreeMap<String, Vec<String>> = required;
-        for name in HOST_SIDE_ENV_NAMES {
-            wanted.entry((*name).to_string()).or_default();
-        }
         for names in wanted.values_mut() {
             names.sort();
             names.dedup();
@@ -387,15 +383,13 @@ impl DaemonEnvState {
                 }
             });
             for (name, required_by) in wanted {
-                let optional = HOST_SIDE_ENV_NAMES.contains(&name.as_str());
                 let covered = is_set_and_non_empty(&overlay, &name);
                 match guard.entries.get_mut(&name) {
                     Some(entry) => {
-                        entry.optional = optional;
                         entry.required_by = required_by;
                         // Invariant 11: a covered name has no unmet clock; an
                         // uncovered one keeps the clock it already started.
-                        if covered || optional {
+                        if covered {
                             entry.unmet_since = None;
                         } else if entry.unmet_since.is_none() {
                             entry.unmet_since = Some(now);
@@ -405,11 +399,10 @@ impl DaemonEnvState {
                         guard.entries.insert(
                             name,
                             StoredEntry {
-                                optional,
                                 required_by,
                                 required_since: now,
                                 last_provided_at: None,
-                                unmet_since: (!covered && !optional).then_some(now),
+                                unmet_since: (!covered).then_some(now),
                             },
                         );
                     }
@@ -543,7 +536,6 @@ impl DaemonEnvState {
                 let held = overlay.get(name).filter(|value| !value.is_empty());
                 RequiredEnvEntry {
                     name: name.clone(),
-                    optional: stored.optional,
                     required_by: stored.required_by.clone(),
                     required_since: stored.required_since,
                     last_provided_at: stored.last_provided_at,
@@ -555,16 +547,16 @@ impl DaemonEnvState {
             .collect()
     }
 
-    /// Required, non-optional names the daemon has no usable value for, sorted.
-    /// This is the count `squad status` reports and the list `squad env` shows.
+    /// Required names the daemon has no usable value for, sorted. This is the
+    /// count `squad status` reports and the list `squad env` shows.
     pub fn unmet_names(&self) -> Vec<String> {
         let overlay = daemon_overlay_snapshot();
         let guard = self.lock();
         guard
             .entries
-            .iter()
-            .filter(|(name, stored)| !stored.optional && !is_set_and_non_empty(&overlay, name))
-            .map(|(name, _)| name.clone())
+            .keys()
+            .filter(|name| !is_set_and_non_empty(&overlay, name))
+            .cloned()
             .collect()
     }
 
@@ -585,14 +577,7 @@ impl DaemonEnvState {
         }
         names
             .into_iter()
-            .filter(|name| {
-                let optional = guard
-                    .entries
-                    .get(name)
-                    .map(|stored| stored.optional)
-                    .unwrap_or_else(|| HOST_SIDE_ENV_NAMES.contains(&name.as_str()));
-                !optional && !is_set_and_non_empty(&overlay, name)
-            })
+            .filter(|name| !is_set_and_non_empty(&overlay, name))
             .collect()
     }
 
@@ -787,8 +772,8 @@ mod tests {
         DaemonEnvState::new(Box::new(NoStore), EnvPersistence::None, Salt::random())
     }
 
-    /// Entries are sorted by name and always include the host-side names, so
-    /// every assertion looks its subject up rather than indexing.
+    /// Entries are sorted by name, so every assertion looks its subject up
+    /// rather than indexing.
     fn entry_for(state: &DaemonEnvState, name: &str) -> RequiredEnvEntry {
         state
             .entries()
@@ -1001,20 +986,53 @@ mod tests {
         );
     }
 
-    /// D7: a host-side name is wanted but never counted as unmet, or every
-    /// daemon on a machine without a token would sit permanently warned.
+    /// Nothing is seeded on the daemon's own behalf: with no task declaring an
+    /// `env()` name, `required_env` is empty. `GITHUB_TOKEN` used to be added
+    /// here unconditionally and exempted from unmet reporting, which silenced
+    /// the one name WI 0116's own examples are written around.
     #[test]
-    fn host_side_names_join_the_required_set_as_optional() {
+    fn no_name_joins_the_required_set_unless_something_declares_it() {
         let _lock = guard();
         let state = state();
         state.set_required(BTreeMap::new(), Utc::now());
 
-        let entries = state.entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "GITHUB_TOKEN");
-        assert!(entries[0].optional);
-        assert!(entries[0].required_by.is_empty());
-        assert_eq!(entries[0].unmet_since, None);
+        assert!(
+            state.entries().is_empty(),
+            "an empty task set requires no env names at all"
+        );
+        assert!(state.unmet_names().is_empty());
+    }
+
+    /// The bug this replaced the host-side exemption for: a task declaring
+    /// `env(GITHUB_TOKEN)` is reported unmet exactly like any other name, at
+    /// every surface that reads one.
+    #[test]
+    fn a_task_declared_github_token_is_unmet_like_any_other_name() {
+        let _lock = guard();
+        let state = state();
+        let now = Utc::now();
+        state.set_required(required(&[("GITHUB_TOKEN", &["nightly"])]), now);
+
+        let nightly = task("nightly", &["env(GITHUB_TOKEN)"]);
+        assert_eq!(
+            state.unmet_for_task(&nightly),
+            vec!["GITHUB_TOKEN".to_string()],
+            "the task card, detail modal and run row all read this"
+        );
+        assert_eq!(
+            state.unmet_names(),
+            vec!["GITHUB_TOKEN".to_string()],
+            "`squad status` and `awman squad env` read this"
+        );
+        assert_eq!(
+            entry_for(&state, "GITHUB_TOKEN").unmet_since,
+            Some(now),
+            "and it carries the same unmet clock as any other name"
+        );
+
+        // Supplying it clears every one of those, with no special case either.
+        state.apply_push(DaemonEnvMap::from_pairs([("GITHUB_TOKEN", "v")]), &[], now);
+        assert!(state.unmet_for_task(&nightly).is_empty());
         assert!(state.unmet_names().is_empty());
     }
 

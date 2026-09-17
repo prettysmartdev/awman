@@ -208,9 +208,9 @@ pub struct DaemonStatus {
     /// [`EnvPersistence`]: crate::data::fs::daemon_env::EnvPersistence
     #[serde(default)]
     pub env_persistence: String,
-    /// Required, non-optional env names the daemon has no value for, sorted.
-    /// Empty on the common path, which is why the CLI one-liner only mentions
-    /// it when it is not.
+    /// Required env names the daemon has no value for, sorted. Empty on the
+    /// common path, which is why the CLI one-liner only mentions it when it is
+    /// not.
     #[serde(default)]
     pub unmet_env: Vec<String>,
 }
@@ -412,9 +412,11 @@ impl LocalTaskGateway {
     ///   declares it;
     /// * every `env(NAME)` in the daemon's own global config and
     ///   `AWMAN_OVERLAYS`, attributed to *every* task because those overlays
-    ///   apply to every run;
-    /// * the fixed host-side names ([`HOST_SIDE_ENV_NAMES`]), attributed to no
-    ///   task and never counted as unmet.
+    ///   apply to every run.
+    ///
+    /// Nothing else. No name is added on the daemon's own behalf, so every
+    /// required name is one something declared and every one is reported unmet
+    /// on the same terms.
     ///
     /// `TaskStore` stays daemon-only, so a client never reads any of this — it
     /// asks for the answer over the socket.
@@ -1408,8 +1410,7 @@ mod tests {
             persistence: "keychain".to_string(),
             required: vec![RequiredEnvEntry {
                 name: "GITHUB_TOKEN".to_string(),
-                optional: true,
-                required_by: Vec::new(),
+                required_by: vec!["nightly".to_string()],
                 required_since: Utc::now(),
                 last_provided_at: None,
                 unmet_since: None,

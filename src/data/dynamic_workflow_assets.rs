@@ -20,9 +20,8 @@ pub const EXAMPLE_WORKFLOW_TOML: &str = include_str!("../assets/dynamic/example-
 pub const WORKFLOW_USAGE_MD: &str = include_str!("../assets/dynamic/workflow-usage.md");
 
 /// The leader prompt template. Substituted with `{{work_item_number}}`,
-/// `{{work_item_path}}`, `{{available_agents}}`,
-/// `{{max_concurrent_steps_note}}`, and `{{developer_guidance}}` before being
-/// delivered.
+/// `{{work_item_path}}`, `{{available_agents}}`, `{{max_concurrent_steps}}`
+/// and `{{developer_guidance}}` before being delivered.
 pub const LEADER_PROMPT_MD: &str = include_str!("../assets/dynamic/leader-prompt.md");
 
 /// The repair prompt template. Substituted with `{{validation_error}}`.
@@ -32,12 +31,38 @@ pub const LEADER_REPAIR_PROMPT: &str = include_str!("../assets/dynamic/leader-re
 /// this agent first reports whether the task is met.
 pub const SQUAD_LEADER_PROMPT_MD: &str = include_str!("../assets/dynamic/squad-leader-prompt.md");
 
+/// The task's overlay inventory, as five ready-to-substitute lists.
+///
+/// Data only: each field is a bullet list, or `(none)`. Every heading and
+/// sentence around them lives in `squad-leader-prompt.md`, so the prompt reads
+/// and edits as prose in one place. Layer 2 fills this in; see
+/// `command::commands::squad::overlay_summary` (WI 0117).
+///
+/// A leader not told what its containers actually have either assumes too much
+/// and writes steps that fail at runtime, or assumes too little and writes a
+/// workflow weaker than the task allows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverlayInventory {
+    /// Host directories, as `container path (permission) — from host path`.
+    pub directories: String,
+    /// `env()` names the daemon holds a value for.
+    pub env_set: String,
+    /// `env()` names the task declares that the daemon has no value for.
+    pub env_unset: String,
+    /// Skills mounted into the agent's skills directory.
+    pub skills: String,
+    /// `context(global)` / `context(repo)` directories, which reach the
+    /// generated workflow's steps but not the leader's own container.
+    pub context: String,
+}
+
 /// Construct the squad evaluation-leader prompt.
 pub fn build_squad_leader_prompt(
     task_name: &str,
     task_description: &str,
     repo_mount_path: &str,
     available_agents: &str,
+    overlays: &OverlayInventory,
     verdict_path: &str,
     guidance: Option<&[String]>,
 ) -> String {
@@ -46,6 +71,11 @@ pub fn build_squad_leader_prompt(
         .replace("{{task_description}}", task_description)
         .replace("{{repo_mount_path}}", repo_mount_path)
         .replace("{{available_agents}}", available_agents)
+        .replace("{{overlay_directories}}", &overlays.directories)
+        .replace("{{overlay_env_set}}", &overlays.env_set)
+        .replace("{{overlay_env_unset}}", &overlays.env_unset)
+        .replace("{{overlay_skills}}", &overlays.skills)
+        .replace("{{overlay_context}}", &overlays.context)
         .replace("{{verdict_path}}", verdict_path)
         .replace(
             "{{developer_guidance}}",
@@ -62,32 +92,34 @@ pub fn build_leader_prompt(
     max_concurrent_steps: Option<usize>,
     guidance: Option<&[String]>,
 ) -> String {
-    let max_concurrent_steps_note = match max_concurrent_steps {
-        Some(n) => format!(
-            "Note: the repository configuration advises a maximum of {n} concurrent steps. \
-             Plan your workflow accordingly."
-        ),
-        None => String::new(),
+    let max_concurrent_steps = match max_concurrent_steps {
+        Some(n) => n.to_string(),
+        None => "no limit".to_string(),
     };
     let developer_guidance = build_developer_guidance(guidance);
     LEADER_PROMPT_MD
         .replace("{{work_item_number}}", work_item_number)
         .replace("{{work_item_path}}", work_item_path)
         .replace("{{available_agents}}", available_agents)
-        .replace("{{max_concurrent_steps_note}}", &max_concurrent_steps_note)
+        .replace("{{max_concurrent_steps}}", &max_concurrent_steps)
         .replace("{{developer_guidance}}", &developer_guidance)
 }
 
-/// Render the `## Developer Guidance` block for the leader prompt from the
-/// repo config's `dynamicWorkflows.guidance` entries. Returns an empty string
-/// when guidance is absent or empty so the `{{developer_guidance}}` placeholder
-/// disappears cleanly. Whitespace-only entries are skipped and any literal
-/// newlines within an entry are flattened to spaces so each entry stays a
-/// single bullet point (WI-0099).
+/// Render the repo config's `dynamicWorkflows.guidance` entries as the bullet
+/// list both leader prompts substitute into their Developer Guidance section
+/// (WI-0099).
+///
+/// Data only: the heading and lead-in live in the templates. Absence renders
+/// `(none)` rather than an empty string, so the templates' spacing stays
+/// static and a reader can tell "nothing configured" from "section missing".
+///
+/// Whitespace-only entries are skipped and any literal newlines within an entry
+/// are flattened to spaces, so each entry stays a single bullet point.
 fn build_developer_guidance(guidance: Option<&[String]>) -> String {
+    const NONE: &str = "(none)";
     let entries = match guidance {
         Some(entries) if !entries.is_empty() => entries,
-        _ => return String::new(),
+        _ => return NONE.to_string(),
     };
     let bullets: Vec<String> = entries
         .iter()
@@ -103,13 +135,9 @@ fn build_developer_guidance(guidance: Option<&[String]>) -> String {
         })
         .collect();
     if bullets.is_empty() {
-        return String::new();
+        return NONE.to_string();
     }
-    format!(
-        "\n## Developer Guidance\nYou MUST follow these project-specific instructions when \
-         building the workflow:\n{}\n",
-        bullets.join("\n")
-    )
+    bullets.join("\n")
 }
 
 /// Construct the repair prompt by substituting the verbatim validation error

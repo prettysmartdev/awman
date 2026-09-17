@@ -271,6 +271,20 @@ for task-scoped files and data. Overlay specifications configured on a task
 are additive with global, repository, environment, and workflow overlays; see
 [Overlays](08-overlays.md) for the syntax and merge rules.
 
+### What the leader agent is told about them
+
+Each run, before it designs anything, the leader agent is given the merged
+overlay set as an inventory in its prompt: which host directories are mounted
+and where, which skills it can call, which context directories the steps will
+get, and — split into *set* and *declared but not set* — which environment
+variables the task named. Names only, never values.
+
+This matters in both directions. A leader not told it has `ssh()` and
+`env(GITHUB_TOKEN)` won't design a workflow that pushes a branch and opens a
+pull request, though the task allows exactly that; one that assumes a key it
+lacks writes steps that fail at runtime. The inventory comes from the same
+resolution the containers launch with, so the two cannot disagree.
+
 ### From the TUI
 
 Every action available on the command line is also available as a key
@@ -359,10 +373,12 @@ Created task nightly-triage.
 It's a warning, not a rejection — the task above **is** created, and the same
 warning fires (with "updated" in place of "created") from `squad edit`. The
 task's containers simply start without that variable until one is supplied.
-It never fires for a name the daemon treats as optional (currently only
-`GITHUB_TOKEN`, which the daemon itself reads for its own use rather than a
-task declaring it), so a machine that legitimately has no GitHub token is
-never nagged about it.
+Every `env()` name is treated the same way — there are no exempt names.
+
+The leader agent is told the same thing each run: a name the daemon still has
+no value for is listed in its prompt as declared but not set, so it plans
+around the gap instead of writing a workflow that dies on it, and can name what
+was missing in the run's verdict reason.
 
 To clear it, export the missing variable in any shell and run any
 `awman squad` command — or run `awman squad env --push` if you want to be
@@ -383,10 +399,9 @@ awman squad env
 ```
 Daemon env coverage (persistence: keychain)
 
-  NAME           STATE       SOURCE      SINCE
-  ANTHROPIC_KEY  ✓ set       this shell  —
-  AWS_PROFILE    ⚠ unmet     —           just now
-  GITHUB_TOKEN   · optional  —           —
+  NAME           STATE    SOURCE      SINCE
+  ANTHROPIC_KEY  ✓ set    this shell  —
+  AWS_PROFILE    ⚠ unmet  —           just now
 
   AWS_PROFILE is required by task "deploy-preview".
   Export it and run `awman squad env --push`.
@@ -414,10 +429,9 @@ AWS_PROFILE=preview awman squad env --push
 ```
 Daemon env coverage (persistence: keychain)
 
-  NAME           STATE       SOURCE      SINCE
-  ANTHROPIC_KEY  ✓ set       pushed      —
-  AWS_PROFILE    ✓ set       this shell  —
-  GITHUB_TOKEN   · optional  —           —
+  NAME           STATE   SOURCE      SINCE
+  ANTHROPIC_KEY  ✓ set   pushed      —
+  AWS_PROFILE    ✓ set   this shell  —
 ```
 
 `--clear` removes the persisted keychain item and says so as a second line
@@ -434,10 +448,9 @@ Daemon env coverage (persistence: keychain)
 
   Stored env item removed. The running daemon keeps the values it already holds.
 
-  NAME           STATE       SOURCE  SINCE
-  ANTHROPIC_KEY  ✓ set       pushed  —
-  AWS_PROFILE    ✓ set       pushed  —
-  GITHUB_TOKEN   · optional  —       —
+  NAME           STATE   SOURCE  SINCE
+  ANTHROPIC_KEY  ✓ set   pushed  —
+  AWS_PROFILE    ✓ set   pushed  —
 ```
 
 If nothing was stored to begin with, that line instead reads
@@ -465,11 +478,9 @@ is exactly what lets the daemon come back armed without asking you for
 anything at login. If that trade isn't one you want on a particular machine,
 set `squad.envPersistence` to `"none"` there.
 
-One name is stored that no task asked for: `GITHUB_TOKEN`. The daemon reads it
-for its own use, so any shell that exports it supplies it on the next `awman
-squad` command, and it is persisted like any other held value — even on a
-machine where you have never created a task. `awman squad env` lists it, and
-`squad.envPersistence: "none"` (or `awman squad env --clear`) removes it.
+Only names some task actually declares are ever requested, held, or stored.
+A daemon with no tasks requires nothing, transmits nothing, and persists
+nothing.
 
 If the keychain isn't usable — `secret-tool` not installed, a locked login
 keychain, no keychain backend on the platform, or a keychain call that fails
@@ -587,8 +598,8 @@ doesn't currently have a value for gets one more line, appended after `Next`:
 whenever nothing is unmet, and it's informational only — it doesn't change
 the card's colour; see [Task environment values](#task-environment-values)
 above and [Card colours](#card-colours) below. The same line appears in the
-task's detail modal (**Enter**) and in its run history when a past run had an
-unmet name at the time it started. Cards reflow as the terminal
+task's detail modal (**Enter**) and in its [run history](#run-history) (**h**)
+when a past run had an unmet name at the time it started. Cards reflow as the terminal
 is resized, at most three to a row, so a card is always at least a third of the
 tab's width and its description summary stays readable on a wide terminal. Use
 the arrow keys to move in two dimensions, including across the final partially
@@ -613,7 +624,8 @@ focus to that tab's command box.
 | Key | Action |
 |-----|--------|
 | **↑ / ↓ / ← / →** | Move between task cards |
-| **Enter** | Open a detail modal for the selected task — description, workspace, mount scope, interval, overlays, agent/model, unmet `env()` values, timestamps, and run history |
+| **Enter** | Open a detail modal for the selected task — description, workspace, mount scope, interval, overlays, agent/model, unmet `env()` values, and timestamps |
+| **h** | Open the [run history](#run-history) for the selected task |
 | **a** | Attach to the task's currently running container(s) — see [Attaching](#attaching-to-a-running-task) |
 | **n** | Create a new task |
 | **e** | Edit the selected task (the creation interview, prefilled) |
@@ -622,10 +634,29 @@ focus to that tab's command box.
 | **r** | Resume the selected task |
 | **d** | Remove the selected task (opens a `[y]es / [n]o` confirmation first) |
 
-The detail modal includes the same task-scoped action hints: **a** attach,
-**e** edit, **t** trigger, **p** pause, **r** resume, **d** delete, and **Esc**
-close. Those keys act on the task shown in the modal, even if the underlying
-card list has changed.
+The detail modal includes the same task-scoped action hints: **h** history,
+**a** attach, **e** edit, **t** trigger, **p** pause, **r** resume, **d**
+delete, and **Esc** close. Those keys act on the task shown in the modal, even
+if the underlying card list has changed.
+
+### Run history
+
+A task's run history is a modal of its own, so a long task description can
+never push it off the bottom of the detail modal. **h** opens it, from either
+place:
+
+- **From the card grid**, it shows the selected task's runs. **Esc** closes it
+  and returns you to the grid — it does not open the detail modal.
+- **From the detail modal**, it replaces that modal. **Esc** closes the history
+  and puts the detail modal back, so you can page between the two with **h**
+  and **Esc**.
+
+The table lists each run's start time, outcome (`running`, `not triggered`,
+`executed`, `failed`, `interrupted`), finish time, and error, plus an
+`Unmet env` column when any run in the history started with an unmet `env()`
+name. **↑ / ↓** and **PgUp / PgDn** scroll it. A task that has never run says
+so instead of showing an empty table. Like the detail modal, the history keeps
+refreshing from the daemon while it is open.
 
 If one of these actions fails — the daemon rejects it, or it cannot reach the
 daemon at all — the reason is shown in red in the hint bar directly above the

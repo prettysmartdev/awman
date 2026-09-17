@@ -53,8 +53,18 @@ Each line reads either `- <agent>` or `- <agent>: <model>, <model>, ...`.
     example file: model names are not validated up front, so a wrong one survives
     until the step fails mid-run.
   - Workflow-level `agent` and `model` set the defaults; per-step fields override them.
-{{max_concurrent_steps_note}}
+
+Maximum concurrent steps advised: {{max_concurrent_steps}}. Plan parallelism
+accordingly.
+
+
+## Developer Guidance
+
+Project-specific instructions you MUST follow when building the workflow.
+
 {{developer_guidance}}
+
+
 ## Designing the Workflow
 
 ### Step decomposition

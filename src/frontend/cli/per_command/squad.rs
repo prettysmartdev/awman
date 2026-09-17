@@ -329,7 +329,7 @@ fn format_env_row(cells: &[String; 4], widths: &[usize; 4]) -> String {
 }
 
 /// How long ago `since` was, coarsely: `3d ago`, `2h ago`, `5m ago`. `—` when
-/// there is no timestamp, which is the covered (and the optional) case.
+/// there is no timestamp, which is the covered case.
 ///
 /// Coarse on purpose — the question this answers is "did I just typo this, or
 /// has it been broken for three days", and a precise duration would answer it
@@ -639,15 +639,15 @@ mod tests {
     // ─── §6d: the `awman squad env` table ───────────────────────────────────
 
     #[test]
-    fn the_env_table_renders_the_header_the_three_states_and_the_next_step() {
+    fn the_env_table_renders_the_header_both_states_and_the_next_step() {
         let rendered = text(&SquadOutcome::Env(report(
             vec![
                 row("ANTHROPIC_KEY", "set", "this shell", None),
                 row("AWS_PROFILE", "unmet", "\u{2014}", Some(Utc::now())),
-                EnvReportRow {
-                    required_by: Vec::new(),
-                    ..row("GITHUB_TOKEN", "optional", "\u{2014}", None)
-                },
+                // A task-declared GITHUB_TOKEN is an ordinary unmet row. It
+                // used to render as `· optional`, which is why the host-side
+                // exemption was removed.
+                row("GITHUB_TOKEN", "unmet", "\u{2014}", Some(Utc::now())),
             ],
             "unavailable(secret-tool not found)",
             None,
@@ -662,7 +662,10 @@ mod tests {
         assert!(rendered.contains("  NAME "), "{rendered}");
         assert!(rendered.contains("\u{2713} set"), "{rendered}");
         assert!(rendered.contains("\u{26a0} unmet"), "{rendered}");
-        assert!(rendered.contains("\u{b7} optional"), "{rendered}");
+        assert!(
+            !rendered.contains("optional"),
+            "no name is exempt from unmet reporting any more: {rendered}"
+        );
         assert!(rendered.contains("this shell"), "{rendered}");
         // `unmet_since` reaches the SINCE column, which is the whole point of
         // stamping it: "just typo'd" and "broken for days" must look different.

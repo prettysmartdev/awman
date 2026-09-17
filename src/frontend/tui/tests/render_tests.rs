@@ -368,8 +368,6 @@ fn squad_task_detail_modal_renders_over_the_body_and_stays_live() {
         crate::frontend::tui::dialogs::SquadDetailState {
             name: "task-a".to_string(),
             task,
-            runs: Vec::new(),
-            scroll: 0,
         },
     ));
 
@@ -851,18 +849,185 @@ fn the_squad_detail_modal_shows_the_task_scoped_action_tooltip() {
         crate::frontend::tui::dialogs::SquadDetailState {
             name: "issue-triage".to_string(),
             task,
-            runs: Vec::new(),
-            scroll: 0,
         },
     ));
 
     let text = buffer_text(&render_app(&mut app, 100, 30));
-    for key in ["a attach", "p pause", "r resume", "d delete"] {
+    for key in ["h history", "a attach", "p pause", "r resume", "d delete"] {
         assert!(
             text.contains(key),
             "the modal's action tooltip must offer {key:?}: {text}"
         );
     }
+}
+
+// ─── the run history lives in its own modal ─────────────────────────────────
+
+/// The bug this split fixes: a task whose description ran long pushed the run
+/// history off the bottom of the detail modal. The detail modal now shows no
+/// history at all — a long description simply uses the room the table used to
+/// take — and the tail of the description is still on screen.
+#[test]
+fn the_squad_detail_modal_shows_no_run_history_and_gives_a_long_description_the_room() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    let mut task = fake_task("issue-triage");
+    task.description = format!("{} TAIL-MARKER", "wordy ".repeat(60));
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![task.clone()];
+        snap.loaded = true;
+    }
+    app.active_dialog = Some(Dialog::SquadTaskDetail(
+        crate::frontend::tui::dialogs::SquadDetailState {
+            name: "issue-triage".to_string(),
+            task,
+        },
+    ));
+
+    let text = buffer_text(&render_app(&mut app, 100, 40));
+    assert!(
+        !text.contains("Run history"),
+        "the detail modal must not render the run history any more: {text}"
+    );
+    assert!(
+        text.contains("TAIL-MARKER"),
+        "the end of a long description must survive now the table is gone: {text}"
+    );
+    assert!(
+        text.contains("Updated:"),
+        "the field block must still be laid out under the description: {text}"
+    );
+}
+
+/// The history modal renders the run table for its own task, plus the Esc
+/// wording for where it was opened from.
+#[test]
+fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
+    use crate::data::fs::task_store::{Run, RunStatus};
+    let run = Run {
+        id: "run-1".into(),
+        task_id: "issue-triage".into(),
+        status: RunStatus::Failed,
+        workflow_path: None,
+        workflow_state_path: None,
+        session_id: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        error: Some("boom".into()),
+        unmet_env: Vec::new(),
+    };
+
+    for (from_detail, expected) in [(true, "esc back to detail"), (false, "esc close")] {
+        let mut app = make_app();
+        push_squad_tab(&mut app);
+        {
+            let state = app.active_tab().squad.as_ref().unwrap();
+            let mut snap = state.snapshot.lock().unwrap();
+            snap.tasks = vec![fake_task("issue-triage")];
+            snap.runs = vec![run.clone()];
+            snap.loaded = true;
+        }
+        app.active_dialog = Some(Dialog::SquadTaskHistory(
+            crate::frontend::tui::dialogs::SquadHistoryState {
+                name: "issue-triage".to_string(),
+                runs: vec![run.clone()],
+                scroll: 0,
+                from_detail,
+            },
+        ));
+
+        let text = buffer_text(&render_app(&mut app, 100, 30));
+        assert!(
+            text.contains("run history: issue-triage"),
+            "the history modal must title itself with its task: {text}"
+        );
+        for column in ["Started", "Status", "Finished", "Error"] {
+            assert!(
+                text.contains(column),
+                "the history modal must render the {column:?} column: {text}"
+            );
+        }
+        assert!(
+            text.contains("boom"),
+            "the history modal must render its runs: {text}"
+        );
+        assert!(
+            text.contains(expected),
+            "from_detail={from_detail} must hint {expected:?}: {text}"
+        );
+    }
+}
+
+/// On a terminal too short for the whole field block, the row that says how to
+/// leave the modal is the one thing that must not be clipped — it is reserved
+/// before the body is laid out.
+#[test]
+fn the_squad_modals_keep_their_key_hint_row_on_a_short_terminal() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    let mut task = fake_task("issue-triage");
+    task.description = "wordy ".repeat(80);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![task.clone()];
+        snap.loaded = true;
+    }
+    app.active_dialog = Some(Dialog::SquadTaskDetail(
+        crate::frontend::tui::dialogs::SquadDetailState {
+            name: "issue-triage".to_string(),
+            task,
+        },
+    ));
+    let text = buffer_text(&render_app(&mut app, 100, 18));
+    assert!(
+        text.contains("esc close"),
+        "the detail modal's tooltip must survive a short terminal: {text}"
+    );
+
+    app.active_dialog = Some(Dialog::SquadTaskHistory(
+        crate::frontend::tui::dialogs::SquadHistoryState {
+            name: "issue-triage".to_string(),
+            runs: Vec::new(),
+            scroll: 0,
+            from_detail: true,
+        },
+    ));
+    let text = buffer_text(&render_app(&mut app, 100, 12));
+    assert!(
+        text.contains("esc back to detail"),
+        "the history modal's hint row must survive a short terminal: {text}"
+    );
+}
+
+/// A task that has never run gets a plain empty state rather than a bare
+/// header row.
+#[test]
+fn the_squad_history_modal_says_so_when_a_task_has_never_run() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    {
+        let state = app.active_tab().squad.as_ref().unwrap();
+        let mut snap = state.snapshot.lock().unwrap();
+        snap.tasks = vec![fake_task("issue-triage")];
+        snap.loaded = true;
+    }
+    app.active_dialog = Some(Dialog::SquadTaskHistory(
+        crate::frontend::tui::dialogs::SquadHistoryState {
+            name: "issue-triage".to_string(),
+            runs: Vec::new(),
+            scroll: 0,
+            from_detail: false,
+        },
+    ));
+
+    let text = buffer_text(&render_app(&mut app, 100, 30));
+    assert!(
+        text.contains("has not run yet"),
+        "an empty history must say so: {text}"
+    );
 }
 
 // ─── every task-interview modal shows its key bindings ──────────────────────

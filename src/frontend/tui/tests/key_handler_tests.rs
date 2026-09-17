@@ -1264,8 +1264,6 @@ fn open_squad_detail(app: &mut App, name: &str) {
         crate::frontend::tui::dialogs::SquadDetailState {
             name: name.to_string(),
             task,
-            runs: Vec::new(),
-            scroll: 0,
         },
     ));
 }
@@ -1337,6 +1335,156 @@ fn squad_detail_modal_a_routes_to_start_squad_attach() {
             .contains("squad requires a container runtime"),
         "'a' in the modal must route to start_squad_attach: {:?}",
         app.status_bar.text
+    );
+}
+
+// ── the run-history modal ───────────────────────────────────────────────────
+
+/// Give the active squad tab's snapshot `count` runs for the selected task, so
+/// the history modal has a table to show and something to scroll.
+fn set_squad_runs(app: &mut App, task: &str, count: usize) {
+    use crate::data::fs::task_store::{Run, RunStatus};
+    let state = app
+        .active_tab()
+        .squad
+        .as_ref()
+        .expect("active tab is squad");
+    let mut snap = state.snapshot.lock().unwrap();
+    snap.runs = (0..count)
+        .map(|i| Run {
+            id: format!("run-{i}"),
+            task_id: task.to_string(),
+            status: RunStatus::WorkflowExecuted,
+            workflow_path: None,
+            workflow_state_path: None,
+            session_id: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error: None,
+            unmet_env: Vec::new(),
+        })
+        .collect();
+}
+
+/// `h` on the card grid opens the history for the selected task, and — because
+/// no detail modal was ever up — Esc closes back to the grid rather than
+/// opening one the user did not ask for.
+#[test]
+fn squad_list_h_opens_history_and_esc_closes_it_without_opening_the_detail_modal() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+    if let Some(state) = app.active_tab_mut().squad.as_mut() {
+        state.selected = 1;
+    }
+
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => {
+            assert_eq!(state.name, "task-b");
+            assert!(
+                !state.from_detail,
+                "history opened from the grid must not remember a detail modal"
+            );
+        }
+        _ => panic!("'h' in the squad list must open the run-history modal"),
+    }
+
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        app.active_dialog.is_none(),
+        "Esc must close the history, not open the detail modal"
+    );
+}
+
+#[test]
+fn squad_list_h_is_a_noop_when_the_list_is_empty() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    assert!(app.active_dialog.is_none());
+}
+
+/// From the detail modal, `h` *replaces* it with the history, and Esc walks
+/// back to the detail modal for the same task.
+#[test]
+fn squad_detail_modal_h_opens_history_and_esc_returns_to_the_detail_modal() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+    set_squad_runs(&mut app, "task-b", 3);
+    open_squad_detail(&mut app, "task-b");
+
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => {
+            assert_eq!(state.name, "task-b");
+            assert!(state.from_detail, "Esc must know to come back here");
+            assert_eq!(state.runs.len(), 3, "the modal must carry the polled runs");
+        }
+        _ => panic!("'h' in the detail modal must open the run-history modal"),
+    }
+
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskDetail(state)) => assert_eq!(
+            state.name, "task-b",
+            "Esc must return to the detail modal for the modal's own task"
+        ),
+        _ => panic!("Esc in a history opened from the detail modal must reopen it"),
+    }
+}
+
+/// The history table scrolls with the arrow keys, and cannot be scrolled past
+/// its last run.
+#[test]
+fn squad_history_modal_scrolls_within_its_runs() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a"]);
+    set_squad_runs(&mut app, "task-a", 3);
+
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(state.scroll, 1),
+        _ => panic!("the history modal must stay open while scrolling"),
+    }
+
+    for _ in 0..10 {
+        press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    }
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(
+            state.scroll, 2,
+            "scrolling must stop at the last run rather than emptying the table"
+        ),
+        _ => panic!("the history modal must stay open while scrolling"),
+    }
+
+    press_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(state.scroll, 1),
+        _ => panic!("the history modal must stay open while scrolling"),
+    }
+}
+
+/// A task removed while its history is up leaves nothing to return to, so Esc
+/// closes rather than reopening a detail modal for a task that is gone.
+#[test]
+fn squad_history_esc_closes_when_the_task_it_came_from_is_gone() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a", "task-b"]);
+    open_squad_detail(&mut app, "task-b");
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+
+    set_squad_tasks(&mut app, &["task-a"]);
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    assert!(
+        app.active_dialog.is_none(),
+        "with the task gone there is no detail modal to return to"
     );
 }
 

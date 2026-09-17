@@ -662,6 +662,9 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         dialogs::Dialog::SquadTaskDetail(state) => {
             render_squad_detail(state, area, frame);
         }
+        dialogs::Dialog::SquadTaskHistory(state) => {
+            render_squad_history(state, area, frame);
+        }
         dialogs::Dialog::SquadStartConfirm => {
             let width = 66u16.min(area.width.saturating_sub(4).max(40));
             let dialog_area = dialogs::centered_fixed(width, 9, area);
@@ -872,20 +875,25 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
     }
 }
 
-/// Render the squad task-detail modal (WI 0102): the field block plus the
-/// scrollable run-history table. Reads only the dialog state, which
+/// Render the squad task-detail modal (WI 0102): the description block plus
+/// the labelled field block. Reads only the dialog state, which
 /// `tick_all_tabs` keeps in sync with the squad tab's snapshot.
+///
+/// Run history is *not* here — it has its own modal (`render_squad_history`,
+/// reached with `h`), because a long description used to push it off the
+/// bottom of this one. With the table gone, the description is free to take
+/// whatever room the fixed field lines leave.
 fn render_squad_detail(state: &dialogs::SquadDetailState, area: Rect, frame: &mut Frame) {
     use crate::data::fs::task_store::{MountScope, TaskStatus};
 
+    // The frame costs four rows and four columns (borders plus the padding
+    // `render_dialog_frame` adds), so the content is laid out against the
+    // budget first and the modal is then sized to what it actually holds —
+    // no trailing band of empty rows where the run table used to be.
+    const CHROME: u16 = 4;
     let width = area.width.saturating_sub(6).clamp(50, 90);
-    let height = area.height.saturating_sub(4).clamp(12, 30);
-    let dialog_area = dialogs::centered_fixed(width, height, area);
-    let title = format!("task: {}", state.name);
-    let inner = dialogs::render_dialog_frame(&title, Color::Cyan, dialog_area, frame);
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
+    let max_height = area.height.saturating_sub(4).clamp(8, 30);
+    let content_width = width.saturating_sub(CHROME);
 
     let c = &state.task;
     let mount = match c.mount_scope {
@@ -897,14 +905,7 @@ fn render_squad_detail(state: &dialogs::SquadDetailState, area: Rect, frame: &mu
         TaskStatus::Active => "active",
         TaskStatus::Paused => "paused",
     };
-    // The description is free text and often longer than the modal is wide,
-    // so it renders as its own wrapped multi-line block rather than a single
-    // clipped `label: value` line. Capped at half the modal so a very long
-    // description can never squeeze out the run history.
-    let description_cap = (inner.height / 2).max(1) as usize;
-    let mut fields: Vec<Line> =
-        squad_description_lines(&c.description, inner.width as usize, description_cap);
-    fields.extend(vec![
+    let mut fields: Vec<Line> = vec![
         squad_field_line("Status", status),
         squad_field_line("Mount scope", mount),
         squad_field_line(
@@ -938,7 +939,7 @@ fn render_squad_detail(state: &dialogs::SquadDetailState, area: Rect, frame: &mu
             "Updated",
             &c.updated_at.format("%Y-%m-%d %H:%M").to_string(),
         ),
-    ]);
+    ];
     // WI 0116 §6b — the same standing marker the card carries, in the field
     // block that already reads as a labelled record. Absent when there is
     // nothing to say, so the modal is unchanged for a fully-covered task.
@@ -950,35 +951,122 @@ fn render_squad_detail(state: &dialogs::SquadDetailState, area: Rect, frame: &mu
     }
     let field_h = fields.len() as u16;
 
+    // The description is free text and often longer than the modal is wide, so
+    // it renders as its own wrapped multi-line block rather than a single
+    // clipped `label: value` line. It gets every row the fixed field lines and
+    // the tooltip do not need, and is ellipsised only when it genuinely
+    // outgrows the modal.
+    let description_cap = max_height
+        .saturating_sub(CHROME)
+        .saturating_sub(field_h)
+        .saturating_sub(2)
+        .max(1) as usize;
+    let description =
+        squad_description_lines(&c.description, content_width as usize, description_cap);
+    let description_h = description.len() as u16;
+
+    // `+ 2`: a blank separator row and the action-tooltip row under the fields.
+    let height = (description_h + field_h + 2 + CHROME).min(max_height);
+    let dialog_area = dialogs::centered_fixed(width, height, area);
+    let title = format!("task: {}", state.name);
+    let inner = dialogs::render_dialog_frame(&title, Color::Cyan, dialog_area, frame);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // The tooltip takes the last row before anything else is laid out, so a
+    // terminal too short for the whole field block clips a field rather than
+    // the row that says how to leave the modal.
+    let (body, tooltip) = squad_body_and_hint_rows(inner);
     let chunks = Layout::vertical([
+        Constraint::Length(description_h),
         Constraint::Length(field_h),
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Min(0),
     ])
-    .split(inner);
-    frame.render_widget(Paragraph::new(fields), chunks[0]);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "Run history",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        chunks[1],
-    );
-    render_squad_run_history(&state.runs, state.scroll, chunks[2], frame);
+    .split(body);
+    frame.render_widget(Paragraph::new(description), chunks[0]);
+    frame.render_widget(Paragraph::new(fields), chunks[1]);
 
     // WI 0106 Part 5: the action tooltip — the same per-task actions the list
     // view's footer hints at, scoped to this modal's task and actually wired
     // up (`dialog_router::handle_dialog_char`) so a user doesn't have to
-    // close the modal to attach/pause/resume/remove.
+    // close the modal to attach/pause/resume/remove. `h` is the way back to
+    // the run history that used to sit below the fields.
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "a attach \u{b7} e edit \u{b7} t trigger \u{b7} p pause \u{b7} r resume \u{b7} d delete \u{b7} esc close",
+            "h history \u{b7} a attach \u{b7} e edit \u{b7} t trigger \u{b7} p pause \u{b7} r resume \u{b7} d delete \u{b7} esc close",
             Style::default().fg(Color::DarkGray),
         )),
-        chunks[3],
+        tooltip,
+    );
+}
+
+/// Split a squad modal's inner area into its body and the single key-hint row
+/// pinned to the bottom. Reserving the hint row up front is what keeps it on
+/// screen when the body is taller than the terminal allows.
+fn squad_body_and_hint_rows(inner: Rect) -> (Rect, Rect) {
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let hint = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1.min(inner.height),
+        ..inner
+    };
+    (body, hint)
+}
+
+/// Render the squad run-history modal: the scrollable run table for one task,
+/// on its own so a long description in the detail modal can never push it out
+/// of view. Esc either returns to the detail modal or closes back to the card
+/// grid, depending on where `h` was pressed (`state.from_detail`).
+fn render_squad_history(state: &dialogs::SquadHistoryState, area: Rect, frame: &mut Frame) {
+    // Sized to the runs it has, up to what the terminal allows: a task with
+    // three runs gets a three-row table, not a mostly-empty box. Anything past
+    // the cap is reached by scrolling.
+    const CHROME: u16 = 4;
+    let width = area.width.saturating_sub(6).clamp(50, 90);
+    let max_height = area.height.saturating_sub(4).clamp(6, 30);
+    let table_h = if state.runs.is_empty() {
+        1
+    } else {
+        // The table's header row plus one row per run.
+        (state.runs.len().min(u16::MAX as usize) as u16).saturating_add(1)
+    };
+    // `+ 2`: a blank separator row and the key-hint row under the table.
+    let height = table_h.saturating_add(2 + CHROME).min(max_height);
+    let dialog_area = dialogs::centered_fixed(width, height, area);
+    let title = format!("run history: {}", state.name);
+    let inner = dialogs::render_dialog_frame(&title, Color::Cyan, dialog_area, frame);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let (body, hint) = squad_body_and_hint_rows(inner);
+    if state.runs.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "This task has not run yet.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            body,
+        );
+    } else {
+        render_squad_run_history(&state.runs, state.scroll, body, frame);
+    }
+
+    let back = if state.from_detail {
+        "esc back to detail"
+    } else {
+        "esc close"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("\u{2191}/\u{2193} scroll \u{b7} {back}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        hint,
     );
 }
 

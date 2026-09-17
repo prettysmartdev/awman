@@ -1095,7 +1095,28 @@ impl App {
                 if let Some(task) = snapshot.tasks.iter().find(|c| c.name == detail.name) {
                     detail.task = task.clone();
                 }
-                detail.runs = snapshot.runs.clone();
+            }
+        }
+
+        // The run-history modal is kept live the same way. `snapshot.runs`
+        // holds the history of the *selected* task, so it is only copied in
+        // while the selection is still the task the modal was opened for —
+        // otherwise the modal would quietly start showing another task's runs.
+        if matches!(self.active_dialog, Some(Dialog::SquadTaskHistory(_))) {
+            let polled = self.tabs[active].squad.as_ref().and_then(|state| {
+                let selected = state.selected_name()?;
+                let runs = state.snapshot.lock().ok().map(|g| g.runs.clone())?;
+                Some((selected, runs))
+            });
+            if let (Some(Dialog::SquadTaskHistory(history)), Some((selected, runs))) =
+                (&mut self.active_dialog, polled)
+            {
+                if selected == history.name {
+                    history.runs = runs;
+                    // A shrinking history (older runs pruned) must not leave
+                    // the table scrolled past its end.
+                    history.scroll = history.scroll.min(history.runs.len().saturating_sub(1));
+                }
             }
         }
 

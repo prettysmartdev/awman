@@ -422,6 +422,16 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                     return;
                 }
             }
+            // Esc in the run-history modal walks back exactly one step: to the
+            // detail modal when that is where `h` was pressed, and to the card
+            // grid when the history was opened from the grid itself.
+            if let Some(Dialog::SquadTaskHistory(state)) = &app.active_dialog {
+                let (name, from_detail) = (state.name.clone(), state.from_detail);
+                if !(from_detail && reopen_squad_detail(app, &name)) {
+                    app.active_dialog = None;
+                }
+                return;
+            }
             if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
                 let tab = app.active_tab();
                 if tab.dormant_slots.is_empty() {
@@ -581,21 +591,27 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         Action::SquadShowDetail => {
             let detail = app.active_tab().squad.as_ref().and_then(|state| {
                 let task = state.selected_task()?;
-                let runs = state
-                    .snapshot
-                    .lock()
-                    .ok()
-                    .map(|snap| snap.runs.clone())
-                    .unwrap_or_default();
                 Some(dialogs::SquadDetailState {
                     name: task.name.clone(),
                     task,
-                    runs,
-                    scroll: 0,
                 })
             });
             if let Some(detail) = detail {
                 app.active_dialog = Some(Dialog::SquadTaskDetail(detail));
+            }
+        }
+        // The run history is a modal of its own, so a task with a long
+        // description cannot push it off the bottom of the detail modal.
+        // Opened from the grid it stands alone: Esc closes it outright rather
+        // than opening a detail modal the user never asked for.
+        Action::SquadShowHistory => {
+            let name = app
+                .active_tab()
+                .squad
+                .as_ref()
+                .and_then(|state| state.selected_name());
+            if let Some(name) = name {
+                open_squad_history(app, &name, false);
             }
         }
         Action::SquadAttach => {
@@ -906,6 +922,53 @@ pub(super) fn squad_dispatch_by_name(app: &mut App, subcommand: &str, name: &str
             arguments,
         },
     );
+}
+
+/// Open the run-history modal for `name`. `from_detail` is what Esc later
+/// consults: `true` reopens the detail modal the user came from, `false`
+/// closes back to the card grid. `pub(super)` so `dialog_router.rs` can open
+/// it from the detail modal's `h` key.
+///
+/// The runs come from the tab snapshot the poller publishes, which holds the
+/// history of the *selected* task — the same source the detail modal used
+/// before the history moved out of it.
+pub(super) fn open_squad_history(app: &mut App, name: &str, from_detail: bool) {
+    let runs = app
+        .active_tab()
+        .squad
+        .as_ref()
+        .and_then(|state| state.snapshot.lock().ok().map(|snap| snap.runs.clone()))
+        .unwrap_or_default();
+    app.active_dialog = Some(Dialog::SquadTaskHistory(dialogs::SquadHistoryState {
+        name: name.to_string(),
+        runs,
+        scroll: 0,
+        from_detail,
+    }));
+}
+
+/// Reopen the detail modal for `name` from the active squad tab's snapshot —
+/// what Esc does in a history modal that was opened from the detail modal.
+/// Returns `false` when the task is no longer in the snapshot (removed while
+/// the history was up), leaving the caller to just close the modal.
+pub(super) fn reopen_squad_detail(app: &mut App, name: &str) -> bool {
+    let task = app.active_tab().squad.as_ref().and_then(|state| {
+        state
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|snap| snap.tasks.iter().find(|t| t.name == name).cloned())
+    });
+    match task {
+        Some(task) => {
+            app.active_dialog = Some(Dialog::SquadTaskDetail(dialogs::SquadDetailState {
+                name: name.to_string(),
+                task,
+            }));
+            true
+        }
+        None => false,
+    }
 }
 
 /// Dispatch `squad edit <name> --interview` through the ordinary Layer-2 path

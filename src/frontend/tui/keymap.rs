@@ -49,6 +49,8 @@ pub enum Action {
     // ── squad list (WI 0102) ─────────────────────────────────────────────
     /// Enter — open the task detail modal for the selected row.
     SquadShowDetail,
+    /// h — open the run-history modal for the selected row.
+    SquadShowHistory,
     /// a — attach to the selected task's running container(s).
     SquadAttach,
     /// n — create a task (drives the Layer-2 interview dialog chain).
@@ -194,6 +196,7 @@ fn map_squad_list_key(key: KeyEvent, ctrl: bool) -> Action {
         KeyCode::Char('a') if !ctrl => Action::SquadAttach,
         KeyCode::Char('n') if !ctrl => Action::SquadNew,
         KeyCode::Char('e') if !ctrl => Action::SquadEdit,
+        KeyCode::Char('h') if !ctrl => Action::SquadShowHistory,
         KeyCode::Char('p') if !ctrl => Action::SquadPause,
         KeyCode::Char('r') if !ctrl => Action::SquadResume,
         KeyCode::Char('t') if !ctrl => Action::SquadTrigger,

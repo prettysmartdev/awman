@@ -308,9 +308,10 @@ pub enum SquadSubcommand {
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvReportRow {
     pub name: String,
-    /// `"set"` (the daemon holds a value), `"unmet"` (it does not and the name
-    /// counts), or `"optional"` (a host-side name the daemon wants but never
-    /// counts as unmet — see `HOST_SIDE_ENV_NAMES`).
+    /// `"set"` (the daemon holds a value) or `"unmet"` (it does not). Every
+    /// required name is treated alike: a name is in `required_env` only
+    /// because a task's `env()` overlay, the daemon's config, or
+    /// `AWMAN_OVERLAYS` asked for it, so there is no third, exempt state.
     pub state: String,
     /// `"this shell"`, `"pushed"`, `"keychain"`, or `"—"` when nothing is held.
     ///
@@ -1444,15 +1445,7 @@ fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
         .iter()
         .map(|entry| {
             let held = entry.source.is_some();
-            let state = if held {
-                "set"
-            } else if entry.optional {
-                // Wanted, but never counted against anyone: a machine with no
-                // GITHUB_TOKEN must not read as permanently broken.
-                "optional"
-            } else {
-                "unmet"
-            };
+            let state = if held { "set" } else { "unmet" };
             // "this shell" outranks the daemon's own answer for a held value:
             // it says the value here matches the value there, so a restart
             // would be re-armed by the next command from this terminal. That
@@ -1636,9 +1629,7 @@ mod unmet_env_warning_tests {
         }
     }
 
-    /// A fully covered task says nothing at all — and neither does an
-    /// `optional` host-side name, because the daemon never puts one on
-    /// `unmet_env` in the first place.
+    /// A fully covered task says nothing at all.
     #[test]
     fn nothing_is_written_when_the_returned_task_has_no_unmet_name() {
         assert!(warn(&task("nightly-triage", &[]), TaskChange::Created).is_empty());

@@ -138,9 +138,14 @@ pub enum Dialog {
     CloseTabConfirm,
     WorkflowCancelConfirm,
     ConfigShow(ConfigShowState),
-    /// Task detail + run history for the squad tab (WI 0102). Kept live by
-    /// `App::tick_all_tabs` from the active squad tab's snapshot.
+    /// Task detail for the squad tab (WI 0102). Kept live by
+    /// `App::tick_all_tabs` from the active squad tab's snapshot. Run history
+    /// lives in its own modal (`SquadTaskHistory`), reached with `h`.
     SquadTaskDetail(SquadDetailState),
+    /// Run history for one squad task, in a modal of its own so a long task
+    /// description can never push the history off the bottom of the detail
+    /// modal. Opened with `h` from the card grid or from the detail modal.
+    SquadTaskHistory(SquadHistoryState),
     /// Confirmation before removing a squad task (WI 0102). `y` dispatches
     /// `squad remove <name>`; `n`/`Esc` dismisses.
     SquadRemoveConfirm {
@@ -266,14 +271,25 @@ pub struct AgentAuthState {
 }
 
 /// State for the squad task-detail modal (WI 0102). `name` is the identity
-/// used by `tick_all_tabs` to refresh `task` and `runs` from the tab
-/// snapshot each tick; `scroll` offsets the run-history table.
+/// used by `tick_all_tabs` to refresh `task` from the tab snapshot each tick.
+/// Run history is not part of this modal — see `SquadHistoryState`.
 #[derive(Debug, Clone)]
 pub struct SquadDetailState {
     pub name: String,
     pub task: crate::data::fs::task_store::Task,
+}
+
+/// State for the squad run-history modal. `name` is the task whose runs are
+/// shown, and the identity `tick_all_tabs` refreshes `runs` against; `scroll`
+/// offsets the run table. `from_detail` records where the modal was opened
+/// from: Esc reopens the detail modal only when the user came from it, and
+/// simply closes when the modal was opened straight from the card grid.
+#[derive(Debug, Clone)]
+pub struct SquadHistoryState {
+    pub name: String,
     pub runs: Vec<crate::data::fs::task_store::Run>,
     pub scroll: usize,
+    pub from_detail: bool,
 }
 
 pub struct ConfigShowState {

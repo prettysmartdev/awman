@@ -91,7 +91,7 @@ pub(super) fn render_squad_body(app: &mut App, area: Rect, frame: &mut Frame) {
     }
     let header_h = header_lines.len() as u16;
 
-    let hint = "enter detail \u{b7} a attach \u{b7} n new \u{b7} e edit \u{b7} \
+    let hint = "enter detail \u{b7} h history \u{b7} a attach \u{b7} n new \u{b7} e edit \u{b7} \
                 t trigger \u{b7} p pause \u{b7} r resume \u{b7} d delete";
 
     let chunks = Layout::vertical([

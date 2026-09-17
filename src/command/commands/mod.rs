@@ -209,7 +209,7 @@ pub enum TypedOverlay {
 }
 
 /// Aggregated overlay information after collecting from all sources.
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct CollectedOverlays {
     pub directories: Vec<crate::engine::overlay::DirectorySpec>,
     pub include_all_skills: bool,

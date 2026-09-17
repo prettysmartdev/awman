@@ -5650,8 +5650,12 @@ prompt = "do something"
         );
     }
 
+    /// The section itself is template text and always renders; what changes is
+    /// whether it carries bullets or an explicit statement that there are none.
+    /// A section that vanished silently could not be told apart from one the
+    /// template never had.
     #[test]
-    fn build_leader_prompt_omits_developer_guidance_section_when_none() {
+    fn build_leader_prompt_states_absent_developer_guidance_when_none() {
         let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             "0099",
             "/path",
@@ -5660,8 +5664,12 @@ prompt = "do something"
             None,
         );
         assert!(
-            !prompt.contains("## Developer Guidance"),
-            "prompt must omit the Developer Guidance section when guidance is None, got: {prompt}"
+            prompt.contains("## Developer Guidance"),
+            "the template owns the heading, so it renders either way, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("(none)"),
+            "absent guidance must be stated, not left blank, got: {prompt}"
         );
         assert!(
             !prompt.contains("{{developer_guidance}}"),
@@ -5670,7 +5678,7 @@ prompt = "do something"
     }
 
     #[test]
-    fn build_leader_prompt_omits_developer_guidance_section_when_empty() {
+    fn build_leader_prompt_states_absent_developer_guidance_when_empty() {
         let guidance: Vec<String> = Vec::new();
         let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             "0099",
@@ -5680,8 +5688,8 @@ prompt = "do something"
             Some(&guidance),
         );
         assert!(
-            !prompt.contains("## Developer Guidance"),
-            "prompt must omit the Developer Guidance section when guidance is empty, got: {prompt}"
+            prompt.contains("(none)"),
+            "an empty guidance list must be stated as absent, got: {prompt}"
         );
         assert!(
             !prompt.contains("{{developer_guidance}}"),
@@ -5690,7 +5698,7 @@ prompt = "do something"
     }
 
     #[test]
-    fn build_leader_prompt_includes_advisory_note_when_max_concurrent_steps_is_some() {
+    fn build_leader_prompt_states_the_concurrency_limit_when_max_concurrent_steps_is_some() {
         let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             "0042",
             "/path",
@@ -5699,13 +5707,16 @@ prompt = "do something"
             None,
         );
         assert!(
-            prompt.contains("maximum of 3 concurrent steps"),
-            "prompt must include the concurrency advisory when Some(n), got: {prompt}"
+            prompt.contains("Maximum concurrent steps advised: 3."),
+            "prompt must state the configured limit when Some(n), got: {prompt}"
         );
     }
 
+    /// As with guidance, the sentence is template text either way: "no limit
+    /// configured" is a fact the leader can plan against, where a vanished line
+    /// is silence it has to guess at.
     #[test]
-    fn build_leader_prompt_omits_advisory_note_when_max_concurrent_steps_is_none() {
+    fn build_leader_prompt_states_no_limit_when_max_concurrent_steps_is_none() {
         let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             "0042",
             "/path",
@@ -5714,8 +5725,12 @@ prompt = "do something"
             None,
         );
         assert!(
-            !prompt.contains("concurrent steps"),
-            "prompt must omit the concurrency advisory entirely when None, got: {prompt}"
+            prompt.contains("Maximum concurrent steps advised: no limit."),
+            "prompt must state the absence of a limit when None, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("{{max_concurrent_steps}}"),
+            "no stray placeholder token must remain when None, got: {prompt}"
         );
     }
 
@@ -6570,7 +6585,7 @@ prompt = "do something useful"
             "leader prompt must contain the configured codex model, got: {leader_prompt}"
         );
         assert!(
-            leader_prompt.contains("maximum of 2 concurrent steps"),
+            leader_prompt.contains("Maximum concurrent steps advised: 2."),
             "leader prompt must contain the maxConcurrentSteps advisory, got: {leader_prompt}"
         );
     }

@@ -5,6 +5,7 @@ pub mod daemon_runtime;
 pub mod env_sync;
 pub mod evaluation;
 pub mod gateway;
+pub mod overlay_summary;
 pub mod runtime_guard;
 pub mod supervisor;
 

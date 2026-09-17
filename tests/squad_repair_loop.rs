@@ -94,6 +94,7 @@ fn squad_leader_prompt() -> String {
         "when a new issue is opened, draft a plan",
         "/workspace",
         "  - claude",
+        &Default::default(),
         "/awman/squad/run/verdict.json",
         None,
     )

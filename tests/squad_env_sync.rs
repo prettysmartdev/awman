@@ -137,7 +137,6 @@ fn coverage_body(salt: &Salt, entries: &[(&str, Option<String>)]) -> serde_json:
             .iter()
             .map(|(name, digest)| serde_json::json!({
                 "name": name,
-                "optional": false,
                 "required_by": ["nightly"],
                 "required_since": "2026-09-09T20:19:54.417577053Z",
                 "last_provided_at": null,

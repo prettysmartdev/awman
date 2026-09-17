@@ -56,13 +56,6 @@ pub const KEYCHAIN_CALL_CAP: Duration = Duration::from_secs(5);
 /// `engine::auth::keychain::decode_go_keyring_payload` already unwraps.
 pub const GO_KEYRING_B64_PREFIX: &str = "go-keyring-base64:";
 
-/// Host-side names the daemon always wants but never counts as unmet.
-///
-/// These are read by the daemon on its own behalf (CI polling, GitHub issue
-/// sourcing) rather than declared by a task, so a machine that legitimately has
-/// no token must not sit permanently warned about one.
-pub const HOST_SIDE_ENV_NAMES: &[&str] = &["GITHUB_TOKEN"];
-
 /// Where the daemon's payload environment is persisted across an OS-initiated
 /// restart.
 ///

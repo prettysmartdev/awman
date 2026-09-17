@@ -131,7 +131,6 @@ mod tests {
     fn entry(name: &str, digest: Option<&str>) -> RequiredEnvEntry {
         RequiredEnvEntry {
             name: name.to_string(),
-            optional: false,
             required_by: vec!["nightly".into()],
             required_since: Utc::now(),
             last_provided_at: None,

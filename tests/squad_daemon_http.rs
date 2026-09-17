@@ -1178,9 +1178,10 @@ async fn status_reports_env_persistence_none_for_the_explicit_opt_out() {
     assert_eq!(
         body["unmet_env"],
         serde_json::json!(["STATUS_TOKEN"]),
-        "the daemon-wide unmet list is required, non-optional and uncovered: {body}"
+        "the daemon-wide unmet list is exactly the required, uncovered names: {body}"
     );
-    // GITHUB_TOKEN is required but optional, so it is never in `unmet_env`.
+    // Nothing is seeded on the daemon's own behalf, so a name no task declares
+    // — GITHUB_TOKEN included — is not required and cannot be unmet.
     assert!(!body["unmet_env"]
         .as_array()
         .unwrap()
@@ -1200,6 +1201,69 @@ async fn status_reports_env_persistence_none_for_the_explicit_opt_out() {
     );
     assert_eq!(unmet["source"], serde_json::Value::Null);
     assert_eq!(unmet["required_by"], serde_json::json!(["nightly"]));
+
+    handle.abort();
+}
+
+/// The reported bug, end to end: a task declaring `env(GITHUB_TOKEN)` against a
+/// daemon that has no value for it must report unmet at every surface, exactly
+/// like any other name.
+///
+/// `GITHUB_TOKEN` used to be seeded into `required_env` on every daemon and
+/// exempted from unmet reporting, so all of these were silent — the TUI card,
+/// the detail modal, the `squad ●` indicator, `squad status`, the create/edit
+/// warning and the run row alike — for the one variable WI 0116's own examples
+/// are written around.
+#[tokio::test]
+async fn a_task_declared_github_token_is_reported_unmet_like_any_other_name() {
+    let _env_guard = ENV_LOCK.lock().await;
+    capture_daemon_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    seed_task(tmp.path(), "nightly", &["env(GITHUB_TOKEN)"]);
+    // The daemon must not inherit one from whatever shell runs the suite: what
+    // is under test is the no-value case.
+    std::env::remove_var("GITHUB_TOKEN");
+    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+
+    let (status, text) = request(
+        reqwest::Method::GET,
+        &format!("{base}/v1/status"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        body["unmet_env"],
+        serde_json::json!(["GITHUB_TOKEN"]),
+        "`squad status` and the daemon-wide count must see it: {body}"
+    );
+
+    // …and so must the per-task marker every TUI surface reads.
+    let (status, text) = request(
+        reqwest::Method::POST,
+        &format!("{base}/v1/commands"),
+        None,
+        Some(serde_json::json!({"subcommand": "squad list", "args": []})),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let tasks: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        tasks[0]["unmet_env"],
+        serde_json::json!(["GITHUB_TOKEN"]),
+        "the card, the detail modal and the indicator all read this: {tasks}"
+    );
+
+    // The coverage view agrees, with the same unmet clock any other name gets.
+    let coverage = env_get(&base, None).await;
+    let entry = entry(&coverage, "GITHUB_TOKEN").expect("the task declares it");
+    assert!(
+        entry["unmet_since"].is_string(),
+        "an uncovered declared name carries an unmet clock: {entry}"
+    );
+    assert_eq!(entry["required_by"], serde_json::json!(["nightly"]));
 
     handle.abort();
 }
@@ -1313,11 +1377,35 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
             awman::engine::squad::SchedulerStatus::default(),
         )),
         SquadPaths::from_root(tmp.path().join("squad")),
-        env_state,
+        Arc::clone(&env_state),
     );
 
-    // A host-side name is always in `required_env`, so the push is accepted and
-    // reaches the store without needing a task on disk.
+    // The daemon stores a pushed value only for a name something declared, and
+    // `push_env` recomputes `required_env` from the store on the way in — so
+    // the declaring task has to be on disk. No name is seeded on the daemon's
+    // own behalf.
+    let now = chrono::Utc::now();
+    store
+        .create(&awman::data::fs::Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "nightly".into(),
+            description: "declares the pushed name".into(),
+            repo_scope: tmp.path().to_path_buf(),
+            mount_scope: awman::data::fs::MountScope::GitRoot,
+            overlays: vec!["env(GITHUB_TOKEN)".to_string()],
+            interval_secs: 3600,
+            status: awman::data::fs::TaskStatus::Active,
+            agent: None,
+            model: None,
+            backoff_until: None,
+            created_at: now,
+            updated_at: now,
+            last_run_at: None,
+            trigger_requested_at: None,
+            last_run_status: None,
+            unmet_env: Vec::new(),
+        })
+        .unwrap();
     let ticks = Arc::new(AtomicUsize::new(0));
     let ticker = tokio::spawn({
         let ticks = Arc::clone(&ticks);
