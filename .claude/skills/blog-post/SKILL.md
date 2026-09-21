@@ -104,7 +104,12 @@ Source and issues at [github.com/prettysmartdev/amux](https://github.com/prettys
 
 **What to include**
 - Shell examples with `sh` code blocks for any commands a reader would run
-- Screenshot placeholders (e.g. `![TUI showing the new dialog](images/NNNN-slug-01.png)`) when a visual would help — do not attempt ASCII art
+- Screenshot placeholders when a visual would help — do not attempt ASCII art. Wrap them in an HTML comment so the docs link check does not flag an image that does not exist yet:
+  ```markdown
+  <!-- SCREENSHOT PLACEHOLDER: the TUI showing the new dialog.
+       Save it as docs/blog/images/NNNN-slug-01.png and replace this comment with:
+       ![TUI showing the new dialog](./images/NNNN-slug-01.png) -->
+  ```
 - The install snippet (`curl -s https://prettysmart.dev/install/amux.sh | sh`) in the first third of the post, inside a `---` fenced section
 - Concrete "before vs. after" framing when the post is about a fix or refactor
 
