@@ -289,6 +289,10 @@ fn migration_is_noop_when_amux_dir_absent() {
 /// link `[text](target)` or `[text](target#anchor)` resolves to a file that
 /// exists. This catches broken links introduced by doc renames (e.g.
 /// `08-headless-mode.md` → `08-api-mode.md`).
+///
+/// Content inside `<!-- … -->` is skipped: it never reaches a reader, so a
+/// link there cannot be broken for anyone. Screenshot placeholders left for a
+/// human to fill in later live in such comments.
 #[test]
 fn docs_internal_links_all_resolve() {
     let docs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
@@ -315,7 +319,7 @@ fn docs_internal_links_all_resolve() {
             .expect("md file must have a parent dir")
             .to_path_buf();
 
-        for link_target in extract_md_links(&content) {
+        for link_target in extract_md_links(&strip_html_comments(&content)) {
             if link_target.starts_with("http://")
                 || link_target.starts_with("https://")
                 || link_target.starts_with("mailto:")
@@ -351,6 +355,30 @@ fn docs_internal_links_all_resolve() {
     );
 }
 
+#[test]
+fn commented_out_links_are_not_checked() {
+    let content = "\
+live [one](./a.md) here
+<!-- SCREENSHOT PLACEHOLDER: save it as images/squad-tab.png, then use:
+     ![squad tab](./images/squad-tab.png) -->
+live [two](./b.md) here
+";
+    let targets = extract_md_links(&strip_html_comments(content));
+    assert_eq!(
+        targets,
+        vec!["./a.md".to_string(), "./b.md".to_string()],
+        "links inside <!-- --> must not be treated as live links"
+    );
+}
+
+#[test]
+fn strip_html_comments_handles_multiple_and_unterminated_spans() {
+    assert_eq!(strip_html_comments("a<!--x-->b<!--y-->c"), "abc");
+    assert_eq!(strip_html_comments("no comments here"), "no comments here");
+    // An unterminated comment swallows the rest of the input.
+    assert_eq!(strip_html_comments("keep<!--dropped [x](./y.md)"), "keep");
+}
+
 fn collect_md_files_recursively(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
@@ -365,6 +393,24 @@ fn collect_md_files_recursively(dir: &std::path::Path) -> Vec<std::path::PathBuf
             out.push(path);
         }
     }
+    out
+}
+
+/// Remove every `<!-- … -->` span from a Markdown string so that commented-out
+/// content is not mistaken for a live link. An unterminated `<!--` swallows the
+/// rest of the input, which is how Markdown renderers treat it.
+fn strip_html_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + "-->".len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
     out
 }
 
