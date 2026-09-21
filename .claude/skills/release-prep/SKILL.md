@@ -134,7 +134,7 @@ Create `docs/blog/NNNN-slug.md` where NNNN is the next number after the last pos
 - Open with the problem or itch, not the solution
 - Explain *why* the feature matters before explaining *what* it does
 - Focus on the improved workflows, problems solved, and benefits to security that the tool brings rather than how it works internally
-- Show examples with code/shell blocks (or screenshot placeholders for the human to fill in later, don't try to do ASCII art)
+- Show examples with code/shell blocks (or screenshot placeholders for the human to fill in later, don't try to do ASCII art). Keep placeholders inside an HTML comment — see the blog-post skill — so the docs link check does not flag an image that does not exist yet
 - No buzzwords ("revolutionary", "game-changing", "seamless", "robust")
 - No fluff ("In this post I will...", "I'm excited to announce...")
 - Inlcude a quick blurb on how to install the tool in the first 1/3 of the post (the curl|sh version)
