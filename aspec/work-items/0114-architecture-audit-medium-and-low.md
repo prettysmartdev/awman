@@ -1,7 +1,8 @@
 # Work Item: Task
 
 Title: Architecture audit remediation, part 2 — the Medium and Low findings
-(F-13 through F-54) from the 2026-09-03 architecture audit
+(F-13 through F-54) from the 2026-09-03 architecture audit, plus F-55 to
+F-57 from the v0.12 re-audit of 2026-09-22
 Issue: `aspec/review-notes/0113-architecture-audit.md`
 
 ## Summary:
@@ -63,6 +64,60 @@ So I can:
 read the code as the intermediate Rust developer the spec is written for
 (report F-34, F-36, F-51, F-52; P1).
 
+## Review — 2026-09-22
+
+This item was written against the tree at `955cca64` (2026-09-04) and last
+touched by 0113 at `1eefe86f` (2026-09-08). Seven commits have landed since,
+notably WI 0115, WI 0116, `fcbaa0b1` (dynamic workflows), `df6531d7` (squad
+leader + env var handling) and `44949a41` (squad cancel, TUI modals). A
+re-verification of every finding against `HEAD` found:
+
+- **One step superseded by a later deliberate design: F-37 step 3.** Do not
+  implement it as drafted — it would reintroduce the WI 0116 regression and
+  put possibly-secret values into world-readable argv. Details in place.
+- **Three items now done or partly done that the item still lists as open:**
+  F-40 step 4 (closed), F-25 step 4 and F-20 step 2 (partly), plus F-14
+  step 1, which became "delete the duplicate" rather than "move".
+- **One naming defect: F-33 step 1** proposed a trait name already taken by
+  an unrelated Layer 2 trait that F-35 step 3 itself extends.
+- **Stale counts and locations** corrected inline: the `Command` impl count
+  (16 → 17), the `apple-containers` arms (5 → 6), the `type_complexity`
+  allows (3 → 4), `SquadHealth` (no such type), `can_dismiss` (no such
+  field), and the `exec_workflow.rs` stub range.
+
+- **Two new Tenet 2 violations introduced by v0.12 itself**, added as
+  **F-55** and **F-56** in a new Group G: the TUI owning squad subcommand
+  names and confirm-modal copy, and Layer 1 rendering the squad key banner.
+  Both fold into findings this item already carries (F-19/F-15 and F-47
+  respectively) — neither needs a separate commit series.
+
+Every other finding was re-checked and stands as written. Line numbers in
+the report and in this item predate up to ~1,250 lines of growth in a single
+file — treat them as hints, and grep for the symbol.
+
+`make architecture-lint` passes at `HEAD`, but it checks only the Tenet 1
+import direction. Tenets 2 (no business logic in frontends) and 3 (typed
+objects over free functions) have no automated check, and every finding in
+Group G is a Tenet 2 violation that the lint cannot see. **F-57** adds two
+guards for the shapes that keep recurring — box-drawing characters below
+Layer 3, and a frontend hand-building a dispatch path — each gated on the
+findings it guards so it lands green.
+
+### Scope drift since 2026-09-04 (affects F-51 sizing)
+
+| File | Then | Now | Δ |
+|---|---:|---:|---:|
+| `src/command/commands/exec_workflow.rs` | 5,943 | 7,195 | +1,252 |
+| `src/engine/workflow/mod.rs` | 7,622 | 8,154 | +532 |
+| `src/command/dispatch/catalogue.rs` | 3,014 | 3,433 | +419 |
+| `src/frontend/tui/render/dialog.rs` | 1,450 | 1,713 | +263 |
+| `src/frontend/tui/squad_indicator.rs` | 232 | 398 | +166 |
+
+F-51's splits are correspondingly larger jobs than costed. Four squad files
+that did not exist when F-51 was written also need a home in its plan:
+`src/command/commands/squad/{overlay_summary,env_sync,daemon_runtime}.rs`
+and `src/engine/squad/env_state.rs`.
+
 ## Implementation Details:
 
 Run `make pre-push` after every commit. Any commit that moves code across a
@@ -108,14 +163,22 @@ Every open question is answered; the full table is in the report under
 #### F-33: rename the second `AgentFrontend`; delete the re-export shims
 Report F-33 (`src/engine/agent/frontend.rs:12-22`, `src/engine/agent_runtime/frontend.rs:81-110`,
 `src/engine/step_status.rs:1`, `src/engine/ready/phase.rs:1`, `src/engine/ready/summary.rs:1`).
-1. Rename `engine::agent::AgentFrontend` to `AgentSetupFrontend`. Make
-   `ReadyFrontend: AgentSetupFrontend` and `InitFrontend: AgentSetupFrontend`
+1. Rename `engine::agent::AgentFrontend` to `AgentImageFrontend`. Make
+   `ReadyFrontend: AgentImageFrontend` and `InitFrontend: AgentImageFrontend`
    and delete their inline re-declarations of `report_step_status` /
    `container_frontend`.
-2. Delete the three `pub use crate::data::…::*` shim files and
+   **Correction (review 2026-09-22):** the original text said
+   `AgentSetupFrontend`, but that name is already taken by a *different*
+   trait — `src/command/commands/agent_setup.rs:17` (Layer 2), the one F-35
+   step 3 below extends. Two traits cannot share it; `AgentImageFrontend`
+   names what the L1 trait actually does.
+2. Delete the `pub use crate::data::…::*` shim files and
    `engine/mod.rs:29`; `sed` every `crate::engine::step_status::StepStatus`,
    `crate::engine::ready::phase::ReadyPhase`, `crate::engine::ready::summary::ReadySummary`
-   import to the `crate::data::…` path.
+   import to the `crate::data::…` path. **A fourth shim of the same class
+   appeared after this item was written** and goes with them:
+   `src/frontend/api/session_setup.rs` is now two lines,
+   `pub use crate::command::commands::api_server::session_setup::*;`.
 3. Tests: compile-only; no behaviour.
 
 #### F-36: blanket forwarding impls replace `WorkflowProxy` and `AgentFrontendProxy`
@@ -151,8 +214,12 @@ Report F-35 (`src/command/dispatch/mod.rs:324-325`, `src/command/commands/auth.r
 4. Fold `SquadDaemonCommand::{run_start, run_stop, run_status, run_logs}`
    into `SquadCommand` (or a plain `SquadDaemon` struct without a `Command`
    impl); delete `SquadDaemonCommand` and `SquadDaemonOutcome`.
-5. Tests: the `Command`-trait impl count drops from 16 to 13; update
-   `tests/cli_parity/catalogue_completeness.rs` accordingly.
+5. Tests: the `Command`-trait impl count drops from **17 to 14**.
+   **Correction (review 2026-09-22):** the original "16 to 13" predates
+   0113, which added `SquadAttachCommand`. Note also that
+   `tests/cli_parity/catalogue_completeness.rs` asserts per-command flags
+   only — it holds no impl-count assertion to update, so the count itself
+   needs no test change.
 
 #### F-34: `PhaseKind` collapses the setup/teardown twins; typed constructor args
 Report F-34 (`src/engine/workflow/mod.rs:2362-2866`, `src/engine/workflow/frontend.rs:122-135`).
@@ -202,21 +269,48 @@ architecture-lint `std::env::var` check are **still open** for 0114.
    `src/data/config/env.rs` with typed accessors on `EnvSnapshot`
    (`attach_dir() -> Option<PathBuf>`, `api_verbose_setup() -> bool` with the
    `0|false|no|off` falsy parse moved from the frontend). Delete
-   `verbose_setup_enabled()` from `src/frontend/api/session_setup.rs`; pass
-   the bool through `ApiSessionSetupObserver`.
+   `verbose_setup_enabled()` — since 0113 it lives at
+   `src/command/commands/api_server/session_setup.rs:459`, not at the
+   `src/frontend/api/session_setup.rs` path the report cites (that file is
+   now a two-line re-export shim; see F-33 step 2) — and pass the bool
+   through `ApiSessionSetupObserver`.
 2. Wrap `poll_ci.rs` as `CiPoller { git: Arc<GitEngine>, token: Option<String> }`
    with `poll(&self, on_message)`; branch/SHA/remote come from `GitEngine`
    (add `head_sha` if missing); the `reqwest` fallback uses the engine-level
    HTTP client once F-28 lands (until then keep the local client).
-3. Env passthrough: resolve `env_passthrough` names into `EnvLiteral` values
-   at L2 from an `EnvSnapshot` before building `ResolvedContainerOptions` /
-   `ResolvedSandboxOptions`; delete the three spawn-time
-   `std::env::var(&envvar.0)` loops. Keep the hermetic `lookup_env` closure
-   seams the tests rely on.
+3. Env passthrough: **superseded — do not implement as written (review
+   2026-09-22).** Commit `df6531d7` and WI 0116 reworked this deliberately,
+   and the step as drafted would undo both:
+   - The container path is no longer three ad-hoc loops. It is one function,
+     `resolve_env_passthrough` (`src/engine/container/docker.rs:706`), which
+     resolves through `host_var` (`src/data/config/env.rs:246`) **at spawn
+     time on purpose**: inside the squad daemon a task's `env()` value
+     arrives over the authenticated socket and lives in the Layer 0 daemon
+     overlay, never in the daemon's own process environment. Pre-resolving
+     at L2 from an `EnvSnapshot` reintroduces exactly the regression WI 0116
+     exists to end.
+   - Turning passthrough into `EnvLiteral` would also change the emitted
+     argv from name-only `-e NAME` to `-e KEY=VALUE`. `docker.rs:800-816`
+     documents why that must never happen: argv is world-readable through
+     `/proc/<pid>/cmdline`, so a host value that may be a secret must stay
+     out of it. That is a security regression, not a refactor.
+   - The one remaining raw loop,
+     `src/engine/sandbox/dsbx/session_config.rs:100`, is deliberately
+     `std::env::var` and **not** `host_var`: that map is written in the clear
+     to `<workspace>/.awman/session.json`, and reading through the daemon
+     overlay would make a socket-pushed value eligible for a plaintext file.
+     Its comment says so; leave it alone.
+   What remains of this step is documentation only: `host_var` already gives
+   Layer 0 ownership of the lookup, which is what the finding asked for.
 4. Add a lint line to `tools/architecture-lint.sh`: `std::env::var` /
    `env::var(` outside `src/data/` fails, with an explicit allowlist for
    `#[cfg(test)]` modules and `src/frontend/cli/output.rs` (`NO_COLOR`,
-   presentation).
+   presentation). **The allowlist must also carry
+   `src/engine/sandbox/dsbx/session_config.rs` and
+   `src/engine/sandbox/dsbx/mod.rs`** — both deliberate, per step 3. Twelve
+   files above `src/data/` still read the environment directly as of
+   2026-09-22; budget for triaging each against `host_var` before enabling
+   the lint, or the line lands red.
 
 #### F-39: `GitEngine` owns the identity probe and the worktree status check
 Report F-39 (`src/command/commands/exec_workflow.rs:1532-1545, 2975-2984`).
@@ -233,15 +327,19 @@ Report F-39 (`src/command/commands/exec_workflow.rs:1532-1545, 2975-2984`).
 #### F-40: branch on capabilities, not on which runtime handle is `Some`
 Report F-40 (`src/command/commands/ready.rs:190`, `clean.rs:218, 404, 458`,
 `src/engine/sandbox/mod.rs:29-35`).
-1. `ready.rs:190`: branch on `engines.runtime.capabilities().kit_declarative`.
+1. `ready.rs:208` (the report's `:190`): still branches on
+   `self.engines.sandbox_runtime.is_some()`; branch on
+   `engines.runtime.capabilities().kit_declarative` instead.
 2. Add `Capabilities::has_image_store: bool` (true for container tier);
    `clean.rs` uses it for the dangling-image category and the trait's
    `list_running`/`stop`/`remove` for the rest.
 3. `ready_sbx_agent` becomes `SandboxRuntime::ready_agent(&self, agent, no_cache, sink)`;
    `ready.rs` calls it through `engines.require_sandbox_runtime()` until
    F-40b folds it into the trait.
-4. `squad/runtime_guard.rs` stays as documented; add `Capabilities::squad_supported`
-   and have the guard read it so the tier decision has one home.
+4. **DONE (review 2026-09-22) — nothing left.** `Capabilities::squad_supported()`
+   exists at `src/engine/agent_runtime/capabilities.rs:46` and
+   `src/engine/squad/daemon.rs:102` reads it;
+   `src/command/commands/squad/runtime_guard.rs` stays as documented.
 
 #### F-40b (decision Q12): `ReadyEngine` and `InitEngine` become runtime-agnostic
 Report question Q12 (`src/engine/ready/mod.rs:738-745`, `src/engine/init/mod.rs:391-402`,
@@ -297,7 +395,9 @@ Report F-47 (`src/engine/squad/verdict.rs:43-109`, `src/command/commands/squad/g
    env, set it on the `Command` builder in `DaemonProcess`, not on the
    parent process.
 3. Emit the API key as a typed `ApiServerOutcome::KeyGenerated { key }`
-   field (or `UserMessage` kind); move `render_api_key_banner` to
+   field (or `UserMessage` kind); move `render_api_key_banner` — now at
+   `src/command/commands/api_server/banner.rs:5`, i.e. already out of the
+   frontend and into L2 but still one layer short — to
    `src/frontend/cli/per_command/api_server.rs`. **Behaviour change**: the
    TUI and API no longer receive box-drawing text unless their frontend
    renders it.
@@ -306,7 +406,15 @@ Report F-47 (`src/engine/squad/verdict.rs:43-109`, `src/command/commands/squad/g
 
 #### F-14: `AuthEngine` verifies API bearer keys
 Report F-14 (`src/frontend/api/serve.rs:43-87`, `src/engine/auth/mod.rs:413-431`).
-1. Move `AuthMode` to `src/engine/auth/`; add
+1. **Partly done (review 2026-09-22):** `AuthMode` now exists at
+   `src/engine/auth/mod.rs:189` with `resolve_for_daemon(paths, skip, hint)`,
+   and its doc comment already states the Layer 1 rationale. What is left is
+   *deletion of a duplicate*, not a move: a structurally identical
+   `pub enum AuthMode` still sits at
+   `src/command/commands/api_server/runtime.rs:26`, and `resolve_auth_mode`
+   is duplicated at `src/frontend/api/serve.rs:223` and
+   `src/command/commands/api_server/runtime.rs:409`. Collapse both onto the
+   engine type. Then add
    `AuthEngine::request_auth_mode(&self, skip: bool) -> Result<AuthMode>` and
    `AuthEngine::verify_bearer(&self, mode: &AuthMode, header: Option<&str>) -> AuthOutcome`
    using `verify_api_key`'s sentinel comparison.
@@ -319,10 +427,15 @@ Report F-14 (`src/frontend/api/serve.rs:43-87`, `src/engine/auth/mod.rs:413-431`
 
 #### F-17: `SquadSupervisor::health()`
 Report F-17 (`src/frontend/tui/squad_indicator.rs:53-78, 115-135`).
-1. Move `classify` and the probe sequence into
-   `SquadSupervisor::health(&self, timeout) -> SquadHealth` in
-   `src/engine/squad/supervisor.rs` (L1, where 0113 Step 3 put the
-   supervisor); move the `SquadHealth` enum there.
+1. Move `classify` (now `src/frontend/tui/squad_indicator.rs:78`) and the
+   probe sequence into `SquadSupervisor::health(&self, timeout) -> SquadHealth`
+   in `src/engine/squad/supervisor.rs` (L1, where 0113 Step 3 put the
+   supervisor). **Note (review 2026-09-22):** there is no `SquadHealth` type
+   to move — the existing enum is `SquadIndicator`
+   (`squad_indicator.rs:30`). Rename it as part of the move or keep the
+   current name; either is fine, but the report's wording implies a type
+   that does not exist. The file grew 232 → 398 lines since the report, so
+   the cited `:53-78, :115-135` spans no longer locate anything.
 2. `SquadIndicatorPoller` keeps its 10 s loop and colour mapping only.
    `squad status` may reuse `health()` for its summary line.
 3. Tests: `tests/squad_status_marker.rs` passes; move the `classify` unit
@@ -332,7 +445,11 @@ Report F-17 (`src/frontend/tui/squad_indicator.rs:53-78, 115-135`).
 Report F-18 (`src/frontend/tui/per_command/workflow_frontend.rs:23-125, 455-470`).
 1. Add `simple_advance: Option<SimpleAdvance { completed_step, next_step }>`
    and `current_step_name: Option<String>` to `AvailableActions`, computed in
-   `WorkflowEngine` where it already computes `can_launch_next`/`can_dismiss`.
+   `WorkflowEngine` where it already computes `can_launch_next`.
+   **Correction (review 2026-09-22):** `AvailableActions` lives in
+   `src/engine/workflow/actions.rs:32`, not in `workflow/mod.rs`, and has no
+   `can_dismiss` field — it gained several parallel-group fields (WI-0096)
+   after the report was written. Read the current struct before adding to it.
 2. The TUI picks the lightweight confirm when `simple_advance.is_some()`;
    `wcb_response_to_action` keeps the key map and drops the permission
    guards (the engine validates `NextAction` against `AvailableActions`).
@@ -366,8 +483,9 @@ Report F-43 (`src/frontend/tui/command_box.rs:20-52`, `src/command/commands/conf
 Report F-15 (`src/frontend/tui/app.rs:26-38, 772-817, 845-853`). Already
 done by 0113 Step 5: gateway injection keyed on `path.first() == "squad"`
 is replaced by `GatewayNeed`. Decision Q6: the banner is deleted.
-1. Delete the "INTERACTIVE MODE" banner (`app.rs:777-798`) and the
-   `is_containerized` match that gates it. No frontend shows it. If a later
+1. Delete the interactive-mode banner (`app.rs:688-709`; the literal reads
+   `INTERACTIVE mode`, not `INTERACTIVE MODE` as the report has it) and the
+   `is_containerized` match at `app.rs:688` that gates it. No frontend shows it. If a later
    need for a per-command "containerized" fact arises, it becomes a
    `CommandSpec` attribute, never a name match.
 2. Add `Dispatch::yolo_effective(&ParsedCommandBoxInput) -> bool` (or expose
@@ -418,7 +536,18 @@ Report F-20 (`src/frontend/tui/dialog_router.rs:70-260`, `src/frontend/tui/per_c
    indices and masks secrets.
 2. `DialogResponse::ConfigEdit(ConfigEditRequest)` replaces the tab-separated
    `Text`; delete `is_valid_map_key` (the command returns
-   `ConfigEditRejection`).
+   `ConfigEditRejection`). **Partly done (review 2026-09-22):**
+   `ConfigEditRequest`, `ConfigEditRejection` and `ConfigFieldRow` already
+   exist, and `src/frontend/tui/per_command/config.rs:17` already returns
+   `Result<Option<ConfigEditRequest>, CommandError>`. Still open: the
+   tab-separated `Text` path at `src/frontend/tui/dialog_router.rs:144` and
+   `is_valid_map_key` at `dialog_router.rs:88`. That helper is a silent drift
+   hazard worth naming in the commit: it re-implements `AgentName::new`'s
+   rules (`src/data/session.rs:72-80` — at most 64 characters, ASCII
+   alphanumeric plus `-` and `_`) and its own comment admits it "Mirrors
+   `data::session::AgentName` rules". Tighten `AgentName` and the dialog
+   keeps accepting what the writer now rejects. Delete it in favour of the
+   Layer 0 constructor rather than re-deriving the rules at Layer 3.
 3. Tests: `src/frontend/tui/tests/render_tests.rs` config cases pass; add a
    `ConfigCommand` test for a rejected map key.
 
@@ -444,7 +573,9 @@ Report F-24 (`src/frontend/tui/command_frontend.rs:64, 108-130`, `src/frontend/t
    `TuiCommandFrontend::new(parsed, dialogs, io, shared)`.
 2. `TabSharedState::for_tests()` replaces the five 50-line test constructors.
 3. Use the existing `SharedResizeTx` alias at `command_frontend.rs:64`;
-   remove all three `type_complexity` allows (F-16 removes the stats tuple).
+   remove all **four** `type_complexity` allows — three in
+   `src/frontend/tui/app.rs:107, 112, 121` plus `command_frontend.rs:64`;
+   the report's "three" predates the fourth (F-16 removes the stats tuple).
 
 #### F-31: config comes from `Session`, not from ad-hoc loads
 Report F-31. The frontend half (dockerfile prompt) closes with F-19.
@@ -593,7 +724,8 @@ Report F-32 (`src/engine/container/runtime.rs:82-320`, `src/engine/agent/mod.rs:
 `src/engine/ready/mod.rs:98-110`).
 1. `ContainerRuntime` delegates to `backend.cli_binary()`; add
    `ContainerBackend::display_name()` and `availability_probe_args()`;
-   delete the five `"apple-containers" =>` arms.
+   delete the `"apple-containers" =>` arms — **six** of them as of
+   2026-09-22, not the five the report counted.
 2. Extend `AgentMatrix` with `settings_mount: Option<&'static str>`,
    `skills_mount: Option<&'static str>`, `credential_source: CredentialSource`,
    `ping_argv: &'static [&'static str]`, `static_env: &'static [(&'static str, &'static str)]`,
@@ -678,8 +810,13 @@ practices; per-command reference belongs in `docs/`.
    rules across CLI/TUI/API, and the `api_allowed` PTY exclusion (Q7).
    Delete every per-command section. Ask the developer to review the new
    outline before writing the body.
-4. Add `requires_runtime: bool` to `CommandSpec`; delete the
-   `!matches!(path.first(), Some("config"))` literal.
+4. Add `requires_runtime: bool` to `CommandSpec`. **Partly done (review
+   2026-09-22):** the dispatch call site is already clean —
+   `CommandCatalogue::requires_runtime(path)` exists
+   (`src/command/dispatch/catalogue.rs:263`) and `dispatch/mod.rs:278` calls
+   it. The literal was moved rather than deleted: it is now that method's
+   body (`catalogue.rs:264`). Finish the job by making it a per-command
+   `CommandSpec` attribute.
 
 #### F-48: typed session kind and step status on the wire
 Report F-48. Decision Q10: the wire schema is not frozen; names may change.
@@ -732,11 +869,12 @@ Step 2 added `#[cfg(test)] Engines::for_tests(root)` and folded the nine
 `make_engines` copies onto it. `TabSharedState::for_tests` is F-24's, not
 0113's — confirm separately. The `TestEnv::engines()` / shared `make_session`
 helper and the seven `#[ignore]` `todo!()` stubs at
-`exec_workflow.rs:5846-5894` are **still open** for 0114.
+`exec_workflow.rs:6712-6760` (the report's `:5846-5894` predates ~1,250
+lines of growth in that file) are **still open** for 0114.
 1. `tests/helpers/mod.rs::TestEnv::engines()` and a single `make_session`
    helper in `src/data/session.rs` under `#[cfg(test)]` (or
    `tests/helpers`) replacing the 23 copies.
-2. The seven `#[ignore]` `todo!()` stubs at `exec_workflow.rs:5846-5894`:
+2. The seven `#[ignore]` `todo!()` stubs at `exec_workflow.rs:6712-6760`:
    implement them as real Docker-gated tests or delete them; a stub that can
    never run is not a test.
 
@@ -757,14 +895,170 @@ the API's raw `HashMap<String, Arc<RwLock<Session>>>` (in `AppState`,
 TUI's `InitialTab::Normal(Session)` into `InitialTab::Normal` built from
 `ctx.session`. Nothing remains for 0114.
 
+### Group G — regressions introduced by v0.12 (audit 2026-09-22)
+
+The 2026-09-03 report covers the tree at `955cca64`. Everything merged after
+it — WI 0113, WI 0115 remediation, WI 0116, the dynamic-workflow updates and
+the two squad commits — was re-audited against the grand architecture's three
+tenets on 2026-09-22. `make architecture-lint` passes, but it only enforces
+Tenet 1 (import direction); Tenets 2 and 3 are not machine-checked, and both
+findings below are Tenet 2. Neither is in the report, so both are numbered
+past its last finding.
+
+#### F-55: the TUI owns squad subcommand names and the confirm-modal copy
+`src/frontend/tui/dialogs/mod.rs:291-325` (new in `44949a41`),
+`src/frontend/tui/key_handler.rs:932-946`.
+
+`SquadConfirmAction` is a Layer 3 enum with three methods that are all Layer 2
+facts:
+- `subcommand()` hard-codes `"trigger"`, `"cancel"`, `"pause"`. The grand
+  architecture is explicit that the command list "resides within the Dispatch
+  package, NEVER any of the frontend packages". Rename a squad subcommand and
+  the catalogue changes while the TUI keeps dispatching the old name — nothing
+  fails at compile time.
+- `title()` and `question(name)` author the modal's prompt copy in the
+  frontend ("Very few strings should be defined within the TUI package").
+- `squad_dispatch_by_name` then hand-builds a `ParsedCommandBoxInput` with
+  `path: vec!["squad".into(), subcommand.into()]` and the argument key literal
+  `"name"`, bypassing the catalogue entirely, so neither the subcommand nor
+  the argument name is ever validated.
+
+This is a textbook `Prompt<D>` — a title, a body and two keyed choices — built
+in Layer 3 *after* F-19 specified that shape for Layer 2. Fix it with F-19:
+add `Prompt<SquadConfirmDecision>` supplied by `SquadCommand`, and have the
+TUI map `y`/`n` to the choice's `value` and return `default_on_dismiss` on
+Esc. The dispatch half belongs with F-15's rule that a command-name fact
+becomes a `CommandSpec` attribute, never a frontend literal. Do F-55 as part
+of those two findings rather than as a separate commit.
+
+#### F-56: Layer 1 renders the squad key banner
+`src/engine/squad/key_setup.rs:71-110` (new file, WI 0116), called from
+`src/engine/squad/supervisor.rs:115` and
+`src/command/commands/squad/daemon.rs:171`.
+
+`render_key_setup` composes box-drawing characters, blank-line-separated
+prose paragraphs, an indented shell snippet and a shell-specific rc-file
+instruction, and hands the result up as `UserMessage.text`. Every frontend
+therefore receives terminal box art it cannot restyle — the TUI draws its own
+frames, and the API serialises `═` runs into JSON.
+
+This is the same defect F-47 step 3 removes for `render_api_key_banner`,
+re-created one layer *lower*: the module comment even says it matches "the API
+server's first-run banner style". Fix it the same way F-47 does, and do the
+two together so the pattern leaves the tree once:
+1. Return the facts, not the rendering — the key, the resolved `ShellFlavor`,
+   and the export line (`export_snippet` is already exactly this and is the
+   part worth keeping).
+2. Move `render_key_setup`'s banner and prose to
+   `src/frontend/cli/per_command/squad.rs`, beside where F-47 puts the API
+   server's banner.
+3. `ShellFlavor` and `from_shell_path` are pure classification over a `$SHELL`
+   string and stay where they are.
+**Behaviour change**: as with F-47, the TUI and API stop receiving
+box-drawing text unless their own frontend renders it. Release note.
+
+#### F-57: two architecture-lint guards for the shapes that keep recurring
+`tools/architecture-lint.sh`. Not a defect of its own — this is the
+regression guard that stops F-47/F-56 and F-15/F-21/F-55 from growing back,
+the same way 0113 F-12's `#![allow(dead_code)]` guard and WI 0116's
+keychain-argv guard did for theirs.
+
+Both are Tenet 2 shapes, both are greppable, and — verified against `HEAD` on
+2026-09-22 — **every current hit of both is an open finding this work item
+already carries, with no unrelated false positives**. Neither line can be
+enabled today; each lands with the last finding it guards. Add each one in
+the same commit that clears its last hit, not before, or the line lands red
+(the mistake F-37 step 4 makes).
+
+**Guard 1 — no box-drawing characters below Layer 3.** Presentation is Layer
+3's job; a banner composed lower reaches every frontend as pre-rendered
+terminal art it cannot restyle, and the API serialises it into JSON. Fail on
+any `U+2500`–`U+257F` codepoint under `src/data/`, `src/engine/` or
+`src/command/`:
+```sh
+grep -rnP '[\x{2500}-\x{257F}]' "$SRC/data" "$SRC/engine" "$SRC/command" --include='*.rs'
+```
+Current hits — all of them F-47 or F-56, and all expected to be gone when
+those land, so **no allowlist is needed**:
+
+| File | Lines | Finding |
+|---|---:|---|
+| `src/command/commands/api_server/banner.rs` | 4 | F-47 step 3 |
+| `src/engine/squad/key_setup.rs` | 2 | F-56 |
+| `src/command/commands/api_server.rs:709` | 1 | F-47 step 3 (the test's `starts_with('╔')` assertion, which moves with the banner) |
+
+Gate: enable once F-47 step 3 and F-56 are both merged.
+
+**Guard 2 — a frontend may not hand-build a dispatch path.** The grand
+architecture requires command-box input to be "routed directly to a method in
+the `Dispatch` package, no parsing or anything else done by the TUI itself".
+A `ParsedCommandBoxInput` literal with a `path: vec![…]` of string literals
+bypasses the catalogue entirely: neither the subcommand nor the argument name
+is ever validated, and renaming either fails nothing at compile time. Fail on
+a `path: vec![` carrying a string literal inside `src/frontend/`:
+```sh
+grep -rn -A3 'ParsedCommandBoxInput {' "$SRC/frontend" --include='*.rs' \
+  | grep -E 'path: vec!\[\s*"'
+```
+Current hits, nine in production code across three files:
+
+| Site | Finding |
+|---|---|
+| `tui/mod.rs:167, 181` | F-21 step 2 (`Dispatch::startup_command`) |
+| `tui/key_handler.rs:314, 636, 1011, 1096, 1110` | F-21 / F-15 |
+| `tui/key_handler.rs:941` (`squad_dispatch_by_name`) | F-55 |
+| `tui/dialog_router.rs:462` | F-55 |
+
+Gate: enable once F-15, F-21 and F-55 are all merged.
+
+**Two false-positive traps, both already paid for once in this repo.**
+1. *Do not detect test code by position.* Six further hits of guard 2 are
+   test fixtures in `tui/per_command/{ready,init,clean,mount_scope,workflow_frontend}.rs`
+   and `app.rs:1378`, and they may legitimately stay. But "the last
+   `#[cfg(test)]` before this line" is not a reliable test: it misreads
+   `tui/mod.rs`, whose `#[cfg(test)] mod tests;` *declaration* sits at line 47
+   while the production startup path it appears to cover is at line 167.
+   `key_handler.rs` and `dialog_router.rs` have no `#[cfg(test)]` at all —
+   their tests live under `tui/tests/`. The script already documents this
+   lesson for the keychain guard ("The allowlist is by PATH, not by position
+   within a file"); apply it here and allowlist the six fixture files by
+   path, or move the fixtures behind a shared constructor and allowlist that
+   one file.
+2. *Guard 1 must not fire on doc comments.* `check_layer` already skips lines
+   whose trimmed content starts with `//`; reuse that filter rather than
+   writing a second one, so a future comment drawing a box in prose stays
+   legal.
+
+Follow the file's existing conventions: a comment block naming the finding
+and the reason, an anchored path allowlist against `"$SRC"`, and
+`VIOLATION [<tag>]: <display>:<lineno>` appended to `$VIOLATION_FILE`.
+Suggested tags: `layer-render` and `dispatch-bypass`.
+
+#### What came back clean
+Recorded so a later audit need not re-derive it: the WI 0116 env modules
+(`src/engine/squad/{env_store,env_state}.rs`) carry explicit layer reasoning
+in their module docs and place the keychain shim correctly at L1; squad
+verdict reason strings originate in the leader's verdict file, travel as
+`Option<String>` on typed L1 enum variants, and are only rendered by the
+frontends; `src/frontend/squad/routes.rs` delegates validation to
+`CommandCatalogue::validate_for_frontend` rather than validating in the route;
+`SquadRunLogs` (`src/data/fs/squad_paths.rs:165`) keeps squad log-path
+construction in Layer 0; and the post-audit TUI additions introduce no new
+defaults, policy branches or command-name string matches. The only Layer 3
+filesystem writes are the panic log (already F-44) and test code.
+
 ### Close-out
 
 1. Re-run the report's Phase 2 metrics and append a `## Remediation — WI 0114`
    section to `aspec/review-notes/0113-architecture-audit.md` with the
    before/after table and the status of each of F-13–F-54 (closed, deferred
-   with reason, rejected with the developer's decision).
+   with reason, rejected with the developer's decision), plus F-55 and F-56
+   from the v0.12 audit in Group G.
 2. Update `aspec/architecture/security.md` for `HostAgentPinger` (F-38) and,
    per report Q11, the `docker.sock` mount under `allow_docker`.
+2b. Confirm both F-57 guards are live before closing the item. A guard still
+   commented out, or added with an allowlist covering a site it was meant to
+   forbid, closes nothing — the next audit finds the same shape back.
 3. Update `aspec/architecture/four-layer-summary.md` if `Prompt<D>`,
    `HeadlessDefaults`, `CallerContext` or `LaunchPolicy` change the
    documented patterns.
@@ -797,6 +1091,13 @@ TUI's `InitialTab::Normal(Session)` into `InitialTab::Normal` built from
 - **F-48**: the wire schema is not frozen, but every renamed value is an
   API change for `docs/09-api-and-remote-mode.md` and the release notes;
   do not rename silently.
+- **F-56**: the key banner is printed exactly once, by whichever process
+  mints the key, and deliberately never by the detached daemon child whose
+  stdout is a log file the key must not reach (`key_setup.rs:76-78`). Moving
+  the rendering to the CLI must preserve that: the engine still decides
+  *whether* a key was minted and says so in the outcome; the frontend decides
+  only how to draw it. A daemon child that ends up with a frontend able to
+  render the banner would leak the key into the log.
 - **F-51**: splitting `workflow/mod.rs` must not change visibility of
   anything `exec_workflow.rs` or `squad/evaluation.rs` imports; use
   `pub(super)`/`pub(crate)` re-exports from `mod.rs`.
@@ -809,6 +1110,16 @@ TUI's `InitialTab::Normal(Session)` into `InitialTab::Normal` built from
   (F-13), the CLI/TUI prompt-parity test (F-19), the wire-string test
   (F-48), the `AgentMatrix` table tests (F-32), and the `markdown_reference`
   vs `cli.md` test (F-25).
+- Group G: F-55's squad confirm modal needs a test that the dispatched
+  subcommand comes from the catalogue, not a frontend literal — assert
+  through `Dispatch` so renaming a squad subcommand fails the test rather
+  than silently dispatching a dead name. F-56 needs the existing
+  `key_setup` rendering tests to move to the CLI frontend with the
+  rendering, leaving the engine side asserting only the export line.
+- F-57's two lint guards are themselves regression guards and carry no
+  tests of their own, but each must be added in the commit that clears its
+  last hit — verify by running `make architecture-lint` alone in that commit
+  and pasting the result into the message, as groups A, D and E already do.
 - Tests move with the code they test: parser tests to the engine (F-06 in
   0113), `classify` tests to L2 (F-17), dialog-selection tests to
   `AvailableActions` (F-18), slot-driver tests to L2 (0113 F-01).
@@ -829,7 +1140,14 @@ TUI's `InitialTab::Normal(Session)` into `InitialTab::Normal` built from
   F-19); frontends render and map keys only.
 - Findings partially or fully absorbed by WI 0113: F-15 (gateway keying),
   F-34 (dead fields), F-37 (`GITHUB_TOKEN`), F-42, F-52 (`Engines::for_tests`),
-  F-53 (dead link), F-54. Confirm each is done before marking it here.
+  F-53 (dead link), F-54. All seven re-confirmed done on 2026-09-22.
+- Findings absorbed by work that landed *after* 0113 (re-confirmed
+  2026-09-22): F-40 step 4 (`Capabilities::squad_supported`), F-14 step 1
+  (`AuthMode` now in `src/engine/auth/`), F-25 step 4
+  (`CommandCatalogue::requires_runtime`), F-20 step 2 (`ConfigEditRequest`
+  and friends). Each is annotated in place; pick up only the remainder.
+- **F-37 step 3 is superseded, not open.** Record it in the close-out as
+  rejected with the reason, not as deferred work.
 
 ## Documentation
 
@@ -850,6 +1168,8 @@ After implementation is complete, update user-facing documentation in `docs/` to
   commands or flags.
 - **Update `aspec/architecture/security.md`** for the `docker.sock` mount
   under `--allow-docker` (decision Q11) and for `HostAgentPinger` (F-38).
+- **`docs/12-squad.md`** also covers F-56: the key-setup banner is CLI-only
+  afterwards, the same note F-47 already requires for the API key banner.
 - **Create new user guides only if a new user-visible feature warrants it** — none is expected.
 - **Never create work-item-specific docs**.
 - **Keep all technical/implementation details in work item specs or code comments**, not in `docs/`.
