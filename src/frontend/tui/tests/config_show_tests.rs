@@ -2,6 +2,7 @@
 //! add-mapping flow, both routed through `dialog_router`.
 
 use super::*;
+use crate::command::commands::config::ConfigEditRequest;
 
 // ─── ConfigShow dialog behavior ──────────────────────────────────────────
 
@@ -22,7 +23,59 @@ fn config_row(
         global_writable,
         repo_writable,
         value_hint: None,
+        shape: crate::command::commands::config::ConfigFieldShape::Scalar,
     }
+}
+
+/// The rows `collect_config_rows` emits for an empty config, as the dialog
+/// sees them.
+///
+/// Taken from the real projection rather than hand-built, so the shapes the
+/// dialog router looks for are the ones production actually produces (F-20).
+fn real_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::ConfigShowRow> {
+    crate::command::commands::config::collect_config_rows(&serde_json::json!({}), &repo)
+        .into_iter()
+        .map(|r| crate::frontend::tui::dialogs::ConfigShowRow {
+            field: r.field,
+            global: r.global_value.unwrap_or_default(),
+            repo: r.repo_value.unwrap_or_default(),
+            effective: r.effective_value.unwrap_or_default(),
+            read_only: r.read_only,
+            global_writable: r.global_writable,
+            repo_writable: r.repo_writable,
+            value_hint: r.value_hint,
+            shape: r.shape,
+        })
+        .collect()
+}
+
+/// The header row for the agent→models map, plus any per-agent rows the given
+/// repo config produces.
+fn map_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::ConfigShowRow> {
+    use crate::command::commands::config::ConfigFieldShape;
+    real_rows(repo)
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.shape,
+                ConfigFieldShape::MapHeader { .. } | ConfigFieldShape::MapEntry
+            )
+        })
+        .collect()
+}
+
+/// The same for the guidance array.
+fn guidance_rows(repo: serde_json::Value) -> Vec<crate::frontend::tui::dialogs::ConfigShowRow> {
+    use crate::command::commands::config::ConfigFieldShape;
+    real_rows(repo)
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.shape,
+                ConfigFieldShape::ArrayHeader { .. } | ConfigFieldShape::ArrayEntry
+            )
+        })
+        .collect()
 }
 
 fn config_show_dialog(rows: Vec<crate::frontend::tui::dialogs::ConfigShowRow>) -> Dialog {
@@ -202,8 +255,10 @@ fn enter_while_editing_sends_field_value_scope_response() {
 
     let resp = rx.try_recv().expect("save must send a dialog response");
     match resp {
-        DialogResponse::Text(s) => assert_eq!(s, "agent\tclaud\tglobal"),
-        other => panic!("expected Text response, got {other:?}"),
+        DialogResponse::ConfigEdit(edit) => {
+            assert_eq!(edit, ConfigEditRequest::to_field("agent", "claud", true))
+        }
+        other => panic!("expected ConfigEdit response, got {other:?}"),
     }
     assert!(
         app.active_dialog.is_none(),
@@ -235,11 +290,12 @@ fn enter_while_editing_trims_whitespace_before_saving() {
 
     let resp = rx.try_recv().expect("save must send a dialog response");
     match resp {
-        DialogResponse::Text(s) => assert_eq!(
-            s, "dynamicWorkflows.maxConcurrentSteps\t3\trepo",
+        DialogResponse::ConfigEdit(edit) => assert_eq!(
+            edit,
+            ConfigEditRequest::to_field("dynamicWorkflows.maxConcurrentSteps", "3", false),
             "stray whitespace must be trimmed so the value validates"
         ),
-        other => panic!("expected Text response, got {other:?}"),
+        other => panic!("expected ConfigEdit response, got {other:?}"),
     }
 }
 
@@ -281,7 +337,10 @@ fn ctrl_n_starts_add_mapping_flow_and_esc_cancels_it() {
     use crate::frontend::tui::dialogs::NewMapEntryPhase;
 
     let mut app = make_app();
-    let _rx = setup_command_dialog(&mut app, config_show_dialog(vec![]));
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(map_rows(serde_json::json!({}))),
+    );
 
     press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
     {
@@ -303,7 +362,10 @@ fn ctrl_n_starts_add_mapping_flow_and_esc_cancels_it() {
 #[test]
 fn ctrl_n_flow_sends_repo_scoped_mapping_edit() {
     let mut app = make_app();
-    let rx = setup_command_dialog(&mut app, config_show_dialog(vec![]));
+    let rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(map_rows(serde_json::json!({}))),
+    );
 
     press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
     for c in "maki".chars() {
@@ -317,11 +379,16 @@ fn ctrl_n_flow_sends_repo_scoped_mapping_edit() {
 
     let resp = rx.try_recv().expect("saving the mapping must respond");
     match resp {
-        DialogResponse::Text(s) => assert_eq!(
-            s, "dynamicWorkflows.agentsToModels.maki\tmodel-a, model-b\trepo",
+        DialogResponse::ConfigEdit(edit) => assert_eq!(
+            edit,
+            ConfigEditRequest::to_field(
+                "dynamicWorkflows.agentsToModels.maki",
+                "model-a, model-b",
+                false
+            ),
             "the new mapping must be written to the repo scope"
         ),
-        other => panic!("expected Text response, got {other:?}"),
+        other => panic!("expected ConfigEdit response, got {other:?}"),
     }
 }
 
@@ -330,7 +397,10 @@ fn ctrl_n_flow_rejects_invalid_agent_name() {
     use crate::frontend::tui::dialogs::NewMapEntryPhase;
 
     let mut app = make_app();
-    let _rx = setup_command_dialog(&mut app, config_show_dialog(vec![]));
+    let _rx = setup_command_dialog(
+        &mut app,
+        config_show_dialog(map_rows(serde_json::json!({}))),
+    );
 
     press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
     for c in "bad name!".chars() {
@@ -346,8 +416,10 @@ fn ctrl_n_flow_rejects_invalid_agent_name() {
         Some(NewMapEntryPhase::Key),
         "an invalid agent name must keep the flow in the key phase"
     );
+    // The wording is `AgentName`'s, in Layer 0 — the same message the config
+    // writer would produce (F-20).
     assert!(
-        app.status_bar.text.contains("not a valid agent name"),
+        app.status_bar.text.contains("invalid agent name"),
         "the status bar must explain the rejection: {}",
         app.status_bar.text
     );
@@ -358,17 +430,9 @@ fn ctrl_n_with_existing_agent_jumps_to_that_row_for_editing() {
     let mut app = make_app();
     let _rx = setup_command_dialog(
         &mut app,
-        config_show_dialog(vec![
-            config_row("agent", "claude", "", false, true, true),
-            config_row(
-                "dynamicWorkflows.agentsToModels.claude",
-                "",
-                "claude-opus-4-8",
-                false,
-                false,
-                true,
-            ),
-        ]),
+        config_show_dialog(map_rows(serde_json::json!({
+            "dynamicWorkflows": { "agentsToModels": { "claude": ["claude-opus-4-8"] } }
+        }))),
     );
 
     press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
@@ -466,11 +530,12 @@ fn enter_while_editing_guidance_entry_sends_response() {
 
     let resp = rx.try_recv().expect("save must send a dialog response");
     match resp {
-        DialogResponse::Text(s) => assert_eq!(
-            s, "dynamicWorkflows.guidance.0\tnew instruction\trepo",
+        DialogResponse::ConfigEdit(edit) => assert_eq!(
+            edit,
+            ConfigEditRequest::to_field("dynamicWorkflows.guidance.0", "new instruction", false),
             "editing an existing entry must send the field\\tvalue\\trepo response"
         ),
-        other => panic!("expected Text response, got {other:?}"),
+        other => panic!("expected ConfigEdit response, got {other:?}"),
     }
 }
 
@@ -497,12 +562,13 @@ fn enter_while_editing_guidance_entry_to_empty_value_sends_removal_response() {
 
     let resp = rx.try_recv().expect("save must send a dialog response");
     match resp {
-        DialogResponse::Text(s) => assert_eq!(
-            s, "dynamicWorkflows.guidance.0\t\trepo",
+        DialogResponse::ConfigEdit(edit) => assert_eq!(
+            edit,
+            ConfigEditRequest::to_field("dynamicWorkflows.guidance.0", "", false),
             "an empty value must be sent through unfiltered; the config layer coerces \
              empty guidance values to removal"
         ),
-        other => panic!("expected Text response, got {other:?}"),
+        other => panic!("expected ConfigEdit response, got {other:?}"),
     }
 }
 
@@ -542,32 +608,9 @@ fn ctrl_n_guidance_flow_sends_repo_scoped_append_response() {
     let mut app = make_app();
     let rx = setup_command_dialog(
         &mut app,
-        config_show_dialog(vec![
-            config_row(
-                "dynamicWorkflows.guidance",
-                "",
-                "2 entries",
-                true,
-                false,
-                false,
-            ),
-            config_row(
-                "dynamicWorkflows.guidance.0",
-                "",
-                "first entry",
-                false,
-                false,
-                true,
-            ),
-            config_row(
-                "dynamicWorkflows.guidance.1",
-                "",
-                "second entry",
-                false,
-                false,
-                true,
-            ),
-        ]),
+        config_show_dialog(guidance_rows(serde_json::json!({
+            "dynamicWorkflows": { "guidance": ["first entry", "second entry"] }
+        }))),
     );
 
     press_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
@@ -578,11 +621,12 @@ fn ctrl_n_guidance_flow_sends_repo_scoped_append_response() {
 
     let resp = rx.try_recv().expect("saving the new entry must respond");
     match resp {
-        DialogResponse::Text(s) => assert_eq!(
-            s, "dynamicWorkflows.guidance.2\tthird entry\trepo",
+        DialogResponse::ConfigEdit(edit) => assert_eq!(
+            edit,
+            ConfigEditRequest::to_field("dynamicWorkflows.guidance.2", "third entry", false),
             "the new entry must append at the current entry count"
         ),
-        other => panic!("expected Text response, got {other:?}"),
+        other => panic!("expected ConfigEdit response, got {other:?}"),
     }
 }
 

@@ -6,21 +6,19 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
-use serde::Serialize;
-
-use crate::command::commands::squad::commands::{SquadCommandFrontend, SquadServeConfig};
+use crate::command::commands::squad::commands::{
+    SquadCommandFrontend, SquadOutcome, SquadServeConfig,
+};
 use crate::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use crate::command::commands::squad::gateway::DaemonStatus;
 use crate::command::commands::squad::key_setup;
-use crate::command::commands::Command;
+use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::env::Env;
-use crate::data::fs::{
-    AcquireError, DaemonGuard, DaemonKind, DaemonProcess, DataPaths, SquadPaths, Termination,
-};
+use crate::data::fs::{DataPaths, SquadPaths};
 use crate::data::message::{MessageLevel, UserMessage};
+use crate::engine::daemon::{AcquireError, DaemonGuard, DaemonKind, DaemonSupervisor, Termination};
 
 #[derive(Debug, Clone)]
 pub struct SquadStartFlags {
@@ -46,62 +44,42 @@ pub enum SquadDaemonSubcommand {
     Logs(SquadLogsFlags),
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", content = "payload")]
-pub enum SquadDaemonOutcome {
-    Started {
-        port: u16,
-        background: bool,
-        refreshed_key: bool,
-    },
-    Stopped {
-        stopped_pid: Option<u32>,
-    },
-    Status(DaemonStatus),
-    Logs {
-        log_path: String,
-    },
-}
-
-pub struct SquadDaemonCommand {
+/// Daemon lifecycle for `awman squad start|stop|status|logs`.
+///
+/// Not a `Command`: these four are subcommands of `awman squad`, dispatched
+/// by [`SquadCommand`], and a second `Command` impl for them only meant a
+/// second outcome enum (`SquadDaemonOutcome`) that `SquadCommand` translated
+/// back into [`SquadOutcome`] one variant at a time (F-35). It is a plain
+/// struct with a `run` method that produces `SquadOutcome` directly.
+///
+/// [`SquadCommand`]: crate::command::commands::squad::commands::SquadCommand
+pub struct SquadDaemon {
     sub: SquadDaemonSubcommand,
     engines: Engines,
 }
 
-impl SquadDaemonCommand {
+impl SquadDaemon {
     pub fn new(sub: SquadDaemonSubcommand, engines: Engines) -> Self {
         Self { sub, engines }
     }
-}
 
-#[async_trait]
-impl Command for SquadDaemonCommand {
-    type Frontend = Box<dyn SquadCommandFrontend>;
-    type Outcome = SquadDaemonOutcome;
-
-    async fn run_with_frontend(
+    pub async fn run(
         self,
-        mut frontend: Self::Frontend,
-    ) -> Result<Self::Outcome, CommandError> {
+        frontend: &mut dyn SquadCommandFrontend,
+    ) -> Result<SquadOutcome, CommandError> {
         let env = Env::from_process();
         let paths = SquadPaths::from_env(&env)?;
-        let process = squad_process(&paths);
+        let process = squad_supervisor(&paths);
         let guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env)?;
         let outcome = match self.sub {
             SquadDaemonSubcommand::Start(flags) => {
-                run_start(
-                    flags,
-                    &self.engines,
-                    &paths,
-                    &process,
-                    &guard,
-                    &mut *frontend,
-                )
-                .await?
+                run_start(flags, &self.engines, &paths, &process, &guard, frontend).await?
             }
-            SquadDaemonSubcommand::Stop(_) => run_stop(&process, &mut *frontend)?,
+            SquadDaemonSubcommand::Stop(_) => run_stop(&process, frontend)?,
             SquadDaemonSubcommand::Status(_) => run_status(&process).await?,
-            SquadDaemonSubcommand::Logs(flags) => run_logs(&process, flags, &mut *frontend).await?,
+            SquadDaemonSubcommand::Logs(flags) => {
+                run_logs(&paths, &process, flags, frontend).await?
+            }
         };
         frontend.replay_queued();
         Ok(outcome)
@@ -110,7 +88,7 @@ impl Command for SquadDaemonCommand {
 
 /// The squad daemon's process identity. Re-exported from Layer 1 so this
 /// module keeps naming the daemon it drives (WI 0113 F-02).
-pub use crate::engine::squad::supervisor::squad_process;
+pub use crate::engine::squad::supervisor::{squad_process, squad_supervisor};
 
 /// Daemon supervision moved to Layer 1 (`engine::squad::supervisor`) in WI
 /// 0113 F-02. `SquadKeyState` is re-exported here because the CLI and TUI
@@ -124,10 +102,10 @@ async fn run_start(
     flags: SquadStartFlags,
     engines: &Engines,
     paths: &SquadPaths,
-    process: &DaemonProcess,
+    process: &DaemonSupervisor,
     guard: &DaemonGuard,
     frontend: &mut dyn SquadCommandFrontend,
-) -> Result<SquadDaemonOutcome, CommandError> {
+) -> Result<SquadOutcome, CommandError> {
     // Must precede every actual daemon launch, including a detached launch.
     guard.check()?;
     if let Some(pid) = process.running_pid()? {
@@ -154,27 +132,30 @@ async fn run_start(
         });
     }
     if flags.refresh_key
-        || (!flags.dangerously_skip_auth && process.paths().read_key_hash()?.is_none())
+        || (!flags.dangerously_skip_auth && process.process().paths().read_key_hash()?.is_none())
     {
         let key = engines.auth_engine.generate_api_key()?;
         let hash = engines.auth_engine.hash_api_key(&key);
-        process.paths().write_key_hash(hash.as_str())?;
+        process.process().paths().write_key_hash(hash.as_str())?;
         tracing::info!(
             refresh = flags.refresh_key,
             "squad daemon key minted or refreshed"
         );
         // The plaintext key is disclosed exactly here, in the foreground
         // process that owns a terminal — never in the detached child, whose
-        // stdout lands in a log file `awman squad logs` prints verbatim.
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: key_setup::render_key_setup(
-                key.as_str(),
-                key_setup::ShellFlavor::from_env(&Env::from_process()),
-            ),
-        });
+        // stdout lands in a log file `awman squad logs` prints verbatim. The
+        // child reaches this block only when the hash is absent, and the hash
+        // was written two lines up, so it never does.
+        //
+        // Layer 2 says *that* a key was minted and hands over the facts; how
+        // the disclosure is drawn is the frontend's, and a frontend with no
+        // user in front of it draws nothing (WI 0114 F-56).
+        frontend.show_key_setup(&SquadKeySetup::for_key(
+            key.as_str(),
+            key_setup::ShellFlavor::from_env(&Env::from_process()),
+        ));
         if flags.refresh_key {
-            return Ok(SquadDaemonOutcome::Started {
+            return Ok(SquadOutcome::Started {
                 port: flags.port,
                 background: false,
                 refreshed_key: true,
@@ -199,7 +180,7 @@ async fn run_start(
             level: MessageLevel::Success,
             text: format!("squad daemon started in background (PID {pid})."),
         });
-        return Ok(SquadDaemonOutcome::Started {
+        return Ok(SquadOutcome::Started {
             port: flags.port,
             background: true,
             refreshed_key: false,
@@ -211,7 +192,7 @@ async fn run_start(
             AcquireError::AlreadyRunning { pid } => {
                 CommandError::Other(format!("squad daemon is already running (PID {pid})"))
             }
-            other => CommandError::Data(other.into_data_error()),
+            other => CommandError::from(other.into_engine_error()),
         })?;
     tracing::info!(port = flags.port, "squad daemon starting in foreground");
     // Layer 2 owns the bootstrap: admission, daemon engines, evaluator, then
@@ -253,13 +234,13 @@ async fn run_start(
     // token for both files. The sidecar goes first, while the claim is still
     // demonstrably ours.
     let me = std::process::id();
-    if process.owns_pidfile(me).unwrap_or(false) {
-        let _ = process.clear_meta();
+    if process.process().owns_pidfile(me).unwrap_or(false) {
+        let _ = process.process().clear_meta();
     }
     let _ = guard.release_owned_by(me);
     result?;
     let _ = paths;
-    Ok(SquadDaemonOutcome::Started {
+    Ok(SquadOutcome::Started {
         port: flags.port,
         background: false,
         refreshed_key: false,
@@ -267,9 +248,9 @@ async fn run_start(
 }
 
 fn run_stop(
-    process: &DaemonProcess,
+    process: &DaemonSupervisor,
     frontend: &mut dyn SquadCommandFrontend,
-) -> Result<SquadDaemonOutcome, CommandError> {
+) -> Result<SquadOutcome, CommandError> {
     tracing::info!("squad administrator requested daemon stop");
     let pid = match process.terminate_running()? {
         Termination::Terminated { pid } => pid,
@@ -277,26 +258,27 @@ fn run_stop(
         // cleaned up either way, so the daemon is simply not running.
         _ => return Err(CommandError::Other("squad daemon is not running".into())),
     };
-    let _ = process.clear_meta();
+    let _ = process.process().clear_meta();
     tracing::info!(pid, "squad daemon stopped");
     frontend.write_message(UserMessage {
         level: MessageLevel::Success,
         text: format!("squad daemon (PID {pid}) stopped."),
     });
-    Ok(SquadDaemonOutcome::Stopped {
+    Ok(SquadOutcome::Stopped {
         stopped_pid: Some(pid),
     })
 }
 
 async fn run_logs(
-    process: &DaemonProcess,
+    paths: &SquadPaths,
+    process: &DaemonSupervisor,
     flags: SquadLogsFlags,
     frontend: &mut dyn SquadCommandFrontend,
-) -> Result<SquadDaemonOutcome, CommandError> {
-    let path = process.paths().log_file();
+) -> Result<SquadOutcome, CommandError> {
+    let path = process.process().paths().log_file();
     // Initial dump: emit every existing line and remember where the file ends
     // so follow-mode only streams what is appended after this point.
-    let mut offset = match tail_new_lines(&path, 0)? {
+    let mut offset = match tail_new_lines(paths, 0)? {
         Some((lines, end)) => {
             for line in lines {
                 frontend.write_message(UserMessage {
@@ -323,7 +305,7 @@ async fn run_logs(
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                    if let Some((lines, end)) = tail_new_lines(&path, offset)? {
+                    if let Some((lines, end)) = tail_new_lines(paths, offset)? {
                         for line in lines {
                             frontend.write_message(UserMessage {
                                 level: MessageLevel::Info,
@@ -337,7 +319,7 @@ async fn run_logs(
         }
     }
 
-    Ok(SquadDaemonOutcome::Logs {
+    Ok(SquadOutcome::Logs {
         log_path: path.display().to_string(),
     })
 }
@@ -347,15 +329,16 @@ async fn run_logs(
 /// partial trailing line is re-read on the next call), or `None` when the file
 /// does not exist yet.
 fn tail_new_lines(
-    path: &std::path::Path,
+    paths: &SquadPaths,
     from: u64,
 ) -> Result<Option<(Vec<String>, u64)>, CommandError> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(crate::data::error::DataError::io(path, error).into()),
+    // Layer 0 owns the path and the open (F-47); `None` is "no log yet".
+    let Some(mut file) = paths.open_daemon_log()? else {
+        return Ok(None);
     };
+    let path = paths.daemon().log_file();
+    let path = path.as_path();
     let len = file
         .metadata()
         .map_err(|error| crate::data::error::DataError::io(path, error))?
@@ -379,13 +362,13 @@ fn tail_new_lines(
     Ok(Some((lines, start + consumed as u64)))
 }
 
-async fn run_status(process: &DaemonProcess) -> Result<SquadDaemonOutcome, CommandError> {
+async fn run_status(process: &DaemonSupervisor) -> Result<SquadOutcome, CommandError> {
     let pid = process.running_pid()?;
-    let meta = process.read_meta()?;
+    let meta = process.process().read_meta()?;
     let bound_addr = meta
         .as_ref()
         .map(|m| format!("{}://{}:{}", m.scheme, m.bind_ip, m.port));
-    Ok(SquadDaemonOutcome::Status(DaemonStatus {
+    Ok(SquadOutcome::Status(DaemonStatus {
         running: pid.is_some(),
         pid,
         bound_addr,
@@ -396,7 +379,7 @@ async fn run_status(process: &DaemonProcess) -> Result<SquadDaemonOutcome, Comma
         // Read from the process sidecar, not from a daemon: there is nobody to
         // ask about persistence or coverage here, and reporting a guess would
         // be worse than reporting nothing.
-        env_persistence: String::new(),
+        env_persistence: None,
         unmet_env: Vec::new(),
     }))
 }
@@ -404,13 +387,26 @@ async fn run_status(process: &DaemonProcess) -> Result<SquadDaemonOutcome, Comma
 #[cfg(test)]
 mod tests {
     use super::tail_new_lines;
+    use crate::data::fs::SquadPaths;
+
+    /// A `SquadPaths` rooted at `tmp`, with its daemon log directory created
+    /// so the test can write the file `tail_new_lines` will open (F-47: the
+    /// open is Layer 0's, so the fixture is a `SquadPaths`, not a bare path).
+    fn log_paths(tmp: &std::path::Path) -> (SquadPaths, std::path::PathBuf) {
+        let paths = SquadPaths::from_root(tmp.to_path_buf());
+        let path = paths.daemon().log_file();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        (paths, path)
+    }
 
     #[test]
     fn tail_reads_the_whole_file_on_the_first_pass() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("awman.log");
+        let (paths, path) = log_paths(tmp.path());
         std::fs::write(&path, "one\ntwo\n").unwrap();
-        let (lines, end) = tail_new_lines(&path, 0).unwrap().unwrap();
+        let (lines, end) = tail_new_lines(&paths, 0).unwrap().unwrap();
         assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
         assert_eq!(end, 8);
     }
@@ -418,12 +414,12 @@ mod tests {
     #[test]
     fn tail_streams_only_lines_appended_after_the_offset() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("awman.log");
+        let (paths, path) = log_paths(tmp.path());
         std::fs::write(&path, "one\n").unwrap();
-        let (_, end) = tail_new_lines(&path, 0).unwrap().unwrap();
+        let (_, end) = tail_new_lines(&paths, 0).unwrap().unwrap();
         // Append more; a follow tick from `end` yields only the new line.
         std::fs::write(&path, "one\ntwo\n").unwrap();
-        let (lines, end2) = tail_new_lines(&path, end).unwrap().unwrap();
+        let (lines, end2) = tail_new_lines(&paths, end).unwrap().unwrap();
         assert_eq!(lines, vec!["two".to_string()]);
         assert_eq!(end2, 8);
     }
@@ -431,22 +427,25 @@ mod tests {
     #[test]
     fn tail_does_not_emit_a_partial_final_line() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("awman.log");
+        let (paths, path) = log_paths(tmp.path());
         // No trailing newline: the partial line must be withheld and re-read.
         std::fs::write(&path, "complete\npartial").unwrap();
-        let (lines, end) = tail_new_lines(&path, 0).unwrap().unwrap();
+        let (lines, end) = tail_new_lines(&paths, 0).unwrap().unwrap();
         assert_eq!(lines, vec!["complete".to_string()]);
         assert_eq!(end, 9, "offset advances only past the last newline");
         // Once the line is completed, the next tick emits it in full.
         std::fs::write(&path, "complete\npartial done\n").unwrap();
-        let (lines, _) = tail_new_lines(&path, end).unwrap().unwrap();
+        let (lines, _) = tail_new_lines(&paths, end).unwrap().unwrap();
         assert_eq!(lines, vec!["partial done".to_string()]);
     }
 
     #[test]
     fn tail_reports_a_missing_file_as_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("does-not-exist.log");
-        assert!(tail_new_lines(&path, 0).unwrap().is_none());
+        let paths = SquadPaths::from_root(tmp.path().to_path_buf());
+        assert!(
+            tail_new_lines(&paths, 0).unwrap().is_none(),
+            "a daemon that has never logged reads as None, not an error"
+        );
     }
 }

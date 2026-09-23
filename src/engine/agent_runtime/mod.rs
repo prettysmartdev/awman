@@ -73,6 +73,19 @@ impl ResolvedAgentOptions {
     }
 }
 
+/// What `AgentRuntimeEngine::ready_agent` should do for one agent.
+///
+/// Both tiers honour `no_cache`; the container tier also honours `build`
+/// (force a rebuild even when the image is present). A sandbox runtime has
+/// no image to force, so `build` is inert there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadyAgentOptions {
+    /// Rebuild/re-emit from scratch, ignoring any cache.
+    pub no_cache: bool,
+    /// Container tier: rebuild the agent image even if it already exists.
+    pub build: bool,
+}
+
 /// What every agent runtime must support. The cross-paradigm trait surface
 /// Layer 2 programs against; paradigm-specific decisions branch on
 /// `capabilities()` or `runtime_name()`, never on concrete types.
@@ -108,6 +121,23 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// provide per-resource metrics (sandbox-class runtimes today).
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError>;
 
+    /// Stats for a running agent known only by name.
+    ///
+    /// Callers that hold a name but no `AgentHandle` — a view tracking a
+    /// container the engine named for it — used to fabricate a handle with an
+    /// empty image tag and `Utc::now()` for the start time, purely to satisfy
+    /// the signature (WI 0114 F-16). The default does exactly that, once, in
+    /// the layer that owns the handle type; a runtime whose stats call takes
+    /// a name natively can override it.
+    fn stats_by_name(&self, name: &str) -> Result<AgentStats, EngineError> {
+        self.stats(&AgentHandle {
+            id: name.to_string(),
+            name: name.to_string(),
+            image_tag: String::new(),
+            started_at: chrono::Utc::now(),
+        })
+    }
+
     /// Stop a running agent. Semantics vary per runtime:
     ///   - container: stop + rm
     ///   - sandbox:   stop (preserve persistent volume)
@@ -140,6 +170,42 @@ pub trait AgentRuntimeEngine: Send + Sync {
 
     /// Name of the CLI binary this runtime drives ("docker", "container", "sbx").
     fn cli_binary(&self) -> &'static str;
+
+    // ─── Agent environment preparation (F-40b) ───────────────────────────
+    //
+    // `ready`, `init` and the agent engine program against these instead of
+    // holding a typed `Arc<ContainerRuntime>`. The image-store methods are
+    // container-paradigm operations: a kit-declarative runtime answers
+    // `EngineError::UnsupportedOnRuntime`, which is a typed "this runtime
+    // cannot" rather than a panic or a silent `false`.
+
+    /// Make `agent`'s environment ready to launch: an image build on the
+    /// container tier, a kit emit + validate on the sandbox tier. The
+    /// paradigm branch lives here, not in the caller.
+    fn ready_agent(
+        &self,
+        agent: &str,
+        opts: ReadyAgentOptions,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+    ) -> Result<(), EngineError>;
+
+    /// Whether `tag` exists in this runtime's local image store.
+    fn image_exists(&self, tag: &str) -> Result<bool, EngineError>;
+
+    /// The `HOME` baked into `tag`'s image config, when the runtime can read
+    /// it. `Ok(None)` means "image present, no `HOME` declared".
+    fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError>;
+
+    /// Build `tag` from `dockerfile` in `context`, streaming build output to
+    /// `on_line`.
+    fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &std::path::Path,
+        context: &std::path::Path,
+        no_cache: bool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError>;
 }
 
 /// The concrete runtime `detect()` chose, exposing both the cross-paradigm

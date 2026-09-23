@@ -28,9 +28,9 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::data::workflow_state::{PhaseStepStatus, StepState, WorkflowState};
+use crate::data::workflow_state::WorkflowState;
 use crate::frontend::tui::tabs::{
-    WorkflowOverviewState, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    StepViewStatus, WorkflowOverviewState, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
 };
 
 /// Rows occupied by one step box (rounded border + one content row).
@@ -170,7 +170,7 @@ pub fn render_workflow_overview(
                         step.name.clone()
                     };
                     let (label, style) =
-                        step_box_label_and_style(&name, &step.status, is_current, box_w);
+                        step_box_label_and_style(&name, step.status, is_current, box_w);
                     let title = column_title.clone().or_else(|| {
                         step_agent_model_title(step.agent.as_deref(), step.model.as_deref(), box_w)
                     });
@@ -182,7 +182,7 @@ pub fn render_workflow_overview(
                     // under different agents/models, so it carries no single
                     // agent/model label — press Ctrl-O to see them. A setup/
                     // teardown column keeps its phase label even collapsed.
-                    let (label, style) = step_box_label_and_style(&name, status, false, box_w);
+                    let (label, style) = step_box_label_and_style(&name, *status, false, box_w);
                     (label, style, column_title.clone())
                 }
             };
@@ -246,12 +246,10 @@ enum ColumnRow<'a> {
     },
     /// The minimized-mode summary of a multi-step stage: `N steps…`, drawn in
     /// the stage's aggregate status colour.
-    Stage { count: usize, status: &'static str },
-}
-
-/// Whether a step status is terminal (the step will not run again).
-fn is_completed_status(status: &str) -> bool {
-    matches!(status, "done" | "cancelled" | "skipped")
+    Stage {
+        count: usize,
+        status: StepViewStatus,
+    },
 }
 
 /// Build the ordered display rows for one stage in **maximized** mode.
@@ -269,12 +267,12 @@ fn build_column_rows<'a>(
     let mut active_idx = 0usize;
     col.iter()
         .map(|s| {
-            let queued = if is_completed_status(&s.status) {
+            let queued = if s.status.is_terminal() {
                 false
             } else {
                 let i = active_idx;
                 active_idx += 1;
-                matches!(max_concurrent, Some(mc) if i >= mc) && s.status == "pending"
+                matches!(max_concurrent, Some(mc) if i >= mc) && s.status == StepViewStatus::Pending
             };
             ColumnRow::Step { step: s, queued }
         })
@@ -305,22 +303,22 @@ fn build_minimized_row<'a>(col: &[&'a WorkflowStepView]) -> ColumnRow<'a> {
 /// is terminal does the stage read as finished — as `done` when they all
 /// succeeded, otherwise as `cancelled` (the ⊘ glyph, since something was
 /// cancelled or skipped).
-fn stage_status(col: &[&WorkflowStepView]) -> &'static str {
-    let has = |s: &str| col.iter().any(|step| step.status == s);
-    if has("error") {
-        "error"
-    } else if has("fixing") {
-        "fixing"
-    } else if has("running") {
-        "running"
-    } else if col.iter().all(|s| is_completed_status(&s.status)) {
-        if col.iter().all(|s| s.status == "done") {
-            "done"
+fn stage_status(col: &[&WorkflowStepView]) -> StepViewStatus {
+    let has = |s: StepViewStatus| col.iter().any(|step| step.status == s);
+    if has(StepViewStatus::Error) {
+        StepViewStatus::Error
+    } else if has(StepViewStatus::Fixing) {
+        StepViewStatus::Fixing
+    } else if has(StepViewStatus::Running) {
+        StepViewStatus::Running
+    } else if col.iter().all(|s| s.status.is_terminal()) {
+        if col.iter().all(|s| s.status == StepViewStatus::Done) {
+            StepViewStatus::Done
         } else {
-            "cancelled"
+            StepViewStatus::Cancelled
         }
     } else {
-        "pending"
+        StepViewStatus::Pending
     }
 }
 
@@ -335,7 +333,7 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
     for ps in &state.setup_step_states {
         steps.push(WorkflowStepView {
             name: ps.description.clone(),
-            status: phase_step_status_to_str(&ps.status).to_string(),
+            status: StepViewStatus::of_phase_step_status(&ps.status),
             agent: None,
             model: None,
             depends_on: Vec::new(),
@@ -347,9 +345,8 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
         let status = state
             .step_states
             .get(&info.name)
-            .map(step_state_to_str)
-            .unwrap_or("pending")
-            .to_string();
+            .map(StepViewStatus::of_step_state)
+            .unwrap_or(StepViewStatus::Pending);
         steps.push(WorkflowStepView {
             name: info.name.clone(),
             status,
@@ -363,7 +360,7 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
     for ps in &state.teardown_step_states {
         steps.push(WorkflowStepView {
             name: ps.description.clone(),
-            status: phase_step_status_to_str(&ps.status).to_string(),
+            status: StepViewStatus::of_phase_step_status(&ps.status),
             agent: None,
             model: None,
             depends_on: Vec::new(),
@@ -384,27 +381,6 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
         steps,
         current_step,
         max_concurrent: None,
-    }
-}
-
-fn step_state_to_str(state: &StepState) -> &'static str {
-    match state {
-        StepState::Pending => "pending",
-        StepState::Running { .. } => "running",
-        StepState::Succeeded => "done",
-        StepState::Failed { .. } => "error",
-        StepState::Cancelled => "cancelled",
-        StepState::Skipped => "skipped",
-    }
-}
-
-fn phase_step_status_to_str(status: &PhaseStepStatus) -> &'static str {
-    match status {
-        PhaseStepStatus::Pending => "pending",
-        PhaseStepStatus::Running => "running",
-        PhaseStepStatus::Succeeded => "done",
-        PhaseStepStatus::Failed { .. } => "error",
-        PhaseStepStatus::Remediating { .. } => "fixing",
     }
 }
 
@@ -541,7 +517,7 @@ fn step_agent_model_title(
 /// Auto-advance-disabled steps get a small `🔒` prefix.
 fn step_box_label_and_style(
     name: &str,
-    status: &str,
+    status: StepViewStatus,
     is_current: bool,
     box_width: u16,
 ) -> (String, Style) {
@@ -557,26 +533,27 @@ fn step_box_label_and_style(
     };
 
     let (glyph, mut style) = match status {
-        "pending" => ("\u{25cb}", Style::default().fg(Color::DarkGray)),
-        "running" => (
+        StepViewStatus::Pending => ("\u{25cb}", Style::default().fg(Color::DarkGray)),
+        StepViewStatus::Running => (
             "\u{25cf}",
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
         ),
-        "done" => ("\u{2713}", Style::default().fg(Color::Green)),
-        "error" => (
+        StepViewStatus::Done => ("\u{2713}", Style::default().fg(Color::Green)),
+        StepViewStatus::Error => (
             "\u{2717}",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        "fixing" => (
+        StepViewStatus::Fixing => (
             "\u{1f527}",
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
-        "cancelled" | "skipped" => ("\u{2298}", Style::default().fg(Color::DarkGray)),
-        _ => ("\u{25cb}", Style::default().fg(Color::DarkGray)),
+        StepViewStatus::Cancelled | StepViewStatus::Skipped => {
+            ("\u{2298}", Style::default().fg(Color::DarkGray))
+        }
     };
     if is_current {
         style = style.add_modifier(Modifier::BOLD);
@@ -589,10 +566,26 @@ fn step_box_label_and_style(
 mod tests {
     use super::*;
 
+    /// A status by the name the overview's own docs use. Unknown names panic
+    /// rather than silently rendering as pending, which is what the `String`
+    /// status did before WI 0114 F-22 typed it.
+    fn st(name: &str) -> StepViewStatus {
+        match name {
+            "pending" => StepViewStatus::Pending,
+            "running" => StepViewStatus::Running,
+            "fixing" => StepViewStatus::Fixing,
+            "done" => StepViewStatus::Done,
+            "error" => StepViewStatus::Error,
+            "cancelled" => StepViewStatus::Cancelled,
+            "skipped" => StepViewStatus::Skipped,
+            other => panic!("no such step status: {other}"),
+        }
+    }
+
     fn step(name: &str, status: &str, deps: Vec<&str>) -> WorkflowStepView {
         WorkflowStepView {
             name: name.into(),
-            status: status.into(),
+            status: st(status),
             agent: None,
             model: None,
             depends_on: deps.into_iter().map(|s| s.into()).collect(),
@@ -603,7 +596,7 @@ mod tests {
     fn phase_step(kind: WorkflowStepKind, name: &str, status: &str) -> WorkflowStepView {
         WorkflowStepView {
             name: name.into(),
-            status: status.into(),
+            status: st(status),
             agent: None,
             model: None,
             depends_on: Vec::new(),
@@ -766,7 +759,7 @@ mod tests {
 
     #[test]
     fn step_box_label_pending_uses_circle_glyph_and_dark_gray() {
-        let (label, style) = step_box_label_and_style("foo", "pending", false, 20);
+        let (label, style) = step_box_label_and_style("foo", st("pending"), false, 20);
         assert!(label.contains('\u{25cb}'));
         assert!(label.contains("foo"));
         assert_eq!(style.fg, Some(Color::DarkGray));
@@ -774,7 +767,7 @@ mod tests {
 
     #[test]
     fn step_box_label_running_uses_filled_circle_blue_bold() {
-        let (label, style) = step_box_label_and_style("foo", "running", false, 20);
+        let (label, style) = step_box_label_and_style("foo", st("running"), false, 20);
         assert!(label.contains('\u{25cf}'));
         assert_eq!(style.fg, Some(Color::Blue));
         assert!(style.add_modifier.contains(Modifier::BOLD));
@@ -782,14 +775,14 @@ mod tests {
 
     #[test]
     fn step_box_label_done_uses_check_glyph_green() {
-        let (label, style) = step_box_label_and_style("foo", "done", false, 20);
+        let (label, style) = step_box_label_and_style("foo", st("done"), false, 20);
         assert!(label.contains('\u{2713}'));
         assert_eq!(style.fg, Some(Color::Green));
     }
 
     #[test]
     fn step_box_label_error_uses_cross_glyph_red_bold() {
-        let (label, style) = step_box_label_and_style("foo", "error", false, 20);
+        let (label, style) = step_box_label_and_style("foo", st("error"), false, 20);
         assert!(label.contains('\u{2717}'));
         assert_eq!(style.fg, Some(Color::Red));
         assert!(style.add_modifier.contains(Modifier::BOLD));
@@ -797,7 +790,7 @@ mod tests {
 
     #[test]
     fn step_box_label_current_step_adds_bold_on_top_of_status() {
-        let (_, style) = step_box_label_and_style("foo", "done", true, 20);
+        let (_, style) = step_box_label_and_style("foo", st("done"), true, 20);
         // Done is not bold by default, but is_current adds BOLD.
         assert!(style.add_modifier.contains(Modifier::BOLD));
     }
@@ -844,7 +837,7 @@ mod tests {
 
     #[test]
     fn step_box_label_truncates_long_name() {
-        let (label, _) = step_box_label_and_style("very-long-step-name", "pending", false, 12);
+        let (label, _) = step_box_label_and_style("very-long-step-name", st("pending"), false, 12);
         assert!(label.contains('\u{2026}'));
     }
 
@@ -915,7 +908,7 @@ mod tests {
             ColumnRow::Stage { count, status } => {
                 assert_eq!(count, 3);
                 // One sibling is still running, so the stage reads as running.
-                assert_eq!(status, "running");
+                assert_eq!(status, st("running"));
             }
             _ => panic!("a parallel stage must collapse to a step-count summary"),
         }
@@ -931,12 +924,12 @@ mod tests {
         let waiting = [step("a", "pending", vec![]), step("b", "pending", vec![])];
 
         let s = |steps: &[WorkflowStepView]| stage_status(&steps.iter().collect::<Vec<_>>());
-        assert_eq!(s(&running), "running");
-        assert_eq!(s(&failed), "error");
-        assert_eq!(s(&fixing), "fixing");
-        assert_eq!(s(&all_done), "done");
-        assert_eq!(s(&mixed_terminal), "cancelled");
-        assert_eq!(s(&waiting), "pending");
+        assert_eq!(s(&running), st("running"));
+        assert_eq!(s(&failed), st("error"));
+        assert_eq!(s(&fixing), st("fixing"));
+        assert_eq!(s(&all_done), st("done"));
+        assert_eq!(s(&mixed_terminal), st("cancelled"));
+        assert_eq!(s(&waiting), st("pending"));
     }
 
     // ── overview renders agent/model title on the box border ───────────────────

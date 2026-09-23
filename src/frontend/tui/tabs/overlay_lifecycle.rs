@@ -22,7 +22,7 @@ impl Tab {
         if lines.is_empty() {
             return;
         }
-        if let Ok(mut log) = self.status_log.lock() {
+        if let Ok(mut log) = self.shared.status_log.lock() {
             log.push(crate::frontend::tui::user_message::StatusLogEntry {
                 level: crate::data::message::MessageLevel::Warning,
                 text: "Agent exited before its output could be displayed; captured output:"
@@ -93,6 +93,7 @@ impl Tab {
     /// reuse it for stats polling and the overlay title.
     pub fn poll_container_exit(&mut self) {
         let exit_code = self
+            .shared
             .container_exit_shared
             .lock()
             .ok()
@@ -121,14 +122,13 @@ impl Tab {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
-                    // Agent-session commands carry the agent's real exit code;
-                    // reflect it instead of unconditionally reporting success.
-                    let exit_code = match &outcome {
-                        CommandOutcome::Chat(o) => o.exit_code.unwrap_or(0),
-                        CommandOutcome::ExecPrompt(o) => o.exit_code.unwrap_or(0),
-                        _ => 0,
-                    };
-                    if let Ok(mut log) = self.status_log.lock() {
+                    // One exit-code policy, and it is Layer 2's
+                    // (`CommandOutcome::exit_code`, F-42). The TUI used to
+                    // match two variants itself and report 0 for everything
+                    // else, so a failed `exec workflow` read as "completed
+                    // successfully" in the status log (F-22).
+                    let exit_code = outcome.exit_code();
+                    if let Ok(mut log) = self.shared.status_log.lock() {
                         if exit_code == 0 {
                             log.push(crate::frontend::tui::user_message::StatusLogEntry {
                                 level: crate::data::message::MessageLevel::Success,
@@ -144,10 +144,10 @@ impl Tab {
                             });
                         }
                     }
-                    self.execution_phase = ExecutionPhase::Done {
+                    self.record_terminal_phase(ExecutionPhase::Done {
                         command: cmd_name,
                         exit_code,
-                    };
+                    });
                     self.close_container_overlay(exit_code);
                     // The command is over — drop every slot (and any dormant
                     // backbone) so the tab returns to the no-container state.
@@ -159,16 +159,16 @@ impl Tab {
                         _ => String::new(),
                     };
                     let err_msg = format!("{err}");
-                    if let Ok(mut log) = self.status_log.lock() {
+                    if let Ok(mut log) = self.shared.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
                             level: crate::data::message::MessageLevel::Error,
                             text: format!("Command '{}' failed: {}", cmd_name, err_msg),
                         });
                     }
-                    self.execution_phase = ExecutionPhase::Error {
+                    self.record_terminal_phase(ExecutionPhase::Error {
                         command: cmd_name,
                         message: err_msg,
-                    };
+                    });
                     self.close_container_overlay(-1);
                     self.clear_container_slots();
                 }
@@ -179,27 +179,33 @@ impl Tab {
                     // Command task dropped without sending a result — in
                     // practice this means the task panicked. The panic hook
                     // records the backtrace; point the user at it.
+                    //
+                    // Presentation only: the status-log line and this tab's
+                    // own `execution_phase`, so the frame being drawn is
+                    // right. The *session* is written by `Dispatch`'s
+                    // `UnfinishedCommandGuard`, which runs as the panicking
+                    // command unwinds (decision Q3, F-22).
                     let cmd_name = match &self.execution_phase {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
-                    let err_msg = match crate::frontend::tui::event_loop::panic_log_path() {
-                        Some(path) => format!(
+                    let err_msg = match crate::frontend::tui::event_loop::panic_log() {
+                        Some(log) => format!(
                             "command task ended unexpectedly (likely a panic — see {})",
-                            path.display()
+                            log.path().display()
                         ),
                         None => "command task ended unexpectedly (likely a panic)".to_string(),
                     };
-                    if let Ok(mut log) = self.status_log.lock() {
+                    if let Ok(mut log) = self.shared.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
                             level: crate::data::message::MessageLevel::Error,
                             text: format!("Command '{}' failed: {}", cmd_name, err_msg),
                         });
                     }
-                    self.execution_phase = ExecutionPhase::Error {
+                    self.record_terminal_phase(ExecutionPhase::Error {
                         command: cmd_name,
                         message: err_msg,
-                    };
+                    });
                     self.close_container_overlay(-1);
                     self.clear_container_slots();
                 }

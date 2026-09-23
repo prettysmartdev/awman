@@ -10,23 +10,31 @@ use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::config::env::Env;
-use crate::data::fs::daemon_guard::{AcquireError, DaemonGuard, DaemonKind};
-use crate::data::fs::daemon_process::{
-    self, DaemonProcess, ServerMeta, Termination, API_PLIST_LABEL, API_UNIT_NAME,
-};
+use crate::data::fs::daemon_process::{DaemonProcess, ServerMeta, API_PLIST_LABEL, API_UNIT_NAME};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::session::Session;
 use crate::engine::auth::TlsMaterial;
+use crate::engine::daemon::{AcquireError, DaemonGuard, DaemonKind, DaemonSupervisor, Termination};
+use crate::engine::remote::{HttpClientOptions, HttpCore};
 
 pub mod event_bus;
 pub mod queue_worker;
 pub mod runtime;
 pub mod session_setup;
 
-pub use runtime::{ApiServerRuntime, ApiSessionLifecycle, AuthMode, CloseOutcome, SetupReadiness};
+/// The one bearer-auth decision, owned by Layer 1. Re-exported here because
+/// `ApiServerRuntime` hands it to the router; Layer 2 holds no copy of it
+/// (WI 0114 F-14).
+pub use crate::engine::auth::AuthMode;
+pub use runtime::{ApiServerRuntime, ApiSessionLifecycle, CloseOutcome, SetupReadiness};
 
 /// Build the API daemon's process handle from its paths.
-fn api_daemon(api_paths: &crate::data::fs::ApiPaths) -> DaemonProcess {
-    DaemonProcess::new(api_paths.daemon(), API_UNIT_NAME, API_PLIST_LABEL)
+fn api_daemon(api_paths: &crate::data::fs::ApiPaths) -> DaemonSupervisor {
+    DaemonSupervisor::new(DaemonProcess::new(
+        api_paths.daemon(),
+        API_UNIT_NAME,
+        API_PLIST_LABEL,
+    ))
 }
 
 /// Configuration handed from the `api start` command to Layer 3's
@@ -43,7 +51,33 @@ pub struct ApiServeConfig {
     pub tls_material: Option<TlsMaterial>,
 }
 
-pub mod banner;
+/// The one-time disclosure of a freshly minted API key.
+///
+/// `awman api start` shows a key exactly once — only its hash is kept on
+/// disk — so a frontend handed one of these displays it; one that drops it
+/// has lost the key for good.
+///
+/// The key travels as a fact, not as a rendering. Layer 2 used to compose the
+/// box-drawing banner itself and push it through `write_message`, which meant
+/// the TUI received terminal art it could not restyle and the API serialised
+/// the `═` runs into JSON. Each frontend now says it its own way: the CLI
+/// draws the box (`frontend::cli::per_command::api_server`), the TUI and the
+/// API state the key as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyDisclosure {
+    key: String,
+}
+
+impl ApiKeyDisclosure {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self { key: key.into() }
+    }
+
+    /// The plaintext key to show.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiServerStartFlags {
@@ -113,33 +147,44 @@ pub enum ApiServerOutcome {
     Status(ApiServerStatusOutcome),
 }
 
-/// Methods Layer 3 must provide to the api start command.
-#[async_trait]
-pub trait ApiServerStartCommandFrontend: UserMessageSink + Send + Sync {
-    async fn serve_until_shutdown(&mut self, runtime: ApiServerRuntime)
-        -> Result<(), CommandError>;
-}
-
-pub trait ApiServerKillCommandFrontend: UserMessageSink + Send + Sync {}
-pub trait ApiServerLogsCommandFrontend: UserMessageSink + Send + Sync {}
-pub trait ApiServerStatusCommandFrontend: UserMessageSink + Send + Sync {}
-
-/// Catch-all frontend for the umbrella `ApiServerCommand`. Includes
-/// `serve_until_shutdown` so the dispatched frontend can boot the server.
+/// The one frontend trait for `awman api`. `start` needs
+/// `serve_until_shutdown`; `kill`, `logs` and `status` need nothing beyond
+/// the message sink, so they share this trait rather than each carrying an
+/// empty one of their own (F-35).
 #[async_trait]
 pub trait ApiServerCommandFrontend: UserMessageSink + Send + Sync {
     async fn serve_until_shutdown(&mut self, runtime: ApiServerRuntime)
         -> Result<(), CommandError>;
+
+    /// Show a key that was just minted. Required, not defaulted: a no-op
+    /// default would silently discard the only copy of the key the user will
+    /// ever be offered.
+    fn show_api_key(&mut self, disclosure: &ApiKeyDisclosure);
 }
 
 pub struct ApiServerCommand {
     sub: ApiServerSubcommand,
     engines: Engines,
+    /// The session this command was built for.
+    ///
+    /// Every command is instantiated with a `Session` (the grand
+    /// architecture's Layer 0 rule, WI 0114 F-49), and this one needs it for
+    /// more than form: `--workdirs` merges with the *effective* config's
+    /// `api.workDirs`, which used to be a bare `GlobalConfig::load()` here —
+    /// a second, ad-hoc config source that ignored the session's own merge
+    /// (F-31).
+    ///
+    /// A snapshot: this command only reads config from it.
+    session: Session,
 }
 
 impl ApiServerCommand {
-    pub fn new(sub: ApiServerSubcommand, engines: Engines) -> Self {
-        Self { sub, engines }
+    pub fn new(sub: ApiServerSubcommand, engines: Engines, session: Session) -> Self {
+        Self {
+            sub,
+            engines,
+            session,
+        }
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10). The four
@@ -160,7 +205,7 @@ impl ApiServerCommand {
             "status" => ApiServerSubcommand::Status(ApiServerStatusFlags {}),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
-        Ok(Self::new(sub, ctx.engines.clone()))
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
     }
 
     pub fn subcommand(&self) -> &ApiServerSubcommand {
@@ -182,7 +227,7 @@ impl Command for ApiServerCommand {
 
         let outcome = match self.sub {
             ApiServerSubcommand::Start(f) => {
-                run_start(f, &self.engines, &mut *frontend, api_paths).await?
+                run_start(f, &self.engines, &self.session, &mut *frontend, api_paths).await?
             }
             ApiServerSubcommand::Kill(_) => run_kill(api_paths, &mut *frontend)?,
             ApiServerSubcommand::Logs(_) => run_logs(api_paths, &mut *frontend)?,
@@ -196,6 +241,7 @@ impl Command for ApiServerCommand {
 async fn run_start(
     flags: ApiServerStartFlags,
     engines: &Engines,
+    session: &Session,
     frontend: &mut dyn ApiServerCommandFrontend,
     api_paths: &crate::data::fs::ApiPaths,
 ) -> Result<ApiServerOutcome, CommandError> {
@@ -217,22 +263,16 @@ async fn run_start(
         &crate::data::fs::SquadPaths::from_env(&Env::from_process()).map_err(CommandError::Data)?,
     );
 
-    // Resolve workdirs by merging CLI --workdirs with the global API config.
-    let config_workdirs: Vec<String> = crate::data::config::global::GlobalConfig::load()
-        .unwrap_or_default()
-        .api
-        .as_ref()
-        .and_then(|h| h.work_dirs.clone())
-        .unwrap_or_default();
-    let workdirs = resolve_workdirs(&flags.workdirs, &config_workdirs)?;
+    // Resolve workdirs by merging CLI --workdirs with the configured API work
+    // dirs. Read from the session's own effective config, not from a fresh
+    // `GlobalConfig::load()`: the session already merged global, repo, env and
+    // flags, and a second load here would answer from a different one (F-31).
+    let workdirs = resolve_workdirs(&flags.workdirs, &session.effective_config().api_work_dirs())?;
 
-    // --refresh-key: generate new key, print banner, exit.
+    // --refresh-key: generate new key, disclose it, exit.
     if flags.refresh_key {
         let key = engines.auth_engine.refresh_api_key()?;
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: banner::render_api_key_banner(key.as_str()),
-        });
+        frontend.show_api_key(&ApiKeyDisclosure::new(key.as_str()));
         return Ok(ApiServerOutcome::Start(ApiServerStartOutcome {
             port: flags.port,
             background: false,
@@ -242,8 +282,8 @@ async fn run_start(
     }
 
     // First-run convenience: if auth is required but no key hash exists on
-    // disk, generate one now and display the banner instead of forcing the
-    // user to re-run with `--refresh-key`.
+    // disk, generate one now and disclose it instead of forcing the user to
+    // re-run with `--refresh-key`.
     let mut auto_generated_key = false;
     if !flags.dangerously_skip_auth && engines.auth_engine.read_api_key_hash()?.is_none() {
         let key = engines.auth_engine.refresh_api_key()?;
@@ -253,10 +293,7 @@ async fn run_start(
                 "No API key configured — generating one now (store it; it will not be shown again):"
                     .to_string(),
         });
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: banner::render_api_key_banner(key.as_str()),
-        });
+        frontend.show_api_key(&ApiKeyDisclosure::new(key.as_str()));
         auto_generated_key = true;
     }
 
@@ -274,7 +311,7 @@ async fn run_start(
     // Background mode: spawn a child process and exit.
     if flags.background {
         // Refuse to start if the squad daemon is running.
-        guard.check().map_err(CommandError::Data)?;
+        guard.check().map_err(CommandError::from)?;
         let binary = std::env::current_exe()
             .map_err(|e| CommandError::Other(format!("cannot determine awman binary: {e}")))?;
         let mut args = vec![
@@ -298,17 +335,17 @@ async fn run_start(
         if child_pid > 0 {
             // Use exclusive write so a racing parallel `api start --background`
             // can't trample the PID we just spawned.
-            if !daemon.claim_pidfile(child_pid)? {
-                if let Some(existing) = daemon.read_pid()? {
+            if !daemon.process().claim_pidfile(child_pid)? {
+                if let Some(existing) = daemon.process().read_pid()? {
                     if existing != child_pid
-                        && daemon_process::is_process_alive(existing)
-                        && daemon_process::pid_is_awman(existing)
+                        && DaemonSupervisor::is_process_alive(existing)
+                        && DaemonSupervisor::pid_is_awman(existing)
                     {
                         return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
                     }
                 }
                 // Stale or matching — overwrite.
-                daemon.force_write_pidfile(child_pid)?;
+                daemon.process().force_write_pidfile(child_pid)?;
             }
         }
 
@@ -333,7 +370,7 @@ async fn run_start(
         .acquire(std::process::id())
         .map_err(|error| match error {
             AcquireError::AlreadyRunning { pid } => CommandError::ApiServerAlreadyRunning { pid },
-            other => CommandError::Data(other.into_data_error()),
+            other => CommandError::from(other.into_engine_error()),
         })?;
 
     // TLS material: generate or load now (unless explicitly skipped) so the
@@ -377,7 +414,7 @@ async fn run_start(
 
     // Persist server metadata so `api status` and remote clients can
     // probe the right endpoint.
-    let _ = daemon.write_meta(&ServerMeta {
+    let _ = daemon.process().write_meta(&ServerMeta {
         port: flags.port,
         bind_ip: bind_ip.to_string(),
         scheme: scheme.to_string(),
@@ -409,8 +446,8 @@ async fn run_start(
     let serve_result = frontend.serve_until_shutdown(runtime).await;
 
     // Always clean up PID + meta files.
-    let _ = daemon.release_pidfile();
-    let _ = daemon.clear_meta();
+    let _ = daemon.process().release_pidfile();
+    let _ = daemon.process().clear_meta();
 
     serve_result?;
 
@@ -456,7 +493,7 @@ fn run_kill(
         }
         Termination::Terminated { pid } => pid,
     };
-    let _ = daemon.clear_meta();
+    let _ = daemon.process().clear_meta();
 
     frontend.write_message(UserMessage {
         level: MessageLevel::Success,
@@ -511,7 +548,7 @@ async fn run_status(
         Some(pid) => pid,
         None => {
             // Cleanup any orphan meta file when no server is running.
-            let _ = daemon.clear_meta();
+            let _ = daemon.process().clear_meta();
             return Ok(ApiServerOutcome::Status(ApiServerStatusOutcome {
                 running: false,
                 pid: None,
@@ -522,7 +559,7 @@ async fn run_status(
         }
     };
 
-    let meta = daemon.read_meta()?;
+    let meta = daemon.process().read_meta()?;
     let bound_addr = meta
         .as_ref()
         .map(|m| format!("{}://{}:{}", m.scheme, m.bind_ip, m.port));
@@ -532,11 +569,13 @@ async fn run_status(
     // process is alive but the server is not responsive.
     let (responsive, version) = if let Some(m) = meta.as_ref() {
         let probe_url = format!("{}://127.0.0.1:{}/v1/status", m.scheme, m.port);
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .danger_accept_invalid_certs(true) // self-signed certs on loopback
-            .build()
-            .map_err(|e| CommandError::RemoteTransport(e.to_string()))?;
+        let client = HttpCore::client(&HttpClientOptions {
+            read_timeout: Some(std::time::Duration::from_secs(2)),
+            // The probe is loopback-only and predates knowing which
+            // self-signed cert the daemon minted.
+            accept_invalid_certs: true,
+            ..HttpClientOptions::default()
+        })?;
         match client.get(&probe_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let body = resp.json::<serde_json::Value>().await.ok();
@@ -616,12 +655,12 @@ mod tests {
     use crate::command::dispatch::Engines;
     use crate::data::message::{UserMessage, UserMessageSink};
 
-    fn make_engines(tmp: &std::path::Path) -> Engines {
-        Engines::for_tests(tmp)
-    }
-
+    #[derive(Default)]
     struct NullFrontend {
         messages: Vec<String>,
+        /// Keys disclosed through `show_api_key`, in order. A frontend
+        /// receives the key itself, never a rendering of it.
+        disclosed_keys: Vec<String>,
     }
     impl UserMessageSink for NullFrontend {
         fn write_message(&mut self, msg: UserMessage) {
@@ -637,13 +676,16 @@ mod tests {
         ) -> Result<(), crate::command::error::CommandError> {
             Ok(())
         }
+        fn show_api_key(&mut self, disclosure: &ApiKeyDisclosure) {
+            self.disclosed_keys.push(disclosure.key().to_string());
+        }
     }
 
     #[tokio::test]
     async fn start_refresh_key_short_circuits_without_checking_auth() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
 
         // Ensure API root exists.
@@ -658,10 +700,15 @@ mod tests {
             dangerously_skip_tls: false,
         };
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
-        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
+        let mut frontend = NullFrontend::default();
+        let result = run_start(
+            flags,
+            &engines,
+            &Session::for_tests(tmp.path()),
+            &mut frontend,
+            &api_paths,
+        )
+        .await;
         assert!(result.is_ok(), "refresh_key must short-circuit: {result:?}");
         if let Ok(ApiServerOutcome::Start(outcome)) = result {
             assert!(outcome.refreshed_key, "refreshed_key must be true");
@@ -672,7 +719,7 @@ mod tests {
     async fn start_without_auth_configured_auto_generates_key_and_proceeds() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
@@ -685,10 +732,15 @@ mod tests {
             dangerously_skip_tls: false,
         };
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
-        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
+        let mut frontend = NullFrontend::default();
+        let result = run_start(
+            flags,
+            &engines,
+            &Session::for_tests(tmp.path()),
+            &mut frontend,
+            &api_paths,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "first-run with no key must auto-generate one and proceed: {result:?}"
@@ -705,9 +757,28 @@ mod tests {
             "must explain that a key was auto-generated; got: {:?}",
             frontend.messages
         );
+        // The key reaches the frontend as a key, not as a rendering of one:
+        // Layer 2 no longer knows what a banner looks like (F-47 step 3).
+        assert_eq!(
+            frontend.disclosed_keys.len(),
+            1,
+            "must disclose the auto-generated key exactly once; got: {:?}",
+            frontend.disclosed_keys
+        );
+        assert_eq!(
+            frontend.disclosed_keys[0].len(),
+            64,
+            "the disclosure must carry the plaintext key itself, not prose"
+        );
+        // Written as a code-point range rather than a literal box character so
+        // this assertion is not itself a hit for the `layer-render` guard it
+        // mirrors. U+2500–U+257F is the Box Drawing block.
         assert!(
-            frontend.messages.iter().any(|m| m.starts_with('╔')),
-            "must emit the banner; got: {:?}",
+            frontend
+                .messages
+                .iter()
+                .all(|m| !m.chars().any(|c| ('\u{2500}'..='\u{257F}').contains(&c))),
+            "no box-drawing may reach a frontend from Layer 2; got: {:?}",
             frontend.messages
         );
     }
@@ -716,7 +787,7 @@ mod tests {
     async fn start_dangerously_skip_auth_proceeds_without_api_key() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
@@ -729,10 +800,15 @@ mod tests {
             dangerously_skip_tls: false,
         };
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
-        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
+        let mut frontend = NullFrontend::default();
+        let result = run_start(
+            flags,
+            &engines,
+            &Session::for_tests(tmp.path()),
+            &mut frontend,
+            &api_paths,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "dangerously_skip_auth must bypass auth check: {result:?}"
@@ -743,7 +819,7 @@ mod tests {
     async fn start_dangerously_skip_tls_yields_plain_http_config() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
@@ -769,12 +845,14 @@ mod tests {
                 // Capture the persisted scheme BEFORE run_start's post-serve
                 // cleanup removes the meta file.
                 self.persisted_scheme = api_daemon(&self.api_paths)
+                    .process()
                     .read_meta()
                     .ok()
                     .flatten()
                     .map(|m| m.scheme);
                 Ok(())
             }
+            fn show_api_key(&mut self, _disclosure: &ApiKeyDisclosure) {}
         }
 
         let flags = ApiServerStartFlags {
@@ -792,7 +870,14 @@ mod tests {
             persisted_scheme: None,
             api_paths: api_paths.clone(),
         };
-        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
+        let result = run_start(
+            flags,
+            &engines,
+            &Session::for_tests(tmp.path()),
+            &mut frontend,
+            &api_paths,
+        )
+        .await;
         assert!(result.is_ok(), "skip-tls must allow startup: {result:?}");
         assert_eq!(
             frontend.tls_was_present,
@@ -825,13 +910,11 @@ mod tests {
     #[test]
     fn kill_no_pid_file_returns_api_not_running_with_warning() {
         let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
+        let mut frontend = NullFrontend::default();
         let result = run_kill(&api_paths, &mut frontend);
         assert!(
             matches!(result, Err(CommandError::ApiServerNotRunning)),
@@ -850,19 +933,18 @@ mod tests {
     #[test]
     fn kill_stale_pid_file_is_cleaned_up_and_returns_api_not_running() {
         let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
         let pid_path = api_paths.pid_file();
 
         // Write a PID that can't possibly be alive.
         api_daemon(&api_paths)
+            .process()
             .force_write_pidfile(u32::MAX - 1)
             .unwrap();
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
+        let mut frontend = NullFrontend::default();
         let result = run_kill(&api_paths, &mut frontend);
         assert!(
             matches!(result, Err(CommandError::ApiServerNotRunning)),
@@ -877,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn status_no_pid_file_returns_not_running() {
         let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
@@ -895,7 +977,7 @@ mod tests {
     #[tokio::test]
     async fn status_with_alive_pid_but_no_meta_reports_not_responsive() {
         let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
@@ -904,6 +986,7 @@ mod tests {
         // check_already_running will treat it as stale; that's still a
         // useful signal — running=false, responsive=false.
         api_daemon(&api_paths)
+            .process()
             .force_write_pidfile(std::process::id())
             .unwrap();
 
@@ -919,13 +1002,11 @@ mod tests {
     #[test]
     fn logs_missing_log_file_emits_warning() {
         let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
+        let mut frontend = NullFrontend::default();
         let result = run_logs(&api_paths, &mut frontend);
         assert!(
             result.is_ok(),
@@ -944,7 +1025,7 @@ mod tests {
     #[test]
     fn logs_existing_log_file_streams_lines() {
         let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
         let api_paths = engines.auth_engine.api_paths().clone();
         api_paths.ensure_root().unwrap();
 
@@ -952,9 +1033,7 @@ mod tests {
         let log_path = api_paths.log_file();
         std::fs::write(&log_path, "line one\nline two\nline three\n").unwrap();
 
-        let mut frontend = NullFrontend {
-            messages: Vec::new(),
-        };
+        let mut frontend = NullFrontend::default();
         let result = run_logs(&api_paths, &mut frontend);
         assert!(result.is_ok());
         assert_eq!(frontend.messages.len(), 3, "must stream all lines");

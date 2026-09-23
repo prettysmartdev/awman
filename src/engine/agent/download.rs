@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use crate::engine::error::EngineError;
+use crate::engine::remote::{HttpClientOptions, HttpCore};
 
 /// GitHub raw URL prefix for awman-shipped Dockerfiles.
 pub const DOCKERFILE_RAW_URL_PREFIX: &str =
@@ -43,11 +44,16 @@ pub async fn download_agent_dockerfile(
     project_base_tag: &str,
 ) -> Result<(), EngineError> {
     let url = dockerfile_url_for(agent);
-    let client_result = reqwest::Client::builder()
-        .user_agent("awman")
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
+    // One builder for the whole tree (WI 0114 F-28) — the short timeouts and
+    // the user agent are this caller's, the client construction is `HttpCore`'s.
+    let client_result = HttpCore::client(
+        &HttpClientOptions::default()
+            .with_timeouts(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(15),
+            )
+            .with_user_agent("awman"),
+    );
 
     let download_attempt: Result<Vec<u8>, String> = match client_result {
         Err(e) => Err(format!("client init: {e}")),

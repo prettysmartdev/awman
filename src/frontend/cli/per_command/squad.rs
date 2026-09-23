@@ -1,9 +1,10 @@
 //! CLI presentation for the squad command family.
 
+use crate::data::fs::daemon_env::{EnvPersistence, EnvVarState};
 use chrono::{DateTime, Utc};
-use clap::ArgMatches;
 
 use crate::command::commands::squad::commands::{EnvReport, SquadOutcome};
+use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::data::fs::task_store::Task;
 
 use super::render::format_table;
@@ -174,9 +175,9 @@ pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String>
             // user's own explicit opt-out and says nothing either. What has to
             // reach a user who never runs `awman squad env` is the degraded
             // case, which otherwise lives only in the daemon log.
-            let persistence = match status.env_persistence.as_str() {
-                "" | "keychain" | "none" => String::new(),
-                other => format!("; env persistence {other}"),
+            let persistence = match &status.env_persistence {
+                None | Some(EnvPersistence::Keychain) | Some(EnvPersistence::None) => String::new(),
+                Some(other) => format!("; env persistence {other}"),
             };
             Some(format!(
                 "squad daemon running (PID {pid}) at {address}; {} tasks ({} active); last tick {last_tick}{unmet}{persistence}",
@@ -244,15 +245,13 @@ fn env_footer(tasks: &[Task]) -> Option<String> {
 /// is present.
 fn render_env_report(report: &EnvReport) -> String {
     let mut out = String::new();
-    // An empty persistence string means "asked something with no daemon to
-    // answer" (`awman squad daemon status`); say nothing rather than guess.
-    if report.persistence.is_empty() {
-        out.push_str("Daemon env coverage\n");
-    } else {
-        out.push_str(&format!(
-            "Daemon env coverage (persistence: {})\n",
-            report.persistence
-        ));
+    // `None` means "asked something with no daemon to answer"
+    // (`awman squad daemon status`); say nothing rather than guess.
+    match &report.persistence {
+        None => out.push_str("Daemon env coverage\n"),
+        Some(persistence) => out.push_str(&format!(
+            "Daemon env coverage (persistence: {persistence})\n"
+        )),
     }
     if let Some(cleared) = report.cleared {
         out.push_str(if cleared {
@@ -271,10 +270,9 @@ fn render_env_report(report: &EnvReport) -> String {
         .rows
         .iter()
         .map(|row| {
-            let state = match row.state.as_str() {
-                "set" => "\u{2713} set".to_string(),
-                "unmet" => "\u{26a0} unmet".to_string(),
-                other => format!("\u{b7} {other}"),
+            let state = match row.state {
+                EnvVarState::Set => "\u{2713} set".to_string(),
+                EnvVarState::Unmet => "\u{26a0} unmet".to_string(),
             };
             [
                 row.name.clone(),
@@ -303,7 +301,7 @@ fn render_env_report(report: &EnvReport) -> String {
     let mut unmet = report
         .rows
         .iter()
-        .filter(|row| row.state == "unmet")
+        .filter(|row| row.state == EnvVarState::Unmet)
         .peekable();
     if unmet.peek().is_some() {
         out.push('\n');
@@ -358,13 +356,6 @@ fn relative_age(since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
         s if s < 86_400 => format!("{}h ago", s / 3600),
         s => format!("{}d ago", s / 86_400),
     }
-}
-
-pub(crate) fn squad_flag(matches: &ArgMatches, flag: &str) -> bool {
-    matches
-        .subcommand_matches("squad")
-        .and_then(|squad| squad.try_get_one::<bool>(flag).ok().flatten().copied())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -428,14 +419,18 @@ mod tests {
             active_count: 2,
             last_tick: Some(at(0)),
             in_flight: 0,
-            env_persistence: "keychain".into(),
+            env_persistence: Some(EnvPersistence::Keychain),
             unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
         }
     }
 
-    fn report(rows: Vec<EnvReportRow>, persistence: &str, cleared: Option<bool>) -> EnvReport {
+    fn report(
+        rows: Vec<EnvReportRow>,
+        persistence: Option<EnvPersistence>,
+        cleared: Option<bool>,
+    ) -> EnvReport {
         EnvReport {
-            persistence: persistence.into(),
+            persistence,
             cleared,
             rows,
         }
@@ -443,13 +438,13 @@ mod tests {
 
     fn row(
         name: &str,
-        state: &str,
+        state: EnvVarState,
         source: &str,
         unmet_since: Option<DateTime<Utc>>,
     ) -> EnvReportRow {
         EnvReportRow {
             name: name.into(),
-            state: state.into(),
+            state,
             source: source.into(),
             unmet_since,
             required_by: vec!["deploy-preview".into()],
@@ -497,9 +492,13 @@ mod tests {
     /// line is unchanged.
     #[test]
     fn squad_status_names_a_degraded_env_persistence_and_stays_silent_otherwise() {
-        for healthy in ["keychain", "none", ""] {
+        for healthy in [
+            Some(EnvPersistence::Keychain),
+            Some(EnvPersistence::None),
+            None,
+        ] {
             let mut ok = status(&[]);
-            ok.env_persistence = healthy.into();
+            ok.env_persistence = healthy.clone();
             let line = text(&SquadOutcome::Status(ok));
             assert!(
                 !line.contains("env persistence"),
@@ -508,7 +507,9 @@ mod tests {
         }
 
         let mut degraded = status(&[]);
-        degraded.env_persistence = "unavailable(secret-tool not found)".into();
+        degraded.env_persistence = Some(EnvPersistence::Unavailable(
+            "secret-tool not found".to_string(),
+        ));
         assert!(
             text(&SquadOutcome::Status(degraded))
                 .ends_with("; env persistence unavailable(secret-tool not found)"),
@@ -517,7 +518,9 @@ mod tests {
 
         // Both clauses can appear, unmet first.
         let mut both = status(&["AWS_PROFILE"]);
-        both.env_persistence = "unavailable(store failed: timed out)".into();
+        both.env_persistence = Some(EnvPersistence::Unavailable(
+            "store failed: timed out".to_string(),
+        ));
         assert!(text(&SquadOutcome::Status(both)).ends_with(
             "; 1 env value unmet; env persistence unavailable(store failed: timed out)"
         ));
@@ -676,14 +679,26 @@ mod tests {
     fn the_env_table_renders_the_header_both_states_and_the_next_step() {
         let rendered = text(&SquadOutcome::Env(report(
             vec![
-                row("ANTHROPIC_KEY", "set", "this shell", None),
-                row("AWS_PROFILE", "unmet", "\u{2014}", Some(Utc::now())),
+                row("ANTHROPIC_KEY", EnvVarState::Set, "this shell", None),
+                row(
+                    "AWS_PROFILE",
+                    EnvVarState::Unmet,
+                    "\u{2014}",
+                    Some(Utc::now()),
+                ),
                 // A task-declared GITHUB_TOKEN is an ordinary unmet row. It
                 // used to render as `· optional`, which is why the host-side
                 // exemption was removed.
-                row("GITHUB_TOKEN", "unmet", "\u{2014}", Some(Utc::now())),
+                row(
+                    "GITHUB_TOKEN",
+                    EnvVarState::Unmet,
+                    "\u{2014}",
+                    Some(Utc::now()),
+                ),
             ],
-            "unavailable(secret-tool not found)",
+            Some(EnvPersistence::Unavailable(
+                "secret-tool not found".to_string(),
+            )),
             None,
         )));
 
@@ -740,8 +755,8 @@ mod tests {
     #[test]
     fn a_fully_covered_report_prints_no_trailing_block() {
         let rendered = text(&SquadOutcome::Env(report(
-            vec![row("ANTHROPIC_KEY", "set", "pushed", None)],
-            "keychain",
+            vec![row("ANTHROPIC_KEY", EnvVarState::Set, "pushed", None)],
+            Some(EnvPersistence::Keychain),
             None,
         )));
         assert!(!rendered.contains("is required by"), "{rendered}");
@@ -753,8 +768,8 @@ mod tests {
     #[test]
     fn the_clear_line_reports_what_actually_happened() {
         let removed = text(&SquadOutcome::Env(report(
-            vec![row("ANTHROPIC_KEY", "set", "pushed", None)],
-            "keychain",
+            vec![row("ANTHROPIC_KEY", EnvVarState::Set, "pushed", None)],
+            Some(EnvPersistence::Keychain),
             Some(true),
         )));
         assert!(
@@ -764,8 +779,8 @@ mod tests {
             "{removed}"
         );
         let nothing = text(&SquadOutcome::Env(report(
-            vec![row("ANTHROPIC_KEY", "set", "pushed", None)],
-            "none",
+            vec![row("ANTHROPIC_KEY", EnvVarState::Set, "pushed", None)],
+            Some(EnvPersistence::None),
             Some(false),
         )));
         assert!(
@@ -775,10 +790,10 @@ mod tests {
     }
 
     /// `awman squad daemon status` has no daemon to ask, so `persistence` is
-    /// `""`. Render nothing rather than guess.
+    /// `None`. Render nothing rather than guess.
     #[test]
-    fn an_empty_persistence_string_degrades_to_a_bare_header() {
-        let rendered = text(&SquadOutcome::Env(report(Vec::new(), "", None)));
+    fn an_absent_persistence_degrades_to_a_bare_header() {
+        let rendered = text(&SquadOutcome::Env(report(Vec::new(), None, None)));
         assert!(rendered.starts_with("Daemon env coverage\n"), "{rendered}");
         assert!(!rendered.contains("persistence"), "{rendered}");
         assert!(
@@ -795,10 +810,10 @@ mod tests {
     fn the_json_env_report_uses_bare_state_words_and_carries_no_value() {
         let outcome = SquadOutcome::Env(report(
             vec![
-                row("AWS_PROFILE", "unmet", "\u{2014}", Some(at(0))),
-                row("NPM_TOKEN", "set", "pushed", None),
+                row("AWS_PROFILE", EnvVarState::Unmet, "\u{2014}", Some(at(0))),
+                row("NPM_TOKEN", EnvVarState::Set, "pushed", None),
             ],
-            "none",
+            Some(EnvPersistence::None),
             Some(true),
         ));
         let json = render_squad(&outcome, true).expect("json renders");
@@ -844,5 +859,113 @@ mod tests {
             parsed["payload"][0]["unmet_env"],
             serde_json::json!(["ANTHROPIC_KEY"])
         );
+    }
+}
+
+/// Draw the one-time squad key disclosure for a terminal.
+///
+/// Moved here from `src/engine/squad/key_setup.rs` by WI 0114 F-56: the box,
+/// the paragraphs and the indenting are presentation, and an engine that
+/// composed them handed every frontend terminal art it could not restyle —
+/// the TUI draws its own frames, and the API serialised the `═` runs into
+/// JSON. Layer 1 now supplies the key, the shell and the export line; this
+/// function is the CLI's way of saying them.
+pub(crate) fn render_key_setup(setup: &SquadKeySetup) -> String {
+    let mut out = String::new();
+    out.push_str(&render_banner(&setup.key));
+    out.push_str("\n\n");
+    out.push_str(&format!(
+        "Add this to {} so the awman CLI and TUI can authenticate to squad:\n\n    {}\n\n",
+        setup.rc_file(),
+        setup.export_line
+    ));
+    out.push_str(
+        "Until you do, export it in the current shell — `awman squad` commands\n\
+         without the key are refused by the daemon with 401 Unauthorized.\n\n",
+    );
+    out.push_str(
+        "Prefer to run without a key? Stop the daemon and start it with\n    \
+         awman squad start --dangerously-skip-auth\n\
+         which mints no key and accepts unauthenticated requests. squad binds to\n\
+         loopback (127.0.0.1) only, so nothing off this machine can reach it.",
+    );
+    out
+}
+
+/// The key on its own, boxed, matching the API server's first-run banner style.
+fn render_banner(key: &str) -> String {
+    let title = "squad API key (store this — it will not be shown again)";
+    // Width follows the longer of title and key so a key of any length fits.
+    let inner = title.chars().count().max(key.chars().count()) + 4;
+    let bar = "═".repeat(inner);
+    let pad = |text: &str| {
+        let used = text.chars().count() + 2;
+        format!("  {text}{}", " ".repeat(inner.saturating_sub(used)))
+    };
+    format!("╔{bar}╗\n║{}║\n║{}║\n╚{bar}╝", pad(title), pad(key))
+}
+
+#[cfg(test)]
+mod key_setup_tests {
+    use super::*;
+    use crate::engine::squad::key_setup::ShellFlavor;
+
+    fn rendered(key: &str, shell: ShellFlavor) -> String {
+        render_key_setup(&SquadKeySetup::for_key(key, shell))
+    }
+
+    #[test]
+    fn snippet_exports_the_documented_env_var_with_the_key() {
+        let out = rendered("deadbeef", ShellFlavor::Zsh);
+        assert!(
+            out.contains("export AWMAN_SQUAD_KEY=deadbeef"),
+            "snippet must be copy-pasteable; got:\n{out}"
+        );
+        assert!(
+            out.contains("~/.zshrc"),
+            "zsh users get ~/.zshrc; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn fish_gets_set_gx_rather_than_export() {
+        let out = rendered("deadbeef", ShellFlavor::Fish);
+        assert!(
+            out.contains("set -gx AWMAN_SQUAD_KEY deadbeef"),
+            "fish has no `export`; got:\n{out}"
+        );
+        assert!(!out.contains("export AWMAN_SQUAD_KEY"), "got:\n{out}");
+        assert!(out.contains("config.fish"), "got:\n{out}");
+    }
+
+    #[test]
+    fn unknown_shell_still_yields_a_posix_export() {
+        let out = rendered("deadbeef", ShellFlavor::Unknown);
+        assert!(
+            out.contains("export AWMAN_SQUAD_KEY=deadbeef"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn snippet_names_the_skip_auth_alternative() {
+        let out = rendered("deadbeef", ShellFlavor::Zsh);
+        assert!(
+            out.contains("--dangerously-skip-auth"),
+            "the no-auth escape hatch must be discoverable here; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn banner_boxes_a_key_longer_than_the_title() {
+        let key = "a".repeat(120);
+        let out = rendered(&key, ShellFlavor::Zsh);
+        assert!(out.contains(&key), "banner must not truncate the key");
+        // Every box line is the same display width as the top border.
+        let lines: Vec<&str> = out.lines().take(4).collect();
+        let width = lines[0].chars().count();
+        for line in &lines[1..4] {
+            assert_eq!(line.chars().count(), width, "misaligned box line: {line}");
+        }
     }
 }

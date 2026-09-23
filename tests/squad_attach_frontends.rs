@@ -20,7 +20,7 @@ use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use awman::data::session_manager::SessionManager;
 use awman::data::workflow_definition::WorkflowStep;
 use awman::data::workflow_state::{StepState, WorkflowState};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -28,7 +28,8 @@ use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::tui::app::App;
 use awman::frontend::tui::tabs::{
-    ContainerSlotEvent, SharedWorkflowViewState, Tab, WorkflowOverviewState, WorkflowViewState,
+    ContainerSlotEvent, SharedWorkflowViewState, StepViewStatus, Tab, WorkflowOverviewState,
+    WorkflowViewState,
 };
 use awman::frontend::tui::workflow_view::{render_workflow_overview, workflow_state_to_view_state};
 use ratatui::backend::TestBackend;
@@ -173,7 +174,13 @@ async fn stop_poller(cancel: CancellationToken, task: tokio::task::JoinHandle<()
 
 /// One rendered step, flattened for comparison: name, status, dependencies,
 /// agent, model.
-type StepFingerprint = (String, String, Vec<String>, Option<String>, Option<String>);
+type StepFingerprint = (
+    String,
+    StepViewStatus,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn view_fingerprint(view: &WorkflowViewState) -> Vec<StepFingerprint> {
     view.steps
@@ -181,7 +188,7 @@ fn view_fingerprint(view: &WorkflowViewState) -> Vec<StepFingerprint> {
         .map(|step| {
             (
                 step.name.clone(),
-                step.status.clone(),
+                step.status,
                 step.depends_on.clone(),
                 step.agent.clone(),
                 step.model.clone(),
@@ -272,9 +279,11 @@ fn squad_app() -> App {
             ApiPaths::at_root("/tmp"),
         )),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(
             tempfile::tempdir().unwrap().path(),
         )),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
     App::new(
         CommandCatalogue::get(),
@@ -286,7 +295,7 @@ fn squad_app() -> App {
 }
 
 fn push_launch(tab: &Tab, step_name: &str, agent: &str, container_name: &str) {
-    let mut events = tab.container_slot_events.lock().unwrap();
+    let mut events = tab.shared.container_slot_events.lock().unwrap();
     events.push_back(ContainerSlotEvent::Launched {
         step_name: step_name.into(),
         agent: agent.into(),
@@ -342,7 +351,7 @@ fn workflow_phase_attach_matches_the_in_process_workflow_slot_and_overview_state
     push_launch(&in_process, "lint", "claude", "awman-lint-id");
     push_launch(&in_process, "test", "codex", "awman-test-id");
     in_process.drain_container_slot_events();
-    *in_process.workflow_state.lock().unwrap() = Some(workflow_state_to_view_state(&state));
+    *in_process.shared.workflow_state.lock().unwrap() = Some(workflow_state_to_view_state(&state));
 
     // The attach driver produces actions from the remote snapshot; its normal
     // downstream representation is the exact same event queue.
@@ -366,12 +375,24 @@ fn workflow_phase_attach_matches_the_in_process_workflow_slot_and_overview_state
         );
     }
     attached.drain_container_slot_events();
-    *attached.workflow_state.lock().unwrap() = Some(workflow_state_to_view_state(&state));
+    *attached.shared.workflow_state.lock().unwrap() = Some(workflow_state_to_view_state(&state));
 
     assert_eq!(slot_fingerprint(&attached), slot_fingerprint(&in_process));
     assert_eq!(attached.focused_slot_idx, in_process.focused_slot_idx);
-    let attached_view = attached.workflow_state.lock().unwrap().clone().unwrap();
-    let in_process_view = in_process.workflow_state.lock().unwrap().clone().unwrap();
+    let attached_view = attached
+        .shared
+        .workflow_state
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    let in_process_view = in_process
+        .shared
+        .workflow_state
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
     assert_eq!(
         view_fingerprint(&attached_view),
         view_fingerprint(&in_process_view)
@@ -488,7 +509,7 @@ async fn daemon_failure_freezes_poller_overview_and_preserves_live_slots() {
         None,
     )]);
     let mut app = squad_app();
-    let view = app.active_tab().workflow_state.clone();
+    let view = app.active_tab().shared.workflow_state.clone();
     let reachable = app
         .active_tab()
         .squad
@@ -571,7 +592,7 @@ fn attaching_mid_workflow_keeps_completed_steps_in_the_existing_overview() {
         mid_workflow_attach
             .steps
             .iter()
-            .any(|step| step.name == "already-done" && step.status == "done"),
+            .any(|step| step.name == "already-done" && step.status == StepViewStatus::Done),
         "the first snapshot after a mid-workflow attach retains completed history"
     );
 }

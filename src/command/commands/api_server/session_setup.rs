@@ -2,17 +2,19 @@
 //!
 //! `SessionSetupBus` follows the same broadcast pattern as the command
 //! `EventBus` but is scoped to session setup lifecycle events.
+//!
+//! It is a *pure broadcaster* (WI 0114 F-41): it sends events and hands out
+//! the shared [`SessionSetupState`] handle, but every transition of that state
+//! is a method on the Layer 0 type. Nothing here decides what a transition
+//! means.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::broadcast;
 
-use crate::data::session_setup_event::{
-    ReadyStepEntry, SessionSetupError, SessionSetupEvent, SessionSetupState, SessionSetupStatus,
-    SetupEventPayload,
-};
-use crate::engine::step_status::StepStatus;
+use crate::data::session_setup_event::{SessionSetupEvent, SessionSetupState, SetupEventPayload};
+use crate::data::step_status::StepStatus;
 
 /// Aggregate state used by both sync ReadyFrontend callbacks (running on the
 /// async setup task) and async HTTP handlers. `std::sync::RwLock` is used
@@ -74,54 +76,6 @@ impl SessionSetupBusSender {
         let _ = self.tx.send(event);
     }
 
-    pub fn update_status(&self, status: SessionSetupStatus) {
-        let mut state = self
-            .current_state
-            .write()
-            .expect("session setup state lock poisoned");
-        state.status = status;
-    }
-
-    pub fn update_stage(&self, stage: &str) {
-        let mut state = self
-            .current_state
-            .write()
-            .expect("session setup state lock poisoned");
-        state.current_stage = Some(stage.to_string());
-    }
-
-    pub fn mark_failed(&self, stage: &str, message: &str) {
-        let mut state = self
-            .current_state
-            .write()
-            .expect("session setup state lock poisoned");
-        state.status = SessionSetupStatus::Failed;
-        state.current_stage = Some(format!("Failed: {message}"));
-        state.error = Some(SessionSetupError {
-            stage: stage.to_string(),
-            message: message.to_string(),
-        });
-    }
-
-    pub fn update_ready_step(&self, step: &str, status: StepStatus) {
-        let mut state = self
-            .current_state
-            .write()
-            .expect("session setup state lock poisoned");
-        if let Some(entry) = state
-            .ready_step_statuses
-            .iter_mut()
-            .find(|e| e.step == step)
-        {
-            entry.status = status;
-        } else {
-            state.ready_step_statuses.push(ReadyStepEntry {
-                step: step.to_string(),
-                status,
-            });
-        }
-    }
-
     pub fn snapshot(&self) -> SessionSetupState {
         self.current_state
             .read()
@@ -129,14 +83,15 @@ impl SessionSetupBusSender {
             .clone()
     }
 
-    pub fn set_ready(&self, summary: crate::engine::ready::summary::ReadySummary) {
+    /// Apply one Layer 0 transition to the shared state. The sender holds the
+    /// lock and nothing else; the transition itself is a
+    /// [`SessionSetupState`] method.
+    fn transition<T>(&self, apply: impl FnOnce(&mut SessionSetupState) -> T) -> T {
         let mut state = self
             .current_state
             .write()
             .expect("session setup state lock poisoned");
-        state.status = SessionSetupStatus::Ready;
-        state.ready_summary = Some(summary);
-        state.current_stage = Some("Setup complete".to_string());
+        apply(&mut state)
     }
 }
 
@@ -147,11 +102,11 @@ use async_trait::async_trait;
 use super::event_bus::EventBusSender;
 use crate::data::execution_event::EventPayload;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::ready_phase::ReadyPhase;
+use crate::data::ready_summary::ReadySummary;
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::ready::frontend::ReadyFrontend;
-use crate::engine::ready::phase::ReadyPhase;
-use crate::engine::ready::summary::ReadySummary;
 
 /// Bridges the `ReadyFrontend` trait (from the ready engine) to the
 /// `SessionSetupBus` during async session setup.
@@ -162,16 +117,23 @@ use crate::engine::ready::summary::ReadySummary;
 pub struct SetupReadyFrontend {
     bus: SessionSetupBusSender,
     event_bus: EventBusSender,
-    /// Short session-id prefix used as the line tag in the API log file.
-    session_prefix: String,
+    /// Session-tagged API log writer (prefix + verbosity).
+    log: SetupLog,
 }
 
 impl SetupReadyFrontend {
-    pub fn new(session_id: &str, bus: SessionSetupBusSender, event_bus: EventBusSender) -> Self {
+    /// `verbose` is `EnvSnapshot::api_verbose_setup()`, read once by the
+    /// caller: Layer 0 owns the variable (F-37).
+    pub fn new(
+        session_id: &str,
+        bus: SessionSetupBusSender,
+        event_bus: EventBusSender,
+        verbose: bool,
+    ) -> Self {
         Self {
             bus,
             event_bus,
-            session_prefix: session_log_prefix(session_id),
+            log: SetupLog::new(session_id, verbose),
         }
     }
 }
@@ -184,7 +146,7 @@ impl UserMessageSink for SetupReadyFrontend {
             MessageLevel::Error => "error",
             MessageLevel::Success => "ok",
         };
-        log_setup_line(&self.session_prefix, &format!("[{phase}] {}", msg.text));
+        self.log.line(&format!("[{phase}] {}", msg.text));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: phase.to_string(),
             message: msg.text,
@@ -199,103 +161,56 @@ impl ReadyFrontend for SetupReadyFrontend {
         &mut self,
         _dockerfile_path: &std::path::Path,
     ) -> Result<bool, EngineError> {
-        Ok(true)
+        Ok(crate::command::headless::HeadlessDefaults::api().create_dockerfile())
     }
 
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
-        Ok(false)
+        Ok(crate::command::headless::HeadlessDefaults::api().run_audit_on_template())
     }
 
     fn report_phase(&mut self, phase: &ReadyPhase) {
-        let message = ready_phase_display(phase);
-        log_setup_line(
-            &self.session_prefix,
-            &format!("phase: {phase:?} — {message}"),
-        );
-        {
-            let mut state = self
-                .bus
-                .current_state
-                .write()
-                .expect("session setup state lock poisoned");
-            state.status = SessionSetupStatus::RunningReady;
-            state.current_ready_phase = Some(phase.clone());
-            state.current_stage = Some(message.clone());
-        }
+        let message = self.bus.transition(|s| s.apply_ready_phase(phase));
+        self.log.line(&format!("phase: {phase:?} — {message}"));
         self.bus.emit(SetupEventPayload::ReadyPhaseChanged {
             phase: phase.clone(),
             message,
         });
     }
 
-    fn report_step_status(&mut self, step: &str, status: StepStatus) {
-        log_setup_line(
-            &self.session_prefix,
-            &format!("step: {step} → {}", format_step_status(&status)),
-        );
-        {
-            let mut state = self
-                .bus
-                .current_state
-                .write()
-                .expect("session setup state lock poisoned");
-            if let Some(entry) = state
-                .ready_step_statuses
-                .iter_mut()
-                .find(|e| e.step == step)
-            {
-                entry.status = status.clone();
-            } else {
-                state.ready_step_statuses.push(ReadyStepEntry {
-                    step: step.to_string(),
-                    status: status.clone(),
-                });
-            }
-        }
-        self.bus.emit(SetupEventPayload::ReadyStepStatus {
-            step: step.to_string(),
-            status,
-        });
-    }
-
     fn report_summary(&mut self, summary: &ReadySummary) {
-        log_setup_line(&self.session_prefix, &format!("ready summary: {summary:?}"));
-        {
-            let mut state = self
-                .bus
-                .current_state
-                .write()
-                .expect("session setup state lock poisoned");
-            state.status = SessionSetupStatus::Ready;
-            state.ready_summary = Some(summary.clone());
-            state.current_stage = Some("Setup complete".to_string());
-        }
+        self.log.line(&format!("ready summary: {summary:?}"));
+        self.bus.transition(|s| s.set_ready(summary.clone()));
         self.bus.emit(SetupEventPayload::SetupComplete {
             ready_summary: Box::new(summary.clone()),
         });
+    }
+}
+
+impl crate::engine::agent::AgentImageFrontend for SetupReadyFrontend {
+    fn report_step_status(
+        &mut self,
+        step: &crate::data::setup_step::SetupStep,
+        status: StepStatus,
+    ) {
+        // The setup state and the wire payload are both keyed by the step's
+        // rendered label, so it is rendered once here and passed on unchanged.
+        // F-45 kept `SetupStep`'s `Display` byte-identical to the `&str` keys
+        // the engines used to pass, so neither the log line nor the event
+        // stream changes.
+        let step = step.to_string();
+        self.log
+            .line(&format!("step: {step} → {}", format_step_status(&status)));
+        self.bus
+            .transition(|s| s.apply_ready_step(&step, status.clone()));
+        self.bus
+            .emit(SetupEventPayload::ReadyStepStatus { step, status });
     }
 
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(SetupContainerSink {
             event_bus: self.event_bus.clone(),
-            session_prefix: self.session_prefix.clone(),
+            log: self.log.clone(),
         })
-    }
-}
-
-fn ready_phase_display(phase: &ReadyPhase) -> String {
-    match phase {
-        ReadyPhase::Preflight => "Running preflight checks...".into(),
-        ReadyPhase::AwaitingDockerfileDecision => "Checking Dockerfile...".into(),
-        ReadyPhase::CreatingDockerfile => "Creating Dockerfile.dev...".into(),
-        ReadyPhase::BuildingBaseImage => "Building base image...".into(),
-        ReadyPhase::BuildingAgentImage => "Building agent image...".into(),
-        ReadyPhase::CheckingNonDefaultAgents => "Checking non-default agent images...".into(),
-        ReadyPhase::CheckingLocalAgent => "Checking local agent...".into(),
-        ReadyPhase::RunningAudit => "Running audit...".into(),
-        ReadyPhase::RebuildingAfterAudit => "Rebuilding after audit...".into(),
-        ReadyPhase::Complete => "Ready checks complete".into(),
-        ReadyPhase::Failed(f) => format!("Failed: {}", f.message),
     }
 }
 
@@ -307,7 +222,7 @@ fn ready_phase_display(phase: &ReadyPhase) -> String {
 /// `command_frontend.rs`.
 struct SetupContainerSink {
     event_bus: EventBusSender,
-    session_prefix: String,
+    log: SetupLog,
 }
 
 impl UserMessageSink for SetupContainerSink {
@@ -318,10 +233,7 @@ impl UserMessageSink for SetupContainerSink {
             MessageLevel::Error => "error",
             MessageLevel::Success => "ok",
         };
-        log_setup_line(
-            &self.session_prefix,
-            &format!("container [{phase}] {}", msg.text),
-        );
+        self.log.line(&format!("container [{phase}] {}", msg.text));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: phase.to_string(),
             message: msg.text,
@@ -345,7 +257,7 @@ impl AgentFrontend for SetupContainerSink {
             AgentStatus::Exited(code) => format!("Container exited with code {code}"),
             AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
-        log_setup_line(&self.session_prefix, &format!("container: {message}"));
+        self.log.line(&format!("container: {message}"));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
             message,
@@ -353,10 +265,10 @@ impl AgentFrontend for SetupContainerSink {
     }
 
     fn report_progress(&mut self, progress: AgentProgress) {
-        log_setup_line(
-            &self.session_prefix,
-            &format!("container [{}] {}", progress.stage, progress.message),
-        );
+        self.log.line(&format!(
+            "container [{}] {}",
+            progress.stage, progress.message
+        ));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: progress.stage,
             message: progress.message,
@@ -372,16 +284,8 @@ impl AgentFrontend for SetupContainerSink {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        forward_container_stream_to_tracing(
-            self.session_prefix.clone(),
-            "stdout".into(),
-            stdout_rx,
-        );
-        forward_container_stream_to_tracing(
-            self.session_prefix.clone(),
-            "stderr".into(),
-            stderr_rx,
-        );
+        forward_container_stream_to_tracing(self.log.clone(), "stdout".into(), stdout_rx);
+        forward_container_stream_to_tracing(self.log.clone(), "stderr".into(), stderr_rx);
         crate::engine::agent_runtime::frontend::AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
@@ -400,7 +304,7 @@ impl AgentFrontend for SetupContainerSink {
 /// Spawn a task that buffers bytes by line and writes each line to the
 /// tracing log with the session prefix.
 fn forward_container_stream_to_tracing(
-    session_prefix: String,
+    log: SetupLog,
     stream_name: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
@@ -413,10 +317,7 @@ fn forward_container_stream_to_tracing(
                 let s = String::from_utf8_lossy(&line[..line.len() - 1]);
                 let trimmed = s.trim_end_matches('\r');
                 if !trimmed.is_empty() {
-                    log_setup_line(
-                        &session_prefix,
-                        &format!("container.{stream_name}: {trimmed}"),
-                    );
+                    log.line(&format!("container.{stream_name}: {trimmed}"));
                 }
             }
         }
@@ -424,16 +325,48 @@ fn forward_container_stream_to_tracing(
             let s = String::from_utf8_lossy(&buf);
             let trimmed = s.trim_end_matches(['\r', '\n']);
             if !trimmed.is_empty() {
-                log_setup_line(
-                    &session_prefix,
-                    &format!("container.{stream_name}: {trimmed}"),
-                );
+                log.line(&format!("container.{stream_name}: {trimmed}"));
             }
         }
     });
 }
 
 // ─── Logging helpers ───────────────────────────────────────────────────────
+
+/// The API log tag for one session: the grep-able session prefix, plus
+/// whether setup chatter is logged at `info` or demoted to `debug`.
+///
+/// The verbosity comes in as a bool rather than being read here: the variable
+/// (`AWMAN_API_VERBOSE_SETUP`) is declared and parsed in Layer 0 by
+/// [`EnvSnapshot::api_verbose_setup`], and nothing above Layer 0 reads the
+/// environment directly (F-37).
+///
+/// [`EnvSnapshot::api_verbose_setup`]: crate::data::config::env::EnvSnapshot::api_verbose_setup
+#[derive(Debug, Clone)]
+pub struct SetupLog {
+    prefix: String,
+    verbose: bool,
+}
+
+impl SetupLog {
+    pub fn new(session_id: &str, verbose: bool) -> Self {
+        Self {
+            prefix: session_log_prefix(session_id),
+            verbose,
+        }
+    }
+
+    /// Write one line, tagged with the session prefix. `info` when verbose (the
+    /// default), `debug` otherwise — so an operator who silences per-session
+    /// chatter can still reach it through `RUST_LOG`.
+    pub fn line(&self, line: &str) {
+        if self.verbose {
+            tracing::info!(target: "awman::api::session_setup", "[{}] {line}", self.prefix);
+        } else {
+            tracing::debug!(target: "awman::api::session_setup", "[{}] {line}", self.prefix);
+        }
+    }
+}
 
 /// First 8 characters of the session id. Short enough to grep, long enough to
 /// disambiguate when multiple sessions run concurrently.
@@ -442,45 +375,27 @@ pub(crate) fn session_log_prefix(session_id: &str) -> String {
     session_id[..end].to_string()
 }
 
-/// Write a line to the tracing log tagged with the session prefix. Level is
-/// `info` by default (so it ends up in the API server log file) and `debug`
-/// when `AWMAN_API_VERBOSE_SETUP` is set to a falsy value, letting operators
-/// silence per-session chatter while keeping it available via `RUST_LOG`.
-pub(crate) fn log_setup_line(session_prefix: &str, line: &str) {
-    if verbose_setup_enabled() {
-        tracing::info!(target: "awman::api::session_setup", "[{session_prefix}] {line}");
-    } else {
-        tracing::debug!(target: "awman::api::session_setup", "[{session_prefix}] {line}");
-    }
-}
-
-/// Returns `true` when verbose setup logging is enabled (the default).
-/// Disabled when `AWMAN_API_VERBOSE_SETUP` is one of `0`, `false`, `no`, `off`.
-pub(crate) fn verbose_setup_enabled() -> bool {
-    match std::env::var("AWMAN_API_VERBOSE_SETUP") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
-}
-
 /// `UserMessageSink` that mirrors every message to the API setup tracing log.
 /// Used by the session-setup task to capture the full output of git commands
 /// (clone, branch checkout, etc.) into the API server's log file with the
 /// session-id prefix that downstream tooling greps for.
 pub struct TracingSetupSink {
-    session_prefix: String,
+    log: SetupLog,
 }
 
 impl TracingSetupSink {
-    pub fn new(session_id: &str) -> Self {
+    /// `verbose` is `EnvSnapshot::api_verbose_setup()`, read once by the
+    /// caller: Layer 0 owns the variable (F-37).
+    pub fn new(session_id: &str, verbose: bool) -> Self {
         Self {
-            session_prefix: session_log_prefix(session_id),
+            log: SetupLog::new(session_id, verbose),
         }
     }
 }
+
+/// F-45: takes the default `command_started`, so the `$ git …` echo line
+/// is byte-identical to the one `run_git_logged` composed before.
+impl crate::engine::git::GitFrontend for TracingSetupSink {}
 
 impl UserMessageSink for TracingSetupSink {
     fn write_message(&mut self, msg: UserMessage) {
@@ -490,7 +405,7 @@ impl UserMessageSink for TracingSetupSink {
             MessageLevel::Error => "error",
             MessageLevel::Success => "ok",
         };
-        log_setup_line(&self.session_prefix, &format!("git [{level}] {}", msg.text));
+        self.log.line(&format!("git [{level}] {}", msg.text));
     }
 
     fn replay_queued(&mut self) {}
@@ -499,8 +414,8 @@ impl UserMessageSink for TracingSetupSink {
 /// Public re-export so route handlers can write a setup-context line to the
 /// API log file using the same prefix and gating as the rest of session
 /// setup (state transitions, ready output, etc.).
-pub fn log_session_setup(session_id: &str, line: &str) {
-    log_setup_line(&session_log_prefix(session_id), line);
+pub fn log_session_setup(session_id: &str, verbose: bool, line: &str) {
+    SetupLog::new(session_id, verbose).line(line);
 }
 
 fn format_step_status(status: &StepStatus) -> String {

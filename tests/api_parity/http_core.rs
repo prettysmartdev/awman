@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
-use awman::command::commands::HttpCore;
-use awman::command::error::CommandError;
 use awman::engine::auth::ApiKey;
+use awman::engine::error::EngineError;
+use awman::engine::remote::HttpCore;
 
 #[tokio::test]
 async fn http_core_trims_base_url_honours_prefix_and_applies_bearer_header() {
@@ -60,7 +60,7 @@ async fn http_core_maps_status_errors_and_tolerates_non_json_delete_body() {
         .await
         .expect_err("HTTP status >= 400 must be surfaced");
     match status {
-        CommandError::RemoteHttpStatus { status: 422, body } => {
+        EngineError::RemoteHttpStatus { status: 422, body } => {
             assert!(body.contains("invalid condition"));
         }
         other => panic!("expected RemoteHttpStatus, got {other:?}"),
@@ -79,7 +79,7 @@ async fn http_core_classifies_connect_and_timeout_errors_like_remote_client() {
     let core = HttpCore::new(&format!("http://{unused}"), "v1", None).unwrap();
     let connect_error = core.get(&["status"]).await.expect_err("port is unused");
     assert!(
-        matches!(connect_error, CommandError::RemoteConnectionRefused(_)),
+        matches!(connect_error, EngineError::RemoteConnectionRefused(_)),
         "expected connection classification, got {connect_error:?}"
     );
 
@@ -101,7 +101,7 @@ async fn http_core_classifies_connect_and_timeout_errors_like_remote_client() {
     assert!(
         matches!(
             HttpCore::map_reqwest_error(timeout),
-            CommandError::RemoteTimeout
+            EngineError::RemoteTimeout
         ),
         "timeout must map to RemoteTimeout"
     );

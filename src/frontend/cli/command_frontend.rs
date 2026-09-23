@@ -18,20 +18,20 @@ use clap::ArgMatches;
 
 use crate::command::commands::status::StatusCommandFrontend;
 use crate::command::commands::{
-    auth::AuthCommandFrontend,
     config::ConfigCommandFrontend,
-    download::DownloadCommandFrontend,
     new::NewCommandFrontend,
     remote::RemoteCommandFrontend,
     specs::{SpecsCommandFrontend, WorkItemKind},
 };
 use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
+use crate::command::dispatch::resolved::ResolvedFlags;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
-use crate::data::message::{UserMessage, UserMessageSink};
-use crate::engine::agent_runtime::frontend::AgentFrontend;
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::prompt::{Prompt, TextPrompt};
 
 use super::user_message::CliUserMessageQueue;
+use crate::command::headless::HeadlessDefaults;
 
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
@@ -43,6 +43,11 @@ pub struct CliFrontend {
     /// Effective non-interactive mode: true when explicitly requested via
     /// `--non-interactive` OR when stdin is not a TTY.
     pub(crate) non_interactive: bool,
+    /// Every answer the CLI gives when it reaches a question it cannot ask —
+    /// stdin is not a TTY, or `--non-interactive` was passed. See
+    /// `src/command/headless.rs` for the table and why the CLI's row differs
+    /// from the API's and squad's.
+    pub(crate) headless: HeadlessDefaults,
     /// Receiver end of the background stdin-reader thread spawned for yolo
     /// countdown input. `None` until the first `yolo_countdown_tick` call on a
     /// TTY; consumed lines are mapped to `YoloTickOutcome` by the
@@ -76,12 +81,6 @@ pub struct CliFrontend {
 
 #[async_trait::async_trait]
 impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFrontend {
-    /// The CLI runs in the user's own shell, so the process's current
-    /// directory is theirs and the mount-scope question can be put to them.
-    fn is_local_user_session(&self) -> bool {
-        true
-    }
-
     /// The daemon host: the unattended frontends its evaluator drives agents
     /// and workflows with. Answers, not decisions — the policy behind them is
     /// Layer 2's.
@@ -100,12 +99,14 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
     }
 
     /// stdout belongs to `--json` consumers, so the key banner goes to stderr
-    /// — the same place it has always been printed.
+    /// — the same place it has always been printed. The drawing is this
+    /// frontend's (WI 0114 F-56); Layer 2 supplies only the key, the shell
+    /// and the export line.
     fn show_key_setup(
         &mut self,
         setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
     ) {
-        eprintln!("{}", setup.body);
+        eprintln!("{}", super::per_command::squad::render_key_setup(setup));
     }
 
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
@@ -122,20 +123,15 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         )
     }
 
+    /// The title, the options and their order are `prompt`'s (F-19); this
+    /// renders them and maps the index back. The old body numbered its own
+    /// two labels and answered `DefaultTaskWorkspace` for anything it did not
+    /// recognise, including the empty line a piped stdin gives.
     fn ask_task_workspace_choice(
         &mut self,
+        prompt: &Prompt<crate::command::commands::squad::commands::TaskWorkspaceChoice>,
     ) -> Result<crate::command::commands::squad::commands::TaskWorkspaceChoice, CommandError> {
-        use crate::command::commands::squad::commands::TaskWorkspaceChoice;
-        let choice = super::per_command::helpers::pick_numbered(
-            "task workspace?",
-            &["Default Task Workspace", "Custom Folder / Repo"],
-            1,
-        );
-        Ok(if choice == 2 {
-            TaskWorkspaceChoice::CustomFolderOrRepo
-        } else {
-            TaskWorkspaceChoice::DefaultTaskWorkspace
-        })
+        self.pick_from_prompt(prompt)
     }
 
     fn ask_task_overlay(&mut self, existing: &[String]) -> Result<Option<String>, CommandError> {
@@ -150,13 +146,10 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
     }
 
     fn confirm_non_git_workspace(&mut self, path: &Path) -> Result<bool, CommandError> {
-        Ok(super::per_command::helpers::yes_no(
-            &format!(
-                "{} is not the root of a Git repository. Keep this path? \
-                 (no = choose a different one)",
-                path.display()
-            ),
-            false,
+        self.interview_yes_no(&format!(
+            "{} is not the root of a Git repository. Keep this path? \
+             (no = choose a different one)",
+            path.display()
         ))
     }
 
@@ -165,26 +158,28 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         path: &Path,
         current_dir: &Path,
     ) -> Result<bool, CommandError> {
-        Ok(super::per_command::helpers::yes_no(
-            &format!(
-                "{} is a parent directory of {}. Mount it anyway? \
-                 (no = choose a different one)",
-                path.display(),
-                current_dir.display()
-            ),
-            false,
+        self.interview_yes_no(&format!(
+            "{} is a parent directory of {}. Mount it anyway? \
+             (no = choose a different one)",
+            path.display(),
+            current_dir.display()
         ))
     }
 
-    fn ask_task_interval(&mut self) -> Result<String, CommandError> {
-        // Blank keeps the documented default; a value is parsed & validated in
-        // Layer 1/2, never here.
-        match super::per_command::helpers::read_line("evaluation interval [6h]?") {
-            Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-            Some(_) => Ok("6h".to_string()),
-            None => Err(CommandError::InteractiveInputUnavailable {
-                prompt: "evaluation interval".into(),
-            }),
+    /// The wording and the default are `prompt`'s (F-19); this only reads a
+    /// line and hands it back for resolution. A value is parsed and validated
+    /// in Layer 1/2, never here.
+    fn ask_task_interval(&mut self, prompt: &TextPrompt) -> Result<String, CommandError> {
+        let hint = match &prompt.default {
+            Some(default) => format!("{} [{default}]?", prompt.title.to_lowercase()),
+            None => format!("{}?", prompt.title.to_lowercase()),
+        };
+        let unavailable = || CommandError::InteractiveInputUnavailable {
+            prompt: prompt.title.clone(),
+        };
+        match super::per_command::helpers::read_line(&hint) {
+            Some(typed) => prompt.resolve(&typed).ok_or_else(unavailable),
+            None => Err(unavailable()),
         }
     }
 
@@ -217,11 +212,10 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
     // ── Task agent pool (WI 0110) ──────────────────────────────────────
 
     fn ask_use_global_squad_config(&mut self) -> Result<bool, CommandError> {
-        Ok(super::per_command::helpers::yes_no(
+        self.interview_yes_no(
             "use the global squad agent/model settings for this task? \
              (no = choose this task's own agents and models)",
-            true,
-        ))
+        )
     }
 
     fn ask_agent_model(
@@ -299,10 +293,7 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         } else {
             current.join(", ")
         };
-        Ok(super::per_command::helpers::yes_no(
-            &format!("replace the task's overlays? current: {shown}"),
-            false,
-        ))
+        self.interview_yes_no(&format!("replace the task's overlays? current: {shown}"))
     }
 
     fn ask_replace_agent_pool(
@@ -318,23 +309,19 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        Ok(super::per_command::helpers::yes_no(
-            &format!("replace the task's agents and models? current: {shown}"),
-            false,
+        self.interview_yes_no(&format!(
+            "replace the task's agents and models? current: {shown}"
         ))
     }
 
+    /// The choices are `prompt`'s (F-19). The old body read `"cwd"` and
+    /// mapped *every other string* — a typo included — to `GitRoot`, building
+    /// a `MountScope` from a string in Layer 3.
     fn ask_task_mount_scope(
         &mut self,
+        prompt: &Prompt<crate::data::fs::task_store::MountScope>,
     ) -> Result<crate::data::fs::task_store::MountScope, CommandError> {
-        use crate::data::fs::task_store::MountScope;
-        match super::per_command::helpers::read_line("mount scope: [gitroot]/cwd?") {
-            Some(s) if s.trim().eq_ignore_ascii_case("cwd") => Ok(MountScope::Cwd),
-            Some(_) => Ok(MountScope::GitRoot),
-            None => Err(CommandError::InteractiveInputUnavailable {
-                prompt: "mount scope".into(),
-            }),
-        }
+        self.pick_from_prompt(prompt)
     }
 
     fn ask_delete_task_dir(
@@ -342,10 +329,8 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         _name: &str,
         path: &std::path::Path,
     ) -> Result<bool, CommandError> {
-        // No TTY (piped / --non-interactive) keeps the safe default: do not
-        // delete the persistent directory.
-        if self.non_interactive || !super::output::stdin_is_tty() {
-            return Ok(false);
+        if self.non_interactive {
+            return Ok(self.headless.delete_task_dir());
         }
         eprintln!(
             "awman: also delete the task directory {}? [y/N]",
@@ -375,15 +360,95 @@ impl Drop for RawModeGuard {
 }
 
 impl CliFrontend {
+    /// A yes/no interview step that no profile answers.
+    ///
+    /// The squad interview's confirmations — keep a non-git path, mount a
+    /// parent directory, replace a task's overlays or its agent pool — have
+    /// no `HeadlessDefaults` row, because there is no answer that is right
+    /// for an absent user. A run that cannot ask says so, the way
+    /// `ask_task_name` already does, instead of answering on their behalf
+    /// (F-19; F-50 step 1 removes the per-prompt `stdin_is_tty()` test that
+    /// used to make the literal `false` here look like a policy).
+    ///
+    /// There is no Enter-default either: `yes_no_required` re-asks until the
+    /// answer is `y` or `n`, matching the TUI's `DialogRequest::YesNo`, whose
+    /// only non-answer is a dismissal.
+    /// Render a `Prompt<D>`'s choices and read the user's pick.
+    ///
+    /// The one place the CLI turns a prompt into terminal lines: hotkey and
+    /// label per choice, then a typed key or a 1-based index. Nothing here is
+    /// copy — every word comes from `command::prompts` — and no answer is
+    /// invented: a run that cannot ask, or a stdin that ends, falls back to
+    /// `default_on_dismiss` and otherwise aborts (F-19).
+    pub(crate) fn pick_from_prompt<D: Clone>(&self, prompt: &Prompt<D>) -> Result<D, CommandError> {
+        let dismissed = || match prompt.default_on_dismiss.clone() {
+            Some(value) => Ok(value),
+            None => Err(CommandError::InteractiveInputUnavailable {
+                prompt: prompt.title.clone(),
+            }),
+        };
+        if self.non_interactive {
+            return dismissed();
+        }
+        eprintln!("awman: {}", prompt.title);
+        if !prompt.body.is_empty() {
+            eprintln!("awman: {}", prompt.body);
+        }
+        for choice in &prompt.choices {
+            eprintln!("  [{}] {}", choice.key, choice.label);
+        }
+        let keys: String = prompt
+            .keys()
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+            .join("/");
+        let Some(typed) = super::per_command::helpers::read_line(&format!("choice [{keys}]:"))
+        else {
+            return dismissed();
+        };
+        let trimmed = typed.trim();
+        let by_key = trimmed
+            .chars()
+            .next()
+            .filter(|_| trimmed.chars().count() == 1)
+            .and_then(|key| prompt.answer_for_key(key));
+        match by_key.or_else(|| {
+            trimmed
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| prompt.answer_at(i))
+        }) {
+            Some(answer) => Ok(answer),
+            None => dismissed(),
+        }
+    }
+
+    fn interview_yes_no(&self, prompt: &str) -> Result<bool, CommandError> {
+        let unavailable = || CommandError::InteractiveInputUnavailable {
+            prompt: prompt.to_string(),
+        };
+        if self.non_interactive {
+            return Err(unavailable());
+        }
+        super::per_command::helpers::yes_no_required(prompt).ok_or_else(unavailable)
+    }
+
     pub fn new(matches: ArgMatches) -> Self {
         let command_path = command_path_from_matches(&matches);
         let explicit_flag = Self::explicit_non_interactive(&matches, &command_path);
-        let non_interactive = crate::frontend::effective_non_interactive(explicit_flag);
+        // The same rule the command's own `ResolvedFlags` will apply, from
+        // the same Layer 2 function — not a second formula (F-50). Caching it
+        // here is what lets the `ask_*` bodies below be one-liners.
+        let non_interactive =
+            ResolvedFlags::is_non_interactive(explicit_flag, super::output::stdin_is_tty());
         Self {
             matches,
             command_path,
             messages: CliUserMessageQueue::new(),
             non_interactive,
+            headless: HeadlessDefaults::cli(),
             yolo_stdin_rx: None,
             last_sink_message_time: None,
             raw_mode_guard: None,
@@ -403,9 +468,9 @@ impl CliFrontend {
     /// catalogue resolution; this cache must agree, or a `--json` caller on
     /// a TTY gets a frontend that still thinks it is interactive while the
     /// command it built believes it is non-interactive JSON. Callers pass
-    /// this into [`crate::frontend::effective_non_interactive`] to fold in
-    /// the no-TTY fallback.
-    fn explicit_non_interactive(matches: &ArgMatches, command_path: &[String]) -> bool {
+    /// this into [`ResolvedFlags::is_non_interactive`] to fold in the
+    /// no-input fallback.
+    pub(crate) fn explicit_non_interactive(matches: &ArgMatches, command_path: &[String]) -> bool {
         let mut m = matches;
         for seg in command_path {
             match m.subcommand_matches(seg) {
@@ -474,6 +539,10 @@ pub fn command_path_from_matches(matches: &ArgMatches) -> Vec<String> {
 
 // ─── UserMessageSink (delegates to the queue) ──────────────────────────────
 
+/// F-45: takes the default `command_started`, so the `$ git …` echo line
+/// is byte-identical to the one `run_git_logged` composed before.
+impl crate::engine::git::GitFrontend for CliFrontend {}
+
 impl UserMessageSink for CliFrontend {
     fn write_message(&mut self, msg: UserMessage) {
         self.messages.write_message(msg);
@@ -487,6 +556,15 @@ impl UserMessageSink for CliFrontend {
 // ─── CommandFrontend ───────────────────────────────────────────────────────
 
 impl CommandFrontend for CliFrontend {
+    fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
+        crate::command::dispatch::catalogue::FrontendKind::Cli
+    }
+
+    /// The CLI is the one frontend whose answer is not a property of its kind:
+    /// it can ask a human only when stdin is a terminal.
+    fn input_available(&self) -> bool {
+        super::output::stdin_is_tty()
+    }
     fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         let Some(m) = self.matches_for(command_path) else {
             return Ok(None);
@@ -598,45 +676,6 @@ impl CommandFrontend for CliFrontend {
 // `ExecWorkflow`, `Api`) gain method bodies in the per-command
 // modules under `src/frontend/cli/per_command/`.
 
-impl AuthCommandFrontend for CliFrontend {
-    fn ask_consent(
-        &mut self,
-        default: bool,
-    ) -> Result<crate::command::commands::auth::AuthConsentChoice, CommandError> {
-        use crate::command::commands::auth::AuthConsentChoice;
-        // TTY-aware: when stdin is not a TTY, use the default. Otherwise
-        // prompt for [y]es / [n]o / [o]nce.
-        if !crate::frontend::cli::output::stdin_is_tty() {
-            return Ok(if default {
-                AuthConsentChoice::Accept
-            } else {
-                AuthConsentChoice::Decline
-            });
-        }
-        let suffix = if default { "[Y/n/o]" } else { "[y/N/o]" };
-        eprintln!("awman: persist agent auth consent for this repo? {suffix}");
-        let mut buf = String::new();
-        if std::io::stdin().read_line(&mut buf).is_err() {
-            return Ok(if default {
-                AuthConsentChoice::Accept
-            } else {
-                AuthConsentChoice::Decline
-            });
-        }
-        Ok(match buf.trim() {
-            "y" | "Y" => AuthConsentChoice::Accept,
-            "n" | "N" => AuthConsentChoice::Decline,
-            "o" | "O" => AuthConsentChoice::Once,
-            _ => {
-                if default {
-                    AuthConsentChoice::Accept
-                } else {
-                    AuthConsentChoice::Decline
-                }
-            }
-        })
-    }
-}
 impl ConfigCommandFrontend for CliFrontend {
     fn present_config_table(
         &mut self,
@@ -649,7 +688,6 @@ impl ConfigCommandFrontend for CliFrontend {
         Ok(None)
     }
 }
-impl DownloadCommandFrontend for CliFrontend {}
 impl NewCommandFrontend for CliFrontend {
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
         require_named_input("workflow name?")
@@ -696,28 +734,42 @@ impl NewCommandFrontend for CliFrontend {
         require_optional_input("skill body (one line)?")
     }
 }
-impl RemoteCommandFrontend for CliFrontend {}
+impl RemoteCommandFrontend for CliFrontend {
+    /// The same box `ready` draws, so a remote session's summary and a local
+    /// one are indistinguishable.
+    fn report_ready_summary(&mut self, summary: &crate::data::ready_summary::ReadySummary) {
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: crate::frontend::render_helpers::render_ready_summary(summary),
+        });
+    }
+}
 impl SpecsCommandFrontend for CliFrontend {
-    fn ask_spec_kind(&mut self) -> Result<WorkItemKind, CommandError> {
-        use super::output::stdin_is_tty;
-        if !stdin_is_tty() {
-            return Ok(WorkItemKind::Task);
+    /// Prints `prompt`'s own choices and maps the answer back through it —
+    /// the labels and hotkeys are Layer 2's (F-19). The CLI used to print its
+    /// own list and accept word aliases (`feature`, `bug`) the TUI did not,
+    /// which is the drift the shared prompt removes.
+    fn ask_spec_kind(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<WorkItemKind>,
+    ) -> Result<WorkItemKind, CommandError> {
+        if self.non_interactive {
+            return Ok(self.headless.spec_kind());
         }
-        eprintln!("awman: work item kind?");
-        eprintln!("  [1] Feature");
-        eprintln!("  [2] Bug");
-        eprintln!("  [3] Task");
-        eprintln!("  [4] Enhancement");
-        Ok(
-            match super::per_command::helpers::read_line("choice [1-4]:").as_deref() {
-                Some("1") | Some("f") | Some("F") | Some("feature") => WorkItemKind::Feature,
-                Some("2") | Some("b") | Some("B") | Some("bug") => WorkItemKind::Bug,
-                Some("4") | Some("e") | Some("E") | Some("enhancement") => {
-                    WorkItemKind::Enhancement
-                }
-                _ => WorkItemKind::Task,
-            },
-        )
+        eprintln!("awman: {}?", prompt.title.to_lowercase());
+        for choice in &prompt.choices {
+            eprintln!("  [{}] {}", choice.key, choice.label);
+        }
+        let keys: String = prompt.keys().into_iter().collect();
+        let typed = super::per_command::helpers::read_line(&format!("choice [{keys}]:"));
+        let answer = typed
+            .as_deref()
+            .and_then(|s| s.trim().chars().next())
+            .and_then(|key| prompt.answer_for_key(key));
+        match answer.or(prompt.default_on_dismiss) {
+            Some(kind) => Ok(kind),
+            None => Err(CommandError::Aborted),
+        }
     }
 
     fn ask_spec_title(&mut self) -> Result<String, CommandError> {
@@ -726,14 +778,6 @@ impl SpecsCommandFrontend for CliFrontend {
 
     fn ask_spec_summary(&mut self) -> Result<String, CommandError> {
         require_multiline_input("spec description?")
-    }
-
-    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(super::per_command::CliContainerProxy)
-    }
-
-    fn set_pty_active(&mut self, active: bool) {
-        self.messages.set_pty_active(active);
     }
 }
 
@@ -1061,14 +1105,34 @@ mod tests {
         assert_eq!(v, Some("codex".to_string()));
     }
 
+    /// Absent `--agent`, the frontend surfaces *the catalogue's* default.
+    ///
+    /// The expected value is read out of the catalogue rather than written
+    /// here as `"claude"` (WI 0114 tests-audit): which agent is the default is
+    /// Layer 2's decision, and a frontend test that pins it would fail on a
+    /// change it has no opinion about, while still not noticing a frontend
+    /// that substituted a default of its own.
     #[test]
     fn flag_enum_default_returns_catalogue_default() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "init"]).unwrap();
+        let catalogue = CommandCatalogue::get();
+        let expected = match catalogue
+            .lookup(&["init"])
+            .expect("`init` is a command")
+            .find_flag("agent")
+            .expect("`init --agent` exists")
+            .default
+        {
+            crate::command::dispatch::catalogue::FlagDefault::Str(s) => s,
+            other => panic!("`init --agent` must have a string default, got {other:?}"),
+        };
+
+        let m = catalogue
+            .build_clap_command()
+            .try_get_matches_from(["awman", "init"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
-        // The catalogue default for `--agent` on `init` is "claude".
         let v = frontend.flag_enum(&["init"], "agent").unwrap();
-        assert_eq!(v, Some("claude".to_string()));
+        assert_eq!(v, Some(expected.to_string()));
     }
 
     #[test]

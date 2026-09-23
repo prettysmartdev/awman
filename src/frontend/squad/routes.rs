@@ -15,13 +15,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 
+use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::squad::commands::SquadOutcome;
 use crate::command::commands::squad::daemon_runtime::SquadWorkflowLookup;
 use crate::command::commands::squad::gateway::EnvPush;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::{CommandOutcome, Dispatch};
 use crate::frontend::api::command_frontend::ApiDispatchFrontend;
-use crate::frontend::api::event_bus::EventBus;
 use crate::frontend::api::serve::{check_bearer_auth, error_json};
 
 use super::state::SquadAppState;
@@ -66,7 +66,11 @@ async fn auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Some(rejection) = check_bearer_auth(&state.handles.auth_mode(), req.headers()) {
+    if let Some(rejection) = check_bearer_auth(
+        &state.handles.engines().auth_engine,
+        &state.handles.auth_mode(),
+        req.headers(),
+    ) {
         return rejection;
     }
     next.run(req).await
@@ -77,20 +81,17 @@ async fn handle_command(
     Json(body): Json<CreateCommandRequest>,
 ) -> Response {
     let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
-    if path_parts.first() != Some(&"squad") {
-        return (
-            StatusCode::BAD_REQUEST,
-            error_json("squad daemon only accepts commands in the squad subtree"),
-        )
-            .into_response();
-    }
 
+    // Which commands this daemon serves is the catalogue's answer, under its
+    // own frontend kind: `SquadDaemon` admits the squad subtree and nothing
+    // else. This route used to compare `path_parts.first()` against the
+    // literal `"squad"` itself (WI 0114 F-50).
     let catalogue = CommandCatalogue::get();
-    if let Err(error) = catalogue.validate_for_frontend(FrontendKind::Api, &path_parts) {
+    if let Err(error) = catalogue.validate_for_frontend(FrontendKind::SquadDaemon, &path_parts) {
         return (StatusCode::BAD_REQUEST, error_json(error.to_string())).into_response();
     }
     if let Err(error) =
-        catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::Api)
+        catalogue.parse_raw_args_with_profile(&path_parts, &body.args, FrontendKind::SquadDaemon)
     {
         return (StatusCode::BAD_REQUEST, error_json(error.to_string())).into_response();
     }

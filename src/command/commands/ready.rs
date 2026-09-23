@@ -3,13 +3,14 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::{resolve_agent, Command};
+use crate::command::commands::launch_policy::LaunchPolicy;
+use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::ready_summary::AgentCredentialHealth;
+use crate::data::step_status::StepStatus;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
-use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone)]
 pub struct ReadyCommandFlags {
@@ -191,7 +192,7 @@ impl Command for ReadyCommand {
         // the per-agent Dockerfile lookup and image-tag computation match
         // whatever the user actually configured. Falls back to "claude" only
         // when no config sets the default.
-        let agent = match resolve_agent(&None, &session) {
+        let agent = match LaunchPolicy::for_session(&session).resolve_agent(&None) {
             Ok(a) => a,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -201,41 +202,6 @@ impl Command for ReadyCommand {
                 return Err(e);
             }
         };
-        // Sandbox runtime: `awman ready` emits and validates kits instead of
-        // building Docker images. Route to the sbx-specific flow and skip the
-        // container ReadyEngine entirely. No credential resolution here — all
-        // sbx secret registration is sandbox-scoped at agent-launch time.
-        if self.engines.sandbox_runtime.is_some() {
-            if self.flags.allow_docker {
-                // No-op under sbx: every sandbox gets a private DinD daemon.
-                tracing::debug!("--allow-docker is a no-op under sbx (private DinD is always on)");
-            }
-            let result = crate::engine::sandbox::ready_sbx_agent(
-                agent.as_str(),
-                self.flags.no_cache,
-                frontend.as_mut(),
-            );
-            frontend.replay_queued();
-            let agent_status = match &result {
-                Ok(()) => StepStatus::Done,
-                Err(e) => StepStatus::Failed(e.to_string()),
-            };
-            let outcome = ReadyOutcome {
-                runtime: self.engines.runtime.runtime_name().to_string(),
-                dockerfile: StepStatus::Skipped,
-                base_image: StepStatus::Skipped,
-                agent_image: agent_status,
-                local_agent: StepStatus::Skipped,
-                audit: StepStatus::Skipped,
-                image_rebuild: StepStatus::Skipped,
-                agent_credentials: credential_health(&self.engines.auth_engine, &agent),
-                non_default_agent_images: Vec::new(),
-                json_requested: self.flags.json,
-                refresh_requested: self.flags.refresh,
-            };
-            result.map_err(CommandError::from)?;
-            return Ok(outcome);
-        }
 
         let options = ReadyEngineOptions {
             agent: agent.clone(),

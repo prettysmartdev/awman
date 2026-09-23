@@ -73,11 +73,13 @@ pub(crate) fn encode_resize(cols: u16, rows: u16) -> Vec<u8> {
 /// by tests and relocated setups), else `~/.awman/attach/`. Both the serving
 /// process and the attaching process derive it the same way, which is what
 /// makes the socket discoverable across processes of the same user.
+///
+/// The variable is declared and parsed in Layer 0
+/// ([`EnvSnapshot::attach_dir`]); nothing above Layer 0 reads the environment
+/// directly (F-37).
 pub(crate) fn default_attach_socket_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("AWMAN_ATTACH_DIR") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir));
-        }
+    if let Some(dir) = crate::data::config::env::Env::from_process().attach_dir() {
+        return Some(dir);
     }
     dirs::home_dir().map(|home| home.join(".awman").join("attach"))
 }
@@ -87,7 +89,7 @@ pub(crate) fn default_attach_socket_dir() -> Option<PathBuf> {
 /// limit (104 bytes on macOS), which a home prefix plus a full squad container
 /// name can exceed.
 pub(crate) fn attach_socket_path(container_name: &str) -> Option<PathBuf> {
-    let digest = crate::data::fs::workflow_state::sha256_hex(container_name);
+    let digest = crate::data::fs::hash::sha256_hex(container_name);
     default_attach_socket_dir().map(|dir| dir.join(format!("{}.sock", &digest[..16])))
 }
 

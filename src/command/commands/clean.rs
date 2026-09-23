@@ -193,9 +193,22 @@ pub struct CleanOutcome {
 
 /// Frontend hooks specific to `awman clean`.
 pub trait CleanCommandFrontend: UserMessageSink + Send + Sync {
-    /// Display the itemized summary and confirm the deletion. Returns `Ok(true)`
-    /// to proceed, `Ok(false)` to abort. Implementations may error (e.g. the
-    /// CLI aborts when stdin is not a TTY and `--yes` was not passed).
+    /// Display the itemized summary, whether or not the user will be asked to
+    /// confirm it.
+    ///
+    /// Separate from [`confirm_deletion`](Self::confirm_deletion) because
+    /// `--yes` skips the question but not the list: the CLI prints the list on
+    /// stdout (so it survives redirected message output) even for a scripted
+    /// run. The default is silent, which is what the TUI wants — its dialog is
+    /// the display, and a `--yes` run has no dialog.
+    fn show_summary(&mut self, _summary: &CleanSummary) {}
+
+    /// Confirm the deletion. Returns `Ok(true)` to proceed, `Ok(false)` to
+    /// abort. Implementations may error (e.g. the CLI aborts when stdin is not
+    /// a TTY).
+    ///
+    /// Only called when the user has *not* already answered with `--yes`;
+    /// [`CleanCommand`] owns that rule, so no frontend re-reads the flag.
     fn confirm_deletion(&mut self, summary: &CleanSummary) -> Result<bool, CommandError>;
 
     /// Report the final deletion result to the user. The default writes a
@@ -254,11 +267,44 @@ impl CleanCommand {
     }
 
     /// Discovery phase: collect all deletable items across the four categories.
+    /// Everything `awman clean` would remove, by category.
+    ///
+    /// Each category is its own method (WI 0114 F-51); this is the order they
+    /// are reported in.
     fn discover(&self, sink: &mut dyn CleanCommandFrontend) -> CleanSummary {
         let mut summary = CleanSummary::default();
 
-        // ─── Categories 1 & 4: containers and images (Docker) ────────────────
-        match self.engines.container_runtime.as_ref() {
+        self.discover_containers_and_images(sink, &mut summary);
+        let terminal_ids = self.discover_repo_workflow_state(sink, &mut summary);
+        self.discover_context_dirs(sink, &mut summary, &terminal_ids);
+        self.discover_pre_migration_backups_category(sink, &mut summary);
+        self.discover_squad_daemon_env_category(&mut summary);
+
+        summary
+    }
+
+    /// Categories 1 & 4: stopped containers and dangling images.
+    ///
+    /// One of `discover`'s labelled categories, lifted out by WI 0114 F-51.
+    fn discover_containers_and_images(
+        &self,
+        sink: &mut dyn CleanCommandFrontend,
+        summary: &mut CleanSummary,
+    ) {
+        // ─── Categories 1 & 4: containers and images ─────────────────────────
+        //
+        // Gated on the capability, not on which runtime handle happens to be
+        // `Some` (F-40). Listing and removing stopped containers and dangling
+        // images are container-paradigm operations the cross-paradigm trait
+        // deliberately does not carry, so the typed handle is still what does
+        // the work — `has_image_store` is what decides whether a runtime has
+        // anything of this kind to reclaim at all.
+        let image_store = if self.engines.runtime.capabilities().has_image_store {
+            self.engines.container_runtime.as_ref()
+        } else {
+            None
+        };
+        match image_store {
             Some(runtime) if runtime.is_available() => {
                 summary.docker_available = true;
                 match runtime.list_stopped() {
@@ -304,7 +350,16 @@ impl CleanCommand {
                 );
             }
         }
+    }
 
+    /// Category 2: completed repo workflow state files and directories.
+    ///
+    /// One of `discover`'s labelled categories, lifted out by WI 0114 F-51.
+    fn discover_repo_workflow_state(
+        &self,
+        sink: &mut dyn CleanCommandFrontend,
+        summary: &mut CleanSummary,
+    ) -> HashSet<uuid::Uuid> {
         // ─── Category 2: completed repo workflow state files/directories ─────
         //
         // Engine workflow state is persisted as flat `<...>.json` files under
@@ -314,7 +369,7 @@ impl CleanCommand {
         // terminal status). We also record the invocation ids of terminal
         // workflows to cross-reference the global context directories below.
         let mut terminal_ids: HashSet<uuid::Uuid> = HashSet::new();
-        let store = crate::data::EngineWorkflowStateStore::at_git_root(self.session.git_root());
+        let store = crate::data::WorkflowStateStore::at_git_root(self.session.git_root());
         let wf_dir = store.dir();
         if wf_dir.is_dir() {
             match std::fs::read_dir(&wf_dir) {
@@ -337,7 +392,7 @@ impl CleanCommand {
                         {
                             discover_repo_workflow_path(
                                 sink,
-                                &mut summary,
+                                summary,
                                 &mut terminal_ids,
                                 &path,
                                 &path,
@@ -346,7 +401,7 @@ impl CleanCommand {
                             let state_path = path.join("state.json");
                             discover_repo_workflow_path(
                                 sink,
-                                &mut summary,
+                                summary,
                                 &mut terminal_ids,
                                 &path,
                                 &state_path,
@@ -361,7 +416,18 @@ impl CleanCommand {
                 ),
             }
         }
+        terminal_ids
+    }
 
+    /// Category 3: completed global context directories.
+    ///
+    /// One of `discover`'s labelled categories, lifted out by WI 0114 F-51.
+    fn discover_context_dirs(
+        &self,
+        sink: &mut dyn CleanCommandFrontend,
+        summary: &mut CleanSummary,
+        terminal_ids: &HashSet<uuid::Uuid>,
+    ) {
         // ─── Category 3: completed global context directories ────────────────
         //
         // Per-invocation directories live under
@@ -424,7 +490,16 @@ impl CleanCommand {
                 format!("clean: cannot resolve context directories: {e}"),
             ),
         }
+    }
 
+    /// Category 5: retained pre-migration database backups.
+    ///
+    /// One of `discover`'s labelled categories, lifted out by WI 0114 F-51.
+    fn discover_pre_migration_backups_category(
+        &self,
+        sink: &mut dyn CleanCommandFrontend,
+        summary: &mut CleanSummary,
+    ) {
         // ─── Category 5: retained pre-migration database backups ─────────────
         //
         // The database relocation renames the legacy originals aside as
@@ -432,17 +507,20 @@ impl CleanCommand {
         // a one-release safety net that awman never reads. Only those three
         // exact filenames are candidates, and the live shared database is
         // explicitly excluded so this rule can never touch it.
-        discover_pre_migration_backups(sink, &mut summary);
+        discover_pre_migration_backups(sink, summary);
+    }
 
+    /// Category 6: the squad daemon's stored environment.
+    ///
+    /// One of `discover`'s labelled categories, lifted out by WI 0114 F-51.
+    fn discover_squad_daemon_env_category(&self, summary: &mut CleanSummary) {
         // ─── Category 6: the squad daemon's stored environment ───────────────
         //
         // Squad persists the values named by `env(VAR)` overlays to the OS
         // keychain by default, so a daemon the OS restarted at login still has
         // them. `awman clean` is the recommended way to undo that; the probe is
         // capped and a platform with no keychain simply finds nothing.
-        discover_squad_daemon_env(&mut summary);
-
-        summary
+        discover_squad_daemon_env(summary);
     }
 
     /// Deletion phase: remove items in a fixed order, counting per-item
@@ -451,7 +529,8 @@ impl CleanCommand {
     fn delete(&self, summary: &CleanSummary) -> CleanResult {
         let mut result = CleanResult::default();
 
-        // 1. Stopped containers.
+        // 1. Stopped containers. `summary.containers` is only ever non-empty
+        // for a runtime with an image store (see `discover`).
         if let Some(runtime) = self.engines.container_runtime.as_ref() {
             for c in &summary.containers {
                 match runtime.remove_container(&c.id) {
@@ -520,6 +599,10 @@ impl CleanCommand {
         }
 
         // 6. Dangling images (last, so container references are gone).
+        // `summary.images` is only ever non-empty for a runtime with an image
+        // store (see `discover`).
+        // `summary.images` is only ever non-empty for a runtime with an image
+        // store (see `discover`).
         if let Some(runtime) = self.engines.container_runtime.as_ref() {
             for img in &summary.images {
                 match runtime.remove_image(&img.id) {
@@ -587,7 +670,12 @@ impl Command for CleanCommand {
         }
 
         // ── Confirmation ─────────────────────────────────────────────────────
-        if !frontend.confirm_deletion(&summary)? {
+        //
+        // `--yes` is the user's answer, so the question is not asked. The rule
+        // lives here rather than in each frontend's `confirm_deletion` body,
+        // where both the CLI and the TUI used to re-read the flag themselves.
+        frontend.show_summary(&summary);
+        if !self.flags.yes && !frontend.confirm_deletion(&summary)? {
             emit(
                 frontend.as_mut(),
                 MessageLevel::Info,
@@ -757,13 +845,14 @@ const PRE_MIGRATION_BACKUP_FILENAMES: [&str; 3] = [
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use tempfile::TempDir;
 
-    // ─── Shared static mutex for env-var mutations ────────────────────────────
-    // Tests that set AWMAN_CONFIG_HOME must hold this lock to avoid interference
-    // when the test suite runs with multiple threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // ─── Env-var mutations ────────────────────────────────────────────────────
+    // Tests that set AWMAN_CONFIG_HOME take `ConfigHomeGuard`, the one lock
+    // over that process-wide variable. A mutex private to this module would
+    // serialise these tests against each other only, leaving them free to
+    // repoint the config home under a `dispatch` or `overlay` test.
+    use crate::data::config::env::ConfigHomeGuard;
 
     // ─── Minimal test frontend ────────────────────────────────────────────────
 
@@ -816,46 +905,13 @@ mod tests {
 
     // ─── Engine / session helpers ─────────────────────────────────────────────
 
-    fn make_session(git_root: &std::path::Path) -> Session {
-        use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
-        let resolver = StaticGitRootResolver::new(git_root);
-        Session::open(
-            git_root.to_path_buf(),
-            &resolver,
-            SessionOpenOptions::default(),
-        )
-        .unwrap()
-    }
-
+    /// `Engines::for_tests` with the container runtime taken away, so a clean
+    /// run must refuse before it reaches Docker rather than depending on
+    /// whether the developer's machine happens to have a daemon.
     fn make_engines_no_docker(git_root: &std::path::Path) -> Engines {
-        use crate::data::fs::{ApiPaths, AuthPathResolver};
-        use crate::engine::agent::AgentEngine;
-        use crate::engine::auth::AuthEngine;
-        use crate::engine::container::ContainerRuntime;
-        use crate::engine::git::GitEngine;
-        use crate::engine::overlay::OverlayEngine;
-
-        let runtime = Arc::new(ContainerRuntime::docker());
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            AuthPathResolver::at_home("/tmp"),
-        ));
-        let git_engine = Arc::new(GitEngine::new());
-        let agent_engine = Arc::new(AgentEngine::new(overlay.clone(), runtime.clone()));
-        let auth_engine = Arc::new(AuthEngine::with_paths(
-            AuthPathResolver::at_home("/tmp"),
-            ApiPaths::at_root("/tmp"),
-        ));
-        let workflow_state_store =
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(git_root));
         Engines {
-            runtime: runtime.clone(),
             container_runtime: None,
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store,
+            ..Engines::for_tests(git_root)
         }
     }
 
@@ -863,7 +919,7 @@ mod tests {
         CleanCommand::new(
             CleanFlags { yes, dry_run },
             make_engines_no_docker(tmp.path()),
-            make_session(tmp.path()),
+            Session::for_tests(tmp.path()),
         )
     }
 
@@ -1135,9 +1191,8 @@ mod tests {
         let wf_dir = tmp.path().join(".awman").join("workflows");
         write_workflow_state(&wf_dir, "abcd1234-test.json", true);
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1159,9 +1214,8 @@ mod tests {
         let workflow_dir = wf_dir.join("completed-workflow");
         write_workflow_state(&workflow_dir, "state.json", true);
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1183,9 +1237,8 @@ mod tests {
         let workflow_dir = wf_dir.join("missing-state");
         std::fs::create_dir_all(&workflow_dir).unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1213,9 +1266,8 @@ mod tests {
             false, /* not complete */
         );
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1257,9 +1309,8 @@ mod tests {
         let path = wf_dir.join("running.json");
         std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1282,9 +1333,8 @@ mod tests {
         // Invalid JSON: should emit a warning and be skipped
         std::fs::write(wf_dir.join("bad.json"), b"{invalid}").unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1307,9 +1357,8 @@ mod tests {
     fn discover_no_docker_warns_and_skips_container_categories() {
         let tmp = TempDir::new().unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true, false);
         let mut fe = TestFrontend::no();
@@ -1332,9 +1381,8 @@ mod tests {
     fn discover_context_dir_by_completed_marker() {
         let tmp = TempDir::new().unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         // Create a context dir with a `completed` marker file
         let ctx_root = home.path().join("context").join("workflows");
@@ -1359,9 +1407,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wf_dir = tmp.path().join(".awman").join("workflows");
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         // Write a completed workflow; capture its invocation_id
         let step = crate::data::workflow_definition::WorkflowStep {
@@ -1413,9 +1460,8 @@ mod tests {
     fn discover_context_dir_without_marker_or_match_excluded() {
         let tmp = TempDir::new().unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         // Context dir with no marker and no terminal workflow match
         let ctx_root = home.path().join("context").join("workflows");
@@ -1438,9 +1484,8 @@ mod tests {
     fn discover_context_dir_symlink_with_marker_is_skipped() {
         let tmp = TempDir::new().unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("completed"), b"").unwrap();
@@ -1593,9 +1638,8 @@ mod tests {
     fn run_nothing_to_clean_skips_confirmation_and_exits_zero() {
         let tmp = TempDir::new().unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, false, false);
         let fe = Box::new(TestFrontend::no());
@@ -1612,9 +1656,8 @@ mod tests {
     fn run_nothing_to_clean_confirm_not_called() {
         let tmp = TempDir::new().unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         // Use a frontend that would panic if confirm is called
         struct NoConfirmFrontend {
@@ -1645,9 +1688,8 @@ mod tests {
         let wf_dir = tmp.path().join(".awman").join("workflows");
         write_workflow_state(&wf_dir, "done.json", true);
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, true /* dry_run */, false);
         let fe = Box::new(TestFrontend::yes());
@@ -1669,9 +1711,8 @@ mod tests {
         let wf_dir = tmp.path().join(".awman").join("workflows");
         write_workflow_state(&wf_dir, "done.json", true);
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, false, false);
         let fe = Box::new(TestFrontend::no());
@@ -1694,9 +1735,8 @@ mod tests {
         let file_path = wf_dir.join("done.json");
         assert!(file_path.exists());
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, false, false);
         let fe = Box::new(TestFrontend::yes());
@@ -1712,6 +1752,88 @@ mod tests {
         );
     }
 
+    /// `--yes` is the user's answer, so the command never asks the question.
+    ///
+    /// The frontend here would refuse if asked, which is how the test tells
+    /// "the rule was applied" apart from "the frontend happened to agree".
+    /// Both frontends used to re-read the flag and short-circuit themselves
+    /// (midpoint finding 23); the rule is `CleanCommand`'s.
+    #[test]
+    fn run_with_yes_deletes_without_asking_the_frontend() {
+        let tmp = TempDir::new().unwrap();
+        let wf_dir = tmp.path().join(".awman").join("workflows");
+        write_workflow_state(&wf_dir, "done.json", true);
+        let file_path = wf_dir.join("done.json");
+
+        let home = TempDir::new().unwrap();
+        let _env = ConfigHomeGuard::set(home.path());
+
+        let cmd = make_cmd(&tmp, false, true);
+        let fe = Box::new(TestFrontend::no());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let outcome = rt.block_on(cmd.run_with_frontend(fe)).unwrap();
+
+        assert_eq!(outcome.deleted, 1, "--yes must proceed with the deletion");
+        assert!(!file_path.exists());
+    }
+
+    /// The list is shown either way: `--yes` skips the question, not the
+    /// itemisation.
+    #[test]
+    fn the_summary_is_shown_whether_or_not_the_user_is_asked() {
+        for yes in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let wf_dir = tmp.path().join(".awman").join("workflows");
+            write_workflow_state(&wf_dir, "done.json", true);
+
+            let home = TempDir::new().unwrap();
+            let _env = ConfigHomeGuard::set(home.path());
+
+            let cmd = make_cmd(&tmp, false, yes);
+            let fe = TestFrontend::yes();
+            let shown = std::sync::Arc::new(std::sync::Mutex::new(false));
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(false));
+            let probe = Box::new(RecordingFrontend {
+                inner: fe,
+                shown: shown.clone(),
+                asked: asked.clone(),
+            });
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(cmd.run_with_frontend(probe)).unwrap();
+
+            assert!(*shown.lock().unwrap(), "summary must be shown (yes={yes})");
+            assert_eq!(
+                *asked.lock().unwrap(),
+                !yes,
+                "the question is asked only without --yes (yes={yes})"
+            );
+        }
+    }
+
+    /// Wraps [`TestFrontend`] and records which hooks the command called.
+    struct RecordingFrontend {
+        inner: TestFrontend,
+        shown: std::sync::Arc<std::sync::Mutex<bool>>,
+        asked: std::sync::Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl UserMessageSink for RecordingFrontend {
+        fn write_message(&mut self, msg: UserMessage) {
+            self.inner.write_message(msg);
+        }
+        fn replay_queued(&mut self) {}
+    }
+
+    impl CleanCommandFrontend for RecordingFrontend {
+        fn show_summary(&mut self, _summary: &CleanSummary) {
+            *self.shown.lock().unwrap() = true;
+        }
+        fn confirm_deletion(&mut self, summary: &CleanSummary) -> Result<bool, CommandError> {
+            *self.asked.lock().unwrap() = true;
+            self.inner.confirm_deletion(summary)
+        }
+    }
+
     #[test]
     fn run_full_flow_leaves_nonterminal_workflow_intact() {
         let tmp = TempDir::new().unwrap();
@@ -1720,9 +1842,8 @@ mod tests {
         write_workflow_state(&wf_dir, "done.json", true);
         write_workflow_state(&wf_dir, "pending.json", false);
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         let cmd = make_cmd(&tmp, false, false);
         let fe = Box::new(TestFrontend::yes());
@@ -1752,9 +1873,8 @@ mod tests {
         // Now remove missing.json so deletion will fail
         std::fs::remove_file(&missing_file).unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         // We need discover to have seen missing.json, then delete to fail.
         // But discover reads the dir at runtime — missing.json is gone.
@@ -1792,9 +1912,8 @@ mod tests {
         let wf_dir = tmp.path().join(".awman").join("workflows");
         std::fs::create_dir_all(&wf_dir).unwrap();
 
-        let _lock = ENV_LOCK.lock().unwrap();
         let home = TempDir::new().unwrap();
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        let _env = ConfigHomeGuard::set(home.path());
 
         // Write a completed workflow file, then get a summary with an extra
         // non-existent path to force a partial failure.

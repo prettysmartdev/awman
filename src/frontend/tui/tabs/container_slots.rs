@@ -52,7 +52,7 @@ impl Tab {
     /// the old slot before adding the new one — keeping the net slot count
     /// correct.
     pub fn drain_container_slot_events(&mut self) {
-        let events: Vec<ContainerSlotEvent> = match self.container_slot_events.lock() {
+        let events: Vec<ContainerSlotEvent> = match self.shared.container_slot_events.lock() {
             Ok(mut q) => q.drain(..).collect(),
             Err(_) => return,
         };
@@ -197,7 +197,7 @@ impl Tab {
     /// which reinitializes the focused slot's parser (clearing the previous
     /// step's terminal content) before the new step's output is processed.
     pub fn drain_container_output(&mut self) {
-        if self.pty_reset_flag.swap(false, Ordering::Relaxed) {
+        if self.shared.pty_reset_flag.swap(false, Ordering::Relaxed) {
             let scrollback = self.session.effective_config().scrollback_lines();
             let focused_idx = self.focused_slot_idx;
             if let Some(slot) = self.container_slots.get_mut(focused_idx) {
@@ -352,10 +352,10 @@ impl Tab {
         self.container_window_state = ContainerWindowState::Hidden;
         self.suppress_container_auto_open = true;
         self.execution_phase = ExecutionPhase::Idle;
-        if let Ok(mut events) = self.container_slot_events.lock() {
+        if let Ok(mut events) = self.shared.container_slot_events.lock() {
             events.clear();
         }
-        if let Ok(mut view) = self.workflow_state.lock() {
+        if let Ok(mut view) = self.shared.workflow_state.lock() {
             *view = None;
         }
     }

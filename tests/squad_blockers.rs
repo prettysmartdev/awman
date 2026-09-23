@@ -28,7 +28,7 @@ use awman::data::fs::task_store::{MountScope, Run, Task, TaskStatus};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
 use awman::data::message::{UserMessage, UserMessageSink};
 use awman::data::session::{AgentHandle, Session};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::agent_runtime::execution::AgentInstance;
 use awman::engine::agent_runtime::{
@@ -122,7 +122,7 @@ impl TaskGateway for RecordingGateway {
             active_count: 0,
             last_tick: None,
             in_flight: 0,
-            env_persistence: "none".into(),
+            env_persistence: Some(awman::data::fs::daemon_env::EnvPersistence::None),
             unmet_env: Vec::new(),
         })
     }
@@ -185,10 +185,16 @@ impl SquadCommandFrontend for ScriptedFrontend {
     fn ask_task_description(&mut self) -> Result<String, CommandError> {
         Ok(self.description.clone())
     }
-    fn ask_task_interval(&mut self) -> Result<String, CommandError> {
+    fn ask_task_interval(
+        &mut self,
+        _prompt: &awman::data::prompt::TextPrompt,
+    ) -> Result<String, CommandError> {
         Ok(self.interval.clone())
     }
-    fn ask_task_workspace_choice(&mut self) -> Result<TaskWorkspaceChoice, CommandError> {
+    fn ask_task_workspace_choice(
+        &mut self,
+        _prompt: &awman::data::prompt::Prompt<TaskWorkspaceChoice>,
+    ) -> Result<TaskWorkspaceChoice, CommandError> {
         Ok(self.workspace_choice)
     }
     fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
@@ -217,7 +223,10 @@ impl SquadCommandFrontend for ScriptedFrontend {
     fn ask_task_model(&mut self) -> Result<Option<String>, CommandError> {
         Ok(self.model.clone())
     }
-    fn ask_task_mount_scope(&mut self) -> Result<MountScope, CommandError> {
+    fn ask_task_mount_scope(
+        &mut self,
+        _prompt: &awman::data::prompt::Prompt<MountScope>,
+    ) -> Result<MountScope, CommandError> {
         Ok(self.mount_scope)
     }
     fn ask_delete_task_dir(&mut self, _name: &str, _path: &Path) -> Result<bool, CommandError> {
@@ -258,7 +267,9 @@ fn engines_with(runtime: Arc<dyn AgentRuntimeEngine>, container: bool, root: &Pa
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, docker)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 
@@ -507,7 +518,7 @@ async fn cli_squad_entry_points_fail_fast_under_a_sandbox_runtime() {
             .build_clap_command()
             .try_get_matches_from(&raw)
             .unwrap_or_else(|e| panic!("argv {raw:?} rejected: {e}"));
-        let ctx = awman::frontend::cli::RuntimeContext::new(
+        let ctx = awman::command::dispatch::RuntimeContext::new(
             env.open_session(),
             sandbox_engines(tmp.path()),
         );
@@ -587,6 +598,33 @@ impl TaskGateway for SharedRecording {
 struct FakeSandboxRuntime;
 
 impl AgentRuntimeEngine for FakeSandboxRuntime {
+    fn ready_agent(
+        &self,
+        _agent: &str,
+        _opts: awman::engine::agent_runtime::ReadyAgentOptions,
+        _sink: &mut dyn awman::data::message::UserMessageSink,
+    ) -> Result<(), awman::engine::error::EngineError> {
+        Ok(())
+    }
+    fn image_exists(&self, _tag: &str) -> Result<bool, awman::engine::error::EngineError> {
+        Ok(true)
+    }
+    fn image_home_dir(
+        &self,
+        _tag: &str,
+    ) -> Result<Option<String>, awman::engine::error::EngineError> {
+        Ok(None)
+    }
+    fn build_image(
+        &self,
+        _tag: &str,
+        _dockerfile: &std::path::Path,
+        _context: &std::path::Path,
+        _no_cache: bool,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), awman::engine::error::EngineError> {
+        Ok(())
+    }
     fn runtime_name(&self) -> &'static str {
         "docker-sbx-experimental"
     }
@@ -604,6 +642,7 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
             dind: DindSupport::Always,
             host_paths_visible: false,
             session_label_supported: false,
+            has_image_store: false,
         };
         &CAPS
     }

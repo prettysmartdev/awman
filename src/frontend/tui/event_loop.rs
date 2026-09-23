@@ -35,22 +35,21 @@ fn restore_terminal(keyboard_enhanced: bool) {
     );
 }
 
-/// Where TUI panics are recorded: `$HOME/.awman/panic.log`. `None` when the
-/// home directory can't be resolved.
-pub(super) fn panic_log_path() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".awman").join("panic.log"))
+/// Where TUI panics are recorded. `None` when the home directory cannot be
+/// resolved.
+pub(super) fn panic_log() -> Option<crate::data::fs::PanicLog> {
+    crate::data::fs::PanicLog::from_env(&crate::data::config::env::Env::from_process())
 }
 
-/// Append a panic report (message, location, thread, backtrace) to
-/// [`panic_log_path`]. Best-effort — a panic hook must never itself panic
-/// or block on errors.
+/// Append a panic report (message, location, thread, backtrace) to the Layer 0
+/// [`PanicLog`]. Best-effort — a panic hook must never itself panic or block
+/// on errors.
+///
+/// The hook formats; Layer 0 resolves the path and writes (F-44).
 fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
-    let Some(path) = panic_log_path() else {
+    let Some(log) = panic_log() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let thread = std::thread::current();
     let entry = format!(
         "──── panic at {} ────\nthread: {}\n{}\nbacktrace:\n{}\n",
@@ -59,14 +58,7 @@ fn log_panic_to_file(info: &std::panic::PanicHookInfo<'_>) {
         info,
         std::backtrace::Backtrace::force_capture(),
     );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write as _;
-        let _ = f.write_all(entry.as_bytes());
-    }
+    log.append(&entry);
 }
 
 /// Set up the terminal, run the main loop, and restore on exit.

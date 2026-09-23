@@ -74,6 +74,15 @@ Applies to every project on the machine unless a repo overrides it.
 }
 ```
 
+### A config file that doesn't parse
+
+A `config.json` that isn't valid JSON, or that fails schema validation, is no
+longer silently ignored in favor of defaults you didn't write. `awman api
+start` and `awman squad start` refuse to start against a malformed config,
+failing with `config parse error in <path>: <reason>` — naming the file and
+the offending key — instead of starting a daemon on settings you never set.
+Fix the file (or restore it from git, for the per-repo one) and try again.
+
 ### Squad daemon configuration
 
 The optional `squad` block is global, so it belongs in
@@ -362,6 +371,8 @@ Under `keychain` auth mode, awman keeps Claude's containerized OAuth credential 
 
 All three keys are optional, and `authRefresh` may appear in either config file. Precedence is per field, not per block: a repository value overrides the matching global value, which overrides the built-in default — so a repository `authRefresh` object that sets only `enabled` still inherits `thresholdMinutes`/`tickSeconds` from the global block (or the built-in defaults) if the global block doesn't set them either. Like `auth`, `authRefresh` is file-edit-only; it is not available through `awman config set`.
 
+**The squad daemon reads `authRefresh` from the global config only.** It builds its refresh monitor once, when the daemon starts, before any request has named a repository — so a repository-level `authRefresh` block does not apply to work the squad daemon runs, and its credential leases begin at daemon boot rather than at the first request. Set `authRefresh` in `$HOME/.awman/config.json` if you want it to govern squad.
+
 ---
 
 ## Runtimes
@@ -513,6 +524,10 @@ Value handling:
 | `AWMAN_API_KEY` | Remote API key; beats `remote.defaultAPIKey`, beaten by `--api-key` |
 | `AWMAN_SQUAD_KEY` | Bearer key the CLI and TUI authenticate to the squad daemon with; printed once as a shell snippet on the daemon's first start — see [squad: Authenticating to the daemon](12-squad.md#authenticating-to-the-daemon) |
 | `AWMAN_REMOTE_SESSION` | Sticky session id for `remote exec` commands; beaten by `--session` |
+| `AWMAN_ATTACH_DIR` | Relocate the directory attach sockets live in; defaults to `~/.awman/attach/` |
+| `AWMAN_API_VERBOSE_SETUP` | Demote the API server's per-session setup logging from `info` to `debug`; set to `0`, `false`, `no` or `off` (case-insensitive) to quiet it. Verbose is the default. |
+
+When the API or squad daemon is started as a background service (`systemd --user` on Linux, `launchd` on macOS), the launching process forwards a small, non-secret allowlist of variables into that service's environment, so the daemon resolves the same config and storage root as the process that started it: `PATH`, `HOME`, `RUST_LOG`, `AWMAN_CONFIG_HOME`, `AWMAN_API_ROOT`, `AWMAN_SQUAD_ROOT`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `AWMAN_OVERLAYS`, `AWMAN_MAX_CONCURRENT_AGENTS` and `AWMAN_LAUNCH_MODE`. Bearer keys (`AWMAN_API_KEY`, `AWMAN_SQUAD_KEY`) are never forwarded this way — the daemon authenticates against the key hash it reads from its storage root instead.
 
 ---
 

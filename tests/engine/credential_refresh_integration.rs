@@ -22,7 +22,7 @@ use awman::engine::container::{
     ContainerName, ContainerOption, ContainerRuntime, Entrypoint, ImageRef,
 };
 use awman::engine::credential_refresh::{
-    install_global, CredentialRefreshMonitor, MonitorConfig, RefreshOutcome,
+    CredentialRefreshMonitor, LeaseFactoryHandle, MonitorConfig, RefreshOutcome,
 };
 use awman::engine::error::EngineError;
 use awman::engine::workflow::actions::{
@@ -30,7 +30,9 @@ use awman::engine::workflow::actions::{
     YoloTickOutcome,
 };
 use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
-use awman::engine::workflow::{Frontend as WorkflowFrontend, WorkflowEngine};
+use awman::engine::workflow::{
+    Frontend as WorkflowFrontend, WorkflowEngine, WorkflowEngineDeps, WorkflowSpec,
+};
 
 fn payload(token: &str, expires_at: SystemTime) -> String {
     let millis = expires_at.duration_since(UNIX_EPOCH).unwrap().as_millis();
@@ -326,10 +328,11 @@ fn run_retry_workflow() -> (usize, usize) {
     };
     let mut engine = WorkflowEngine::new(
         &session,
-        retry_workflow(),
-        None,
-        Box::new(UnattendedTestFrontend),
-        Box::new(factory),
+        WorkflowSpec::new(retry_workflow()).with_work_item_context(None),
+        WorkflowEngineDeps {
+            frontend: Box::new(UnattendedTestFrontend),
+            agent_factory: Box::new(factory),
+        },
     )
     .unwrap();
     let outcome = tokio::runtime::Runtime::new()
@@ -518,7 +521,10 @@ fn integration_spawn_choke_holds_lease_before_pty_piped_and_acp_on_docker_and_ap
     let staged = tempfile::tempdir().unwrap();
     let delivery = materialized_delivery(&home, staged.path());
     let monitor = monitor();
-    install_global(monitor.clone());
+    // F-38: the monitor is carried explicitly on the options rather than
+    // installed in a process-global, so each build below names the factory it
+    // leases through.
+    let factory = LeaseFactoryHandle::new(std::sync::Arc::new(monitor.clone()));
 
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         for (runtime, label) in [
@@ -536,6 +542,7 @@ fn integration_spawn_choke_holds_lease_before_pty_piped_and_acp_on_docker_and_ap
                     ContainerOption::Name(ContainerName::new(format!("awman-{label}-{mode}"))),
                     ContainerOption::Acp(acp),
                     ContainerOption::RefreshableCredential(delivery.clone()),
+                    ContainerOption::CredentialLeaseFactory(factory.clone()),
                 ])
                 .unwrap();
                 let instance = runtime

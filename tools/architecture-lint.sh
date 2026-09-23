@@ -239,6 +239,231 @@ if [ -n "$w_value_matches" ]; then
     done
 fi
 
+# WI 0114 F-37 step 4: every environment variable awman reads is named and read
+# in `src/data/config/env.rs`. Above Layer 0, a `std::env::var` is a second,
+# undeclared config source — it bypasses `EnvSnapshot`'s known-key list, is
+# invisible to `ForwardedEnv`'s daemon bootstrap allowlist, and cannot be
+# tested without mutating the process environment. Read through `EnvSnapshot`,
+# or through `host_var` for a value a squad client may have pushed.
+#
+# Test code is exempt: a test that mutates and restores `PATH` around a fake
+# binary is not a config read. The exemption is by **brace span**, not by
+# position — Rust accepts items after a `#[cfg(test)] mod tests`, so "anything
+# past the first `#[cfg(test)]`" would hide a real hit (the same trap the
+# keychain-argv guard above documents). Any `#[cfg(...)]` naming `test`
+# qualifies, including `#[cfg(all(test, unix))]`.
+#
+# A whole *file* can also be test code: `#[cfg(test)] mod tests;` gates
+# `foo/tests.rs` or `foo/tests/*.rs` from the parent, so the attribute is not
+# in the file the scanner reads. Those paths are skipped wholesale — the
+# convention is enforced by the fact that nothing else may live there.
+TEST_FILE_RE='(/tests/|/tests\.rs$)'
+#
+# One production read is deliberate and allowlisted by path:
+# `src/engine/sandbox/dsbx/session_config.rs` writes the non-sensitive env map
+# into a workspace-readable `session.json`, and must read *this process's* own
+# environment rather than the daemon overlay — the file itself explains why.
+ENV_VAR_ALLOWED='^'"$SRC"'/engine/sandbox/dsbx/session_config\.rs$'
+env_var_matches=$(
+    find "$SRC/engine" "$SRC/command" "$SRC/frontend" -name '*.rs' -print0 2>/dev/null |
+    grep -zEv "$TEST_FILE_RE" |
+    xargs -0 awk '
+        FNR == 1 { depth = 0; pending = 0 }
+        {
+            code = $0
+            sub(/\/\/.*$/, "", code)
+            if (depth > 0) {
+                depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
+                next
+            }
+            if (code ~ /#\[cfg\(/ && code ~ /[(,[:space:]]test[),[:space:]]/) {
+                pending = 1
+                next
+            }
+            if (pending) {
+                if (code ~ /^[[:space:]]*$/) next
+                opens = gsub(/\{/, "{", code)
+                closes = gsub(/\}/, "}", code)
+                if (opens > closes) depth = opens - closes
+                pending = 0
+                next
+            }
+            if (code ~ /std::env::var|[^A-Za-z0-9_]env::var\(|env::var_os\(/) {
+                printf "%s:%d:%s\n", FILENAME, FNR, $0
+            }
+        }
+    ' | grep -Ev "^($(echo "$ENV_VAR_ALLOWED" | sed 's/^\^//;s/\$$//')):" || true
+)
+if [ -n "$env_var_matches" ]; then
+    echo ""
+    echo "architecture-lint: std::env::var above Layer 0; declare the variable in src/data/config/env.rs and read it through EnvSnapshot (or host_var):"
+    echo "$env_var_matches" | while IFS= read -r line; do
+        file_and_line="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        display="${file_and_line#"$REPO_ROOT/"}"
+        echo "VIOLATION [env-var]: $display:$lineno"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
+# WI 0114 F-31: configuration reaches a command through its `Session` (which
+# merged global, repo, environment and flags) or, for a daemon that has none,
+# through the `GlobalConfig` its `Engines` bundle was assembled from. A
+# `GlobalConfig::load()` or `RepoConfig::load()` anywhere else is a second,
+# ad-hoc config source: it re-reads the file the command was not built against,
+# and every historical instance wrapped it in `unwrap_or_default()`, silently
+# turning a malformed config into defaults.
+#
+# Same brace-span exemption for test code as the env-var guard above.
+#
+# Two production reads are allowlisted by path, each the single load its owner
+# is entitled to:
+#   * src/command/dispatch/mod.rs — `Engines::for_daemon`, the bootstrap read
+#     for a process with no `Session`. Propagates its error.
+#   * src/engine/init/mod.rs — `InitEngine`'s `Preflight`, which loads the repo
+#     config once and then *writes* it; it is the thing producing that file.
+CONFIG_LOAD_ALLOWED="^($SRC/command/dispatch/mod\.rs|$SRC/engine/init/mod\.rs):"
+config_load_matches=$(
+    find "$SRC/engine" "$SRC/command" "$SRC/frontend" -name '*.rs' -print0 2>/dev/null |
+    grep -zEv "$TEST_FILE_RE" |
+    xargs -0 awk '
+        FNR == 1 { depth = 0; pending = 0 }
+        {
+            code = $0
+            sub(/\/\/.*$/, "", code)
+            if (depth > 0) {
+                depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
+                next
+            }
+            if (code ~ /#\[cfg\(/ && code ~ /[(,[:space:]]test[),[:space:]]/) {
+                pending = 1
+                next
+            }
+            if (pending) {
+                if (code ~ /^[[:space:]]*$/) next
+                opens = gsub(/\{/, "{", code)
+                closes = gsub(/\}/, "}", code)
+                if (opens > closes) depth = opens - closes
+                pending = 0
+                next
+            }
+            if (code ~ /GlobalConfig::load\(\)|RepoConfig::load\(/) {
+                printf "%s:%d:%s\n", FILENAME, FNR, $0
+            }
+        }
+    ' | grep -Ev "$CONFIG_LOAD_ALLOWED" || true
+)
+if [ -n "$config_load_matches" ]; then
+    echo ""
+    echo "architecture-lint: an ad-hoc config load; read through Session::effective_config() (or Engines::global_config in a daemon):"
+    echo "$config_load_matches" | while IFS= read -r line; do
+        file_and_line="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        display="${file_and_line#"$REPO_ROOT/"}"
+        echo "VIOLATION [config-load]: $display:$lineno"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
+# WI 0114 F-57 guard 2: a frontend may not hand-build a dispatch path.
+#
+# The grand architecture requires command-box input to be "routed directly to a
+# method in the Dispatch package, no parsing or anything else done by the TUI
+# itself". A `ParsedCommandBoxInput` literal whose `path` is a `vec![` of
+# string literals bypasses the catalogue entirely: neither the subcommand nor
+# the argument key is ever validated, so renaming either leaves the frontend
+# dispatching a dead name and fails nothing until a user presses the key. That
+# is exactly how F-15, F-21 and F-55 happened — three times, in three files.
+#
+# A frontend names the *intent* instead: a `FrontendAction` variant, turned
+# into an invocation by `CommandCatalogue::action_input`, which reads the path,
+# the flag names and the positional argument's name out of the catalogue.
+#
+# Detection is a four-line window from each `ParsedCommandBoxInput {` — the
+# `-A3` the finding specifies — looking for a `path: vec![` opening on a string
+# literal. Comment text is stripped first, so prose quoting the old shape (this
+# very block, and `src/command/dispatch/frontend_action.rs`'s module doc) stays
+# legal. There is no allowlist: as of this commit `src/frontend/` has no hits,
+# test fixtures included, because the fixtures build their input the same way.
+
+dispatch_bypass_matches=$(
+    find "$SRC/frontend" -name '*.rs' -print0 2>/dev/null |
+    xargs -0 awk '
+        FNR == 1 { window = 0 }
+        {
+            code = $0
+            sub(/\/\/.*$/, "", code)
+            if (code ~ /ParsedCommandBoxInput[[:space:]]*\{/) window = 4
+            if (window > 0) {
+                if (code ~ /path:[[:space:]]*vec!\[[[:space:]]*"/) {
+                    printf "%s:%d:%s\n", FILENAME, FNR, $0
+                }
+                window--
+            }
+        }
+    ' || true
+)
+if [ -n "$dispatch_bypass_matches" ]; then
+    echo ""
+    echo "architecture-lint: a frontend hand-builds a dispatch path; name a FrontendAction and let CommandCatalogue::action_input build the invocation:"
+    echo "$dispatch_bypass_matches" | while IFS= read -r line; do
+        file_and_line="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        display="${file_and_line#"$REPO_ROOT/"}"
+        echo "VIOLATION [dispatch-bypass]: $display:$lineno"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
+# WI 0114 F-57 guard 1: presentation lives in Layer 3.
+#
+# Box-drawing characters (Unicode block U+2500–U+257F: `╔ ═ ║ ╚ ─ │ ┌ …`) are
+# terminal art. A layer below `src/frontend/` that composes them has decided
+# how its output looks, and every frontend is then stuck with that decision:
+# the TUI draws its own frames and ends up with a box inside a box, and the API
+# serialises the `═` runs into JSON no HTTP client wanted. That is how the
+# squad key banner (F-56) and the API-key banner (F-47 step 3) both went wrong.
+# Engines and commands return facts; the frontend draws.
+#
+# Scope is `src/data`, `src/engine` and `src/command`. `#[cfg(test)]` code is
+# not exempt — a test that pins the art pins the layering mistake with it; the
+# api_server first-run test states the same property as a `'\u{2500}'..` range
+# instead, which is also how to write one of these assertions.
+#
+# Comment text is stripped first (the same `//`-to-end-of-line filter the
+# env-var and config-load guards use), so the `// ─── section ───` dividers
+# throughout the tree stay legal, as does prose like this block. The match runs
+# on raw UTF-8 bytes under `LC_ALL=C` — `E2 94 xx` / `E2 95 xx` is exactly the
+# Box Drawing block — because BSD/macOS grep has no `-P`.
+#
+# There is no allowlist: as of this commit `src/{data,engine,command}` has no
+# hits at all.
+layer_render_matches=$(
+    find "$SRC/data" "$SRC/engine" "$SRC/command" -name '*.rs' -print0 2>/dev/null |
+    xargs -0 awk '
+        {
+            code = $0
+            sub(/\/\/.*$/, "", code)
+            printf "%s:%d:%s\n", FILENAME, FNR, code
+        }
+    ' | LC_ALL=C grep -E $'\xe2[\x94\x95][\x80-\xbf]' || true
+)
+if [ -n "$layer_render_matches" ]; then
+    echo ""
+    echo "architecture-lint: box-drawing below src/frontend/; return the fact and let each frontend draw it:"
+    echo "$layer_render_matches" | while IFS= read -r line; do
+        file_and_line="${line%%:*}"
+        rest="${line#*:}"
+        lineno="${rest%%:*}"
+        display="${file_and_line#"$REPO_ROOT/"}"
+        echo "VIOLATION [layer-render]: $display:$lineno"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
 # Report results.
 if [ -s "$VIOLATION_FILE" ]; then
     count=$(wc -l < "$VIOLATION_FILE" | tr -d ' ')

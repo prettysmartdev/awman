@@ -1,7 +1,7 @@
 //! Per-command frontend trait impls for the CLI.
 //!
 //! Most per-command frontend traits in `src/command/commands/` are pure
-//! marker traits (e.g. `AuthCommandFrontend`, `ConfigCommandFrontend`)
+//! marker traits (e.g. `ConfigCommandFrontend`, `RemoteCommandFrontend`)
 //! whose only requirement is `UserMessageSink + Send + Sync`. Those are
 //! satisfied by the umbrella impls in `command_frontend.rs`.
 //!
@@ -32,5 +32,3 @@ mod container_frontend_marker;
 mod mount_scope;
 mod workflow_frontend_marker;
 mod worktree_lifecycle_marker;
-
-pub(super) use container_frontend_marker::CliContainerProxy;

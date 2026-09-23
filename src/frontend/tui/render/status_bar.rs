@@ -7,6 +7,7 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
 
     let tab = app.active_tab();
     let workflow_active = tab
+        .shared
         .workflow_state
         .lock()
         .map(|g| g.is_some())

@@ -2,7 +2,6 @@
 
 use crate::command::commands::specs::{SpecsCommandFrontend, WorkItemKind};
 use crate::command::error::CommandError;
-use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
@@ -31,41 +30,14 @@ impl SpecsCommandFrontend for TuiCommandFrontend {
         }
     }
 
-    fn ask_spec_kind(&mut self) -> Result<WorkItemKind, CommandError> {
-        let response = self.ask_dialog(DialogRequest::KindSelect {
-            title: "Work item kind".into(),
-            options: vec![
-                ("1".into(), "Feature".into()),
-                ("2".into(), "Bug".into()),
-                ("3".into(), "Task".into()),
-                ("4".into(), "Enhancement".into()),
-            ],
-        })?;
-        Ok(match response {
-            DialogResponse::Char('1') | DialogResponse::Index(0) => WorkItemKind::Feature,
-            DialogResponse::Char('2') | DialogResponse::Index(1) => WorkItemKind::Bug,
-            DialogResponse::Char('3') | DialogResponse::Index(2) => WorkItemKind::Task,
-            DialogResponse::Char('4') | DialogResponse::Index(3) => WorkItemKind::Enhancement,
-            _ => WorkItemKind::Task,
-        })
-    }
-
-    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(super::TuiContainerProxy::new(self.status_log.clone()))
-    }
-
-    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
-        match self.container_io.take() {
-            Some(io) => Box::new(super::TuiContainerProxy::with_io(
-                self.status_log.clone(),
-                io,
-                self.container_name_shared.clone(),
-            )),
-            None => Box::new(super::TuiContainerProxy::new(self.status_log.clone())),
-        }
-    }
-
-    fn set_pty_active(&mut self, active: bool) {
-        self.pty_active = active;
+    /// Renders `prompt`'s own choices and maps the answer back through it —
+    /// the labels and hotkeys are Layer 2's (F-19).
+    fn ask_spec_kind(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<WorkItemKind>,
+    ) -> Result<WorkItemKind, CommandError> {
+        // No dismissal default on this prompt: abandoning the interview
+        // abandons it, which is what `pick_from_prompt` does with a `None`.
+        self.pick_from_prompt(prompt)
     }
 }

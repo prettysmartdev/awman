@@ -3,13 +3,8 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::agent_auth::AgentAuthFrontend;
-use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::mount_scope::MountScopeFrontend;
-use crate::command::commands::{
-    collect_all_overlay_specs, parse_overlay_list, resolve_agent, resolve_context_overlays,
-    warn_legacy_config, Command,
-};
+use crate::command::commands::launch_policy::{LaunchModeDecision, LaunchPolicy};
+use crate::command::commands::{parse_overlay_list, Command};
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -40,32 +35,11 @@ pub struct ExecPromptOutcome {
 
 pub trait ExecPromptCommandFrontend:
     UserMessageSink
-    + MountScopeFrontend
-    + AgentSetupFrontend
-    + AgentAuthFrontend
-    + crate::command::commands::agent_setup::HasAgentFrontend
+    + crate::command::commands::agent_setup::AgentLaunchFrontend
     + crate::engine::acp::AcpFrontend
     + Send
     + Sync
 {
-    /// Inform the frontend that the host stdio is now owned by a running
-    /// container. Frontends that would otherwise interleave UserMessages with
-    /// container output (e.g. the CLI) queue messages until the container
-    /// releases stdio. Default impl: no-op (suitable for non-blocking sinks
-    /// like the TUI).
-    fn set_pty_active(&mut self, _active: bool) {}
-
-    /// Called after the agent container launches. The sender is the broadcast
-    /// channel from the container's stuck detector; the TUI stores it so the
-    /// tab can subscribe for stuck-coloring. Default impl: no-op (CLI/API
-    /// frontends ignore it).
-    fn set_stuck_sender(
-        &mut self,
-        _sender: std::sync::Arc<
-            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
-        >,
-    ) {
-    }
 }
 
 async fn ensure_exec_prompt_agent_setup(
@@ -78,10 +52,10 @@ async fn ensure_exec_prompt_agent_setup(
     let config = EffectiveConfig::default();
     let mut adapter =
         crate::command::commands::agent_setup::AgentFrontendAdapter::new(frontend.as_mut());
-    let runtime = std::sync::Arc::clone(agent_engine.container_runtime_arc());
+    let runtime = std::sync::Arc::clone(agent_engine.runtime());
     agent_engine
         .ensure_available(session, agent, &config, &mut adapter, move |tag: &str| {
-            runtime.image_exists(tag)
+            runtime.image_exists(tag).unwrap_or(false)
         })
         .await
         .map_err(CommandError::from)
@@ -205,7 +179,7 @@ impl Command for ExecPromptCommand {
             build_prompt_string(self.flags.prompt.as_deref(), issue_markdown.as_deref())
                 .expect("validated above: at least one of prompt or --issue must be present");
 
-        let agent = match resolve_agent(&self.flags.agent, &session) {
+        let agent = match LaunchPolicy::for_session(&session).resolve_agent(&self.flags.agent) {
             Ok(a) => a,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -224,26 +198,19 @@ impl Command for ExecPromptCommand {
                 && session.repo_config().agent.is_some()
                 && session.repo_config().launch_mode
                     == Some(crate::data::config::repo::LaunchMode::Acp));
-        let launch_decision =
-            match crate::command::commands::resolve_launch_mode(&config, &agent, explicit_acp) {
-                Ok(decision) => decision,
-                Err(e) => return Err(CommandError::from(e)),
-            };
-        if launch_decision == crate::command::commands::LaunchModeDecision::StdioWithFallbackWarning
+        let launch_decision = match LaunchPolicy::resolve_launch_mode(&config, &agent, explicit_acp)
         {
+            Ok(decision) => decision,
+            Err(e) => return Err(CommandError::from(e)),
+        };
+        if launch_decision == LaunchModeDecision::StdioWithFallbackWarning {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
-                text: crate::command::commands::acp_fallback_warning(&agent),
+                text: LaunchPolicy::acp_fallback_warning(&agent),
             });
         }
-        if agent.as_str() == "gemini" {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: "The 'gemini' agent is deprecated by Google. \
-                       Migrate to 'antigravity' — run 'awman chat --agent antigravity' \
-                       (or 'awman config set agent antigravity' to change your default)."
-                    .to_string(),
-            });
+        if let Some(note) = LaunchPolicy::deprecation_warning(&agent) {
+            frontend.write_message(note);
         }
 
         frontend.write_message(UserMessage {
@@ -271,10 +238,12 @@ impl Command for ExecPromptCommand {
             }
             all
         };
-        let collected = collect_all_overlay_specs(&session, cli_typed, None, None)?;
+        let collected = session
+            .effective_config()
+            .collected_overlays(cli_typed, None, None)?;
 
         // Emit deprecation warnings for legacy config fields.
-        warn_legacy_config(&session, frontend.as_mut());
+        LaunchPolicy::for_session(&session).warn_legacy_config(frontend.as_mut());
 
         // The Dockerfile + image setup is container-paradigm only; sandbox
         // runtimes get their per-agent kits from `awman ready` instead.
@@ -338,14 +307,15 @@ impl Command for ExecPromptCommand {
             resolved_credentials
         };
 
-        let (context_overlays, system_prompt) = resolve_context_overlays(
-            &collected.context_overlays,
-            &session,
-            &agent,
-            None,
-            None,
-            frontend.as_mut(),
-        )?;
+        let (context_overlays, system_prompt) = LaunchPolicy::for_session(&session)
+            .with_git(&self.engines.git_engine)
+            .resolve_context_overlays(
+                &collected.context_overlays,
+                &agent,
+                None,
+                None,
+                frontend.as_mut(),
+            )?;
 
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
@@ -356,7 +326,7 @@ impl Command for ExecPromptCommand {
             model: self.flags.model.clone(),
             // ACP sends its initial turn after the initialize/session-new
             // handshake; stdio retains the existing seeded-launch behavior.
-            initial_prompt: (launch_decision != crate::command::commands::LaunchModeDecision::Acp)
+            initial_prompt: (launch_decision != LaunchModeDecision::Acp)
                 .then(|| final_prompt.clone()),
             env_passthrough: if collected.env_passthrough.is_empty() {
                 None
@@ -369,9 +339,7 @@ impl Command for ExecPromptCommand {
             system_prompt,
             context_overlays,
             launch_mode: match launch_decision {
-                crate::command::commands::LaunchModeDecision::Acp => {
-                    crate::data::config::repo::LaunchMode::Acp
-                }
+                LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
                 _ => crate::data::config::repo::LaunchMode::Stdio,
             },
             ..Default::default()
@@ -382,7 +350,6 @@ impl Command for ExecPromptCommand {
             &agent,
             &run_opts,
             &credentials,
-            self.engines.runtime.as_ref(),
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -408,7 +375,7 @@ impl Command for ExecPromptCommand {
             level: MessageLevel::Info,
             text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
         });
-        let exit = if launch_decision == crate::command::commands::LaunchModeDecision::Acp {
+        let exit = if launch_decision == LaunchModeDecision::Acp {
             let (runtime_frontend, transport) = crate::engine::acp::AcpTransport::channel();
             let execution = match instance.run_with_frontend(Box::new(runtime_frontend)) {
                 Ok(execution) => execution,
@@ -424,8 +391,15 @@ impl Command for ExecPromptCommand {
                 execution,
                 transport,
                 Box::new(crate::data::message::StderrMessageSink::new()),
-                run_opts.yolo.unwrap_or(YoloMode::Disabled),
-                run_opts.auto.unwrap_or(AutoMode::Disabled),
+                // Layer 2 owns the flags, so Layer 2 turns them into the
+                // permission policy (F-46).
+                if matches!(run_opts.yolo, Some(YoloMode::Enabled))
+                    || matches!(run_opts.auto, Some(AutoMode::Enabled))
+                {
+                    crate::engine::acp::PermissionPolicy::AutoApprove
+                } else {
+                    crate::engine::acp::PermissionPolicy::Ask
+                },
             );
             if let Err(e) = acp.initialize("/workspace").await {
                 // Reap the launched container before returning on a failed
@@ -461,7 +435,11 @@ impl Command for ExecPromptCommand {
             exit
         };
 
-        crate::command::commands::report_session_end(frontend.as_mut(), "exec prompt", &exit);
+        crate::command::commands::LaunchPolicy::report_session_end(
+            frontend.as_mut(),
+            "exec prompt",
+            &exit,
+        );
 
         let exit_code = exit.map(|e| e.exit_code).ok();
         Ok(ExecPromptOutcome {

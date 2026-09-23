@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::step_status::StepStatus;
+use crate::data::step_status::StepStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitSummary {

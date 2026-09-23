@@ -1,19 +1,28 @@
 use super::*;
-use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+use crate::data::session::Session;
 
 fn make_test_session() -> Session {
     let tmp = tempfile::tempdir().unwrap();
-    let resolver = StaticGitRootResolver::new(tmp.path());
-    Session::open(
-        tmp.path().to_path_buf(),
-        &resolver,
-        SessionOpenOptions::default(),
-    )
-    .unwrap()
+    Session::for_tests(tmp.path())
 }
 
 fn make_tab() -> Tab {
     Tab::new(make_test_session())
+}
+
+/// A tab whose session is a remote (auto-cloned) one. Since WI 0114 F-22 the
+/// magenta remote tab colour comes from `SessionType::Remote`, not from a
+/// `Tab::is_remote` flag that only a test ever set — so this fixture is what
+/// the production path actually produces.
+fn make_remote_tab() -> Tab {
+    let mut session = make_test_session();
+    let cloned_path = session.working_dir().to_path_buf();
+    session.set_session_type(crate::data::session::SessionType::Remote {
+        repo_url: "https://example.invalid/repo.git".to_string(),
+        branch: "main".to_string(),
+        cloned_path,
+    });
+    Tab::new(session)
 }
 
 /// Install a single container slot (as `spawn_command` would) and return
@@ -33,8 +42,7 @@ fn make_named_tab(name: &str) -> (Tab, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let resolver = StaticGitRootResolver::new(&dir);
-    let session = Session::open(dir.clone(), &resolver, SessionOpenOptions::default()).unwrap();
+    let session = Session::for_tests(&dir);
     (Tab::new(session), tmp)
 }
 
@@ -93,7 +101,7 @@ fn container_exit_report_closes_window_and_leaves_summary() {
     tab.start_container("claude".into(), "awman-abc".into(), 80, 24);
     tab.container_window_state = ContainerWindowState::Maximized;
     tab.container_rendered = true; // pretend a frame made it to screen
-    *tab.container_exit_shared.lock().unwrap() = Some(137);
+    *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
 
     tab.poll_container_exit();
 
@@ -111,7 +119,7 @@ fn container_exit_report_closes_window_and_leaves_summary() {
         "the slot's container_info must survive so later workflow steps keep stats polling"
     );
     assert!(
-        tab.container_exit_shared.lock().unwrap().is_none(),
+        tab.shared.container_exit_shared.lock().unwrap().is_none(),
         "the exit slot is consumed"
     );
 }
@@ -139,7 +147,7 @@ fn late_bytes_after_container_exit_do_not_reopen_window() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     tab.focused_slot_mut().unwrap().container_stdout_rx = Some(rx);
 
-    *tab.container_exit_shared.lock().unwrap() = Some(0);
+    *tab.shared.container_exit_shared.lock().unwrap() = Some(0);
     tab.poll_container_exit();
     assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
 
@@ -154,7 +162,7 @@ fn late_bytes_after_container_exit_do_not_reopen_window() {
 
     // The next step launches: the engine sets pty_reset_flag, after which
     // fresh output auto-opens the window again.
-    tab.pty_reset_flag.store(true, Ordering::Relaxed);
+    tab.shared.pty_reset_flag.store(true, Ordering::Relaxed);
     tx.send(b"next step output".to_vec()).unwrap();
     tab.drain_container_output();
     assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
@@ -464,17 +472,26 @@ fn tab_color_stuck_is_yellow() {
 #[test]
 fn tab_color_remote_is_magenta() {
     use ratatui::style::Color;
-    let mut tab = make_tab();
-    tab.is_remote = true;
+    let tab = make_remote_tab();
     assert_eq!(tab_color(&tab), Color::Magenta);
+}
+
+#[test]
+fn tab_color_local_session_is_not_magenta() {
+    use ratatui::style::Color;
+    let tab = make_tab();
+    assert_ne!(
+        tab_color(&tab),
+        Color::Magenta,
+        "a local session must not read as remote"
+    );
 }
 
 #[test]
 fn tab_color_stuck_takes_priority_over_remote() {
     use ratatui::style::Color;
-    let mut tab = make_tab();
+    let mut tab = make_remote_tab();
     tab.stuck = true;
-    tab.is_remote = true;
     assert_eq!(tab_color(&tab), Color::Yellow);
 }
 
@@ -762,7 +779,8 @@ fn finish_with_chat_outcome(tab: &mut Tab, exit_code: Option<i32>) {
 }
 
 fn log_texts(tab: &Tab) -> Vec<(crate::data::message::MessageLevel, String)> {
-    tab.status_log
+    tab.shared
+        .status_log
         .lock()
         .unwrap()
         .iter()
@@ -909,7 +927,8 @@ fn evicting_focused_slot_advances_focus_to_next_live_slot() {
     tab.container_slots.push(slot("c"));
     tab.focused_slot_idx = 1; // focus "b"
 
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Exited {
@@ -938,7 +957,8 @@ fn evicting_slot_before_focused_shifts_index_down() {
     tab.container_slots.push(slot("c"));
     tab.focused_slot_idx = 2; // focus "c"
 
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Exited {
@@ -961,7 +981,8 @@ fn evicting_last_slot_hides_the_container_window() {
     tab.container_slots.push(slot("a"));
     tab.container_window_state = ContainerWindowState::Maximized;
 
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Exited {
@@ -1053,7 +1074,8 @@ fn launched_slot_parser_is_sized_to_the_overlay_not_80x24() {
     let (resize_tx, mut resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
     let (_stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Launched {
@@ -1087,7 +1109,8 @@ fn container_name_event_updates_the_matching_slot() {
     tab.container_slots.push(slot("build"));
     tab.container_slots.push(slot("test"));
 
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::ContainerName {
@@ -1180,7 +1203,7 @@ fn group_started_stashes_backbone_and_group_finished_restores_it() {
 
     // Parallel group starts: the backbone goes dormant, group slots join.
     {
-        let mut q = tab.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container_slot_events.lock().unwrap();
         q.push_back(ContainerSlotEvent::GroupStarted);
         q.push_back(ContainerSlotEvent::Launched {
             step_name: "a".into(),
@@ -1201,7 +1224,7 @@ fn group_started_stashes_backbone_and_group_finished_restores_it() {
 
     // Group drains and finishes: the backbone is restored.
     {
-        let mut q = tab.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container_slot_events.lock().unwrap();
         q.push_back(ContainerSlotEvent::Exited {
             step_name: "a".into(),
         });
@@ -1232,14 +1255,15 @@ fn group_started_evicts_summary_bar_and_unblocks_auto_open() {
     tab.container_rendered = true;
 
     // Leader is killed — leaves a red summary bar and suppresses auto-open.
-    *tab.container_exit_shared.lock().unwrap() = Some(137);
+    *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
     tab.poll_container_exit();
     assert_eq!(tab.container_window_state, ContainerWindowState::Hidden);
     assert!(tab.last_container_summary.is_some());
     assert!(tab.suppress_container_auto_open);
 
     // Engine fires GroupStarted for the first parallel group.
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::GroupStarted);
@@ -1255,7 +1279,8 @@ fn group_started_evicts_summary_bar_and_unblocks_auto_open() {
 
     // First container in the new group launches and produces output.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    tab.container_slot_events
+    tab.shared
+        .container_slot_events
         .lock()
         .unwrap()
         .push_back(ContainerSlotEvent::Launched {
@@ -1286,7 +1311,7 @@ fn yolo_started_shares_cancel_flag_and_tick_updates_slot_state() {
 
     let cancel_flag: SharedYoloCancelFlag = Arc::new(AtomicBool::new(false));
     {
-        let mut q = tab.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container_slot_events.lock().unwrap();
         q.push_back(ContainerSlotEvent::YoloStarted {
             step_name: "b".into(),
             cancel_flag: cancel_flag.clone(),
@@ -1327,7 +1352,7 @@ fn yolo_started_shares_cancel_flag_and_tick_updates_slot_state() {
 
     // Finishing clears both the flag and the displayed countdown.
     {
-        let mut q = tab.container_slot_events.lock().unwrap();
+        let mut q = tab.shared.container_slot_events.lock().unwrap();
         q.push_back(ContainerSlotEvent::YoloFinished {
             step_name: "b".into(),
         });
@@ -1356,7 +1381,7 @@ fn make_squad_tab() -> Tab {
 fn tab_color_squad_is_cyan_regardless_of_execution_phase() {
     use ratatui::style::Color;
     // D8 (implementation-contract.md §0.0): `is_squad` sits at the same tier
-    // as `is_remote`, below `stuck`/yolo but above every execution-phase
+    // as a remote session, below `stuck`/yolo but above every execution-phase
     // colour. Vary phase and container-window state; the colour must never
     // move off Cyan.
     let mut tab = make_squad_tab();
@@ -1388,7 +1413,7 @@ fn tab_color_squad_is_cyan_regardless_of_execution_phase() {
 fn tab_color_stuck_takes_priority_over_squad() {
     // Companion to `tab_color_stuck_takes_priority_over_remote`: D8 narrowed
     // the squad unit test to "regardless of execution phase" only — `stuck`
-    // legitimately wins at the tier above, exactly as it does over `is_remote`.
+    // legitimately wins at the tier above, exactly as it does over a remote session.
     use ratatui::style::Color;
     let mut tab = make_squad_tab();
     tab.stuck = true;
@@ -1423,5 +1448,101 @@ fn new_squad_starts_no_git_poll() {
     assert!(
         tab.git_poll_handle.is_none(),
         "Tab::new_squad must not spawn a git poll task"
+    );
+}
+
+// ── WI 0114 F-22: the tab is a view of SessionState ─────────────────────────
+
+/// `ExecutionPhase` is derived from `SessionState::current_command`, so the
+/// tab can never disagree with the session about what is running.
+#[test]
+fn execution_phase_is_derived_from_the_session_state() {
+    use crate::data::session::SessionState;
+    use crate::frontend::tui::tabs::ExecutionPhase;
+
+    let mut state = SessionState::new();
+    assert_eq!(
+        ExecutionPhase::of_session_state(&state),
+        ExecutionPhase::Idle,
+        "no recorded command reads as idle"
+    );
+
+    state.begin_command("exec workflow", vec![]);
+    assert_eq!(
+        ExecutionPhase::of_session_state(&state),
+        ExecutionPhase::Running {
+            command: "exec workflow".to_string()
+        }
+    );
+
+    state.finish_command(3);
+    assert_eq!(
+        ExecutionPhase::of_session_state(&state),
+        ExecutionPhase::Done {
+            command: "exec workflow".to_string(),
+            exit_code: 3,
+        },
+        "a finished command keeps its name and carries its exit code"
+    );
+
+    let mut failed = SessionState::new();
+    failed.begin_command("chat", vec![]);
+    failed.fail_command("docker is not running");
+    assert_eq!(
+        ExecutionPhase::of_session_state(&failed),
+        ExecutionPhase::Error {
+            command: "chat".to_string(),
+            message: "docker is not running".to_string(),
+        }
+    );
+}
+
+/// `refresh_from_session` is the one place the tab adopts session state.
+#[test]
+fn refresh_from_session_adopts_the_phase_workflow_and_container() {
+    use crate::data::session::AgentHandle;
+    use crate::data::workflow_definition::WorkflowStep;
+    use crate::data::workflow_state::WorkflowState;
+    use crate::frontend::tui::tabs::ExecutionPhase;
+
+    let mut tab = make_tab();
+    let mut session = make_test_session();
+
+    let steps = vec![WorkflowStep {
+        name: "build".into(),
+        depends_on: vec![],
+        prompt_template: String::new(),
+        agent: None,
+        model: None,
+        overlays: None,
+        abort_on_failure: false,
+    }];
+    let workflow_state = WorkflowState::new("deploy".into(), &steps, "h".into(), Some(114));
+
+    let state = session.state_mut();
+    state.begin_command("exec workflow", vec![]);
+    state.set_current_workflow(Some(workflow_state.summary()));
+    state.set_current_container(Some(AgentHandle {
+        id: "abc123".into(),
+        image_tag: "awman-claude:latest".into(),
+        name: "awman-build".into(),
+        started_at: chrono::Utc::now(),
+    }));
+
+    tab.refresh_from_session(&session);
+
+    assert_eq!(
+        tab.execution_phase,
+        ExecutionPhase::Running {
+            command: "exec workflow".to_string()
+        }
+    );
+    let workflow = tab.current_workflow.as_ref().expect("workflow adopted");
+    assert_eq!(workflow.workflow_name, "deploy");
+    assert_eq!(workflow.work_item, Some(114));
+    assert_eq!(workflow.total_steps, 1);
+    assert_eq!(
+        tab.current_container.as_ref().map(|c| c.name.as_str()),
+        Some("awman-build")
     );
 }

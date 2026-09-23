@@ -380,6 +380,18 @@ impl ContainerBackend for DockerBackend {
         "docker"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Docker"
+    }
+
+    fn cli_binary(&self) -> &'static str {
+        "docker"
+    }
+
+    fn availability_probe_args(&self) -> &'static [&'static str] {
+        &["info", "--format", "{{.ServerVersion}}"]
+    }
+
     fn image_home_dir(&self, tag: &str) -> Option<String> {
         // Print one env entry per line so we can scan for `HOME=…` without
         // parsing JSON. `docker image inspect` exits 0 even when User/Env are

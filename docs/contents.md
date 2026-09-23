@@ -22,6 +22,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 11 | [Runtimes](11-runtimes.md) | Docker, Apple Containers, Docker Sandboxes — platform support, setup, lifecycle |
 | 12 | [squad](12-squad.md) | Your squad of agents: tasks, durable workspaces, the squad tab, attach, guardrails |
 | 13 | [Cleaning Up](13-cleaning-up.md) | `awman clean` — remove containers, workflow files, and dangling images |
+| 14 | [Command Reference](14-command-reference.md) | Every command, subcommand, flag, and argument awman accepts, generated from the source of truth |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

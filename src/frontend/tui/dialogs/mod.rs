@@ -7,6 +7,9 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::command::commands::squad::commands::SquadConfirmDecision;
+use crate::command::dispatch::frontend_action::FrontendAction;
+use crate::data::prompt::Prompt;
 use crate::frontend::tui::text_edit::TextEdit;
 
 /// Title of the `Ctrl-T` New Tab dialog. The key handler's `Ctrl-S` intercept
@@ -97,6 +100,14 @@ pub enum DialogResponse {
     Index(usize),
     Char(char),
     Dismissed,
+    /// A config-table edit, as the command layer's own type.
+    ///
+    /// Before WI 0114 F-20 this rode `Text` as a tab-separated
+    /// `"field\tvalue\tscope"` string that `dialog_router.rs` formatted and
+    /// `per_command/config.rs` split back apart — a private wire protocol
+    /// between two files, with a silent `Ok(None)` whenever the split did not
+    /// yield three parts.
+    ConfigEdit(crate::command::commands::config::ConfigEditRequest),
 }
 
 /// The active dialog state stored in `App`.
@@ -152,11 +163,16 @@ pub enum Dialog {
         name: String,
     },
     /// Confirmation before triggering, cancelling or pausing a squad task
-    /// from the card grid or the detail modal. `y` dispatches the action's
-    /// `squad <subcommand> <name>`; `n`/`Esc` dismisses.
+    /// from the card grid or the detail modal.
+    ///
+    /// Everything the modal says is `prompt`'s: Layer 2 built it
+    /// (`SquadCommand::confirm_prompt`) and Layer 2 knows which command
+    /// `action` dispatches to. This dialog holds the two facts the frontend
+    /// does own — which task, and which answer a keypress is.
     SquadActionConfirm {
-        action: SquadConfirmAction,
+        action: FrontendAction,
         name: String,
+        prompt: Prompt<SquadConfirmDecision>,
     },
     /// Confirmation before starting a squad daemon that is not already running
     /// (WI 0110). Opening the squad tab starts a long-lived background
@@ -286,54 +302,6 @@ pub struct SquadDetailState {
     pub task: crate::data::fs::task_store::Task,
 }
 
-/// A squad task action that asks for confirmation before it is dispatched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SquadConfirmAction {
-    Trigger,
-    Cancel,
-    Pause,
-}
-
-impl SquadConfirmAction {
-    /// The `squad` subcommand the action dispatches.
-    pub fn subcommand(self) -> &'static str {
-        match self {
-            Self::Trigger => "trigger",
-            Self::Cancel => "cancel",
-            Self::Pause => "pause",
-        }
-    }
-
-    /// The dialog title.
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Trigger => "Trigger task",
-            Self::Cancel => "Cancel run",
-            Self::Pause => "Pause task",
-        }
-    }
-
-    /// The question the dialog asks about task `name`.
-    pub fn question(self, name: &str) -> String {
-        match self {
-            Self::Trigger => format!("Evaluate task \"{name}\" on the next tick?"),
-            Self::Cancel => {
-                format!("Cancel the in-progress run of task \"{name}\" and stop its agents?")
-            }
-            Self::Pause => format!("Pause task \"{name}\"?"),
-        }
-    }
-
-    /// The label for the `y` key.
-    pub fn verb(self) -> &'static str {
-        match self {
-            Self::Trigger => "trigger",
-            Self::Cancel => "cancel run",
-            Self::Pause => "pause",
-        }
-    }
-}
-
 /// State for the squad run-history modal. `name` is the task whose runs are
 /// shown, and the identity `tick_all_tabs` refreshes `runs` against; `scroll`
 /// offsets the run table. `from_detail` records where the modal was opened
@@ -398,6 +366,11 @@ pub struct ConfigShowRow {
     pub repo_writable: bool,
     /// Short format hint shown while editing (e.g. "true or false").
     pub value_hint: Option<String>,
+    /// The row's shape, carried through from `ConfigFieldRow` so the dialog
+    /// can find the map and array headers — and build a new member's field
+    /// name from the header's own prefix — without spelling a config path
+    /// (WI 0114 F-20).
+    pub shape: crate::command::commands::config::ConfigFieldShape,
 }
 
 /// Compute a centered rect for a dialog.

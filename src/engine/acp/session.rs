@@ -23,7 +23,6 @@ use crate::engine::acp::protocol::{
     SessionUpdate,
 };
 use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
-use crate::engine::container::options::{AutoMode, YoloMode};
 use crate::engine::error::EngineError;
 
 /// A running ACP agent plus its JSON-RPC client.
@@ -31,6 +30,21 @@ use crate::engine::error::EngineError;
 /// Construct the companion [`crate::engine::acp::AcpTransportFrontend`] with
 /// `AcpTransport::channel`, pass it to `AgentInstance::run_with_frontend`, and
 /// then build this session from the resulting execution and transport.
+/// What an ACP session does when the agent asks permission for a tool call.
+///
+/// The session is *told* the policy rather than deriving it from `--yolo` /
+/// `--auto`: those are command flags, and reading them here put a permission
+/// decision — the most security-relevant one awman makes — in Layer 1 (F-46).
+/// Layer 2 computes this from the flags it owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionPolicy {
+    /// Approve every request without consulting the frontend.
+    AutoApprove,
+    /// Ask the frontend. The default: a session that has not been told
+    /// otherwise must never approve on the user's behalf.
+    #[default]
+    Ask,
+}
 pub struct AcpSession {
     execution: AgentExecution,
     client: Arc<AcpClient>,
@@ -38,7 +52,7 @@ pub struct AcpSession {
     permissions_rx: mpsc::UnboundedReceiver<IncomingRequest>,
     pending_permissions: Mutex<HashSet<JsonRpcId>>,
     updates_rx: mpsc::UnboundedReceiver<SessionUpdate>,
-    auto_approve: bool,
+    permissions: PermissionPolicy,
 }
 
 impl AcpSession {
@@ -46,17 +60,15 @@ impl AcpSession {
         execution: AgentExecution,
         transport: AcpTransport,
         sink: Box<dyn UserMessageSink>,
-        yolo: YoloMode,
-        auto: AutoMode,
+        permissions: PermissionPolicy,
     ) -> Self {
-        Self::new(execution, AcpClient::new(transport, sink), yolo, auto)
+        Self::new(execution, AcpClient::new(transport, sink), permissions)
     }
 
     pub fn new(
         execution: AgentExecution,
         mut client: AcpClient,
-        yolo: YoloMode,
-        auto: AutoMode,
+        permissions: PermissionPolicy,
     ) -> Self {
         let permissions_rx = client.take_incoming();
         let updates_rx = client.take_updates();
@@ -67,7 +79,7 @@ impl AcpSession {
             permissions_rx,
             pending_permissions: Mutex::new(HashSet::new()),
             updates_rx,
-            auto_approve: matches!(yolo, YoloMode::Enabled) || matches!(auto, AutoMode::Enabled),
+            permissions,
         }
     }
 
@@ -306,7 +318,7 @@ impl AcpSession {
             .lock()
             .await
             .insert(request.request_id.clone());
-        let decision = if self.auto_approve {
+        let decision = if matches!(self.permissions, PermissionPolicy::AutoApprove) {
             PermissionDecision::approve(&request.options)
         } else {
             frontend.request_permission(request.clone())
@@ -368,12 +380,7 @@ mod tests {
         let (frontend, transport) = AcpTransport::channel();
         let mut io = frontend.into_io_for_test();
         let client = AcpClient::new(transport, Box::new(RecordingMessageSink::new()));
-        let mut session = AcpSession::new(
-            finished_execution(),
-            client,
-            YoloMode::Disabled,
-            AutoMode::Disabled,
-        );
+        let mut session = AcpSession::new(finished_execution(), client, PermissionPolicy::Ask);
         for id in [41, 42] {
             io.stdout.send(serde_json::to_vec(&serde_json::json!({
                 "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
@@ -437,12 +444,7 @@ mod tests {
         let (frontend, transport) = AcpTransport::channel();
         let mut io = frontend.into_io_for_test();
         let client = AcpClient::new(transport, Box::new(RecordingMessageSink::new()));
-        let mut session = AcpSession::new(
-            finished_execution(),
-            client,
-            YoloMode::Disabled,
-            AutoMode::Disabled,
-        );
+        let mut session = AcpSession::new(finished_execution(), client, PermissionPolicy::Ask);
         io.stdout
             .send(
                 serde_json::to_vec(&serde_json::json!({
@@ -482,12 +484,7 @@ mod tests {
         let (frontend, transport) = AcpTransport::channel();
         let mut io = frontend.into_io_for_test();
         let client = AcpClient::new(transport, Box::new(RecordingMessageSink::new()));
-        let mut session = AcpSession::new(
-            finished_execution(),
-            client,
-            YoloMode::Disabled,
-            AutoMode::Disabled,
-        );
+        let mut session = AcpSession::new(finished_execution(), client, PermissionPolicy::Ask);
         *session.session_id.lock().await = Some("s".into());
 
         let the_update = SessionUpdate::AgentMessageChunk {
@@ -551,12 +548,7 @@ mod tests {
         let (frontend, transport) = AcpTransport::channel();
         let io = frontend.into_io_for_test();
         let client = AcpClient::new(transport, Box::new(RecordingMessageSink::new()));
-        let mut session = AcpSession::new(
-            finished_execution(),
-            client,
-            YoloMode::Disabled,
-            AutoMode::Disabled,
-        );
+        let mut session = AcpSession::new(finished_execution(), client, PermissionPolicy::Ask);
         *session.session_id.lock().await = Some("s".into());
         // Drop the container IO so both stdout (reader) and stdin close: the
         // turn's request fails and the incoming channel closes.
@@ -576,16 +568,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn yolo_auto_approves_without_calling_frontend_permission_hook() {
+    async fn auto_approve_policy_approves_without_calling_frontend_permission_hook() {
+        // F-46 renamed this from `yolo_auto_approves_…`: the session is told
+        // a `PermissionPolicy` now, and no longer knows what `--yolo` is.
         let (frontend, transport) = AcpTransport::channel();
         let mut io = frontend.into_io_for_test();
         let client = AcpClient::new(transport, Box::new(RecordingMessageSink::new()));
-        let mut session = AcpSession::new(
-            finished_execution(),
-            client,
-            YoloMode::Enabled,
-            AutoMode::Disabled,
-        );
+        let mut session =
+            AcpSession::new(finished_execution(), client, PermissionPolicy::AutoApprove);
         io.stdout
             .send(
                 serde_json::to_vec(&serde_json::json!({

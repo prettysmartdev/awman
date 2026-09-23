@@ -329,7 +329,7 @@ fn assert_leases_before_spawn(options: &ResolvedContainerOptions, leases: &[Cred
     debug_assert!(
         options.refreshable_credentials.is_empty()
             || !leases.is_empty()
-            || crate::engine::credential_refresh::global().is_none(),
+            || options.lease_factory.is_none(),
         "file-delivered credential spawned without a lease"
     );
 }

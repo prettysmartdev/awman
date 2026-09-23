@@ -27,18 +27,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use awman::command::commands::api_server::event_bus::EventBus;
 use awman::command::dispatch::{CommandFrontend, Engines};
+use awman::data::fs::api_db::NewSessionRow;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
-use awman::data::EngineWorkflowStateStore;
+use awman::data::session::SessionKind;
+use awman::data::session_setup_event::SessionSetupStatus;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-use awman::frontend::api::event_bus::EventBus;
 use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -58,7 +61,7 @@ fn make_app_state_with_workdirs(
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
-    let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
+    let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
         runtime: runtime.clone(),
@@ -69,6 +72,8 @@ fn make_app_state_with_workdirs(
         auth_engine,
         agent_engine,
         workflow_state_store,
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
 
     Arc::new(AppState {
@@ -105,14 +110,14 @@ async fn spawn_router(
 /// Insert an active + setup-ready local session directly into the store.
 fn insert_ready_session(store: &SqliteSessionStore, session_id: &str, workdir: &str) {
     store
-        .insert_session_full(
-            session_id,
+        .insert_session_full(NewSessionRow {
+            id: session_id,
             workdir,
-            &chrono::Utc::now().to_rfc3339(),
-            "ready",
-            "local",
-            None,
-        )
+            created_at: &chrono::Utc::now().to_rfc3339(),
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 }
 
@@ -605,7 +610,14 @@ async fn real_network_create_command_closed_session_returns_404() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full("closed-sess", "/work", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "closed-sess",
+            workdir: "/work",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     state.store.close_session_force("closed-sess", &ts).unwrap();
 
@@ -641,7 +653,14 @@ async fn real_network_create_command_closing_session_returns_409() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full("closing-sess", "/work", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "closing-sess",
+            workdir: "/work",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     state
         .store
@@ -682,14 +701,14 @@ async fn real_network_create_command_session_not_ready_returns_409() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full(
-            "notready-sess",
-            "/work",
-            &ts,
-            "running_ready",
-            "local",
-            None,
-        )
+        .insert_session_full(NewSessionRow {
+            id: "notready-sess",
+            workdir: "/work",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::RunningReady,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     let resp = reqwest::Client::new()

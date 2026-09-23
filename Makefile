@@ -9,7 +9,7 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
-.PHONY: all build install test test-fast test-full clean release architecture-lint pre-push
+.PHONY: all build install test test-fast test-full clean release architecture-lint pre-push docs-reference
 
 all: build
 
@@ -45,10 +45,25 @@ test-full:
 architecture-lint:
 	@bash tools/architecture-lint.sh
 
+# Rewrite docs/14-command-reference.md from CommandCatalogue. The doc is
+# generated, never hand-edited; `markdown_reference_matches_committed_docs`
+# fails whenever a catalogue change leaves it stale, and this is the fix.
+docs-reference:
+	cargo test --lib \
+		command::dispatch::projections::markdown::tests::regenerate_command_reference \
+		-- --ignored
+
+# The test step goes through the `test` target rather than calling `cargo
+# test` directly, so the pre-push gate gets the same per-run fixture root.
+# Running the suite against a shared /tmp is what the `test` target was
+# hardened against, and pre-push is the one that runs in a container where
+# a work item has already left tens of thousands of fixture directories
+# behind: every test body after the handful that need no temp directory
+# then dies on, or crawls against, a /tmp that cannot take another one.
 pre-push: architecture-lint
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
-	cargo test --quiet
+	$(MAKE) --no-print-directory test
 
 clean:
 	cargo clean

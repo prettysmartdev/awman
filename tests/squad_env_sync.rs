@@ -401,7 +401,8 @@ async fn a_read_only_probe_gateway_pushes_nothing() {
 /// what it actually does over the wire.
 #[tokio::test]
 async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
-    use awman::frontend::tui::squad_indicator::{SquadIndicator, SquadIndicatorPoller};
+    use awman::engine::squad::SquadHealth as SquadIndicator;
+    use awman::frontend::tui::squad_indicator::SquadIndicatorPoller;
 
     let _lock = PROCESS_ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -526,7 +527,10 @@ async fn the_remote_gateway_reads_coverage_as_names_digests_and_timestamps() {
     let coverage: EnvCoverage = gateway.env_coverage().await.expect("coverage");
 
     assert_eq!(coverage.salt, salt.to_hex());
-    assert_eq!(coverage.persistence, "none");
+    assert_eq!(
+        coverage.persistence,
+        awman::data::fs::daemon_env::EnvPersistence::None
+    );
     assert_eq!(coverage.required.len(), 1);
     assert_eq!(coverage.required[0].name, "WI0116_SYNC_TOKEN");
     assert_eq!(

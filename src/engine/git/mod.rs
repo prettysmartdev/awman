@@ -9,24 +9,29 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::data::error::DataError;
-use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::session::GitRootResolver;
 use crate::data::worktree_paths::{
     worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
 };
 use crate::engine::error::EngineError;
 
-/// Run a git command and log both the command line and output to the sink.
+pub mod frontend;
+
+pub use frontend::{GitCommand, GitFrontend};
+
+/// Run a git command, reporting it to the frontend and streaming its output.
 fn run_git_logged(
     args: &[&str],
     cwd: &Path,
-    sink: &mut dyn UserMessageSink,
+    sink: &mut dyn GitFrontend,
 ) -> Result<std::process::Output, EngineError> {
-    let cmd_str = format!("git {}", args.join(" "));
-    sink.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: format!("$ {cmd_str}"),
-    });
+    let command = GitCommand::new(args);
+    let cmd_str = command.display();
+    // The engine reports the fact; the frontend draws it. The default impl
+    // writes the same `$ git …` line this function used to compose itself
+    // (F-45), so nothing changes for a frontend that has not opted in.
+    sink.command_started(&command);
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -97,6 +102,32 @@ pub struct NumstatEntry {
 #[derive(Debug, Default, Clone)]
 pub struct GitEngine;
 
+/// The committer identity git resolves for a given directory. Either field is
+/// `None` when git cannot resolve it at any level (repo, global, system).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
+}
+
+impl GitIdentity {
+    /// The `user.*` keys that are not set, in the order a message should list
+    /// them. Empty when the identity is complete.
+    pub fn missing_keys(&self) -> Vec<&'static str> {
+        [
+            self.name.is_none().then_some("user.name"),
+            self.email.is_none().then_some("user.email"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Whether git has everything it needs to create a commit here.
+    pub fn is_complete(&self) -> bool {
+        self.name.is_some() && self.email.is_some()
+    }
+}
 impl GitEngine {
     pub fn new() -> Self {
         Self
@@ -423,6 +454,31 @@ impl GitEngine {
         Ok(())
     }
 
+    /// The URL git would actually use for `remote` in `repo_dir`, with the
+    /// user's `url.*.insteadOf` rewrites applied — `git remote get-url`.
+    ///
+    /// `None` when there is no such remote, or when git cannot be run at all.
+    /// This is the value the `context(repo)` directory slug is derived from
+    /// (WI 0114 F-29 moved that read out of Layer 0's `ContextDirResolver`),
+    /// and it must stay `get-url` rather than [`remote_url`](Self::remote_url):
+    /// a user with an `insteadOf` rewrite configured has a context directory
+    /// named after the rewritten URL, and switching to the stored value would
+    /// silently orphan it.
+    pub fn remote_effective_url(&self, repo_dir: &Path, remote: &str) -> Option<String> {
+        let output = Command::new("git")
+            .args(["remote", "get-url", remote])
+            .current_dir(repo_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!url.is_empty()).then_some(url)
+    }
+
     /// Read the URL configured for `remote` in `repo_dir`, exactly as stored
     /// in that repository's git config.
     ///
@@ -569,6 +625,56 @@ impl GitEngine {
         }
     }
 
+    /// The `user.name` / `user.email` git resolves **for `path`**.
+    ///
+    /// `git -C <path> config user.name` applies the normal precedence —
+    /// repo-local `.git/config` over `~/.gitconfig` over system — so a repo
+    /// that configures its own identity is honoured. A probe run without
+    /// `current_dir` (as `exec workflow` did before F-39) only ever saw the
+    /// global value and warned about a repo that was in fact configured.
+    ///
+    /// A field git cannot resolve comes back as `None` rather than an error:
+    /// an unset identity is a normal state the caller reports on, not a
+    /// failure to interrogate git.
+    pub fn identity_configured(&self, path: &Path) -> Result<GitIdentity, EngineError> {
+        Ok(GitIdentity {
+            name: self.config_value(path, "user.name")?,
+            email: self.config_value(path, "user.email")?,
+        })
+    }
+
+    /// One `git -C <path> config <key>`, `None` when unset or empty.
+    fn config_value(&self, path: &Path, key: &str) -> Result<Option<String>, EngineError> {
+        let output = Command::new("git")
+            .args(["config", key])
+            .current_dir(path)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git config {key}`: {e}")))?;
+        if !output.status.success() {
+            // Exit 1 is git's "key not set", which is not an error here.
+            return Ok(None);
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(if value.is_empty() { None } else { Some(value) })
+    }
+    /// The commit SHA HEAD points at in `git_root`.
+    pub fn head_sha(&self, git_root: &Path) -> Result<String, EngineError> {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(git_root)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git rev-parse HEAD`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git rev-parse HEAD failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     // ─── Logged variants ──────────────────────────────────────────────
     //
     // These methods mirror the unlogged methods above but push every git
@@ -579,7 +685,7 @@ impl GitEngine {
     pub fn uncommitted_files_logged(
         &self,
         path: &Path,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<Vec<String>, EngineError> {
         let output = run_git_logged(&["status", "--porcelain"], path, sink)?;
         if !output.status.success() {
@@ -601,7 +707,7 @@ impl GitEngine {
         &self,
         path: &Path,
         message: &str,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let add = run_git_logged(&["add", "-A"], path, sink)?;
         if !add.status.success() {
@@ -627,7 +733,7 @@ impl GitEngine {
         git_root: &Path,
         worktree_path: &Path,
         branch: &str,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         std::fs::create_dir_all(worktree_path.parent().unwrap_or(worktree_path))
             .map_err(|e| EngineError::io(worktree_path, e))?;
@@ -654,7 +760,7 @@ impl GitEngine {
         &self,
         git_root: &Path,
         worktree_path: &Path,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let wt_str = worktree_path
             .to_str()
@@ -681,7 +787,7 @@ impl GitEngine {
         branch: &str,
         worktree_path: &Path,
         squash: bool,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         if !squash {
             let message = format!("Merge {branch}");
@@ -728,7 +834,7 @@ impl GitEngine {
         &self,
         git_root: &Path,
         branch: &str,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let output = run_git_logged(&["branch", "-D", branch], git_root, sink)?;
         if !output.status.success() {
@@ -749,7 +855,7 @@ impl GitEngine {
         url: &str,
         branch: Option<&str>,
         dest: &Path,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
@@ -786,7 +892,7 @@ impl GitEngine {
     pub fn pull_latest_logged(
         &self,
         repo_dir: &Path,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let fetch = run_git_logged(&["fetch", "origin"], repo_dir, sink)?;
         if !fetch.status.success() {
@@ -817,7 +923,7 @@ impl GitEngine {
         &self,
         path: &Path,
         branch: &str,
-        sink: &mut dyn UserMessageSink,
+        sink: &mut dyn GitFrontend,
     ) -> Result<&'static str, EngineError> {
         let output = run_git_logged(&["checkout", branch], path, sink)?;
         if output.status.success() {

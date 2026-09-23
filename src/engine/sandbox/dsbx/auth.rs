@@ -13,6 +13,7 @@
 //! via `sbx create`) before any secret is set.
 
 use crate::data::message::UserMessageSink;
+use crate::engine::agent::agent_matrix::matrix_for;
 use crate::engine::container::options::{EnvLiteral, EnvVar};
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::dsbx::spawn::SbxCommand;
@@ -23,24 +24,17 @@ use crate::engine::sandbox::dsbx::spawn::SbxCommand;
 pub(super) use crate::engine::auth::service_for_credential;
 
 /// Allowlist of provider auth env vars accepted via `env(VAR)` overlays for
-/// launch-time auto-auth, per agent. Only mixin-kit agents participate —
-/// agent-kit agents (antigravity, crush, maki, cline) are intentionally left
-/// out for now, so they return an empty list.
+/// launch-time auto-auth, read from the one per-agent table
+/// ([`AgentMatrix::sandbox_auth_env_vars`], F-32). An unknown agent name has
+/// no entry and therefore no allowlist.
 ///
-/// Each var must satisfy two constraints, both verified against the Docker
-/// Sandboxes credentials docs: the var maps to an sbx well-known service
-/// ([`service_for_credential`]), and the agent's base kit actually routes that
-/// service through the host proxy (the kit template's `network.allowedDomains`
-/// / `environment.proxyManaged`).
+/// This used to be a second `match agent` here — a per-agent table outside
+/// `AgentMatrix`, and one the F-32 acceptance grep could not see because it
+/// matched a `&str` parameter rather than `agent.as_str()`.
 pub(super) fn supported_auth_env_vars(agent: &str) -> &'static [&'static str] {
-    match agent {
-        "claude" => &["ANTHROPIC_API_KEY"],
-        "codex" => &["OPENAI_API_KEY"],
-        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "copilot" => &["GH_TOKEN", "GITHUB_TOKEN"],
-        "opencode" => &["ANTHROPIC_API_KEY"],
-        _ => &[],
-    }
+    matrix_for(agent)
+        .map(|m| m.sandbox_auth_env_vars)
+        .unwrap_or(&[])
 }
 
 /// Heuristic: does this env-var name look like it carries a secret? Used to

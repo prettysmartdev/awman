@@ -20,7 +20,7 @@ use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
 use awman::command::dispatch::Engines;
 use awman::data::fs::daemon_process::{DaemonProcess, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -51,7 +51,9 @@ fn engines_with(container_runtime: Arc<ContainerRuntime>, root: &std::path::Path
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, container_runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 
@@ -177,9 +179,13 @@ async fn post_commands_rejects_non_squad_subcommand() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
+    // The refusal is now the catalogue's standard
+    // `NotAvailableForFrontend`, raised under `FrontendKind::SquadDaemon`
+    // (WI 0114 F-50) rather than a literal path comparison in the router.
+    let error = body["error"].as_str().unwrap();
     assert!(
-        body["error"].as_str().unwrap().contains("squad subtree"),
-        "error must explain the squad-only subtree restriction: {body}"
+        error.contains("exec workflow") && error.contains("squad daemon"),
+        "error must name the command and the frontend that refuses it: {body}"
     );
 
     handle.abort();
@@ -322,7 +328,7 @@ impl TaskEvaluator for WorkflowInFlightEvaluator {
             "deadbeef".to_string(),
             None,
         );
-        let store = EngineWorkflowStateStore::at_git_root(&self.state_dir);
+        let store = WorkflowStateStore::at_git_root(&self.state_dir);
         let state_path = store.save(&state).expect("persisting workflow state");
 
         let workflow_path = request.task_dir.join("workflow.toml");
@@ -1309,7 +1315,8 @@ async fn the_status_route_reports_all_three_env_persistence_forms() {
         );
         let status = gateway.status().await.expect("status must succeed");
         assert_eq!(
-            status.env_persistence, expected,
+            status.env_persistence.as_ref().map(|p| p.to_string()),
+            Some(expected.to_string()),
             "the string `GET /v1/status` serialises is the daemon's own Display"
         );
         // And it survives serialisation verbatim — the frontend renders it as

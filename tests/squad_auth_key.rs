@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use awman::command::commands::squad::commands::SquadCommandFrontend;
 use awman::command::commands::squad::daemon::{
-    SquadDaemonCommand, SquadDaemonSubcommand, SquadStartFlags,
+    SquadDaemon, SquadDaemonSubcommand, SquadStartFlags,
 };
-use awman::command::commands::squad::key_setup::{render_key_setup, ShellFlavor};
-use awman::command::commands::Command as AwmanCommand;
+use awman::command::commands::squad::key_setup::{export_snippet, ShellFlavor};
+use awman::command::commands::squad::supervisor::SquadKeySetup;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
 use awman::data::config::env::{
@@ -23,7 +23,7 @@ use awman::data::config::env::{
 use awman::data::fs::daemon_process::ServerMeta;
 use awman::data::fs::{ApiPaths, SquadPaths};
 use awman::data::message::{UserMessage, UserMessageSink};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -36,14 +36,27 @@ static PROCESS_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 /// Captures every user-facing message and returns immediately from the serve
 /// call, so `run_start` runs end to end without binding a port.
+///
+/// The key disclosure is recorded *separately* from the message stream: since
+/// WI 0114 F-56 Layer 2 hands a frontend the key, the shell and the export
+/// line and each frontend draws its own banner, so a test that looked for the
+/// banner's prose in `write_message` output would pass vacuously against the
+/// trait's do-nothing default.
 #[derive(Clone, Default)]
 struct RecordingFrontend {
     messages: Arc<Mutex<Vec<String>>>,
+    disclosures: Arc<Mutex<Vec<SquadKeySetup>>>,
 }
 
 impl RecordingFrontend {
     fn text(&self) -> String {
         self.messages.lock().unwrap().join("\n")
+    }
+
+    /// Every key this run disclosed, in order. More than one would mean the
+    /// same secret was shown twice.
+    fn disclosures(&self) -> Vec<SquadKeySetup> {
+        self.disclosures.lock().unwrap().clone()
     }
 }
 
@@ -62,6 +75,10 @@ impl SquadCommandFrontend for RecordingFrontend {
         &self,
     ) -> Option<Arc<dyn awman::command::commands::squad::evaluation::SquadRunFrontends>> {
         Some(awman::frontend::squad::unattended::UnattendedFrontends::shared())
+    }
+
+    fn show_key_setup(&mut self, setup: &SquadKeySetup) {
+        self.disclosures.lock().unwrap().push(setup.clone());
     }
 
     async fn serve_squad_daemon(
@@ -87,12 +104,14 @@ fn engines_at(root: &Path) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 
 /// Scope the process environment to an isolated fixture, then restore it.
-/// `SquadDaemonCommand` reads `Env::from_process()`.
+/// `SquadDaemon` reads `Env::from_process()`.
 struct ScopedEnv(Vec<(&'static str, Option<String>)>);
 
 impl ScopedEnv {
@@ -130,8 +149,8 @@ async fn run_start(home: &Path, flags: SquadStartFlags) -> (RecordingFrontend, S
         (SHELL, "/bin/zsh"),
     ]);
     let frontend = RecordingFrontend::default();
-    let command = SquadDaemonCommand::new(SquadDaemonSubcommand::Start(flags), engines_at(home));
-    AwmanCommand::run_with_frontend(command, Box::new(frontend.clone()))
+    SquadDaemon::new(SquadDaemonSubcommand::Start(flags), engines_at(home))
+        .run(&mut frontend.clone())
         .await
         .expect("squad start must succeed on a clean fixture");
     (frontend, SquadPaths::from_root(&squad_root))
@@ -175,35 +194,39 @@ async fn first_start_emits_a_shell_export_snippet_for_the_minted_key() {
     )
     .await;
 
-    let text = frontend.text();
-    assert!(
-        text.contains("export AWMAN_SQUAD_KEY="),
-        "start must emit a copy-pasteable export line; got:\n{text}"
+    let disclosures = frontend.disclosures();
+    assert_eq!(
+        disclosures.len(),
+        1,
+        "a first start discloses the minted key exactly once"
     );
-    assert!(
-        text.contains("~/.zshrc"),
-        "the snippet must name the shell startup file; got:\n{text}"
+    let disclosed = &disclosures[0];
+    assert_eq!(
+        disclosed.export_line,
+        format!("export {AWMAN_SQUAD_KEY}={}", disclosed.key),
+        "start must hand over a copy-pasteable export line"
+    );
+    assert_eq!(
+        disclosed.rc_file(),
+        "~/.zshrc",
+        "the fixture's SHELL is /bin/zsh, so the startup file is ~/.zshrc"
     );
     assert!(
         paths.daemon().key_hash_file().exists(),
         "the key hash must be persisted so the daemon can verify it"
     );
 
-    // The snippet carries the real key, not a placeholder: the hash on disk is
-    // never the plaintext, so a wrong key here would be undetectable later.
-    let exported = text
-        .split("export AWMAN_SQUAD_KEY=")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("export line must carry a value");
+    // The disclosure carries the real key, not a placeholder: the hash on disk
+    // is never the plaintext, so a wrong key here would be undetectable later.
     assert!(
-        exported.len() >= 32,
-        "exported value must be the key itself; got {exported:?}"
+        disclosed.key.len() >= 32,
+        "the disclosed value must be the key itself; got {:?}",
+        disclosed.key
     );
     assert!(
         !std::fs::read_to_string(paths.daemon().key_hash_file())
             .unwrap()
-            .contains(exported),
+            .contains(&disclosed.key),
         "the plaintext key must never be what lands in the hash file"
     );
 }
@@ -230,10 +253,14 @@ async fn skip_auth_mints_no_key_and_warns_that_auth_is_disabled() {
         !paths.daemon().key_hash_file().exists(),
         "--dangerously-skip-auth must write no key hash"
     );
+    assert!(
+        frontend.disclosures().is_empty(),
+        "no key may be disclosed when none was minted"
+    );
     let text = frontend.text();
     assert!(
         !text.contains("AWMAN_SQUAD_KEY"),
-        "no key may be disclosed when none was minted; got:\n{text}"
+        "nor may one be named in the message stream; got:\n{text}"
     );
     assert!(
         text.contains("DISABLED") && text.contains("--dangerously-skip-auth"),
@@ -261,10 +288,18 @@ async fn refresh_key_re_emits_the_export_snippet() {
         },
     )
     .await;
-    let text = frontend.text();
+    let disclosures = frontend.disclosures();
+    assert_eq!(
+        disclosures.len(),
+        1,
+        "--refresh-key must disclose the replacement key too"
+    );
     assert!(
-        text.contains("export AWMAN_SQUAD_KEY="),
-        "--refresh-key must emit the setup snippet too; got:\n{text}"
+        disclosures[0]
+            .export_line
+            .starts_with(&format!("export {AWMAN_SQUAD_KEY}=")),
+        "got: {:?}",
+        disclosures[0].export_line
     );
 }
 
@@ -272,12 +307,13 @@ async fn refresh_key_re_emits_the_export_snippet() {
 /// These two drifting apart is precisely the gap this work closes.
 #[test]
 fn the_exported_variable_is_the_one_the_client_reads() {
-    let snippet = render_key_setup("secret-key", ShellFlavor::Zsh);
+    let snippet = export_snippet("secret-key", ShellFlavor::Zsh);
     let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_KEY, "secret-key")]);
     assert_eq!(env.squad_key(), Some("secret-key"));
-    assert!(
-        snippet.contains(&format!("export {AWMAN_SQUAD_KEY}=secret-key")),
-        "snippet must export the variable `EnvSnapshot::squad_key` reads; got:\n{snippet}"
+    assert_eq!(
+        snippet,
+        format!("export {AWMAN_SQUAD_KEY}=secret-key"),
+        "the snippet must export the variable `EnvSnapshot::squad_key` reads"
     );
 }
 

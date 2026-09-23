@@ -53,20 +53,11 @@ pub struct OverlaySpec {
     pub permission: OverlayPermission,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverlayPermission {
-    ReadOnly,
-    ReadWrite,
-}
-
-impl OverlayPermission {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            OverlayPermission::ReadOnly => "ro",
-            OverlayPermission::ReadWrite => "rw",
-        }
-    }
-}
+// `OverlayPermission` is Layer 0: the overlay grammar in
+// `data::config::overlays` parses it, and a Layer 0 parser cannot name a
+// Layer 1 type (WI 0114 F-27). Re-exported here for one release so existing
+// `engine::container::options::OverlayPermission` paths still compile.
+pub use crate::data::config::overlays::OverlayPermission;
 
 /// A passthrough environment variable (read from host at launch time).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +158,10 @@ pub enum ContainerOption {
     /// A refreshable credential already planted in a staged settings overlay.
     /// It carries paths and an opaque fingerprint only — never secret bytes.
     RefreshableCredential(RefreshableCredentialDelivery),
+    /// Who registers the leases for this launch's refreshable credentials
+    /// (F-38). Absent means leases are disabled — see
+    /// [`ResolvedContainerOptions::lease_factory`].
+    CredentialLeaseFactory(crate::engine::credential_refresh::LeaseFactoryHandle),
     DisallowedTools(Vec<String>),
     AllowedTools(Vec<String>),
     Model {
@@ -431,6 +426,16 @@ pub struct ResolvedContainerOptions {
     pub agent_credentials: Vec<(String, String)>,
     /// File-delivered credentials that the refresh monitor will later lease.
     pub refreshable_credentials: Vec<RefreshableCredentialDelivery>,
+    /// Who hands out the leases for `refreshable_credentials`, carried
+    /// explicitly rather than reached through a process-global (F-38).
+    ///
+    /// `None` means leases are disabled for this launch: the backends
+    /// register nothing and `assert_leases_before_spawn` accepts the empty
+    /// lease vec. That is the state a command with `authRefresh.enabled:
+    /// false` produces, and it is also the default, so any options value
+    /// built without a factory behaves exactly as it did when no monitor was
+    /// installed in the process.
+    pub lease_factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
     pub disallowed_tools: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub model: Option<ModelFlagForm>,
@@ -509,6 +514,9 @@ impl ResolvedContainerOptions {
             ContainerOption::RefreshableCredential(credential) => {
                 self.refreshable_credentials.push(credential);
             }
+            ContainerOption::CredentialLeaseFactory(factory) => {
+                self.lease_factory = Some(factory);
+            }
             ContainerOption::DisallowedTools(v) => self.disallowed_tools.extend(v),
             ContainerOption::AllowedTools(v) => self.allowed_tools.extend(v),
             ContainerOption::Model { flag } => self.model = Some(flag),
@@ -583,6 +591,72 @@ impl From<ResolveError> for crate::engine::error::EngineError {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ─── WI-0114 F-38: the lease factory is carried, not reached for ────────
+
+    /// A delivery with fixed, never-touched paths: these two tests assert
+    /// only whether a lease is taken, so nothing reads the files.
+    fn unstaged_delivery() -> RefreshableCredentialDelivery {
+        RefreshableCredentialDelivery {
+            agent: crate::data::session::AgentName::new("claude").unwrap(),
+            spec_agent: "claude",
+            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
+            staged_path: PathBuf::from("/staged/.claude/.credentials.json"),
+            staged_root: PathBuf::from("/staged/.claude"),
+            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
+        }
+    }
+
+    /// Options built WITHOUT a lease factory disable leases: no factory is
+    /// recorded and `register_container_leases` hands back nothing, even for a
+    /// launch that carries a file-delivered credential.
+    ///
+    /// This is the behaviour the absent process-global monitor used to
+    /// produce (`global().is_none()`), and it is what the
+    /// `authRefresh.enabled: false` kill switch now relies on.
+    #[test]
+    fn options_without_a_monitor_disable_leases() {
+        let resolved = ResolvedContainerOptions::resolve([
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::RefreshableCredential(unstaged_delivery()),
+        ])
+        .expect("resolve");
+
+        assert!(
+            resolved.lease_factory.is_none(),
+            "no factory was supplied, so none must be recorded"
+        );
+        assert_eq!(
+            resolved.refreshable_credentials.len(),
+            1,
+            "the credential itself is still delivered — only the lease is off"
+        );
+        assert!(
+            crate::engine::credential_refresh::register_container_leases(&resolved, "ctr")
+                .is_empty(),
+            "a launch with no lease factory must take no leases"
+        );
+    }
+
+    /// The counterpart: a factory supplied as an option is recorded on the
+    /// resolved bag, so the backends read it from the options they were handed
+    /// instead of from process-global state.
+    #[test]
+    fn a_supplied_lease_factory_is_carried_on_the_resolved_options() {
+        use crate::engine::credential_refresh::{
+            CredentialRefreshMonitor, LeaseFactoryHandle, MonitorConfig,
+        };
+        let monitor = CredentialRefreshMonitor::new(MonitorConfig::default());
+        let factory = LeaseFactoryHandle::new(std::sync::Arc::new(monitor));
+
+        let resolved = ResolvedContainerOptions::resolve([
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::CredentialLeaseFactory(factory.clone()),
+        ])
+        .expect("resolve");
+
+        assert_eq!(resolved.lease_factory, Some(factory));
+    }
 
     #[test]
     fn yolo_and_plan_conflict_returns_error() {

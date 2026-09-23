@@ -1,6 +1,9 @@
 //! Keyboard event handling: focus-context detection, keymap action
 //! dispatch, PTY passthrough, clipboard, and command submission.
 
+use crate::command::commands::squad::commands::SquadCommand;
+use crate::command::dispatch::catalogue::CommandCatalogue;
+use crate::command::dispatch::FrontendAction;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::app::{App, Focus};
@@ -20,8 +23,19 @@ fn command_box_locked(app: &App) -> bool {
 }
 
 /// Determine focus context and dispatch the key event through the keymap.
-pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
-    let ctx = if app.active_dialog.is_some() {
+mod dialog;
+mod edit;
+mod scroll;
+mod squad;
+mod tab;
+
+/// Which pane a key is aimed at, given what is on screen.
+///
+/// Decided before the keymap is consulted, because the same key means
+/// different things in a dialog, in a maximised container, and in the command
+/// box.
+fn focus_context(app: &App) -> FocusContext {
+    if app.active_dialog.is_some() {
         FocusContext::Dialog
     } else if app.active_tab().container_overlay_active()
         && matches!(
@@ -50,14 +64,21 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             Focus::CommandBox => FocusContext::CommandBox,
             Focus::ExecutionWindow => FocusContext::ExecutionWindow,
         }
-    };
+    }
+}
 
+/// Keys a dialog claims before the generic keymap runs.
+///
+/// Returns `true` when the key was consumed. These cannot go through the
+/// keymap because they depend on *which* dialog is open, which the keymap's
+/// `FocusContext::Dialog` does not distinguish.
+fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
     // WorkflowControlBoard intercepts arrow keys and Ctrl+Enter before the
     // generic keymap so they map to workflow navigation rather than scroll/cursor.
     if matches!(app.active_dialog, Some(Dialog::WorkflowControlBoard(_)))
         && handle_workflow_control_board_key(app, key)
     {
-        return;
+        return true;
     }
 
     // TUI-2: Yolo countdown dialog allows tab switching — dismiss the dialog
@@ -78,7 +99,7 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                         app.switch_to_next_tab();
                     }
                 }
-                return;
+                return true;
             }
             _ => {}
         }
@@ -98,7 +119,7 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     {
         app.active_dialog = None;
         app.active_tab_mut().cycle_focused_slot();
-        return;
+        return true;
     }
 
     // TUI-3: In MultilineInput dialogs, bare Enter inserts a newline while
@@ -118,11 +139,11 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                     editor.insert_newline();
                 }
             }
-            return;
+            return true;
         }
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
             dialog_router::handle_dialog_submit(app);
-            return;
+            return true;
         }
     }
 
@@ -139,7 +160,7 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         // No manual resize here: `tick_all_tabs` keeps every slot's parser
         // and PTY in lockstep with the overlay's actual inner rect, so the
         // rotated-in slot is already correctly sized.
-        return;
+        return true;
     }
 
     // Ctrl-S inside the New Tab dialog opens the squad tab. Safe because the
@@ -157,566 +178,74 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         app.active_dialog = None;
         app.command_dialog_active = false;
         app.open_or_focus_squad_tab();
+        return true;
+    }
+
+    false
+}
+
+pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    let ctx = focus_context(app);
+    if intercept_dialog_keys(app, key) {
         return;
     }
 
     let action = keymap::map_key(key, ctx);
 
     match action {
-        // ── Global actions ────────────────────────────────────────────
-        Action::OpenNewTabDialog => {
-            // Ctrl-T while CloseTabConfirm is open closes just this tab.
-            if matches!(app.active_dialog, Some(Dialog::CloseTabConfirm)) {
-                app.active_dialog = None;
-                app.close_active_tab();
-                return;
-            }
-            let cwd = app
-                .active_tab()
-                .session
-                .working_dir()
-                .to_string_lossy()
-                .to_string();
-            // The squad shortcut is advertised in the dialog's key-hint row
-            // (`render/dialog.rs`), next to Enter/Esc, not in the prompt.
-            app.active_dialog = Some(Dialog::TextInput {
-                title: dialogs::NEW_TAB_DIALOG_TITLE.to_string(),
-                prompt: "Working directory:".to_string(),
-                editor: {
-                    let mut ed = text_edit::TextEdit::new(false);
-                    ed.set_text(&cwd);
-                    ed
-                },
-            });
-            app.command_dialog_active = false;
-        }
-        Action::PreviousTab => app.switch_to_prev_tab(),
-        Action::NextTab => app.switch_to_next_tab(),
-        Action::CloseTabOrQuit => {
-            // Second Ctrl-C while QuitConfirm or CloseTabConfirm is open
-            // confirms the quit action immediately.
-            if matches!(app.active_dialog, Some(Dialog::QuitConfirm)) {
-                app.active_dialog = None;
-                app.should_quit = true;
-                return;
-            }
-            if matches!(app.active_dialog, Some(Dialog::CloseTabConfirm)) {
-                app.active_dialog = None;
-                app.should_quit = true;
-                return;
-            }
-            // A fatal startup error leaves nothing to return to — Ctrl-C
-            // quits outright, same as Enter/Esc.
-            if matches!(app.active_dialog, Some(Dialog::FatalError { .. })) {
-                app.active_dialog = None;
-                app.should_quit = true;
-                return;
-            }
-            if app.active_dialog.is_some() {
-                return;
-            }
-            // If a workflow is active in the focused tab, prefer the
-            // workflow-cancel confirmation over the close-tab one — old amux
-            // semantics. The user can still escape and Ctrl+C again to close
-            // the tab if they really mean it.
-            let workflow_active = app
-                .active_tab()
-                .workflow_state
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
-            if workflow_active
-                && matches!(
-                    app.active_tab().execution_phase,
-                    tabs::ExecutionPhase::Running { .. }
-                )
-            {
-                app.active_dialog = Some(Dialog::WorkflowCancelConfirm);
-            } else if app.tabs.len() > 1 {
-                app.active_dialog = Some(Dialog::CloseTabConfirm);
-            } else {
-                app.active_dialog = Some(Dialog::QuitConfirm);
-            }
-        }
-        Action::CycleContainerWindow => {
-            let tab = app.active_tab_mut();
-            tab.container_window_state = tab.container_window_state.cycle();
-            // Selection coords are relative to the window the drag started
-            // in; cycling swaps which window owns selections, so drop it.
-            tab.mouse_selection = None;
-            if tab.container_window_state != ContainerWindowState::Hidden {
-                resize_slots_to_terminal(tab);
-            }
-        }
-        Action::ToggleWorkflowOverview => {
-            let tab = app.active_tab_mut();
-            tab.workflow_overview_state = tab.workflow_overview_state.toggle();
-            // The overview always opens at the top of the stage; a stale
-            // offset from a previous maximization would hide the first steps.
-            tab.workflow_overview_scroll_offset = 0;
-            // Ctrl-O never touches `container_window_state` — the container
-            // PTY's min/max is Ctrl-M's business alone. It does change the
-            // height the PTY overlay is drawn at, so any selection anchored in
-            // it no longer means anything.
-            tab.mouse_selection = None;
-            if tab.container_window_state != ContainerWindowState::Hidden {
-                resize_slots_to_terminal(tab);
-            }
-        }
-        Action::ToggleGitSidebar => {
-            // WI 0102: the git sidebar is meaningless for the squad tab's
-            // synthetic session, so Ctrl-G is a no-op while it is active.
-            if app.active_tab().is_squad {
-                return;
-            }
-            let tab = app.active_tab_mut();
-            tab.git_sidebar_state = match tab.git_sidebar_state {
-                git_sidebar::GitSidebarState::Open => git_sidebar::GitSidebarState::Closed,
-                git_sidebar::GitSidebarState::Closed => git_sidebar::GitSidebarState::Open,
-            };
-            // Opening/closing the sidebar changes the width of the left chunk
-            // that the container overlay occupies, so reflow the container PTY
-            // to the new width. This is needed even when the container is
-            // Maximized (it fills the left chunk, not the whole frame).
-            if tab.container_window_state != ContainerWindowState::Hidden {
-                resize_slots_to_terminal(tab);
-            }
-        }
-        Action::WorkflowControl => {
-            let engine_tx = app
-                .active_tab()
-                .engine_tx_shared
-                .lock()
-                .ok()
-                .and_then(|g| g.clone());
-            if let Some(tx) = engine_tx {
-                if matches!(app.active_dialog, Some(Dialog::WorkflowStepConfirm(_))) {
-                    app.send_dialog_response(DialogResponse::Char('W'));
-                    app.active_dialog = None;
-                    app.command_dialog_active = false;
-                } else if app.command_dialog_active {
-                    dialog_router::dismiss_dialog(app);
-                }
-                let focused_step = app
-                    .active_tab()
-                    .focused_slot()
-                    .map(|slot| slot.step_name.clone())
-                    .unwrap_or_default();
-                let _ = tx.send(crate::engine::workflow::EngineRequest::OpenControlBoard {
-                    step_name: focused_step,
-                });
-            }
-        }
-        Action::OpenConfigShow => {
-            // Run `config show` through dispatch so the command layer
-            // computes the rows and the frontend trait presents the dialog.
-            let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-                path: vec!["config".into(), "show".into()],
-                flags: Default::default(),
-                arguments: Default::default(),
-            };
-            app.spawn_command("config show", parsed);
-        }
+        Action::OpenNewTabDialog
+        | Action::PreviousTab
+        | Action::NextTab
+        | Action::CloseTabOrQuit
+        | Action::CycleContainerWindow
+        | Action::ToggleWorkflowOverview
+        | Action::ToggleGitSidebar
+        | Action::FocusExecutionWindow
+        | Action::FocusCommandBox
+        | Action::ToggleStatusLog
+        | Action::DetachContainers => tab::handle(app, action),
 
-        // ── Command box actions ───────────────────────────────────────
-        Action::SubmitCommand => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_submit(app);
-            } else if !command_box_locked(app) {
-                handle_command_submit(app);
-            }
-        }
-        Action::AutocompleteNext => {
-            app.update_suggestions();
-            if !app.suggestion_row.is_empty() {
-                let suggestion = app.suggestion_row[0].clone();
-                app.command_input.set_text(&suggestion);
-            }
-        }
-        Action::AutocompletePrev => {
-            app.update_suggestions();
-            if let Some(suggestion) = app.suggestion_row.last().cloned() {
-                app.command_input.set_text(&suggestion);
-            }
-        }
-        Action::FocusExecutionWindow => {
-            app.focus = Focus::ExecutionWindow;
-        }
+        Action::ScrollUp
+        | Action::ScrollDown
+        | Action::ScrollPageUp
+        | Action::ScrollPageDown
+        | Action::ScrollToTop
+        | Action::ScrollToBottom => scroll::handle(app, action, ctx),
 
-        // ── Execution window actions ──────────────────────────────────
-        Action::FocusCommandBox => {
-            app.focus = Focus::CommandBox;
-        }
-        Action::ScrollUp => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_scroll(app, -1);
-            } else if ctx == FocusContext::SquadList {
-                if let Some(state) = app.active_tab_mut().squad.as_mut() {
-                    state.move_selection(-1);
-                }
-            } else {
-                let tab = app.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_add(1);
-            }
-        }
-        Action::ScrollDown => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_scroll(app, 1);
-            } else if ctx == FocusContext::SquadList {
-                if let Some(state) = app.active_tab_mut().squad.as_mut() {
-                    state.move_selection(1);
-                }
-            } else {
-                let tab = app.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_sub(1);
-            }
-        }
-        Action::ScrollPageUp => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_scroll(app, -10);
-            } else {
-                let tab = app.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_add(20);
-            }
-        }
-        Action::ScrollPageDown => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_scroll(app, 10);
-            } else {
-                let tab = app.active_tab_mut();
-                tab.scroll_offset = tab.scroll_offset.saturating_sub(20);
-            }
-        }
-        Action::ScrollToTop => {
-            let tab = app.active_tab_mut();
-            tab.scroll_offset = usize::MAX / 2;
-        }
-        Action::ScrollToBottom => {
-            let tab = app.active_tab_mut();
-            tab.scroll_offset = 0;
-        }
-        Action::CopySelection => {
-            copy_selection_to_clipboard(app);
-        }
-        Action::ToggleStatusLog => {
-            let tab = app.active_tab_mut();
-            tab.status_log_collapsed = !tab.status_log_collapsed;
-        }
+        Action::SubmitCommand
+        | Action::AutocompleteNext
+        | Action::AutocompletePrev
+        | Action::CopySelection
+        | Action::Char(_)
+        | Action::Backspace
+        | Action::Delete
+        | Action::BackspaceWord
+        | Action::CursorLeft
+        | Action::CursorRight
+        | Action::CursorWordLeft
+        | Action::CursorWordRight
+        | Action::CursorHome
+        | Action::CursorEnd
+        | Action::InsertNewline => edit::handle(app, action, ctx),
 
-        // ── Dialog actions ────────────────────────────────────────────
-        Action::DismissDialog => {
-            // A fatal startup error cannot be dismissed back into a usable
-            // app — Esc quits, same as Enter.
-            if matches!(app.active_dialog, Some(Dialog::FatalError { .. })) {
-                app.active_dialog = None;
-                app.should_quit = true;
-                return;
-            }
-            // In ConfigShow editing / add-mapping mode, Esc cancels the edit
-            // (back to browse) instead of closing the dialog.
-            if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
-                if state.editing || state.new_entry.is_some() {
-                    state.editing = false;
-                    state.new_entry = None;
-                    state.error = None;
-                    return;
-                }
-            }
-            // Esc in the run-history modal walks back exactly one step: to the
-            // detail modal when that is where `h` was pressed, and to the card
-            // grid when the history was opened from the grid itself.
-            if let Some(Dialog::SquadTaskHistory(state)) = &app.active_dialog {
-                let (name, from_detail) = (state.name.clone(), state.from_detail);
-                if !(from_detail && reopen_squad_detail(app, &name)) {
-                    app.active_dialog = None;
-                }
-                return;
-            }
-            if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
-                let tab = app.active_tab();
-                if tab.dormant_slots.is_empty() {
-                    tab.yolo_cancel_flag
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                } else if let Some(slot) = tab.focused_slot() {
-                    // Parallel group: the modal is only ever shown for the
-                    // focused slot (see `tick_all_tabs`), so cancel that
-                    // slot's countdown rather than the tab-level one.
-                    slot.yolo_cancel_flag
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                app.active_dialog = None;
-                return;
-            }
-            dialog_router::dismiss_dialog(app);
-        }
-        Action::NewMapEntry => {
-            // Ctrl+N in the config dialog: start an add-entry flow. On a
-            // guidance section row it starts the single-phase guidance entry
-            // flow; on an agentsToModels row it starts the two-phase
-            // key→value flow. No-op elsewhere.
-            if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
-                if state.new_entry.is_none() {
-                    let on_guidance_row = state
-                        .rows
-                        .get(state.selected)
-                        .map(|r| {
-                            r.field == "dynamicWorkflows.guidance"
-                                || r.field.starts_with("dynamicWorkflows.guidance.")
-                        })
-                        .unwrap_or(false);
-                    state.new_entry = Some(if on_guidance_row {
-                        dialogs::NewMapEntryPhase::GuidanceEntry
-                    } else {
-                        dialogs::NewMapEntryPhase::Key
-                    });
-                    state.editing = true;
-                    state.error = None;
-                    // Both agentsToModels and guidance entries are repo-scoped.
-                    state.edit_column = 1;
-                    state.editor = crate::frontend::tui::text_edit::TextEdit::new(false);
-                }
-            }
-        }
+        Action::SquadShowDetail
+        | Action::SquadShowHistory
+        | Action::SquadAttach
+        | Action::SquadNew
+        | Action::SquadEdit
+        | Action::SquadPause
+        | Action::SquadResume
+        | Action::SquadTrigger
+        | Action::SquadCancel
+        | Action::SquadDelete
+        | Action::SquadMoveLeft
+        | Action::SquadMoveRight => squad::handle(app, action),
 
-        // ── Text input actions ────────────────────────────────────────
-        Action::Char(c) => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_char(app, c);
-            } else if command_box_locked(app) {
-                // Command box is read-only while a command is executing.
-            } else if c == 'q' && app.command_input.text.is_empty() {
-                // `q` with an empty input opens the quit dialog (old-TUI parity).
-                app.active_dialog = Some(Dialog::QuitConfirm);
-            } else {
-                app.command_input.insert_char(c);
-                app.input_error = None;
-                app.update_suggestions();
-            }
-        }
-        Action::Backspace => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_backspace(app);
-            } else if !command_box_locked(app) {
-                app.command_input.backspace();
-                app.input_error = None;
-                app.update_suggestions();
-            }
-        }
-        Action::Delete => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_delete(app);
-            } else if !command_box_locked(app) {
-                app.command_input.delete();
-                app.input_error = None;
-                app.update_suggestions();
-            }
-        }
-        Action::BackspaceWord => {
-            if !command_box_locked(app) {
-                app.command_input.backspace_word();
-                app.input_error = None;
-                app.update_suggestions();
-            }
-        }
-        Action::CursorLeft => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_cursor(app, CursorDir::Left);
-            } else if !command_box_locked(app) {
-                app.command_input.move_left();
-            }
-        }
-        Action::CursorRight => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_cursor(app, CursorDir::Right);
-            } else if !command_box_locked(app) {
-                app.command_input.move_right();
-            }
-        }
-        Action::CursorWordLeft => {
-            if !command_box_locked(app) {
-                app.command_input.move_word_left();
-            }
-        }
-        Action::CursorWordRight => {
-            if !command_box_locked(app) {
-                app.command_input.move_word_right();
-            }
-        }
-        Action::CursorHome => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_cursor(app, CursorDir::Home);
-            } else if !command_box_locked(app) {
-                app.command_input.move_home();
-            }
-        }
-        Action::CursorEnd => {
-            if ctx == FocusContext::Dialog {
-                dialog_router::handle_dialog_cursor(app, CursorDir::End);
-            } else if !command_box_locked(app) {
-                app.command_input.move_end();
-            }
-        }
-        Action::InsertNewline => {
-            if !command_box_locked(app) {
-                app.command_input.insert_newline();
-            }
-        }
+        Action::WorkflowControl
+        | Action::OpenConfigShow
+        | Action::DismissDialog
+        | Action::NewMapEntry => dialog::handle(app, action),
 
-        // WI 0110: Ctrl-\ leaves the container view without signalling any
-        // container. A squad attach session ends outright (its local attach
-        // clients are killed, the daemon's containers keep running); an
-        // ordinary command's maximized container is merely minimized, so it
-        // keeps streaming into its status bar and Ctrl-M brings it back. In
-        // neither case does a byte reach the agent's PTY — that is the whole
-        // difference from Ctrl-C.
-        Action::DetachContainers => {
-            if crate::frontend::tui::squad_attach::detach_squad_attach(app) {
-                return;
-            }
-            if app.active_tab().container_overlay_active() {
-                app.active_tab_mut().container_window_state = tabs::ContainerWindowState::Minimized;
-                app.focus = Focus::CommandBox;
-                app.status_bar.text =
-                    "Detached from the container. It is still running — ctrl-m to return."
-                        .to_string();
-                app.needs_redraw = true;
-            }
-        }
-
-        // ── squad list actions (WI 0102) ───────────────────────────────
-        // Each either opens a dialog or dispatches through `spawn_command`
-        // into Layer 2. None calls a gateway method directly — the keys are a
-        // shortcut over the same Layer-2 path the command box uses, never a
-        // second path.
-        Action::SquadShowDetail => {
-            let detail = app.active_tab().squad.as_ref().and_then(|state| {
-                let task = state.selected_task()?;
-                Some(dialogs::SquadDetailState {
-                    name: task.name.clone(),
-                    task,
-                })
-            });
-            if let Some(detail) = detail {
-                app.active_dialog = Some(Dialog::SquadTaskDetail(detail));
-            }
-        }
-        // The run history is a modal of its own, so a task with a long
-        // description cannot push it off the bottom of the detail modal.
-        // Opened from the grid it stands alone: Esc closes it outright rather
-        // than opening a detail modal the user never asked for.
-        Action::SquadShowHistory => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                open_squad_history(app, &name, false);
-            }
-        }
-        Action::SquadAttach => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                crate::frontend::tui::squad_attach::start_squad_attach(app, &name);
-            }
-        }
-        Action::SquadNew => {
-            let mut flags = std::collections::BTreeMap::new();
-            flags.insert(
-                "interview".to_string(),
-                crate::command::dispatch::parsed_input::FlagValue::Bool(true),
-            );
-            app.spawn_command(
-                "squad add --interview",
-                crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-                    path: vec!["squad".into(), "add".into()],
-                    flags,
-                    arguments: Default::default(),
-                },
-            );
-        }
-        // WI 0110: `e` is `n`'s counterpart for an existing task — the same
-        // Layer-2 interview, reached through the same `spawn_command` path,
-        // with the task name as its argument.
-        Action::SquadEdit => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                squad_edit_by_name(app, &name);
-            }
-        }
-        Action::SquadPause => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                confirm_squad_action(app, dialogs::SquadConfirmAction::Pause, name);
-            }
-        }
-        Action::SquadResume => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                squad_dispatch_by_name(app, "resume", &name);
-            }
-        }
-        Action::SquadTrigger => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                confirm_squad_action(app, dialogs::SquadConfirmAction::Trigger, name);
-            }
-        }
-        Action::SquadCancel => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                confirm_squad_action(app, dialogs::SquadConfirmAction::Cancel, name);
-            }
-        }
-        Action::SquadDelete => {
-            let name = app
-                .active_tab()
-                .squad
-                .as_ref()
-                .and_then(|state| state.selected_name());
-            if let Some(name) = name {
-                app.active_dialog = Some(Dialog::SquadRemoveConfirm { name });
-            }
-        }
-        // WI 0106 Part 5: card-grid column movement. Row movement (Up/Down)
-        // stays on `Action::ScrollUp`/`ScrollDown` above — only Left/Right are
-        // grid-new.
-        Action::SquadMoveLeft => {
-            if let Some(state) = app.active_tab_mut().squad.as_mut() {
-                state.move_selection_col(-1);
-            }
-        }
-        Action::SquadMoveRight => {
-            if let Some(state) = app.active_tab_mut().squad.as_mut() {
-                state.move_selection_col(1);
-            }
-        }
-
-        // ── PTY passthrough ───────────────────────────────────────────
         Action::ForwardToPty(key_event) => {
             forward_key_to_pty(app, key_event);
         }
@@ -846,6 +375,7 @@ fn copy_selection_to_clipboard(app: &mut App) {
         }
         Err(e) => {
             app.active_tab_mut()
+                .shared
                 .status_log
                 .lock()
                 .map(|mut log| {
@@ -876,6 +406,7 @@ pub(super) fn copy_dialog_text_to_clipboard(app: &mut App, label: &str, text: &s
         ),
     };
     app.active_tab_mut()
+        .shared
         .status_log
         .lock()
         .map(|mut log| {
@@ -901,7 +432,7 @@ fn handle_command_submit(app: &mut App) {
             app.input_error = None;
             app.command_input.set_text("");
             app.suggestion_row.clear();
-            app.spawn_command(&text, parsed);
+            app.spawn_command(parsed);
         }
         Err(err) => {
             app.input_error = Some(command_box::format_parse_error(&err));
@@ -918,31 +449,36 @@ fn handle_command_submit(app: &mut App) {
 /// `pub(super)` so the detail modal's action tooltip (`dialog_router.rs`) can
 /// reuse it against the task the modal is showing, rather than the list's
 /// current selection.
-/// Ask before dispatching a trigger, cancel or pause for `name`. Replaces
-/// whatever dialog is open (the detail modal, when pressed from there); `y`
-/// in the confirmation dispatches the action.
-pub(super) fn confirm_squad_action(
-    app: &mut App,
-    action: dialogs::SquadConfirmAction,
-    name: String,
-) {
-    app.active_dialog = Some(Dialog::SquadActionConfirm { action, name });
+/// Raise `action` against task `name` from a key.
+///
+/// Whether the user is asked first, and in what words, is
+/// `SquadCommand::confirm_prompt`'s answer, not this module's: a prompt means
+/// the confirmation modal opens over whatever is showing (the detail modal,
+/// when pressed from there), and no prompt means the action goes straight
+/// out. Before WI 0114 F-55 the TUI made both calls — three actions routed
+/// through a confirm helper and `resume` around it.
+pub(super) fn squad_task_action(app: &mut App, action: FrontendAction, name: String) {
+    match SquadCommand::confirm_prompt(action, &name) {
+        Some(prompt) => {
+            app.active_dialog = Some(Dialog::SquadActionConfirm {
+                action,
+                name,
+                prompt,
+            })
+        }
+        None => squad_dispatch(app, action, &name),
+    }
 }
 
-pub(super) fn squad_dispatch_by_name(app: &mut App, subcommand: &str, name: &str) {
-    let mut arguments = std::collections::BTreeMap::new();
-    arguments.insert(
-        "name".to_string(),
-        crate::command::dispatch::parsed_input::ArgValue::Single(name.to_string()),
-    );
-    app.spawn_command(
-        &format!("squad {subcommand} {name}"),
-        crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-            path: vec!["squad".into(), subcommand.into()],
-            flags: Default::default(),
-            arguments,
-        },
-    );
+/// Dispatch `action` against task `name` through the ordinary Layer-2 path.
+///
+/// The subcommand and the positional argument's name both come out of the
+/// catalogue (`CommandCatalogue::action_input`); this function knows neither.
+/// `pub(super)` so the confirmation's `y` in `dialog_router.rs` can send the
+/// action it has just had approved.
+pub(super) fn squad_dispatch(app: &mut App, action: FrontendAction, name: &str) {
+    let input = CommandCatalogue::get().action_input(action, Some(name));
+    app.spawn_command(input);
 }
 
 /// Open the run-history modal for `name`. `from_detail` is what Esc later
@@ -995,24 +531,10 @@ pub(super) fn reopen_squad_detail(app: &mut App, name: &str) -> bool {
 /// Dispatch `squad edit <name> --interview` through the ordinary Layer-2 path
 /// (WI 0110). `pub(super)` so the detail modal can edit the task it is showing.
 pub(super) fn squad_edit_by_name(app: &mut App, name: &str) {
-    let mut arguments = std::collections::BTreeMap::new();
-    arguments.insert(
-        "name".to_string(),
-        crate::command::dispatch::parsed_input::ArgValue::Single(name.to_string()),
-    );
-    let mut flags = std::collections::BTreeMap::new();
-    flags.insert(
-        "interview".to_string(),
-        crate::command::dispatch::parsed_input::FlagValue::Bool(true),
-    );
-    app.spawn_command(
-        &format!("squad edit {name} --interview"),
-        crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-            path: vec!["squad".into(), "edit".into()],
-            flags,
-            arguments,
-        },
-    );
+    let parsed = app
+        .catalogue
+        .action_input(FrontendAction::EditSquadTask, Some(name));
+    app.spawn_command(parsed);
 }
 
 // ─── WorkflowControlBoard special handler ────────────────────────────────────
@@ -1086,31 +608,7 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
             return;
         }
     };
-    let is_git = app.tabs[idx].session.git_root().join(".git").exists();
     app.active_tab = idx;
-
-    if is_git {
-        app.spawn_command(
-            "ready",
-            crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-                path: vec!["ready".into()],
-                flags: Default::default(),
-                arguments: Default::default(),
-            },
-        );
-    } else {
-        let mut flags = std::collections::BTreeMap::new();
-        flags.insert(
-            "watch".to_string(),
-            crate::command::dispatch::parsed_input::FlagValue::Bool(true),
-        );
-        app.spawn_command(
-            "status --watch",
-            crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-                path: vec!["status".into()],
-                flags,
-                arguments: Default::default(),
-            },
-        );
-    }
+    let startup = app.catalogue.startup_command(&app.tabs[idx].session);
+    app.spawn_command(startup);
 }

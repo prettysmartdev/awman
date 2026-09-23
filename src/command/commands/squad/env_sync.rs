@@ -143,7 +143,7 @@ mod tests {
     fn coverage(salt: &Salt, required: Vec<RequiredEnvEntry>) -> EnvCoverage {
         EnvCoverage {
             salt: salt.to_hex(),
-            persistence: "keychain".into(),
+            persistence: crate::data::fs::daemon_env::EnvPersistence::Keychain,
             required,
         }
     }
@@ -239,7 +239,7 @@ mod tests {
     fn an_unparseable_salt_falls_back_to_sending() {
         let coverage = EnvCoverage {
             salt: "not-hex".into(),
-            persistence: "none".into(),
+            persistence: crate::data::fs::daemon_env::EnvPersistence::None,
             required: vec![entry("TOKEN", Some("0123456789abcdef"))],
         };
 

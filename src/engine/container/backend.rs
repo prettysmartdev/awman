@@ -97,15 +97,19 @@ pub(super) trait ContainerBackend: Send + Sync {
         None
     }
 
-    /// CLI binary for this backend (`docker` or `container`). Default maps
-    /// the well-known `name()` values; override when adding a backend whose
-    /// binary differs from its name.
-    fn cli_binary(&self) -> &'static str {
-        match self.name() {
-            "apple-containers" => "container",
-            _ => "docker",
-        }
-    }
+    /// User-facing display name for this backend (e.g. `"Docker"`,
+    /// `"Apple Containers"`). Surfaced by `ContainerRuntime::display_name`.
+    fn display_name(&self) -> &'static str;
+
+    /// CLI binary for this backend (`docker` or `container`). Every backend
+    /// states its own; F-32 deleted the `match name()` table that used to
+    /// live here, so adding a backend cannot forget to declare one.
+    fn cli_binary(&self) -> &'static str;
+
+    /// Argv for the cheapest "is the runtime daemon reachable?" probe, run as
+    /// `<cli_binary()> <availability_probe_args()>` by
+    /// `ContainerRuntime::is_available`. Success is exit status zero.
+    fn availability_probe_args(&self) -> &'static [&'static str];
 
     // ─── Background container lifecycle ─────────────────────────────────────
     //

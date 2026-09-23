@@ -267,7 +267,7 @@ fn push_slot_event(
 pub fn start_squad_attach(app: &mut App, task: &str) {
     let raw = format!("squad attach {task}");
     match Dispatch::<TuiCommandFrontend>::parse_command_box_input(&raw) {
-        Ok(parsed) => app.spawn_command(&raw, parsed),
+        Ok(parsed) => app.spawn_command(parsed),
         Err(error) => app.status_bar.text = error.to_string(),
     }
 }

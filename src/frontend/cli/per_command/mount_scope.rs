@@ -1,7 +1,7 @@
 //! `MountScopeFrontend` impl for the CLI.
 //!
-//! The safe non-interactive default is `MountGitRoot`.
-//! When stdin is a TTY the CLI prompts; otherwise it returns the default.
+//! When stdin is a TTY the CLI prompts; otherwise it returns the CLI profile's
+//! answer from `src/command/headless.rs`.
 
 use std::path::Path;
 
@@ -9,7 +9,6 @@ use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFronte
 use crate::command::error::CommandError;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
-use crate::frontend::cli::output::stdin_is_tty;
 
 impl MountScopeFrontend for CliFrontend {
     fn ask_mount_scope(
@@ -17,8 +16,8 @@ impl MountScopeFrontend for CliFrontend {
         git_root: &Path,
         cwd: &Path,
     ) -> Result<MountScopeDecision, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(MountScopeDecision::MountGitRoot);
+        if self.non_interactive {
+            return Ok(self.headless.mount_scope());
         }
         eprintln!(
             "awman: cwd ({}) is below git root ({}). Mount [r]oot / [c]urrent dir / [a]bort?",

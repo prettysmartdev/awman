@@ -21,6 +21,7 @@ use crate::frontend::tui::tabs::{
     SharedActiveWorktreePath, SharedContainerExitCode, SharedContainerName, SharedEngineTx,
     SharedPtyResetFlag, SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender,
     SharedTuiContext, SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
+    TabSharedState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
@@ -58,12 +59,9 @@ pub struct TuiCommandFrontend {
     /// Shared slot for the stdin sender. When a new workflow step creates
     /// fresh stdin channels, the new sender is placed here so the TUI event
     /// loop can pick it up and forward keystrokes to the new container.
-    pub(crate) stdin_tx_shared:
-        std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
+    pub(crate) stdin_tx_shared: SharedStdinTx,
     /// Shared slot for the resize sender, same pattern as stdin_tx_shared.
-    #[allow(clippy::type_complexity)]
-    pub(crate) resize_tx_shared:
-        std::sync::Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>>>,
+    pub(crate) resize_tx_shared: SharedResizeTx,
     /// Shared slot for the engine sender. The engine publishes the
     /// sender here via `set_engine_sender`; the TUI event loop reads
     /// it to send Ctrl-W requests.
@@ -108,33 +106,61 @@ pub struct TuiCommandFrontend {
 // `SquadCommandFrontend` for `TuiCommandFrontend` (interview dialogs) lives in
 // `per_command::squad`, alongside the other per-command TUI frontend impls.
 
+/// The two ends of a command's dialog conversation: requests out to the TUI
+/// event loop, responses back from it. They are created as a pair and are
+/// useless apart, so they are passed as one value.
+pub struct DialogChannels {
+    pub tx: std::sync::mpsc::Sender<DialogRequest>,
+    pub rx: std::sync::mpsc::Receiver<DialogResponse>,
+}
+
+impl DialogChannels {
+    pub fn new(
+        tx: std::sync::mpsc::Sender<DialogRequest>,
+        rx: std::sync::mpsc::Receiver<DialogResponse>,
+    ) -> Self {
+        Self { tx, rx }
+    }
+}
+
 impl TuiCommandFrontend {
     pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
         self.parsed.flags.contains_key("container")
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Build the frontend for one command run in one tab.
+    ///
+    /// `shared` is the tab's [`TabSharedState`] — the fifteen cross-thread
+    /// slots this frontend and the tab both observe. It is destructured here
+    /// so each slot keeps its own field and doc comment; the tab hands the
+    /// whole bundle over so that no slot can be forgotten at a call site.
     pub fn new(
         parsed: ParsedCommandBoxInput,
-        status_log: SharedStatusLog,
-        dialog_tx: std::sync::mpsc::Sender<DialogRequest>,
-        dialog_rx: std::sync::mpsc::Receiver<DialogResponse>,
+        dialogs: DialogChannels,
         container_io: AgentIo,
-        workflow_view: SharedWorkflowViewState,
-        yolo_state: SharedYoloState,
-        yolo_cancel_flag: SharedYoloCancelFlag,
-        pty_reset_flag: SharedPtyResetFlag,
-        container_name_shared: SharedContainerName,
-        container_exit_shared: SharedContainerExitCode,
-        stdin_tx_shared: SharedStdinTx,
-        resize_tx_shared: SharedResizeTx,
-        engine_tx_shared: SharedEngineTx,
-        stuck_sender_shared: SharedStuckSender,
-        active_worktree_path: SharedActiveWorktreePath,
-        status_dashboard: SharedStatusDashboard,
-        tui_context_shared: SharedTuiContext,
-        container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
+        shared: TabSharedState,
     ) -> Self {
+        let TabSharedState {
+            workflow_state: workflow_view,
+            yolo_state,
+            yolo_cancel_flag,
+            status_log,
+            status_dashboard,
+            container_slot_events,
+            pty_reset_flag,
+            container_name_shared,
+            container_exit_shared,
+            stdin_tx_shared,
+            resize_tx_shared,
+            engine_tx_shared,
+            stuck_sender_shared,
+            active_worktree_path,
+            tui_context_shared,
+        } = shared;
+        let DialogChannels {
+            tx: dialog_tx,
+            rx: dialog_rx,
+        } = dialogs;
         let stdout_tx = container_io.stdout.clone();
         Self {
             parsed,
@@ -262,6 +288,35 @@ impl TuiCommandFrontend {
             .map_err(|_| CommandError::Aborted)
     }
 
+    /// Draw a `Prompt<D>` as a `KindSelect` dialog and map the answer back.
+    ///
+    /// The one place the TUI turns a prompt into a modal: the title and the
+    /// keyed labels come from `command::prompts`, and a dismissal means
+    /// `default_on_dismiss` — or `Aborted` when the prompt has none (F-19).
+    /// Nothing here is copy, and no `D` is constructed from a string.
+    pub(crate) fn pick_from_prompt<D: Clone>(
+        &self,
+        prompt: &crate::data::prompt::Prompt<D>,
+    ) -> Result<D, CommandError> {
+        let response = self.ask_dialog(DialogRequest::KindSelect {
+            title: prompt.title.clone(),
+            options: prompt
+                .choices
+                .iter()
+                .map(|choice| (choice.key.to_string(), choice.label.clone()))
+                .collect(),
+        })?;
+        let answer = match response {
+            DialogResponse::Char(key) => prompt.answer_for_key(key),
+            DialogResponse::Index(index) => prompt.answer_at(index),
+            _ => None,
+        };
+        match answer.or_else(|| prompt.default_on_dismiss.clone()) {
+            Some(value) => Ok(value),
+            None => Err(CommandError::Aborted),
+        }
+    }
+
     /// Check if a flag-path flag is a known Bool flag in the catalogue.
     fn is_known_bool_flag(&self, command_path: &[&str], flag: &str) -> bool {
         let cat = CommandCatalogue::get();
@@ -273,6 +328,10 @@ impl TuiCommandFrontend {
 }
 
 // ─── UserMessageSink ──────────────────────────────────────────────────────
+
+/// F-45: takes the default `command_started`, so the `$ git …` echo line
+/// is byte-identical to the one `run_git_logged` composed before.
+impl crate::engine::git::GitFrontend for TuiCommandFrontend {}
 
 impl UserMessageSink for TuiCommandFrontend {
     fn write_message(&mut self, msg: UserMessage) {
@@ -287,6 +346,9 @@ impl UserMessageSink for TuiCommandFrontend {
 // ─── CommandFrontend ──────────────────────────────────────────────────────
 
 impl CommandFrontend for TuiCommandFrontend {
+    fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
+        crate::command::dispatch::catalogue::FrontendKind::Tui
+    }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         match self.parsed.flags.get(flag) {
             Some(FlagValue::Bool(v)) => Ok(Some(*v)),

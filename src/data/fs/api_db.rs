@@ -11,6 +11,8 @@ use rusqlite::{params, Connection};
 
 use crate::data::error::DataError;
 use crate::data::fs::api_paths::ApiPaths;
+use crate::data::session::SessionKind;
+use crate::data::session_setup_event::SessionSetupStatus;
 
 /// Persistable session metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +32,24 @@ pub struct SessionRecord {
     /// For `remote` sessions, the resolved clone destination on disk so that
     /// failure cleanup can remove the partial clone.
     pub cloned_path: Option<String>,
+}
+
+/// The columns a new session row is created with.
+///
+/// A struct rather than six positional parameters, two of which were
+/// interchangeable `&str`s carrying an enum's spelling (WI 0114 F-48): the
+/// call site now names each column, and `setup_status` and `kind` are the
+/// types whose values they are, so a typo is a compile error rather than a
+/// row nothing matches.
+#[derive(Debug, Clone, Copy)]
+pub struct NewSessionRow<'a> {
+    pub id: &'a str,
+    pub workdir: &'a str,
+    pub created_at: &'a str,
+    pub setup_status: SessionSetupStatus,
+    pub kind: SessionKind,
+    /// For `remote` sessions, the resolved clone destination on disk.
+    pub cloned_path: Option<&'a str>,
 }
 
 /// Outcome of the session lifecycle guard for a newly-submitted command.
@@ -211,35 +231,35 @@ impl SqliteSessionStore {
         workdir: &str,
         created_at: &str,
     ) -> Result<(), DataError> {
-        self.insert_session_full(id, workdir, created_at, "ready", "local", None)
+        self.insert_session_full(NewSessionRow {
+            id,
+            workdir,
+            created_at,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
     }
 
-    /// Insert a session with explicit setup_status, session_type, and
-    /// optional cloned_path. Used by the async-setup pipeline so that the
-    /// row exists in `initializing` state before any setup work runs — so
-    /// that the server-restart-cleanup pass can find non-terminal sessions
-    /// even before any setup_state.json is written.
-    pub fn insert_session_full(
-        &self,
-        id: &str,
-        workdir: &str,
-        created_at: &str,
-        setup_status: &str,
-        session_type: &str,
-        cloned_path: Option<&str>,
-    ) -> Result<(), DataError> {
+    /// Insert a session row.
+    ///
+    /// Used by the async-setup pipeline so that the row exists in
+    /// `initializing` state before any setup work runs — so that the
+    /// server-restart-cleanup pass can find non-terminal sessions even before
+    /// any setup_state.json is written.
+    pub fn insert_session_full(&self, row: NewSessionRow<'_>) -> Result<(), DataError> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO sessions \
                  (id, workdir, created_at, status, setup_status, session_type, cloned_path) \
                  VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
             params![
-                id,
-                workdir,
-                created_at,
-                setup_status,
-                session_type,
-                cloned_path
+                row.id,
+                row.workdir,
+                row.created_at,
+                row.setup_status.as_str(),
+                row.kind.as_str(),
+                row.cloned_path
             ],
         )?;
         Ok(())

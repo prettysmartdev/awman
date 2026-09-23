@@ -304,6 +304,7 @@ mod tests {
                     dind: DindSupport::OnRequest,
                     host_paths_visible: true,
                     session_label_supported: true,
+                    has_image_store: true,
                 },
             }
         }
@@ -320,12 +321,40 @@ mod tests {
                     dind: DindSupport::Always,
                     host_paths_visible: false,
                     session_label_supported: false,
+                    has_image_store: false,
                 },
             }
         }
     }
 
     impl AgentRuntimeEngine for FakeContainerRuntime {
+        fn ready_agent(
+            &self,
+            _agent: &str,
+            _opts: crate::engine::agent_runtime::ReadyAgentOptions,
+            _sink: &mut dyn crate::data::message::UserMessageSink,
+        ) -> Result<(), crate::engine::error::EngineError> {
+            Ok(())
+        }
+        fn image_exists(&self, _tag: &str) -> Result<bool, crate::engine::error::EngineError> {
+            Ok(true)
+        }
+        fn image_home_dir(
+            &self,
+            _tag: &str,
+        ) -> Result<Option<String>, crate::engine::error::EngineError> {
+            Ok(None)
+        }
+        fn build_image(
+            &self,
+            _tag: &str,
+            _dockerfile: &std::path::Path,
+            _context: &std::path::Path,
+            _no_cache: bool,
+            _on_line: &mut dyn FnMut(&str),
+        ) -> Result<(), crate::engine::error::EngineError> {
+            Ok(())
+        }
         fn runtime_name(&self) -> &'static str {
             if self.caps.kit_declarative {
                 "docker-sbx-experimental"

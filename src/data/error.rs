@@ -35,6 +35,9 @@ pub enum DataError {
         source: serde_json::Error,
     },
 
+    #[error("invalid overlay spec '{spec}': {reason}")]
+    InvalidOverlaySpec { spec: String, reason: String },
+
     #[error("config serialize error: {source}")]
     ConfigSerialize {
         #[source]

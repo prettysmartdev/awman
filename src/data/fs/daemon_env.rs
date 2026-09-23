@@ -155,12 +155,13 @@ impl FallbackReason {
 /// The persistence state a daemon reports on `GET /v1/status`, so
 /// `awman squad status` and the TUI tab can show it without anyone reading a
 /// log file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EnvPersistence {
     /// Storing to the OS keychain.
     Keychain,
     /// Not storing: either the explicit opt-out or a degraded daemon that
     /// started that way by configuration.
+    #[default]
     None,
     /// Configured for the keychain, but unavailable — the string is a
     /// [`FallbackReason`] rendered.
@@ -174,6 +175,31 @@ impl std::fmt::Display for EnvPersistence {
             EnvPersistence::None => write!(f, "none"),
             EnvPersistence::Unavailable(reason) => write!(f, "unavailable({reason})"),
         }
+    }
+}
+
+/// Whether the daemon holds a value for a required environment variable.
+///
+/// A two-valued fact that rode the wire as a `String` and was matched with
+/// `as_str()` in the CLI renderer (WI 0114 F-48). Every required name is
+/// treated alike: a name is in `required_env` only because a task's `env()`
+/// overlay, the daemon's config, or `AWMAN_OVERLAYS` asked for it, so there is
+/// no third, exempt state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvVarState {
+    /// The daemon holds a value.
+    Set,
+    /// It does not.
+    Unmet,
+}
+
+impl std::fmt::Display for EnvVarState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EnvVarState::Set => "set",
+            EnvVarState::Unmet => "unmet",
+        })
     }
 }
 

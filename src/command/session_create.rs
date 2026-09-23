@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 use crate::command::error::CommandError;
+use crate::data::session::SessionKind;
 
 /// URL schemes accepted for `remote` session repository URLs. Bare paths and
 /// `file:` URLs are intentionally excluded — a remote session must reference a
@@ -31,6 +32,9 @@ pub const DEFAULT_REPO_URL_SCHEMES: &[&str] = &["http://", "https://", "git@", "
 #[derive(Debug, Clone, Default)]
 pub struct SessionCreateRequest {
     /// `"local"` (default) or `"remote"`. Case-insensitive.
+    ///
+    /// Still a `String` because it is what arrives on the wire; it is parsed
+    /// into a [`SessionKind`] by `validate`, once (WI 0114 F-48).
     pub session_type: Option<String>,
     /// Host workdir to mount (required for `local`).
     pub workdir: Option<String>,
@@ -72,8 +76,8 @@ impl SessionCreatePolicy {
 /// route handler previously computed inline.
 #[derive(Debug, Clone)]
 pub struct SessionCreatePlan {
-    /// Normalized session type: `"local"` or `"remote"`.
-    pub session_type: String,
+    /// The validated session kind.
+    pub kind: SessionKind,
     /// Resolved workdir. For remote sessions this equals the clone destination.
     pub resolved_workdir: PathBuf,
     /// Clone destination for remote sessions; `None` for local.
@@ -100,14 +104,16 @@ impl SessionCreateRequest {
         &self,
         policy: &SessionCreatePolicy,
     ) -> Result<SessionCreatePlan, CommandError> {
-        let session_type = self
-            .session_type
-            .as_deref()
-            .unwrap_or("local")
-            .to_lowercase();
+        // One parse, in Layer 2, producing the typed kind every later reader
+        // uses (F-48). The `as_str()` matches this replaced ran in three
+        // places against three separately-written literal sets.
+        let raw = self.session_type.as_deref().unwrap_or("local");
+        let kind: SessionKind = raw.parse().map_err(|_| CommandError::SessionInvalidType {
+            got: raw.to_string(),
+        })?;
 
-        match session_type.as_str() {
-            "local" => {
+        match kind {
+            SessionKind::Local => {
                 let workdir_in = self
                     .workdir
                     .as_deref()
@@ -130,14 +136,14 @@ impl SessionCreateRequest {
                     });
                 }
                 Ok(SessionCreatePlan {
-                    session_type,
+                    kind,
                     resolved_workdir: requested,
                     cloned_path: None,
                     repo_url: None,
                     branch: None,
                 })
             }
-            "remote" => {
+            SessionKind::Remote => {
                 let repo_url = self
                     .repo_url
                     .clone()
@@ -156,16 +162,13 @@ impl SessionCreateRequest {
                 let folder = repo_folder_from_url(&repo_url);
                 let cloned = policy.clone_base_dir.join(&folder);
                 Ok(SessionCreatePlan {
-                    session_type,
+                    kind,
                     resolved_workdir: cloned.clone(),
                     cloned_path: Some(cloned),
                     repo_url: Some(repo_url),
                     branch: self.branch.clone(),
                 })
             }
-            other => Err(CommandError::SessionInvalidType {
-                got: other.to_string(),
-            }),
         }
     }
 }
@@ -355,7 +358,7 @@ mod validate_tests {
         let plan = local(Some(workdir.path().to_str().unwrap()))
             .validate(&policy(vec![canon.clone()]))
             .expect("allowlisted workdir must validate");
-        assert_eq!(plan.session_type, "local");
+        assert_eq!(plan.kind, SessionKind::Local);
         assert_eq!(plan.resolved_workdir, canon);
         assert!(plan.cloned_path.is_none());
         assert!(plan.repo_url.is_none());
@@ -437,7 +440,7 @@ mod validate_tests {
             let plan = remote(Some(url))
                 .validate(&policy(vec![]))
                 .unwrap_or_else(|e| panic!("accepted scheme {url} must validate; got {e:?}"));
-            assert_eq!(plan.session_type, "remote");
+            assert_eq!(plan.kind, SessionKind::Remote);
             assert_eq!(plan.repo_url.as_deref(), Some(url));
             assert!(
                 plan.cloned_path.is_some(),

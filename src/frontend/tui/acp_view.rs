@@ -86,7 +86,8 @@ pub fn render_acp_maximized(
     let step_name: Option<String> = Some(slot.step_name.clone())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            tab.workflow_state
+            tab.shared
+                .workflow_state
                 .lock()
                 .ok()
                 .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))

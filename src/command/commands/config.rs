@@ -6,47 +6,9 @@ use serde::Serialize;
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
+use crate::data::config::config_json::{apply_config_field, config_field_value};
+use crate::data::config::fields::{field_spec, FieldScope, CONFIG_FIELDS};
 use crate::data::message::UserMessageSink;
-
-/// Scope metadata for each config field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldScope {
-    /// May only be written to global config.
-    GlobalOnly,
-    /// May only be written to repo config.
-    RepoOnly,
-    /// May be written to either global or repo config.
-    Both,
-}
-
-/// Entry in the config field table: `(dotted_name, scope)`.
-const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
-    ("agent", FieldScope::Both),
-    ("auto_agent_auth_accepted", FieldScope::GlobalOnly),
-    ("terminal_scrollback_lines", FieldScope::Both),
-    ("yoloDisallowedTools", FieldScope::Both),
-    ("workItems", FieldScope::RepoOnly),
-    ("overlays", FieldScope::Both),
-    ("agentStuckTimeout", FieldScope::Both),
-    ("maxConcurrentAgents", FieldScope::Both),
-    ("runtime", FieldScope::GlobalOnly),
-    ("default_agent", FieldScope::GlobalOnly),
-    ("api", FieldScope::GlobalOnly),
-    ("remote", FieldScope::Both),
-    // Dot-notation nested fields
-    ("work_items.dir", FieldScope::RepoOnly),
-    ("work_items.template", FieldScope::RepoOnly),
-    ("api.workDirs", FieldScope::GlobalOnly),
-    ("api.port", FieldScope::GlobalOnly),
-    ("api.background", FieldScope::GlobalOnly),
-    ("remote.defaultAddr", FieldScope::Both),
-    ("remote.defaultAPIKey", FieldScope::Both),
-    // Dynamic-workflow config (WI-0095), repo-only.
-    ("dynamicWorkflows.defaultLeader", FieldScope::RepoOnly),
-    ("dynamicWorkflows.maxConcurrentSteps", FieldScope::RepoOnly),
-    ("dynamicWorkflows.agentsToModels", FieldScope::RepoOnly),
-    ("dynamicWorkflows.guidance", FieldScope::RepoOnly),
-];
 
 /// Field names that were removed in WI-0082 (overlay unification). Naming any
 /// of these in `awman config get|set` returns a guidance error instead of the
@@ -67,7 +29,7 @@ fn removed_field_message(name: &str) -> Option<&'static str> {
 
 /// Flat list of all valid field names (for suggestions / validation).
 fn valid_field_names() -> Vec<&'static str> {
-    VALID_CONFIG_FIELDS.iter().map(|(name, _)| *name).collect()
+    CONFIG_FIELDS.iter().map(|spec| spec.name).collect()
 }
 
 /// Dot-path prefix of per-agent `agentsToModels` entries.
@@ -99,21 +61,15 @@ fn guidance_entry_index(name: &str) -> Option<usize> {
     idx.parse::<usize>().ok()
 }
 
-/// Lexical validation for an `agentsToModels` key, mirroring
-/// `data::session::AgentName` (ASCII alphanumerics, `-`, `_`, length 1..=64).
+/// Lexical validation for an `agentsToModels` key.
+///
+/// The rule is `AgentName`'s, in Layer 0 — a map key here *is* an agent name.
+/// This used to restate it, and so did the TUI's dialog router; three copies
+/// of one rule, free to drift (WI 0114 F-20).
 fn validate_agents_to_models_key(key: &str) -> Result<(), String> {
-    if key.is_empty()
-        || key.len() > 64
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!(
-            "'{key}' is not a valid agent name: only ASCII alphanumerics, '-', and '_' are \
-             allowed, length 1..=64"
-        ));
-    }
-    Ok(())
+    crate::data::session::AgentName::new(key)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Whether `name` is an accepted field name for `config get`/`config set`.
@@ -130,10 +86,7 @@ fn field_scope(name: &str) -> Option<FieldScope> {
     if agents_to_models_entry_key(name).is_some() || guidance_entry_index(name).is_some() {
         return Some(FieldScope::RepoOnly);
     }
-    VALID_CONFIG_FIELDS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, s)| *s)
+    field_spec(name).map(|spec| spec.scope)
 }
 
 /// Valid agent names for config set agent=<value>. Must stay in sync with
@@ -315,48 +268,13 @@ fn validate_default_leader_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Levenshtein edit distance between two strings.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let m = a.len();
-    let n = b.len();
-    // Row 0: dp[0][j] = j for j in 0..=n
-    let first_row: Vec<usize> = (0..=n).collect();
-    let mut dp: Vec<Vec<usize>> = std::iter::once(first_row)
-        .chain((1..=m).map(|i| {
-            let mut row = vec![0usize; n + 1];
-            row[0] = i;
-            row
-        }))
-        .collect();
-    for i in 1..=m {
-        for j in 1..=n {
-            dp[i][j] = if a[i - 1] == b[j - 1] {
-                dp[i - 1][j - 1]
-            } else {
-                1 + dp[i - 1][j - 1].min(dp[i - 1][j]).min(dp[i][j - 1])
-            };
-        }
-    }
-    dp[m][n]
-}
-
-/// Return candidates with levenshtein distance <= 3, sorted by distance ascending.
-fn levenshtein_suggestions<'a>(input: &str, candidates: &[&'a str]) -> Vec<&'a str> {
-    let mut scored: Vec<(usize, &'a str)> = candidates
-        .iter()
-        .filter_map(|c| {
-            let dist = levenshtein(input, c);
-            if dist <= 3 {
-                Some((dist, *c))
-            } else {
-                None
-            }
-        })
-        .collect();
-    scored.sort_by_key(|(d, _)| *d);
-    scored.into_iter().map(|(_, c)| c).collect()
+/// Config-field names within three edits of `input`, nearest first.
+///
+/// The distance itself is [`crate::data::text::nearest`]; the threshold stays
+/// here, because how near a miss is worth offering depends on the vocabulary
+/// being searched — a config field list is short and its names are long.
+fn field_suggestions<'a>(input: &str, candidates: &[&'a str]) -> Vec<&'a str> {
+    crate::data::text::nearest(input, candidates, 3)
 }
 
 #[derive(Debug, Clone)]
@@ -409,59 +327,68 @@ pub struct ConfigFieldRow {
     /// Short human-readable format hint shown while editing the value
     /// (e.g. "true or false", "comma-separated list").
     pub value_hint: Option<String>,
+    /// What *shape* of config entry this row is, as distinct from what kind
+    /// of value it holds.
+    ///
+    /// A frontend offering "add an entry" needs to know which row heads a map
+    /// and which heads an array, and how to name a new member of it. The TUI
+    /// used to answer both from field-name prefix literals —
+    /// `"dynamicWorkflows.agentsToModels."` and `"dynamicWorkflows.guidance."`
+    /// spelled out in `dialog_router.rs` (WI 0114 F-20).
+    pub shape: ConfigFieldShape,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The shape of a config entry: what a frontend may *do* with the row, as
+/// opposed to [`ConfigFieldKind`], which is what values it accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ConfigFieldKind {
-    Bool,
-    Number,
-    /// Fixed enum (e.g. agent name); the `set` validator rejects values
-    /// outside the documented set.
-    Enum,
-    String,
+pub enum ConfigFieldShape {
+    /// An ordinary single-valued field.
+    Scalar,
+    /// The read-only header of a string-keyed map, naming the prefix a new
+    /// member's field name is built from.
+    MapHeader { prefix: String },
+    /// One member of a map.
+    MapEntry,
+    /// The read-only header of an ordered array, naming the prefix a new
+    /// element's field name is built from.
+    ArrayHeader { prefix: String },
+    /// One element of an array.
+    ArrayEntry,
 }
+
+/// Re-exported from Layer 0, where the config schema lives (WI 0114 F-51).
+pub use crate::data::config::fields::ConfigFieldKind;
 
 /// Map a known config field name to its `ConfigFieldKind`. Mirrors the
 /// schema in `RepoConfig` / `GlobalConfig`. Unknown fields default to
 /// `String` (callers should reject them before reaching this function).
 fn config_field_kind(name: &str) -> ConfigFieldKind {
-    match name {
-        "agent" | "default_agent" => ConfigFieldKind::Enum,
-        "auto_agent_auth_accepted" | "api.background" => ConfigFieldKind::Bool,
-        "terminal_scrollback_lines"
-        | "agentStuckTimeout"
-        | "api.port"
-        | "dynamicWorkflows.maxConcurrentSteps"
-        | "maxConcurrentAgents" => ConfigFieldKind::Number,
-        _ => ConfigFieldKind::String,
-    }
+    field_spec(name)
+        .map(|spec| spec.kind)
+        // A per-agent or per-entry row is not in the table; both hold text.
+        .unwrap_or(ConfigFieldKind::String)
 }
-
-/// Fields whose value is computed by awman itself and cannot be set by the
-/// user via `awman config set`. Surfaced with `(read-only)` in the table.
-const READ_ONLY_FIELDS: &[&str] = &["auto_agent_auth_accepted"];
 
 /// Whether a config field is read-only in the show/edit UI. Per-agent
 /// `dynamicWorkflows.agentsToModels.<agent>` rows are inline-editable; only
 /// the summary row for the map itself (added in `collect_config_rows`) and
 /// awman-computed fields are read-only.
 fn is_read_only_field(name: &str) -> bool {
-    READ_ONLY_FIELDS.contains(&name)
-        || name == "dynamicWorkflows.agentsToModels"
-        || name == "dynamicWorkflows.guidance"
+    field_spec(name).is_some_and(|spec| spec.read_only)
 }
 
 /// Per-scope writability for a field, derived from its scope. Read-only
 /// fields are writable in neither scope.
 fn field_writability(name: &str) -> (bool, bool) {
-    if is_read_only_field(name) {
-        return (false, false);
-    }
-    match field_scope(name) {
-        Some(FieldScope::GlobalOnly) => (true, false),
-        Some(FieldScope::RepoOnly) => (false, true),
-        Some(FieldScope::Both) => (true, true),
+    match field_spec(name) {
+        Some(spec) => spec.writability(),
+        // A per-agent or per-entry row: repo-only and editable.
+        None if agents_to_models_entry_key(name).is_some()
+            || guidance_entry_index(name).is_some() =>
+        {
+            (false, true)
+        }
         None => (false, false),
     }
 }
@@ -475,30 +402,10 @@ fn config_field_hint(name: &str) -> Option<String> {
     if guidance_entry_index(name).is_some() {
         return Some("a single instruction; save an empty value to remove".to_string());
     }
-    match name {
-        "agent" | "default_agent" => Some(format!("one of: {}", VALID_AGENT_VALUES.join(", "))),
-        "auto_agent_auth_accepted" | "api.background" => Some("true or false".to_string()),
-        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => {
-            Some("positive integer".to_string())
-        }
-        "dynamicWorkflows.maxConcurrentSteps" => Some("integer >= 1".to_string()),
-        "maxConcurrentAgents" => Some("integer >= 1 (unset = unlimited)".to_string()),
-        "dynamicWorkflows.defaultLeader" => {
-            Some("agent::model (e.g. claude::claude-opus-4-8)".to_string())
-        }
-        "dynamicWorkflows.agentsToModels" => {
-            Some("press Ctrl+N to add an agent; edit per-agent rows inline".to_string())
-        }
-        "dynamicWorkflows.guidance" => Some(
-            "press Ctrl+N to add a guidance entry; edit per-entry rows inline; save an empty \
-             value to remove"
-                .to_string(),
-        ),
-        "yoloDisallowedTools" | "overlays" | "api.workDirs" => {
-            Some("comma-separated list".to_string())
-        }
-        _ => None,
-    }
+    let hint = field_spec(name)?.hint?;
+    // The two agent fields share one hint whose value set is the catalogue's,
+    // not the table's, so the table carries a placeholder.
+    Some(hint.replace("{agents}", &VALID_AGENT_VALUES.join(", ")))
 }
 
 /// Render an `agentsToModels` model-list JSON value as a comma-separated string
@@ -514,10 +421,8 @@ fn render_models_value(v: &serde_json::Value) -> String {
     }
 }
 
-const SENSITIVE_FIELDS: &[&str] = &["remote.defaultAPIKey"];
-
 fn mask_sensitive(field: &str, value: Option<String>) -> Option<String> {
-    if !SENSITIVE_FIELDS.contains(&field) {
+    if !field_spec(field).is_some_and(|spec| spec.sensitive) {
         return value;
     }
     value.map(|v| {
@@ -534,7 +439,8 @@ pub fn collect_config_rows(
     repo: &serde_json::Value,
 ) -> Vec<ConfigFieldRow> {
     let mut rows: Vec<ConfigFieldRow> = Vec::new();
-    for (name, _scope) in VALID_CONFIG_FIELDS {
+    for spec in CONFIG_FIELDS {
+        let name = &spec.name;
         // The agentsToModels map and the guidance array are expanded into one
         // row per entry below rather than shown as a single unreadable JSON
         // blob (WI-0095, WI-0099).
@@ -555,6 +461,7 @@ pub fn collect_config_rows(
             global_writable,
             repo_writable,
             value_hint: config_field_hint(name),
+            shape: ConfigFieldShape::Scalar,
         });
     }
     // The agent→models map always gets a read-only summary row so the mapping
@@ -582,6 +489,9 @@ pub fn collect_config_rows(
         global_writable: false,
         repo_writable: false,
         value_hint: config_field_hint("dynamicWorkflows.agentsToModels"),
+        shape: ConfigFieldShape::MapHeader {
+            prefix: "dynamicWorkflows.agentsToModels.".to_string(),
+        },
     });
     if let Some(map) = map {
         let mut keys: Vec<&String> = map.keys().collect();
@@ -600,6 +510,7 @@ pub fn collect_config_rows(
                 global_writable: false,
                 repo_writable: true,
                 value_hint,
+                shape: ConfigFieldShape::MapEntry,
             });
         }
     }
@@ -628,6 +539,9 @@ pub fn collect_config_rows(
         global_writable: false,
         repo_writable: false,
         value_hint: config_field_hint("dynamicWorkflows.guidance"),
+        shape: ConfigFieldShape::ArrayHeader {
+            prefix: "dynamicWorkflows.guidance.".to_string(),
+        },
     });
     if let Some(arr) = guidance {
         for (i, entry) in arr.iter().enumerate() {
@@ -644,6 +558,7 @@ pub fn collect_config_rows(
                 global_writable: false,
                 repo_writable: true,
                 value_hint,
+                shape: ConfigFieldShape::ArrayEntry,
             });
         }
     }
@@ -666,11 +581,47 @@ pub struct ConfigSetOutcome {
 }
 
 /// A user edit returned from the config show dialog.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEditRequest {
     pub field: String,
     pub value: String,
     pub global: bool,
+}
+
+impl ConfigEditRequest {
+    /// An edit to an existing row.
+    pub fn to_field(field: impl Into<String>, value: impl Into<String>, global: bool) -> Self {
+        Self {
+            field: field.into(),
+            value: value.into(),
+            global,
+        }
+    }
+
+    /// A new member of the map or array whose header has `shape`, named
+    /// `member`.
+    ///
+    /// The field name is built from the header's own prefix, so a frontend
+    /// adding an entry never spells a config path. `None` when the shape
+    /// heads neither a map nor an array (WI 0114 F-20).
+    pub fn new_member(
+        shape: &ConfigFieldShape,
+        member: &str,
+        value: impl Into<String>,
+    ) -> Option<Self> {
+        let prefix = match shape {
+            ConfigFieldShape::MapHeader { prefix } | ConfigFieldShape::ArrayHeader { prefix } => {
+                prefix
+            }
+            _ => return None,
+        };
+        Some(Self {
+            field: format!("{prefix}{member}"),
+            value: value.into(),
+            // Both expanded sections are repo-only.
+            global: false,
+        })
+    }
 }
 
 /// An edit that failed validation or could not be written to disk. Handed
@@ -822,7 +773,7 @@ impl Command for ConfigCommand {
                     return Err(CommandError::Other(msg.to_string()));
                 }
                 if !is_valid_field_name(&f.field) {
-                    let suggestions = levenshtein_suggestions(&f.field, &names);
+                    let suggestions = field_suggestions(&f.field, &names);
                     return Err(CommandError::UnknownConfigField {
                         name: f.field.clone(),
                         suggestions: if suggestions.is_empty() {
@@ -855,7 +806,7 @@ impl Command for ConfigCommand {
                     return Err(CommandError::Other(msg.to_string()));
                 }
                 if !is_valid_field_name(&f.field) {
-                    let suggestions = levenshtein_suggestions(&f.field, &names);
+                    let suggestions = field_suggestions(&f.field, &names);
                     return Err(CommandError::UnknownConfigField {
                         name: f.field.clone(),
                         suggestions: if suggestions.is_empty() {
@@ -955,187 +906,10 @@ fn write_config_field(
     }
 }
 
-/// Look up a JSON field value, supporting dot-notation (e.g. "work_items.dir").
-fn config_field_value(json: &serde_json::Value, field: &str) -> Option<String> {
-    let parts: Vec<&str> = field.split('.').collect();
-    let mut current = json;
-    for part in &parts {
-        // A numeric segment indexes into an array (e.g. the
-        // dynamicWorkflows.guidance.<n> entries); everything else is an
-        // object key.
-        current = match current {
-            serde_json::Value::Array(arr) => arr.get(part.parse::<usize>().ok()?)?,
-            _ => current.get(*part)?,
-        };
-    }
-    Some(match current {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Null => return None,
-        // Arrays of strings display comma-separated — the same shape the
-        // user types when setting a list field, so edits round-trip.
-        serde_json::Value::Array(arr) if arr.iter().all(|x| x.is_string()) => arr
-            .iter()
-            .filter_map(|x| x.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        other => other.to_string(),
-    })
-}
-
-/// Write a coerced value into the config JSON: `Null` removes the field
-/// (used for `agentsToModels` entry deletion), anything else is set.
-fn apply_config_field(json: &mut serde_json::Value, field: &str, value: serde_json::Value) {
-    if value.is_null() {
-        remove_config_field(json, field);
-    } else {
-        set_config_field(json, field, value);
-    }
-}
-
-/// Remove a JSON field, supporting dot-notation for nested objects and a
-/// trailing numeric segment that indexes into an array-of-strings field
-/// (e.g. `dynamicWorkflows.guidance.1`). Removing an array element via
-/// `Vec::remove` compacts the remaining elements, so subsequent entries are
-/// automatically re-indexed (WI-0099). Missing intermediate objects make this
-/// a no-op.
-fn remove_config_field(json: &mut serde_json::Value, field: &str) {
-    let parts: Vec<&str> = field.split('.').collect();
-    let last = *parts.last().expect("split never yields an empty vec");
-    // Trailing numeric segment: remove the element from the parent array.
-    if let Ok(index) = last.parse::<usize>() {
-        if parts.len() >= 2 {
-            let mut current = json;
-            for part in &parts[..parts.len() - 1] {
-                match current.get_mut(*part) {
-                    Some(v) => current = v,
-                    None => return,
-                }
-            }
-            if let serde_json::Value::Array(arr) = current {
-                if index < arr.len() {
-                    arr.remove(index);
-                }
-            }
-            return;
-        }
-    }
-    let mut current = json;
-    for part in &parts[..parts.len() - 1] {
-        match current.get_mut(*part) {
-            Some(v) => current = v,
-            None => return,
-        }
-    }
-    if let serde_json::Value::Object(obj) = current {
-        obj.remove(last);
-    }
-}
-
-/// Set a JSON field, supporting dot-notation for nested objects.
-/// E.g. "work_items.dir" sets `json["work_items"]["dir"]`.
-fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json::Value) {
-    let parts: Vec<&str> = field.split('.').collect();
-    // Trailing numeric segment: set (or append) an element in the parent
-    // array-of-strings field (e.g. `dynamicWorkflows.guidance.<n>`). An index
-    // at or past the current length appends, which is how the TUI Ctrl+N flow
-    // adds a new entry (WI-0099). Intermediate objects and the array itself
-    // are created on demand so guidance can be added to a config that has no
-    // `dynamicWorkflows` block yet.
-    if let Some(index) = parts.last().and_then(|p| p.parse::<usize>().ok()) {
-        if parts.len() >= 2 {
-            set_array_element(json, &parts[..parts.len() - 1], index, value);
-            return;
-        }
-    }
-    if parts.len() == 1 {
-        // Top-level field
-        if let serde_json::Value::Object(obj) = json {
-            obj.insert(field.to_string(), value);
-        }
-    } else {
-        // Navigate into nested objects, creating intermediate objects as needed.
-        let mut current = json;
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                // Last segment: insert the value.
-                if let serde_json::Value::Object(obj) = current {
-                    obj.insert(part.to_string(), value);
-                }
-                return;
-            }
-            // Intermediate segment: ensure a nested object exists.
-            if !current.get(*part).map(|v| v.is_object()).unwrap_or(false) {
-                if let serde_json::Value::Object(obj) = current {
-                    obj.insert(
-                        part.to_string(),
-                        serde_json::Value::Object(serde_json::Map::new()),
-                    );
-                }
-            }
-            current = current.get_mut(*part).expect("just inserted nested object");
-        }
-    }
-}
-
-/// Set or append an element in an array-of-strings field addressed by
-/// `array_path` (the dot-path segments up to and including the array field,
-/// e.g. `["dynamicWorkflows", "guidance"]`). Intermediate objects and the
-/// array are created on demand. `index >= len` appends; `index < len`
-/// overwrites in place. Used for the `dynamicWorkflows.guidance` array
-/// (WI-0099).
-fn set_array_element(
-    json: &mut serde_json::Value,
-    array_path: &[&str],
-    index: usize,
-    value: serde_json::Value,
-) {
-    let Some((array_field, obj_path)) = array_path.split_last() else {
-        return;
-    };
-    // Navigate (creating as needed) the object path that holds the array.
-    let mut current = json;
-    for part in obj_path {
-        if !current.get(*part).map(|v| v.is_object()).unwrap_or(false) {
-            if let serde_json::Value::Object(obj) = current {
-                obj.insert(
-                    part.to_string(),
-                    serde_json::Value::Object(serde_json::Map::new()),
-                );
-            } else {
-                return;
-            }
-        }
-        current = current.get_mut(*part).expect("just inserted nested object");
-    }
-    // Ensure the array field exists and is an array.
-    if !current
-        .get(*array_field)
-        .map(|v| v.is_array())
-        .unwrap_or(false)
-    {
-        if let serde_json::Value::Object(obj) = current {
-            obj.insert(
-                array_field.to_string(),
-                serde_json::Value::Array(Vec::new()),
-            );
-        } else {
-            return;
-        }
-    }
-    if let Some(serde_json::Value::Array(arr)) = current.get_mut(*array_field) {
-        if index < arr.len() {
-            arr[index] = value;
-        } else {
-            arr.push(value);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::config::config_json::{remove_config_field, set_config_field};
 
     // ── config_field_value ───────────────────────────────────────────────────
 
@@ -1449,14 +1223,53 @@ mod tests {
         );
     }
 
+    /// The map key *is* an agent name, so the rule and the wording are
+    /// `AgentName`'s (F-20). Asserting the same message `AgentName::new`
+    /// produces is what keeps this from becoming a fourth copy of the rule.
     #[test]
     fn validate_and_coerce_agents_to_models_entry_rejects_bad_agent_key() {
         let err =
             validate_and_coerce("dynamicWorkflows.agentsToModels.bad name!", "m1").unwrap_err();
-        assert!(
-            err.contains("not a valid agent name"),
-            "invalid agent keys must be rejected, got: {err}"
+        let from_layer_0 = crate::data::session::AgentName::new("bad name!")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err, from_layer_0,
+            "the rejection must be Layer 0's, verbatim"
         );
+    }
+
+    /// The whole round trip a TUI user takes: a key the dialog accepts is one
+    /// `config set` accepts, and a key it rejects is one `config set` rejects.
+    #[test]
+    fn the_dialogs_key_rule_and_the_writers_key_rule_are_the_same_rule() {
+        for key in ["claude", "gpt-4", "my_agent", "a", &"x".repeat(64)] {
+            assert!(
+                crate::data::session::AgentName::new(key).is_ok(),
+                "{key} must be accepted"
+            );
+            assert!(
+                validate_and_coerce(&format!("dynamicWorkflows.agentsToModels.{key}"), "m1")
+                    .is_ok(),
+                "{key} must be writable"
+            );
+        }
+        // An empty key never forms a field name at all — `is_valid_field_name`
+        // rejects `dynamicWorkflows.agentsToModels.` before validation — so
+        // only non-empty rejections are comparable here.
+        for key in ["bad name!", "a/b", &"x".repeat(65)] {
+            assert!(
+                crate::data::session::AgentName::new(key).is_err(),
+                "{key:?} must be rejected"
+            );
+            assert!(
+                validate_and_coerce(&format!("dynamicWorkflows.agentsToModels.{key}"), "m1")
+                    .is_err(),
+                "{key:?} must not be writable"
+            );
+        }
+        assert!(crate::data::session::AgentName::new("").is_err());
+        assert!(!is_valid_field_name("dynamicWorkflows.agentsToModels."));
     }
 
     // ── validate_and_coerce: dynamicWorkflows.guidance (WI-0099) ────────────
@@ -1759,40 +1572,12 @@ mod tests {
         assert_eq!(field_scope("agent"), Some(FieldScope::Both));
     }
 
-    // ── levenshtein ───────────────────────────────────────────────────────────
+    // ── field_suggestions ─────────────────────────────────────────────────────
 
     #[test]
-    fn levenshtein_identical_strings_is_zero() {
-        assert_eq!(levenshtein("agent", "agent"), 0);
-    }
-
-    #[test]
-    fn levenshtein_empty_string_is_length_of_other() {
-        assert_eq!(levenshtein("", "abc"), 3);
-        assert_eq!(levenshtein("abc", ""), 3);
-    }
-
-    #[test]
-    fn levenshtein_one_substitution() {
-        assert_eq!(levenshtein("cat", "cut"), 1);
-    }
-
-    #[test]
-    fn levenshtein_one_insertion() {
-        assert_eq!(levenshtein("agent", "agents"), 1);
-    }
-
-    #[test]
-    fn levenshtein_one_deletion() {
-        assert_eq!(levenshtein("agents", "agent"), 1);
-    }
-
-    // ── levenshtein_suggestions ───────────────────────────────────────────────
-
-    #[test]
-    fn levenshtein_suggestions_finds_close_match() {
+    fn field_suggestions_finds_close_match() {
         let names = valid_field_names();
-        let result = levenshtein_suggestions("agnet", &names);
+        let result = field_suggestions("agnet", &names);
         // "agnet" is distance 2 from "agent" (two transpositions); should appear.
         assert!(
             result.contains(&"agent"),
@@ -1801,9 +1586,9 @@ mod tests {
     }
 
     #[test]
-    fn levenshtein_suggestions_empty_when_no_close_match() {
+    fn field_suggestions_empty_when_no_close_match() {
         let names = valid_field_names();
-        let result = levenshtein_suggestions("zzzzzzzzzzz", &names);
+        let result = field_suggestions("zzzzzzzzzzz", &names);
         assert!(
             result.is_empty(),
             "suggestions must be empty for very distant input"
@@ -1811,10 +1596,10 @@ mod tests {
     }
 
     #[test]
-    fn levenshtein_suggestions_sorted_by_distance() {
+    fn field_suggestions_sorted_by_distance() {
         let names = valid_field_names();
         // "runtim" is distance 1 from "runtime" and distance 2+ from all others.
-        let result = levenshtein_suggestions("runtim", &names);
+        let result = field_suggestions("runtim", &names);
         if result.len() >= 2 {
             // First result must be "runtime" (closest match).
             assert_eq!(
@@ -1854,17 +1639,8 @@ mod edit_loop_tests {
         }
     }
 
-    fn make_engines() -> crate::command::dispatch::Engines {
-        crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"))
-    }
-
     fn open_session(git_root: &std::path::Path) -> crate::data::session::Session {
-        crate::data::session::Session::open_at_git_root(
-            git_root.to_path_buf(),
-            git_root.to_path_buf(),
-            crate::data::session::SessionOpenOptions::default(),
-        )
-        .unwrap()
+        crate::data::session::Session::for_tests(git_root)
     }
 
     #[tokio::test]
@@ -1894,7 +1670,7 @@ mod edit_loop_tests {
 
         let cmd = ConfigCommand::new(
             ConfigSubcommand::Show(ConfigShowFlags {}),
-            make_engines(),
+            crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp")),
             open_session(tmp.path()),
         );
         cmd.run_with_frontend(Box::new(frontend))
@@ -1945,7 +1721,7 @@ mod edit_loop_tests {
                 value: "not-an-object".into(),
                 global: false,
             }),
-            make_engines(),
+            crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp")),
             open_session(tmp.path()),
         );
         let err = cmd

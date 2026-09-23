@@ -176,6 +176,27 @@ Suggestions include flag hints from the command catalogue:
 --yolo — enable auto-advance mode    --plan — read-only run
 ```
 
+### Flag validation
+
+The command box parses your input through the same validation the CLI and the
+API use, so it rejects what they would reject rather than carrying a bad value
+into the command:
+
+```
+chat --launch-mode banana
+```
+```
+invalid value for flag 'launch-mode' on ["chat"]: 'banana' is not one of ["stdio", "acp"]
+```
+
+A non-numeric value for a numeric flag (`squad start --port abc`) is rejected
+the same way. In both cases the text you typed stays in the box so you can fix
+just the bad part instead of retyping the whole command. A `-`-prefixed token
+is never accepted as a flag's value (`--agent -c` is a missing value for
+`--agent`, not `-c`), and `--flag=false` on a boolean flag turns it off, the
+same as it does everywhere else awman parses flags. An unrecognised short flag
+or short-flag cluster (e.g. `ready -ab`) is reported as `unknown flag: -ab`.
+
 When a suggestion shows a file path (worktree or working directory), long paths are automatically truncated in the middle to fit the display:
 
 ```
@@ -196,10 +217,14 @@ If a worktree is active for the session, it shows the worktree path:
 Using Worktree: /home/user/myproject-worktree
 ```
 
-If you type an unrecognised command, awman suggests the closest known one:
+If you type an unrecognised command, awman suggests the closest known one —
+including a typo in a subcommand, not just the top-level command:
 
 ```
-'exex' is not an awman command.  Did you mean: exec
+exec wrkflow
+```
+```
+did you mean: exec workflow?
 ```
 
 ### Quitting

@@ -62,3 +62,40 @@ impl HasAgentFrontend for TuiCommandFrontend {
         }
     }
 }
+
+/// One `AgentImageFrontend` for the TUI: `ReadyFrontend` and `InitFrontend`
+/// both extend it (F-33), and both reported image-setup steps identically
+/// before the merge.
+impl crate::engine::agent::AgentImageFrontend for TuiCommandFrontend {
+    fn report_step_status(
+        &mut self,
+        step: &crate::data::setup_step::SetupStep,
+        status: crate::data::step_status::StepStatus,
+    ) {
+        self.messages.info(format!("  {step}: {status:?}"));
+    }
+
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+        Box::new(super::TuiContainerProxy::new(self.status_log.clone()))
+    }
+}
+
+/// One `AgentLaunchFrontend` for the TUI: `chat`, `exec prompt`,
+/// `exec workflow` and `specs` all shared these two methods with identical
+/// bodies before F-35.
+impl crate::command::commands::agent_setup::AgentLaunchFrontend for TuiCommandFrontend {
+    fn set_pty_active(&mut self, active: bool) {
+        self.pty_active = active;
+    }
+
+    fn set_stuck_sender(
+        &mut self,
+        sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
+        >,
+    ) {
+        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
+            *guard = Some(sender);
+        }
+    }
+}

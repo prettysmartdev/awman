@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::data::fs::workflow_state::sha256_hex;
+use crate::data::fs::hash::sha256_hex;
 
 /// 8-hex-char SHA-256 prefix of the canonicalized git-root path. Used as a
 /// stable identifier for per-repo image tags and per-repo state filenames.

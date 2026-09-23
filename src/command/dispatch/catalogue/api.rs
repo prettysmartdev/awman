@@ -1,0 +1,160 @@
+//! `api` — the HTTP server's own lifecycle commands.
+//!
+//! Split out of `dispatch/catalogue.rs` by WI 0114 F-51. The specs are data;
+//! `ROOT` in `mod.rs` is what assembles them into the tree.
+
+use super::*;
+
+// ── api ────────────────────────────────────────────────────────────────
+
+pub(super) const API_SERVER: CommandSpec = CommandSpec {
+    name: "api",
+    aliases: &[],
+    help: "Run awman as an API HTTP server for remote/automated access.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: true,
+    opens_tui_when_bare: false,
+    subcommands: &[
+        &API_SERVER_START,
+        &API_SERVER_KILL,
+        &API_SERVER_LOGS,
+        &API_SERVER_STATUS,
+    ],
+};
+
+pub(super) const API_SERVER_START: CommandSpec = CommandSpec {
+    name: "start",
+    aliases: &[],
+    help: "Start the API HTTP server.",
+    long_help: None,
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "port",
+            short: None,
+            help: "Port to listen on.",
+            kind: FlagKind::U16,
+            default: FlagDefault::U16(9876),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "workdirs",
+            short: None,
+            help: "Allowlisted working directories (repeatable).",
+            kind: FlagKind::VecString,
+            default: FlagDefault::EmptyVec,
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "background",
+            short: None,
+            help: "Daemonize via the OS process manager.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "refresh-key",
+            short: None,
+            help: "Regenerate the API key.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "dangerously-skip-auth",
+            short: None,
+            help: "Disable authentication for this execution even if a key hash exists on disk.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "dangerously-skip-tls",
+            short: None,
+            help: "Serve plain HTTP instead of HTTPS. Intended for localhost/test only.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: true,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+pub(super) const API_SERVER_KILL: CommandSpec = CommandSpec {
+    name: "kill",
+    aliases: &[],
+    help: "Stop the background API server.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: true,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+pub(super) const API_SERVER_LOGS: CommandSpec = CommandSpec {
+    name: "logs",
+    aliases: &[],
+    help: "Stream the background server log file to stdout.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: true,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+pub(super) const API_SERVER_STATUS: CommandSpec = CommandSpec {
+    name: "status",
+    aliases: &[],
+    help: "Show API server status.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: true,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};

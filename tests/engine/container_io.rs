@@ -4,10 +4,10 @@
 //! with the correct configuration, and that bytes flow correctly between the
 //! engine-side senders/receivers and the frontend's sinks.
 
+use awman::command::commands::api_server::event_bus::EventBus;
 use awman::data::execution_event::EventPayload;
 use awman::engine::agent_runtime::frontend::AgentFrontend;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-use awman::frontend::api::event_bus::EventBus;
 use awman::frontend::cli::CliFrontend;
 
 // ─── helpers ────────────────────────────────────────────────────────────────

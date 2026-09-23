@@ -11,10 +11,19 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use awman::command::dispatch::Engines;
 use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME};
 use awman::data::config::flags::FlagConfig;
+use awman::data::fs::{ApiPaths, AuthPathResolver};
 use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+use awman::data::WorkflowStateStore;
+use awman::engine::agent::AgentEngine;
+use awman::engine::auth::AuthEngine;
+use awman::engine::container::ContainerRuntime;
+use awman::engine::git::GitEngine;
+use awman::engine::overlay::OverlayEngine;
 
 // ─── Runtime skip helpers ────────────────────────────────────────────────────
 
@@ -116,6 +125,65 @@ impl IsolatedEnv {
         };
         Session::open(self.git_root.path().to_path_buf(), &resolver, opts).expect("Session::open")
     }
+
+    /// A hermetic engine bundle rooted at this fixture's fake HOME (WI 0114
+    /// F-52).
+    ///
+    /// `Engines::for_tests` is `#[cfg(test)]`, so it is invisible from an
+    /// integration-test binary; every test binary that needed one used to
+    /// hand-assemble the eight engines, and the copies had already drifted in
+    /// whether `container_runtime` was populated. That choice is the one thing
+    /// a caller actually varies, so it is the argument: `Some(runtime)` means
+    /// "this test may reach a container", `None` means "refuse before Docker
+    /// is touched".
+    pub fn engines(&self, with_container_runtime: bool) -> Engines {
+        engines_at(
+            self.home_dir.path(),
+            self.git_root.path(),
+            with_container_runtime,
+        )
+    }
+}
+
+/// [`IsolatedEnv::engines`] for a test that owns its own directories.
+///
+/// `home` roots the auth and API paths; `git_root` roots the workflow-state
+/// store. They are the same directory in most fixtures.
+pub fn engines_at(
+    home: &std::path::Path,
+    git_root: &std::path::Path,
+    with_container_runtime: bool,
+) -> Engines {
+    let runtime = Arc::new(ContainerRuntime::docker());
+    let auth_paths = AuthPathResolver::at_home(home);
+    // `home/api`, the same place `IsolatedEnv::api_root` names.
+    let api_paths = ApiPaths::from_root(home.join("api"));
+    api_paths.ensure_root().expect("create API paths");
+    let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
+    Engines {
+        runtime: runtime.clone(),
+        container_runtime: with_container_runtime.then(|| runtime.clone() as Arc<ContainerRuntime>),
+        sandbox_runtime: None,
+        git_engine: Arc::new(GitEngine::new()),
+        overlay_engine: overlay_engine.clone(),
+        auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
+        agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(git_root)),
+        credential_monitor: None,
+        global_config: Arc::new(Default::default()),
+    }
+}
+
+/// A session whose working directory and Git root are both `root`, with
+/// `AWMAN_CONFIG_HOME` pinned there too so it cannot read the developer's real
+/// global config. The integration-test counterpart of `Session::for_tests`.
+pub fn session_at(root: &std::path::Path) -> Session {
+    let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, root.to_str().unwrap())]);
+    let opts = SessionOpenOptions {
+        env: Some(env),
+        ..Default::default()
+    };
+    Session::open_at_git_root(root.to_path_buf(), root.to_path_buf(), opts).expect("Session::open")
 }
 
 // ─── Minimal workflow definition builders ───────────────────────────────────

@@ -32,18 +32,18 @@ pub mod key_setup;
 pub mod launcher;
 pub mod scheduler;
 pub mod supervisor;
-pub mod verdict;
 
 pub use daemon::{SquadDaemonDeps, SquadDaemonEngine};
 pub use evaluator::{
     EvaluationOutcome, EvaluationRequest, NoRunProgress, RunProgress, TaskEvaluator,
 };
-pub use launcher::{
-    drive_unattended_agent, ensure_directory_workspace_project, LeaderExit, LeaderRunSpec,
-    SquadAgentLauncher, UnattendedExit,
-};
+pub use launcher::{LeaderExit, LeaderRunSpec, SquadAgentLauncher, UnattendedExit};
 pub use scheduler::{SchedulerStatus, SquadScheduler, TICK_INTERVAL};
-pub use supervisor::{SquadEndpoint, SquadKeyState, SquadSupervisor};
-pub use verdict::{
+pub use supervisor::{SquadEndpoint, SquadHealth, SquadKeyState, SquadSupervisor};
+// The verdict file is an on-disk, cross-process contract written by the
+// leader agent, so it lives in Layer 0 now (F-47). Re-exported here for one
+// release: `command::commands::squad::evaluation` and the daemon both name it
+// through this path today.
+pub use crate::data::fs::squad_verdict::{
     read_verdict, verdict_path, RunVerdict, VerdictError, RUN_DIR_CONTAINER_PATH, VERDICT_FILE_NAME,
 };

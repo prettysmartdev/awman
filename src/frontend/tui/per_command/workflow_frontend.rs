@@ -4,76 +4,50 @@ use std::time::Duration;
 
 use crate::data::message::UserMessageSink;
 use crate::data::workflow_definition::WorkflowStep;
-use crate::data::workflow_state::WorkflowState;
+use crate::data::workflow_state::{PhaseKind, WorkflowState};
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
     AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
-use crate::engine::workflow::EngineRequest;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse, WorkflowControlBoardState};
-use crate::frontend::tui::tabs::{ContainerSlotEvent, WorkflowStepKind};
+use crate::frontend::tui::tabs::{ContainerSlotEvent, StepViewStatus, WorkflowStepKind};
 
 impl WorkflowFrontend for TuiCommandFrontend {
     fn show_workflow_control_board(
         &mut self,
-        state: &WorkflowState,
+        _state: &WorkflowState,
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
-        // On a failure board the failed step's container is already gone, so
-        // there is no Running step to name — the engine names it instead.
-        let step_name = available
-            .step_failure
-            .as_ref()
-            .map(|f| f.step_name.clone())
-            .or_else(|| {
-                state
-                    .step_states
-                    .iter()
-                    .find(|(_, s)| {
-                        matches!(s, crate::data::workflow_state::StepState::Running { .. })
-                    })
-                    .map(|(name, _)| name.clone())
-            })
-            .unwrap_or_else(|| "current step".to_string());
+        // Which step the board is about, and whether this is the plain
+        // "advance to the next step?" case, are the engine's answers (F-18).
+        // The TUI used to scan `WorkflowState::step_states` for both.
+        let step_name = available.focused_step_label().to_string();
 
-        // Lightweight step confirm for the simple "advance to next step?" case.
-        let has_failures = state
-            .step_states
-            .values()
-            .any(|s| matches!(s, crate::data::workflow_state::StepState::Failed { .. }));
-        if available.can_launch_next && !has_failures && !available.can_dismiss {
-            let mut pending = state
-                .step_states
-                .iter()
-                .filter(|(_, s)| matches!(s, crate::data::workflow_state::StepState::Pending));
-            let first_pending = pending.next().map(|(name, _)| name.clone());
-            let is_single = first_pending.is_some() && pending.next().is_none();
-            if let Some(next_name) = first_pending.filter(|_| is_single) {
-                let response = self
-                    .ask_dialog(DialogRequest::WorkflowStepConfirm(
-                        crate::frontend::tui::dialogs::WorkflowStepConfirmState {
-                            completed_step: step_name.clone(),
-                            next_step: next_name,
-                        },
-                    ))
-                    .map_err(|e| EngineError::Other(e.to_string()))?;
-                return Ok(match response {
-                    DialogResponse::Char('>') => NextAction::LaunchNext,
-                    DialogResponse::Char('W') => {
-                        let response2 = self
-                            .ask_dialog(DialogRequest::WorkflowControlBoard(control_board_state(
-                                &step_name, available,
-                            )))
-                            .map_err(|e| EngineError::Other(e.to_string()))?;
-                        wcb_response_to_action(response2, available)
-                    }
-                    DialogResponse::Dismissed => NextAction::Pause,
-                    _ => NextAction::Pause,
-                });
-            }
+        if let Some(advance) = &available.simple_advance {
+            let response = self
+                .ask_dialog(DialogRequest::WorkflowStepConfirm(
+                    crate::frontend::tui::dialogs::WorkflowStepConfirmState {
+                        completed_step: advance.completed_step.clone(),
+                        next_step: advance.next_step.clone(),
+                    },
+                ))
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            return Ok(match response {
+                DialogResponse::Char('>') => NextAction::LaunchNext,
+                DialogResponse::Char('W') => {
+                    let response2 = self
+                        .ask_dialog(DialogRequest::WorkflowControlBoard(control_board_state(
+                            &step_name, available,
+                        )))
+                        .map_err(|e| EngineError::Other(e.to_string()))?;
+                    wcb_response_to_action(response2, available)
+                }
+                DialogResponse::Dismissed => NextAction::Pause,
+                _ => NextAction::Pause,
+            });
         }
 
         let response = self
@@ -123,9 +97,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
             .info(format!("workflow step '{}': {:?}", step.name, status));
         if let Ok(mut guard) = self.workflow_view.lock() {
             if let Some(view) = guard.as_mut() {
-                let status_str = workflow_status_str(&status);
+                let view_status = workflow_step_view_status(&status);
                 if let Some(s) = view.steps.iter_mut().find(|s| s.name == step.name) {
-                    s.status = status_str.to_string();
+                    s.status = view_status;
                 }
                 view.current_step = if matches!(status, WorkflowStepStatus::Running) {
                     Some(step.name.clone())
@@ -184,7 +158,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
                 };
                 crate::frontend::tui::tabs::WorkflowStepView {
                     name: s.name.clone(),
-                    status: workflow_status_str(&s.status).to_string(),
+                    status: workflow_step_view_status(&s.status),
                     agent,
                     model,
                     depends_on: s.depends_on.clone(),
@@ -282,98 +256,72 @@ impl WorkflowFrontend for TuiCommandFrontend {
         true
     }
 
-    fn on_setup_step_started(&mut self, description: &str) {
-        self.messages.info(format!("setup: {description}"));
+    fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
+        self.messages
+            .info(format!("{}: {description}", kind.label()));
         upsert_phase_step(
             &self.workflow_view,
-            WorkflowStepKind::Setup,
+            step_kind(kind),
             description,
-            "running",
+            StepViewStatus::Running,
         );
     }
 
-    fn on_setup_step_output(&mut self, line: &str) {
+    fn on_phase_step_output(&mut self, _kind: PhaseKind, line: &str) {
         self.messages.info(format!("  {line}"));
     }
 
-    fn on_setup_step_completed(&mut self, description: &str) {
-        self.messages.success(format!("setup: {description}"));
+    fn on_phase_step_completed(&mut self, kind: PhaseKind, description: &str) {
+        self.messages
+            .success(format!("{}: {description}", kind.label()));
         upsert_phase_step(
             &self.workflow_view,
-            WorkflowStepKind::Setup,
+            step_kind(kind),
             description,
-            "done",
+            StepViewStatus::Done,
         );
     }
 
-    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
-        let msg = if stderr.is_empty() {
-            format!("setup failed: {description} (exit {exit_code})")
-        } else {
-            format!("setup failed: {description} (exit {exit_code}): {stderr}")
-        };
-        self.messages.error_msg(msg);
-        upsert_phase_step(
-            &self.workflow_view,
-            WorkflowStepKind::Setup,
-            description,
-            "error",
-        );
-    }
-
-    fn on_teardown_step_started(&mut self, description: &str) {
-        self.messages.info(format!("teardown: {description}"));
-        upsert_phase_step(
-            &self.workflow_view,
-            WorkflowStepKind::Teardown,
-            description,
-            "running",
-        );
-    }
-
-    fn on_teardown_step_output(&mut self, line: &str) {
-        self.messages.info(format!("  {line}"));
-    }
-
-    fn on_teardown_step_completed(&mut self, description: &str) {
-        self.messages.success(format!("teardown: {description}"));
-        upsert_phase_step(
-            &self.workflow_view,
-            WorkflowStepKind::Teardown,
-            description,
-            "done",
-        );
-    }
-
-    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
-        let msg = if stderr.is_empty() {
-            format!("teardown failed: {description} (exit {exit_code})")
-        } else {
-            format!("teardown failed: {description} (exit {exit_code}): {stderr}")
-        };
-        self.messages.error_msg(msg);
-        upsert_phase_step(
-            &self.workflow_view,
-            WorkflowStepKind::Teardown,
-            description,
-            "error",
-        );
-    }
-
-    fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
-        if let Ok(mut guard) = self.engine_tx_shared.lock() {
-            *guard = Some(tx);
-        }
-    }
-
-    fn set_stuck_sender(
+    fn on_phase_step_failed(
         &mut self,
-        sender: std::sync::Arc<
-            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::execution::StuckEvent>,
-        >,
+        kind: PhaseKind,
+        description: &str,
+        exit_code: i32,
+        stderr: &str,
     ) {
-        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
-            *guard = Some(sender);
+        let label = kind.label();
+        let msg = if stderr.is_empty() {
+            format!("{label} failed: {description} (exit {exit_code})")
+        } else {
+            format!("{label} failed: {description} (exit {exit_code}): {stderr}")
+        };
+        self.messages.error_msg(msg);
+        upsert_phase_step(
+            &self.workflow_view,
+            step_kind(kind),
+            description,
+            StepViewStatus::Error,
+        );
+    }
+
+    /// The TUI routes Ctrl-W through the engine's request channel and colours
+    /// the tab from the stuck channel, so it keeps both. Per-parallel-step
+    /// handovers (`handles.step.is_some()`) are ignored here exactly as the
+    /// old `set_parallel_step_*` no-op defaults ignored them: the parallel
+    /// view has its own wiring.
+    fn attach_engine(&mut self, handles: crate::engine::workflow::frontend::EngineHandles) {
+        if handles.step.is_some() {
+            return;
+        }
+        if let Some(tx) = handles.requests {
+            if let Ok(mut guard) = self.engine_tx_shared.lock() {
+                *guard = Some(tx);
+            }
+        }
+        if let Some(sender) = handles.stuck {
+            if let Ok(mut guard) = self.stuck_sender_shared.lock() {
+                *guard = Some(sender);
+            }
         }
     }
 
@@ -530,21 +478,33 @@ fn wcb_response_to_action(response: DialogResponse, available: &AvailableActions
 
 /// Map a `WorkflowStepStatus` to the lower-case string used in
 /// `WorkflowStepView.status` (the renderer matches on it).
-fn workflow_status_str(status: &WorkflowStepStatus) -> &'static str {
+/// How an engine step status reads in the Workflow Overview. The third such
+/// conversion, alongside `StepViewStatus::of_step_state` /
+/// `of_phase_step_status`; all three are exhaustive (WI 0114 F-22).
+fn workflow_step_view_status(status: &WorkflowStepStatus) -> StepViewStatus {
     match status {
-        WorkflowStepStatus::Pending => "pending",
-        WorkflowStepStatus::Running => "running",
-        WorkflowStepStatus::Succeeded => "done",
-        WorkflowStepStatus::Failed { .. } => "error",
-        WorkflowStepStatus::Cancelled => "cancelled",
-        WorkflowStepStatus::Skipped => "skipped",
+        WorkflowStepStatus::Pending => StepViewStatus::Pending,
+        WorkflowStepStatus::Running => StepViewStatus::Running,
+        WorkflowStepStatus::Succeeded => StepViewStatus::Done,
+        WorkflowStepStatus::Failed { .. } => StepViewStatus::Error,
+        WorkflowStepStatus::Cancelled => StepViewStatus::Cancelled,
+        WorkflowStepStatus::Skipped => StepViewStatus::Skipped,
+    }
+}
+
+/// The workflow-view row kind for a phase. The view has a third kind
+/// (`Agent`) for ordinary steps, so it is not the same enum as `PhaseKind`.
+fn step_kind(kind: PhaseKind) -> WorkflowStepKind {
+    match kind {
+        PhaseKind::Setup => WorkflowStepKind::Setup,
+        PhaseKind::Teardown => WorkflowStepKind::Teardown,
     }
 }
 
 /// Insert or update a setup/teardown pseudo-step in the live Workflow
 /// Overview, so a locally-attached run shows the same `[setup]`/`[teardown]`
 /// column a squad/remote run gets from `workflow_state_to_view_state` — the
-/// engine's `on_*_step_*` hooks (unlike `report_workflow_progress`) carry
+/// engine's `on_phase_step_*` hooks (unlike `report_workflow_progress`) carry
 /// only a description, not the full ordered plan, so entries appear as they
 /// start rather than as `pending` ahead of time.
 ///
@@ -558,7 +518,7 @@ fn upsert_phase_step(
     workflow_view: &crate::frontend::tui::tabs::SharedWorkflowViewState,
     kind: WorkflowStepKind,
     description: &str,
-    status: &str,
+    status: StepViewStatus,
 ) {
     use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
 
@@ -572,12 +532,12 @@ fn upsert_phase_step(
         .rev()
         .find(|s| s.kind == kind && s.name == description)
     {
-        existing.status = status.to_string();
+        existing.status = status;
         return;
     }
     let step = WorkflowStepView {
         name: description.to_string(),
-        status: status.to_string(),
+        status,
         agent: None,
         model: None,
         depends_on: Vec::new(),
@@ -600,67 +560,18 @@ fn upsert_phase_step(
 mod tests {
     use std::time::Duration;
 
+    use crate::data::workflow_state::PhaseKind;
     use crate::engine::workflow::frontend::WorkflowFrontend;
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;
     use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+    use crate::frontend::tui::tabs::StepViewStatus;
 
     fn make_frontend() -> (
         TuiCommandFrontend,
         std::sync::mpsc::Receiver<DialogRequest>,
         std::sync::mpsc::Sender<DialogResponse>,
     ) {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<DialogRequest>();
-        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<DialogResponse>();
-        let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-        let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let container_io = crate::engine::agent_runtime::frontend::AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: Some(resize_rx),
-            initial_size: Some((80, 24)),
-        };
-        let status_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-            path: vec!["workflow".into()],
-            flags: Default::default(),
-            arguments: Default::default(),
-        };
-        let workflow_view = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let yolo_state = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let yolo_cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pty_reset_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let engine_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let stuck_sender_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let frontend = TuiCommandFrontend::new(
-            parsed,
-            status_log,
-            req_tx,
-            resp_rx,
-            container_io,
-            workflow_view,
-            yolo_state,
-            yolo_cancel_flag,
-            pty_reset_flag,
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            stdin_tx_shared,
-            resize_tx_shared,
-            engine_tx_shared,
-            stuck_sender_shared,
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(
-                crate::command::commands::status::StatusCommandTuiContext::default(),
-            )),
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-        );
-        (frontend, req_rx, resp_tx)
+        crate::frontend::tui::tests::test_command_frontend(&["workflow"], Default::default())
     }
 
     #[test]
@@ -777,27 +688,36 @@ mod tests {
         }
     }
 
+    /// The TUI renders the lightweight confirm when — and only when — the
+    /// engine says the board is the simple-advance case. *Whether* it is is
+    /// the engine's judgement, tested in `engine::workflow` (F-18); this is a
+    /// rendering assertion.
     #[test]
-    fn simple_advance_shows_lightweight_dialog() {
-        use crate::data::workflow_state::StepState;
+    fn a_simple_advance_board_renders_the_lightweight_dialog() {
+        use crate::engine::workflow::actions::SimpleAdvance;
         use crate::engine::workflow::frontend::WorkflowFrontend;
 
         let (mut frontend, req_rx, resp_tx) = make_frontend();
 
-        let mut state = make_workflow_state_one_pending();
-        state.set_status("build", StepState::Succeeded);
-        let available = make_available_launch_next();
+        let state = make_workflow_state_one_pending();
+        let available = crate::engine::workflow::actions::AvailableActions {
+            can_launch_next: true,
+            simple_advance: Some(SimpleAdvance {
+                completed_step: "build".into(),
+                next_step: "test".into(),
+            }),
+            ..Default::default()
+        };
 
         let handle = std::thread::spawn(move || {
             let req = req_rx.recv().unwrap();
-            assert!(
-                matches!(
-                    req,
-                    crate::frontend::tui::dialogs::DialogRequest::WorkflowStepConfirm(_)
-                ),
-                "single-pending-step should show WorkflowStepConfirm, got {:?}",
-                req
-            );
+            match req {
+                crate::frontend::tui::dialogs::DialogRequest::WorkflowStepConfirm(state) => {
+                    assert_eq!(state.completed_step, "build");
+                    assert_eq!(state.next_step, "test");
+                }
+                other => panic!("expected WorkflowStepConfirm, got {other:?}"),
+            }
             resp_tx.send(DialogResponse::Char('>')).unwrap();
         });
 
@@ -811,8 +731,10 @@ mod tests {
         );
     }
 
+    /// No `simple_advance` means the full control board, whatever the state
+    /// looks like — the frontend does not second-guess the engine.
     #[test]
-    fn parallel_fan_out_falls_through_to_wcb() {
+    fn a_board_without_simple_advance_renders_the_control_board() {
         use crate::data::workflow_state::StepState;
         use crate::engine::workflow::frontend::WorkflowFrontend;
 
@@ -829,7 +751,7 @@ mod tests {
                     req,
                     crate::frontend::tui::dialogs::DialogRequest::WorkflowControlBoard(_)
                 ),
-                "two pending steps should show WorkflowControlBoard, got {:?}",
+                "no simple_advance should show WorkflowControlBoard, got {:?}",
                 req
             );
             resp_tx.send(DialogResponse::Char('>')).unwrap();
@@ -1109,16 +1031,33 @@ mod tests {
     }
 
     #[test]
-    fn set_engine_sender_stores_tx() {
-        use crate::engine::workflow::frontend::WorkflowFrontend;
+    fn attach_engine_stores_the_request_sender() {
+        use crate::engine::workflow::frontend::{EngineHandles, WorkflowFrontend};
         use crate::engine::workflow::EngineRequest;
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
         assert!(frontend.engine_tx_shared.lock().unwrap().is_none());
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-        frontend.set_engine_sender(tx);
+        frontend.attach_engine(EngineHandles::requests(tx));
         assert!(frontend.engine_tx_shared.lock().unwrap().is_some());
+    }
+
+    /// A per-parallel-step handover must not overwrite the workflow-level
+    /// channels — the old `set_parallel_step_*` defaults were no-ops here and
+    /// the single `attach_engine` has to keep that distinction.
+    #[test]
+    fn attach_engine_ignores_a_per_step_handover() {
+        use crate::engine::agent_runtime::execution::StuckEvent;
+        use crate::engine::workflow::frontend::{EngineHandles, WorkflowFrontend};
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        let (sender, _rx) = tokio::sync::broadcast::channel::<StuckEvent>(4);
+        frontend.attach_engine(EngineHandles::step_stuck("a", std::sync::Arc::new(sender)));
+        assert!(
+            frontend.stuck_sender_shared.lock().unwrap().is_none(),
+            "a parallel step's stuck channel must not land in the tab-level slot"
+        );
     }
 
     // take_io self-heals when the slot is empty. Launch paths that skip
@@ -1153,8 +1092,8 @@ mod tests {
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
 
-        frontend.on_setup_step_started("clone repo");
-        frontend.on_setup_step_completed("clone repo");
+        frontend.on_phase_step_started(PhaseKind::Setup, "clone repo");
+        frontend.on_phase_step_completed(PhaseKind::Setup, "clone repo");
 
         frontend.report_workflow_progress(&[WorkflowStepProgressInfo {
             name: "build".into(),
@@ -1166,21 +1105,25 @@ mod tests {
             max_concurrent: None,
         }]);
 
-        frontend.on_teardown_step_started("clean up");
+        frontend.on_phase_step_started(PhaseKind::Teardown, "clean up");
 
         let guard = frontend.workflow_view.lock().unwrap();
         let view = guard.as_ref().expect("workflow view must be seeded");
-        let steps: Vec<(WorkflowStepKind, &str, &str)> = view
+        let steps: Vec<(WorkflowStepKind, &str, StepViewStatus)> = view
             .steps
             .iter()
-            .map(|s| (s.kind, s.name.as_str(), s.status.as_str()))
+            .map(|s| (s.kind, s.name.as_str(), s.status))
             .collect();
         assert_eq!(
             steps,
             vec![
-                (WorkflowStepKind::Setup, "clone repo", "done"),
-                (WorkflowStepKind::Agent, "build", "running"),
-                (WorkflowStepKind::Teardown, "clean up", "running"),
+                (WorkflowStepKind::Setup, "clone repo", StepViewStatus::Done),
+                (WorkflowStepKind::Agent, "build", StepViewStatus::Running),
+                (
+                    WorkflowStepKind::Teardown,
+                    "clean up",
+                    StepViewStatus::Running
+                ),
             ],
             "setup must stay ahead of the main steps and teardown behind them, \
              surviving report_workflow_progress's replace of the main-step list"
@@ -1193,8 +1136,8 @@ mod tests {
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
 
-        frontend.on_setup_step_started("install deps");
-        frontend.on_setup_step_failed("install deps", 1, "boom");
+        frontend.on_phase_step_started(PhaseKind::Setup, "install deps");
+        frontend.on_phase_step_failed(PhaseKind::Setup, "install deps", 1, "boom");
 
         let guard = frontend.workflow_view.lock().unwrap();
         let view = guard.as_ref().expect("workflow view must be seeded");
@@ -1204,7 +1147,7 @@ mod tests {
             "the started step is updated in place, not duplicated"
         );
         assert_eq!(view.steps[0].kind, WorkflowStepKind::Setup);
-        assert_eq!(view.steps[0].status, "error");
+        assert_eq!(view.steps[0].status, StepViewStatus::Error);
     }
 
     // ── WI-0115 §1: the failure board's dialog state ────────────────────

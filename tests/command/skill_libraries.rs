@@ -7,23 +7,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use awman::command::commands::collect_all_overlay_specs;
+use awman::command::commands::api_server::event_bus::EventBus;
 use awman::command::commands::new::{NewOutcome, NewSkillOutcome};
 use awman::command::dispatch::catalogue::CommandCatalogue;
-use awman::command::dispatch::{BuiltCommand, CommandOutcome, Dispatch, Engines};
-use awman::data::fs::api_paths::ApiPaths;
+use awman::command::dispatch::{BuiltCommand, CommandOutcome, Dispatch};
 use awman::data::fs::auth_paths::AuthPathResolver;
 use awman::data::fs::skill_library::{read_library_meta, LIBRARY_META_FILENAME};
-use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
-use awman::data::EngineWorkflowStateStore;
-use awman::engine::agent::AgentEngine;
-use awman::engine::auth::AuthEngine;
 use awman::engine::container::options::OverlayPermission;
-use awman::engine::container::ContainerRuntime;
-use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-use awman::frontend::api::event_bus::EventBus;
 use awman::frontend::cli::CliFrontend;
 
 /// `AWMAN_CONFIG_HOME` and Git's process-wide config injection are shared by
@@ -141,30 +133,6 @@ fn write_skill(repo: &Path, subdir: &str, skill: &str) {
     std::fs::write(dir.join("SKILL.md"), format!("# {skill}\n")).expect("write SKILL.md");
 }
 
-fn make_session(root: &Path) -> Session {
-    let resolver = StaticGitRootResolver::new(root);
-    Session::open(root.to_path_buf(), &resolver, SessionOpenOptions::default())
-        .expect("open test session")
-}
-
-fn make_engines(home: &Path, root: &Path) -> Engines {
-    let api_paths = ApiPaths::from_root(home.join("api"));
-    api_paths.ensure_root().expect("create API paths");
-    let auth_paths = AuthPathResolver::at_home(home);
-    let runtime = Arc::new(ContainerRuntime::docker());
-    let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
-    Engines {
-        runtime: runtime.clone(),
-        container_runtime: Some(runtime.clone()),
-        sandbox_runtime: None,
-        git_engine: Arc::new(GitEngine::new()),
-        overlay_engine: overlay_engine.clone(),
-        auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
-        agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(root)),
-    }
-}
-
 fn run_cli(root: &Path, home: &Path, args: &[&str]) -> NewSkillOutcome {
     let matches = CommandCatalogue::get()
         .build_clap_command()
@@ -173,8 +141,8 @@ fn run_cli(root: &Path, home: &Path, args: &[&str]) -> NewSkillOutcome {
     let frontend = CliFrontend::new(matches);
     let dispatch = Dispatch::new(
         frontend,
-        Arc::new(tokio::sync::RwLock::new(make_session(root))),
-        make_engines(home, root),
+        Arc::new(tokio::sync::RwLock::new(crate::helpers::session_at(root))),
+        crate::helpers::engines_at(home, root, true),
     );
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     match runtime
@@ -195,8 +163,8 @@ fn run_api(root: &Path, home: &Path, args: &[&str]) -> NewSkillOutcome {
     let frontend = ApiDispatchFrontend::new("new skill", &argv, bus.sender());
     let dispatch = Dispatch::new(
         frontend,
-        Arc::new(tokio::sync::RwLock::new(make_session(root))),
-        make_engines(home, root),
+        Arc::new(tokio::sync::RwLock::new(crate::helpers::session_at(root))),
+        crate::helpers::engines_at(home, root, true),
     );
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     match runtime
@@ -230,8 +198,8 @@ fn assert_cli_overlay_flag_reaches_command(
         .expect("agent command flags must parse");
     let dispatch = Dispatch::new(
         CliFrontend::new(matches),
-        Arc::new(tokio::sync::RwLock::new(make_session(root))),
-        make_engines(home, root),
+        Arc::new(tokio::sync::RwLock::new(crate::helpers::session_at(root))),
+        crate::helpers::engines_at(home, root, true),
     );
     match dispatch.build_command(command_path).expect("build command") {
         BuiltCommand::Chat(command) => {
@@ -409,7 +377,7 @@ fn real_git_subdir_is_persisted_and_library_and_single_skill_overlay_mounts_are_
         "skill(custom-library/brainstorming)",
     );
 
-    let session = make_session(workdir.path());
+    let session = crate::helpers::session_at(workdir.path());
     let engine = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home.path()));
     for (overlay, expected_host, expected_container) in [
         (
@@ -423,13 +391,14 @@ fn real_git_subdir_is_persisted_and_library_and_single_skill_overlay_mounts_are_
             PathBuf::from("/root/.claude/commands/custom-library/brainstorming"),
         ),
     ] {
-        let collected = collect_all_overlay_specs(
-            &session,
-            awman::command::commands::parse_overlay_list(overlay).unwrap(),
-            None,
-            None,
-        )
-        .expect("chat/exec prompt overlay collection");
+        let collected = session
+            .effective_config()
+            .collected_overlays(
+                awman::command::commands::parse_overlay_list(overlay).unwrap(),
+                None,
+                None,
+            )
+            .expect("chat/exec prompt overlay collection");
         let specs = engine
             .build_overlays(
                 &session,

@@ -55,12 +55,14 @@ pub(super) fn render_execution_window(app: &mut App, area: Rect, frame: &mut Fra
 
     // Status dashboard takes priority when populated by the status command.
     let has_dashboard = tab
+        .shared
         .status_dashboard
         .lock()
         .map(|d| d.is_some())
         .unwrap_or(false);
 
     let log_empty = tab
+        .shared
         .status_log
         .lock()
         .map(|log| log.is_empty())
@@ -159,7 +161,7 @@ pub(super) fn capture_buffer_grid(buf: &Buffer, area: Rect) -> Vec<Vec<String>> 
 /// "screen rows", not log entries — matches old amux's behavior where the
 /// scroll is anchored to the bottom and increasing offset moves toward older.
 fn render_output_content(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
-    let log = match tab.status_log.lock() {
+    let log = match tab.shared.status_log.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -215,7 +217,7 @@ fn render_output_content(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
 
 /// Render the status dashboard as a proper ratatui `Table` widget.
 fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
-    let dash = match tab.status_dashboard.lock() {
+    let dash = match tab.shared.status_dashboard.lock() {
         Ok(g) => g,
         Err(_) => return,
     };

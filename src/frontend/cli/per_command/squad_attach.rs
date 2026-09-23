@@ -29,7 +29,11 @@ impl SquadAttachFrontend for CliFrontend {
         }
         let items = format_candidates(candidates);
         let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-        let picked = super::helpers::pick_numbered("attach to which container?", &refs, 1);
+        let Some(picked) = super::helpers::pick_numbered("attach to which container?", &refs, 1)
+        else {
+            // stdin ended without a choice; the same answer a headless run gets.
+            return Ok(None);
+        };
         Ok((1..=candidates.len())
             .contains(&picked)
             .then_some(picked - 1))

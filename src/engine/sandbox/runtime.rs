@@ -11,7 +11,8 @@ use crate::data::session::Session;
 use crate::engine::agent_runtime::execution::{AgentExitInfo, ExecutionBackend, StuckEvent};
 use crate::engine::agent_runtime::{
     AgentExecution, AgentFrontend, AgentHandle, AgentHandlePreview, AgentInstance,
-    AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ResolvedAgentOptions,
+    AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ReadyAgentOptions,
+    ResolvedAgentOptions,
 };
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::backend::SandboxBackend;
@@ -30,6 +31,7 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
     dind: DindSupport::Always,
     host_paths_visible: false,
     session_label_supported: false,
+    has_image_store: false,
 };
 
 pub struct SandboxRuntime {
@@ -37,6 +39,27 @@ pub struct SandboxRuntime {
 }
 
 impl SandboxRuntime {
+    /// Prepare this runtime for a single agent at `awman ready` time: check
+    /// the `sbx` binary and login, emit the agent's kit, register
+    /// credentials, and validate the kit. Reports every `sbx` subprocess on
+    /// `sink`.
+    ///
+    /// `no_cache` removes the agent's existing awman sandboxes (`sbx rm`)
+    /// before re-emitting the kit, so the next launch re-runs the kit install
+    /// from a clean state.
+    ///
+    /// An inherent method on the runtime rather than the free
+    /// `sandbox::ready_sbx_agent` it replaces (F-40, Tenet 3). F-40b lifts it
+    /// onto `AgentRuntimeEngine` so `ready` stops naming the tier at all.
+    pub fn ready_agent(
+        &self,
+        agent: &str,
+        no_cache: bool,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+    ) -> Result<(), EngineError> {
+        super::dsbx::ready_agent(agent, no_cache, sink)
+    }
+
     /// Construct with the Docker Sandbox (`sbx`) backend.
     ///
     /// Platform guards: Docker Sandboxes are not available on Linux, and not
@@ -62,6 +85,21 @@ impl SandboxRuntime {
         Ok(Self {
             backend: Arc::new(DSbxBackend::new()),
         })
+    }
+
+    /// The same runtime without the platform guards, so the layers above can
+    /// be tested on a host `dsbx()` refuses to run on.
+    ///
+    /// Nothing here probes `sbx`: the backend is a unit struct and every
+    /// method that shells out is only reached by a test that asks for it.
+    /// What this makes testable is the *paradigm* — `capabilities()`,
+    /// `runtime_name()`, and which `ResolvedAgentOptions` variant the layers
+    /// above resolve for a sandbox-class runtime.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            backend: Arc::new(DSbxBackend::new()),
+        }
     }
 }
 
@@ -171,6 +209,45 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn cli_binary(&self) -> &'static str {
         self.backend.cli_binary()
+    }
+
+    fn ready_agent(
+        &self,
+        agent: &str,
+        opts: ReadyAgentOptions,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+    ) -> Result<(), EngineError> {
+        // `opts.build` is inert here: a kit is emitted and validated every
+        // time, so there is no cached image to force a rebuild of.
+        SandboxRuntime::ready_agent(self, agent, opts.no_cache, sink)
+    }
+
+    fn image_exists(&self, _tag: &str) -> Result<bool, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "local image probe",
+        })
+    }
+
+    fn image_home_dir(&self, _tag: &str) -> Result<Option<String>, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "image HOME lookup",
+        })
+    }
+
+    fn build_image(
+        &self,
+        _tag: &str,
+        _dockerfile: &std::path::Path,
+        _context: &std::path::Path,
+        _no_cache: bool,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "image build",
+        })
     }
 }
 

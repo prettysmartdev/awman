@@ -5,12 +5,12 @@
 //! Reconciliation for the rationale.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 use crate::data::fs::path_guard::validate_under_root;
+use crate::data::fs::remote_slug::RemoteSlug;
 
 /// Resolves host-side context directory paths.
 #[derive(Debug, Clone)]
@@ -51,11 +51,14 @@ impl ContextDirResolver {
 
     /// `~/.awman/context/repo/{owner}/{repo}/`
     ///
-    /// Derived from `git remote get-url origin` at `git_root`. Falls back to
-    /// `_local/{dirname}` when no remote is configured. Always normalised to
-    /// lowercase with non-alphanumeric chars replaced by dashes.
-    pub fn repo_dir(&self, git_root: &Path) -> PathBuf {
-        let slug = repo_slug(git_root);
+    /// `remote_url` is the repository's `origin` URL, supplied by the caller —
+    /// Layer 1's `GitEngine` reads it (WI 0114 F-29; a Layer 0 path resolver
+    /// must not shell out to git). Pass `None` when there is no remote, or
+    /// when reading it failed: the slug then falls back to `_local/{dirname}`,
+    /// exactly as a failed `git remote get-url` did before. Always normalised
+    /// to lowercase with non-alphanumeric chars replaced by dashes.
+    pub fn repo_dir(&self, remote_url: Option<&str>, git_root: &Path) -> PathBuf {
+        let slug = repo_slug(remote_url, git_root);
         self.awman_home.join("context").join("repo").join(slug)
     }
 
@@ -73,10 +76,10 @@ impl ContextDirResolver {
     }
 }
 
-/// Derive `{owner}/{repo}` slug from the git remote URL at `git_root`.
-/// Falls back to `_local/{dirname}` when no remote is configured.
-fn repo_slug(git_root: &Path) -> String {
-    if let Some(slug) = slug_from_remote(git_root) {
+/// Derive the `{owner}/{repo}` slug from `remote_url`, falling back to
+/// `_local/{dirname}` when there is none (or it names no owner/repo pair).
+fn repo_slug(remote_url: Option<&str>, git_root: &Path) -> String {
+    if let Some(slug) = remote_url.and_then(parse_owner_repo) {
         return slug;
     }
     let dirname = git_root
@@ -86,65 +89,13 @@ fn repo_slug(git_root: &Path) -> String {
     format!("_local/{}", normalise_slug(dirname))
 }
 
-/// Try to extract `{owner}/{repo}` from `git remote get-url origin`.
-fn slug_from_remote(git_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(git_root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_owner_repo(&url)
-}
-
-/// Extract and normalise owner/repo from git remote URL formats.
-fn parse_owner_repo(remote_url: &str) -> Option<String> {
-    let remote = remote_url.trim();
-
-    // SSH: git@host:owner/repo.git
-    if let Some(colon_idx) = remote.find(':') {
-        if remote[..colon_idx].contains('@') {
-            let rest = &remote[colon_idx + 1..];
-            let rest = rest.strip_suffix(".git").unwrap_or(rest);
-            let parts: Vec<&str> = rest.splitn(2, '/').collect();
-            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Some(format!(
-                    "{}/{}",
-                    normalise_slug(parts[0]),
-                    normalise_slug(parts[1])
-                ));
-            }
-        }
-    }
-
-    // HTTPS: https://host/owner/repo.git
-    if let Some(idx) = remote.find("://") {
-        let after_scheme = &remote[idx + 3..];
-        // Skip the hostname
-        if let Some(path_start) = after_scheme.find('/') {
-            let path = &after_scheme[path_start + 1..];
-            let path = path.strip_suffix(".git").unwrap_or(path);
-            let parts: Vec<&str> = path.splitn(3, '/').collect();
-            if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Some(format!(
-                    "{}/{}",
-                    normalise_slug(parts[0]),
-                    normalise_slug(parts[1])
-                ));
-            }
-        }
-    }
-
-    None
+/// Extract and normalise `owner/repo` from a git remote URL.
+pub fn parse_owner_repo(remote_url: &str) -> Option<String> {
+    RemoteSlug::parse(remote_url).map(|slug| slug.normalised_path())
 }
 
 /// Normalise a slug component: lowercase, non-alphanumeric chars replaced by dashes.
-fn normalise_slug(s: &str) -> String {
+pub fn normalise_slug(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -234,16 +185,37 @@ mod tests {
     }
 
     #[test]
-    fn repo_slug_falls_back_to_local_dirname() {
+    fn repo_slug_falls_back_to_local_dirname_without_a_remote() {
         let tmp = tempfile::tempdir().unwrap();
-        // No git repo, so slug_from_remote will fail
-        let slug = repo_slug(tmp.path());
+        let slug = repo_slug(None, tmp.path());
         let dirname = tmp.path().file_name().unwrap().to_str().unwrap();
         assert!(
             slug.starts_with("_local/"),
             "must fall back to _local/; got: {slug}"
         );
         assert_eq!(slug, format!("_local/{}", normalise_slug(dirname)));
+    }
+
+    /// A remote URL that names no owner/repo pair is the same case as no
+    /// remote at all — that is what a failed `git remote get-url` produced
+    /// before the URL became a parameter.
+    #[test]
+    fn repo_slug_falls_back_when_the_remote_names_no_owner_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slug = repo_slug(Some("not-a-url"), tmp.path());
+        assert!(
+            slug.starts_with("_local/"),
+            "must fall back to _local/; got: {slug}"
+        );
+    }
+
+    #[test]
+    fn repo_slug_uses_the_supplied_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            repo_slug(Some("https://github.com/My.Org/My_Repo.git"), tmp.path()),
+            "my-org/my-repo"
+        );
     }
 
     #[test]
@@ -259,7 +231,7 @@ mod tests {
     fn repo_dir_returns_path_under_context_repo() {
         let resolver = ContextDirResolver::at_home("/home/user/.awman");
         let tmp = tempfile::tempdir().unwrap();
-        let dir = resolver.repo_dir(tmp.path());
+        let dir = resolver.repo_dir(None, tmp.path());
         assert!(
             dir.starts_with("/home/user/.awman/context/repo"),
             "repo_dir must be under context/repo; got: {}",

@@ -280,21 +280,9 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
     use crate::data::fs::api_db::SqliteSessionStore;
-    use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
 
     // ─── helpers ──────────────────────────────────────────────────────────────
-
-    fn make_session(git_root: &std::path::Path, home_dir: &std::path::Path) -> Session {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_dir.to_str().unwrap())]);
-        let resolver = StaticGitRootResolver::new(git_root);
-        let opts = SessionOpenOptions {
-            env: Some(env),
-            ..Default::default()
-        };
-        Session::open(git_root.to_path_buf(), &resolver, opts).unwrap()
-    }
 
     struct TestEnv {
         git_root: tempfile::TempDir,
@@ -310,7 +298,7 @@ mod tests {
         }
 
         fn make_session(&self) -> Session {
-            make_session(self.git_root.path(), self.home_dir.path())
+            Session::for_tests_isolated(self.git_root.path(), self.home_dir.path())
         }
     }
 
@@ -502,7 +490,7 @@ mod tests {
             let git_root = git_tmp.path().to_path_buf();
             let home_dir = home_tmp.path().to_path_buf();
             handles.push(tokio::spawn(async move {
-                let session = make_session(&git_root, &home_dir);
+                let session = Session::for_tests_isolated(&git_root, &home_dir);
                 manager.create(session).unwrap()
             }));
         }
@@ -566,7 +554,7 @@ mod tests {
             let manager = SessionManager::with_persistence(adapter);
 
             for _ in 0..3 {
-                let session = make_session(git_tmp.path(), home_tmp.path());
+                let session = Session::for_tests_isolated(git_tmp.path(), home_tmp.path());
                 let id = manager.create(session).unwrap();
                 created_ids.push(id.to_string());
             }

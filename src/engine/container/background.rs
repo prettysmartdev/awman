@@ -449,6 +449,15 @@ mod tests {
         fn name(&self) -> &'static str {
             "recording"
         }
+        fn display_name(&self) -> &'static str {
+            "Recording"
+        }
+        fn cli_binary(&self) -> &'static str {
+            "recording-cli"
+        }
+        fn availability_probe_args(&self) -> &'static [&'static str] {
+            &["probe"]
+        }
         fn start_background(
             &self,
             _image: &str,

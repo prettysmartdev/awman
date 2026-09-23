@@ -14,7 +14,7 @@ use awman::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
 use awman::data::workflow_state::{
     StepState, WorkflowPhase, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION,
 };
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 
 // ─── Workflow parsing parity across formats ───────────────────────────────────
 
@@ -212,7 +212,7 @@ fn dag_cycle_detection() {
 #[test]
 fn workflow_state_save_load_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = EngineWorkflowStateStore::at_git_root(tmp.path());
+    let store = WorkflowStateStore::at_git_root(tmp.path());
 
     let steps = vec![make_step("a", &[]), make_step("b", &["a"])];
     let mut state = WorkflowState::new("my-wf".into(), &steps, "abc123".into(), None);
@@ -230,7 +230,7 @@ fn workflow_state_save_load_roundtrip() {
 #[test]
 fn workflow_state_save_load_with_work_item() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = EngineWorkflowStateStore::at_git_root(tmp.path());
+    let store = WorkflowStateStore::at_git_root(tmp.path());
 
     let steps = vec![make_step("alpha", &[])];
     let state = WorkflowState::new("my-wf".into(), &steps, "hash".into(), Some(42));
@@ -244,7 +244,7 @@ fn workflow_state_save_load_with_work_item() {
 #[test]
 fn workflow_state_load_absent_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = EngineWorkflowStateStore::at_git_root(tmp.path());
+    let store = WorkflowStateStore::at_git_root(tmp.path());
     let result = store.load(None, "nonexistent").unwrap();
     assert!(result.is_none());
 }
@@ -252,7 +252,7 @@ fn workflow_state_load_absent_returns_none() {
 #[test]
 fn workflow_state_delete_removes_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = EngineWorkflowStateStore::at_git_root(tmp.path());
+    let store = WorkflowStateStore::at_git_root(tmp.path());
 
     let steps = vec![make_step("a", &[])];
     let state = WorkflowState::new("del-wf".into(), &steps, "h".into(), None);
@@ -388,7 +388,7 @@ fn workflow_state_v1_fixture_round_trip_through_store() {
     let original: WorkflowState = serde_json::from_str(&fixture).unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
-    let store = EngineWorkflowStateStore::at_git_root(tmp.path());
+    let store = WorkflowStateStore::at_git_root(tmp.path());
     store.save(&original).unwrap();
     let reloaded = store
         .load(None, &original.workflow_name)

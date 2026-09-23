@@ -899,3 +899,257 @@ regression tests above; the 2 `main.rs`-bin tests are counted separately).
   container. This must be re-verified in a fresh container before WI 0113 is
   signed off as fully green — do not treat this report's individual passing
   runs as equivalent to a certified `make pre-push` pass.
+
+## Remediation — WI 0114
+
+Close-out pass, 2026-09-23. Covers F-13 through F-54 (the Medium and Low
+findings WI 0114 owns) plus F-55, F-56 and F-57 from the v0.12 re-audit
+(Group G). Evidence: `/awman/context/workflow/50-final-review.md` (the
+independent adversarial review against the tree at `91e00af..fc81410`),
+`51-remediation.md` (the eleven commits that cleared every should-fix finding
+the review raised), every `step-group-*.md` / `NN-group-*.md` handoff, and
+direct re-inspection of the tree at `HEAD` (`ad53bbf`) — commit subjects are
+not trusted on their own (`50-final-review.md` note 16 records that group-g
+wrote no handoff and one commit's subject covers two findings).
+
+**F-57 verified independently by this pass, not taken on trust.** Both guards
+were read directly in `tools/architecture-lint.sh` (`layer-render` at line
+421, `dispatch-bypass` at line 370 — neither commented out, neither carrying
+an allowlist) and `make architecture-lint` was re-run alone: `architecture-lint:
+OK — all imports respect the layering rules`, exit 0. F-57 is closed.
+
+### Disposition of F-13 – F-54, plus F-55 – F-57
+
+Status vocabulary matches `50-final-review.md`: **closed**, **closed
+(deviation)** — done with a recorded judgment call the developer should
+confirm, **deferred** — with the reason and the remaining scope, **rejected**
+— with the decision, **rejected-superseded** — a specific step rejected
+because a later, deliberate design decision overrides it.
+
+| ID | Status | Commit(s) | Detail |
+|---|---|---|---|
+| F-13 | closed (deviation) | `cf87ef8`, `e1bd88d` | `HeadlessDefaults::{api,squad,cli}` — three named profiles, not Q5's two named profiles; developer to confirm the third (`cli()`) is intended (recorded in `assumptions.md`). Table test pins every cell. Q4 residue (the squad leader's mount scope, chosen in `src/frontend/squad/unattended.rs`) cleared in `e1bd88d`: `SquadRunFrontends::leader_frontend` now takes `mount_scope` from the same expression `workflow_frontend` always used. |
+| F-14 | closed (deviation) | `971c50a` | One `AuthMode` (engine-owned); `request_auth_mode`/`verify_bearer`; timing-shape test. Deviation, recorded and left as-is: step 2's squad-daemon `AuthEngine` was not built — `src/engine/squad/daemon.rs:199` still calls `AuthMode::resolve_for_daemon` over raw paths rather than building an `AuthEngine` over `SquadPaths::daemon()`. The reason lived only in commit `971c50a`'s message; it is recorded here so it survives history rewrites. |
+| F-15 | closed | `27fbcd4`, `f40c875` | "INTERACTIVE mode" banner deleted in both TUI and CLI (Q6); `LaunchDisplay`; gateway keying on `path.first() == "squad"` replaced by `GatewayNeed`. |
+| F-16 | closed | `149b12e` | `ContainerStatsSampler` + `AgentRuntimeEngine::stats_by_name`; the tuple stats channel is gone. |
+| F-17 | closed | `9f1bc16`, `14b3e7c` | `SquadSupervisor::health()` in L1; `SquadIndicatorPoller` keeps only cadence and colour. The one classification the first pass left in the TUI (`SquadGatewayResolver::from_env` failure → `Unreachable`) moved to `SquadGatewayResolver::health_from_env` (L2) in `14b3e7c`; no deviation remains. |
+| F-18 | closed | `49e9c38` | `AvailableActions::simple_advance` / `current_step_name` computed by the engine; the TUI's permission-guard duplication is gone. |
+| F-19 | deferred (partly done) | `b31a4f4`, `679e7e1`, `e439f2c`, `46bd4a1` | Done: `Prompt<D>`/`Choice<D>` (L0, `src/data/prompt.rs`), `command::prompts` (L2 copy), `ask_spec_kind`, `ask_task_interval`, the squad confirm dialog (F-55), the CLI's squad-interview bodies and its `yes_no`/`read_line`/`read_multiline`/`pick_numbered` helpers (no longer TTY-testing themselves — `e439f2c`, which also closed four live F-50 misses: `init`'s `ask_replace_aspec`/`ask_run_audit` and `ready`'s `ask_create_dockerfile`/`ask_run_audit_on_template`), and the Dockerfile-setup prompt including its six frontend tests that used to pin `CreateNew` on a dismissal (`46bd4a1`). **Still deferred:** the remaining `ask_*` methods that keep a bespoke TUI dialog — `ask_task_repo`, `ask_task_overlay`, `ask_edited_*`, and the init/ready yes/no steps whose Enter-default legitimately *is* the Layer 2 profile's value. Reason: each has a bespoke TUI dialog; converting piecemeal leaves the TUI less consistent than converting as a batch, which is new work beyond this item's should-fix list. |
+| F-20 | closed | `01f3f5e` | `DialogResponse::ConfigEdit(ConfigEditRequest)`; `is_valid_map_key`'s re-derivation of `AgentName`'s rules is gone. |
+| F-21 | closed | `e372c4b` | `Session::is_git_repo` (L0); `Dispatch::startup_command`/`FrontendAction::startup_for` (L2) backs both TUI call sites. |
+| F-22 | closed (deviation) | `34d5413`, `00eceb6` | `Tab` derives phase, workflow overview and container name from `SessionState` each tick; typed `StepViewStatus` replaces the string matches. Deviation, recorded: `Tab` was not split into a `TabView` type, and `stuck`/`yolo_mode` stay on `Tab` rather than moving — both named as deliberate simplifications from the drafted shape. |
+| F-23 | closed | `ae676b3` | `RuntimeContext` moved to L2; `render_summary_box`/`StepStatus::glyph` to a shared L3 `render_helpers`. `src/frontend/tui` imports nothing from `src/frontend/cli`. |
+| F-24 | closed | `c3478ff` | `TabSharedState`, `DialogChannels`, `TabSharedState::for_tests()`; all four `type_complexity` allows removed. |
+| F-25 | closed | `cf87ef8`, `3658159` | Steps 1–3 (`CommandCatalogue::markdown_reference`, generated `docs/14-command-reference.md`, `cli.md` rewritten to UX standards only) landed in `cf87ef8` under an F-13 commit subject — do not infer status from commit subjects (`50-final-review.md` note 16). Step 4 (`requires_runtime` as a `CommandSpec` attribute on all 47 literals, plus the `make docs-reference` target) closed in `3658159`, which also folded `opens_tui_when_bare` into the same per-command-attribute pass and deleted the `TUI_WHEN_BARE` catalogue-level list, per `assumptions.md`. |
+| F-26 | closed | `d2fe0e0` | One token parser (`parsed_input::parse` → `raw_args::parse_against_spec`); the TUI rejects `--launch-mode banana` / `--port abc` at parse time, same as the API; `ready -ab` reads `unknown flag: -ab`. |
+| F-27 | closed (deviation) | `cf4d2a4` | Overlay grammar, `DirectorySpec`/`ContextScope`/`OverlayPermission` moved to L0; `LaunchPolicy` (L2) holds `resolve_agent`/`resolve_launch_mode`/etc. Deviation: load-time validation of `RepoConfig.overlays` (`DataError::InvalidOverlaySpec`) was deliberately not added — recorded, not silently dropped. |
+| F-28 | closed | `6ad20fc` | `engine::remote::{http_core, client, events}`; one async `reqwest::Client` builder shared by the remote client. |
+| F-29 | closed (deviation) | `844b426` | `DaemonSupervisor` (the only type that may spawn the daemon binary), `AspecDownloader`, `RemoteSlug`. Deviation: `ContextDirResolver::repo_dir`'s parameter is named `remote_effective_url`, not the report's `remote_url`, to name what it actually is; `skill_library.rs`'s own remote-slug parser was kept rather than unified (recorded). Windows is unverified by a real cross-compiled build in this container (see the test-suite note below). |
+| F-30 | closed | `a0dc210` | One workflow-state store (`WorkflowStateStore`, `src/data/fs/workflow_state.rs`); `resolve_default_agent` deleted in favour of `Session::open_at_git_root` deriving `default_agent` from `EffectiveConfig::agent()`; hash helpers moved to `fs/hash.rs`. |
+| F-31 | closed | `f8100bf` | Config reads route through `Session`/`Engines`; `DataError::ConfigParse` names the file, line and reason; the config-load lint guard is live (two allowlisted, deliberate sites remain: `command/dispatch/mod.rs` and `engine/init/mod.rs`, down from 13 production sites at baseline — see metrics below). |
+| F-32 | closed (deviation) | `09b634a`, `d023af6`, `dd7cb51` | `ContainerBackend`/`AgentMatrix` are the only per-backend and per-agent tables; `"apple-containers" =>` arms and `agent.as_str() ==`/`match agent.as_str()` under `src/engine` are both at 0 (see metrics). Deviation, recorded and known: the antigravity host-ping still runs a binary literally named `antigravity`, but antigravity ships `agy` — the ping always fails. This is a **known issue**, stated in `docs/releases/unreleased.md`, not fixed here (fixing it changes the one sanctioned host-agent-execution path and needs its own work item). |
+| F-33 | closed | `3f8c7f0` | `AgentImageFrontend` (renamed from the taken `AgentSetupFrontend`); all five re-export shim files deleted, including the fourth one (`frontend/api/session_setup.rs`) found after the item was written. |
+| F-34 | closed | `f3e84de` | `PhaseKind::{Setup,Teardown}`; `run_phase`/`run_single_phase_step`/`run_phase_remediation` collapse the setup/teardown twins; five `on_phase_step_*` callbacks replace the ten; `WorkflowEngineDeps`/`WorkflowSpec` replace the 5–6-parameter constructors. Setup's failure-file behaviour is release-noted as an intentional improvement; the API's `phase` string is still exactly `"setup"`/`"teardown"`. |
+| F-35 | closed (deviation) | `081dea0` | `AuthCommand`/`DownloadCommand`/their frontends deleted (tarball logic kept as a private `InitCommand` helper); the three empty `ApiServer*CommandFrontend` traits merged; `AgentLaunchFrontend` added. Deviation: `set_pty_active` was made **required**, not defaulted — a stronger reading of the drafted "pick one default" instruction, so a frontend cannot silently drop PTY state. `Command`-trait impl count is 14 (verified below), matching the corrected target. |
+| F-36 | closed (deviation) | `72f8353` | `WorkflowProxy` deleted in favour of a blanket `impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for Arc<Mutex<Box<F>>>`. Deviation: `AgentFrontendProxy` was kept rather than deleted — it owns per-container I/O that the blanket-impl shape does not fit — and this is recorded rather than silently diverging from the drafted "delete both". |
+| F-37 | steps 1, 2, 4 closed; **step 3 rejected-superseded** | `822d280`, `3929ec6` | Steps 1, 2 and 4 closed: `AWMAN_ATTACH_DIR`/`AWMAN_API_VERBOSE_SETUP` declared in `EnvSnapshot`; `poll_ci.rs` wrapped as `CiPoller`; the `env-var` lint guard is live in `tools/architecture-lint.sh`, allowlisting only `#[cfg(test)]` code and the one deliberate production site named in step 3. **Step 3 is rejected as drafted, not deferred** — implementing it would reintroduce the WI 0116 regression and put possibly-secret values into world-readable argv: `resolve_env_passthrough` (`src/engine/container/docker.rs:706`) resolves through `host_var` **at spawn time, on purpose**, because inside the squad daemon a task's `env()` value arrives over the authenticated socket and lives only in the Layer 0 daemon overlay — it never enters the daemon's own process environment, and pre-resolving it at L2 from an `EnvSnapshot` (what step 3 as drafted asks for) would put it back there. Turning the passthrough into `EnvLiteral` would also change the emitted `docker` argv from name-only `-e NAME` to `-e KEY=VALUE`; `docker.rs:800-816` documents why that must never happen — argv is world-readable through `/proc/<pid>/cmdline`, so a host value that may be a secret must stay out of it. That is a security regression, not a refactor, so it is rejected outright rather than left open. The one remaining raw `std::env::var` loop (`src/engine/sandbox/dsbx/session_config.rs:100`) is deliberately *not* routed through `host_var` for the opposite reason: that map is written in the clear to `<workspace>/.awman/session.json`, and reading through the daemon overlay would make a socket-pushed value eligible for a plaintext file. Both exceptions are named in the `env-var` guard's allowlist by path, with the reasoning in the guarded files' own comments. |
+| F-38 | closed | `169440a` | `HostAgentPinger` (`src/engine/ready/host_agent.rs`) is the only type in the tree that may spawn an agent binary on the host; `install_global`/`global()`/`OnceLock` deleted, `ResolvedContainerOptions` carries an explicit `lease_factory` (`options_without_a_monitor_disable_leases` proves the no-monitor path); `SquadAgentLauncher` owns the run-log-directory helpers. `security.md`'s S1 note is updated in this close-out pass to name `HostAgentPinger` (see below). Release-noted side effect: the squad daemon's `authRefresh` is now global-only (docs updated in `99de7b4`). |
+| F-39 | closed | `b8e4c9a` | `GitEngine::identity_configured`/`GitIdentity`; `worktree_git_status` replaced by `git_engine.uncommitted_files`. Behaviour change (release-noted): a repo-local `user.name`/`user.email` is now honoured. |
+| F-40 | closed | `ab9b288` | Steps 1–3 (capability-based branching in `ready.rs`/`clean.rs`, `Capabilities::has_image_store`, `SandboxRuntime::ready_agent`); step 4 was already done at the item's review pass (`Capabilities::squad_supported()`). |
+| F-40b | closed (deviation) | `dc15cc4`, `246a3fc` | `AgentRuntimeEngine::{ready_agent, image_exists, image_home_dir}`; `ReadyEngine`/`InitEngine`/`AgentEngine` take `Arc<dyn AgentRuntimeEngine>` instead of a concrete `Arc<ContainerRuntime>`; `ready.rs` has no `sandbox_runtime.is_some()` branch left. Deviation, developer to confirm: `ContainerRuntime::ready_agent` returns `EngineError::UnsupportedOnRuntime` rather than the sandbox tier growing image-build support (recorded in `assumptions.md`). |
+| F-41 | closed | `244efec` | `SessionSetupPresenter` (five methods) split out; `SessionSetupState` mutation logic moved onto the L0 type in `src/data/session_setup_event.rs`; the API bus is a pure broadcaster. |
+| F-42 | closed (by WI 0113) | — | `CommandOutcome::exit_code`/`is_partial_failure`; both CLI and API's `QueueWorker` call the same method. Nothing was open for 0114. |
+| F-43 | closed | `8fd1f3f` | Levenshtein helper moved to `src/data/text.rs`; `CommandCatalogue::suggest` covers nested paths; `CommandError::UnknownCommand { path, suggestions }` — both frontends only format. |
+| F-44 | closed | `4873a7d` | `PanicLog::from_env`/`path`/`append` in L0; the TUI hook formats and calls it. |
+| F-45 | closed | `b3d5f12` | `attach_engine(EngineHandles)` replaces the four `set_*` setters; `ReadyStep`/`InitStep`/`AgentSetupStep` enums with `Display`; `GitFrontend::command_started`, `ReadyFrontend::report_ping`, `WorkflowFrontend::report_ci_poll` added with default text-writing impls, so no frontend output changed unless it opted in. |
+| F-46 | closed | `a0e6c8e` | `TaskEvaluator`/scheduler reports resolved `(agent, model)` back instead of re-parsing `agent::model` strings; `AcpSession::new` takes a typed `PermissionPolicy`. |
+| F-47 | closed | `1464630`, `4ad8f1f`, `9fa7e3b` | Steps 1–2 (`RunVerdict` in L0, `TaskStore`/`SquadPaths` helpers, the key published to the L0 overlay and read back via `PUBLISHED_KEYS`) closed early. **Step 3 was open through the first review pass** (`api_server.rs` still called `banner::render_api_key_banner` and pushed box-drawing art up as `UserMessage.text`) and was the review's one blocking finding; fixed in `9fa7e3b`: `ApiKeyDisclosure` (L2, one-shot), `ApiServerCommandFrontend::show_api_key` made **required** (not defaulted, so a frontend cannot silently drop the only copy of the key — the same hazard the pre-existing `SquadCommandFrontend::show_key_setup` default has, deliberately not repeated); the CLI draws the box, the TUI and API state the key as text; `banner.rs` deleted. This is also the commit that landed F-57 guard 1 (see below). |
+| F-48 | closed | `1aa5978` | `WorkflowStepTransition`, `CommandStatus`, `WorkflowPhaseTransition`, session `type` and `awman squad env` row `state` are typed enums; no wire value was renamed; `persistence` is now **absent** rather than `""` when no daemon answered (release-noted and documented). |
+| F-49 | closed (deviation) | `d9d58a0` | `CallerContext { path, frontend, local_user }` built once by `Dispatch`; `StatusCommandFrontend::tui_context()`/`SquadCommandFrontend::is_local_user_session()` deleted. Deviation: `tui_context` stays as a live data hook on `CallerContext` rather than disappearing entirely (recorded as deliberate). |
+| F-50 | closed | `39e811e`, `e439f2c` | `CommandFrontend::input_available()` (TTY fact only) feeds `ResolvedFlags::is_non_interactive`; `effective_non_interactive` and the cached CLI field are gone; `CommandCatalogue::frontend_profile(FrontendKind)`; `FrontendKind::SquadDaemon` added to `FrontendVisibility`. `e439f2c` closed four live misses of this pattern the review did not name (`init`'s and `ready`'s remaining `yes_no`-backed prompts, which still tested the TTY directly inside `ask_*` until then). |
+| F-51 | closed (deviation) | `35cbde8`…`d6c85de` (11 commits) | All eleven file-split/typed-status bullets landed; `exec_workflow.rs`, `workflow/mod.rs`, `dispatch/catalogue.rs` and `tui/render/dialog.rs` are now directories (see the scope-drift table below). Deviation: `SQUAD_EDIT`'s flag-array derivation and the `env_state.rs` code split were not done (only its tests were split) — recorded, not silently dropped. One user-visible string collapsed from three wordings to one during the splits (`exec workflow: failed to create worktree: {e}`); release-noted rather than restored, because restoring it would widen `WorktreeName` with a variant the type deliberately does not have. |
+| F-52 | closed | `72c7bf1`, `4558fc0` | `Session::for_tests*`/`IsolatedEnv::engines` replace the 23 `make_session` / 11 `make_engines*` copies (down to 15 / 2 — see metrics; the residue is legitimate per-test fixtures, not duplication of the deleted kind); 0 `todo!()` in production code. The thirteen integration test files that had never compiled (`tests/{async_cancellation,download_integration,headless_integration,init_unification,memory_bounds,modular_dockerfiles,overlays_integration,performance_stress,remote_integration,runtime_integration,shortcuts_0054,terminal_selection,tui_tabs}.rs`) were confirmed dead one-by-one (each given a temporary `[[test]]` entry and `cargo check --test` run against it individually, all thirteen fail at the pre-0072 import surface) and deleted in `4558fc0`. Neither `tui_tabs.rs` nor `download_integration.rs` — the two files this item's own text names as live regression suites — was ever registered or buildable; live TUI tab coverage is `src/frontend/tui/tabs/tests.rs` and `tests/squad_tui_tab.rs`. |
+| F-53 | closed | `9cf0ff2` | `UserMessageSink`'s doc comment now names its own layer as Layer 0, correcting a "Defined by Layer 1" comment. |
+| F-54 | closed (by WI 0113) | — | `SessionManager` used by the API. Nothing was open for 0114. |
+| F-55 | closed | `679e7e1`, `7f79073` | `SquadConfirmAction` deleted; `Dialog::SquadActionConfirm` carries a `Prompt<SquadConfirmDecision>` built by `SquadCommand::confirm_prompt` → `prompts::squad_task_confirm`; the TUI maps `y`/`n` to the choice's `value`; dispatch goes through `CommandCatalogue::action_input`, not a hand-built `ParsedCommandBoxInput`. F-57 guard 2 landed in the same commit (`679e7e1`), pasted, with no allowlist. |
+| F-56 | closed | `f2a3650` | `KeyDisclosure` carries the key, shell and export line with no rendering; the CLI draws the banner (`frontend/cli/per_command/squad.rs`), the TUI shows none. Note: the completing commit is `f2a3650` (tests-audit) because group-g's own work was never committed — do not infer this from `git log --grep=F-56` alone. |
+| F-57 | closed | `679e7e1` (guard 2), `9fa7e3b` (guard 1) | Both guards verified live by this close-out pass directly against `tools/architecture-lint.sh` and by re-running `make architecture-lint` alone (see above): `layer-render` (guard 1, no allowlist — landed in the same commit that cleared F-47 step 3's last hit) and `dispatch-bypass` (guard 2, no allowlist — landed in the same commit that cleared F-55's last hit). Neither guard is commented out and neither allowlist covers a site either guard was meant to forbid. |
+
+### Before / after — Phase 2 metrics
+
+"Before" is `/awman/context/workflow/03-baseline.md`, captured 2026-09-22
+before any 0114 change (297 `.rs` files, 150,956 lines under `src/`,
+`Cargo.toml` still `0.12.0`, no commit hash available in that container).
+"After" is measured today (2026-09-23) at `HEAD` (`ad53bbf`), same container
+family, `cargo 1.94.0`. `src/` is now **356 `.rs` files, 160,623 lines** (+59
+files, +9,667 lines — F-51's splits create new files faster than they delete
+lines; F-33/F-35/F-52 net-delete elsewhere).
+
+**`make architecture-lint`**
+
+| | Before | After |
+|---|---|---|
+| Result | `architecture-lint: OK` | `architecture-lint: OK` |
+| Guards present | Tenet 1 (Layers 0–2), F-12 `#![allow]` guard, WI 0116 keychain-argv guards (2) | Same four, **plus** `env-var` (F-37), `config-load` (F-31), `dispatch-bypass` (F-57 guard 2), `layer-render` (F-57 guard 1) — eight guards total, verified by reading the script |
+
+**`make pre-push`**
+
+| | Before | After |
+|---|---|---|
+| Result | Not run by the planning step (no code changed yet); the WI 0113 close-out could not certify one clean run in its container (zombie/`TooManyLinks` exhaustion) | **exit 0** — 3,493 passed / 0 failed / 1 ignored (the one ignored test is `regenerate_command_reference`, a generator, not a check). Re-run by this close-out pass, verbatim. |
+
+**Scope-drift files (`wc -l`) — the five files the work item's own review flagged as having grown since the report**
+
+| File | Report (2026-09-03) | Baseline (2026-09-22) | After (2026-09-23) |
+|---|---:|---:|---|
+| `src/command/commands/exec_workflow.rs` | 5,943 | 7,195 | **split** into `exec_workflow/` (7 files, 6,510 lines total) |
+| `src/engine/workflow/mod.rs` | 7,622 | 8,154 | **split** into `engine/workflow/` (16 files incl. tests, 11,359 lines total; `mod.rs` itself is 947) |
+| `src/command/dispatch/catalogue.rs` | 3,014 | 3,433 | **split** into `dispatch/catalogue/` (9 files, 3,865 lines total) |
+| `src/frontend/tui/render/dialog.rs` | 1,450 | 1,713 | **split** into `render/dialog/` (5 files, 1,882 lines total) |
+| `src/frontend/tui/squad_indicator.rs` | 232 | 398 | **71** (health/classify logic moved to `engine/squad/supervisor.rs`, 1,146 lines, and `command/commands/squad/supervisor.rs`, 454 lines) |
+
+None of the five is a single file over ~1,500 lines any more; each is now
+several files with one responsibility apiece, per User Story 3 (F-51, F-34,
+F-25, F-17).
+
+**`Command` trait implementations**
+
+| | Before | After |
+|---|---:|---:|
+| `grep -rnE 'impl (Command\|dispatch::Command) for' src/` | 17 | **14** |
+
+Matches F-35's corrected target exactly. The 14: `remote, clean, config,
+ready, specs, status, api_server, init, exec_prompt, chat, exec_workflow,
+squad/attach, squad/commands, new`. `auth`, `download` and the squad-daemon
+sub-commands (`run_start`/`run_stop`/`run_status`/`run_logs`) are gone,
+folded into `InitCommand` (tarball helper) and `SquadCommand` respectively.
+The anchored grep returns 14 exactly; an unanchored `grep -rn` also matches a
+doc-comment line in `exec_workflow/execute.rs` that quotes the impl but is
+not one.
+
+**Per-agent / per-backend tables (F-32)**
+
+| Metric | Before | After |
+|---|---:|---:|
+| `agent.as_str() ==` under `src/engine` | 4 | **0** |
+| `match agent.as_str()` under `src/engine` | 6 tables | **0** (the one remaining hit is a comment in `agent_matrix.rs` naming what it replaced) |
+| `"apple-containers" =>` arms | 6 | **0** |
+
+**Lint suppressions**
+
+| Metric | Before | After |
+|---|---:|---:|
+| `type_complexity` allows | 4 | **0** |
+| All `#[allow(...)]`/`#![allow(...)]` under `src/` | 11 item-level, 0 crate-level | **7** item-level, 0 crate-level |
+
+**F-57 guard pre-counts**
+
+| Guard | Before (baseline pre-count) | After |
+|---|---:|---|
+| Guard 1 (`layer-render`, box-drawing below L3) | 7 hits (`key_setup.rs` ×2, `banner.rs` ×4, `api_server.rs` ×1) | **0 hits, no allowlist** — verified live by reading `tools/architecture-lint.sh` and re-running `make architecture-lint` |
+| Guard 2 (`dispatch-bypass`, hand-built `ParsedCommandBoxInput`) | 15 hits (9 production, 6 test fixtures) | **0 hits, no allowlist** — same verification |
+
+**Config-load discipline (F-31)**
+
+| Metric | Before | After |
+|---|---:|---|
+| `GlobalConfig::load()` / `RepoConfig::load(` outside `src/data/` and `src/command/startup.rs`, production code | 13 sites | **2 sites**, both allowlisted by the `config-load` guard as the one deliberate read each names (`command/dispatch/mod.rs`, `engine/init/mod.rs`) |
+
+**Other Phase 2 metrics**
+
+| Metric | Before | After |
+|---|---:|---:|
+| `pub fn` total under `src/` | 1,194 | 1,358 |
+| … `src/data` / `src/engine` / `src/command` / `src/frontend` | 452 / 302 / 282 / 158 | 497 / 368 / 330 / 163 |
+| `pub struct` per layer (data/engine/command/frontend) | 89 / 132 / 163 / 50 | 100 / 154 / 158 / 51 |
+| `pub trait` per layer (data/engine/command/frontend) | 4 / 14 / 35 / 0 | 4 / 19 / 28 / 0 |
+| `use crate::command::commands` under `src/frontend` | 112 | 115 |
+| `#[ignore]` tests | 8 | **1** (the docs-reference generator; F-52 deleted the dead-file `#[ignore]`s) |
+| `todo!()` in `src/` | 7 | **0** |
+| `fn make_session` copies | 23 | **15** |
+| `fn make_engines*` copies | 11 | **2** |
+| `impl WorkflowFrontend for` (real + fakes) | 14 (6 real incl. the proxy, 8 fakes) | 14 (5 real + a blanket forwarding impl that doesn't match this grep, 9 fakes) |
+| `"6h"` literals outside the catalogue, non-test | 3 | **0** (the catalogue's `FlagDefault::Str("6h")` is the only production value; every other hit is a doc comment or a `Prompt`/test literal) |
+| `reqwest::Client` builders/constructors, non-test | 6 | **2** (`engine/remote/http_core.rs` — the shared client `poll_ci`, `remote_client` and `agent/download.rs` now use — and `engine/issue/github.rs`, documented as the one deliberate holdout) |
+| Re-export shim files (`pub use crate::…::*`, ≤2 lines) | 5 | **0** |
+| Direct `stdin_is_tty()` calls in `src/frontend/cli` | 22 lines (~19 production) | **8** (one definition, the rest resolution/test code) |
+| `pub trait` in `src/command` | 35 | 28 |
+
+### Machine checks re-run at close-out
+
+| Check | Result |
+|---|---|
+| `bash tools/architecture-lint.sh` | `architecture-lint: OK — all imports respect the layering rules`, exit 0 |
+| `make architecture-lint` | Same, exit 0 |
+| `make pre-push` | exit 0 — 3,493 passed / 0 failed / 1 ignored |
+| F-57 guard 1 script read | Live at `tools/architecture-lint.sh:421` (`layer_render_matches=`), no allowlist, not commented out |
+| F-57 guard 2 script read | Live at `tools/architecture-lint.sh:370` (`dispatch_bypass_matches=`), no allowlist, not commented out |
+
+### `aspec/architecture/security.md` and `aspec/architecture/four-layer-summary.md`
+
+Both updated by this close-out pass:
+
+- **`security.md`**: the S1 "Sole exception" bullet now names `HostAgentPinger`
+  (`src/engine/ready/host_agent.rs`) instead of the deleted `ping_local_agent`
+  free function, states it is the only type in awman permitted to spawn an
+  agent binary on the host, and distinguishes it from
+  `engine::daemon::DaemonSupervisor` (the only type permitted to spawn the
+  *daemon* binary — a separate exception, per `13-group-d.md` §7 and
+  `14-group-e.md` §4). Per report decision Q11, a new sanctioned-exception
+  bullet documents the `docker.sock` mount under `--allow-docker` as a
+  deliberate, opt-in widening beyond the current-directory-only mount rule
+  (S2) — a socket, not a directory, off by default, built only by
+  `docker.rs`'s `allow_docker` argv path.
+- **`four-layer-summary.md`**: "What Goes Where" gained `Prompt<D>`/`Choice<D>`
+  under Layer 0 (F-19), `AgentMatrix`/`ContainerBackend` and `HostAgentPinger`
+  under Layer 1 (F-32, F-38), and `CallerContext`, `HeadlessDefaults`,
+  `LaunchPolicy` and `command::prompts` under Layer 2 (F-49, F-13, F-27,
+  F-19) — none of these four named types were documented in this file before
+  0114. "Last Updated" bumped to September 23, 2026 (WI 0114).
+
+### Release notes
+
+`docs/releases/unreleased.md` (committed in `99de7b4`) carries every
+user-visible behaviour change from this item, grouped by what it means for a
+reader rather than by finding number: `chat`/workflow exit-code and status
+parity (F-22, F-42), `--non-interactive` honoured on a TTY (F-50, F-19), a
+malformed `config.json` failing a daemon start instead of silently defaulting
+(F-31), the squad daemon's `authRefresh` going global-only (F-38), `persistence`
+omitted vs. `""` (F-48), interactive prompts no longer self-answering on a
+pipe (F-19/F-50), GitHub remote-URL matching widened (pre-existing fix folded
+in), the repo-local git identity fix (F-39), nested "did you mean" (F-43), a
+remote session's tab colour fix, the setup/teardown failure-file parity
+(F-34), the TUI command box matching the API's validation (F-26), typed wire
+enums with no renamed values (F-48), one `ready` summary everywhere, the
+API-key and squad-key banners drawn per frontend instead of as shared
+box-drawing text (F-47, F-56), the mount-scope/workspace/Dockerfile prompts
+reading the same in the CLI and the TUI (F-19), one worktree-creation failure
+message (F-51 note 12), and the "INTERACTIVE mode" banner's removal (F-15,
+Q6). A "Known issues" section states the antigravity host-ping name mismatch
+(F-32) rather than shipping it silently. `docs/07-configuration.md` documents
+`authRefresh`'s new global-only scope for the squad daemon.
+
+### Residue not owned by close-out (recorded, not re-litigated)
+
+The following are named in `50-final-review.md` notes 15–22 and confirmed
+still true at `HEAD`; none is this item's to fix and each is recorded so the
+next audit does not re-derive it: commit hygiene on seven pre-existing
+cross-layer commits with no `architecture-lint` paste (history, not
+reversible without a rewrite); process gaps in group-b and group-g, which
+wrote no handoff files; Windows and macOS unverified by a real cross-compiled
+build in this container (`rustup target add` dies in `aws-lc-sys`); no
+container-gated test path exercised (no Docker daemon in this container);
+four pre-existing Tenet 2 shapes flagged "for the next audit" at baseline
+`91e00af` (the CLI's `exec workflow` fast path bypassing `Dispatch::admit`,
+`ApiDispatchFrontend`'s no-op `show_key_setup`, `error_exit_code`, the
+`CardStatus` precedence table); four developer decisions pending in
+`assumptions.md` (`HeadlessDefaults::cli()` as a third profile, `ready_agent`
+returning `UnsupportedOnRuntime`, the antigravity ping name, `authRefresh`
+global-only); midpoint note 26 (two wire fields still typed as `String`); and
+F-55's argument-key round-trip test being vacuous by construction until a
+second squad subcommand argument exists.
+
+All should-fix and blocking findings from the adversarial review are FIXED.
+Nothing was rejected in remediation; F-37 step 3 is this item's only
+rejected(-superseded) step, and it was rejected at the work-item-review stage
+(2026-09-22), not during remediation.

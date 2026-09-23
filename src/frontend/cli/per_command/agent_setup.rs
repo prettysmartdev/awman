@@ -1,8 +1,7 @@
 //! `AgentSetupFrontend` impl for the CLI.
 //!
-//! The safe non-interactive default is
-//! `Setup` (proceed with download/build). The CLI prompts on stdin only
-//! when stdin is a TTY; otherwise it returns the safe default.
+//! The CLI prompts on stdin only when stdin is a TTY; otherwise it returns the
+//! CLI profile's answer from `src/command/headless.rs`.
 
 use crate::command::commands::agent_setup::{AgentSetupDecision, AgentSetupFrontend};
 use crate::command::error::CommandError;
@@ -10,7 +9,6 @@ use crate::data::message::{MessageLevel, UserMessageSink};
 use crate::data::session::AgentName;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
-use crate::frontend::cli::output::stdin_is_tty;
 
 impl AgentSetupFrontend for CliFrontend {
     fn ask_agent_setup(
@@ -20,8 +18,8 @@ impl AgentSetupFrontend for CliFrontend {
         default_available: bool,
         image_only: bool,
     ) -> Result<AgentSetupDecision, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(AgentSetupDecision::Setup);
+        if self.non_interactive {
+            return Ok(self.headless.agent_setup(default_available));
         }
         let action = if image_only {
             format!("Build image for {}", requested.as_str())

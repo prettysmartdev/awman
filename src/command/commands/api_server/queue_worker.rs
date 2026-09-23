@@ -6,7 +6,9 @@ use std::sync::Arc;
 use super::event_bus::EventBus;
 use super::runtime::ApiSessionLifecycle;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
-use crate::data::execution_event::EventPayload;
+use crate::data::execution_event::{
+    CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
+};
 use crate::data::fs::api_command_log::CommandLogWriter;
 use crate::data::fs::api_db::{CommandRecord, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
@@ -382,8 +384,8 @@ fn spawn_tracing_subscriber(
                         step_index,
                         from_status,
                         to_status,
-                    } => match to_status.as_str() {
-                        "failed" => tracing::error!(
+                    } => match to_status {
+                        StepStatusKind::Failed => tracing::error!(
                             command_id = %command_id,
                             session_id = %session_id,
                             subcommand = %subcommand,
@@ -393,7 +395,7 @@ fn spawn_tracing_subscriber(
                             to = %to_status,
                             "Workflow step failed"
                         ),
-                        "cancelled" | "skipped" => tracing::warn!(
+                        StepStatusKind::Cancelled | StepStatusKind::Skipped => tracing::warn!(
                             command_id = %command_id,
                             session_id = %session_id,
                             subcommand = %subcommand,
@@ -419,7 +421,10 @@ fn spawn_tracing_subscriber(
                         step_desc,
                         status,
                     } => {
-                        if status == "failed" {
+                        if matches!(
+                            status,
+                            PhaseStatusKind::Failed | PhaseStatusKind::TeardownFailed
+                        ) {
                             tracing::error!(
                                 command_id = %command_id,
                                 session_id = %session_id,
@@ -445,8 +450,8 @@ fn spawn_tracing_subscriber(
                         status,
                         exit_code,
                         error,
-                    } => match status.as_str() {
-                        "done" => tracing::info!(
+                    } => match status {
+                        CommandStatusKind::Done => tracing::info!(
                             command_id = %command_id,
                             session_id = %session_id,
                             subcommand = %subcommand,

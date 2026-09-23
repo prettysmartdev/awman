@@ -442,6 +442,13 @@ task(s) that need it, and is omitted entirely once nothing is unmet.
 | `--clear` | Remove whatever the daemon has persisted to the OS keychain. Leaves the running daemon's in-memory values untouched — see [Persisting values across a restart](#persisting-values-across-a-restart) below. |
 | `--json` | Machine-readable output, same envelope as `list`/`show`/`status`. |
 
+In `--json` output, each row's `state` is `"set"` or `"unmet"` (the wire form
+of the `✓`/`⚠` glyphs above), and the header's `persistence` field is the
+`--clear`/keychain state described below. If no daemon could be reached to
+answer at all, `persistence` is omitted from the JSON entirely rather than
+sent as `""` — the two are not the same thing: `""` would mean "asked, got
+nothing back," where an absent field means "couldn't ask."
+
 `--push` re-sends every required name your shell has and re-reads the table,
 so a row you just fixed shows the update immediately:
 
@@ -1121,10 +1128,30 @@ The snippet is tailored to your shell: zsh gets `~/.zshrc`, bash gets
 `~/.bashrc`, and fish gets `set -gx AWMAN_SQUAD_KEY …` for
 `~/.config/fish/config.fish`.
 
-In the TUI this appears as a modal, whose text can't be selected with the
-mouse. Press `c` to copy just the key to the clipboard, or `z` to copy the
-shell snippet (e.g. `export AWMAN_SQUAD_KEY=…`) — either can be pressed as
-many times as you like before dismissing the modal with `Enter`.
+The box-drawn banner above is the CLI's own rendering; the daemon itself only
+ever hands a frontend the key, the shell, and the export line, and each
+frontend draws them its own way. In the TUI this appears as a modal in the
+TUI's own dialog style (no box-drawing characters — the modal's border is
+the frame), whose text can't be selected with the mouse:
+
+```
+╭ squad authentication ────────────────────────────────────────────────╮
+│                                                                       │
+│  squad API key (store this — it will not be shown again):            │
+│                                                                       │
+│    954ec30c6719074e0ea952588461d079f97675424b8ecb53b5cbe76a9f06c96b  │
+│                                                                       │
+│  Add this to ~/.zshrc so the awman CLI and TUI can authenticate to    │
+│  squad:                                                               │
+│                                                                       │
+│    export AWMAN_SQUAD_KEY=954ec30c6719074e0ea952588461d079f97675424… │
+│                                                                       │
+╰───────────────────────────────────────────────────────────────────────╯
+```
+
+Press `c` to copy just the key to the clipboard, or `z` to copy the shell
+snippet (e.g. `export AWMAN_SQUAD_KEY=…`) — either can be pressed as many
+times as you like before dismissing the modal with `Enter`.
 
 ### When the key is missing
 

@@ -18,6 +18,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::TraceLayer;
 
 use crate::command::commands::api_server::event_bus::EventBus;
+use crate::command::commands::api_server::session_setup::{
+    log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
+};
 pub use crate::command::commands::api_server::AuthMode;
 use crate::command::commands::api_server::{ApiSessionLifecycle, CloseOutcome, SetupReadiness};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
@@ -25,19 +28,16 @@ use crate::command::error::CommandError;
 use crate::command::session_create::{
     SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest,
 };
-use crate::command::session_setup::{SessionSetup, SessionSetupObserver};
+use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
+use crate::data::fs::api_db::NewSessionRow;
 use crate::data::fs::api_db::{SessionCommandAdmission, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
-use crate::data::message::UserMessageSink;
-use crate::data::ready_summary::ReadySummary;
-use crate::data::session::Session;
 use crate::data::session_manager::SessionManager;
-use crate::data::session_setup_event::{SessionSetupStatus, SetupEventPayload};
+use crate::data::session_setup_event::SessionSetupStatus;
+use crate::data::session_setup_event::SetupEventPayload;
+use crate::engine::git::GitFrontend;
 use crate::engine::ready::frontend::ReadyFrontend;
-use crate::frontend::api::session_setup::{
-    log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
-};
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
@@ -223,9 +223,11 @@ async fn auth_middleware(
 ) -> Response {
     // State extraction only: the decision itself lives in one shared place so
     // the API and squad daemons can never diverge on how a key is accepted.
-    if let Some(rejection) =
-        crate::frontend::api::serve::check_bearer_auth(&state.auth_mode, req.headers())
-    {
+    if let Some(rejection) = crate::frontend::api::serve::check_bearer_auth(
+        &state.engines.auth_engine,
+        &state.auth_mode,
+        req.headers(),
+    ) {
         return rejection;
     }
     next.run(req).await
@@ -294,17 +296,19 @@ async fn handle_create_session(
     // the setup task. If the server restarts mid-setup we want the cleanup
     // pass to find this session as non-terminal even if no setup_state.json
     // was written yet.
-    if let Err(e) = state.store.insert_session_full(
-        &session_id,
-        &plan.resolved_workdir.to_string_lossy(),
-        &created_at,
-        "initializing",
-        &plan.session_type,
-        plan.cloned_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .as_deref(),
-    ) {
+    let workdir = plan.resolved_workdir.to_string_lossy().into_owned();
+    let cloned_path = plan
+        .cloned_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    if let Err(e) = state.store.insert_session_full(NewSessionRow {
+        id: &session_id,
+        workdir: &workdir,
+        created_at: &created_at,
+        setup_status: SessionSetupStatus::Initializing,
+        kind: plan.kind,
+        cloned_path: cloned_path.as_deref(),
+    }) {
         tracing::error!(error = %e, "Failed to insert session");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -322,7 +326,7 @@ async fn handle_create_session(
 
     tracing::info!(
         session_id = %session_id,
-        session_type = %plan.session_type,
+        session_type = %plan.kind,
         workdir = %plan.resolved_workdir.display(),
         "Session created (setup starting)"
     );
@@ -340,12 +344,13 @@ async fn handle_create_session(
         .into_response()
 }
 
-/// Drive the Layer 2 [`SessionSetup`] orchestrator, supplying an
-/// [`ApiSessionSetupObserver`] that renders each step onto the session-setup
-/// event bus, persists the setup status, registers the opened session, and
-/// vends the ready-checks frontend. All setup *behavior* — clone/branch
-/// sequencing and the remote-clone failure-cleanup rule — lives in Layer 2;
-/// this frontend only maps that behavior onto its transport and state.
+/// Drive the Layer 2 [`SessionSetup`] orchestrator with an
+/// [`ApiSessionSetupPresenter`]. Every setup *behaviour* — clone/branch
+/// sequencing, the remote-clone failure-cleanup rule, the status column, the
+/// `setup_state.json` snapshot and every `SessionSetupState` transition — is
+/// Layer 2's or Layer 0's (WI 0114 F-41). This frontend supplies the bus the
+/// events are broadcast on, the log they are mirrored to, and the ready
+/// frontend, and nothing else.
 async fn run_session_setup(
     state: Arc<AppState>,
     session_id: String,
@@ -357,78 +362,43 @@ async fn run_session_setup(
         plan,
         state.engines.clone(),
         Arc::clone(&state.sessions),
+        Arc::clone(&setup_bus.current_state),
+        Arc::clone(&state.store),
+        state.paths.clone(),
     );
-    let mut observer = ApiSessionSetupObserver {
+    let mut presenter = ApiSessionSetupPresenter {
         bus_sender: setup_bus.sender(),
         setup_bus,
         state,
         session_id,
+        verbose_setup: crate::data::config::env::Env::from_process().api_verbose_setup(),
     };
-    setup.run(&mut observer).await;
+    setup.run(&mut presenter).await;
 }
 
-/// API-frontend implementation of the Layer 2 [`SessionSetupObserver`]. Owns the
-/// event-bus, status-persistence, in-memory session map, and ready-frontend
-/// glue that is inherently API-mode presentation/state.
-struct ApiSessionSetupObserver {
+/// API-frontend implementation of the Layer 2 [`SessionSetupPresenter`]: the
+/// session-setup broadcast bus, the session-tagged log, and the ready-checks
+/// frontend. It persists nothing and decides nothing.
+struct ApiSessionSetupPresenter {
     state: Arc<AppState>,
     session_id: String,
     setup_bus: Arc<SessionSetupBus>,
     bus_sender: SessionSetupBusSender,
+    /// Whether per-session setup lines are logged at `info` or `debug`.
+    /// Read once from the Layer 0 snapshot when the presenter is built; Layer
+    /// 0 owns `AWMAN_API_VERBOSE_SETUP` and nothing above it reads the
+    /// environment directly (F-37).
+    verbose_setup: bool,
 }
 
 #[async_trait::async_trait]
-impl SessionSetupObserver for ApiSessionSetupObserver {
-    fn enter_status(&mut self, status: SessionSetupStatus) {
-        let persisted = status.as_str();
-        self.bus_sender.update_status(status);
-        let _ = self
-            .state
-            .store
-            .update_setup_status(&self.session_id, persisted);
-    }
-
-    fn set_stage(&mut self, message: &str) {
-        self.bus_sender.update_stage(message);
-    }
-
-    fn stage_changed(&mut self, stage: &str, message: &str) {
-        self.bus_sender.emit(SetupEventPayload::StageChanged {
-            stage: stage.to_string(),
-            message: message.to_string(),
-        });
-    }
-
-    fn mark_failed(&mut self, stage: &str, error: &str) {
-        self.bus_sender.mark_failed(stage, error);
-        self.bus_sender.emit(SetupEventPayload::SetupFailed {
-            stage: stage.to_string(),
-            error: error.to_string(),
-        });
-    }
-
-    fn set_ready(&mut self, summary: &ReadySummary) {
-        self.bus_sender.set_ready(summary.clone());
-        self.bus_sender.emit(SetupEventPayload::SetupComplete {
-            ready_summary: Box::new(summary.clone()),
-        });
-    }
-
-    fn persist_status(&mut self, status: &str) {
-        let _ = self
-            .state
-            .store
-            .update_setup_status(&self.session_id, status);
-    }
-
+impl SessionSetupPresenter for ApiSessionSetupPresenter {
     fn log(&mut self, line: &str) {
-        log_session_setup(&self.session_id, line);
+        log_session_setup(&self.session_id, self.verbose_setup, line);
     }
 
-    async fn register_session(&mut self, _session: Arc<tokio::sync::RwLock<Session>>) {
-        if self.state.sessions.get_by_key(&self.session_id).is_none() {
-            tracing::error!(session_id = %self.session_id, "SessionSetup did not register its session");
-        }
+    fn emit(&mut self, event: SetupEventPayload) {
+        self.bus_sender.emit(event);
     }
 
     fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
@@ -439,37 +409,23 @@ impl SessionSetupObserver for ApiSessionSetupObserver {
             &self.session_id,
             self.setup_bus.sender(),
             event_bus.sender(),
+            self.verbose_setup,
         ))
     }
 
-    fn git_log_sink(&mut self) -> Box<dyn UserMessageSink + Send> {
-        Box::new(TracingSetupSink::new(&self.session_id))
+    fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
+        Box::new(TracingSetupSink::new(&self.session_id, self.verbose_setup))
     }
 
-    async fn persist_and_cleanup(&mut self) {
-        persist_setup_state(&self.state, &self.session_id, &self.setup_bus).await;
-        cleanup_setup_bus(
-            Arc::clone(&self.state),
-            self.session_id.clone(),
-            Arc::clone(&self.setup_bus),
-        )
-        .await;
+    async fn finished(&mut self) {
+        cleanup_setup_bus(Arc::clone(&self.state), self.session_id.clone()).await;
     }
 }
 
-async fn persist_setup_state(state: &AppState, session_id: &str, setup_bus: &SessionSetupBus) {
-    let setup_state = setup_bus.snapshot();
-    if let Err(e) = state.paths.save_setup_state(session_id, &setup_state) {
-        tracing::error!(session_id = %session_id, error = %e, "Failed to persist setup_state.json");
-    }
-}
-
-async fn cleanup_setup_bus(
-    state: Arc<AppState>,
-    session_id: String,
-    _setup_bus: Arc<SessionSetupBus>,
-) {
-    // Retain the setup bus for 60 seconds after reaching terminal state.
+/// Retain the setup bus for 60 seconds after the run reaches a terminal state,
+/// so a client that polls or subscribes just after completion still sees the
+/// final events, then drop it.
+async fn cleanup_setup_bus(state: Arc<AppState>, session_id: String) {
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     state.setup_buses.lock().await.remove(&session_id);
 }
@@ -675,9 +631,9 @@ async fn handle_create_command(
     // Validate the command shape against the catalogue BEFORE touching session
     // state. Both checks below are request-shape (400-class) errors derived
     // entirely from the command catalogue — no per-command logic in the route.
+    let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
     {
         let catalogue = CommandCatalogue::get();
-        let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
 
         // (1) The command must be reachable via the API frontend.
         if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
@@ -817,10 +773,15 @@ async fn handle_create_command(
         "Command enqueued"
     );
 
-    let flags_applied = serde_json::json!({
-        "yolo": true,
-        "non_interactive": true,
-    });
+    // The profile's own account of itself, not a restatement of it (F-50).
+    // Serialised with the underscore spelling the response has always used.
+    let flags_applied = serde_json::Value::Object(
+        CommandCatalogue::get()
+            .frontend_profile(FrontendKind::Api, &path_parts)
+            .into_iter()
+            .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
+            .collect(),
+    );
 
     (
         StatusCode::ACCEPTED,
@@ -1313,6 +1274,23 @@ async fn handle_get_workflow(
     }
 }
 
+/// One `FlagDefault` as the JSON a client sees in `flags_applied`.
+///
+/// Rendering only — the values themselves come from the catalogue's frontend
+/// profile (WI 0114 F-50).
+fn flag_default_json(
+    value: &crate::command::dispatch::catalogue::FlagDefault,
+) -> serde_json::Value {
+    use crate::command::dispatch::catalogue::FlagDefault;
+    match value {
+        FlagDefault::Bool(b) => serde_json::Value::Bool(*b),
+        FlagDefault::Str(s) => serde_json::Value::String((*s).to_string()),
+        FlagDefault::U16(n) => serde_json::Value::from(*n),
+        FlagDefault::EmptyVec => serde_json::Value::Array(Vec::new()),
+        FlagDefault::None => serde_json::Value::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,8 +1337,7 @@ mod tests {
             AuthPathResolver::at_home(tmp),
             paths.clone(),
         ));
-        let workflow_state_store =
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(tmp));
+        let workflow_state_store = Arc::new(crate::data::WorkflowStateStore::at_git_root(tmp));
         let engines = Engines {
             runtime: runtime.clone(),
             container_runtime: Some(runtime),
@@ -1370,6 +1347,8 @@ mod tests {
             auth_engine,
             agent_engine,
             workflow_state_store,
+            credential_monitor: None,
+            global_config: std::sync::Arc::new(Default::default()),
         };
         Arc::new(AppState {
             store,

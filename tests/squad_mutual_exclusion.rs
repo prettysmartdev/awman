@@ -24,9 +24,9 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Barrier};
 
 use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
-use awman::data::error::DataError;
-use awman::data::fs::daemon_guard::{DaemonGuard, DaemonKind};
 use awman::data::fs::{ApiPaths, SquadPaths};
+use awman::engine::daemon::{DaemonGuard, DaemonKind, DaemonSupervisor};
+use awman::engine::error::EngineError;
 
 /// `AWMAN_CONFIG_HOME` is scoped to a fixture too: `DaemonGuard`'s shared
 /// startup-arbitration lock lives beside the shared database, and a test must
@@ -90,7 +90,7 @@ impl FakeAwmanProcess {
         let mut child = child;
         let pid = child.id();
         for _ in 0..500 {
-            if awman::data::fs::daemon_process::pid_is_awman(pid) {
+            if DaemonSupervisor::pid_is_awman(pid) {
                 return Self { _dir: dir, child };
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -129,7 +129,7 @@ fn squad_running_blocks_api_start() {
         .check()
         .expect_err("starting awman api while squad is running must be refused");
     assert!(
-        matches!(&err, DataError::Other(msg) if msg.contains("squad")),
+        matches!(&err, EngineError::Other(msg) if msg.contains("squad")),
         "error must name the squad daemon: {err}"
     );
 
@@ -151,7 +151,7 @@ fn api_running_blocks_squad_start() {
         .check()
         .expect_err("starting the squad daemon while awman api is running must be refused");
     assert!(
-        matches!(&err, DataError::Other(msg) if msg.contains("awman api")),
+        matches!(&err, EngineError::Other(msg) if msg.contains("awman api")),
         "error must name awman api: {err}"
     );
     assert!(
@@ -269,13 +269,12 @@ fn concurrent_start_race_produces_exactly_one_winner_every_time() {
 
 use awman::command::commands::squad::commands::SquadCommandFrontend;
 use awman::command::commands::squad::daemon::{
-    SquadDaemonCommand, SquadDaemonSubcommand, SquadStartFlags,
+    SquadDaemon, SquadDaemonSubcommand, SquadStartFlags,
 };
-use awman::command::commands::Command as AwmanCommand;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
 use awman::data::message::{UserMessage, UserMessageSink};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -318,12 +317,14 @@ fn engines_at(root: &Path) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 
 /// Scope the process environment to an isolated fixture for the duration of a
-/// call, then restore it. `SquadDaemonCommand` reads `Env::from_process()`.
+/// call, then restore it. `SquadDaemon` reads `Env::from_process()`.
 struct ScopedEnv(Vec<(&'static str, Option<String>)>);
 
 impl ScopedEnv {
@@ -373,7 +374,7 @@ async fn a_live_api_daemon_stops_squad_startup_before_any_store_pidfile_or_port(
         (AWMAN_CONFIG_HOME, home.path()),
     ]);
 
-    let command = SquadDaemonCommand::new(
+    let command = SquadDaemon::new(
         SquadDaemonSubcommand::Start(SquadStartFlags {
             port: 0,
             background: false,
@@ -382,7 +383,8 @@ async fn a_live_api_daemon_stops_squad_startup_before_any_store_pidfile_or_port(
         }),
         engines_at(home.path()),
     );
-    let error = AwmanCommand::run_with_frontend(command, Box::new(NeverServesFrontend))
+    let error = command
+        .run(&mut NeverServesFrontend)
         .await
         .expect_err("squad must refuse to start while awman api is running");
 

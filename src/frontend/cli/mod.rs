@@ -11,16 +11,14 @@
 //! lives in Layer 2.
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::ArgMatches;
-use tokio::sync::RwLock;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::{BuiltCommand, Dispatch, Engines};
+use crate::command::dispatch::catalogue::CommandCatalogue;
+use crate::command::dispatch::{BuiltCommand, Dispatch, RuntimeContext};
 use crate::command::error::CommandError;
 use crate::command::CommandOutcome;
-use crate::data::session::Session;
 
 mod command_frontend;
 mod output;
@@ -30,25 +28,6 @@ mod user_message;
 
 pub use command_frontend::{command_path_from_matches, CliFrontend};
 pub use parallel::CliParallelFrontend;
-
-/// Bundle of state that `main.rs` constructs once at startup and hands to
-/// either [`run`] (CLI path) or [`crate::frontend::tui::run`] (TUI path).
-///
-/// The same engines and session are reused regardless of which frontend
-/// runs; only the `Dispatch` wrapper differs.
-pub struct RuntimeContext {
-    pub session: Arc<RwLock<Session>>,
-    pub engines: Engines,
-}
-
-impl RuntimeContext {
-    pub fn new(session: Session, engines: Engines) -> Self {
-        Self {
-            session: Arc::new(RwLock::new(session)),
-            engines,
-        }
-    }
-}
 
 /// Entry point for the CLI frontend.
 ///
@@ -100,13 +79,22 @@ fn render_error_for_mode(error: &CommandError, json: bool) -> ExitCode {
     }
 }
 
-/// True exactly for the TTY form of bare `awman squad`, which main.rs opens in
-/// the TUI. JSON implies non-interactive and therefore never takes this path.
-pub fn is_bare_squad_tui_invocation(matches: &ArgMatches) -> bool {
-    command_path_from_matches(matches) == ["squad"]
+/// True for the TTY form of a bare command that has a TUI form, which main.rs
+/// opens in the TUI.
+///
+/// Which commands those are is the catalogue's fact
+/// ([`CommandCatalogue::opens_tui_when_bare`]); this keeps only the two facts
+/// about *this invocation* that a frontend is the right place to read — is
+/// stdin a terminal, and did the user ask for non-interactive output.
+/// `--json` implies `--non-interactive` through the catalogue's own `implies`
+/// edge, which `CliFrontend::explicit_non_interactive` resolves, so this no
+/// longer spells that rule out a second time.
+pub fn is_bare_tui_invocation(matches: &ArgMatches) -> bool {
+    let path = command_path_from_matches(matches);
+    let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+    CommandCatalogue::get().opens_tui_when_bare(&path_refs)
         && output::stdin_is_tty()
-        && !per_command::squad::squad_flag(matches, "non-interactive")
-        && !per_command::squad::squad_flag(matches, "json")
+        && !CliFrontend::explicit_non_interactive(matches, &path)
 }
 
 /// Format a successful [`CommandOutcome`] to user-facing stdout text.
@@ -129,11 +117,13 @@ pub(crate) fn format_outcome(outcome: &CommandOutcome, json: bool) -> Option<Str
 pub(crate) fn format_error(err: &CommandError) -> String {
     let body = match err {
         CommandError::Aborted => "command aborted by user".to_string(),
-        CommandError::UnknownCommand { path } => {
-            format!(
-                "unknown command: {}\n  try `awman --help` for the full command list",
-                path.join(" ")
-            )
+        CommandError::UnknownCommand { path, suggestions } => {
+            let mut body = format!("unknown command: {}", path.join(" "));
+            if let Some(nearest) = suggestions.first() {
+                body.push_str(&format!("\n  did you mean `awman {nearest}`?"));
+            }
+            body.push_str("\n  try `awman --help` for the full command list");
+            body
         }
         CommandError::UnknownFlag { command, flag } => {
             format!(
@@ -248,6 +238,25 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             format!("workflow file not found: {}", path.display())
         }
         CommandError::Engine(e) => match e {
+            // The five remote-transport variants have Layer 2 twins, and
+            // `From<EngineError> for CommandError` maps them onto those, so `?`
+            // never lands here. A directly-constructed `Engine(Remote*)` still
+            // renders exactly like its twin above.
+            crate::engine::error::EngineError::RemoteTimeout => {
+                "remote request timed out".into()
+            }
+            crate::engine::error::EngineError::RemoteConnectionRefused(reason) => {
+                format!("remote connection refused: {reason}")
+            }
+            crate::engine::error::EngineError::RemoteHttpStatus { status, body } => {
+                format!("remote returned HTTP {status}: {body}")
+            }
+            crate::engine::error::EngineError::MalformedSseEvent(msg) => {
+                format!("malformed SSE event from remote: {msg}")
+            }
+            crate::engine::error::EngineError::RemoteTransport(msg) => {
+                format!("remote transport error: {msg}")
+            }
             crate::engine::error::EngineError::UnknownRuntime { value, valid } => format!(
                 "invalid runtime '{value}' in global config ($HOME/.awman/config.json); \
                  valid values: {valid}"
@@ -272,6 +281,12 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             }
             crate::engine::error::EngineError::Sandbox(msg) => {
                 format!("sandbox backend error: {msg}")
+            }
+            crate::engine::error::EngineError::UnsupportedOnRuntime { runtime, operation } => {
+                format!(
+                    "{operation} is not supported on the {runtime} runtime; \
+                     change `runtime` in the global config to one that provides it"
+                )
             }
             crate::engine::error::EngineError::OptionVariantMismatch { runtime, got } => format!(
                 "runtime {runtime} was given {got}-paradigm options; this indicates a Layer 2 dispatch bug"
@@ -485,6 +500,7 @@ mod tests {
         let usage_errors: &[CommandError] = &[
             CommandError::UnknownCommand {
                 path: path(&["bogus"]),
+                suggestions: Vec::new(),
             },
             CommandError::UnknownFlag {
                 command: path(&["init"]),
@@ -561,6 +577,70 @@ mod tests {
         assert!(m.subcommand_name().is_none());
     }
 
+    /// The squad daemon serves the squad subtree and nothing else, and the
+    /// catalogue is what says so (F-50).
+    #[test]
+    fn the_squad_daemon_frontend_admits_only_the_squad_subtree() {
+        use crate::command::dispatch::catalogue::FrontendKind;
+        let catalogue = CommandCatalogue::get();
+        assert!(catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &["squad", "list"]));
+        for outside in [
+            vec!["exec", "workflow"],
+            vec!["ready"],
+            vec!["chat"],
+            vec!["status"],
+        ] {
+            assert!(
+                !catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &outside),
+                "{outside:?} is outside the squad subtree"
+            );
+        }
+        // A squad leaf the API itself refuses (interactive/PTY) is refused
+        // here too: `SquadDaemon` narrows the API profile, it does not widen
+        // it.
+        assert!(!catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &["squad", "attach"]));
+    }
+
+    /// Which commands have a bare TUI form is the catalogue's fact, so
+    /// renaming one cannot leave a stale literal in this module.
+    #[test]
+    fn the_catalogue_names_the_commands_with_a_bare_tui_form() {
+        let catalogue = CommandCatalogue::get();
+        assert!(catalogue.opens_tui_when_bare(&["squad"]));
+        for other in ["status", "ready", "init", "clean", "config"] {
+            assert!(
+                !catalogue.opens_tui_when_bare(&[other]),
+                "{other} has no bare TUI form"
+            );
+        }
+        // A subcommand of one that does is still a plain CLI command.
+        assert!(!catalogue.opens_tui_when_bare(&["squad", "list"]));
+        assert!(!catalogue.opens_tui_when_bare(&[]));
+    }
+
+    /// `--json` implies `--non-interactive`, so a `--json` invocation never
+    /// opens the TUI even though it is otherwise the bare form. This module
+    /// used to re-check `--json` itself; it now goes through the one resolver.
+    #[test]
+    fn json_and_non_interactive_both_keep_bare_squad_in_the_cli() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        for argv in [
+            vec!["awman", "squad", "--json"],
+            vec!["awman", "squad", "--non-interactive"],
+        ] {
+            let m = cmd.clone().try_get_matches_from(&argv).unwrap();
+            let path = command_path_from_matches(&m);
+            assert!(
+                CliFrontend::explicit_non_interactive(&m, &path),
+                "{argv:?} must resolve to non-interactive"
+            );
+            assert!(
+                !is_bare_tui_invocation(&m),
+                "{argv:?} must not open the TUI"
+            );
+        }
+    }
+
     #[test]
     fn render_outcome_empty_is_success() {
         let outcome = crate::command::CommandOutcome::Empty;
@@ -610,6 +690,7 @@ mod tests {
             CommandError::Other("boom".into()),
             CommandError::UnknownCommand {
                 path: vec!["bad".into()],
+                suggestions: Vec::new(),
             },
         ];
         for err in errors {
@@ -634,11 +715,26 @@ mod tests {
     fn format_error_unknown_command_includes_path() {
         let err = CommandError::UnknownCommand {
             path: vec!["foo".into(), "bar".into()],
+            suggestions: Vec::new(),
         };
         let s = format_error(&err);
         assert!(
             s.contains("foo") || s.contains("bar"),
             "UnknownCommand error should include the path: {s:?}"
+        );
+    }
+
+    /// Rendering only: the catalogue decides what the near misses are.
+    #[test]
+    fn format_error_unknown_command_renders_a_suggestion_when_given_one() {
+        let err = CommandError::UnknownCommand {
+            path: vec!["exec".into(), "wrkflow".into()],
+            suggestions: vec!["exec workflow".into()],
+        };
+        let s = format_error(&err);
+        assert!(
+            s.contains("did you mean `awman exec workflow`?"),
+            "a suggestion must render as a runnable command line: {s:?}"
         );
     }
 

@@ -19,4 +19,4 @@ pub use protocol::{
     PermissionDecision, PermissionOption, PermissionRequest, PlanEntry, PromptResponse,
     SessionUpdate, ToolCall, ToolCallUpdate,
 };
-pub use session::AcpSession;
+pub use session::{AcpSession, PermissionPolicy};

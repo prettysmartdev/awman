@@ -8,9 +8,12 @@
 pub mod commands;
 pub mod dispatch;
 pub mod error;
+pub mod headless;
+pub mod prompts;
 pub mod session_create;
 pub mod session_setup;
 pub mod startup;
+pub mod stats_sampler;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{
@@ -21,5 +24,5 @@ pub use error::CommandError;
 pub use session_create::{
     SessionCreatePlan, SessionCreatePolicy, SessionCreateRequest, DEFAULT_REPO_URL_SCHEMES,
 };
-pub use session_setup::{SessionSetup, SessionSetupObserver};
+pub use session_setup::{SessionSetup, SessionSetupPresenter};
 pub use startup::{Startup, StartupOutcome};

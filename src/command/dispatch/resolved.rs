@@ -15,9 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::dispatch::catalogue::{
-    ArgumentKind, ArgumentSpec, CommandSpec, FlagDefault, FlagKind, FlagSpec,
+    ArgumentKind, ArgumentSpec, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendKind,
 };
 use crate::command::dispatch::{CommandFrontend, Engines};
 use crate::command::error::CommandError;
@@ -165,6 +167,28 @@ impl ResolvedFlags {
         self.supplied.contains(name)
     }
 
+    /// Whether the command declares `name` at all.
+    ///
+    /// The value getters panic on an undeclared flag on purpose — a
+    /// constructor asking for a flag its own command does not have is a bug.
+    /// [`ResolvedFlags::unattended`] asks a question *across* commands, most
+    /// of which declare neither flag, so it needs this instead.
+    fn declared(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+    }
+
+    /// Whether this invocation runs without a human answering the agent's
+    /// permission prompts — `--yolo` (skip them) or `--auto` (approve them).
+    ///
+    /// The single answer to "is this run unattended". The TUI used to
+    /// recompute it as `yolo || auto` off the raw parsed input, which is a
+    /// Layer 2 decision spelled in Layer 3: add a third flag with the same
+    /// meaning and the tab indicator silently stops tracking it. A command
+    /// that declares neither flag is never unattended.
+    pub fn unattended(&self) -> bool {
+        (self.declared("yolo") && self.bool("yolo")) || (self.declared("auto") && self.bool("auto"))
+    }
+
     /// Resolve every flag `spec` declares against `frontend`.
     ///
     /// The order is load-bearing: read, then validate mutual exclusions
@@ -197,7 +221,39 @@ impl ResolvedFlags {
             supplied,
         };
         resolved.validate_conflicts(command_path, spec.flags)?;
-        Ok(resolved.close_over_implications(spec.flags))
+        let mut resolved = resolved.close_over_implications(spec.flags);
+        resolved.apply_non_interactive_rule(spec, frontend.input_available());
+        Ok(resolved)
+    }
+
+    /// The one non-interactive rule: an invocation is non-interactive when the
+    /// user asked for it (directly, or through a flag that implies it) **or**
+    /// when there is nowhere to read an answer from.
+    ///
+    /// Before WI 0114 F-50 this was `frontend::effective_non_interactive` in
+    /// Layer 3, called once by the CLI to cache its own copy and re-derived
+    /// per-`ask_*` elsewhere, so a command could believe it was interactive
+    /// while its frontend believed the opposite.
+    pub fn is_non_interactive(explicitly_requested: bool, input_available: bool) -> bool {
+        explicitly_requested || !input_available
+    }
+
+    /// Apply [`is_non_interactive`](Self::is_non_interactive) to this
+    /// command's `non-interactive` flag, if it declares one.
+    ///
+    /// Runs after implication closure, so `--json ⇒ --non-interactive` has
+    /// already been folded in and counts as "explicitly requested".
+    fn apply_non_interactive_rule(&mut self, spec: &'static CommandSpec, input_available: bool) {
+        const FLAG: &str = "non-interactive";
+        if spec.find_flag(FLAG).is_none() {
+            return;
+        }
+        let explicit = matches!(self.values.get(FLAG), Some(ResolvedValue::Bool(true)));
+        let effective = Self::is_non_interactive(explicit, input_available);
+        if effective && !explicit {
+            tracing::info!("auto-detected non-interactive mode (no input available)");
+        }
+        self.values.insert(FLAG, ResolvedValue::Bool(effective));
     }
 
     /// Any pair of supplied flags must not name each other in
@@ -394,16 +450,43 @@ impl ResolvedArgs {
 #[derive(Debug, Clone)]
 pub struct CallerContext {
     path: Vec<String>,
+    frontend: FrontendKind,
+    local_user: bool,
 }
 
 impl CallerContext {
-    pub fn new(canonical_path: &[&str]) -> Self {
+    /// Build from the canonical path and the frontend running the command.
+    ///
+    /// `local_user` is derived from the frontend kind rather than asked of
+    /// the frontend: it *is* a property of the kind, and a per-frontend
+    /// `is_local_user_session` override was a decision living in Layer 3
+    /// (WI 0114 F-49).
+    pub fn new(canonical_path: &[&str], frontend: FrontendKind) -> Self {
         Self {
             path: canonical_path
                 .iter()
                 .map(|part| (*part).to_string())
                 .collect(),
+            frontend,
+            local_user: frontend.is_local_user(),
         }
+    }
+
+    /// Which frontend is running this command.
+    pub fn frontend(&self) -> FrontendKind {
+        self.frontend
+    }
+
+    /// Whether the caller is the user's own session on the host that chose
+    /// the paths in the request — and therefore whether the process's current
+    /// directory is the user's and a human is there to answer.
+    ///
+    /// `false` for the API frontend, which re-executes a request a client
+    /// already authorised from a working directory unrelated to the caller's.
+    /// Mount-scope policy that compares against the current directory is
+    /// applied on the client, once, not again in the daemon.
+    pub fn local_user(&self) -> bool {
+        self.local_user
     }
 
     /// The canonical command path, in the shape `CommandError`'s constructors
@@ -427,7 +510,15 @@ pub struct BuildContext<'a> {
     pub flags: &'a ResolvedFlags,
     pub args: &'a ResolvedArgs,
     pub engines: &'a Engines,
+    /// A snapshot of the session, for the many commands that only read it.
     pub session: Session,
+    /// The *shared* session the frontend and every other holder observe.
+    ///
+    /// A command that records in-flight state — what is running, which
+    /// workflow, which container (decision Q3, WI 0114 F-22) — must write
+    /// through this, not through the `session` snapshot above, or the write
+    /// lands on a clone nobody else can see.
+    pub managed_session: Arc<RwLock<Session>>,
     /// The squad daemon gateway `Dispatch::admit` resolved for this command's
     /// `GatewayNeed`, if any.
     pub gateway: Option<Arc<dyn TaskGateway>>,
@@ -487,6 +578,55 @@ mod tests {
         assert!(
             !flags.supplied("non-interactive"),
             "an implied flag was never supplied by the frontend"
+        );
+    }
+
+    // ─── the non-interactive rule (WI 0114 F-50) ────────────────────────────
+
+    /// The rule itself, in the one place it lives.
+    #[test]
+    fn non_interactive_is_asked_for_or_forced_by_having_nowhere_to_ask() {
+        assert!(ResolvedFlags::is_non_interactive(true, true));
+        assert!(ResolvedFlags::is_non_interactive(true, false));
+        assert!(ResolvedFlags::is_non_interactive(false, false));
+        assert!(!ResolvedFlags::is_non_interactive(false, true));
+    }
+
+    /// A caller with nowhere to read an answer from resolves
+    /// `--non-interactive` whether or not it passed the flag — and the flag
+    /// still reads as unsupplied, because the user did not supply it.
+    #[test]
+    fn a_frontend_without_input_resolves_non_interactive() {
+        let frontend = FakeCommandFrontend::new().without_input();
+        let flags = resolve(&["ready"], &frontend);
+        assert!(flags.bool("non-interactive"));
+        assert!(!flags.supplied("non-interactive"));
+    }
+
+    /// With input available the flag is the user's alone.
+    #[test]
+    fn a_frontend_with_input_leaves_non_interactive_to_the_user() {
+        let flags = resolve(&["ready"], &FakeCommandFrontend::new());
+        assert!(!flags.bool("non-interactive"));
+
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.bools.insert("non-interactive".into(), true);
+        assert!(resolve(&["ready"], &frontend).bool("non-interactive"));
+    }
+
+    /// A command with no `--non-interactive` flag is left untouched.
+    #[test]
+    fn a_command_without_the_flag_is_unaffected_by_the_rule() {
+        let frontend = FakeCommandFrontend::new().without_input();
+        let flags = resolve(&["status"], &frontend);
+        assert!(
+            CommandCatalogue::get()
+                .lookup(&["status"])
+                .unwrap()
+                .find_flag("non-interactive")
+                .is_none()
+                || flags.bool("non-interactive"),
+            "the rule must not invent a flag the command does not declare"
         );
     }
 

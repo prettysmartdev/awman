@@ -32,6 +32,11 @@ pub struct Capabilities {
     /// Agents can be attributed to a session via a runtime label.
     /// true: container; false: sandbox (uses names).
     pub session_label_supported: bool,
+    /// The runtime keeps a local image store that can accumulate dangling
+    /// images and needs reclaiming. true: container; false: sandbox, whose
+    /// agent environments are declared by kit and have no image layer cache
+    /// of awman's own to sweep.
+    pub has_image_store: bool,
 }
 
 impl Capabilities {
@@ -95,6 +100,7 @@ mod tests {
             caps.session_label_supported,
             "docker supports session labels"
         );
+        assert!(caps.has_image_store, "docker keeps a local image store");
     }
 
     #[test]
@@ -135,6 +141,10 @@ mod tests {
                 assert!(
                     !caps.session_label_supported,
                     "sandbox uses names, not labels"
+                );
+                assert!(
+                    !caps.has_image_store,
+                    "sandbox has no local image store to reclaim"
                 );
             }
             Err(_) => {

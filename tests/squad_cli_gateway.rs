@@ -24,27 +24,21 @@ use awman::command::dispatch::{BuiltCommand, Dispatch, Engines};
 use awman::command::error::CommandError;
 use awman::command::CommandOutcome;
 use awman::data::config::env::Env;
-use awman::data::fs::daemon_guard::{DaemonGuard, DaemonKind};
 use awman::data::fs::daemon_process::{DaemonProcess, ServerMeta};
 use awman::data::fs::task_store::{MountScope, Run, RunStatus, Task, TaskStatus};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
 use awman::data::session::Session;
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::agent_runtime::frontend::AgentIo;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
+use awman::engine::daemon::{DaemonGuard, DaemonKind, DaemonSupervisor};
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
 use awman::frontend::cli::{command_path_from_matches, CliFrontend};
-use awman::frontend::tui::command_frontend::TuiCommandFrontend;
-use awman::frontend::tui::tabs::{
-    SharedActiveWorktreePath, SharedContainerExitCode, SharedContainerName,
-    SharedContainerSlotEvents, SharedEngineTx, SharedPtyResetFlag, SharedResizeTx,
-    SharedStatusDashboard, SharedStdinTx, SharedStuckSender, SharedTuiContext,
-    SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
-};
-use awman::frontend::tui::user_message::SharedStatusLog;
+use awman::frontend::tui::command_frontend::{DialogChannels, TuiCommandFrontend};
+use awman::frontend::tui::tabs::TabSharedState;
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -199,7 +193,7 @@ impl TaskGateway for RecordingGateway {
             active_count: 1,
             last_tick: None,
             in_flight: 0,
-            env_persistence: "none".into(),
+            env_persistence: Some(awman::data::fs::daemon_env::EnvPersistence::None),
             unmet_env: Vec::new(),
         })
     }
@@ -218,7 +212,9 @@ fn engines_at(root: &Path) -> Engines {
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 
@@ -241,9 +237,7 @@ fn tui_frontend(raw: &str) -> TuiCommandFrontend {
 
     TuiCommandFrontend::new(
         parsed,
-        Arc::new(Mutex::new(Vec::new())) as SharedStatusLog,
-        dialog_tx,
-        dialog_rx,
+        DialogChannels::new(dialog_tx, dialog_rx),
         AgentIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
@@ -252,20 +246,7 @@ fn tui_frontend(raw: &str) -> TuiCommandFrontend {
             resize: None,
             initial_size: None,
         },
-        Arc::new(Mutex::new(None)) as SharedWorkflowViewState,
-        Arc::new(Mutex::new(None)) as SharedYoloState,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)) as SharedYoloCancelFlag,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)) as SharedPtyResetFlag,
-        Arc::new(Mutex::new(None)) as SharedContainerName,
-        Arc::new(Mutex::new(None)) as SharedContainerExitCode,
-        Arc::new(Mutex::new(None)) as SharedStdinTx,
-        Arc::new(Mutex::new(None)) as SharedResizeTx,
-        Arc::new(Mutex::new(None)) as SharedEngineTx,
-        Arc::new(Mutex::new(None)) as SharedStuckSender,
-        Arc::new(Mutex::new(None)) as SharedActiveWorktreePath,
-        Arc::new(Mutex::new(None)) as SharedStatusDashboard,
-        Arc::new(Mutex::new(Default::default())) as SharedTuiContext,
-        Arc::new(Mutex::new(std::collections::VecDeque::new())) as SharedContainerSlotEvents,
+        TabSharedState::default(),
     )
 }
 
@@ -711,7 +692,7 @@ impl FakeAwmanProcess {
         let mut child = child;
         let pid = child.id();
         for _ in 0..500 {
-            if awman::data::fs::daemon_process::pid_is_awman(pid) {
+            if DaemonSupervisor::pid_is_awman(pid) {
                 return Self { _dir: dir, child };
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

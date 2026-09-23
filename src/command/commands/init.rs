@@ -8,8 +8,8 @@ use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::session::AgentName;
+use crate::data::step_status::StepStatus;
 use crate::engine::init::{InitEngine, InitEngineOptions, InitFrontend, InitSummary};
-use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone)]
 pub struct InitCommandFlags {
@@ -121,6 +121,9 @@ impl Command for InitCommand {
             agent: agent_name,
             run_aspec_setup: self.flags.aspec,
             git_root: session.git_root().to_path_buf(),
+            // Prompt copy is Layer 2's and reaches Layer 1 through the options
+            // struct, because an engine cannot name a Layer 2 type (F-19).
+            dockerfile_setup_prompt: crate::command::prompts::dockerfile_setup(),
         };
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,

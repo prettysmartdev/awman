@@ -1,9 +1,10 @@
-//! `GithubIssueSource` — GitHub implementation of `IssueSource`.
+//! `GithubIssueSource` â GitHub implementation of `IssueSource`.
 
 use std::path::Path;
 use std::process::Command;
 
 use crate::data::config::env::Env;
+use crate::data::fs::remote_slug::RemoteSlug;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::git::GitEngine;
 
@@ -215,7 +216,7 @@ fn parse_input(
     provider: &str,
     git_engine: &GitEngine,
 ) -> Result<(String, String, u32), IssueSourceError> {
-    // Bare integer — resolve from git remote
+    // Bare integer â resolve from git remote
     if input.chars().all(|c| c.is_ascii_digit()) {
         let number = input
             .parse::<u32>()
@@ -316,30 +317,16 @@ fn detect_github_remote(
     })
 }
 
-/// Extract owner/repo from various git remote URL formats.
+/// Extract owner/repo from a GitHub remote URL.
+///
+/// The URL splitting is the shared Layer 0 `RemoteSlug` parser (WI 0114
+/// F-29); what stays here is the GitHub-specific half — the host must be
+/// `github.com`, and owner and repo are kept verbatim because they are path
+/// segments in a GitHub API call, not a directory name.
 fn parse_owner_repo_from_remote(remote_url: &str) -> Option<(String, String)> {
-    let remote = remote_url.trim();
-
-    // SSH: git@github.com:owner/repo.git
-    if let Some(rest) = remote.strip_prefix("git@github.com:") {
-        let rest = rest.strip_suffix(".git").unwrap_or(rest);
-        let parts: Vec<&str> = rest.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
-    }
-
-    // HTTPS: https://github.com/owner/repo.git
-    let path = remote
-        .strip_prefix("https://github.com/")
-        .or_else(|| remote.strip_prefix("http://github.com/"))?;
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let parts: Vec<&str> = path.splitn(3, '/').collect();
-    if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
-    }
+    RemoteSlug::parse(remote_url)
+        .filter(|slug| slug.is_host("github.com"))
+        .map(|slug| (slug.owner, slug.repo))
 }
 
 /// Try fetching via `gh issue view`.
@@ -679,7 +666,7 @@ mod tests {
     fn title_slug_non_ascii_title() {
         let issue = Issue {
             source_id: "https://github.com/owner/repo/issues/5".into(),
-            title: "café résumé".into(),
+            title: "cafÃ© rÃ©sumÃ©".into(),
             body: String::new(),
             provider: "GitHub".into(),
         };
@@ -725,7 +712,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Additional can_handle tests ───────────────────────────────────────────
+    // ââ Additional can_handle tests âââââââââââââââââââââââââââââââââââââââââââ
 
     #[test]
     fn can_handle_empty_string_returns_false() {
@@ -757,7 +744,7 @@ mod tests {
         assert!(GithubIssueSource.can_handle("http://github.com/owner/repo/issues/7"));
     }
 
-    // ── title_slug edge cases ─────────────────────────────────────────────────
+    // ââ title_slug edge cases âââââââââââââââââââââââââââââââââââââââââââââââââ
 
     #[test]
     fn title_slug_very_long_title_truncated() {
@@ -792,11 +779,11 @@ mod tests {
         );
     }
 
-    // ── detect_github_remote tests ────────────────────────────────────────────
+    // ââ detect_github_remote tests ââââââââââââââââââââââââââââââââââââââââââââ
 
     #[test]
     fn detect_github_remote_fails_for_no_remote() {
-        // A temp dir that is not a git repo — the remote lookup will fail.
+        // A temp dir that is not a git repo â the remote lookup will fail.
         let tmp = tempfile::tempdir().unwrap();
         let result = detect_github_remote(tmp.path(), "GitHub", &GitEngine::new());
         match result {
@@ -807,7 +794,7 @@ mod tests {
         }
     }
 
-    // ── Fake gh CLI tests (try_gh_cli_with_cmd) ───────────────────────────────
+    // ââ Fake gh CLI tests (try_gh_cli_with_cmd) âââââââââââââââââââââââââââââââ
 
     #[cfg(unix)]
     #[test]
@@ -899,7 +886,7 @@ exit 0
         );
     }
 
-    // ── REST API mock tests ───────────────────────────────────────────────────
+    // ââ REST API mock tests âââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     #[tokio::test]
     async fn fetch_rest_api_200_returns_issue() {
@@ -1130,7 +1117,7 @@ exit 0
         }
     }
 
-    // ── fetch_issue_with_progress tests ──────────────────────────────────────
+    // ââ fetch_issue_with_progress tests ââââââââââââââââââââââââââââââââââââââ
 
     #[cfg(unix)]
     #[test]

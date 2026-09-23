@@ -1,15 +1,15 @@
 //! `AgentAuthFrontend` impl for the CLI.
 //!
-//! The safe non-interactive default is `DeclineOnce`
-//! (do NOT auto-persist consent). The CLI prompts on stdin only when stdin
-//! is a TTY; otherwise it falls back to the safe default.
+//! The CLI prompts on stdin only when stdin is a TTY; otherwise it returns the
+//! CLI profile's answer from `src/command/headless.rs` — which, alone among
+//! the three headless profiles, declines rather than injecting a human user's
+//! host credentials nobody consented to.
 
 use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend};
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
-use crate::frontend::cli::output::stdin_is_tty;
 
 impl AgentAuthFrontend for CliFrontend {
     fn ask_agent_auth_consent(
@@ -17,8 +17,8 @@ impl AgentAuthFrontend for CliFrontend {
         agent: &AgentName,
         env_var_names: &[&str],
     ) -> Result<AgentAuthDecision, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(AgentAuthDecision::DeclineOnce);
+        if self.non_interactive {
+            return Ok(self.headless.agent_auth_consent());
         }
         let vars = if env_var_names.is_empty() {
             "no environment variables".to_string()

@@ -4,6 +4,8 @@
 //! panic-log path resolution.
 
 use super::*;
+use crate::command::commands::squad::commands::SquadCommand;
+use crate::command::dispatch::FrontendAction;
 
 // ─── Autocomplete cycling ─────────────────────────────────────────────────
 
@@ -360,6 +362,63 @@ fn submit_command_blocked_while_running() {
     ));
 }
 
+// ─── Command-box parse rejections (WI 0114 F-26) ─────────────────────────
+//
+// The box parses through the same `parse_raw_args` the API frontend uses, so
+// an input the API refuses is refused here too, with the same message. Both
+// of these used to be accepted by the box's own parser and carried into the
+// command as strings.
+
+#[test]
+fn submitting_a_bad_enum_value_leaves_the_box_with_an_error() {
+    let mut app = make_app();
+    app.command_input.set_text("chat --launch-mode banana");
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    let error = app
+        .input_error
+        .as_deref()
+        .expect("a bad enum value must be reported in the command box");
+    assert!(
+        error.contains("banana") && error.contains("stdio"),
+        "the hint must name the bad value and the allowed set: {error}"
+    );
+    assert!(
+        !app.command_input.text.is_empty(),
+        "the typed text must survive so the user can correct it"
+    );
+}
+
+#[test]
+fn submitting_a_non_numeric_number_leaves_the_box_with_an_error() {
+    let mut app = make_app();
+    app.command_input.set_text("squad start --port abc");
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    let error = app
+        .input_error
+        .as_deref()
+        .expect("a non-numeric number must be reported in the command box");
+    assert!(
+        error.contains("abc"),
+        "the hint must name the bad value: {error}"
+    );
+}
+
+/// The cluster's refusal changed kind from `CommandBoxParse` to `UnknownFlag`;
+/// the hint must still read as what the user typed.
+#[test]
+fn submitting_a_short_flag_cluster_names_the_cluster() {
+    let mut app = make_app();
+    app.command_input.set_text("ready -ab");
+
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(app.input_error.as_deref(), Some("unknown flag: -ab"));
+}
+
 // ─── q with empty box opens QuitConfirm ──────────────────────────────────
 
 #[test]
@@ -450,8 +509,8 @@ fn ctrl_w_with_no_workflow_is_silent_noop() {
 fn ctrl_w_during_running_step_sends_engine_request() {
     use crate::engine::workflow::EngineRequest;
     use crate::frontend::tui::tabs::WorkflowStepKind;
-    use crate::frontend::tui::tabs::WorkflowStepView;
     use crate::frontend::tui::tabs::WorkflowViewState;
+    use crate::frontend::tui::tabs::{StepViewStatus, WorkflowStepView};
 
     let mut app = make_app();
 
@@ -459,7 +518,7 @@ fn ctrl_w_during_running_step_sends_engine_request() {
     let view = WorkflowViewState {
         steps: vec![WorkflowStepView {
             name: "build".into(),
-            status: "running".into(),
+            status: StepViewStatus::Running,
             agent: None,
             model: None,
             depends_on: vec![],
@@ -468,11 +527,11 @@ fn ctrl_w_during_running_step_sends_engine_request() {
         current_step: Some("build".into()),
         max_concurrent: None,
     };
-    *app.active_tab_mut().workflow_state.lock().unwrap() = Some(view);
+    *app.active_tab_mut().shared.workflow_state.lock().unwrap() = Some(view);
 
     // Wire up an engine channel so we can observe what's sent.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-    *app.active_tab_mut().engine_tx_shared.lock().unwrap() = Some(tx);
+    *app.active_tab_mut().shared.engine_tx_shared.lock().unwrap() = Some(tx);
 
     press_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
 
@@ -491,7 +550,7 @@ fn ctrl_w_in_step_confirm_escalates_to_wcb() {
 
     // Wire up an engine channel so Ctrl-W handler fires.
     let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-    *app.active_tab_mut().engine_tx_shared.lock().unwrap() = Some(engine_tx);
+    *app.active_tab_mut().shared.engine_tx_shared.lock().unwrap() = Some(engine_tx);
 
     // Open a StepConfirm dialog with a response channel.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -598,7 +657,9 @@ fn cycle_to_hidden_does_not_send_resize() {
 
 #[test]
 fn scroll_down_reveals_hidden_parallel_steps() {
-    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    };
     use crossterm::event::{MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
@@ -609,7 +670,7 @@ fn scroll_down_reveals_hidden_parallel_steps() {
         steps: (0..6)
             .map(|i| WorkflowStepView {
                 name: format!("step-{i}"),
-                status: "pending".into(),
+                status: StepViewStatus::Pending,
                 agent: None,
                 model: None,
                 depends_on: vec![],
@@ -619,7 +680,7 @@ fn scroll_down_reveals_hidden_parallel_steps() {
         current_step: None,
         max_concurrent: None,
     };
-    *app.active_tab_mut().workflow_state.lock().unwrap() = Some(view);
+    *app.active_tab_mut().shared.workflow_state.lock().unwrap() = Some(view);
 
     // Simulate the renderer having recorded an overview rect.
     let overview_rect = Rect::new(0, 30, 80, 9);
@@ -646,7 +707,9 @@ fn scroll_down_reveals_hidden_parallel_steps() {
 
 #[test]
 fn scroll_clamped_at_bounds() {
-    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    };
     use crossterm::event::{MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
@@ -654,7 +717,7 @@ fn scroll_clamped_at_bounds() {
     let view = WorkflowViewState {
         steps: vec![WorkflowStepView {
             name: "only".into(),
-            status: "pending".into(),
+            status: StepViewStatus::Pending,
             agent: None,
             model: None,
             depends_on: vec![],
@@ -663,7 +726,7 @@ fn scroll_clamped_at_bounds() {
         current_step: None,
         max_concurrent: None,
     };
-    *app.active_tab_mut().workflow_state.lock().unwrap() = Some(view);
+    *app.active_tab_mut().shared.workflow_state.lock().unwrap() = Some(view);
 
     let overview_rect = Rect::new(0, 30, 80, 3);
     app.active_tab_mut().last_overview_rect = Some(overview_rect);
@@ -690,11 +753,11 @@ fn scroll_clamped_at_bounds() {
 #[test]
 fn panic_log_path_lives_under_awman_home() {
     // Skip on hosts with no resolvable home dir (the hook no-ops there).
-    if let Some(path) = crate::frontend::tui::event_loop::panic_log_path() {
+    if let Some(log) = crate::frontend::tui::event_loop::panic_log() {
         assert!(
-            path.ends_with(".awman/panic.log"),
+            log.path().ends_with(".awman/panic.log"),
             "panic log must live in the awman data dir: {}",
-            path.display()
+            log.path().display()
         );
     }
 }
@@ -804,6 +867,7 @@ fn esc_on_parallel_yolo_modal_cancels_the_focused_slots_flag_only() {
     );
     assert!(
         !app.active_tab()
+            .shared
             .yolo_cancel_flag
             .load(std::sync::atomic::Ordering::Relaxed),
         "the tab-level (sequential-path) flag is unrelated here"
@@ -869,7 +933,7 @@ fn set_squad_tasks(app: &mut App, names: &[&str]) {
 /// mirroring `tests/squad_sandbox_refusal.rs`'s `FakeSandboxRuntime` approach.
 fn make_app_no_container_runtime() -> App {
     let catalogue = CommandCatalogue::get();
-    let mut engines = make_engines();
+    let mut engines = crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"));
     engines.container_runtime = None;
     let session_manager = Arc::new(SessionManager::in_memory());
     let tab = Tab::new(make_session());
@@ -1817,8 +1881,8 @@ fn a_failed_daemon_start_is_reported_in_a_modal() {
 /// `Missing` arm — it discards it and raises the dialog — so a real endpoint
 /// is not needed to prove which arm ran.
 fn unreachable_gateway() -> crate::command::commands::squad::gateway::RemoteTaskGateway {
-    use crate::command::commands::http_core::HttpCore;
     use crate::command::commands::squad::gateway::RemoteTaskGateway;
+    use crate::engine::remote::HttpCore;
     RemoteTaskGateway::new(HttpCore::new("http://127.0.0.1:1", "v1", None).unwrap())
 }
 
@@ -1895,20 +1959,17 @@ fn a_key_refresh_already_in_flight_makes_a_second_acceptance_inert() {
 #[test]
 fn a_completed_key_refresh_opens_the_tab_and_displays_the_new_key() {
     use crate::command::commands::squad::daemon::SquadKeyState;
+    use crate::engine::squad::key_setup::{KeyDisclosure, ShellFlavor};
 
     let mut app = make_app();
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(Ok(crate::frontend::tui::app::SquadStartup {
         gateway: std::sync::Arc::new(unreachable_gateway()),
-        key_state: SquadKeyState::Minted {
-            setup: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
-            key: "deadbeef".to_string(),
-        },
-        key_setup: Some(crate::frontend::tui::app::SquadKeySetup {
-            body: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
-            key: "deadbeef".to_string(),
-            zshrc_snippet: "export AWMAN_SQUAD_KEY=deadbeef".to_string(),
-        }),
+        key_state: SquadKeyState::Minted(KeyDisclosure::new("deadbeef", ShellFlavor::Zsh)),
+        key_setup: Some(crate::frontend::tui::app::SquadKeySetup::for_key(
+            "deadbeef",
+            ShellFlavor::Zsh,
+        )),
     }))
     .unwrap();
     app.squad_startup_rx = Some(rx);
@@ -2098,20 +2159,26 @@ fn detaching_a_squad_attach_session_refocuses_the_grid_on_the_next_tick() {
 
 /// The key opened a confirmation for `action` on `name` and dispatched nothing
 /// yet; `y` then dispatches it and closes the dialog.
-fn assert_confirms_then_dispatches(
-    app: &mut App,
-    action: crate::frontend::tui::dialogs::SquadConfirmAction,
-    name: &str,
-) {
+///
+/// The question and the hotkey are read off the prompt Layer 2 supplied, not
+/// written here: this asserts the frontend *uses* the prompt, and the copy
+/// itself is `command::prompts`' to test (WI 0114 F-55).
+fn assert_confirms_then_dispatches(app: &mut App, action: FrontendAction, name: &str) {
     match &app.active_dialog {
         Some(Dialog::SquadActionConfirm {
             action: asked,
             name: asked_name,
+            prompt,
         }) => {
             assert_eq!(*asked, action);
             assert_eq!(
                 asked_name, name,
                 "the confirmation must name the right task"
+            );
+            assert_eq!(
+                prompt,
+                &SquadCommand::confirm_prompt(action, name).expect("{action:?} asks first"),
+                "the modal must show Layer 2's prompt, unaltered"
             );
         }
         _ => panic!("{action:?} must open Dialog::SquadActionConfirm"),
@@ -2125,15 +2192,18 @@ fn assert_confirms_then_dispatches(
     assert!(app.active_dialog.is_none(), "'y' closes the confirmation");
     assert!(
         app.active_tab().command_result_rx.is_some(),
-        "'y' must dispatch `squad {}`",
-        action.subcommand()
+        "'y' must dispatch {:?}",
+        action.path()
     );
 }
 
 #[test]
 fn squad_list_t_c_p_confirm_before_acting_on_the_selected_task() {
-    use crate::frontend::tui::dialogs::SquadConfirmAction::{Cancel, Pause, Trigger};
-    for (key, action) in [('t', Trigger), ('c', Cancel), ('p', Pause)] {
+    for (key, action) in [
+        ('t', FrontendAction::TriggerSquadTask),
+        ('c', FrontendAction::CancelSquadRun),
+        ('p', FrontendAction::PauseSquadTask),
+    ] {
         let mut app = make_app();
         push_squad_tab(&mut app);
         set_squad_tasks(&mut app, &["task-a", "task-b"]);
@@ -2150,8 +2220,11 @@ fn squad_list_t_c_p_confirm_before_acting_on_the_selected_task() {
 /// grid's selection — the two can differ while the list reflows.
 #[test]
 fn squad_detail_modal_t_c_p_confirm_before_acting_on_the_modals_task() {
-    use crate::frontend::tui::dialogs::SquadConfirmAction::{Cancel, Pause, Trigger};
-    for (key, action) in [('t', Trigger), ('c', Cancel), ('p', Pause)] {
+    for (key, action) in [
+        ('t', FrontendAction::TriggerSquadTask),
+        ('c', FrontendAction::CancelSquadRun),
+        ('p', FrontendAction::PauseSquadTask),
+    ] {
         let mut app = make_app();
         push_squad_tab(&mut app);
         set_squad_tasks(&mut app, &["task-a", "task-b"]);

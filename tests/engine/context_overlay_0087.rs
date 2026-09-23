@@ -4,8 +4,8 @@
 //! exec_prompt + context(global) pipeline, workflow overlay merging, and the
 //! context(workflow) dynamic prompt step-progression markers.
 
-use awman::command::commands::{collect_all_overlay_specs, ContextScope};
 use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+use awman::data::config::overlays::ContextScope;
 use awman::data::fs::ContextDirResolver;
 use awman::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
 use awman::engine::agent::{AgentEngine, AgentRunOptions};
@@ -105,13 +105,10 @@ fn workflow_top_level_context_repo_and_step_context_global_produce_two_specs() {
     let workflow_overlays = vec!["context(repo)".to_string()];
     let step_overlays = vec!["context(global)".to_string()];
 
-    let collected = collect_all_overlay_specs(
-        &session,
-        vec![],
-        Some(&workflow_overlays),
-        Some(&step_overlays),
-    )
-    .unwrap();
+    let collected = session
+        .effective_config()
+        .collected_overlays(vec![], Some(&workflow_overlays), Some(&step_overlays))
+        .unwrap();
 
     assert_eq!(
         collected.context_overlays.len(),
@@ -149,13 +146,10 @@ fn workflow_context_global_at_top_level_plus_step_context_workflow_union_semanti
     let workflow_overlays = vec!["context(global)".to_string()];
     let step_overlays = vec!["context(workflow)".to_string()];
 
-    let collected = collect_all_overlay_specs(
-        &session,
-        vec![],
-        Some(&workflow_overlays),
-        Some(&step_overlays),
-    )
-    .unwrap();
+    let collected = session
+        .effective_config()
+        .collected_overlays(vec![], Some(&workflow_overlays), Some(&step_overlays))
+        .unwrap();
 
     assert_eq!(
         collected.context_overlays.len(),

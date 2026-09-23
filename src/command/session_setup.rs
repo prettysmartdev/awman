@@ -11,87 +11,90 @@
 //! Per Tenet 2 of the grand architecture that ordered sequence, and in
 //! particular the remote-clone failure-cleanup rule, must not live in a
 //! frontend — it lives here so every frontend gets it for free and cannot
-//! drift. The frontend supplies a [`SessionSetupObserver`] to receive the
-//! presentation/state side effects (progress events, status persistence,
-//! in-memory session registration, the ready-checks frontend) exactly the way
-//! [`ReadyEngine`](crate::engine::ready::ReadyEngine) accepts a
-//! [`ReadyFrontend`]. The orchestrator itself performs no HTTP, event-bus, or
-//! in-memory-map work of its own.
+//! drift.
+//!
+//! The frontend supplies a [`SessionSetupPresenter`], which does exactly three
+//! things: write a line to the frontend's log, broadcast a
+//! [`SetupEventPayload`], and vend the two sinks the run needs. It does not
+//! persist anything. Before WI 0114 F-41 the trait also demanded
+//! `persist_status`, `register_session` and `persist_and_cleanup` of every
+//! frontend, so each one had to re-implement where a setup status is stored,
+//! when it is written relative to on-disk clone cleanup, and how the
+//! `SessionSetupState` transitions work. All of that is now here or in Layer 0:
+//! [`SessionSetup`] owns the session store, the setup-state snapshot and the
+//! [`SessionManager`], and every state transition is a method on
+//! [`SessionSetupState`].
 
+use crate::data::session::SessionKind;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 
-use crate::command::commands::resolve_agent;
+use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::dispatch::Engines;
 use crate::command::session_create::SessionCreatePlan;
-use crate::data::message::UserMessageSink;
-use crate::data::ready_summary::ReadySummary;
-use crate::data::session::{Session, SessionOpenOptions, SessionType};
+use crate::data::fs::api_db::SqliteSessionStore;
+use crate::data::fs::api_paths::ApiPaths;
+use crate::data::session::{SessionOpenOptions, SessionType};
 use crate::data::session_manager::SessionManager;
-use crate::data::session_setup_event::SessionSetupStatus;
+use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus, SetupEventPayload};
 use crate::engine::error::EngineError;
+use crate::engine::git::GitFrontend;
 use crate::engine::ready::frontend::ReadyFrontend;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions};
 
-/// Presentation and frontend-state side effects the [`SessionSetup`]
-/// orchestrator delegates to the calling frontend.
+/// Presentation-only side effects the [`SessionSetup`] orchestrator delegates
+/// to the calling frontend.
 ///
-/// Every method corresponds to a side effect the API frontend previously
-/// performed inline in its `run_session_setup`: emitting progress on the
-/// session-setup event bus, persisting the setup status column, registering the
-/// opened session in the in-memory map, and vending the ready-checks frontend.
-/// The orchestrator owns the *sequence and cleanup rules*; the observer owns
-/// *how each step is surfaced and persisted* for a given frontend.
+/// Deliberately small. Every state transition has already been applied to the
+/// shared [`SessionSetupState`] by the orchestrator before a presenter method
+/// is called, and every persistence decision — which store column, which file,
+/// in what order relative to deleting a partial clone — belongs to the
+/// orchestrator. A presenter surfaces what happened; it never decides what it
+/// means (WI 0114 F-41).
 #[async_trait]
-pub trait SessionSetupObserver: Send {
-    /// Enter a new setup status: surface it to the frontend and persist it
-    /// (frontends map the enum's [`SessionSetupStatus::as_str`] to their store).
-    fn enter_status(&mut self, status: SessionSetupStatus);
-
-    /// Update the human-readable "current stage" line.
-    fn set_stage(&mut self, message: &str);
-
-    /// Emit a stage-changed progress event (`stage` is the machine key).
-    fn stage_changed(&mut self, stage: &str, message: &str);
-
-    /// Surface a terminal failure for `stage` with `error` (no persistence — the
-    /// orchestrator calls [`persist_status`](Self::persist_status) separately so
-    /// it controls ordering relative to on-disk clone cleanup).
-    fn mark_failed(&mut self, stage: &str, error: &str);
-
-    /// Surface successful completion carrying the ready summary.
-    fn set_ready(&mut self, summary: &ReadySummary);
-
-    /// Persist the terminal status string (`"ready"` / `"failed"`).
-    fn persist_status(&mut self, status: &str);
-
+pub trait SessionSetupPresenter: Send {
     /// Append a line to the frontend's session-scoped setup log.
     fn log(&mut self, line: &str);
 
-    /// Register the freshly opened session in the frontend's in-memory map.
-    async fn register_session(&mut self, session: Arc<RwLock<Session>>);
+    /// Broadcast one setup event to whatever is watching this session.
+    ///
+    /// The single broadcast method replaces the old trait's
+    /// `stage_changed` / `mark_failed` / `set_ready` triple: with the state
+    /// mutation gone, those differed only in which [`SetupEventPayload`] they
+    /// built, so building it is the orchestrator's job and sending it is the
+    /// frontend's.
+    fn emit(&mut self, event: SetupEventPayload);
 
     /// Vend the ready-checks frontend used to drive [`ReadyEngine`].
     fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend>;
 
     /// Vend a message sink that captures git clone/branch output.
-    fn git_log_sink(&mut self) -> Box<dyn UserMessageSink + Send>;
+    fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send>;
 
-    /// Persist the final setup snapshot and schedule frontend-state cleanup.
-    async fn persist_and_cleanup(&mut self);
+    /// The run has reached a terminal state and the orchestrator has finished
+    /// persisting. Frontends use this to retire per-session broadcast
+    /// machinery; nothing about the session's recorded outcome depends on it.
+    async fn finished(&mut self);
 }
 
 /// Layer 2 orchestrator that drives a validated [`SessionCreatePlan`] through
 /// clone → branch → open → ready, delegating presentation to a
-/// [`SessionSetupObserver`].
+/// [`SessionSetupPresenter`].
 pub struct SessionSetup {
     session_id: String,
     plan: SessionCreatePlan,
     engines: Engines,
     sessions: Arc<SessionManager>,
+    /// The live setup snapshot. Shared with the frontend, which serves and
+    /// streams it; only this orchestrator and the ready frontend write to it,
+    /// and only through [`SessionSetupState`]'s own transition methods.
+    setup_state: Arc<std::sync::RwLock<SessionSetupState>>,
+    /// The session row whose `setup_status` column this run advances.
+    store: Arc<SqliteSessionStore>,
+    /// Where the terminal `setup_state.json` snapshot is written.
+    paths: ApiPaths,
 }
 
 impl SessionSetup {
@@ -100,13 +103,82 @@ impl SessionSetup {
         plan: SessionCreatePlan,
         engines: Engines,
         sessions: Arc<SessionManager>,
+        setup_state: Arc<std::sync::RwLock<SessionSetupState>>,
+        store: Arc<SqliteSessionStore>,
+        paths: ApiPaths,
     ) -> Self {
         Self {
             session_id,
             plan,
             engines,
             sessions,
+            setup_state,
+            store,
+            paths,
         }
+    }
+
+    /// Apply one transition to the shared setup state. Every write this
+    /// orchestrator makes goes through here, so the lock is never held across
+    /// an await and the transition rules stay in Layer 0.
+    fn state<T>(&self, apply: impl FnOnce(&mut SessionSetupState) -> T) -> T {
+        let mut state = self
+            .setup_state
+            .write()
+            .expect("session setup state lock poisoned");
+        apply(&mut state)
+    }
+
+    /// Enter a lifecycle status and persist it to the session row.
+    fn enter_status(&self, status: SessionSetupStatus) {
+        let persisted = status.as_str();
+        self.state(|s| s.enter_status(status));
+        let _ = self.store.update_setup_status(&self.session_id, persisted);
+    }
+
+    /// Record a terminal failure in the state and broadcast it. The caller
+    /// still decides when to persist the `"failed"` status relative to
+    /// deleting a partial clone.
+    fn mark_failed(&self, presenter: &mut dyn SessionSetupPresenter, stage: &str, error: &str) {
+        self.state(|s| s.mark_failed(stage, error));
+        presenter.emit(SetupEventPayload::SetupFailed {
+            stage: stage.to_string(),
+            error: error.to_string(),
+        });
+    }
+
+    /// Set the human-readable stage line and broadcast the machine-keyed
+    /// stage change together, which is how every stage in the run reports.
+    fn stage(&self, presenter: &mut dyn SessionSetupPresenter, stage: &str, message: &str) {
+        self.state(|s| s.set_stage(message));
+        presenter.emit(SetupEventPayload::StageChanged {
+            stage: stage.to_string(),
+            message: message.to_string(),
+        });
+    }
+
+    /// Persist the terminal status string (`"ready"` / `"failed"`) to the
+    /// session row.
+    fn persist_status(&self, status: &str) {
+        let _ = self.store.update_setup_status(&self.session_id, status);
+    }
+
+    /// Write the final snapshot to `setup_state.json` and let the frontend
+    /// retire its per-session machinery.
+    async fn finish(&self, presenter: &mut dyn SessionSetupPresenter) {
+        let snapshot = self
+            .setup_state
+            .read()
+            .expect("session setup state lock poisoned")
+            .clone();
+        if let Err(e) = self.paths.save_setup_state(&self.session_id, &snapshot) {
+            tracing::error!(
+                session_id = %self.session_id,
+                error = %e,
+                "Failed to persist setup_state.json"
+            );
+        }
+        presenter.finished().await;
     }
 
     /// Delete a remote session's cloned directory, ignoring errors — used on the
@@ -121,9 +193,10 @@ impl SessionSetup {
     }
 
     /// Run the full setup sequence, reporting progress and terminal state via
-    /// `observer`. Returns when setup reaches a terminal state (ready or failed)
-    /// and the frontend-state cleanup has been scheduled.
-    pub async fn run(&self, observer: &mut dyn SessionSetupObserver) {
+    /// `presenter`. Returns when setup reaches a terminal state (ready or
+    /// failed), the snapshot is on disk, and the frontend has been told to
+    /// retire its per-session machinery.
+    pub async fn run(&self, presenter: &mut dyn SessionSetupPresenter) {
         let session_id = &self.session_id;
 
         // Delay setup work briefly so the frontend's acknowledgement (the API's
@@ -133,30 +206,29 @@ impl SessionSetup {
 
         tracing::info!(
             session_id = %session_id,
-            session_type = %self.plan.session_type,
+            session_type = %self.plan.kind,
             workdir = %self.plan.resolved_workdir.display(),
             repo_url = self.plan.repo_url.as_deref().unwrap_or(""),
             branch = self.plan.branch.as_deref().unwrap_or(""),
             "Beginning session setup"
         );
 
-        observer.log(&format!(
+        presenter.log(&format!(
             "state → {:?}: starting setup (type={}, workdir={})",
             SessionSetupStatus::Initializing,
-            self.plan.session_type,
+            self.plan.kind,
             self.plan.resolved_workdir.display()
         ));
 
         // ── [remote only] Stage 1: clone repository ──────────────────────────
-        if self.plan.session_type == "remote" {
-            observer.enter_status(SessionSetupStatus::CloningRepository);
+        if self.plan.kind == SessionKind::Remote {
+            self.enter_status(SessionSetupStatus::CloningRepository);
             let msg = format!(
                 "Cloning {}...",
                 self.plan.repo_url.as_deref().unwrap_or("repository")
             );
-            observer.set_stage(&msg);
-            observer.stage_changed("cloning_repository", &msg);
-            observer.log(&format!(
+            self.stage(presenter, "cloning_repository", &msg);
+            presenter.log(&format!(
                 "state → {:?}: clone stage",
                 SessionSetupStatus::CloningRepository
             ));
@@ -175,7 +247,7 @@ impl SessionSetup {
             );
             let git = Arc::clone(&self.engines.git_engine);
             let dest_for_clone = dest.clone();
-            let mut clone_sink = observer.git_log_sink();
+            let mut clone_sink = presenter.git_log_sink();
             // Clone the repository's default branch regardless of `plan.branch`.
             // The requested branch (which may not exist on the remote) is created
             // or checked out in the dedicated branch-setup stage below.
@@ -188,23 +260,25 @@ impl SessionSetup {
             });
             if let Err(e) = clone_result {
                 tracing::error!(session_id = %session_id, error = %e, "Clone failed");
-                observer.mark_failed("clone", &e.to_string());
+                self.mark_failed(presenter, "clone", &e.to_string());
                 // Cleanup any partial clone.
                 self.delete_clone().await;
-                observer.persist_status("failed");
-                observer.persist_and_cleanup().await;
+                self.persist_status("failed");
+                self.finish(presenter).await;
                 return;
             }
             tracing::info!(session_id = %session_id, "Repository cloned");
-            observer.stage_changed("cloning_repository_done", "Repository cloned");
+            presenter.emit(SetupEventPayload::StageChanged {
+                stage: "cloning_repository_done".to_string(),
+                message: "Repository cloned".to_string(),
+            });
 
             // ── [remote only] Stage 2: set up branch ─────────────────────────
             if let Some(branch) = self.plan.branch.as_deref() {
-                observer.enter_status(SessionSetupStatus::SettingUpBranch);
+                self.enter_status(SessionSetupStatus::SettingUpBranch);
                 let msg = format!("Checking out branch '{branch}'...");
-                observer.set_stage(&msg);
-                observer.stage_changed("setting_up_branch", &msg);
-                observer.log(&format!(
+                self.stage(presenter, "setting_up_branch", &msg);
+                presenter.log(&format!(
                     "state → {:?}: branch={branch}",
                     SessionSetupStatus::SettingUpBranch
                 ));
@@ -217,7 +291,7 @@ impl SessionSetup {
                 let git = Arc::clone(&self.engines.git_engine);
                 let dest_for_branch = dest.clone();
                 let branch_owned = branch.to_string();
-                let mut branch_sink = observer.git_log_sink();
+                let mut branch_sink = presenter.git_log_sink();
                 let branch_result = tokio::task::spawn_blocking(move || {
                     git.checkout_or_create_branch_logged(
                         &dest_for_branch,
@@ -239,17 +313,17 @@ impl SessionSetup {
                             disposition = disposition,
                             "Branch ready"
                         );
-                        observer.stage_changed(
-                            "branch_ready",
-                            &format!("Branch '{branch}' {disposition}"),
-                        );
+                        presenter.emit(SetupEventPayload::StageChanged {
+                            stage: "branch_ready".to_string(),
+                            message: format!("Branch '{branch}' {disposition}"),
+                        });
                     }
                     Err(e) => {
                         tracing::error!(session_id = %session_id, error = %e, "Branch setup failed");
-                        observer.mark_failed("branch", &e.to_string());
+                        self.mark_failed(presenter, "branch", &e.to_string());
                         self.delete_clone().await;
-                        observer.persist_status("failed");
-                        observer.persist_and_cleanup().await;
+                        self.persist_status("failed");
+                        self.finish(presenter).await;
                         return;
                     }
                 }
@@ -257,13 +331,13 @@ impl SessionSetup {
         }
 
         // ── Stage 3 (all): open Session ──────────────────────────────────────
-        observer.enter_status(SessionSetupStatus::RunningReady);
-        observer.set_stage("Opening session...");
-        observer.stage_changed(
-            "running_ready",
-            "Opening session and running ready checks...",
-        );
-        observer.log(&format!(
+        self.enter_status(SessionSetupStatus::RunningReady);
+        self.state(|s| s.set_stage("Opening session..."));
+        presenter.emit(SetupEventPayload::StageChanged {
+            stage: "running_ready".to_string(),
+            message: "Opening session and running ready checks...".to_string(),
+        });
+        presenter.log(&format!(
             "state → {:?}: opening session at {}",
             SessionSetupStatus::RunningReady,
             self.plan.resolved_workdir.display()
@@ -286,12 +360,12 @@ impl SessionSetup {
                     error = %e,
                     "Session setup failed: could not open session"
                 );
-                observer.mark_failed("session_open", &e.to_string());
-                if self.plan.session_type == "remote" {
+                self.mark_failed(presenter, "session_open", &e.to_string());
+                if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                observer.persist_status("failed");
-                observer.persist_and_cleanup().await;
+                self.persist_status("failed");
+                self.finish(presenter).await;
                 return;
             }
         };
@@ -299,7 +373,7 @@ impl SessionSetup {
         // For remote sessions, replace the default Local session_type so that
         // downstream consumers (e.g. worktree suppression in ExecWorkflowCommand)
         // see the correct variant.
-        if self.plan.session_type == "remote" {
+        if self.plan.kind == SessionKind::Remote {
             if let Some(cloned_path) = self.plan.cloned_path.clone() {
                 let repo_url = self.plan.repo_url.clone().unwrap_or_default();
                 let branch = self.plan.branch.clone().unwrap_or_default();
@@ -311,7 +385,12 @@ impl SessionSetup {
             }
         }
 
-        observer.register_session(Arc::clone(&session)).await;
+        // The session is registered by `open_or_create_with_key` above; this
+        // is the assertion the API observer used to make on the orchestrator's
+        // behalf (WI 0114 F-41). `session` is held for the ready stage below.
+        if self.sessions.get_by_key(session_id).is_none() {
+            tracing::error!(session_id = %session_id, "SessionSetup did not register its session");
+        }
         tracing::info!(session_id = %session_id, "Session opened, running ReadyEngine");
 
         // ── Stage 4 (all): run ReadyEngine ───────────────────────────────────
@@ -324,14 +403,14 @@ impl SessionSetup {
         // else mis-targets the per-agent Dockerfile lookup and re-downloads the
         // template every session.
         let session_guard = session.read().await;
-        let agent = match resolve_agent(&None, &session_guard) {
+        let agent = match LaunchPolicy::for_session(&session_guard).resolve_agent(&None) {
             Ok(a) => a,
             Err(e) => {
                 drop(session_guard);
                 tracing::error!(session_id = %session_id, error = %e, "Failed to resolve agent");
-                observer.mark_failed("resolve_agent", &e.to_string());
-                observer.persist_status("failed");
-                observer.persist_and_cleanup().await;
+                self.mark_failed(presenter, "resolve_agent", &e.to_string());
+                self.persist_status("failed");
+                self.finish(presenter).await;
                 return;
             }
         };
@@ -343,9 +422,9 @@ impl SessionSetup {
             Err(e) => {
                 drop(session_guard);
                 tracing::error!(session_id = %session_id, error = %e, "Runtime unsupported for session setup");
-                observer.mark_failed("ready", &e.to_string());
-                observer.persist_status("failed");
-                observer.persist_and_cleanup().await;
+                self.mark_failed(presenter, "ready", &e.to_string());
+                self.persist_status("failed");
+                self.finish(presenter).await;
                 return;
             }
         };
@@ -368,7 +447,7 @@ impl SessionSetup {
         );
         drop(session_guard);
 
-        let mut setup_frontend = observer.ready_frontend();
+        let mut setup_frontend = presenter.ready_frontend();
 
         // Cap ReadyEngine at 10 minutes — any legitimate run, including a clean
         // base-image build, completes well within this. If the wall-clock exceeds
@@ -379,8 +458,11 @@ impl SessionSetup {
 
         match ready_outcome {
             Ok(Ok(summary)) => {
-                observer.set_ready(&summary);
-                observer.persist_status("ready");
+                self.state(|s| s.set_ready(summary.clone()));
+                presenter.emit(SetupEventPayload::SetupComplete {
+                    ready_summary: Box::new(summary),
+                });
+                self.persist_status("ready");
                 tracing::info!(session_id = %session_id, "Session setup complete");
             }
             Ok(Err(e)) => {
@@ -389,24 +471,24 @@ impl SessionSetup {
                     error = %e,
                     "Session setup failed during ready"
                 );
-                observer.mark_failed("ready", &e.to_string());
-                if self.plan.session_type == "remote" {
+                self.mark_failed(presenter, "ready", &e.to_string());
+                if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                observer.persist_status("failed");
+                self.persist_status("failed");
             }
             Err(_elapsed) => {
                 let msg = "ReadyEngine exceeded the 600s setup deadline".to_string();
                 tracing::error!(session_id = %session_id, "{msg}");
-                observer.mark_failed("ready_timeout", &msg);
-                if self.plan.session_type == "remote" {
+                self.mark_failed(presenter, "ready_timeout", &msg);
+                if self.plan.kind == SessionKind::Remote {
                     self.delete_clone().await;
                 }
-                observer.persist_status("failed");
+                self.persist_status("failed");
             }
         }
 
-        observer.persist_and_cleanup().await;
+        self.finish(presenter).await;
     }
 }
 
@@ -414,36 +496,50 @@ impl SessionSetup {
 mod tests {
     use super::*;
     use crate::data::message::RecordingMessageSink;
+    use crate::data::session_setup_event::SetupEventPayload;
 
-    /// Records the observer callbacks a run makes so tests can assert on the
-    /// sequence and terminal state without a real frontend, event bus, or store.
+    /// The whole presenter surface, recorded. Since WI 0114 F-41 that is five
+    /// methods and none of them persist anything: what the run *decided* is
+    /// read back from the shared `SessionSetupState` and the session store,
+    /// not from the frontend.
     #[derive(Default)]
-    struct RecordingObserver {
-        statuses: Vec<SessionSetupStatus>,
-        failures: Vec<(String, String)>,
-        persisted_statuses: Vec<String>,
-        registered: bool,
+    struct RecordingPresenter {
+        events: Vec<SetupEventPayload>,
         ready_frontend_called: bool,
-        cleanup_called: bool,
+        finished_called: bool,
+    }
+
+    impl RecordingPresenter {
+        /// The `(stage, error)` pairs of every `SetupFailed` event broadcast.
+        fn failures(&self) -> Vec<(String, String)> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    SetupEventPayload::SetupFailed { stage, error } => {
+                        Some((stage.clone(), error.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The machine keys of every `StageChanged` event broadcast, in order.
+        fn stage_keys(&self) -> Vec<String> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    SetupEventPayload::StageChanged { stage, .. } => Some(stage.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     #[async_trait]
-    impl SessionSetupObserver for RecordingObserver {
-        fn enter_status(&mut self, status: SessionSetupStatus) {
-            self.statuses.push(status);
-        }
-        fn set_stage(&mut self, _message: &str) {}
-        fn stage_changed(&mut self, _stage: &str, _message: &str) {}
-        fn mark_failed(&mut self, stage: &str, error: &str) {
-            self.failures.push((stage.to_string(), error.to_string()));
-        }
-        fn set_ready(&mut self, _summary: &ReadySummary) {}
-        fn persist_status(&mut self, status: &str) {
-            self.persisted_statuses.push(status.to_string());
-        }
+    impl SessionSetupPresenter for RecordingPresenter {
         fn log(&mut self, _line: &str) {}
-        async fn register_session(&mut self, _session: Arc<RwLock<Session>>) {
-            self.registered = true;
+        fn emit(&mut self, event: SetupEventPayload) {
+            self.events.push(event);
         }
         fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
             // Only reached once setup gets all the way to the ready stage; the
@@ -451,11 +547,11 @@ mod tests {
             self.ready_frontend_called = true;
             unreachable!("ready_frontend must not be reached on the clone-failure path");
         }
-        fn git_log_sink(&mut self) -> Box<dyn UserMessageSink + Send> {
+        fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
             Box::new(RecordingMessageSink::new())
         }
-        async fn persist_and_cleanup(&mut self) {
-            self.cleanup_called = true;
+        async fn finished(&mut self) {
+            self.finished_called = true;
         }
     }
 
@@ -477,9 +573,7 @@ mod tests {
         ));
         let workflow_state_store = {
             let tmp = tempfile::tempdir().unwrap();
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                tmp.path(),
-            ))
+            Arc::new(crate::data::WorkflowStateStore::at_git_root(tmp.path()))
         };
         Engines {
             runtime: runtime.clone(),
@@ -490,6 +584,8 @@ mod tests {
             auth_engine,
             agent_engine,
             workflow_state_store,
+            credential_monitor: None,
+            global_config: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -508,7 +604,7 @@ mod tests {
         assert!(cloned_path.exists());
 
         let plan = SessionCreatePlan {
-            session_type: "remote".to_string(),
+            kind: SessionKind::Remote,
             resolved_workdir: cloned_path.clone(),
             cloned_path: Some(cloned_path.clone()),
             // A path that does not exist → `git clone` fails immediately.
@@ -516,37 +612,84 @@ mod tests {
             branch: None,
         };
 
+        // The orchestrator now owns persistence, so the test gives it a real
+        // store and a real API directory rather than a frontend that fakes
+        // them (F-41).
+        let api_root = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(api_root.path());
+        let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
+        store
+            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
+                id: "sess-clone-fail",
+                workdir: &cloned_path.display().to_string(),
+                created_at: "2026-09-22T00:00:00Z",
+                setup_status: SessionSetupStatus::Initializing,
+                kind: SessionKind::Remote,
+                cloned_path: Some(&cloned_path.display().to_string()),
+            })
+            .unwrap();
+        let setup_state = Arc::new(std::sync::RwLock::new(SessionSetupState::new()));
+
         let setup = SessionSetup::new(
             "sess-clone-fail".to_string(),
             plan,
             test_engines(),
             Arc::new(SessionManager::in_memory()),
+            Arc::clone(&setup_state),
+            Arc::clone(&store),
+            paths.clone(),
         );
-        let mut observer = RecordingObserver::default();
-        setup.run(&mut observer).await;
+        let mut presenter = RecordingPresenter::default();
+        setup.run(&mut presenter).await;
 
         // The partial clone directory must be gone (the failure-cleanup rule).
         assert!(
             !cloned_path.exists(),
             "the partially-cloned directory must be deleted on clone failure"
         );
-        // The clone stage was entered and the failure was surfaced for `clone`.
-        assert!(observer
-            .statuses
-            .contains(&SessionSetupStatus::CloningRepository));
-        assert_eq!(
-            observer.failures.len(),
-            1,
-            "exactly one failure should be reported; got {:?}",
-            observer.failures
-        );
-        assert_eq!(observer.failures[0].0, "clone");
-        // Terminal state persisted as failed, cleanup scheduled, ready never run.
-        assert_eq!(observer.persisted_statuses, vec!["failed".to_string()]);
-        assert!(observer.cleanup_called, "persist_and_cleanup must run");
+        // The clone stage was entered and broadcast.
         assert!(
-            !observer.registered && !observer.ready_frontend_called,
-            "setup must not reach session registration or the ready stage"
+            presenter
+                .stage_keys()
+                .contains(&"cloning_repository".to_string()),
+            "the clone stage must be broadcast; got {:?}",
+            presenter.stage_keys()
+        );
+        // The failure was surfaced once, for `clone`.
+        let failures = presenter.failures();
+        assert_eq!(
+            failures.len(),
+            1,
+            "exactly one failure should be reported; got {failures:?}"
+        );
+        assert_eq!(failures[0].0, "clone");
+
+        // The Layer 0 state reached the terminal failure, with the stage named.
+        let final_state = setup_state.read().unwrap().clone();
+        assert_eq!(final_state.status, SessionSetupStatus::Failed);
+        assert_eq!(
+            final_state.error.as_ref().map(|e| e.stage.as_str()),
+            Some("clone")
+        );
+
+        // The orchestrator persisted the terminal status to the session row
+        // and the snapshot to disk — neither went through the frontend.
+        let row = store.get_session("sess-clone-fail").unwrap().unwrap();
+        assert_eq!(row.setup_status, "failed");
+        let snapshot_path = paths.session_setup_state_path("sess-clone-fail");
+        assert!(
+            snapshot_path.exists(),
+            "setup_state.json must be written by the orchestrator"
+        );
+        let snapshot: SessionSetupState =
+            serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
+        assert_eq!(snapshot.status, SessionSetupStatus::Failed);
+
+        // The frontend was told the run finished, and the ready stage never ran.
+        assert!(presenter.finished_called, "finished() must run");
+        assert!(
+            !presenter.ready_frontend_called,
+            "setup must not reach the ready stage"
         );
     }
 }

@@ -1,6 +1,5 @@
 //! Per-tab state.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -9,7 +8,7 @@ use ratatui::layout::Rect;
 
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
-use crate::data::session::{Session, SessionId};
+use crate::data::session::{CommandStatus, Session, SessionId, SessionState};
 use crate::engine::acp::{PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
 use crate::engine::git::{GitDiffSummary, GitEngine};
@@ -36,6 +35,34 @@ pub enum ExecutionPhase {
     Running { command: String },
     Done { command: String, exit_code: i32 },
     Error { command: String, message: String },
+}
+
+impl ExecutionPhase {
+    /// How a session's recorded command reads in the tab bar and the
+    /// execution window.
+    ///
+    /// The phase is a *view* of `SessionState::current_command`, which Layer 2
+    /// writes for every frontend (decision Q3, WI 0114 F-22). The TUI used to
+    /// keep its own copy and set it in four places, so the tab could disagree
+    /// with the session about what was running.
+    pub fn of_session_state(state: &SessionState) -> Self {
+        let Some(cmd) = state.current_command.as_ref() else {
+            return Self::Idle;
+        };
+        match &cmd.status {
+            CommandStatus::Pending | CommandStatus::Running => Self::Running {
+                command: cmd.subcommand.clone(),
+            },
+            CommandStatus::Done => Self::Done {
+                command: cmd.subcommand.clone(),
+                exit_code: cmd.exit_code.unwrap_or(0),
+            },
+            CommandStatus::Error(message) => Self::Error {
+                command: cmd.subcommand.clone(),
+                message: message.clone(),
+            },
+        }
+    }
 }
 
 /// Container overlay window state.
@@ -106,7 +133,7 @@ pub struct WorkflowViewState {
 #[derive(Debug, Clone)]
 pub struct WorkflowStepView {
     pub name: String,
-    pub status: String,
+    pub status: StepViewStatus,
     /// Resolved agent (e.g. `"claude"`) — fed by `report_workflow_progress`.
     pub agent: Option<String>,
     /// Optional resolved model.
@@ -119,6 +146,65 @@ pub struct WorkflowStepView {
     /// own dedicated first/last column in the overview rather than being
     /// grouped by `depends_on` topology alongside `Agent` steps.
     pub kind: WorkflowStepKind,
+}
+
+/// How one step of a workflow reads in the Workflow Overview.
+///
+/// The Layer 0 run carries two different status enums — `StepState` for agent
+/// steps and `PhaseStepStatus` for setup/teardown steps — that the overview
+/// renders identically. This is the one classification it renders from, and
+/// both conversions ([`StepViewStatus::of_step_state`],
+/// [`StepViewStatus::of_phase_step_status`]) are exhaustive, so a new Layer 0
+/// variant is a compile error rather than a step that silently draws as
+/// pending. Until WI 0114 F-22 this was a `String` matched on in four places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepViewStatus {
+    /// Not started.
+    Pending,
+    /// Executing now.
+    Running,
+    /// An `on_failure` remediation is running for this step.
+    Fixing,
+    /// Finished successfully.
+    Done,
+    /// Finished with a failure.
+    Error,
+    /// Abandoned before it could finish.
+    Cancelled,
+    /// Never ran because it was not needed.
+    Skipped,
+}
+
+impl StepViewStatus {
+    /// Whether the step will not run again.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled | Self::Skipped)
+    }
+
+    /// How an agent step's Layer 0 state reads.
+    pub fn of_step_state(state: &crate::data::workflow_state::StepState) -> Self {
+        use crate::data::workflow_state::StepState;
+        match state {
+            StepState::Pending => Self::Pending,
+            StepState::Running { .. } => Self::Running,
+            StepState::Succeeded => Self::Done,
+            StepState::Failed { .. } => Self::Error,
+            StepState::Cancelled => Self::Cancelled,
+            StepState::Skipped => Self::Skipped,
+        }
+    }
+
+    /// How a setup/teardown step's Layer 0 state reads.
+    pub fn of_phase_step_status(status: &crate::data::workflow_state::PhaseStepStatus) -> Self {
+        use crate::data::workflow_state::PhaseStepStatus;
+        match status {
+            PhaseStepStatus::Pending => Self::Pending,
+            PhaseStepStatus::Running => Self::Running,
+            PhaseStepStatus::Succeeded => Self::Done,
+            PhaseStepStatus::Failed { .. } => Self::Error,
+            PhaseStepStatus::Remediating { .. } => Self::Fixing,
+        }
+    }
 }
 
 /// The phase a [`WorkflowStepView`] belongs to.
@@ -496,6 +582,102 @@ pub enum ContainerSlotEvent {
 /// slots: the workflow frontend pushes, the event loop drains.
 pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<ContainerSlotEvent>>>;
 
+/// The cross-thread slots a [`Tab`] shares with the command thread running
+/// against it.
+///
+/// Every field is an `Arc` handle: the tab keeps one end, the
+/// `TuiCommandFrontend` built for a command keeps the other, and both observe
+/// the same value. They travel together — a frontend that received some of
+/// them and not others would render against a tab it is only half wired to —
+/// so they are one clonable bundle rather than fifteen constructor
+/// parameters.
+#[derive(Clone)]
+pub struct TabSharedState {
+    /// Workflow view state written by the engine's `WorkflowFrontend` impl and
+    /// read by the Workflow Overview renderer.
+    pub workflow_state: SharedWorkflowViewState,
+    /// Yolo countdown state, rendered as a non-modal overlay.
+    pub yolo_state: SharedYoloState,
+    /// Cancel flag for the yolo countdown; set on Esc, read and cleared by
+    /// `yolo_countdown_tick`.
+    pub yolo_cancel_flag: SharedYoloCancelFlag,
+    /// The tab's status log, appended to by `TuiUserMessageSink`.
+    pub status_log: SharedStatusLog,
+    /// Structured `status` dashboard rows, rendered as a `Table` widget.
+    pub status_dashboard: SharedStatusDashboard,
+    /// Queue of container-slot lifecycle events, drained each tick.
+    pub container_slot_events: SharedContainerSlotEvents,
+    /// Signals the event loop to reset the vt100 parser between steps.
+    pub pty_reset_flag: SharedPtyResetFlag,
+    /// Name of the running container, published by the container frontend.
+    pub container_name_shared: SharedContainerName,
+    /// Exit code of a mid-workflow container that actually terminated.
+    pub container_exit_shared: SharedContainerExitCode,
+    /// Stdin sender slot, republished on each workflow step transition.
+    pub stdin_tx_shared: SharedStdinTx,
+    /// Resize sender slot, same pattern as `stdin_tx_shared`.
+    pub resize_tx_shared: SharedResizeTx,
+    /// Engine request sender, published by the engine for Ctrl-W.
+    pub engine_tx_shared: SharedEngineTx,
+    /// Stuck-event broadcast sender, published by the container engine.
+    pub stuck_sender_shared: SharedStuckSender,
+    /// Active worktree path, driving the bottom-bar context line.
+    pub active_worktree_path: SharedActiveWorktreePath,
+    /// Live TUI context refreshed each tick for `status --watch`.
+    pub tui_context_shared: SharedTuiContext,
+}
+
+impl TabSharedState {
+    /// A fresh, empty set of slots. Every tab starts with its own.
+    pub fn new() -> Self {
+        Self {
+            workflow_state: Arc::new(Mutex::new(None)),
+            yolo_state: Arc::new(Mutex::new(None)),
+            yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
+            status_log: Arc::new(Mutex::new(Vec::new())),
+            status_dashboard: Arc::new(Mutex::new(None)),
+            container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            pty_reset_flag: Arc::new(AtomicBool::new(false)),
+            container_name_shared: Arc::new(Mutex::new(None)),
+            container_exit_shared: Arc::new(Mutex::new(None)),
+            stdin_tx_shared: Arc::new(Mutex::new(None)),
+            resize_tx_shared: Arc::new(Mutex::new(None)),
+            engine_tx_shared: Arc::new(Mutex::new(None)),
+            stuck_sender_shared: Arc::new(Mutex::new(None)),
+            active_worktree_path: Arc::new(Mutex::new(None)),
+            tui_context_shared: Arc::new(Mutex::new(
+                crate::command::commands::status::StatusCommandTuiContext::default(),
+            )),
+        }
+    }
+
+    /// Fresh slots for a test that builds a `TuiCommandFrontend` without a
+    /// `Tab`. Identical to [`TabSharedState::new`]; named so the call sites
+    /// read as fixtures rather than as production wiring.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self::new()
+    }
+
+    /// Replace the per-command slots before a new command is spawned into the
+    /// tab, so a stale container name, exit code or I/O sender from the
+    /// previous command cannot be observed by the new one. The log, workflow
+    /// view and dashboard slots persist for the life of the tab.
+    pub fn reset_for_new_command(&mut self) {
+        self.container_name_shared = Arc::new(Mutex::new(None));
+        self.container_exit_shared = Arc::new(Mutex::new(None));
+        self.stdin_tx_shared = Arc::new(Mutex::new(None));
+        self.resize_tx_shared = Arc::new(Mutex::new(None));
+        self.engine_tx_shared = Arc::new(Mutex::new(None));
+    }
+}
+
+impl Default for TabSharedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Tab state — one per open tab.
 pub struct Tab {
     /// Identity of the manager-owned session backing this tab. The session
@@ -504,7 +686,17 @@ pub struct Tab {
     pub session_id: SessionId,
     pub session: Session,
     pub(crate) git_engine: Arc<GitEngine>,
+    /// Derived from `SessionState::current_command` by
+    /// [`Tab::refresh_from_session`] each tick. Never assigned directly:
+    /// whatever starts or ends a command records that on the session, and this
+    /// follows.
     pub execution_phase: ExecutionPhase,
+    /// Derived from `SessionState::current_workflow` each tick — the live run's
+    /// summary, mirrored by `WorkflowEngine::persist`.
+    pub current_workflow: Option<crate::data::workflow_state::WorkflowSummary>,
+    /// Derived from `SessionState::current_container` each tick.
+    pub current_container: Option<crate::data::session::AgentHandle>,
+
     pub container_window_state: ContainerWindowState,
     /// How many lines from the bottom to skip in the focused slot's vt100
     /// scrollback when the container is Maximized. 0 = follow live output.
@@ -534,20 +726,11 @@ pub struct Tab {
     /// reflects what the user saw (the window content shifts as new
     /// status-log lines arrive).
     pub exec_window_grid: Vec<Vec<String>>,
-    /// Shared workflow view state. The engine's `WorkflowFrontend` impl
-    /// writes here on `report_workflow_progress` / `report_step_status`;
-    /// the renderer reads from here when drawing the Workflow Overview.
-    pub workflow_state: SharedWorkflowViewState,
-    /// Shared yolo countdown state. Updated by `yolo_countdown_tick` on the
-    /// engine side; rendered as a non-modal overlay (avoids the dialog-spam
-    /// that a per-tick `ask_dialog` would cause).
-    pub yolo_state: SharedYoloState,
-    /// Shared cancel flag for yolo countdown. TUI event loop sets this on
-    /// Esc; `yolo_countdown_tick` reads + clears it.
-    pub yolo_cancel_flag: SharedYoloCancelFlag,
-    pub status_log: SharedStatusLog,
+    /// Cross-thread slots shared with the command thread (see
+    /// [`TabSharedState`]). Handed to the `TuiCommandFrontend` as one
+    /// bundle when a command is spawned into this tab.
+    pub shared: TabSharedState,
     pub status_log_collapsed: bool,
-    pub status_dashboard: SharedStatusDashboard,
     pub scroll_offset: usize,
     pub workflow_overview_scroll_offset: usize,
     /// Whether the Workflow Overview shows one box per stage (the default) or
@@ -556,11 +739,14 @@ pub struct Tab {
     pub workflow_overview_state: WorkflowOverviewState,
     pub last_overview_rect: Option<Rect>,
     pub mouse_selection: Option<TextSelection>,
-    pub workflow_agent_fallbacks: HashMap<String, String>,
-    pub is_remote: bool,
-    /// Fixed tab kind, following the `is_remote` precedent. A squad tab is not
-    /// bound to a project directory and renders squad content in place of the
-    /// execution window. Never toggled after construction.
+    /// Fixed tab kind. A squad tab is not bound to a project directory and
+    /// renders squad content in place of the execution window. Never toggled
+    /// after construction.
+    ///
+    /// Remoteness is *not* a field here: it is a property of the session
+    /// (`SessionType::Remote`), read through it. `Tab::is_remote` was a `bool`
+    /// that nothing outside the initialiser and two tests ever set, so the
+    /// magenta remote tab colour could not appear (WI 0114 F-22).
     pub is_squad: bool,
     /// Squad sub-view state (selection, polled tasks, daemon reachability).
     /// `Some` exactly when `is_squad`.
@@ -587,9 +773,6 @@ pub struct Tab {
     /// and is restored when the group finishes. Non-empty exactly while a
     /// parallel group is active.
     pub dormant_slots: Vec<ContainerSlot>,
-    /// Shared queue of slot lifecycle events published by the workflow
-    /// frontend; drained each tick to maintain `container_slots`.
-    pub container_slot_events: SharedContainerSlotEvents,
     /// Set after a mid-workflow container exit closes the window: PTY bytes
     /// that were still in flight from the dead container must not re-open it
     /// via `drain_container_output`'s auto-open branch. Cleared when the next
@@ -604,32 +787,6 @@ pub struct Tab {
     pub dialog_request_rx: Option<std::sync::mpsc::Receiver<DialogRequest>>,
     /// Event loop sends dialog responses back to the command thread.
     pub dialog_response_tx: Option<std::sync::mpsc::Sender<DialogResponse>>,
-    /// Shared flag: workflow frontend sets this to signal the TUI to reset the
-    /// vt100 parser between workflow steps.
-    pub pty_reset_flag: SharedPtyResetFlag,
-    /// Shared container name: set by the container frontend when the engine
-    /// reports the running container's name.
-    pub container_name_shared: SharedContainerName,
-    /// Shared container exit code: set by the workflow frontend when the
-    /// engine reports a mid-workflow container has actually terminated.
-    pub container_exit_shared: SharedContainerExitCode,
-    /// Shared stdin sender slot for workflow step transitions.
-    pub stdin_tx_shared: SharedStdinTx,
-    /// Shared resize sender slot for workflow step transitions.
-    pub resize_tx_shared: SharedResizeTx,
-    /// Shared control board sender for mid-step WCB requests.
-    pub engine_tx_shared: SharedEngineTx,
-    /// Shared stuck sender from the container engine. The event loop
-    /// subscribes from it when a new sender appears.
-    pub stuck_sender_shared: SharedStuckSender,
-    /// Shared active worktree path: set by the worktree-lifecycle frontend
-    /// after a worktree is created/resumed, cleared after the workflow
-    /// finalize step. Drives the "Using worktree: <path>" bottom-bar line.
-    pub active_worktree_path: SharedActiveWorktreePath,
-    /// Live TUI context for the status command. The event loop refreshes this
-    /// on every tick; `TuiCommandFrontend` reads from it on each watch
-    /// iteration so the status table always reflects current tab state.
-    pub tui_context_shared: SharedTuiContext,
 
     // ── Git sidebar ──────────────────────────────────────────────────────
     /// Whether the git sidebar is open. Toggled by Ctrl-G.
@@ -685,6 +842,40 @@ impl Tab {
         tab
     }
 
+    /// The tab's cross-thread slots, cloned for the command thread that is
+    /// about to run against this tab.
+    pub fn shared(&self) -> TabSharedState {
+        self.shared.clone()
+    }
+
+    /// Adopt the manager-owned session's in-flight state as this tab's view,
+    /// once per tick (decision Q3, WI 0114 F-22).
+    ///
+    /// Everything derived here is written by Layer 2 (`Dispatch::run_command`)
+    /// or Layer 1 (`WorkflowEngine::persist`), never by the tab. The tab keeps
+    /// the derived values as plain fields rather than re-deriving them in
+    /// every renderer, because rendering happens many times per tick and this
+    /// runs once.
+    /// Adopt a terminal phase this tab observed, so the frame being drawn is
+    /// already right.
+    ///
+    /// A view update only. Layer 2 has recorded the same outcome on the
+    /// session before the result reaches this tab, and
+    /// `refresh_from_session` re-derives `execution_phase` from there on the
+    /// next tick — including for a command that panicked, which
+    /// `Dispatch`'s own guard records (decision Q3, WI 0114 F-22). The tab
+    /// writes nothing back.
+    pub(crate) fn record_terminal_phase(&mut self, phase: ExecutionPhase) {
+        self.execution_phase = phase;
+    }
+
+    pub fn refresh_from_session(&mut self, session: &Session) {
+        self.session = session.clone();
+        self.execution_phase = ExecutionPhase::of_session_state(session.state());
+        self.current_workflow = session.state().current_workflow.clone();
+        self.current_container = session.state().current_container.clone();
+    }
+
     /// Shared field initialisation for [`Tab::new`] and [`Tab::new_squad`].
     /// Starts **no** poll and spawns nothing; the caller decides whether a git
     /// poll runs (normal tab) or not (squad tab).
@@ -694,6 +885,8 @@ impl Tab {
             session,
             git_engine,
             execution_phase: ExecutionPhase::Idle,
+            current_workflow: None,
+            current_container: None,
             container_window_state: ContainerWindowState::Hidden,
             container_scroll_offset: 0,
             last_container_summary: None,
@@ -701,19 +894,13 @@ impl Tab {
             container_rendered: false,
             exec_inner_area: None,
             exec_window_grid: Vec::new(),
-            workflow_state: Arc::new(Mutex::new(None)),
-            yolo_state: Arc::new(Mutex::new(None)),
-            yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
-            status_log: Arc::new(Mutex::new(Vec::new())),
+            shared: TabSharedState::new(),
             status_log_collapsed: false,
-            status_dashboard: Arc::new(Mutex::new(None)),
             scroll_offset: 0,
             workflow_overview_scroll_offset: 0,
             workflow_overview_state: WorkflowOverviewState::Minimized,
             last_overview_rect: None,
             mouse_selection: None,
-            workflow_agent_fallbacks: HashMap::new(),
-            is_remote: false,
             is_squad: false,
             squad: None,
             output_lines: Vec::new(),
@@ -723,22 +910,10 @@ impl Tab {
             container_slots: Vec::new(),
             focused_slot_idx: 0,
             dormant_slots: Vec::new(),
-            container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             suppress_container_auto_open: false,
             command_result_rx: None,
             dialog_request_rx: None,
             dialog_response_tx: None,
-            pty_reset_flag: Arc::new(AtomicBool::new(false)),
-            container_name_shared: Arc::new(Mutex::new(None)),
-            container_exit_shared: Arc::new(Mutex::new(None)),
-            stdin_tx_shared: Arc::new(Mutex::new(None)),
-            resize_tx_shared: Arc::new(Mutex::new(None)),
-            engine_tx_shared: Arc::new(Mutex::new(None)),
-            stuck_sender_shared: Arc::new(Mutex::new(None)),
-            active_worktree_path: Arc::new(Mutex::new(None)),
-            tui_context_shared: Arc::new(Mutex::new(
-                crate::command::commands::status::StatusCommandTuiContext::default(),
-            )),
             git_sidebar_state: GitSidebarState::Closed,
             git_diff_summary: Arc::new(Mutex::new(None)),
             git_poll_handle: None,
@@ -778,7 +953,7 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     use ratatui::style::Color;
     // Yolo countdown in progress: alternate yellow/magenta each second so
     // background tabs flash visibly, matching old-amux behavior.
-    if let Ok(guard) = tab.yolo_state.lock() {
+    if let Ok(guard) = tab.shared.yolo_state.lock() {
         if let Some(ref state) = *guard {
             return if state.remaining_secs % 2 == 0 {
                 Color::Yellow
@@ -795,7 +970,7 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     if tab.is_squad {
         return Color::Cyan;
     }
-    if tab.is_remote {
+    if tab.session.session_type().is_remote() {
         return Color::Magenta;
     }
     match &tab.execution_phase {

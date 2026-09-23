@@ -26,6 +26,7 @@ impl ConfigCommandFrontend for TuiCommandFrontend {
                 global_writable: r.global_writable,
                 repo_writable: r.repo_writable,
                 value_hint: r.value_hint.clone(),
+                shape: r.shape.clone(),
             })
             .collect();
 
@@ -50,19 +51,13 @@ impl ConfigCommandFrontend for TuiCommandFrontend {
         })?;
 
         match response {
-            DialogResponse::Text(edit_str) => {
-                // Format: "field\tvalue\tscope" where scope is "global" or "repo"
-                let parts: Vec<&str> = edit_str.splitn(3, '\t').collect();
-                if parts.len() == 3 {
-                    self.last_config_edit_field = Some(parts[0].to_string());
-                    Ok(Some(ConfigEditRequest {
-                        field: parts[0].to_string(),
-                        value: parts[1].to_string(),
-                        global: parts[2] == "global",
-                    }))
-                } else {
-                    Ok(None)
-                }
+            // The command layer's own type, straight through (F-20). This
+            // used to split a tab-separated string the dialog router built,
+            // and answer `Ok(None)` — a dismissal — whenever the split did
+            // not yield exactly three parts.
+            DialogResponse::ConfigEdit(edit) => {
+                self.last_config_edit_field = Some(edit.field.clone());
+                Ok(Some(edit))
             }
             _ => Ok(None),
         }

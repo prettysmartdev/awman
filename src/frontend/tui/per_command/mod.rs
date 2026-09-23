@@ -8,12 +8,10 @@ mod acp_frontend;
 mod agent_auth;
 mod agent_setup;
 mod api_server;
-mod auth;
 mod chat;
 mod clean;
 mod config;
 mod container_frontend;
-mod download;
 mod exec_prompt;
 mod exec_workflow;
 mod init;
@@ -29,3 +27,4 @@ mod worktree_lifecycle;
 
 pub use acp_frontend::{AcpPromptReceiver, AcpPromptSender, TuiAcpFrontend};
 pub use container_frontend::TuiContainerProxy;
+pub(crate) use squad::key_setup_dialog;

@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::data::session::AgentName;
+use crate::engine::agent::agent_matrix::CredentialSource;
 use crate::engine::auth::credential::{
     self, HostCredentialSource, RefreshableCredentialSpec, CLAUDE_KEYCHAIN_SERVICE,
 };
@@ -43,18 +44,28 @@ pub struct AgentSecretFile {
 /// Env-var credentials for the agent. Empty when the platform has no keychain
 /// integration, the entry is missing, or the payload fails to decode.
 pub fn agent_keychain_credentials(agent: &AgentName) -> Vec<(String, String)> {
-    match agent.as_str() {
-        "claude" => claude_keychain_credentials(),
-        _ => Vec::new(),
+    match credential_source(agent) {
+        CredentialSource::ClaudeKeychainOauth => claude_keychain_credentials(),
+        CredentialSource::AntigravityKeychainFile | CredentialSource::None => Vec::new(),
     }
+}
+
+/// This agent's credential scheme, from the one per-agent table
+/// (`agent_matrix`). An agent the matrix does not know has no host credential
+/// awman passes through — which is exactly what the `_ =>` arms these three
+/// functions used to carry said.
+fn credential_source(agent: &AgentName) -> CredentialSource {
+    crate::engine::agent::agent_matrix::matrix_for(agent.as_str())
+        .map(|m| m.credential_source)
+        .unwrap_or(CredentialSource::None)
 }
 
 /// File-form credentials for the agent. Empty when the platform has no
 /// keychain integration, the entry is missing, or the payload fails to decode.
 pub fn agent_keychain_files(agent: &AgentName) -> Vec<AgentSecretFile> {
-    match agent.as_str() {
-        "antigravity" => antigravity_keychain_files(),
-        _ => Vec::new(),
+    match credential_source(agent) {
+        CredentialSource::AntigravityKeychainFile => antigravity_keychain_files(),
+        CredentialSource::ClaudeKeychainOauth | CredentialSource::None => Vec::new(),
     }
 }
 
@@ -63,9 +74,9 @@ pub fn agent_keychain_files(agent: &AgentName) -> Vec<AgentSecretFile> {
 /// `None` keeps an agent's behaviour EXACTLY as it is today (env delivery for
 /// claude-less agents, `AgentSecretFile` delivery for antigravity).
 pub fn refreshable_spec_for(agent: &AgentName) -> Option<&'static RefreshableCredentialSpec> {
-    match agent.as_str() {
-        "claude" => Some(credential::claude_spec()),
-        _ => None,
+    match credential_source(agent) {
+        CredentialSource::ClaudeKeychainOauth => Some(credential::claude_spec()),
+        CredentialSource::AntigravityKeychainFile | CredentialSource::None => None,
     }
 }
 

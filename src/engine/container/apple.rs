@@ -336,6 +336,18 @@ impl ContainerBackend for AppleBackend {
         "apple-containers"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Apple Containers"
+    }
+
+    fn cli_binary(&self) -> &'static str {
+        "container"
+    }
+
+    fn availability_probe_args(&self) -> &'static [&'static str] {
+        &["system", "status"]
+    }
+
     fn image_home_dir(&self, tag: &str) -> Option<String> {
         // `container image inspect` emits a JSON array of variants; the env
         // list lives at `[0].variants[*].config.config.Env`. We pick the

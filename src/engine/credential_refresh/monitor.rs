@@ -16,7 +16,7 @@
 //! the first lease and parks when the registry empties.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::data::fs::auth_paths::AuthPathResolver;
@@ -26,7 +26,7 @@ use crate::engine::auth::credential::{
 };
 use crate::engine::auth::keychain::refreshable_spec_for;
 use crate::engine::auth::RefreshableCredentialDelivery;
-use crate::engine::ready::{refresh_host_credential, HostRefreshOutcome};
+use crate::engine::ready::{HostAgentPinger, HostRefreshOutcome};
 
 use super::lease::{CredentialLease, LeaseRegistry, RegistryShared};
 
@@ -111,6 +111,10 @@ pub struct CredentialRefreshMonitor {
     /// never raced by the tick loop and a concurrent `refresh_now` (INV-4).
     refresh_gate: tokio::sync::Mutex<()>,
     thread_started: std::sync::Once,
+    /// The one handle permitted to execute an agent binary on the host
+    /// (F-38). The tick loop's refresh is authorized trigger (b) in
+    /// `security.md`.
+    host_agent: HostAgentPinger,
 }
 
 impl CredentialRefreshMonitor {
@@ -143,6 +147,7 @@ impl CredentialRefreshMonitor {
             state: Mutex::new(HashMap::new()),
             refresh_gate: tokio::sync::Mutex::new(()),
             thread_started: std::sync::Once::new(),
+            host_agent: HostAgentPinger::new(),
         })
     }
 
@@ -339,7 +344,11 @@ impl CredentialRefreshMonitor {
         // its last-known-good file — loudly, never silently.
         let mut stale_remediation: Option<String> = None;
         let snapshot = if near_expiry {
-            match refresh_host_credential(spec, &self.binding).await {
+            match self
+                .host_agent
+                .refresh_credential(spec, &self.binding)
+                .await
+            {
                 HostRefreshOutcome::Advanced { .. } => match (spec.read)(&source) {
                     Ok(fresh) => fresh,
                     Err(reason) => {
@@ -603,26 +612,12 @@ fn run_monitor_loop(weak: Weak<CredentialRefreshMonitor>, shared: Arc<RegistrySh
     }
 }
 
-// ── Process-global installation ─────────────────────────────────────────────
-//
-// The container backends have no access to `Engines`, so the monitor is reached
-// through a process-global. `global()` returning `None` means "no monitor
-// installed" — every lease call becomes a no-op and behaviour is exactly
-// today's. That is also how the `authRefresh.enabled: false` kill switch is
-// implemented: install nothing.
-
-static GLOBAL_MONITOR: OnceLock<Arc<CredentialRefreshMonitor>> = OnceLock::new();
-
-/// Install the process monitor. Idempotent; the first install wins. Called once
-/// from the command layer when the effective config enables refresh.
-pub fn install_global(monitor: Arc<CredentialRefreshMonitor>) {
-    let _ = GLOBAL_MONITOR.set(monitor);
-}
-
-/// `None` when no monitor was installed.
-pub fn global() -> Option<Arc<CredentialRefreshMonitor>> {
-    GLOBAL_MONITOR.get().cloned()
-}
+// WI 0114 F-38 deleted the process-global `OnceLock<Arc<CredentialRefreshMonitor>>`
+// and its `install_global`/`global` pair. The monitor now travels as an
+// explicit `Arc<dyn CredentialLeaseFactory>` on `ResolvedContainerOptions`;
+// options built without one take no leases, which is exactly what the absent
+// global used to mean — including for the `authRefresh.enabled: false` kill
+// switch, which now simply passes no factory.
 
 #[cfg(test)]
 mod tests {

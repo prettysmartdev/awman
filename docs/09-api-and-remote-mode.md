@@ -1102,6 +1102,30 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
 
 `awman remote exec --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
 
+**Structured events:** the plain-text view above is a simplification. Each
+SSE frame actually carries a named `event:` type (`stdout_line`,
+`stderr_line`, `status_message`, `workflow_step_transition`,
+`workflow_phase_transition`, `workflow_parallel_step_launched`,
+`workflow_parallel_step_exited`, `workflow_parallel_group_finished`,
+`command_status`, `done`) and a JSON `data:` payload, so a client that wants
+structured data instead of log lines can read the `event:` field and parse
+accordingly. Add `?format=json` to the same URL to fetch the full captured
+event log as one JSON array instead of streaming it:
+
+```sh
+curl -s "http://localhost:9876/v1/commands/<command-id>/logs/stream?format=json" \
+  -H 'Authorization: Bearer <api-key>'
+```
+
+The status-carrying events use small typed enums rather than free-form
+strings, so a client can match on a fixed set of values:
+
+| Field | Values |
+|-------|--------|
+| `workflow_step_transition.from_status` / `.to_status` | `pending`, `running`, `succeeded`, `failed`, `cancelled`, `skipped` |
+| `workflow_phase_transition.status` | `running`, `succeeded`, `failed`, `paused`, `teardown_failed` |
+| `command_status.status` | `done`, `paused`, `aborted`, `error` |
+
 #### Get session queue status
 
 ```sh
@@ -1737,11 +1761,21 @@ awman remote session start /home/user/my-project \
   --api-key <key>
 ```
 
-On success, awman prints the new session ID:
+On success, awman prints the new session ID, followed by a readiness summary
+box for the remote host's environment — the same "Ready Summary" box `awman
+ready` prints locally (same rows, same glyphs), not a separately-composed
+report:
 
 ```
 Session started: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 Workdir: /home/user/my-project
+
+┌─ Ready Summary (docker) ──────────────┐
+│ Dockerfile          ✓                 │
+│ Base image          ✓                 │
+│ Agent image         ✓                 │
+│ ...                                    │
+└────────────────────────────────────────┘
 ```
 
 In CLI mode, `dir` is required. In TUI mode, `dir` is optional — if omitted and saved directories are configured, awman shows an interactive picker (see [TUI interactive flows](#tui-interactive-flows)).

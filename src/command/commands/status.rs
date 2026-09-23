@@ -96,6 +96,15 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
     /// Optional TUI context, returned as an owned clone so implementations
     /// can serve a fresh value from a shared slot on every call.
     /// Defaults to `None` for CLI / API.
+    ///
+    /// **Deliberately still a frontend hook** (WI 0114 F-49, which proposed
+    /// folding it into `CallerContext`). Unlike `is_local_user_session`, this
+    /// is not a fact about the caller fixed at construction: `awman status
+    /// --watch` reads it once per tick, and the tab numbers, stuck flags and
+    /// command labels it carries change while the command runs. A
+    /// construction-time snapshot would pin the dashboard to whatever the
+    /// tabs looked like when the watch started. The frontend supplies data
+    /// here, not a decision, which is the line Tenet 2 draws.
     fn tui_context(&self) -> Option<StatusCommandTuiContext> {
         None
     }

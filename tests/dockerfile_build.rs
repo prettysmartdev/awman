@@ -98,5 +98,8 @@ fn build_codex_template() {
 
 #[test]
 fn build_opencode_template() {
-    build_template("templates/Dockerfile.opencode", "awman-test-opencode:latest");
+    build_template(
+        "templates/Dockerfile.opencode",
+        "awman-test-opencode:latest",
+    );
 }

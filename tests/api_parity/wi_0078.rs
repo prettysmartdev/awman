@@ -17,23 +17,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use awman::command::commands::api_server::event_bus::EventBus;
+use awman::command::commands::api_server::session_setup::SessionSetupBus;
 use awman::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
-use awman::data::execution_event::{EventPayload, ExecutionEvent};
+use awman::data::execution_event::{
+    CommandStatusKind, EventPayload, ExecutionEvent, PhaseStatusKind, StepStatusKind,
+};
+use awman::data::fs::api_db::NewSessionRow;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
+use awman::data::session::SessionKind;
 use awman::data::session_setup_event::{SessionSetupState, SessionSetupStatus};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::frontend::api::event_bus::EventBus;
 use awman::frontend::api::routes::{build_router, AppState, AuthMode};
-use awman::frontend::api::session_setup::SessionSetupBus;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -56,7 +60,7 @@ fn make_app_state_with_workdirs(
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
-    let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
+    let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
         runtime: runtime.clone(),
@@ -67,6 +71,8 @@ fn make_app_state_with_workdirs(
         auth_engine,
         agent_engine,
         workflow_state_store,
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
 
     Arc::new(AppState {
@@ -612,8 +618,8 @@ fn sse_event_type_names_are_correct_snake_case() {
             WorkflowStepTransition {
                 step_name: "s".into(),
                 step_index: 0,
-                from_status: "pending".into(),
-                to_status: "running".into(),
+                from_status: StepStatusKind::Pending,
+                to_status: StepStatusKind::Running,
             },
             "workflow_step_transition",
         ),
@@ -621,13 +627,13 @@ fn sse_event_type_names_are_correct_snake_case() {
             WorkflowPhaseTransition {
                 phase: "main".into(),
                 step_desc: "step".into(),
-                status: "running".into(),
+                status: PhaseStatusKind::Running,
             },
             "workflow_phase_transition",
         ),
         (
             CommandStatus {
-                status: "done".into(),
+                status: CommandStatusKind::Done,
                 exit_code: Some(0),
                 error: None,
             },
@@ -705,11 +711,11 @@ async fn ndjson_1000_events_all_parseable() {
             3 => EventPayload::WorkflowStepTransition {
                 step_name: format!("step_{i}"),
                 step_index: i as usize,
-                from_status: "pending".into(),
-                to_status: "running".into(),
+                from_status: StepStatusKind::Pending,
+                to_status: StepStatusKind::Running,
             },
             _ => EventPayload::CommandStatus {
-                status: "running".into(),
+                status: CommandStatusKind::Done,
                 exit_code: None,
                 error: None,
             },
@@ -783,13 +789,29 @@ async fn session_setup_bus_initial_state_is_initializing() {
     assert!(state.error.is_none());
 }
 
-#[tokio::test]
-async fn session_setup_bus_status_transitions_via_sender() {
-    let bus = SessionSetupBus::new(32);
-    let sender = bus.sender();
+// Since WI 0114 F-41 the transition rules below are `SessionSetupState`
+// methods, not bus methods: the bus broadcasts and holds the shared handle,
+// and everything that writes to a setup snapshot — the orchestrator, the ready
+// frontend, a future second multi-session frontend — goes through the same
+// Layer 0 methods. These tests exercise them through the handle the bus hands
+// out, so they still cover what a client of `GET /v1/sessions/:id/setup` sees.
 
-    sender.update_status(SessionSetupStatus::RunningReady);
-    sender.update_stage("Building image...");
+/// Write through the bus's shared state handle, the way the orchestrator and
+/// the ready frontend do.
+fn transition(
+    bus: &SessionSetupBus,
+    apply: impl FnOnce(&mut awman::data::session_setup_event::SessionSetupState),
+) {
+    let mut state = bus.current_state.write().unwrap();
+    apply(&mut state);
+}
+
+#[tokio::test]
+async fn session_setup_state_status_and_stage_transitions() {
+    let bus = SessionSetupBus::new(32);
+
+    transition(&bus, |s| s.enter_status(SessionSetupStatus::RunningReady));
+    transition(&bus, |s| s.set_stage("Building image..."));
 
     let state = bus.snapshot();
     assert_eq!(state.status, SessionSetupStatus::RunningReady);
@@ -797,11 +819,10 @@ async fn session_setup_bus_status_transitions_via_sender() {
 }
 
 #[tokio::test]
-async fn session_setup_bus_mark_failed_sets_error() {
+async fn session_setup_state_mark_failed_sets_error() {
     let bus = SessionSetupBus::new(32);
-    let sender = bus.sender();
 
-    sender.mark_failed("build_step", "docker not found");
+    transition(&bus, |s| s.mark_failed("build_step", "docker not found"));
 
     let state = bus.snapshot();
     assert_eq!(state.status, SessionSetupStatus::Failed);
@@ -809,30 +830,38 @@ async fn session_setup_bus_mark_failed_sets_error() {
     assert_eq!(err.stage, "build_step");
     assert_eq!(err.message, "docker not found");
     assert!(state.status.is_terminal());
+    assert_eq!(
+        state.current_stage.as_deref(),
+        Some("Failed: docker not found"),
+        "the stage line must read as a failure"
+    );
 }
 
 #[tokio::test]
-async fn session_setup_bus_ready_step_statuses_accumulate() {
-    use awman::engine::step_status::StepStatus;
+async fn session_setup_state_ready_step_statuses_accumulate() {
+    use awman::data::step_status::StepStatus;
 
     let bus = SessionSetupBus::new(32);
-    let sender = bus.sender();
 
-    sender.update_ready_step("preflight", StepStatus::Running);
+    transition(&bus, |s| {
+        s.apply_ready_step("preflight", StepStatus::Running)
+    });
     {
         let state = bus.snapshot();
         assert_eq!(state.ready_step_statuses.len(), 1);
         assert_eq!(state.ready_step_statuses[0].step, "preflight");
     }
 
-    sender.update_ready_step("build_image", StepStatus::Running);
+    transition(&bus, |s| {
+        s.apply_ready_step("build_image", StepStatus::Running)
+    });
     {
         let state = bus.snapshot();
         assert_eq!(state.ready_step_statuses.len(), 2);
     }
 
     // Update an existing step.
-    sender.update_ready_step("preflight", StepStatus::Done);
+    transition(&bus, |s| s.apply_ready_step("preflight", StepStatus::Done));
     {
         let state = bus.snapshot();
         assert_eq!(
@@ -847,6 +876,29 @@ async fn session_setup_bus_ready_step_statuses_accumulate() {
             .unwrap();
         assert_eq!(preflight.status, StepStatus::Done);
     }
+}
+
+/// `apply_ready_phase` enters `RunningReady`, records the phase, and returns
+/// the same stage line it writes — so a caller broadcasts exactly what a
+/// snapshot reader sees.
+#[tokio::test]
+async fn session_setup_state_apply_ready_phase_returns_the_stage_it_writes() {
+    use awman::data::ready_phase::ReadyPhase;
+
+    let bus = SessionSetupBus::new(32);
+    let returned = {
+        let mut state = bus.current_state.write().unwrap();
+        state.apply_ready_phase(&ReadyPhase::BuildingBaseImage)
+    };
+
+    let state = bus.snapshot();
+    assert_eq!(state.status, SessionSetupStatus::RunningReady);
+    assert_eq!(
+        state.current_ready_phase,
+        Some(ReadyPhase::BuildingBaseImage)
+    );
+    assert_eq!(state.current_stage.as_deref(), Some(returned.as_str()));
+    assert_eq!(returned, "Building base image...");
 }
 
 #[tokio::test]
@@ -935,16 +987,16 @@ fn execution_event_json_roundtrip_all_payload_variants() {
         EventPayload::WorkflowStepTransition {
             step_name: "step1".into(),
             step_index: 0,
-            from_status: "pending".into(),
-            to_status: "running".into(),
+            from_status: StepStatusKind::Pending,
+            to_status: StepStatusKind::Running,
         },
         EventPayload::WorkflowPhaseTransition {
             phase: "main".into(),
             step_desc: "Running agent".into(),
-            status: "running".into(),
+            status: PhaseStatusKind::Running,
         },
         EventPayload::CommandStatus {
-            status: "done".into(),
+            status: CommandStatusKind::Done,
             exit_code: Some(0),
             error: None,
         },
@@ -1081,9 +1133,9 @@ fn remote_exec_subcommands_are_not_api_allowed() {
 /// frontend — independent of how the command layer interprets the values.
 #[test]
 fn api_frontend_always_returns_yolo_true_regardless_of_input() {
+    use awman::command::commands::api_server::event_bus::EventBus;
     use awman::command::dispatch::CommandFrontend;
     use awman::frontend::api::command_frontend::ApiDispatchFrontend;
-    use awman::frontend::api::event_bus::EventBus;
 
     let bus = EventBus::new(8);
     // Send the explicit "--yolo false --non-interactive false" args — the
@@ -1129,14 +1181,14 @@ async fn real_network_exec_response_advertises_flags_applied() {
     // waiting for the async setup pipeline.
     state
         .store
-        .insert_session_full(
-            "flags-session",
-            &workdir_path.display().to_string(),
-            "2026-01-01T00:00:00Z",
-            "ready",
-            "local",
-            None,
-        )
+        .insert_session_full(NewSessionRow {
+            id: "flags-session",
+            workdir: &workdir_path.display().to_string(),
+            created_at: "2026-01-01T00:00:00Z",
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     let client = reqwest::Client::new();
@@ -1216,23 +1268,44 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
     let store = SqliteSessionStore::open(tmp.path()).unwrap();
 
     store
-        .insert_session_full("s1", "/wd1", "ts", "running_ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd1",
+            created_at: "ts",
+            setup_status: SessionSetupStatus::RunningReady,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     store
-        .insert_session_full(
-            "s2",
-            "/wd2",
-            "ts",
-            "cloning_repository",
-            "remote",
-            Some("/clone/s2"),
-        )
+        .insert_session_full(NewSessionRow {
+            id: "s2",
+            workdir: "/wd2",
+            created_at: "ts",
+            setup_status: SessionSetupStatus::CloningRepository,
+            kind: SessionKind::Remote,
+            cloned_path: Some("/clone/s2"),
+        })
         .unwrap();
     store
-        .insert_session_full("s3", "/wd3", "ts", "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s3",
+            workdir: "/wd3",
+            created_at: "ts",
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     store
-        .insert_session_full("s4", "/wd4", "ts", "failed", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s4",
+            workdir: "/wd4",
+            created_at: "ts",
+            setup_status: SessionSetupStatus::Failed,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     let in_progress = store.list_sessions_with_in_progress_setup().unwrap();
@@ -1253,7 +1326,14 @@ fn update_setup_status_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let store = SqliteSessionStore::open(tmp.path()).unwrap();
     store
-        .insert_session_full("sid", "/wd", "ts", "initializing", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "sid",
+            workdir: "/wd",
+            created_at: "ts",
+            setup_status: SessionSetupStatus::Initializing,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     let s = store.get_session("sid").unwrap().unwrap();
@@ -1290,8 +1370,8 @@ async fn real_network_job_logs_404_for_unknown_job() {
 /// writer with a known state and assert the JSON round-trips.
 #[test]
 fn setup_state_serializes_correctly_to_disk_format() {
-    use awman::engine::ready::summary::ReadySummary;
-    use awman::engine::step_status::StepStatus;
+    use awman::data::ready_summary::ReadySummary;
+    use awman::data::step_status::StepStatus;
 
     let mut summary = ReadySummary::new("docker");
     summary.dockerfile = StepStatus::Done;
@@ -1537,7 +1617,7 @@ mod remote_session_start_wait_tests {
     use awman::data::fs::auth_paths::AuthPathResolver;
     use awman::data::message::{MessageLevel, UserMessage, UserMessageSink};
     use awman::data::session::{Session, SessionOpenOptions};
-    use awman::data::EngineWorkflowStateStore;
+    use awman::data::WorkflowStateStore;
     use awman::engine::agent::AgentEngine;
     use awman::engine::auth::AuthEngine;
     use awman::engine::container::ContainerRuntime;
@@ -1564,7 +1644,7 @@ mod remote_session_start_wait_tests {
         let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
         let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, api_paths));
         let git_engine = Arc::new(GitEngine::new());
-        let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(root));
+        let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(root));
         Engines {
             runtime: runtime.clone(),
             container_runtime: Some(runtime),
@@ -1574,6 +1654,8 @@ mod remote_session_start_wait_tests {
             auth_engine,
             agent_engine,
             workflow_state_store,
+            credential_monitor: None,
+            global_config: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -1687,10 +1769,15 @@ mod remote_session_start_wait_tests {
             all_text.contains("is ready"),
             "poll loop should print 'Session ... is ready.'; got:\n{all_text}"
         );
-        // The rendered summary box uses the runtime name in its title.
+        // The summary is reported through the frontend, which titles it with
+        // the runtime name (WI 0114 F-23: Layer 2 no longer draws the box).
         assert!(
-            all_text.contains("docker"),
-            "poll loop must render the ready summary (which contains the runtime name); got:\n{all_text}"
+            all_text.contains("Ready Summary (docker)"),
+            "poll loop must report the ready summary; got:\n{all_text}"
+        );
+        assert!(
+            all_text.contains("Dockerfile: done"),
+            "every summary row must be reported; got:\n{all_text}"
         );
         assert!(
             levels(&messages).contains(&MessageLevel::Success),

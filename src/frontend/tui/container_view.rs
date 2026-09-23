@@ -85,7 +85,8 @@ pub fn render_container_maximized(
     let step_name: Option<String> = Some(focused_slot.step_name.clone())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            tab.workflow_state
+            tab.shared
+                .workflow_state
                 .lock()
                 .ok()
                 .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
@@ -502,18 +503,12 @@ mod tests {
 
     // ── WI-0096 minimized-bar rendering (E2E) ───────────────────────────────
 
-    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+    use crate::data::session::Session;
     use crate::frontend::tui::tabs::{ContainerSlot, ContainerSlotEvent, Tab};
 
     fn make_test_session() -> Session {
         let tmp = tempfile::tempdir().unwrap();
-        let resolver = StaticGitRootResolver::new(tmp.path());
-        Session::open(
-            tmp.path().to_path_buf(),
-            &resolver,
-            SessionOpenOptions::default(),
-        )
-        .unwrap()
+        Session::for_tests(tmp.path())
     }
 
     fn render_bars_to_text(tab: &Tab, width: u16, height: u16) -> String {
@@ -585,7 +580,8 @@ mod tests {
         assert!(text.contains("[test]"));
 
         // The background step exits → its slot is evicted and the bar is gone.
-        tab.container_slot_events
+        tab.shared
+            .container_slot_events
             .lock()
             .unwrap()
             .push_back(ContainerSlotEvent::Exited {

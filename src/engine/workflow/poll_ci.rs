@@ -2,8 +2,12 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
+use crate::data::ci_poll_event::CiPollEvent;
 use crate::engine::error::EngineError;
+use crate::engine::git::GitEngine;
+use crate::engine::remote::{HttpClientOptions, HttpCore};
 
 /// Result of a single CI status check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,80 +16,6 @@ pub enum CiStatus {
     Running,
     Success,
     Failed(String),
-}
-
-/// Fetch the CI status for the current branch/HEAD from GitHub.
-///
-/// Primary path: `gh run list` (if `gh` is installed and authenticated).
-/// Fallback: GitHub REST API via `reqwest` with `GITHUB_TOKEN`.
-pub fn fetch_ci_status(git_root: &Path) -> Result<CiStatus, EngineError> {
-    let branch = detect_branch(git_root)?;
-    let head_sha = detect_head_sha(git_root)?;
-
-    if gh_is_available() {
-        return fetch_via_gh(&branch, &head_sha, git_root);
-    }
-
-    // Host-supplied, so it must come through the daemon overlay when squad is
-    // the caller: the daemon does not inherit the shell that created the task.
-    let token = match crate::data::config::env::host_var(crate::data::config::env::GITHUB_TOKEN) {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            return Err(EngineError::Other(
-                "poll_ci: neither `gh` CLI (authenticated) nor GITHUB_TOKEN env var is available; \
-                 cannot poll CI status"
-                    .into(),
-            ));
-        }
-    };
-
-    let (owner, repo) = detect_github_repo(git_root)?;
-    fetch_via_api(&owner, &repo, &branch, &head_sha, &token)
-}
-
-fn detect_branch(git_root: &Path) -> Result<String, EngineError> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(git_root)
-        .output()
-        .map_err(|e| EngineError::Other(format!("poll_ci: failed to run git rev-parse: {e}")))?;
-    if !output.status.success() {
-        return Err(EngineError::Other(
-            "poll_ci: git rev-parse --abbrev-ref HEAD failed".into(),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn detect_head_sha(git_root: &Path) -> Result<String, EngineError> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(git_root)
-        .output()
-        .map_err(|e| EngineError::Other(format!("poll_ci: failed to run git rev-parse: {e}")))?;
-    if !output.status.success() {
-        return Err(EngineError::Other(
-            "poll_ci: git rev-parse HEAD failed".into(),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn detect_github_repo(git_root: &Path) -> Result<(String, String), EngineError> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(git_root)
-        .output()
-        .map_err(|e| {
-            EngineError::Other(format!("poll_ci: failed to run git remote get-url: {e}"))
-        })?;
-    if !output.status.success() {
-        return Err(EngineError::Other(
-            "poll_ci: git remote get-url origin failed; cannot determine GitHub repo".into(),
-        ));
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_github_owner_repo(&url)
 }
 
 fn parse_github_owner_repo(url: &str) -> Result<(String, String), EngineError> {
@@ -141,7 +71,10 @@ async fn fetch_workflow_runs_json(
     url: String,
     token: String,
 ) -> Result<serde_json::Value, EngineError> {
-    let client = reqwest::Client::new();
+    // The shared builder with every option left at its default, which is the
+    // untimed client this poller has always used (WI 0114 F-28).
+    let client = HttpCore::client(&HttpClientOptions::default())
+        .map_err(|e| EngineError::Other(format!("poll_ci: {e}")))?;
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -334,74 +267,133 @@ fn parse_run_list(json: &serde_json::Value, head_sha: &str) -> Result<CiStatus, 
     }
 }
 
-/// Run the full poll_ci loop: poll at `interval_secs` for up to `max_retries`.
+// `PollMessage` is gone (WI 0114 F-45): the poller reports a typed
+// `CiPollEvent` and the frontend decides the level and the wording. The doc
+// block that sat here described `msg_info`/`msg_warning` closures that had
+// already been replaced by the single `on_message` callback; it is now on
+// `CiPoller::poll`, describing the parameters that actually exist.
+
+/// Polls GitHub for the CI status of the current branch/HEAD.
 ///
-/// `msg_info` and `msg_warning` are closures for emitting status messages.
-/// The first few `NotFound` results are treated as `Running` (the CI run
-/// may not have been created yet).
-/// Message level for poll_ci status updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PollMessage {
-    Info,
-    Warning,
+/// Typed rather than a pair of free functions (Tenet 3), and holding its two
+/// collaborators rather than reaching for them: branch, HEAD SHA and remote
+/// URL come from [`GitEngine`] instead of three ad-hoc `git` shells, and the
+/// GitHub token is supplied at construction instead of read from the
+/// environment here (F-37 — Layer 0 owns `GITHUB_TOKEN`, and inside the squad
+/// daemon the value arrives over the socket, not in the process environment,
+/// which is why the caller resolves it through `host_var`).
+///
+/// The `reqwest` client stays local to this type until F-28 gives the engine
+/// a shared one.
+pub struct CiPoller {
+    git: Arc<GitEngine>,
+    token: Option<String>,
 }
 
-pub fn run_poll_ci_loop(
-    git_root: &Path,
-    interval_secs: u32,
-    max_retries: u32,
-    mut on_message: impl FnMut(PollMessage, String),
-) -> Result<(), EngineError> {
-    let grace_not_found = 3u32.min(max_retries);
-
-    for attempt in 1..=max_retries {
-        on_message(
-            PollMessage::Info,
-            format!("Polling CI (attempt {attempt}/{max_retries})..."),
-        );
-
-        let result = fetch_ci_status(git_root)?;
-
-        match result {
-            CiStatus::Success => {
-                on_message(PollMessage::Info, "CI passed".to_string());
-                return Ok(());
-            }
-            CiStatus::Running => {
-                on_message(PollMessage::Info, "CI still running".to_string());
-            }
-            CiStatus::NotFound if attempt <= grace_not_found => {
-                on_message(
-                    PollMessage::Info,
-                    "No CI run found yet (may not have been created); will retry".to_string(),
-                );
-            }
-            CiStatus::NotFound => {
-                return Err(EngineError::Container(
-                    "poll_ci: no CI run found for this branch/commit".into(),
-                ));
-            }
-            CiStatus::Failed(detail) => {
-                on_message(PollMessage::Warning, format!("CI failed: {detail}"));
-                return Err(EngineError::Container(format!(
-                    "poll_ci: CI failed: {detail}"
-                )));
-            }
-        }
-
-        if attempt < max_retries {
-            std::thread::sleep(std::time::Duration::from_secs(interval_secs.into()));
-        }
+impl CiPoller {
+    pub fn new(git: Arc<GitEngine>, token: Option<String>) -> Self {
+        Self { git, token }
     }
 
-    Err(EngineError::Container(
-        "poll_ci: CI did not complete within max_retries attempts".into(),
-    ))
+    /// Fetch the CI status for `git_root`'s current branch/HEAD.
+    ///
+    /// Primary path: `gh run list` (if `gh` is installed and authenticated).
+    /// Fallback: the GitHub REST API with the token this poller was built
+    /// with.
+    pub fn fetch_status(&self, git_root: &Path) -> Result<CiStatus, EngineError> {
+        let branch = self.git.current_branch(git_root).ok_or_else(|| {
+            EngineError::Other(
+                "poll_ci: cannot determine the current branch (detached HEAD?)".into(),
+            )
+        })?;
+        let head_sha = self.git.head_sha(git_root)?;
+
+        if gh_is_available() {
+            return fetch_via_gh(&branch, &head_sha, git_root);
+        }
+
+        let token = match self.token.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                return Err(EngineError::Other(
+                    "poll_ci: neither `gh` CLI (authenticated) nor GITHUB_TOKEN env var is \
+                     available; cannot poll CI status"
+                        .into(),
+                ));
+            }
+        };
+
+        let remote_url = self.git.remote_url(git_root, "origin").map_err(|e| {
+            EngineError::Other(format!(
+                "poll_ci: cannot determine the GitHub repo from remote 'origin': {e}"
+            ))
+        })?;
+        let (owner, repo) = parse_github_owner_repo(&remote_url)?;
+        fetch_via_api(&owner, &repo, &branch, &head_sha, token)
+    }
+
+    /// Poll until CI passes, fails, or `max_retries` attempts are spent.
+    ///
+    /// `on_event` receives each observation as a typed [`CiPollEvent`]; the
+    /// poller no longer composes the narration itself (F-45). `CiPollEvent`'s
+    /// `Display` is the wording it used to compose.
+    pub fn poll(
+        &self,
+        git_root: &Path,
+        interval_secs: u32,
+        max_retries: u32,
+        mut on_event: impl FnMut(CiPollEvent),
+    ) -> Result<(), EngineError> {
+        let grace_not_found = 3u32.min(max_retries);
+
+        for attempt in 1..=max_retries {
+            on_event(CiPollEvent::Attempt {
+                attempt,
+                of: max_retries,
+            });
+
+            match self.fetch_status(git_root)? {
+                CiStatus::Success => {
+                    on_event(CiPollEvent::Passed);
+                    return Ok(());
+                }
+                CiStatus::Running => {
+                    on_event(CiPollEvent::StillRunning);
+                }
+                CiStatus::NotFound if attempt <= grace_not_found => {
+                    on_event(CiPollEvent::NoRunYet);
+                }
+                CiStatus::NotFound => {
+                    return Err(EngineError::Container(
+                        "poll_ci: no CI run found for this branch/commit".into(),
+                    ));
+                }
+                CiStatus::Failed(detail) => {
+                    on_event(CiPollEvent::Failed {
+                        detail: detail.clone(),
+                    });
+                    return Err(EngineError::Container(format!(
+                        "poll_ci: CI failed: {detail}"
+                    )));
+                }
+            }
+
+            if attempt < max_retries {
+                std::thread::sleep(std::time::Duration::from_secs(interval_secs.into()));
+            }
+        }
+
+        Err(EngineError::Container(
+            "poll_ci: CI did not complete within max_retries attempts".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::engine::test_path::PathGuard;
 
     #[test]
     fn parse_github_ssh_url() {
@@ -718,25 +710,27 @@ mod tests {
     #[test]
     fn run_poll_ci_loop_emits_attempt_message_before_fetch_fails() {
         let tmp = tempfile::tempdir().unwrap(); // NOT a git repo
-        let mut messages: Vec<(PollMessage, String)> = Vec::new();
+        let mut events: Vec<CiPollEvent> = Vec::new();
 
-        let result = run_poll_ci_loop(tmp.path(), 0, 5, |level, msg| {
-            messages.push((level, msg));
+        let result = test_poller(None).poll(tmp.path(), 0, 5, |event| {
+            events.push(event);
         });
 
         assert!(result.is_err(), "must fail on a non-git directory");
         // The attempt banner is emitted before fetch_ci_status is called.
         assert_eq!(
-            messages.len(),
+            events.len(),
             1,
-            "exactly one message before the error propagates"
+            "exactly one event before the error propagates"
         );
+        assert_eq!(events[0], CiPollEvent::Attempt { attempt: 1, of: 5 });
+        // The narration the default `report_ci_poll` will render.
         assert!(
-            messages[0].1.contains("attempt 1/5"),
-            "first message must be the attempt banner: {:?}",
-            messages[0].1
+            events[0].to_string().contains("attempt 1/5"),
+            "first event must be the attempt banner: {}",
+            events[0]
         );
-        assert_eq!(messages[0].0, PollMessage::Info);
+        assert_eq!(events[0].level(), crate::data::message::MessageLevel::Info);
     }
 
     /// Exhausting all retries (CI remains running) must return a "did not
@@ -757,8 +751,6 @@ mod tests {
             return;
         }
 
-        let _lock = GH_SCRIPT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
         let bin_dir = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_test_git_repo(repo.path());
@@ -771,15 +763,12 @@ mod tests {
         write_executable(bin_dir.path().join("gh"), script);
         write_executable(bin_dir.path().join("which"), "#!/bin/sh\nexit 0\n");
 
-        let orig_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.path().display()));
+        let _path = PathGuard::prepending(bin_dir.path());
 
         let mut messages: Vec<String> = Vec::new();
-        let result = run_poll_ci_loop(repo.path(), 0, 3, |_, msg| {
-            messages.push(msg);
+        let result = test_poller(None).poll(repo.path(), 0, 3, |event| {
+            messages.push(event.to_string());
         });
-
-        std::env::set_var("PATH", orig_path);
 
         let err = result.unwrap_err();
         assert!(
@@ -815,8 +804,6 @@ mod tests {
             return;
         }
 
-        let _lock = GH_SCRIPT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
         let bin_dir = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_test_git_repo(repo.path());
@@ -828,15 +815,12 @@ mod tests {
         write_executable(bin_dir.path().join("gh"), script);
         write_executable(bin_dir.path().join("which"), "#!/bin/sh\nexit 0\n");
 
-        let orig_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.path().display()));
+        let _path = PathGuard::prepending(bin_dir.path());
 
-        let mut messages: Vec<(PollMessage, String)> = Vec::new();
-        let result = run_poll_ci_loop(repo.path(), 0, 5, |level, msg| {
-            messages.push((level, msg));
+        let mut events: Vec<CiPollEvent> = Vec::new();
+        let result = test_poller(None).poll(repo.path(), 0, 5, |event| {
+            events.push(event);
         });
-
-        std::env::set_var("PATH", orig_path);
 
         assert!(
             result.is_ok(),
@@ -844,8 +828,8 @@ mod tests {
             result
         );
         assert!(
-            messages.iter().any(|(_, m)| m.contains("CI passed")),
-            "must emit 'CI passed' message: {messages:?}"
+            events.contains(&CiPollEvent::Passed),
+            "must emit the CI-passed event: {events:?}"
         );
     }
 
@@ -866,8 +850,6 @@ mod tests {
             return;
         }
 
-        let _lock = GH_SCRIPT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
         let bin_dir = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_test_git_repo(repo.path());
@@ -879,17 +861,14 @@ mod tests {
         write_executable(bin_dir.path().join("gh"), script);
         write_executable(bin_dir.path().join("which"), "#!/bin/sh\nexit 0\n");
 
-        let orig_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.path().display()));
+        let _path = PathGuard::prepending(bin_dir.path());
 
         let mut warnings: Vec<String> = Vec::new();
-        let result = run_poll_ci_loop(repo.path(), 0, 5, |level, msg| {
-            if level == PollMessage::Warning {
-                warnings.push(msg);
+        let result = test_poller(None).poll(repo.path(), 0, 5, |event| {
+            if event.level() == crate::data::message::MessageLevel::Warning {
+                warnings.push(event.to_string());
             }
         });
-
-        std::env::set_var("PATH", orig_path);
 
         assert!(result.is_err(), "should fail when CI fails");
         let err_str = result.unwrap_err().to_string();
@@ -907,10 +886,11 @@ mod tests {
     /// must return an error mentioning both missing authentication paths.
     #[test]
     fn real_git_missing_github_token_and_no_gh_returns_descriptive_error() {
-        // Serialise against sibling tests that mutate PATH to install a fake
+        // Serialise against every sibling that mutates PATH to install a fake
         // `gh` — without this we can observe their PATH and find a "gh" we
-        // shouldn't have.
-        let _lock = GH_SCRIPT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // shouldn't have. The guard is the process-wide one, so this also
+        // covers the dsbx fake-`sbx` tests, not just this module's.
+        let _path = PathGuard::acquire();
 
         if !std::process::Command::new("git")
             .arg("--version")
@@ -949,7 +929,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         init_test_git_repo(repo.path());
 
-        let err = fetch_ci_status(repo.path()).unwrap_err();
+        let err = test_poller(None).fetch_status(repo.path()).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("GITHUB_TOKEN"),
@@ -958,10 +938,13 @@ mod tests {
         assert!(msg.contains("gh"), "error must mention gh CLI: {msg}");
     }
 
-    // ── Helpers for real-git tests ────────────────────────────────────────────
+    /// A poller over a real `GitEngine` with an explicit token, so these
+    /// tests never depend on the ambient environment.
+    fn test_poller(token: Option<&str>) -> CiPoller {
+        CiPoller::new(Arc::new(GitEngine::new()), token.map(str::to_string))
+    }
 
-    /// Serialises tests that mutate the process-wide PATH.
-    static GH_SCRIPT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // ── Helpers for real-git tests ────────────────────────────────────────────
 
     fn init_test_git_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {

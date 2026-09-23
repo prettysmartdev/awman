@@ -18,6 +18,7 @@ use crate::data::config::global::GlobalConfig;
 use crate::data::config::repo::RepoConfig;
 use crate::data::error::DataError;
 use crate::data::fs::SquadPaths;
+use crate::data::workflow_state::WorkflowSummary;
 
 /// Newtype around the underlying session UUID.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,51 +136,6 @@ pub struct CommandInvocation {
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Lifecycle state of a single workflow step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StepStatus {
-    Pending,
-    Running,
-    Done,
-    Error(String),
-}
-
-/// Persistable record of one step in a workflow invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowStepRecord {
-    pub name: String,
-    pub depends_on: Vec<String>,
-    pub prompt_template: String,
-    pub status: StepStatus,
-    pub container_id: Option<String>,
-    #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-/// Persistable state of a workflow invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowInvocation {
-    pub id: Uuid,
-    pub title: Option<String>,
-    pub workflow_name: String,
-    pub workflow_hash: String,
-    #[serde(default)]
-    pub work_item: Option<u32>,
-    pub steps: Vec<WorkflowStepRecord>,
-    /// User-controlled flags persisted alongside the run.
-    #[serde(default)]
-    pub paused: bool,
-    #[serde(default)]
-    pub yolo: bool,
-    #[serde(default)]
-    pub auto: bool,
-    /// Index of the step the workflow is currently processing, if any.
-    #[serde(default)]
-    pub current_step: Option<usize>,
-}
-
 /// Severity of a session log entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionLogKind {
@@ -208,10 +164,22 @@ impl SessionLogEntry {
 }
 
 /// Mutable runtime state belonging to a session.
+///
+/// Decision Q3 makes this the ruling in-flight state: commands write
+/// `current_command` / `current_workflow` / `current_container` through the
+/// [`Session`] they own, and a frontend view — the TUI's tab — derives from it
+/// rather than keeping a parallel copy (WI 0114 F-30/F-22).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     pub current_command: Option<CommandInvocation>,
-    pub current_workflow: Option<WorkflowInvocation>,
+    /// The workflow running in this session right now, summarised.
+    ///
+    /// A projection of the `WorkflowState` the engine owns, refreshed
+    /// whenever the engine persists. The run's authoritative state is never
+    /// here: this exists so a session view can render without loading a state
+    /// file, which is what the deleted `WorkflowInvocation` — a second,
+    /// never-written workflow model — was trying and failing to be.
+    pub current_workflow: Option<WorkflowSummary>,
     pub current_container: Option<AgentHandle>,
     pub errors: Vec<SessionLogEntry>,
     pub notes: Vec<SessionLogEntry>,
@@ -229,6 +197,77 @@ impl SessionState {
 
     pub fn record_note(&mut self, kind: SessionLogKind, message: impl Into<String>) {
         self.notes.push(SessionLogEntry::now(kind, message));
+    }
+
+    // ── In-flight transitions ───────────────────────────────────────────────
+    //
+    // Decision Q3 makes this state the ruling record of what a session is
+    // doing. Every write goes through one of the methods below so the rules —
+    // what a status means, what a terminal command keeps, when the container
+    // handle is dropped — are stated once, in Layer 0, and a frontend deriving
+    // a view from this state can never disagree with the command that wrote it
+    // (WI 0114 F-22).
+
+    /// Record that `subcommand` has started running in this session.
+    ///
+    /// Idempotent for the same command: the TUI records the start
+    /// synchronously so the tab never renders an idle frame between spawning a
+    /// command and the command thread reaching `Dispatch::run_command`, which
+    /// records it again.
+    pub fn begin_command(&mut self, subcommand: impl Into<String>, args: Vec<String>) {
+        let subcommand = subcommand.into();
+        if let Some(existing) = self.current_command.as_mut() {
+            if existing.status == CommandStatus::Running
+                && existing.subcommand == subcommand
+                && existing.args == args
+            {
+                return;
+            }
+        }
+        self.current_command = Some(CommandInvocation {
+            id: Uuid::new_v4(),
+            subcommand,
+            args,
+            status: CommandStatus::Running,
+            exit_code: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+        });
+    }
+
+    /// Record that the running command finished with `exit_code`.
+    ///
+    /// The invocation is kept rather than cleared: a frontend shows what just
+    /// ran and how it ended until the next command replaces it. Does nothing
+    /// when no command is recorded.
+    pub fn finish_command(&mut self, exit_code: i32) {
+        if let Some(cmd) = self.current_command.as_mut() {
+            cmd.status = CommandStatus::Done;
+            cmd.exit_code = Some(exit_code);
+            cmd.finished_at = Some(chrono::Utc::now());
+        }
+        self.current_container = None;
+    }
+
+    /// Record that the running command failed before producing an exit code.
+    pub fn fail_command(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(cmd) = self.current_command.as_mut() {
+            cmd.status = CommandStatus::Error(message);
+            cmd.finished_at = Some(chrono::Utc::now());
+        }
+        self.current_container = None;
+    }
+
+    /// Mirror the live workflow run's summary. `None` clears it when no
+    /// workflow is running.
+    pub fn set_current_workflow(&mut self, summary: Option<WorkflowSummary>) {
+        self.current_workflow = summary;
+    }
+
+    /// Record the agent container this session is currently running.
+    pub fn set_current_container(&mut self, container: Option<AgentHandle>) {
+        self.current_container = container;
     }
 }
 
@@ -260,6 +299,59 @@ impl GitRootResolver for StaticGitRootResolver {
     }
 }
 
+/// Which kind of session this is, with no payload.
+///
+/// The discriminant of [`SessionType`], usable where only the kind matters:
+/// the `type` field on the API's create-session body, the `session_type`
+/// column, and the catalogue's `--type` flag, all of which carried it as a
+/// free-form `String` matched with `as_str()` in three places (WI 0114 F-48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Local,
+    Remote,
+}
+
+impl SessionKind {
+    /// Every kind, in the order the `--type` flag lists them.
+    pub const ALL: &'static [SessionKind] = &[SessionKind::Local, SessionKind::Remote];
+
+    /// The serialised spelling — the wire value and the database value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Local => "local",
+            SessionKind::Remote => "remote",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SessionKind {
+    type Err = DataError;
+
+    /// Case-insensitive, matching what the API accepted when this was a
+    /// lowercased `String` comparison.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(SessionKind::Local),
+            "remote" => Ok(SessionKind::Remote),
+            other => Err(DataError::Other(format!(
+                "unknown session type '{other}'; expected one of {}",
+                SessionKind::ALL
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+}
+
 /// Whether this session targets a local working directory or a remote
 /// repository that was cloned automatically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +368,14 @@ pub enum SessionType {
 }
 
 impl SessionType {
+    /// This session's kind, without its payload.
+    pub fn kind(&self) -> SessionKind {
+        match self {
+            SessionType::Local { .. } => SessionKind::Local,
+            SessionType::Remote { .. } => SessionKind::Remote,
+        }
+    }
+
     pub fn is_remote(&self) -> bool {
         matches!(self, SessionType::Remote { .. })
     }
@@ -301,6 +401,15 @@ pub struct Session {
     id: SessionId,
     session_type: SessionType,
     git_root: PathBuf,
+    /// Whether `git_root` is a real repository root, as the `GitRootResolver`
+    /// answered at open time.
+    ///
+    /// `false` only for a session opened over a directory git does not know
+    /// about (`open_or_workdir_fallback`) or over the squad storage root.
+    /// Recorded here rather than probed for later: the resolver is the one
+    /// place that decides, a `.git` probe is wrong for a worktree or a
+    /// submodule, and a frontend must not be the layer asking.
+    is_git_repo: bool,
     repo_config: RepoConfig,
     global_config: GlobalConfig,
     env: EnvSnapshot,
@@ -338,7 +447,7 @@ impl Session {
                 message: other.to_string(),
             },
         })?;
-        Self::open_at_git_root(working_dir, git_root, opts)
+        Self::open_resolved(working_dir, git_root, opts, true)
     }
 
     /// Open a session, falling back to using the working directory as the git
@@ -351,7 +460,7 @@ impl Session {
         match Self::open(working_dir.clone(), resolver, opts.clone()) {
             Ok(session) => Ok(session),
             Err(DataError::GitRootNotFound { .. }) => {
-                Self::open_at_git_root(working_dir.clone(), working_dir, opts)
+                Self::open_resolved(working_dir.clone(), working_dir, opts, false)
             }
             Err(other) => Err(other),
         }
@@ -366,27 +475,55 @@ impl Session {
     pub fn open_squad_root(env: &EnvSnapshot) -> Result<Self, DataError> {
         let root = SquadPaths::from_env(env)?.root().to_path_buf();
         std::fs::create_dir_all(&root).map_err(|source| DataError::io(&root, source))?;
-        Self::open_at_git_root(
+        Self::open_resolved(
             root.clone(),
             root,
             SessionOpenOptions {
                 env: Some(env.clone()),
                 ..Default::default()
             },
+            false,
         )
     }
 
     /// Open a session with an explicit, pre-resolved git root.
+    ///
+    /// The caller supplying a git root asserts that it is one; the two callers
+    /// that know otherwise ([`Session::open_or_workdir_fallback`]'s fallback
+    /// arm and [`Session::open_squad_root`]) go through `open_resolved`.
     pub fn open_at_git_root(
         working_dir: PathBuf,
         git_root: PathBuf,
         opts: SessionOpenOptions,
     ) -> Result<Self, DataError> {
+        Self::open_resolved(working_dir, git_root, opts, true)
+    }
+
+    /// The one constructor. `is_git_repo` records what the caller's resolution
+    /// actually established, so nothing downstream has to probe for it.
+    fn open_resolved(
+        working_dir: PathBuf,
+        git_root: PathBuf,
+        opts: SessionOpenOptions,
+        is_git_repo: bool,
+    ) -> Result<Self, DataError> {
         let env = opts.env.unwrap_or_else(EnvSnapshot::empty);
         let repo_config = RepoConfig::load(&git_root)?;
         let global_config = GlobalConfig::load_with(&env)?;
 
-        let default_agent = resolve_default_agent(&opts.flags, &repo_config, &global_config)?;
+        // One agent-precedence rule, and it is `EffectiveConfig`'s
+        // (flag > repo.agent > global.default_agent). This used to be
+        // re-encoded here as `resolve_default_agent`, which is exactly the
+        // drift Layer 0 is supposed to prevent (WI 0114 F-30).
+        let default_agent = EffectiveConfig::new(
+            opts.flags.clone(),
+            env.clone(),
+            repo_config.clone(),
+            global_config.clone(),
+        )
+        .agent()
+        .map(|name| AgentName::new(&name))
+        .transpose()?;
         let available_agents = opts.available_agents.unwrap_or_default();
 
         let now = SystemTime::now();
@@ -397,6 +534,7 @@ impl Session {
                 workdir: working_dir,
             },
             git_root,
+            is_git_repo,
             repo_config,
             global_config,
             env,
@@ -428,6 +566,17 @@ impl Session {
 
     pub fn git_root(&self) -> &Path {
         &self.git_root
+    }
+
+    /// Whether this session is rooted at a real git repository.
+    ///
+    /// Answered from the `GitRootResolver` outcome captured when the session
+    /// was opened. Frontends used to probe `git_root().join(".git").exists()`
+    /// to decide which command to start a tab with (WI 0114 F-21); that probe
+    /// is both a Layer 3 decision and wrong for a linked worktree, whose
+    /// `.git` is a file, and for a bare or submodule checkout.
+    pub fn is_git_repo(&self) -> bool {
+        self.is_git_repo
     }
 
     pub fn repo_config(&self) -> &RepoConfig {
@@ -507,21 +656,57 @@ impl Session {
     }
 }
 
-fn resolve_default_agent(
-    flags: &FlagConfig,
-    repo: &RepoConfig,
-    global: &GlobalConfig,
-) -> Result<Option<AgentName>, DataError> {
-    if let Some(name) = flags.agent.as_deref() {
-        return Ok(Some(AgentName::new(name)?));
+/// The one way a unit test builds a `Session` (WI 0114 F-52).
+///
+/// Twenty-three copies of a private `make_session` used to stand here, one per
+/// test module, and they had drifted: some pinned `AWMAN_CONFIG_HOME` at a
+/// temp dir and some did not, so whether a test could fall through to the
+/// developer's real `~/.awman/config.json` depended on which module it lived
+/// in. These three constructors cover every shape those copies had between
+/// them; a test that needs something else builds `SessionOpenOptions` itself
+/// and says why.
+///
+/// `#[cfg(test)]` because the equivalent for an *integration* test is
+/// `tests/helpers/mod.rs` — `IsolatedEnv::open_session` and `session_at`.
+#[cfg(test)]
+impl Session {
+    /// A session whose working directory and Git root are both `root`.
+    ///
+    /// The env snapshot is the process's, so a test that reads configuration
+    /// wants [`Session::for_tests_isolated`] instead.
+    pub(crate) fn for_tests(root: &Path) -> Self {
+        Self::for_tests_with_options(root, SessionOpenOptions::default())
     }
-    if let Some(name) = repo.agent.as_deref() {
-        return Ok(Some(AgentName::new(name)?));
+
+    /// As [`Session::for_tests`], but with `AWMAN_CONFIG_HOME` pinned at
+    /// `config_home` so the session cannot read the developer's real global
+    /// config. Any test asserting on a config *source* must use this.
+    pub(crate) fn for_tests_isolated(root: &Path, config_home: &Path) -> Self {
+        Self::for_tests_with_env(
+            root,
+            EnvSnapshot::with_overrides([(
+                crate::data::config::env::AWMAN_CONFIG_HOME,
+                config_home.to_str().expect("fixture path must be UTF-8"),
+            )]),
+        )
     }
-    if let Some(name) = global.default_agent.as_deref() {
-        return Ok(Some(AgentName::new(name)?));
+
+    /// As [`Session::for_tests`], with a caller-supplied env snapshot.
+    pub(crate) fn for_tests_with_env(root: &Path, env: EnvSnapshot) -> Self {
+        Self::for_tests_with_options(
+            root,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
     }
-    Ok(None)
+
+    /// The general case, for a fixture none of the three above fits.
+    pub(crate) fn for_tests_with_options(root: &Path, opts: SessionOpenOptions) -> Self {
+        Self::open_at_git_root(root.to_path_buf(), root.to_path_buf(), opts)
+            .expect("Session::for_tests must open at a fixture root")
+    }
 }
 
 #[cfg(test)]
@@ -773,6 +958,113 @@ mod tests {
         assert_eq!(
             session.global_config().default_agent.as_deref(),
             Some("claude")
+        );
+    }
+
+    /// F-30's regression guard: `Session::default_agent` and
+    /// `EffectiveConfig::agent` are the same rule, not two copies of it. If a
+    /// second precedence chain is ever reintroduced in `Session::open`, one of
+    /// these rows disagrees.
+    #[test]
+    fn session_default_agent_never_diverges_from_effective_config() {
+        let cases: [(Option<&str>, Option<&str>, Option<&str>); 6] = [
+            // (flag, repo, global)
+            (Some("flag"), Some("repo"), Some("global")),
+            (None, Some("repo"), Some("global")),
+            (None, None, Some("global")),
+            (None, None, None),
+            (Some("flag"), None, None),
+            (None, Some("repo"), None),
+        ];
+
+        for (flag, repo_agent, global_agent) in cases {
+            let git_tmp = tempfile::tempdir().unwrap();
+            let home_tmp = tempfile::tempdir().unwrap();
+
+            if let Some(a) = repo_agent {
+                let awman_dir = git_tmp.path().join(REPO_CONFIG_SUBDIR);
+                std::fs::create_dir_all(&awman_dir).unwrap();
+                std::fs::write(
+                    awman_dir.join("config.json"),
+                    format!(r#"{{"agent":"{a}"}}"#),
+                )
+                .unwrap();
+            }
+            if let Some(a) = global_agent {
+                std::fs::write(
+                    home_tmp.path().join("config.json"),
+                    format!(r#"{{"default_agent":"{a}"}}"#),
+                )
+                .unwrap();
+            }
+
+            let env = EnvSnapshot::with_overrides([(
+                AWMAN_CONFIG_HOME,
+                home_tmp.path().to_str().unwrap(),
+            )]);
+            let resolver = StaticGitRootResolver::new(git_tmp.path());
+            let opts = SessionOpenOptions {
+                env: Some(env),
+                flags: FlagConfig {
+                    agent: flag.map(str::to_string),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let session = Session::open(git_tmp.path().to_path_buf(), &resolver, opts).unwrap();
+
+            assert_eq!(
+                session.default_agent().map(|a| a.as_str().to_string()),
+                session.effective_config().agent(),
+                "flag={flag:?} repo={repo_agent:?} global={global_agent:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_state_command_tests {
+    use super::*;
+
+    /// Finishing a command drops the container handle: nothing is running any
+    /// more, so a view must not keep drawing one.
+    #[test]
+    fn finishing_a_command_clears_the_current_container() {
+        let mut state = SessionState::new();
+        state.begin_command("chat", vec![]);
+        state.set_current_container(Some(AgentHandle {
+            id: "abc123".into(),
+            image_tag: "awman-claude:latest".into(),
+            name: "awman-chat".into(),
+            started_at: chrono::Utc::now(),
+        }));
+        assert!(state.current_container.is_some());
+
+        state.finish_command(0);
+        assert!(state.current_container.is_none());
+    }
+
+    /// The synchronous start the TUI records and the one
+    /// `Dispatch::run_command` records on the command thread must not produce
+    /// two invocations.
+    #[test]
+    fn begin_command_is_idempotent_for_the_same_command() {
+        let mut state = SessionState::new();
+        state.begin_command("chat", vec!["--agent".into(), "claude".into()]);
+        let first_id = state.current_command.as_ref().unwrap().id;
+
+        state.begin_command("chat", vec!["--agent".into(), "claude".into()]);
+        assert_eq!(
+            state.current_command.as_ref().unwrap().id,
+            first_id,
+            "re-recording the same running command must not start a new invocation"
+        );
+
+        state.begin_command("ready", vec![]);
+        assert_ne!(
+            state.current_command.as_ref().unwrap().id,
+            first_id,
+            "a different command does start a new invocation"
         );
     }
 }

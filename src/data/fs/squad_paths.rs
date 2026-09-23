@@ -131,6 +131,36 @@ impl SquadPaths {
         Ok(base)
     }
 
+    /// Create (idempotently) the file a task's image build streams into, and
+    /// return it with its path.
+    ///
+    /// `seq` distinguishes the images built within one run. Layer 0 owns the
+    /// name and the create, so the evaluator no longer composes a filename
+    /// and calls `File::create` itself (F-47).
+    pub fn build_log(
+        &self,
+        task: &str,
+        run_id: &str,
+        seq: u32,
+    ) -> Result<(PathBuf, std::fs::File), DataError> {
+        let dir = self.task_builds_dir(task)?;
+        std::fs::create_dir_all(&dir).map_err(|error| DataError::io(&dir, error))?;
+        let path = dir.join(format!("{run_id}-{seq}.log"));
+        let file = std::fs::File::create(&path).map_err(|error| DataError::io(&path, error))?;
+        Ok((path, file))
+    }
+
+    /// Open the daemon's log file for reading. `Ok(None)` when it does not
+    /// exist yet — a daemon that has not started, or has not logged.
+    pub fn open_daemon_log(&self) -> Result<Option<std::fs::File>, DataError> {
+        let path = self.daemon().log_file();
+        match std::fs::File::open(&path) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DataError::io(&path, error)),
+        }
+    }
+
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
         std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))

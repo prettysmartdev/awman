@@ -10,8 +10,8 @@
 //! which point this becomes a pure error-mapping shim.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::command::commands::http_core::HttpCore;
 use crate::command::commands::squad::env_sync;
 use crate::command::commands::squad::gateway::{RemoteTaskGateway, TaskGateway};
 use crate::command::commands::squad::runtime_guard::require_container_tier;
@@ -21,7 +21,9 @@ use crate::command::error::CommandError;
 use crate::data::config::env::EnvSnapshot;
 use crate::engine::auth::ApiKey;
 use crate::engine::error::EngineError;
-use crate::engine::squad::{key_setup, SquadEndpoint, SquadKeyState, SquadSupervisor};
+use crate::engine::remote::HttpCore;
+use crate::engine::squad::key_setup::{KeyDisclosure, ShellFlavor};
+use crate::engine::squad::{SquadEndpoint, SquadHealth, SquadKeyState, SquadSupervisor};
 
 /// A squad bearer key this process just minted, split so a frontend can show
 /// the banner and still copy the raw key or the bare export line on its own.
@@ -31,25 +33,43 @@ use crate::engine::squad::{key_setup, SquadEndpoint, SquadKeyState, SquadSupervi
 /// key for good.
 #[derive(Debug, Clone)]
 pub struct SquadKeySetup {
-    /// The rendered banner plus shell snippet, ready to display.
-    pub body: String,
+    /// The plaintext key.
     pub key: String,
-    pub zshrc_snippet: String,
+    /// The shell it was resolved against, so a frontend can name the startup
+    /// file the export belongs in ([`ShellFlavor::rc_file`]).
+    pub shell: ShellFlavor,
+    /// The line to add to that file — also what a "copy the snippet" action
+    /// puts on the clipboard.
+    pub export_line: String,
 }
 
 impl SquadKeySetup {
+    /// The disclosure for a key just minted for `shell`.
+    pub fn for_key(key: &str, shell: ShellFlavor) -> Self {
+        Self::from_disclosure(&KeyDisclosure::new(key, shell))
+    }
+
+    fn from_disclosure(disclosure: &KeyDisclosure) -> Self {
+        Self {
+            key: disclosure.key.clone(),
+            shell: disclosure.shell,
+            export_line: disclosure.export_line.clone(),
+        }
+    }
+
     /// The disclosure a key state carries, if it carries one. Only a key this
     /// process minted has anything to show: `Ready` means the key came from
     /// the environment, and `Missing` means there is none to show.
-    fn from_key_state(state: &SquadKeyState, env: &EnvSnapshot) -> Option<Self> {
-        let SquadKeyState::Minted { setup, key } = state else {
+    fn from_key_state(state: &SquadKeyState) -> Option<Self> {
+        let SquadKeyState::Minted(disclosure) = state else {
             return None;
         };
-        Some(Self {
-            zshrc_snippet: key_setup::export_snippet(key, key_setup::ShellFlavor::from_env(env)),
-            body: setup.clone(),
-            key: key.clone(),
-        })
+        Some(Self::from_disclosure(disclosure))
+    }
+
+    /// The startup file the export belongs in, as displayed to the user.
+    pub fn rc_file(&self) -> &'static str {
+        self.shell.rc_file()
     }
 }
 
@@ -61,6 +81,12 @@ pub struct SquadStartup {
     pub key_state: SquadKeyState,
     pub key_setup: Option<SquadKeySetup>,
 }
+
+/// The outcome of one attempt to open a squad daemon for a frontend.
+///
+/// Named so a frontend handing the attempt to a background thread can declare
+/// the receiving channel without re-spelling the pair.
+pub type SquadStartupResult = Result<SquadStartup, SquadStartError>;
 
 /// Why opening a squad daemon for a frontend failed, typed so the caller maps
 /// an outcome rather than a message prefix (WI 0113 F-04).
@@ -115,7 +141,6 @@ impl SquadStartError {
 
 pub struct SquadGatewayResolver {
     inner: SquadSupervisor,
-    env: EnvSnapshot,
     /// The disclosure `gateway_for` read out of `key_state`, waiting for the
     /// frontend to show it. `key_state` is itself one-shot, so this is where
     /// a minted key lives between resolving the gateway and displaying it.
@@ -126,7 +151,6 @@ impl SquadGatewayResolver {
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, CommandError> {
         Ok(Self {
             inner: SquadSupervisor::from_env(env)?,
-            env: env.clone(),
             pending_key_setup: Mutex::new(None),
         })
     }
@@ -142,9 +166,11 @@ impl SquadGatewayResolver {
         self.inner.generated_key()
     }
 
-    /// Take the one-shot setup snippet for a key this process minted.
-    pub fn take_generated_key_setup(&self) -> Option<String> {
-        self.inner.take_generated_key_setup()
+    /// Take the one-shot disclosure for a key this process minted.
+    pub fn take_key_disclosure(&self) -> Option<SquadKeySetup> {
+        self.inner
+            .take_key_disclosure()
+            .map(|disclosure| SquadKeySetup::from_disclosure(&disclosure))
     }
 
     /// What this process can authenticate to squad with.
@@ -200,6 +226,57 @@ impl SquadGatewayResolver {
             .transpose()
     }
 
+    /// Probe the daemon once and report its [`SquadHealth`].
+    ///
+    /// Starts nothing and mints no key: the gateway is
+    /// [`SquadSupervisor::probe_endpoint`]'s read-only one, so a health check
+    /// never has the side effect of provisioning a daemon.
+    ///
+    /// `timeout` bounds the whole probe, so a hung daemon cannot stack
+    /// probes behind it — a caller polling on an interval keeps at most one
+    /// in flight. A probe that runs out of time reports `Unreachable`, which
+    /// is what a daemon that does not answer in time *is*.
+    ///
+    /// The verdict itself is [`SquadSupervisor::health`], at Layer 1. This
+    /// method is the transport half, and lives here only until the Layer 1
+    /// HTTP client lands (WI 0114 F-28) and the whole probe can move down
+    /// beside the classification.
+    pub async fn health(&self, timeout: Duration) -> SquadHealth {
+        tokio::time::timeout(timeout, self.probe_health())
+            .await
+            .unwrap_or(SquadHealth::Unreachable)
+    }
+
+    /// One health probe for a caller that holds no resolver — the TUI's
+    /// bottom-row indicator poller, which re-reads the environment on every
+    /// tick so a key minted mid-session is picked up without a restart.
+    ///
+    /// Infallible, and that is the point. A resolver that cannot even be
+    /// built — no squad root resolvable from this environment — is a daemon
+    /// this process got no answer from, which is exactly what `Unreachable`
+    /// means; deciding that is a health classification and belongs here, with
+    /// [`Self::health`] and [`SquadSupervisor::health`], not in a frontend
+    /// (Tenet 2, F-17).
+    pub async fn health_from_env(env: &EnvSnapshot, timeout: Duration) -> SquadHealth {
+        match Self::from_env(env) {
+            Ok(resolver) => resolver.health(timeout).await,
+            Err(_) => SquadHealth::Unreachable,
+        }
+    }
+
+    async fn probe_health(&self) -> SquadHealth {
+        let gateway = match self.probe_gateway() {
+            Ok(Some(gateway)) => gateway,
+            // No endpoint sidecar, no key, or a malformed one. Whether a
+            // process is running at all is `health`'s to decide.
+            Ok(None) | Err(_) => return self.inner.health(None),
+        };
+        match gateway.list().await {
+            Ok(tasks) => self.inner.health(Some(&tasks)),
+            Err(_) => self.inner.health(None),
+        }
+    }
+
     /// A gateway to a running daemon, starting one only when needed.
     pub async fn ensure_running(&self) -> Result<RemoteTaskGateway, CommandError> {
         let endpoint = self.inner.ensure_running().await?;
@@ -232,11 +309,8 @@ impl SquadGatewayResolver {
             GatewayNeed::Running => {
                 let gateway = self.ensure_running().await?;
                 match self.key_state()? {
-                    SquadKeyState::Minted { setup, key } => {
-                        *self.pending_setup_slot() = SquadKeySetup::from_key_state(
-                            &SquadKeyState::Minted { setup, key },
-                            &self.env,
-                        );
+                    state @ SquadKeyState::Minted(_) => {
+                        *self.pending_setup_slot() = SquadKeySetup::from_key_state(&state);
                     }
                     SquadKeyState::Ready => {}
                     SquadKeyState::Missing => return Err(CommandError::SquadKeyMissing),
@@ -265,10 +339,7 @@ impl SquadGatewayResolver {
     /// it. A sandbox-class runtime cannot back squad at all, so asking the
     /// daemon anything would be asking a question whose answer could not be
     /// honoured.
-    pub async fn open_for_frontend(
-        &self,
-        engines: &Engines,
-    ) -> Result<SquadStartup, SquadStartError> {
+    pub async fn open_for_frontend(&self, engines: &Engines) -> SquadStartupResult {
         require_container_tier(engines)
             .map_err(|error| SquadStartError::SandboxRuntime(error.to_string()))?;
         let endpoint = self
@@ -283,7 +354,7 @@ impl SquadGatewayResolver {
     /// ordinary open returns — so a frontend drains a recovery and a first
     /// run through one path. The key is always `Minted` here, which is the
     /// point: the recovery ends by showing the user the key they were missing.
-    pub async fn refresh_key_for_frontend(&self) -> Result<SquadStartup, SquadStartError> {
+    pub async fn refresh_key_for_frontend(&self) -> SquadStartupResult {
         let endpoint = self
             .inner
             .refresh_key()
@@ -305,10 +376,7 @@ impl SquadGatewayResolver {
 
     /// Build a resolver from `env` and open a daemon for a frontend in one
     /// call, so a frontend never has to map a `CommandError` of its own.
-    pub async fn open_from_env(
-        env: &EnvSnapshot,
-        engines: &Engines,
-    ) -> Result<SquadStartup, SquadStartError> {
+    pub async fn open_from_env(env: &EnvSnapshot, engines: &Engines) -> SquadStartupResult {
         Self::from_env(env)
             .map_err(SquadStartError::attributed)?
             .open_for_frontend(engines)
@@ -316,17 +384,14 @@ impl SquadGatewayResolver {
     }
 
     /// [`Self::open_from_env`]'s key-refresh counterpart.
-    pub async fn refresh_key_from_env(env: &EnvSnapshot) -> Result<SquadStartup, SquadStartError> {
+    pub async fn refresh_key_from_env(env: &EnvSnapshot) -> SquadStartupResult {
         Self::from_env(env)
             .map_err(SquadStartError::attributed)?
             .refresh_key_for_frontend()
             .await
     }
 
-    async fn startup_from_endpoint(
-        &self,
-        endpoint: SquadEndpoint,
-    ) -> Result<SquadStartup, SquadStartError> {
+    async fn startup_from_endpoint(&self, endpoint: SquadEndpoint) -> SquadStartupResult {
         let key_state = self
             .inner
             .key_state()
@@ -336,7 +401,7 @@ impl SquadGatewayResolver {
         if matches!(key_state, SquadKeyState::Missing) {
             return Err(SquadStartError::KeyMissing);
         }
-        let key_setup = SquadKeySetup::from_key_state(&key_state, &self.env);
+        let key_setup = SquadKeySetup::from_key_state(&key_state);
         // A frontend opening a squad view is a keyed connection to a running
         // daemon like any other, so it syncs too (WI 0116 §4a).
         let gateway = Self::synced_gateway(endpoint)
@@ -361,5 +426,29 @@ impl SquadGatewayResolver {
             "v1",
             endpoint.key.as_ref(),
         )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::config::env::AWMAN_SQUAD_ROOT;
+
+    /// `health_from_env` classifies in Layer 2 for a caller that holds no
+    /// resolver. With a squad root that exists but has no daemon behind it,
+    /// the verdict is `NotRunning` — not `Unreachable`, which is what the
+    /// TUI's poller used to answer for anything it could not resolve itself
+    /// (F-17, finding 10 of the WI 0114 final review).
+    #[tokio::test]
+    async fn health_from_env_classifies_an_empty_squad_root_as_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(
+            AWMAN_SQUAD_ROOT,
+            tmp.path().to_string_lossy().to_string(),
+        )]);
+
+        let health = SquadGatewayResolver::health_from_env(&env, Duration::from_secs(2)).await;
+
+        assert_eq!(health, SquadHealth::NotRunning);
     }
 }

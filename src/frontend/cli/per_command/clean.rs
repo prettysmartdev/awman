@@ -8,24 +8,19 @@
 use std::io::Write;
 
 use crate::command::commands::clean::{CleanCommandFrontend, CleanSummary};
-use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::frontend::cli::command_frontend::CliFrontend;
-use crate::frontend::cli::output::stdin_is_tty;
 
 impl CleanCommandFrontend for CliFrontend {
-    fn confirm_deletion(&mut self, summary: &CleanSummary) -> Result<bool, CommandError> {
+    fn show_summary(&mut self, summary: &CleanSummary) {
         // Print the itemized list to stdout so it is visible even when message
         // output is redirected.
         println!("{}", summary.render());
+    }
 
-        // `--yes` short-circuits the prompt (scripting).
-        if self.flag_bool(&["clean"], "yes")?.unwrap_or(false) {
-            return Ok(true);
-        }
-
+    fn confirm_deletion(&mut self, _summary: &CleanSummary) -> Result<bool, CommandError> {
         // Refuse to guess when we cannot ask: abort rather than silently no-op.
-        if !stdin_is_tty() {
+        if self.non_interactive {
             return Err(CommandError::InteractiveInputUnavailable {
                 prompt: "yes".to_string(),
             });

@@ -1,15 +1,18 @@
-//! The one-time "here is your squad key" snippet.
+//! The facts a one-time squad key disclosure is made of.
 //!
-//! The squad daemon has always minted a bearer key on its first start, but the
-//! key was printed as a bare line with no indication of how the CLI or TUI were
-//! meant to present it back. This module renders the missing half: the exported
-//! environment variable ([`AWMAN_SQUAD_KEY`]) and the shell startup file to put
-//! it in, so a first run leaves the user with a working client rather than a
-//! secret they cannot spend.
+//! The squad daemon mints a bearer key on its first start. The plaintext
+//! exists nowhere else — only its hash reaches disk — so the process that
+//! mints it must hand the user both the key and the shell line that makes it
+//! usable, or the key is lost.
 //!
-//! Rendering is a pure function of (key, shell) so the wording is unit-testable
-//! and the caller decides where the text goes — stdout for the CLI, the squad
-//! tab's message area for the TUI.
+//! This module owns the two facts that are not presentation: which shell the
+//! user runs, and therefore what the export line and the startup file are.
+//! Until WI 0114 F-56 it also drew a box-drawing banner and wrote three
+//! paragraphs of prose, and handed the result up as `UserMessage.text` — so
+//! every frontend received terminal art it could not restyle, and the API
+//! serialised `═` runs into JSON. The rendering now lives in each frontend
+//! (`src/frontend/cli/per_command/squad.rs` draws the CLI's banner); Layer 1
+//! says only *that* a key was minted and what it is.
 
 use crate::data::config::env::{EnvSnapshot, AWMAN_SQUAD_KEY};
 
@@ -46,7 +49,9 @@ impl ShellFlavor {
     }
 
     /// The startup file the export belongs in, as displayed to the user.
-    fn rc_file(self) -> &'static str {
+    ///
+    /// A fact about the shell, not a sentence: a frontend puts it in one.
+    pub fn rc_file(self) -> &'static str {
         match self {
             Self::Zsh => "~/.zshrc",
             Self::Bash => "~/.bashrc",
@@ -72,43 +77,39 @@ pub fn export_snippet(key: &str, shell: ShellFlavor) -> String {
     shell.export_line(key)
 }
 
-/// The box-drawn key banner plus the shell snippet that makes the key usable.
+/// Everything a one-time squad key disclosure consists of.
 ///
-/// Printed exactly once, by whichever process mints the key — never by the
+/// Built exactly once, by whichever process minted the key — never by the
 /// detached daemon child, whose stdout is a log file the key must not reach.
-pub fn render_key_setup(key: &str, shell: ShellFlavor) -> String {
-    let mut out = String::new();
-    out.push_str(&render_banner(key));
-    out.push_str("\n\n");
-    out.push_str(&format!(
-        "Add this to {} so the awman CLI and TUI can authenticate to squad:\n\n    {}\n\n",
-        shell.rc_file(),
-        shell.export_line(key)
-    ));
-    out.push_str(
-        "Until you do, export it in the current shell — `awman squad` commands\n\
-         without the key are refused by the daemon with 401 Unauthorized.\n\n",
-    );
-    out.push_str(
-        "Prefer to run without a key? Stop the daemon and start it with\n    \
-         awman squad start --dangerously-skip-auth\n\
-         which mints no key and accepts unauthenticated requests. squad binds to\n\
-         loopback (127.0.0.1) only, so nothing off this machine can reach it.",
-    );
-    out
+/// A frontend that is handed one of these displays it; one that drops it has
+/// lost the key for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDisclosure {
+    /// The plaintext key.
+    pub key: String,
+    /// The shell it was resolved against, for the startup file's name.
+    pub shell: ShellFlavor,
+    /// The line to add to that startup file. Pre-built because it is the fact
+    /// worth keeping from the old renderer, and because it is what a "copy
+    /// the snippet" action puts on the clipboard verbatim.
+    pub export_line: String,
 }
 
-/// The key on its own, boxed, matching the API server's first-run banner style.
-fn render_banner(key: &str) -> String {
-    let title = "squad API key (store this — it will not be shown again)";
-    // Width follows the longer of title and key so a key of any length fits.
-    let inner = title.chars().count().max(key.chars().count()) + 4;
-    let bar = "═".repeat(inner);
-    let pad = |text: &str| {
-        let used = text.chars().count() + 2;
-        format!("  {text}{}", " ".repeat(inner.saturating_sub(used)))
-    };
-    format!("╔{bar}╗\n║{}║\n║{}║\n╚{bar}╝", pad(title), pad(key))
+impl KeyDisclosure {
+    pub fn new(key: impl Into<String>, shell: ShellFlavor) -> Self {
+        let key = key.into();
+        let export_line = export_snippet(&key, shell);
+        Self {
+            key,
+            shell,
+            export_line,
+        }
+    }
+
+    /// The startup file the export belongs in, as displayed to the user.
+    pub fn rc_file(&self) -> &'static str {
+        self.shell.rc_file()
+    }
 }
 
 #[cfg(test)]
@@ -141,58 +142,49 @@ mod tests {
         assert_eq!(ShellFlavor::from_shell_path(Some("")), ShellFlavor::Unknown);
     }
 
+    /// The export line is the one thing Layer 1 still spells, because it is a
+    /// fact about the shell rather than a way of saying it. The prose that
+    /// used to surround it is asserted in the CLI frontend now (F-56).
     #[test]
-    fn snippet_exports_the_documented_env_var_with_the_key() {
-        let out = render_key_setup("deadbeef", ShellFlavor::Zsh);
-        assert!(
-            out.contains("export AWMAN_SQUAD_KEY=deadbeef"),
-            "snippet must be copy-pasteable; got:\n{out}"
-        );
-        assert!(
-            out.contains("~/.zshrc"),
-            "zsh users get ~/.zshrc; got:\n{out}"
-        );
+    fn the_export_line_is_the_documented_env_var_with_the_key() {
+        let disclosure = KeyDisclosure::new("deadbeef", ShellFlavor::Zsh);
+        assert_eq!(disclosure.export_line, "export AWMAN_SQUAD_KEY=deadbeef");
+        assert_eq!(disclosure.rc_file(), "~/.zshrc");
     }
 
     #[test]
     fn fish_gets_set_gx_rather_than_export() {
-        let out = render_key_setup("deadbeef", ShellFlavor::Fish);
-        assert!(
-            out.contains("set -gx AWMAN_SQUAD_KEY deadbeef"),
-            "fish has no `export`; got:\n{out}"
+        let disclosure = KeyDisclosure::new("deadbeef", ShellFlavor::Fish);
+        assert_eq!(
+            disclosure.export_line, "set -gx AWMAN_SQUAD_KEY deadbeef",
+            "fish has no `export`"
         );
-        assert!(!out.contains("export AWMAN_SQUAD_KEY"), "got:\n{out}");
-        assert!(out.contains("config.fish"), "got:\n{out}");
+        assert_eq!(disclosure.rc_file(), "~/.config/fish/config.fish");
     }
 
     #[test]
     fn unknown_shell_still_yields_a_posix_export() {
-        let out = render_key_setup("deadbeef", ShellFlavor::Unknown);
+        let disclosure = KeyDisclosure::new("deadbeef", ShellFlavor::Unknown);
+        assert_eq!(disclosure.export_line, "export AWMAN_SQUAD_KEY=deadbeef");
         assert!(
-            out.contains("export AWMAN_SQUAD_KEY=deadbeef"),
-            "got:\n{out}"
+            disclosure.rc_file().contains("~/.zshrc"),
+            "an unknown shell names examples, not a fact: {}",
+            disclosure.rc_file()
         );
     }
 
+    /// `export_snippet` is what the clipboard action copies, and it is the
+    /// same string the disclosure carries — one spelling, not two.
     #[test]
-    fn snippet_names_the_skip_auth_alternative() {
-        let out = render_key_setup("deadbeef", ShellFlavor::Zsh);
-        assert!(
-            out.contains("--dangerously-skip-auth"),
-            "the no-auth escape hatch must be discoverable here; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn banner_boxes_a_key_longer_than_the_title() {
-        let key = "a".repeat(120);
-        let out = render_key_setup(&key, ShellFlavor::Zsh);
-        assert!(out.contains(&key), "banner must not truncate the key");
-        // Every box line is the same display width as the top border.
-        let lines: Vec<&str> = out.lines().take(4).collect();
-        let width = lines[0].chars().count();
-        for line in &lines[1..4] {
-            assert_eq!(line.chars().count(), width, "misaligned box line: {line}");
+    fn the_disclosures_export_line_is_the_clipboard_snippet() {
+        for shell in [
+            ShellFlavor::Zsh,
+            ShellFlavor::Bash,
+            ShellFlavor::Fish,
+            ShellFlavor::Unknown,
+        ] {
+            let disclosure = KeyDisclosure::new("deadbeef", shell);
+            assert_eq!(disclosure.export_line, export_snippet("deadbeef", shell));
         }
     }
 }

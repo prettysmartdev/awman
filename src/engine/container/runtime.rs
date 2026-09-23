@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
-    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ResolvedAgentOptions,
+    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ReadyAgentOptions,
+    ResolvedAgentOptions,
 };
 use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
@@ -50,6 +51,7 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     dind: DindSupport::OnRequest,
     host_paths_visible: true,
     session_label_supported: true,
+    has_image_store: true,
 };
 
 pub struct ContainerRuntime {
@@ -81,10 +83,7 @@ impl ContainerRuntime {
     /// User-facing display name for the chosen backend
     /// (e.g. `"Docker"`, `"Apple Containers"`).
     pub fn display_name(&self) -> &'static str {
-        match self.backend.name() {
-            "apple-containers" => "Apple Containers",
-            _ => "Docker",
-        }
+        self.backend.display_name()
     }
 
     /// Static description of what container-class runtimes can do.
@@ -117,12 +116,8 @@ impl ContainerRuntime {
     ) -> Result<(), EngineError> {
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
-        let cli = self.backend.name();
         // Both "docker" and "container" share the same `build` argv shape.
-        let cli_bin = match cli {
-            "apple-containers" => "container",
-            _ => "docker",
-        };
+        let cli_bin = self.backend.cli_binary();
         let mut args: Vec<String> = vec!["build".into()];
         if no_cache {
             args.push("--no-cache".into());
@@ -195,10 +190,7 @@ impl ContainerRuntime {
     /// Times out after 10 seconds to avoid hanging when the daemon is unresponsive.
     pub fn image_exists(&self, tag: &str) -> bool {
         use std::process::{Command, Stdio};
-        let cli_bin = match self.backend.name() {
-            "apple-containers" => "container",
-            _ => "docker",
-        };
+        let cli_bin = self.backend.cli_binary();
         let child = Command::new(cli_bin)
             .args(["image", "inspect", tag])
             .stdout(Stdio::null())
@@ -281,10 +273,7 @@ impl ContainerRuntime {
 
     /// The CLI binary name for this runtime (`"docker"` or `"container"`).
     pub fn cli_binary(&self) -> &'static str {
-        match self.backend.name() {
-            "apple-containers" => "container",
-            _ => "docker",
-        }
+        self.backend.cli_binary()
     }
 
     /// Start a background container for setup/teardown execution.
@@ -315,10 +304,8 @@ impl ContainerRuntime {
     /// Returns `false` when `docker info` (or equivalent) fails or times out.
     pub fn is_available(&self) -> bool {
         use std::process::Stdio;
-        let (cli_bin, args): (&str, &[&str]) = match self.backend.name() {
-            "apple-containers" => ("container", &["system", "status"]),
-            _ => ("docker", &["info", "--format", "{{.ServerVersion}}"]),
-        };
+        let cli_bin = self.backend.cli_binary();
+        let args = self.backend.availability_probe_args();
         let child = std::process::Command::new(cli_bin)
             .args(args)
             .stdout(Stdio::null())
@@ -396,6 +383,43 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn cli_binary(&self) -> &'static str {
         ContainerRuntime::cli_binary(self)
+    }
+
+    fn ready_agent(
+        &self,
+        _agent: &str,
+        _opts: ReadyAgentOptions,
+        _sink: &mut dyn crate::data::message::UserMessageSink,
+    ) -> Result<(), EngineError> {
+        // Only defined for kit-declarative runtimes, and only ever called
+        // behind `capabilities().kit_declarative` (see `ReadyEngine`). The
+        // container tier prepares an agent by building its image, which
+        // `ReadyEngine` drives through `build_image` because the step in
+        // front of it — downloading the per-agent Dockerfile — belongs to
+        // `engine::agent::download`, not to a runtime.
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "kit-declarative agent preparation",
+        })
+    }
+
+    fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
+        Ok(ContainerRuntime::image_exists(self, tag))
+    }
+
+    fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        Ok(ContainerRuntime::image_home_dir(self, tag))
+    }
+
+    fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &std::path::Path,
+        context: &std::path::Path,
+        no_cache: bool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        ContainerRuntime::build_image(self, tag, dockerfile, context, no_cache, on_line)
     }
 }
 

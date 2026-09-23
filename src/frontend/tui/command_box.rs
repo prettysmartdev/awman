@@ -19,36 +19,25 @@ pub fn parse_input(text: &str) -> Result<ParsedCommandBoxInput, CommandError> {
 /// Given a `CommandError` from parsing, format a user-visible error string.
 pub fn format_parse_error(err: &CommandError) -> String {
     match err {
-        CommandError::UnknownCommand { path } => {
-            let name = path.join(" ");
-            let suggestion = find_suggestion(&name);
-            match suggestion {
-                Some(s) => format!("did you mean: {s}?"),
-                None => format!("unknown command: {name}"),
-            }
-        }
+        CommandError::UnknownCommand { path, suggestions } => match suggestions.first() {
+            Some(nearest) => format!("did you mean: {nearest}?"),
+            None => format!("unknown command: {}", path.join(" ")),
+        },
+        // `flag` arrives as the catalogue's own name for a long flag
+        // (`yolo`) and as the token the user typed for a short one (`-c`) or
+        // a short-flag cluster (`-ab`). Prefixing everything with `--` turned
+        // the latter into `---ab` (WI 0114 F-26, which routed the command box
+        // through the shared parser and so started producing those).
         CommandError::UnknownFlag { flag, .. } => {
-            format!("unknown flag: --{flag}")
+            if flag.starts_with('-') {
+                format!("unknown flag: {flag}")
+            } else {
+                format!("unknown flag: --{flag}")
+            }
         }
         CommandError::CommandBoxParse(msg) => msg.clone(),
         other => format!("{other}"),
     }
-}
-
-/// Levenshtein-based suggestion for unknown commands (threshold ≤4).
-fn find_suggestion(input: &str) -> Option<String> {
-    use crate::command::dispatch::catalogue::CommandCatalogue;
-    let cat = CommandCatalogue::get();
-    let names: Vec<&str> = cat.root().subcommands.iter().map(|s| s.name).collect();
-
-    let mut best: Option<(&str, usize)> = None;
-    for name in &names {
-        let dist = strsim::levenshtein(input, name);
-        if dist <= 4 && (best.is_none() || dist < best.unwrap().1) {
-            best = Some((name, dist));
-        }
-    }
-    best.map(|(name, _)| name.to_string())
 }
 
 #[cfg(test)]
@@ -99,33 +88,35 @@ mod tests {
 
     // ── format_parse_error ────────────────────────────────────────────────────
 
+    /// Rendering only: *which* commands are near misses is the catalogue's
+    /// answer, asserted in `catalogue::tests` (WI 0114 F-43).
     #[test]
-    fn format_parse_error_unknown_command_close_match_shows_did_you_mean() {
-        // "cht" is distance 1 from "chat"
+    fn format_parse_error_renders_the_first_suggestion_it_is_given() {
         let err = CommandError::UnknownCommand {
             path: vec!["cht".to_string()],
+            suggestions: vec!["chat".to_string(), "clean".to_string()],
         };
         let msg = format_parse_error(&err);
         assert!(
-            msg.contains("did you mean"),
-            "close match must show 'did you mean', got: {msg}"
+            msg.contains("did you mean") && msg.contains("chat"),
+            "a suggestion must render as a 'did you mean', got: {msg}"
         );
         assert!(
-            msg.contains("chat"),
-            "suggestion must include 'chat', got: {msg}"
+            !msg.contains("clean"),
+            "the command box has one line; only the nearest miss fits: {msg}"
         );
     }
 
     #[test]
-    fn format_parse_error_unknown_command_no_match_shows_unknown() {
-        // "zzzzzzzzz" is far from every command
+    fn format_parse_error_without_suggestions_shows_unknown_command() {
         let err = CommandError::UnknownCommand {
             path: vec!["zzzzzzzzz".to_string()],
+            suggestions: Vec::new(),
         };
         let msg = format_parse_error(&err);
         assert!(
-            msg.contains("unknown command"),
-            "no-match must show 'unknown command', got: {msg}"
+            msg.contains("unknown command") && msg.contains("zzzzzzzzz"),
+            "no-match must name what was typed, got: {msg}"
         );
     }
 
@@ -140,6 +131,35 @@ mod tests {
             msg.contains("bogus"),
             "must mention the unknown flag, got: {msg}"
         );
+    }
+
+    /// The hint reads as the user typed it. A long flag gains the `--` the
+    /// catalogue name omits; a short flag or a cluster already has its dash
+    /// and must not gain two more (WI 0114 F-26).
+    #[test]
+    fn format_parse_error_renders_a_flag_the_way_it_was_typed() {
+        let hint = |flag: &str| {
+            format_parse_error(&CommandError::UnknownFlag {
+                command: vec!["ready".to_string()],
+                flag: flag.to_string(),
+            })
+        };
+        assert_eq!(hint("bogus"), "unknown flag: --bogus");
+        assert_eq!(hint("-z"), "unknown flag: -z");
+        assert_eq!(hint("-ab"), "unknown flag: -ab");
+    }
+
+    /// End to end from the box's own entry point: the cluster the box used to
+    /// refuse with its own message now produces the shared parser's
+    /// `UnknownFlag`, and the hint still names exactly what was typed.
+    #[test]
+    fn a_short_flag_cluster_hint_names_the_cluster() {
+        let err = parse_input("ready -ab").unwrap_err();
+        assert!(
+            matches!(err, CommandError::UnknownFlag { ref flag, .. } if flag == "-ab"),
+            "got {err:?}"
+        );
+        assert_eq!(format_parse_error(&err), "unknown flag: -ab");
     }
 
     #[test]

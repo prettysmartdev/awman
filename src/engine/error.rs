@@ -136,6 +136,36 @@ pub enum EngineError {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 
+    /// A paradigm-specific operation the active runtime does not provide —
+    /// a local image probe against the sandbox tier, for instance. Typed
+    /// rather than `NotImplemented` so a caller can tell "this runtime
+    /// cannot" from "awman has not built this yet" (F-40b).
+    #[error("{operation} is not supported on the {runtime} runtime")]
+    UnsupportedOnRuntime {
+        runtime: &'static str,
+        operation: &'static str,
+    },
+
+    // ── Remote HTTP transport (WI 0114 F-28) ──────────────────────────────
+    // The strings match `CommandError`'s twins exactly: Layer 2 maps these
+    // onto them in `From<EngineError> for CommandError`, so a transport
+    // failure reads and exits the same whether it surfaced from the engine
+    // or from a Layer 2 client of the squad gateway.
+    #[error("remote request timed out")]
+    RemoteTimeout,
+
+    #[error("remote connection refused: {0}")]
+    RemoteConnectionRefused(String),
+
+    #[error("remote returned status {status}: {body}")]
+    RemoteHttpStatus { status: u16, body: String },
+
+    #[error("malformed SSE event from remote: {0}")]
+    MalformedSseEvent(String),
+
+    #[error("remote transport error: {0}")]
+    RemoteTransport(String),
+
     #[error("{0}")]
     Other(String),
 }

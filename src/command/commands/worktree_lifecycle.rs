@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::command::error::CommandError;
-use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::error::EngineError;
-use crate::engine::git::GitEngine;
+use crate::engine::git::{GitEngine, GitFrontend};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreWorktreeDecision {
@@ -75,7 +75,7 @@ pub struct PostWorkflowWorktreePrompt {
     pub keep_label: String,
 }
 
-pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
+pub trait WorktreeLifecycleFrontend: GitFrontend + Send + Sync {
     fn ask_pre_worktree_uncommitted_files(
         &mut self,
         files: &[String],
@@ -122,6 +122,47 @@ pub struct WorktreeLifecycle {
 }
 
 impl WorktreeLifecycle {
+    /// What an `exec workflow` run names its worktree and branch after.
+    ///
+    /// The three cases used to be a four-armed `if`/`else` in
+    /// `exec_workflow`, with `for_workflow`/`for_work_item` called from each
+    /// arm and the same error message written out three times
+    /// (WI 0114 F-51). Naming is a property of the run, so it is decided here,
+    /// once, and `open` is called once.
+    pub fn name_for(
+        issue_slug: Option<&str>,
+        work_item: Option<u32>,
+        workflow_path: &Path,
+    ) -> WorktreeName {
+        // `--issue` outranks `--work-item`, which outranks the workflow file:
+        // the more specific the user was, the more specific the branch name.
+        if let Some(slug) = issue_slug {
+            return WorktreeName::Workflow(slug.to_string());
+        }
+        if let Some(number) = work_item {
+            return WorktreeName::WorkItem(number);
+        }
+        WorktreeName::Workflow(
+            workflow_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("workflow")
+                .to_string(),
+        )
+    }
+
+    /// Open the lifecycle for a [`WorktreeName`].
+    pub fn open(
+        git_engine: Arc<GitEngine>,
+        git_root: PathBuf,
+        name: &WorktreeName,
+    ) -> Result<Self, CommandError> {
+        match name {
+            WorktreeName::Workflow(name) => Self::for_workflow(git_engine, git_root, name),
+            WorktreeName::WorkItem(number) => Self::for_work_item(git_engine, git_root, *number),
+        }
+    }
+
     pub fn for_workflow(
         git_engine: Arc<GitEngine>,
         git_root: PathBuf,
@@ -374,6 +415,8 @@ mod tests {
     use crate::engine::git::GitEngine;
 
     // ─── Recording frontend ───────────────────────────────────────────────────
+
+    impl crate::engine::git::GitFrontend for RecordingWorktreeLifecycleFrontend {}
 
     struct RecordingWorktreeLifecycleFrontend {
         pre_uncommitted_response: PreWorktreeDecision,
@@ -1056,6 +1099,7 @@ mod tests {
             inner: RecordingWorktreeLifecycleFrontend,
             received_had_error: Option<bool>,
         }
+        impl crate::engine::git::GitFrontend for ErrorRecordingFrontend {}
         impl crate::data::message::UserMessageSink for ErrorRecordingFrontend {
             fn write_message(&mut self, msg: UserMessage) {
                 self.inner.write_message(msg);
@@ -1192,5 +1236,51 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .ok();
+    }
+}
+
+/// What a worktree and its branch are named after.
+///
+/// Carries the choice so it can be made in one place and acted on in another
+/// (WI 0114 F-51).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeName {
+    /// A workflow file's stem, or an issue's slug.
+    Workflow(String),
+    /// A work item number.
+    WorkItem(u32),
+}
+
+#[cfg(test)]
+mod name_for_tests {
+    use super::*;
+
+    /// The precedence the four `if`/`else` arms encoded before F-51 collapsed
+    /// them: the more specific the user was, the more specific the name.
+    #[test]
+    fn an_issue_slug_outranks_a_work_item_which_outranks_the_file() {
+        let path = Path::new("/repo/flows/deploy.toml");
+        assert_eq!(
+            WorktreeLifecycle::name_for(Some("fix-login"), Some(114), path),
+            WorktreeName::Workflow("fix-login".into())
+        );
+        assert_eq!(
+            WorktreeLifecycle::name_for(None, Some(114), path),
+            WorktreeName::WorkItem(114)
+        );
+        assert_eq!(
+            WorktreeLifecycle::name_for(None, None, path),
+            WorktreeName::Workflow("deploy".into())
+        );
+    }
+
+    /// A path with no usable stem falls back to the same literal the old code
+    /// used in both of its copies.
+    #[test]
+    fn a_path_without_a_stem_falls_back_to_workflow() {
+        assert_eq!(
+            WorktreeLifecycle::name_for(None, None, Path::new("..")),
+            WorktreeName::Workflow("workflow".into())
+        );
     }
 }

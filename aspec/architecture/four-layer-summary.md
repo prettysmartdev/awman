@@ -49,6 +49,11 @@
 - Workflow definitions, workflow state
 - Worktree paths, overlay path resolution
 - File I/O: reading/writing configs, SQLite, JSON
+- `Prompt<D>` / `Choice<D>` (`src/data/prompt.rs`) — the shape of every
+  interactive question: a title, body, keyed choices and a dismissal default.
+  Layer 0 holds the shape (plain data, so a Layer 1 trait can name it); Layer
+  2's `command::prompts` fills in the copy. A frontend maps a keypress or
+  index to a `Choice`'s value and never builds a `D` from a string.
 - **No business logic. No containers. No git. No network.**
 
 ### Layer 1: Engine (`src/engine/`)
@@ -60,6 +65,13 @@
 - SquadDaemonEngine (squad daemon bootstrap: store open/migrate, orphan-run
   reconciliation, scheduler spawn)
 - SquadSupervisor (squad daemon lifecycle: ensure running, key state, health)
+- `AgentMatrix` / `ContainerBackend` (`src/engine/agent/agent_matrix.rs`,
+  `src/engine/container/backend.rs`) — the only per-agent and per-backend
+  tables; adding an agent or a runtime backend is a new table row, not a new
+  `match agent.as_str()` arm scattered across the engine.
+- `HostAgentPinger` (`src/engine/ready/host_agent.rs`) — the only type
+  permitted to spawn an agent binary on the host (see
+  `aspec/architecture/security.md`).
 - **Real systems (Docker, git, filesystem), no frontends.**
 
 ### Layer 2: Command (`src/command/`)
@@ -74,6 +86,18 @@
 - `GatewayNeed` (catalogue attribute — `None`/`Running`/`IfRunning` — that
   tells `Dispatch` whether and how hard to resolve a squad daemon gateway
   before building a command)
+- `CallerContext` (`src/command/dispatch/resolved.rs`) — which command path,
+  frontend kind and local-user fact a command was built with; built once by
+  `Dispatch`, not asked of the frontend per-call.
+- `HeadlessDefaults` (`src/command/headless.rs`) — the named answer profiles
+  (`::api()`, `::squad()`, `::cli()`) a command delegates to when no operator
+  is attached, instead of each frontend answering its own `ask_*` inline.
+- `LaunchPolicy` (`src/command/commands/launch_policy.rs`) — the decisions a
+  command makes before putting an agent in front of a user: which agent,
+  stdio vs. ACP, which context directories, how the session's end is
+  reported.
+- `command::prompts` — the constructors that fill in a Layer 0 `Prompt<D>`'s
+  titles, labels and hotkeys; the single place prompt copy is written.
 - Per-command types: InitCommand, ChatCommand, ExecWorkflowCommand,
   SquadAttachCommand, etc.
 - All business logic (agent selection, defaults, error handling)
@@ -236,4 +260,4 @@ All three frontends now support `foo` identically — because the logic is in La
 
 ---
 
-**Last Updated**: September 5, 2026 (WI 0113)
+**Last Updated**: September 23, 2026 (WI 0114)

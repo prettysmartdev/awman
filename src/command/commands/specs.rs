@@ -3,16 +3,14 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::agent_auth::AgentAuthFrontend;
-use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
-use crate::command::commands::{resolve_agent, Command};
+use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::prompt::Prompt;
 use crate::engine::agent::AgentRunOptions;
-use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::container::options::ContainerOption;
 
 #[derive(Debug, Clone)]
@@ -67,7 +65,7 @@ impl WorkItemKind {
 }
 
 pub trait SpecsCommandFrontend:
-    UserMessageSink + MountScopeFrontend + AgentSetupFrontend + AgentAuthFrontend + Send + Sync
+    UserMessageSink + crate::command::commands::agent_setup::AgentLaunchFrontend + Send + Sync
 {
     /// Prompt the user for the title of the new spec. Returns the title text.
     /// CLI implementations gate this on `stdin_is_tty()` and fall back to a
@@ -81,9 +79,17 @@ pub trait SpecsCommandFrontend:
         Ok(String::new())
     }
 
-    /// Prompt the user for the work-item kind. Default: `Task`, matching the
-    /// safe-default-on-pipe behavior expected of every Q&A method.
-    fn ask_spec_kind(&mut self) -> Result<WorkItemKind, CommandError> {
+    /// Put `prompt` to the user and return the kind they chose.
+    ///
+    /// The copy is `command::prompts::work_item_kind()`'s (WI 0114 F-19); a
+    /// frontend renders the choices, maps a keypress or an index back through
+    /// `Prompt::answer_for_key` / `answer_at`, and returns the result. The
+    /// default is the safe-default-on-pipe behaviour expected of every Q&A
+    /// method.
+    fn ask_spec_kind(
+        &mut self,
+        _prompt: &Prompt<WorkItemKind>,
+    ) -> Result<WorkItemKind, CommandError> {
         Ok(WorkItemKind::Task)
     }
 
@@ -92,56 +98,6 @@ pub trait SpecsCommandFrontend:
     /// content unmodified.
     fn ask_spec_summary_prefilled(&mut self, content: &str) -> Result<String, CommandError> {
         Ok(content.to_string())
-    }
-
-    /// Hand back a container-side frontend for spawning the interview / amend
-    /// agent. Default impl returns a no-op proxy; CLI / TUI override.
-    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(NoopRuntimeFrontend)
-    }
-
-    /// Like `container_frontend`, but yields a frontend that surrenders its
-    /// PTY I/O channels for direct bridging. Interactive container launches
-    /// call this so the PTY is wired to the TUI renderer.
-    /// Default falls back to `container_frontend`.
-    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
-        self.container_frontend()
-    }
-
-    /// PTY lifecycle gating around the agent run. Default: no-op.
-    fn set_pty_active(&mut self, _active: bool) {}
-}
-
-/// A minimal `AgentFrontend` used as a default when the per-frontend
-/// impl doesn't supply one. Suitable for non-interactive command paths and
-/// tests that don't actually run a container.
-struct NoopRuntimeFrontend;
-
-impl crate::data::message::UserMessageSink for NoopRuntimeFrontend {
-    fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-    fn replay_queued(&mut self) {}
-}
-
-#[async_trait]
-impl AgentFrontend for NoopRuntimeFrontend {
-    fn report_status(&mut self, _status: crate::engine::agent_runtime::frontend::AgentStatus) {}
-    fn report_progress(
-        &mut self,
-        _progress: crate::engine::agent_runtime::frontend::AgentProgress,
-    ) {
-    }
-    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::engine::agent_runtime::frontend::AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        }
     }
 }
 
@@ -223,7 +179,7 @@ impl Command for SpecsCommand {
 
                 // Run the amend agent to review the file against the
                 // implementation. Honors --non-interactive and --allow-docker.
-                let agent = match resolve_agent(&None, &session) {
+                let agent = match LaunchPolicy::for_session(&session).resolve_agent(&None) {
                     Ok(a) => a,
                     Err(e) => {
                         frontend.write_message(UserMessage {
@@ -415,7 +371,9 @@ pub(crate) async fn create_new_spec(
         let slug = fi.slug.clone();
         (kind, title, summary, slug)
     } else {
-        let kind = frontend.ask_spec_kind().unwrap_or(WorkItemKind::Task);
+        let kind = frontend
+            .ask_spec_kind(&crate::command::prompts::work_item_kind())
+            .unwrap_or(WorkItemKind::Task);
         let title = frontend
             .ask_spec_title()
             .unwrap_or_else(|_| "Untitled".into());
@@ -482,7 +440,7 @@ pub(crate) async fn create_new_spec(
     };
 
     if should_interview {
-        let agent = match resolve_agent(&None, &session) {
+        let agent = match LaunchPolicy::for_session(&session).resolve_agent(&None) {
             Ok(a) => a,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -665,6 +623,7 @@ fn slugify(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::session::Session;
 
     #[test]
     fn slugify_basic_lowercases_and_hyphenates() {
@@ -740,6 +699,19 @@ mod tests {
             Ok(crate::command::commands::agent_auth::AgentAuthDecision::Decline)
         }
     }
+    /// The fake never launches a container; both methods are inert.
+    impl crate::command::commands::agent_setup::HasAgentFrontend for FakeSpecsFrontend {
+        fn container_frontend(
+            &mut self,
+        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
+            Box::new(crate::command::commands::agent_setup::NullAgentFrontend)
+        }
+    }
+
+    impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeSpecsFrontend {
+        fn set_pty_active(&mut self, _active: bool) {}
+    }
+
     impl super::SpecsCommandFrontend for FakeSpecsFrontend {
         fn ask_spec_title(&mut self) -> Result<String, crate::command::error::CommandError> {
             Ok("My Test Spec".to_string())
@@ -747,20 +719,6 @@ mod tests {
         fn ask_spec_summary(&mut self) -> Result<String, crate::command::error::CommandError> {
             Ok("A one-line summary.".to_string())
         }
-    }
-
-    fn make_engines_with_root(root: &std::path::Path) -> crate::command::dispatch::Engines {
-        crate::command::dispatch::Engines::for_tests(root)
-    }
-
-    fn make_session(root: &std::path::Path) -> crate::data::session::Session {
-        let resolver = crate::data::session::StaticGitRootResolver::new(root);
-        crate::data::session::Session::open(
-            root.to_path_buf(),
-            &resolver,
-            crate::data::session::SessionOpenOptions::default(),
-        )
-        .unwrap()
     }
 
     #[tokio::test]
@@ -774,8 +732,8 @@ mod tests {
         std::fs::create_dir_all(&work_items).unwrap();
         std::fs::write(work_items.join("0042-my-feature.md"), "# My Feature").unwrap();
 
-        let engines = make_engines_with_root(tmp.path());
-        let session = make_session(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
+        let session = Session::for_tests(tmp.path());
         let cmd = super::SpecsCommand::new(
             super::SpecsSubcommand::Amend(super::SpecsAmendFlags {
                 work_item: "0042".to_string(),
@@ -797,8 +755,8 @@ mod tests {
         let work_items = tmp.path().join("aspec").join("work-items");
         std::fs::create_dir_all(&work_items).unwrap();
 
-        let engines = make_engines_with_root(tmp.path());
-        let session = make_session(tmp.path());
+        let engines = Engines::for_tests(tmp.path());
+        let session = Session::for_tests(tmp.path());
         let cmd = super::SpecsCommand::new(
             super::SpecsSubcommand::Amend(super::SpecsAmendFlags {
                 work_item: "9999".to_string(),

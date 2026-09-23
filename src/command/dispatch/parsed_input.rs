@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, CommandSpec, FlagKind};
+use crate::command::dispatch::catalogue::{CommandCatalogue, CommandSpec};
 use crate::command::error::CommandError;
 
 /// Result of `parse_command_box_input`. `path` is the resolved canonical
@@ -33,6 +33,12 @@ pub enum ArgValue {
 }
 
 /// Tokenize `raw` against the catalogue.
+///
+/// Three steps, and only the middle one is this module's own: split the string
+/// into tokens, resolve the leading tokens to a command path, then hand the
+/// rest to the catalogue's raw-argument parser — the same parser the API
+/// frontend uses. WI 0114 F-26 deleted the second token loop that used to live
+/// here; the TUI now rejects exactly what the API rejects, at the same point.
 pub fn parse(
     raw: &str,
     catalogue: &CommandCatalogue,
@@ -43,8 +49,9 @@ pub fn parse(
         return Err(CommandError::CommandBoxParse("empty input".into()));
     }
 
-    // Walk the catalogue resolving subcommands, collecting flags and
-    // positional args along the way.
+    // Walk the catalogue resolving subcommands. The command box submits one
+    // string, so unlike argv this has to find where the path ends and the
+    // arguments begin; everything after that point is the shared parser's.
     let mut current: &CommandSpec = catalogue.root();
     let mut path: Vec<String> = Vec::new();
     let mut idx = 0;
@@ -66,179 +73,9 @@ pub fn parse(
         return Err(CommandError::unknown_command(&[tokens[0].as_str()]));
     }
 
-    let mut flags: BTreeMap<String, FlagValue> = BTreeMap::new();
-    let mut positionals: Vec<String> = Vec::new();
-    let mut consume_var_args_remaining = false;
-
-    while idx < tokens.len() {
-        let tok = &tokens[idx];
-        if consume_var_args_remaining {
-            positionals.push(tok.clone());
-            idx += 1;
-            continue;
-        }
-        if tok == "--" {
-            // Trailing var-args boundary marker.
-            consume_var_args_remaining = true;
-            idx += 1;
-            continue;
-        }
-        if let Some(rest) = tok.strip_prefix("--") {
-            // Long flag: --name or --name=value
-            let (name, inline_value) = match rest.find('=') {
-                Some(eq) => (&rest[..eq], Some(rest[eq + 1..].to_string())),
-                None => (rest, None),
-            };
-            let had_inline = inline_value.is_some();
-            let flag_spec = current.find_flag(name).ok_or_else(|| {
-                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                CommandError::unknown_flag(&path_strs, name)
-            })?;
-            // Helper closure to read a value: prefer inline; otherwise advance idx.
-            let mut read_value =
-                |inline: Option<String>, msg: &str| -> Result<String, CommandError> {
-                    if let Some(v) = inline {
-                        idx += 1;
-                        Ok(v)
-                    } else {
-                        idx += 1;
-                        let v = tokens
-                            .get(idx)
-                            .cloned()
-                            .ok_or_else(|| CommandError::CommandBoxParse(msg.to_string()))?;
-                        idx += 1;
-                        Ok(v)
-                    }
-                };
-            let _ = had_inline;
-            match flag_spec.kind {
-                FlagKind::Bool => {
-                    flags.insert(name.to_string(), FlagValue::Bool(true));
-                    idx += 1;
-                }
-                FlagKind::String
-                | FlagKind::OptionalString
-                | FlagKind::Path
-                | FlagKind::OptionalPath
-                | FlagKind::Enum(_) => {
-                    let value = read_value(inline_value, &format!("flag --{name} needs a value"))?;
-                    flags.insert(name.to_string(), FlagValue::String(value));
-                }
-                FlagKind::U16 | FlagKind::UsizeAtLeastOne => {
-                    let raw = read_value(inline_value, &format!("flag --{name} needs a number"))?;
-                    flags.insert(name.to_string(), FlagValue::String(raw));
-                }
-                FlagKind::VecString => {
-                    let value = read_value(inline_value, &format!("flag --{name} needs a value"))?;
-                    flags
-                        .entry(name.to_string())
-                        .and_modify(|v| match v {
-                            FlagValue::Strings(items) => items.push(value.clone()),
-                            other => *other = FlagValue::Strings(vec![value.clone()]),
-                        })
-                        .or_insert_with(|| FlagValue::Strings(vec![value]));
-                }
-            }
-        } else if let Some(short_run) = tok.strip_prefix('-') {
-            // Treat short flags one at a time. Only single-char shorts are
-            // supported.
-            if short_run.len() != 1 {
-                return Err(CommandError::CommandBoxParse(format!(
-                    "short-flag bundle '-{short_run}' is not supported by the command box"
-                )));
-            }
-            let ch = short_run.chars().next().unwrap();
-            let flag_spec = current
-                .flags
-                .iter()
-                .find(|f| f.short == Some(ch))
-                .ok_or_else(|| {
-                    let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                    CommandError::unknown_flag(&path_strs, format!("-{ch}"))
-                })?;
-            match flag_spec.kind {
-                FlagKind::Bool => {
-                    flags.insert(flag_spec.long.to_string(), FlagValue::Bool(true));
-                    idx += 1;
-                }
-                _ => {
-                    idx += 1;
-                    let value = tokens.get(idx).cloned().ok_or_else(|| {
-                        CommandError::CommandBoxParse(format!("-{ch} needs a value"))
-                    })?;
-                    idx += 1;
-                    flags.insert(flag_spec.long.to_string(), FlagValue::String(value));
-                }
-            }
-        } else {
-            positionals.push(tok.clone());
-            idx += 1;
-        }
-    }
-
-    // Keep the TUI command box in parity with the clap and API projections:
-    // all frontends must reject mutually-exclusive catalogue flags before a
-    // command is built or any host-side operation can run.
-    for flag in current.flags {
-        if !flags.contains_key(flag.long) {
-            continue;
-        }
-        if let Some(conflicting) = flag
-            .conflicts_with
-            .iter()
-            .find(|conflicting| flags.contains_key::<str>(*conflicting))
-        {
-            let path_strs: Vec<&str> = path.iter().map(|segment| segment.as_str()).collect();
-            return Err(CommandError::InvalidFlagValue {
-                command: path_strs
-                    .iter()
-                    .map(|segment| (*segment).to_string())
-                    .collect(),
-                flag: flag.long.to_string(),
-                reason: format!("--{} conflicts with --{}", flag.long, conflicting),
-            });
-        }
-    }
-
-    // Map positional tokens onto declared arguments.
-    let mut arguments: BTreeMap<String, ArgValue> = BTreeMap::new();
-    let mut pos_idx = 0;
-    let mut last_was_var = false;
-    for arg in current.arguments {
-        match arg.kind {
-            ArgumentKind::TrailingVarArgs => {
-                let collected: Vec<String> = positionals[pos_idx..].to_vec();
-                arguments.insert(arg.name.to_string(), ArgValue::Multi(collected));
-                pos_idx = positionals.len();
-                last_was_var = true;
-            }
-            _ => {
-                if let Some(v) = positionals.get(pos_idx) {
-                    arguments.insert(arg.name.to_string(), ArgValue::Single(v.clone()));
-                    pos_idx += 1;
-                } else if !arg.optional {
-                    let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                    return Err(CommandError::missing_required_argument(
-                        &path_strs, arg.name,
-                    ));
-                }
-            }
-        }
-    }
-    let _ = last_was_var;
-
-    // Keep parity with clap and the API projection: a positional the command
-    // never declared is a usage error, not a token to drop on the floor.
-    if let Some(extra) = positionals.get(pos_idx) {
-        let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-        return Err(CommandError::unexpected_argument(&path_strs, extra.clone()));
-    }
-
-    Ok(ParsedCommandBoxInput {
-        path,
-        flags,
-        arguments,
-    })
+    let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
+    let parsed = catalogue.parse_raw_args(&path_refs, &tokens[idx..])?;
+    Ok(parsed.into_command_box_input(current, path))
 }
 
 #[cfg(test)]
@@ -352,5 +189,93 @@ mod tests {
             ),
             "-n must map to non-interactive flag"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_parser_tests {
+    //! WI 0114 F-26: the command box parses through the same
+    //! `CommandCatalogue::parse_raw_args` the API frontend uses, so it rejects
+    //! the same input. Each case below was accepted by the box's own parser and
+    //! refused by the API's.
+
+    use super::*;
+    use crate::command::error::CommandError;
+
+    /// A value outside a flag's declared enum is rejected at parse time, not
+    /// carried as a string into the command.
+    #[test]
+    fn a_bad_enum_value_is_rejected_at_parse_time() {
+        let err = parse("chat --launch-mode banana", CommandCatalogue::get()).unwrap_err();
+        match err {
+            CommandError::InvalidFlagValue { flag, reason, .. } => {
+                assert_eq!(flag, "launch-mode");
+                assert!(
+                    reason.contains("banana") && reason.contains("stdio"),
+                    "the reason must name the bad value and the allowed set: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFlagValue, got {other:?}"),
+        }
+    }
+
+    /// The same error the API gives for the same input.
+    #[test]
+    fn a_bad_enum_value_gives_the_same_error_as_the_api() {
+        let catalogue = CommandCatalogue::get();
+        let from_box = parse("chat --launch-mode banana", catalogue).unwrap_err();
+        let from_api = catalogue
+            .parse_raw_args(&["chat"], &["--launch-mode".into(), "banana".into()])
+            .unwrap_err();
+        assert_eq!(from_box.to_string(), from_api.to_string());
+    }
+
+    /// A non-numeric value for a numeric flag is rejected at parse time.
+    #[test]
+    fn a_non_numeric_number_is_rejected_at_parse_time() {
+        let err = parse("squad start --port abc", CommandCatalogue::get()).unwrap_err();
+        match err {
+            CommandError::InvalidFlagValue { flag, reason, .. } => {
+                assert_eq!(flag, "port");
+                assert!(
+                    reason.contains("abc"),
+                    "the reason must name the bad value: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFlagValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_number_gives_the_same_error_as_the_api() {
+        let catalogue = CommandCatalogue::get();
+        let from_box = parse("squad start --port abc", catalogue).unwrap_err();
+        let from_api = catalogue
+            .parse_raw_args(&["squad", "start"], &["--port".into(), "abc".into()])
+            .unwrap_err();
+        assert_eq!(from_box.to_string(), from_api.to_string());
+    }
+
+    /// A well-formed numeric value still reaches the frontend as the string
+    /// the command box's own parser produced.
+    #[test]
+    fn a_valid_number_still_arrives_as_a_string() {
+        let parsed = parse("squad start --port 9000", CommandCatalogue::get()).unwrap();
+        assert!(
+            matches!(parsed.flags.get("port"), Some(FlagValue::String(s)) if s == "9000"),
+            "got {:?}",
+            parsed.flags.get("port")
+        );
+    }
+
+    /// A short-flag cluster is an unknown flag now, as it is on the CLI and in
+    /// the API, rather than a command-box-specific refusal.
+    #[test]
+    fn a_short_flag_cluster_is_an_unknown_flag() {
+        let err = parse("ready -ab", CommandCatalogue::get()).unwrap_err();
+        match err {
+            CommandError::UnknownFlag { flag, .. } => assert_eq!(flag, "-ab"),
+            other => panic!("expected UnknownFlag, got {other:?}"),
+        }
     }
 }

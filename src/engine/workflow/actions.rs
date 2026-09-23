@@ -68,6 +68,47 @@ pub struct AvailableActions {
     /// failed (WI-0115 §1). Frontends render it as an error banner above the
     /// action list; `None` is the ordinary between-steps board.
     pub step_failure: Option<StepFailureContext>,
+    /// The step the board is about: the failed step on a failure board,
+    /// otherwise the step still running. `None` when the engine is between
+    /// steps with nothing running — see [`focused_step_label`].
+    ///
+    /// Frontends used to scan `WorkflowState::step_states` for a `Running`
+    /// entry themselves (WI 0114 F-18). The engine already knows.
+    ///
+    /// [`focused_step_label`]: AvailableActions::focused_step_label
+    pub focused_step: Option<String>,
+    /// Set when this board is the plain "advance to the next step?" case, for
+    /// which a frontend may offer a lightweight confirm instead of the full
+    /// control board. `None` means render the board.
+    ///
+    /// Whether the case applies is an engine judgement — it depends on the
+    /// DAG's remaining work and on whether anything failed — so the engine
+    /// makes it (WI 0114 F-18). A frontend that has no lightweight form
+    /// ignores this and renders the board, exactly as the CLI does.
+    pub simple_advance: Option<SimpleAdvance>,
+}
+
+impl AvailableActions {
+    /// How a frontend names the step this board is about.
+    ///
+    /// The fallback is copy, so it lives here rather than in each frontend.
+    pub fn focused_step_label(&self) -> &str {
+        self.focused_step.as_deref().unwrap_or("current step")
+    }
+}
+
+/// The plain "one step finished, one step left" board: no failures, nothing
+/// running, and exactly one step still pending.
+///
+/// Carries both names so a frontend renders the confirm without going back to
+/// `WorkflowState` for them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SimpleAdvance {
+    /// The step the board is about, already defaulted — the same string
+    /// [`AvailableActions::focused_step_label`] returns.
+    pub completed_step: String,
+    /// The single step still pending.
+    pub next_step: String,
 }
 
 /// Why the Workflow Control Board is being shown after a step failure, and

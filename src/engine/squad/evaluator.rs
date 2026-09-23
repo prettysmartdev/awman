@@ -32,6 +32,14 @@ pub trait RunProgress: Send + Sync {
     /// The workflow validated and is about to run. `state_path` is the engine's
     /// own `WorkflowStateStore` file for it — never a re-derived filename.
     fn workflow_started(&self, run_id: &RunId, workflow_path: &Path, state_path: &Path);
+
+    /// The evaluator has resolved which agent and model this run's leader
+    /// will use. Reported rather than re-derived: before F-46 the scheduler
+    /// re-parsed `defaultLeader` (`agent::model`) and `agentsToModels`
+    /// itself, duplicating a Layer 2 policy it could only approximate.
+    ///
+    /// Default no-op: a caller with no run row to update ignores it.
+    fn leader_resolved(&self, _task: &str, _agent: &str, _model: Option<&str>) {}
 }
 
 /// A `RunProgress` that records nothing. Used by tests and by any caller with no

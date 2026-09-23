@@ -13,12 +13,10 @@ use crate::command::commands::api_server::{
     ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
     ApiServerStatusOutcome,
 };
-use crate::command::commands::auth::AuthOutcome;
 use crate::command::commands::chat::ChatOutcome;
 use crate::command::commands::config::{
     ConfigGetOutcome, ConfigOutcome, ConfigSetOutcome, ConfigShowOutcome,
 };
-use crate::command::commands::download::DownloadOutcome;
 use crate::command::commands::exec_prompt::ExecPromptOutcome;
 use crate::command::commands::exec_workflow::ExecWorkflowOutcome;
 use crate::command::commands::init::InitOutcome;
@@ -52,8 +50,6 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         CommandOutcome::Remote(o) => render_remote(o),
         CommandOutcome::New(o) => render_new(o),
         CommandOutcome::Specs(o) => render_specs(o),
-        CommandOutcome::Auth(o) => render_auth(o),
-        CommandOutcome::Download(o) => render_download(o),
         CommandOutcome::Clean(o) => render_clean(o),
         CommandOutcome::Squad(o) => super::squad::render_squad(o, json),
         CommandOutcome::SquadAttach(_) => None,
@@ -433,34 +429,13 @@ fn render_specs_amend(o: &SpecsAmendOutcome) -> String {
     format!("Amended work item {}.", o.work_item)
 }
 
-fn render_auth(o: &AuthOutcome) -> Option<String> {
-    let head = if o.accepted {
-        "Agent auth consent accepted for this repo."
-    } else {
-        "Agent auth consent declined for this repo."
-    };
-    Some(format!("{head} persisted={}", o.persisted))
-}
-
-fn render_download(o: &DownloadOutcome) -> Option<String> {
-    let dest = o
-        .dest_path
-        .as_deref()
-        .map(|p| format!(" -> {p}"))
-        .unwrap_or_default();
-    Some(format!(
-        "Downloaded asset: {}{} ({} bytes)",
-        o.asset, dest, o.bytes_written
-    ))
-}
-
 // ─── tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::command::commands::status::{ContainerKind, ContainerSource, StatusOutcome};
-    use crate::engine::step_status::StepStatus;
+    use crate::data::step_status::StepStatus;
 
     #[test]
     fn render_empty_returns_none() {
@@ -673,22 +648,6 @@ mod tests {
         assert!(s.contains("abc123"));
     }
 
-    #[test]
-    fn render_auth_accepted_vs_declined() {
-        assert!(render_auth(&AuthOutcome {
-            accepted: true,
-            persisted: true
-        })
-        .unwrap()
-        .contains("accepted"));
-        assert!(render_auth(&AuthOutcome {
-            accepted: false,
-            persisted: true
-        })
-        .unwrap()
-        .contains("declined"));
-    }
-
     // ── render_ready ──────────────────────────────────────────────────────────
 
     #[test]
@@ -779,6 +738,7 @@ mod tests {
                     global_writable: true,
                     repo_writable: true,
                     value_hint: None,
+                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
                 },
                 ConfigFieldRow {
                     field: "auto_agent_auth_accepted".into(),
@@ -790,6 +750,7 @@ mod tests {
                     global_writable: false,
                     repo_writable: false,
                     value_hint: None,
+                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
                 },
             ],
         };
@@ -826,6 +787,7 @@ mod tests {
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
+                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
                 },
                 ConfigFieldRow {
                     field: "dynamicWorkflows.maxConcurrentSteps".into(),
@@ -837,6 +799,7 @@ mod tests {
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
+                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
                 },
                 ConfigFieldRow {
                     field: "dynamicWorkflows.agentsToModels.claude".into(),
@@ -848,6 +811,7 @@ mod tests {
                     global_writable: false,
                     repo_writable: true,
                     value_hint: None,
+                    shape: crate::command::commands::config::ConfigFieldShape::Scalar,
                 },
             ],
         };
@@ -1076,36 +1040,6 @@ mod tests {
         assert!(
             s.contains("3") || s.contains("exit"),
             "exit code must appear: {s}"
-        );
-    }
-
-    // ── render_download ───────────────────────────────────────────────────────
-
-    use crate::command::commands::download::DownloadOutcome;
-
-    #[test]
-    fn render_download_shows_asset_and_bytes() {
-        let o = DownloadOutcome {
-            asset: "aspec".into(),
-            bytes_written: 12345,
-            dest_path: Some("/some/path/aspec".into()),
-        };
-        let s = render_download(&o).expect("download must produce output");
-        assert!(s.contains("aspec"), "asset name must appear: {s}");
-        assert!(s.contains("12345"), "bytes_written must appear: {s}");
-    }
-
-    #[test]
-    fn render_download_without_dest_path() {
-        let o = DownloadOutcome {
-            asset: "dockerfile-claude".into(),
-            bytes_written: 42,
-            dest_path: None,
-        };
-        let s = render_download(&o).expect("download must produce output even without dest_path");
-        assert!(
-            s.contains("dockerfile-claude"),
-            "asset name must appear: {s}"
         );
     }
 

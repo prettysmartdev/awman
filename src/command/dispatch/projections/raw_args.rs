@@ -8,12 +8,13 @@
 //! argument) is derived from the canonical [`CommandSpec`] data, so API-mode
 //! parsing can never drift from the clap (CLI) or command-box (TUI) projections.
 //!
-//! This is the third projection alongside `clap.rs` (CLI) and `tui_hints.rs` /
-//! `parsed_input.rs` (TUI). Unlike `parsed_input::parse`, the command path is
-//! supplied by the caller rather than tokenized from a raw string, and values
-//! are coerced to their declared types (u16/usize/path/enum) with a structured
-//! [`CommandError`] on mismatch — mirroring how clap rejects the same input in
-//! CLI mode.
+//! This is also the TUI command box's parser. `parsed_input::parse` splits the
+//! submitted string and resolves the command path, then hands the remaining
+//! tokens here (WI 0114 F-26); it used to carry a second flag loop of its own,
+//! which accepted bad enum values and non-numeric numbers the API rejected.
+//! Values are coerced to their declared types (u16/usize/path/enum) with a
+//! structured [`CommandError`] on mismatch — mirroring how clap rejects the
+//! same input in CLI mode.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendKind,
 };
+use crate::command::dispatch::parsed_input::{ArgValue, FlagValue, ParsedCommandBoxInput};
 use crate::command::error::CommandError;
 
 /// A single parsed flag value, typed per the catalogue's declared [`FlagKind`].
@@ -121,12 +123,12 @@ impl ParsedArgs {
 /// One declarative per-frontend flag default. `forced` distinguishes a policy
 /// that overrides any request-supplied value from one that only fills a default
 /// when the caller omitted the flag.
-struct FrontendFlagDefault {
-    flag: &'static str,
-    value: FlagDefault,
+pub(crate) struct FrontendFlagDefault {
+    pub(crate) flag: &'static str,
+    pub(crate) value: FlagDefault,
     /// `true`: override even an explicit request value (technical requirement).
     /// `false`: apply only when the flag was not supplied (overridable default).
-    forced: bool,
+    pub(crate) forced: bool,
 }
 
 /// API-profile flag defaults.
@@ -153,9 +155,16 @@ const API_FLAG_DEFAULTS: &[FrontendFlagDefault] = &[
     },
 ];
 
-fn frontend_flag_defaults(frontend: FrontendKind) -> &'static [FrontendFlagDefault] {
+/// The flag defaults a frontend profile applies, as data.
+///
+/// `pub(crate)` so the API frontend can *report* its own profile rather than
+/// hand-writing `{"yolo": true, "non_interactive": true}` into a response
+/// body — the literal F-50 found in `api/routes.rs`.
+pub(crate) fn frontend_flag_defaults(frontend: FrontendKind) -> &'static [FrontendFlagDefault] {
     match frontend {
-        FrontendKind::Api => API_FLAG_DEFAULTS,
+        // The squad daemon runs unattended for the same reasons the API
+        // server does, and applies the same profile.
+        FrontendKind::Api | FrontendKind::SquadDaemon => API_FLAG_DEFAULTS,
         // CLI and TUI resolve flag defaults through clap / the command layer;
         // no profile overrides apply, guaranteeing this mechanism cannot alter
         // their behavior.
@@ -244,6 +253,84 @@ impl CommandCatalogue {
         apply_frontend_defaults(&mut parsed, spec, frontend);
         Ok(parsed)
     }
+
+    /// The flags a frontend profile forces or defaults for `path`, as
+    /// `(flag name, value)` pairs — the profile's own account of itself.
+    ///
+    /// A frontend that reports its profile to a client reads it here rather
+    /// than restating it: `api/routes.rs` used to answer `POST /v1/commands`
+    /// with a hand-written `{"yolo": true, "non_interactive": true}` that no
+    /// test tied to `API_FLAG_DEFAULTS` (WI 0114 F-50). Flags the command
+    /// does not declare are left out, so the report matches what was applied.
+    pub fn frontend_profile(
+        &self,
+        frontend: FrontendKind,
+        path: &[&str],
+    ) -> Vec<(&'static str, FlagDefault)> {
+        let Some(spec) = self.lookup_with_aliases(path) else {
+            return Vec::new();
+        };
+        frontend_flag_defaults(frontend)
+            .iter()
+            .filter(|entry| spec.find_flag(entry.flag).is_some())
+            .map(|entry| (entry.flag, entry.value))
+            .collect()
+    }
+}
+
+impl ParsedArgs {
+    /// Reshape into the TUI command box's [`ParsedCommandBoxInput`].
+    ///
+    /// The command box's frontend reads flags as strings, so the typed values
+    /// this parser produced are rendered back — which is what the box's own
+    /// parser produced before WI 0114 F-26 folded the two together. The
+    /// difference is that a bad enum value or a non-numeric number has already
+    /// been rejected by the time this runs, rather than surviving as a string
+    /// to fail later (or not at all).
+    pub fn into_command_box_input(
+        self,
+        spec: &CommandSpec,
+        path: Vec<String>,
+    ) -> ParsedCommandBoxInput {
+        let flags = self
+            .flags
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    ParsedFlag::Bool(b) => FlagValue::Bool(b),
+                    ParsedFlag::Str(s) => FlagValue::String(s),
+                    ParsedFlag::Strings(v) => FlagValue::Strings(v),
+                    ParsedFlag::Path(p) => FlagValue::String(p.display().to_string()),
+                    ParsedFlag::U16(n) => FlagValue::String(n.to_string()),
+                    ParsedFlag::Usize(n) => FlagValue::String(n.to_string()),
+                };
+                (name, value)
+            })
+            .collect();
+
+        let arguments = self
+            .arguments
+            .into_iter()
+            .map(|(name, values)| {
+                let trailing = spec
+                    .arguments
+                    .iter()
+                    .any(|a| a.name == name && matches!(a.kind, ArgumentKind::TrailingVarArgs));
+                let value = if trailing {
+                    ArgValue::Multi(values)
+                } else {
+                    ArgValue::Single(values.into_iter().next().unwrap_or_default())
+                };
+                (name, value)
+            })
+            .collect();
+
+        ParsedCommandBoxInput {
+            path,
+            flags,
+            arguments,
+        }
+    }
 }
 
 fn parse_against_spec(
@@ -271,19 +358,19 @@ fn parse_against_spec(
     let mut greedy = false;
     let mut after_double_dash = false;
 
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
+    let mut cursor = RawArgCursor::new(args, path);
+    while !cursor.done() {
+        let arg = cursor.peek().expect("not done").clone();
 
         if greedy || after_double_dash {
-            positionals.push(arg.clone());
-            i += 1;
+            positionals.push(arg);
+            cursor.advance();
             continue;
         }
 
         if arg == "--" {
             after_double_dash = true;
-            i += 1;
+            cursor.advance();
             continue;
         }
 
@@ -295,7 +382,7 @@ fn parse_against_spec(
             let flag_spec = spec
                 .find_flag(name)
                 .ok_or_else(|| CommandError::unknown_flag(path, name))?;
-            i = apply_flag(flag_spec, inline, args, i, path, &mut flags)?;
+            cursor.apply_flag(flag_spec, inline, &mut flags)?;
         } else if let Some(short) = arg.strip_prefix('-') {
             // Only single-character short flags are supported (clap parity).
             if short.chars().count() != 1 {
@@ -307,15 +394,15 @@ fn parse_against_spec(
                 .iter()
                 .find(|f| f.short == Some(ch))
                 .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
-            i = apply_flag(flag_spec, None, args, i, path, &mut flags)?;
+            cursor.apply_flag(flag_spec, None, &mut flags)?;
         } else {
-            positionals.push(arg.clone());
+            positionals.push(arg);
             // Begin greedy capture once we have started filling a trailing
             // var-arg (i.e. once positionals exceed the fixed leading ones).
             if trailing && positionals.len() > fixed_arg_count {
                 greedy = true;
             }
-            i += 1;
+            cursor.advance();
         }
     }
 
@@ -383,107 +470,138 @@ fn parse_against_spec(
     })
 }
 
-/// Apply a single flag to the flag map, consuming a value from `args` when the
-/// flag's kind requires one. Returns the index of the next unconsumed token.
-fn apply_flag(
-    flag_spec: &FlagSpec,
-    inline: Option<String>,
-    args: &[String],
+/// A position in an argument vector, and the command path errors are
+/// reported against.
+///
+/// The three were passed separately to `apply_flag` and `read_value`, which
+/// then returned the new index for the caller to assign back — an invitation
+/// to forget (WI 0114 F-51). The cursor advances itself.
+pub(super) struct RawArgCursor<'a> {
+    args: &'a [String],
+    /// Index of the next unconsumed token.
     i: usize,
-    path: &[&str],
-    flags: &mut BTreeMap<String, ParsedFlag>,
-) -> Result<usize, CommandError> {
-    let key = flag_spec.long.to_string();
-    match flag_spec.kind {
-        FlagKind::Bool => {
-            // clap `SetTrue`: presence implies true and no following value is
-            // consumed. An inline `--flag=false` is honored for completeness.
-            let value = !matches!(inline.as_deref(), Some("false"));
-            flags.insert(key, ParsedFlag::Bool(value));
-            Ok(i + 1)
-        }
-        FlagKind::String | FlagKind::OptionalString => {
-            let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            flags.insert(key, ParsedFlag::Str(val));
-            Ok(next)
-        }
-        FlagKind::Enum(allowed) => {
-            let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            if !allowed.contains(&val.as_str()) {
-                return Err(CommandError::InvalidFlagValue {
-                    command: path.iter().map(|s| s.to_string()).collect(),
-                    flag: flag_spec.long.to_string(),
-                    reason: format!("'{val}' is not one of {allowed:?}"),
-                });
-            }
-            flags.insert(key, ParsedFlag::Str(val));
-            Ok(next)
-        }
-        FlagKind::VecString => {
-            let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            match flags.get_mut(&key) {
-                Some(ParsedFlag::Strings(items)) => items.push(val),
-                _ => {
-                    flags.insert(key, ParsedFlag::Strings(vec![val]));
-                }
-            }
-            Ok(next)
-        }
-        FlagKind::Path | FlagKind::OptionalPath => {
-            let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            flags.insert(key, ParsedFlag::Path(PathBuf::from(val)));
-            Ok(next)
-        }
-        FlagKind::U16 => {
-            let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            let n = val
-                .parse::<u16>()
-                .map_err(|_| CommandError::InvalidFlagValue {
-                    command: path.iter().map(|s| s.to_string()).collect(),
-                    flag: flag_spec.long.to_string(),
-                    reason: format!("'{val}' is not a valid integer (0..=65535)"),
-                })?;
-            flags.insert(key, ParsedFlag::U16(n));
-            Ok(next)
-        }
-        FlagKind::UsizeAtLeastOne => {
-            let (val, next) = read_value(inline, args, i, path, flag_spec.long)?;
-            let n = val
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n >= 1)
-                .ok_or_else(|| CommandError::InvalidFlagValue {
-                    command: path.iter().map(|s| s.to_string()).collect(),
-                    flag: flag_spec.long.to_string(),
-                    reason: format!("'{val}' is not a positive integer (>= 1)"),
-                })?;
-            flags.insert(key, ParsedFlag::Usize(n));
-            Ok(next)
-        }
-    }
+    path: &'a [&'a str],
 }
 
-/// Read a value for a value-taking flag: the inline `--flag=value` form if
-/// present, otherwise the following token. A following token that looks like a
-/// flag (or a missing token) is a structured error, matching clap's refusal to
-/// consume a `-`-prefixed token as a value by default.
-fn read_value(
-    inline: Option<String>,
-    args: &[String],
-    i: usize,
-    path: &[&str],
-    flag: &str,
-) -> Result<(String, usize), CommandError> {
-    if let Some(v) = inline {
-        return Ok((v, i + 1));
+impl<'a> RawArgCursor<'a> {
+    fn new(args: &'a [String], path: &'a [&'a str]) -> Self {
+        Self { args, i: 0, path }
     }
-    match args.get(i + 1) {
-        Some(v) if !v.starts_with('-') => Ok((v.clone(), i + 2)),
-        _ => Err(CommandError::InvalidFlagValue {
-            command: path.iter().map(|s| s.to_string()).collect(),
-            flag: flag.to_string(),
-            reason: "flag requires a value".to_string(),
-        }),
+
+    fn peek(&self) -> Option<&'a String> {
+        self.args.get(self.i)
+    }
+
+    fn advance(&mut self) {
+        self.i += 1;
+    }
+
+    fn done(&self) -> bool {
+        self.i >= self.args.len()
+    }
+
+    /// Apply a single flag to the flag map, consuming a value when the flag's kind
+    /// requires one. Advances past everything it consumed.
+    fn apply_flag(
+        &mut self,
+        flag_spec: &FlagSpec,
+        inline: Option<String>,
+        flags: &mut BTreeMap<String, ParsedFlag>,
+    ) -> Result<(), CommandError> {
+        let path = self.path;
+        let key = flag_spec.long.to_string();
+        match flag_spec.kind {
+            FlagKind::Bool => {
+                // clap `SetTrue`: presence implies true and no following value is
+                // consumed. An inline `--flag=false` is honored for completeness.
+                let value = !matches!(inline.as_deref(), Some("false"));
+                flags.insert(key, ParsedFlag::Bool(value));
+                self.advance();
+                Ok(())
+            }
+            FlagKind::String | FlagKind::OptionalString => {
+                let val = self.read_value(inline, flag_spec.long)?;
+                flags.insert(key, ParsedFlag::Str(val));
+                Ok(())
+            }
+            FlagKind::Enum(allowed) => {
+                let val = self.read_value(inline, flag_spec.long)?;
+                if !allowed.contains(&val.as_str()) {
+                    return Err(CommandError::InvalidFlagValue {
+                        command: path.iter().map(|s| s.to_string()).collect(),
+                        flag: flag_spec.long.to_string(),
+                        reason: format!("'{val}' is not one of {allowed:?}"),
+                    });
+                }
+                flags.insert(key, ParsedFlag::Str(val));
+                Ok(())
+            }
+            FlagKind::VecString => {
+                let val = self.read_value(inline, flag_spec.long)?;
+                match flags.get_mut(&key) {
+                    Some(ParsedFlag::Strings(items)) => items.push(val),
+                    _ => {
+                        flags.insert(key, ParsedFlag::Strings(vec![val]));
+                    }
+                }
+                Ok(())
+            }
+            FlagKind::Path | FlagKind::OptionalPath => {
+                let val = self.read_value(inline, flag_spec.long)?;
+                flags.insert(key, ParsedFlag::Path(PathBuf::from(val)));
+                Ok(())
+            }
+            FlagKind::U16 => {
+                let val = self.read_value(inline, flag_spec.long)?;
+                let n = val
+                    .parse::<u16>()
+                    .map_err(|_| CommandError::InvalidFlagValue {
+                        command: path.iter().map(|s| s.to_string()).collect(),
+                        flag: flag_spec.long.to_string(),
+                        reason: format!("'{val}' is not a valid integer (0..=65535)"),
+                    })?;
+                flags.insert(key, ParsedFlag::U16(n));
+                Ok(())
+            }
+            FlagKind::UsizeAtLeastOne => {
+                let val = self.read_value(inline, flag_spec.long)?;
+                let n = val
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| CommandError::InvalidFlagValue {
+                        command: path.iter().map(|s| s.to_string()).collect(),
+                        flag: flag_spec.long.to_string(),
+                        reason: format!("'{val}' is not a positive integer (>= 1)"),
+                    })?;
+                flags.insert(key, ParsedFlag::Usize(n));
+                Ok(())
+            }
+        }
+    }
+
+    /// Read a value for a value-taking flag: the inline `--flag=value` form
+    /// if present, otherwise the following token. A following token that looks
+    /// like a flag (or a missing token) is a structured error, matching clap's
+    /// refusal to consume a `-`-prefixed token as a value by default.
+    fn read_value(&mut self, inline: Option<String>, flag: &str) -> Result<String, CommandError> {
+        if let Some(v) = inline {
+            self.advance();
+            return Ok(v);
+        }
+        match self.args.get(self.i + 1) {
+            Some(v) if !v.starts_with('-') => {
+                let v = v.clone();
+                self.advance();
+                self.advance();
+                Ok(v)
+            }
+            _ => Err(CommandError::InvalidFlagValue {
+                command: self.path.iter().map(|s| s.to_string()).collect(),
+                flag: flag.to_string(),
+                reason: "flag requires a value".to_string(),
+            }),
+        }
     }
 }
 

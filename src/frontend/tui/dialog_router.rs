@@ -3,11 +3,28 @@
 //! ConfigShow dialog's inline-edit and add-mapping flows.
 
 use super::app::App;
-use super::dialogs::{self, Dialog, DialogResponse, SquadConfirmAction};
+use crate::command::commands::squad::commands::SquadConfirmDecision;
+use crate::command::dispatch::FrontendAction;
+
+use super::dialogs::{self, Dialog, DialogResponse};
 use super::key_handler;
 
 /// Dismiss the active dialog, sending Dismissed to the command thread if needed.
 pub(super) fn dismiss_dialog(app: &mut App) {
+    // A confirmation carries what walking away from it means
+    // (`Prompt::default_on_dismiss`), so Esc is answered out of the prompt
+    // rather than assumed to be "no" here (WI 0114 F-19/F-55).
+    if let Some(Dialog::SquadActionConfirm {
+        action,
+        name,
+        prompt,
+    }) = &app.active_dialog
+    {
+        let (action, name, decision) = (*action, name.clone(), prompt.default_on_dismiss);
+        app.active_dialog = None;
+        apply_squad_confirm(app, action, &name, decision);
+        return;
+    }
     if app.command_dialog_active {
         app.send_dialog_response(DialogResponse::Dismissed);
     }
@@ -82,24 +99,41 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
     }
 }
 
-/// Lexical validation for a new `agentsToModels` key typed in the config
-/// dialog. Mirrors `data::session::AgentName` rules so bad keys are rejected
-/// before they reach the config writer.
-fn is_valid_map_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 64
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// The shape of the row heading the config table's map section, if it has one.
+///
+/// Found by shape rather than by field-name prefix (WI 0114 F-20), so renaming
+/// a config path moves nothing in this file.
+fn map_header_shape(
+    state: &dialogs::ConfigShowState,
+) -> Option<&crate::command::commands::config::ConfigFieldShape> {
+    use crate::command::commands::config::ConfigFieldShape;
+    state
+        .rows
+        .iter()
+        .map(|row| &row.shape)
+        .find(|shape| matches!(shape, ConfigFieldShape::MapHeader { .. }))
+}
+
+/// The same for the table's array section.
+fn array_header_shape(
+    state: &dialogs::ConfigShowState,
+) -> Option<&crate::command::commands::config::ConfigFieldShape> {
+    use crate::command::commands::config::ConfigFieldShape;
+    state
+        .rows
+        .iter()
+        .map(|row| &row.shape)
+        .find(|shape| matches!(shape, ConfigFieldShape::ArrayHeader { .. }))
 }
 
 /// Handle Enter in the ConfigShow dialog: advance the add-mapping flow, save
 /// the active inline edit, or begin editing the selected row.
 fn config_show_submit(app: &mut App) {
+    use crate::command::commands::config::{ConfigEditRequest, ConfigFieldShape};
     use dialogs::NewMapEntryPhase;
 
     let mut toast: Option<String> = None;
-    let mut response: Option<String> = None;
+    let mut response: Option<ConfigEditRequest> = None;
     let mut begin_edit = false;
 
     if let Some(Dialog::ConfigShow(state)) = &mut app.active_dialog {
@@ -107,15 +141,20 @@ fn config_show_submit(app: &mut App) {
             // Phase 1 of Ctrl+N: confirm the agent name.
             Some(NewMapEntryPhase::Key) => {
                 let key = state.editor.text.trim().to_string();
+                // The agent-name rule is `AgentName`'s, in Layer 0. This used
+                // to be a hand-copied `is_valid_map_key` (F-20), which could
+                // — and would — drift from the rule the config writer applies.
                 if key.is_empty() {
                     toast = Some("Type an agent name, or press Esc to cancel".to_string());
-                } else if !is_valid_map_key(&key) {
-                    toast = Some(format!(
-                        "'{key}' is not a valid agent name: use ASCII letters, digits, '-', '_' \
-                         (max 64 chars)"
-                    ));
+                } else if let Err(error) = crate::data::session::AgentName::new(key.clone()) {
+                    toast = Some(error.to_string());
                 } else {
-                    let field = format!("dynamicWorkflows.agentsToModels.{key}");
+                    let field = map_header_shape(state)
+                        .and_then(|header| {
+                            ConfigEditRequest::new_member(header, &key, String::new())
+                        })
+                        .map(|request| request.field)
+                        .unwrap_or_default();
                     if let Some(idx) = state.rows.iter().position(|r| r.field == field) {
                         // Already mapped: jump to the existing row and edit it
                         // instead of silently overwriting.
@@ -140,9 +179,9 @@ fn config_show_submit(app: &mut App) {
                     toast =
                         Some("Enter at least one model name, or press Esc to cancel".to_string());
                 } else {
-                    response = Some(format!(
-                        "dynamicWorkflows.agentsToModels.{key}\t{value}\trepo"
-                    ));
+                    response = map_header_shape(state).and_then(|header| {
+                        ConfigEditRequest::new_member(header, &key, value.clone())
+                    });
                 }
             }
             // Ctrl+N (single-phase): append a new guidance entry. The index is
@@ -156,28 +195,26 @@ fn config_show_submit(app: &mut App) {
                     let next_index = state
                         .rows
                         .iter()
-                        .filter(|r| r.field.starts_with("dynamicWorkflows.guidance."))
+                        .filter(|r| matches!(r.shape, ConfigFieldShape::ArrayEntry))
                         .count();
-                    response = Some(format!(
-                        "dynamicWorkflows.guidance.{next_index}\t{value}\trepo"
-                    ));
+                    response = array_header_shape(state).and_then(|header| {
+                        ConfigEditRequest::new_member(
+                            header,
+                            &next_index.to_string(),
+                            value.clone(),
+                        )
+                    });
                 }
             }
             None if state.editing => {
-                // Save the edited value: send "field\tvalue\tscope". The
-                // value is trimmed — stray whitespace would otherwise fail
-                // validation for numbers and agent::model specs.
+                // Save the edited value. The value is trimmed — stray
+                // whitespace would otherwise fail validation for numbers and
+                // agent::model specs.
                 let row = &state.rows[state.selected];
-                let scope = if state.edit_column == 0 {
-                    "global"
-                } else {
-                    "repo"
-                };
-                response = Some(format!(
-                    "{}\t{}\t{}",
-                    row.field,
+                response = Some(ConfigEditRequest::to_field(
+                    row.field.clone(),
                     state.editor.text.trim(),
-                    scope
+                    state.edit_column == 0,
                 ));
             }
             None => begin_edit = true,
@@ -190,8 +227,8 @@ fn config_show_submit(app: &mut App) {
     if let Some(text) = toast {
         app.status_bar.text = text;
     }
-    if let Some(edit_str) = response {
-        app.send_dialog_response(DialogResponse::Text(edit_str));
+    if let Some(edit) = response {
+        app.send_dialog_response(DialogResponse::ConfigEdit(edit));
         app.active_dialog = None;
         app.command_dialog_active = false;
     }
@@ -444,26 +481,14 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             match c {
                 'y' | 'Y' => {
                     app.active_dialog = None;
-                    let mut arguments = std::collections::BTreeMap::new();
-                    arguments.insert(
-                        "name".to_string(),
-                        crate::command::dispatch::parsed_input::ArgValue::Single(name.clone()),
+                    // This dialog IS the confirmation; the action carries the
+                    // catalogue's "assume yes" flag so Layer 2 does not ask
+                    // again.
+                    let parsed = app.catalogue.action_input(
+                        crate::command::dispatch::FrontendAction::RemoveSquadTask,
+                        Some(&name),
                     );
-                    // This dialog IS the confirmation: pass `--yes` so Layer 2
-                    // removes the persistent directory without a second prompt.
-                    let mut flags = std::collections::BTreeMap::new();
-                    flags.insert(
-                        "yes".to_string(),
-                        crate::command::dispatch::parsed_input::FlagValue::Bool(true),
-                    );
-                    app.spawn_command(
-                        &format!("squad remove {name} --yes"),
-                        crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-                            path: vec!["squad".into(), "remove".into()],
-                            flags,
-                            arguments,
-                        },
-                    );
+                    app.spawn_command(parsed);
                 }
                 'n' | 'N' => {
                     app.active_dialog = None;
@@ -472,19 +497,18 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             }
         }
 
-        // `y` dispatches the confirmed trigger/cancel/pause through the
-        // ordinary Layer-2 path; `n`/`Esc` dismisses without acting.
-        Some(Dialog::SquadActionConfirm { action, name }) => {
+        // Which key means what is the prompt's; the frontend only maps the
+        // press (case-insensitively, as it always has) and applies the answer.
+        Some(Dialog::SquadActionConfirm {
+            action,
+            name,
+            prompt,
+        }) => {
+            let answer = prompt.answer_for_key(c.to_ascii_lowercase());
             let (action, name) = (*action, name.clone());
-            match c {
-                'y' | 'Y' => {
-                    app.active_dialog = None;
-                    key_handler::squad_dispatch_by_name(app, action.subcommand(), &name);
-                }
-                'n' | 'N' => {
-                    app.active_dialog = None;
-                }
-                _ => {}
+            if let Some(decision) = answer {
+                app.active_dialog = None;
+                apply_squad_confirm(app, action, &name, Some(decision));
             }
         }
 
@@ -605,22 +629,22 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
                     crate::frontend::tui::squad_attach::start_squad_attach(app, &name);
                 }
                 'p' => {
-                    key_handler::confirm_squad_action(app, SquadConfirmAction::Pause, name);
+                    key_handler::squad_task_action(app, FrontendAction::PauseSquadTask, name);
                 }
                 'r' => {
-                    key_handler::squad_dispatch_by_name(app, "resume", &name);
                     app.active_dialog = None;
+                    key_handler::squad_task_action(app, FrontendAction::ResumeSquadTask, name);
                 }
                 // Evaluate this task on the next tick regardless of its
                 // schedule — the modal's counterpart to `t` on the grid, and
                 // scoped to the modal's task like every other key here.
                 't' => {
-                    key_handler::confirm_squad_action(app, SquadConfirmAction::Trigger, name);
+                    key_handler::squad_task_action(app, FrontendAction::TriggerSquadTask, name);
                 }
                 // Stop this task's in-progress run — the modal's counterpart
                 // to `c` on the grid.
                 'c' => {
-                    key_handler::confirm_squad_action(app, SquadConfirmAction::Cancel, name);
+                    key_handler::squad_task_action(app, FrontendAction::CancelSquadRun, name);
                 }
                 // WI 0110: edit the task the modal is showing, not the list's
                 // current selection — the same scoping the other four keys use.
@@ -668,5 +692,19 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         | Some(Dialog::FatalError { .. }) => {}
 
         None => {}
+    }
+}
+
+/// Act on a squad confirmation's answer. `Dispatch` sends the action Layer 2
+/// resolves to a command; `Dismiss` — and a prompt with no dismissal default —
+/// does nothing.
+fn apply_squad_confirm(
+    app: &mut App,
+    action: FrontendAction,
+    name: &str,
+    decision: Option<SquadConfirmDecision>,
+) {
+    if decision == Some(SquadConfirmDecision::Dispatch) {
+        key_handler::squad_dispatch(app, action, name);
     }
 }

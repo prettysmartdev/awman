@@ -15,10 +15,6 @@ use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl ExecWorkflowCommandFrontend for CliFrontend {
-    fn set_pty_active(&mut self, active: bool) {
-        self.messages.set_pty_active(active);
-    }
-
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.write_message(UserMessage {
             level: MessageLevel::Info,
@@ -35,11 +31,8 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
         &mut self,
         prompt: &WorkflowResumePrompt,
     ) -> Result<WorkflowResumeDecision, CommandError> {
-        // Without a TTY, keep the old non-interactive default: preserve the
-        // saved work and pick up where the previous run stopped, rather than
-        // discarding it and re-running every step.
         if self.non_interactive {
-            return Ok(prompt.resume_from_stop_point());
+            return Ok(self.headless.workflow_resume(prompt));
         }
         eprintln!("awman: {}", prompt.title);
         for line in prompt.body.lines() {

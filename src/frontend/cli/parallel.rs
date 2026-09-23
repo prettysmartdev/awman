@@ -17,20 +17,17 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use tokio::sync::broadcast;
 
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::workflow_definition::WorkflowStep;
-use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::StuckEvent;
+use crate::data::workflow_state::{PhaseKind, WorkflowState};
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
     AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
-use crate::engine::workflow::frontend::WorkflowFrontend;
-use crate::engine::workflow::EngineRequest;
+use crate::engine::workflow::frontend::{EngineHandles, WorkflowFrontend};
 
 use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend};
 use crate::command::commands::agent_setup::{AgentSetupDecision, AgentSetupFrontend};
@@ -260,6 +257,10 @@ fn redraw_status_bar(state: &Arc<Mutex<ChromeState>>) {
     let _ = out.flush();
 }
 
+/// F-45: takes the default `command_started`, so the `$ git …` echo line
+/// is byte-identical to the one `run_git_logged` composed before.
+impl crate::engine::git::GitFrontend for CliParallelFrontend {}
+
 impl UserMessageSink for CliParallelFrontend {
     fn write_message(&mut self, msg: UserMessage) {
         self.inner.write_message(msg);
@@ -394,11 +395,25 @@ impl WorktreeLifecycleFrontend for CliParallelFrontend {
     }
 }
 
-impl ExecWorkflowCommandFrontend for CliParallelFrontend {
+/// `CliParallelFrontend` wraps a `CliFrontend`; every agent-launch question
+/// is answered by the wrapped frontend.
+impl crate::command::commands::agent_setup::AgentLaunchFrontend for CliParallelFrontend {
     fn set_pty_active(&mut self, active: bool) {
         self.inner.set_pty_active(active);
     }
+}
 
+impl crate::command::commands::agent_setup::HasAgentFrontend for CliParallelFrontend {
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+        self.inner.container_frontend()
+    }
+
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
+        self.inner.container_frontend_for_pty()
+    }
+}
+
+impl ExecWorkflowCommandFrontend for CliParallelFrontend {
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.inner.report_workflow_summary(summary);
     }
@@ -488,54 +503,36 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.inner.supports_interactive_recovery()
     }
 
-    fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
-        self.inner.set_engine_sender(tx);
+    fn attach_engine(&mut self, handles: EngineHandles) {
+        self.inner.attach_engine(handles);
     }
 
-    fn set_stuck_sender(&mut self, sender: Arc<broadcast::Sender<StuckEvent>>) {
-        self.inner.set_stuck_sender(sender);
+    fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
+        self.inner.on_phase_step_started(kind, description);
     }
 
-    fn on_setup_step_started(&mut self, description: &str) {
-        self.inner.on_setup_step_started(description);
+    fn on_phase_step_output(&mut self, kind: PhaseKind, line: &str) {
+        self.inner.on_phase_step_output(kind, line);
     }
 
-    fn on_setup_step_output(&mut self, line: &str) {
-        self.inner.on_setup_step_output(line);
+    fn on_phase_step_completed(&mut self, kind: PhaseKind, description: &str) {
+        self.inner.on_phase_step_completed(kind, description);
     }
 
-    fn on_setup_step_completed(&mut self, description: &str) {
-        self.inner.on_setup_step_completed(description);
-    }
-
-    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+    fn on_phase_step_failed(
+        &mut self,
+        kind: PhaseKind,
+        description: &str,
+        exit_code: i32,
+        stderr: &str,
+    ) {
         self.inner
-            .on_setup_step_failed(description, exit_code, stderr);
+            .on_phase_step_failed(kind, description, exit_code, stderr);
     }
 
-    fn on_setup_step_fixing(&mut self, description: &str, attempt: u32, of: u32) {
-        self.inner.on_setup_step_fixing(description, attempt, of);
-    }
-
-    fn on_teardown_step_started(&mut self, description: &str) {
-        self.inner.on_teardown_step_started(description);
-    }
-
-    fn on_teardown_step_output(&mut self, line: &str) {
-        self.inner.on_teardown_step_output(line);
-    }
-
-    fn on_teardown_step_completed(&mut self, description: &str) {
-        self.inner.on_teardown_step_completed(description);
-    }
-
-    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+    fn on_phase_step_fixing(&mut self, kind: PhaseKind, description: &str, attempt: u32, of: u32) {
         self.inner
-            .on_teardown_step_failed(description, exit_code, stderr);
-    }
-
-    fn on_teardown_step_fixing(&mut self, description: &str, attempt: u32, of: u32) {
-        self.inner.on_teardown_step_fixing(description, attempt, of);
+            .on_phase_step_fixing(kind, description, attempt, of);
     }
 
     // === Parallel-group methods: the actual WI-0096 §7 chrome. ===
@@ -633,15 +630,6 @@ impl WorkflowFrontend for CliParallelFrontend {
         if !self.chrome_active || self.is_focused(step_name) {
             self.inner.yolo_countdown_finished(step_name);
         }
-    }
-
-    fn set_parallel_step_io(&mut self, _step_name: &str, _io: AgentIo) {}
-
-    fn set_parallel_step_stuck_sender(
-        &mut self,
-        _step_name: &str,
-        _sender: Arc<broadcast::Sender<StuckEvent>>,
-    ) {
     }
 }
 

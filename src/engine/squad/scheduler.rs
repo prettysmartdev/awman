@@ -23,18 +23,28 @@ use tokio_util::sync::CancellationToken;
 
 use crate::data::config::global::task_squad_config;
 use crate::data::config::{EnvSnapshot, GlobalConfig};
+use crate::data::fs::SquadRunPaths;
 use crate::data::fs::{RunDetail, RunId, RunStatus, SquadPaths, Task, TaskStore};
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::engine::container::naming::parse_squad_task_slug;
 use crate::engine::squad::env_state::DaemonEnvState;
-use crate::engine::squad::launcher::prepare_run_log_dir;
 
 use super::evaluator::{EvaluationOutcome, EvaluationRequest, RunProgress, TaskEvaluator};
 
+/// A leader's resolved identity for one task, as the Layer 2 evaluator
+/// reported it. The scheduler logs this instead of re-deriving it (F-46).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLeader {
+    pub agent: String,
+    pub model: Option<String>,
+}
+
 /// Records the live workflow-state path on the run row the moment the generated
-/// workflow starts. The store stays the scheduler's to write.
+/// workflow starts, and the leader's resolved agent/model as soon as Layer 2
+/// has chosen it. The store stays the scheduler's to write.
 struct StoreRunProgress {
     store: Arc<TaskStore>,
+    resolved_leaders: Arc<Mutex<HashMap<String, ResolvedLeader>>>,
 }
 
 impl RunProgress for StoreRunProgress {
@@ -50,6 +60,16 @@ impl RunProgress for StoreRunProgress {
         {
             tracing::warn!("squad: failed to record workflow state path: {error}");
         }
+    }
+
+    fn leader_resolved(&self, task: &str, agent: &str, model: Option<&str>) {
+        self.resolved_leaders.lock().unwrap().insert(
+            task.to_string(),
+            ResolvedLeader {
+                agent: agent.to_string(),
+                model: model.map(str::to_string),
+            },
+        );
     }
 }
 
@@ -125,6 +145,10 @@ pub struct SquadScheduler {
     /// it so multi-tick behaviour (the concurrency bound, live config re-read)
     /// is observable without a 30-second wait.
     tick_interval: Duration,
+    /// Per-task leader identity as Layer 2 resolved it, reported through
+    /// `RunProgress::leader_resolved` (F-46). The running-agent log reads
+    /// this instead of re-parsing `defaultLeader`/`agentsToModels`.
+    resolved_leaders: Arc<Mutex<HashMap<String, ResolvedLeader>>>,
 }
 
 impl SquadScheduler {
@@ -144,6 +168,7 @@ impl SquadScheduler {
             runtime: None,
             env_state: None,
             tick_interval: TICK_INTERVAL,
+            resolved_leaders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -204,10 +229,7 @@ impl SquadScheduler {
         let squad = cfg.squad.unwrap_or_default();
         let max_concurrent = squad.max_concurrent_evaluations_or_default().max(1);
 
-        self.log_running_agents(
-            squad.default_leader.as_deref(),
-            squad.agents_to_models.as_ref(),
-        );
+        self.log_running_agents();
 
         let now = Utc::now();
         {
@@ -303,7 +325,9 @@ impl SquadScheduler {
                     continue;
                 }
             };
-            let run_log_dir = match prepare_run_log_dir(&task_dir, &run_id) {
+            let run_log_dir = match SquadRunPaths::new(&task_dir, &run_id)
+                .and_then(|paths| paths.prepare().map(|dir| dir.to_path_buf()))
+            {
                 Ok(dir) => dir,
                 Err(error) => {
                     let detail = RunDetail {
@@ -369,6 +393,7 @@ impl SquadScheduler {
                 );
 
             let runtime = self.runtime.clone();
+            let resolved_leaders = Arc::clone(&self.resolved_leaders);
             let store = Arc::clone(&self.store);
             let evaluator = Arc::clone(&self.evaluator);
             let status = Arc::clone(&self.status);
@@ -391,6 +416,7 @@ impl SquadScheduler {
                     default_leader,
                     cancel,
                     runtime,
+                    resolved_leaders,
                 })
                 .await;
             });
@@ -408,11 +434,7 @@ impl SquadScheduler {
     /// Log one line per live squad container. An empty runtime snapshot emits
     /// nothing at all — including immediately after the last agent exits — so
     /// the daemon log stays a lifecycle record rather than a heartbeat.
-    fn log_running_agents(
-        &self,
-        default_leader: Option<&str>,
-        agents_to_models: Option<&HashMap<String, Vec<String>>>,
-    ) {
+    fn log_running_agents(&self) {
         let Some(runtime) = &self.runtime else {
             return;
         };
@@ -425,13 +447,7 @@ impl SquadScheduler {
                 return;
             }
         };
-        for summary in running_agent_summaries(
-            &self.store,
-            &handles,
-            Utc::now(),
-            default_leader,
-            agents_to_models,
-        ) {
+        for summary in self.running_agent_summaries(&handles, Utc::now()) {
             tracing::info!(
                 task = %summary.task,
                 container = %summary.container,
@@ -442,6 +458,58 @@ impl SquadScheduler {
                 "squad running agent"
             );
         }
+    }
+    /// Turn a live container snapshot into the summary lines the daemon log
+    /// emits.
+    ///
+    /// A method rather than a free function, and it reads the leader identity
+    /// Layer 2 *reported* (`RunProgress::leader_resolved`) rather than
+    /// re-deriving it (F-46). Before, this parsed `defaultLeader`'s
+    /// `agent::model` spelling and reached into `agentsToModels` to pick a
+    /// model — a copy of Layer 2's resolution policy that could only
+    /// approximate it, and a per-agent default in Layer 1.
+    ///
+    /// Separated from the logging so the "nothing running emits nothing / one
+    /// entry per running container" rule is testable without a container
+    /// runtime: an empty snapshot yields an empty vector, and the caller
+    /// therefore logs nothing at all rather than a heartbeat.
+    pub fn running_agent_summaries(
+        &self,
+        handles: &[crate::data::session::AgentHandle],
+        now: DateTime<Utc>,
+    ) -> Vec<RunningAgentSummary> {
+        let resolved = self.resolved_leaders.lock().unwrap();
+        handles
+            .iter()
+            .map(|handle| {
+                let task_name = parse_squad_task_slug(&handle.name).unwrap_or("unknown");
+                let reported = resolved.get(task_name);
+                // The task's own columns are the fallback: they are the
+                // request, recorded in Layer 0, not a default this layer
+                // invented. A run whose leader has not reported yet — the
+                // window between container launch and resolution — says so.
+                let configured = self.store.get(task_name).ok().flatten();
+                let agent = reported
+                    .map(|r| r.agent.as_str())
+                    .or_else(|| configured.as_ref().and_then(|task| task.agent.as_deref()))
+                    .unwrap_or("unresolved")
+                    .to_string();
+                let model = reported
+                    .and_then(|r| r.model.clone())
+                    .or_else(|| configured.as_ref().and_then(|task| task.model.clone()));
+                RunningAgentSummary {
+                    task: task_name.to_string(),
+                    container: handle.name.clone(),
+                    agent,
+                    model,
+                    image: handle.image_tag.clone(),
+                    elapsed_secs: now
+                        .signed_duration_since(handle.started_at)
+                        .num_seconds()
+                        .max(0),
+                }
+            })
+            .collect()
     }
 }
 
@@ -454,61 +522,6 @@ pub struct RunningAgentSummary {
     pub model: Option<String>,
     pub image: String,
     pub elapsed_secs: i64,
-}
-
-/// Turn a live container snapshot into the summary lines the daemon log emits.
-///
-/// Separated from the logging so the "nothing running emits nothing / one entry
-/// per running container" rule is testable without a container runtime: an
-/// empty snapshot yields an empty vector, and the caller therefore logs
-/// nothing at all rather than a heartbeat.
-pub fn running_agent_summaries(
-    store: &TaskStore,
-    handles: &[crate::data::session::AgentHandle],
-    now: DateTime<Utc>,
-    default_leader: Option<&str>,
-    agents_to_models: Option<&HashMap<String, Vec<String>>>,
-) -> Vec<RunningAgentSummary> {
-    let default_leader = default_leader.map(|value| {
-        let (agent, model) = value
-            .split_once("::")
-            .map(|(agent, model)| (agent, Some(model)))
-            .unwrap_or((value, None));
-        (agent, model)
-    });
-    handles
-        .iter()
-        .map(|handle| {
-            let task_name = parse_squad_task_slug(&handle.name).unwrap_or("unknown");
-            let configured = store.get(task_name).ok().flatten();
-            let agent = configured
-                .as_ref()
-                .and_then(|task| task.agent.as_deref())
-                .or_else(|| default_leader.map(|(agent, _)| agent))
-                .unwrap_or("configured-default");
-            let model = configured
-                .as_ref()
-                .and_then(|task| task.model.as_deref())
-                .or_else(|| default_leader.and_then(|(_, model)| model))
-                .or_else(|| {
-                    agents_to_models
-                        .and_then(|models| models.get(agent))
-                        .and_then(|models| models.first())
-                        .map(String::as_str)
-                });
-            RunningAgentSummary {
-                task: task_name.to_string(),
-                container: handle.name.clone(),
-                agent: agent.to_string(),
-                model: model.map(str::to_string),
-                image: handle.image_tag.clone(),
-                elapsed_secs: now
-                    .signed_duration_since(handle.started_at)
-                    .num_seconds()
-                    .max(0),
-            }
-        })
-        .collect()
 }
 
 /// Bundled arguments for one task's evaluation task.
@@ -529,6 +542,8 @@ struct EvaluateArgs {
     cancel: CancellationToken,
     /// Used to stop the task's containers when the run is cancelled.
     runtime: Option<Arc<dyn AgentRuntimeEngine>>,
+    /// Where the evaluator's resolved leader identity is recorded (F-46).
+    resolved_leaders: Arc<Mutex<HashMap<String, ResolvedLeader>>>,
 }
 
 /// Open a run row, delegate evaluation, record the terminal status, and adjust
@@ -549,6 +564,7 @@ async fn evaluate_task(args: EvaluateArgs) {
         default_leader,
         cancel,
         runtime,
+        resolved_leaders,
     } = args;
 
     // The tick already incremented `in_flight`, registered the cancellation
@@ -570,6 +586,7 @@ async fn evaluate_task(args: EvaluateArgs) {
         default_leader,
         progress: Arc::new(StoreRunProgress {
             store: Arc::clone(&store),
+            resolved_leaders: Arc::clone(&resolved_leaders),
         }),
     });
     // `biased`: once a cancel has been asked for it wins, even if the
@@ -767,7 +784,7 @@ async fn finish_canceled_run(
         &RunDetail {
             // A leader that already wrote its verdict before the cancel keeps
             // its reason on the record.
-            reason: super::verdict::read_verdict(run_log_dir)
+            reason: crate::data::fs::RunVerdict::read_from(run_log_dir)
                 .ok()
                 .and_then(|verdict| verdict.reason),
             ..Default::default()
@@ -965,6 +982,28 @@ mod tests {
         store
     }
 
+    /// A scheduler over `store` with no runtime — enough to exercise the
+    /// running-agent summary, which only reads the store and the reported
+    /// leader identities.
+    fn summary_scheduler(store: Arc<TaskStore>, tmp: &std::path::Path) -> SquadScheduler {
+        SquadScheduler::new(
+            store,
+            SquadPaths::from_root(tmp.join("squad")),
+            Arc::new(NoopEvaluator),
+            EnvSnapshot::empty(),
+        )
+    }
+
+    /// An evaluator that is never invoked by the summary tests.
+    struct NoopEvaluator;
+
+    #[async_trait::async_trait]
+    impl TaskEvaluator for NoopEvaluator {
+        async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
+            EvaluationOutcome::NotTriggered { reason: None }
+        }
+    }
+
     fn handle(
         name: &str,
         image: &str,
@@ -984,9 +1023,11 @@ mod tests {
     #[test]
     fn the_running_agents_summary_is_empty_when_nothing_is_running() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = summary_store(tmp.path());
+        let scheduler = summary_scheduler(Arc::new(summary_store(tmp.path())), tmp.path());
         assert!(
-            running_agent_summaries(&store, &[], Utc::now(), Some("claude::opus"), None).is_empty(),
+            scheduler
+                .running_agent_summaries(&[], Utc::now())
+                .is_empty(),
             "an empty container snapshot must produce no summary lines"
         );
     }
@@ -996,7 +1037,7 @@ mod tests {
     #[test]
     fn the_running_agents_summary_reports_one_entry_per_running_container() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = summary_store(tmp.path());
+        let store = Arc::new(summary_store(tmp.path()));
         let now = Utc::now();
         let mut configured = Task {
             id: "id-triage".into(),
@@ -1037,7 +1078,19 @@ mod tests {
             ),
         ];
 
-        let summaries = running_agent_summaries(&store, &handles, now, Some("claude::opus"), None);
+        let scheduler = summary_scheduler(Arc::clone(&store), tmp.path());
+        // The leader resolution Layer 2 reports for the second task. The
+        // first task's own `agent`/`model` columns still speak for it (F-46:
+        // the fallback is the recorded request, not a re-derived default).
+        scheduler.resolved_leaders.lock().unwrap().insert(
+            "nightly-sweep".to_string(),
+            ResolvedLeader {
+                agent: "claude".into(),
+                model: Some("opus".into()),
+            },
+        );
+
+        let summaries = scheduler.running_agent_summaries(&handles, now);
 
         assert_eq!(summaries.len(), 2, "one entry per running container");
         assert_eq!(
@@ -1051,8 +1104,8 @@ mod tests {
                 elapsed_secs: 90,
             }
         );
-        // The second task configures neither agent nor model, so both fall back
-        // to `squad.defaultLeader`.
+        // The second task configures neither agent nor model, so the summary
+        // reports what Layer 2 resolved for it.
         assert_eq!(summaries[1].task, "nightly-sweep");
         assert_eq!(summaries[1].agent, "claude");
         assert_eq!(summaries[1].model.as_deref(), Some("opus"));

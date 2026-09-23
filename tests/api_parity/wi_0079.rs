@@ -13,10 +13,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use awman::command::dispatch::Engines;
+use awman::data::fs::api_db::NewSessionRow;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
-use awman::data::EngineWorkflowStateStore;
+use awman::data::session::SessionKind;
+use awman::data::session_setup_event::SessionSetupStatus;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -43,7 +46,7 @@ fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
-    let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
+    let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
         runtime: runtime.clone(),
@@ -54,6 +57,8 @@ fn make_app_state(root: &std::path::Path) -> Arc<AppState> {
         auth_engine,
         agent_engine,
         workflow_state_store,
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
 
     Arc::new(AppState {
@@ -86,14 +91,14 @@ async fn spawn_router(
 // Insert a session directly into the store with status='active' and setup_status='ready'.
 fn insert_ready_session(store: &SqliteSessionStore, session_id: &str, workdir: &str) {
     store
-        .insert_session_full(
-            session_id,
+        .insert_session_full(NewSessionRow {
+            id: session_id,
             workdir,
-            &chrono::Utc::now().to_rfc3339(),
-            "ready",
-            "local",
-            None,
-        )
+            created_at: &chrono::Utc::now().to_rfc3339(),
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 }
 
@@ -106,7 +111,14 @@ fn enqueue_and_claim_fifo_order() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     // Stagger inserts with tiny delays so queued_at is strictly ordered.
@@ -176,14 +188,14 @@ fn atomic_claim_no_duplicates() {
     // (one command per session avoids the session-exclusion constraint).
     for i in 0..4u32 {
         store
-            .insert_session_full(
-                &format!("s{i}"),
-                &format!("/wd/{i}"),
-                &ts,
-                "ready",
-                "local",
-                None,
-            )
+            .insert_session_full(NewSessionRow {
+                id: &format!("s{i}"),
+                workdir: &format!("/wd/{i}"),
+                created_at: &ts,
+                setup_status: SessionSetupStatus::Ready,
+                kind: SessionKind::Local,
+                cloned_path: None,
+            })
             .unwrap();
         store
             .enqueue_command(
@@ -233,7 +245,14 @@ fn session_exclusive_execution_one_running_at_a_time() {
     let store = Arc::new(store);
 
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     store
@@ -276,7 +295,14 @@ fn cross_session_concurrency_both_claimed() {
 
     for (sid, cid) in [("sA", "cA"), ("sB", "cB")] {
         store
-            .insert_session_full(sid, "/wd", &ts, "ready", "local", None)
+            .insert_session_full(NewSessionRow {
+                id: sid,
+                workdir: "/wd",
+                created_at: &ts,
+                setup_status: SessionSetupStatus::Ready,
+                kind: SessionKind::Local,
+                cloned_path: None,
+            })
             .unwrap();
         store
             .enqueue_command(cid, sid, "exec prompt", "[]", "/logs/c")
@@ -309,7 +335,14 @@ fn stale_command_recovery_resets_old_running_commands() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     // Insert a command directly with running status and a very old started_at.
@@ -359,7 +392,14 @@ fn stale_command_recovery_does_not_touch_fresh_running_commands() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     store
@@ -386,7 +426,14 @@ fn backward_compat_legacy_pending_commands_are_claimable() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     // Insert legacy command via old insert_command (status='pending').
@@ -413,7 +460,14 @@ fn count_queued_for_session_is_accurate() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     assert_eq!(store.count_queued_for_session("s1").unwrap(), 0);
@@ -441,7 +495,14 @@ fn cancel_queued_for_session_cancels_all_queued() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     store
@@ -474,7 +535,14 @@ fn queue_position_for_command_is_zero_indexed() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     store
@@ -504,7 +572,14 @@ fn queue_position_is_none_for_non_queued_commands() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     store
@@ -529,14 +604,14 @@ fn queue_depth_under_load_no_duplicates() {
     for sess_idx in 0..10u32 {
         let sid = format!("sess-{sess_idx}");
         store
-            .insert_session_full(
-                &sid,
-                &format!("/wd/{sess_idx}"),
-                &ts,
-                "ready",
-                "local",
-                None,
-            )
+            .insert_session_full(NewSessionRow {
+                id: &sid,
+                workdir: &format!("/wd/{sess_idx}"),
+                created_at: &ts,
+                setup_status: SessionSetupStatus::Ready,
+                kind: SessionKind::Local,
+                cloned_path: None,
+            })
             .unwrap();
         for cmd_idx in 0..10u32 {
             let cid = format!("cmd-{sess_idx}-{cmd_idx}");
@@ -594,7 +669,14 @@ fn server_restart_recovery_resets_stale_running_commands() {
     let ts = chrono::Utc::now().to_rfc3339();
 
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     // Simulate a command that was running when the server crashed.
@@ -1225,7 +1307,14 @@ async fn real_network_post_commands_rejected_on_closing_session() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full("closing-sess", "/work", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "closing-sess",
+            workdir: "/work",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     state
         .store
@@ -1276,7 +1365,14 @@ async fn real_network_double_delete_returns_200_with_current_state() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full("double-del-sess", "/work", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "double-del-sess",
+            workdir: "/work",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     state
         .store
@@ -1318,7 +1414,14 @@ async fn real_network_delete_already_closed_session_returns_200() {
     let ts = chrono::Utc::now().to_rfc3339();
     state
         .store
-        .insert_session_full("already-closed", "/work", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "already-closed",
+            workdir: "/work",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     state.store.close_session("already-closed", &ts).unwrap();
 
@@ -1357,7 +1460,7 @@ async fn real_network_local_session_creation_succeeds() {
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
-    let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
+    let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
     let engines = Engines {
         runtime: runtime.clone(),
         container_runtime: Some(runtime),
@@ -1367,6 +1470,8 @@ async fn real_network_local_session_creation_succeeds() {
         auth_engine,
         agent_engine,
         workflow_state_store,
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
     let state = Arc::new(AppState {
         store: Arc::new(store),
@@ -1571,7 +1676,7 @@ async fn real_network_workflow_state_404_when_no_state_file() {
 fn workflow_state_to_view_state_maps_all_phases() {
     use awman::data::workflow_definition::WorkflowStep;
     use awman::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowState};
-    use awman::frontend::tui::tabs::WorkflowStepKind;
+    use awman::frontend::tui::tabs::{StepViewStatus, WorkflowStepKind};
     use awman::frontend::tui::workflow_view::workflow_state_to_view_state;
 
     fn ws(name: &str, deps: &[&str]) -> WorkflowStep {
@@ -1628,7 +1733,8 @@ fn workflow_state_to_view_state_maps_all_phases() {
         view.steps[0].name
     );
     assert_eq!(
-        view.steps[0].status, "done",
+        view.steps[0].status,
+        StepViewStatus::Done,
         "succeeded setup step must have status='done'"
     );
 
@@ -1638,7 +1744,8 @@ fn workflow_state_to_view_state_maps_all_phases() {
         view.steps[1].name
     );
     assert_eq!(
-        view.steps[1].status, "running",
+        view.steps[1].status,
+        StepViewStatus::Running,
         "running setup step must have status='running'"
     );
 
@@ -1667,7 +1774,8 @@ fn workflow_state_to_view_state_maps_all_phases() {
         view.steps[4].name
     );
     assert_eq!(
-        view.steps[4].status, "pending",
+        view.steps[4].status,
+        StepViewStatus::Pending,
         "pending teardown step must have status='pending'"
     );
 }
@@ -1677,6 +1785,7 @@ fn workflow_state_to_view_state_maps_all_phases() {
 fn workflow_state_to_view_state_no_phase_steps() {
     use awman::data::workflow_definition::WorkflowStep;
     use awman::data::workflow_state::WorkflowState;
+    use awman::frontend::tui::tabs::StepViewStatus;
     use awman::frontend::tui::workflow_view::workflow_state_to_view_state;
 
     let steps = vec![WorkflowStep {
@@ -1693,7 +1802,7 @@ fn workflow_state_to_view_state_no_phase_steps() {
 
     assert_eq!(view.steps.len(), 1);
     assert_eq!(view.steps[0].name, "only-step");
-    assert_eq!(view.steps[0].status, "pending");
+    assert_eq!(view.steps[0].status, StepViewStatus::Pending);
     assert_eq!(view.steps[0].agent.as_deref(), Some("claude"));
 }
 
@@ -1702,6 +1811,7 @@ fn workflow_state_to_view_state_no_phase_steps() {
 fn workflow_state_to_view_state_current_step_index() {
     use awman::data::workflow_definition::WorkflowStep;
     use awman::data::workflow_state::{StepState, WorkflowState};
+    use awman::frontend::tui::tabs::StepViewStatus;
     use awman::frontend::tui::workflow_view::workflow_state_to_view_state;
 
     let steps = vec![
@@ -1731,13 +1841,15 @@ fn workflow_state_to_view_state_current_step_index() {
 
     let view = workflow_state_to_view_state(&state);
     assert_eq!(
-        view.steps[0].status, "done",
-        "alpha must be 'done'; got '{}'",
+        view.steps[0].status,
+        StepViewStatus::Done,
+        "alpha must be 'done'; got {:?}",
         view.steps[0].status
     );
     assert_eq!(
-        view.steps[1].status, "running",
-        "beta must be 'running'; got '{}'",
+        view.steps[1].status,
+        StepViewStatus::Running,
+        "beta must be 'running'; got {:?}",
         view.steps[1].status
     );
     assert_eq!(
@@ -1753,6 +1865,7 @@ fn workflow_state_to_view_state_current_step_index() {
 fn workflow_state_to_view_state_phase_step_statuses() {
     use awman::data::workflow_definition::WorkflowStep;
     use awman::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowState};
+    use awman::frontend::tui::tabs::StepViewStatus;
     use awman::frontend::tui::workflow_view::workflow_state_to_view_state;
 
     let steps = vec![WorkflowStep {
@@ -1790,10 +1903,10 @@ fn workflow_state_to_view_state_phase_step_statuses() {
 
     // 4 setup + 1 main = 5 steps.
     assert_eq!(view.steps.len(), 5);
-    assert_eq!(view.steps[0].status, "pending");
-    assert_eq!(view.steps[1].status, "running");
-    assert_eq!(view.steps[2].status, "done");
-    assert_eq!(view.steps[3].status, "error");
+    assert_eq!(view.steps[0].status, StepViewStatus::Pending);
+    assert_eq!(view.steps[1].status, StepViewStatus::Running);
+    assert_eq!(view.steps[2].status, StepViewStatus::Done);
+    assert_eq!(view.steps[3].status, StepViewStatus::Error);
 }
 
 // ─── WorkerId unit tests ───────────────────────────────────────────────────────
@@ -1822,7 +1935,14 @@ fn complete_command_sets_status_and_result() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     store
         .enqueue_command("c1", "s1", "exec workflow", "[]", "/l")
@@ -1846,7 +1966,14 @@ fn complete_command_error_path() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
     store
         .enqueue_command("c1", "s1", "exec workflow", "[]", "/l")
@@ -2103,7 +2230,14 @@ fn recover_stale_commands_zero_threshold_recovers_all_running() {
     let (_tmp, store) = make_store();
     let ts = chrono::Utc::now().to_rfc3339();
     store
-        .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
+        .insert_session_full(NewSessionRow {
+            id: "s1",
+            workdir: "/wd",
+            created_at: &ts,
+            setup_status: SessionSetupStatus::Ready,
+            kind: SessionKind::Local,
+            cloned_path: None,
+        })
         .unwrap();
 
     // A command started "just now" — well within any non-zero stale window.
@@ -2185,4 +2319,195 @@ async fn real_network_post_after_delete_is_rejected() {
     );
 
     server.abort();
+}
+
+// ─── Status-event `phase` labels (WI 0114, F-33 / midpoint finding 3) ────────
+//
+// The merged `AgentImageFrontend` impl tags every setup status event with the
+// command's own name, read from `ApiDispatchFrontend::command_path`. Before
+// WI 0114 that field held `body.subcommand` verbatim, so a request could
+// choose its own label; it is now the catalogue's canonical spelling. These
+// assertions read the serialised JSON, not the enum, because the label is a
+// wire contract for every client that groups setup events by phase.
+
+/// Build the JSON an `AgentImageFrontend` status event serialises to for
+/// `subcommand`.
+async fn phase_label_for(subcommand: &str) -> serde_json::Value {
+    use awman::command::commands::api_server::event_bus::EventBus;
+    use awman::data::setup_step::{ReadyStep, SetupStep};
+    use awman::data::step_status::StepStatus;
+    use awman::engine::agent::AgentImageFrontend;
+    use awman::frontend::api::command_frontend::ApiDispatchFrontend;
+
+    let bus = EventBus::new(16);
+    let mut rx = bus.subscribe();
+    let mut fe = ApiDispatchFrontend::new(subcommand, &[], bus.sender());
+    fe.report_step_status(
+        &SetupStep::Ready(ReadyStep::BuildBaseImage),
+        StepStatus::Running,
+    );
+    let ev = rx.recv().await.unwrap();
+    // The payload serialises as `{"type": "StatusMessage", "data": {...}}`;
+    // the label lives in `data`.
+    serde_json::to_value(&ev.payload).unwrap()["data"].clone()
+}
+
+#[tokio::test]
+async fn init_setup_events_are_labelled_init_on_the_wire() {
+    let json = phase_label_for("init").await;
+    assert_eq!(
+        json["phase"], "init",
+        "the `init` setup event stream is labelled `init`; got {json}"
+    );
+}
+
+#[tokio::test]
+async fn ready_setup_events_are_labelled_ready_on_the_wire() {
+    let json = phase_label_for("ready").await;
+    assert_eq!(
+        json["phase"], "ready",
+        "the `ready` setup event stream is labelled `ready`; got {json}"
+    );
+}
+
+/// The label comes from the catalogue, so padding or odd casing in the request
+/// body cannot change it. `{"subcommand": " ready"}` passes route validation
+/// (it splits on whitespace) and used to emit `phase: " ready"`.
+#[tokio::test]
+async fn a_padded_subcommand_still_emits_the_canonical_phase_label() {
+    let json = phase_label_for("  ready  ").await;
+    assert_eq!(
+        json["phase"], "ready",
+        "the request body must not choose the phase label; got {json}"
+    );
+}
+
+// ─── Typed wire enums (WI 0114, F-48) ───────────────────────────────────────
+//
+// `from_status`/`to_status`, `CommandStatus.status`, `WorkflowPhaseTransition
+// .status`, the `session_type` column and `awman squad env`'s state column
+// were all free-form `String`s produced by a hand-written map in one file and
+// consumed by an `as_str()` match in another. They are enums now; these
+// assertions read the *serialised* form, because that is the contract a client
+// reads, and a rename of a variant must not silently rename a wire value.
+
+fn payload_json(payload: awman::data::execution_event::EventPayload) -> serde_json::Value {
+    serde_json::to_value(&payload).unwrap()["data"].clone()
+}
+
+#[tokio::test]
+async fn step_status_kinds_serialise_to_their_documented_wire_values() {
+    use awman::data::execution_event::{EventPayload, StepStatusKind};
+
+    let expected = [
+        (StepStatusKind::Pending, "pending"),
+        (StepStatusKind::Running, "running"),
+        (StepStatusKind::Succeeded, "succeeded"),
+        (StepStatusKind::Failed, "failed"),
+        (StepStatusKind::Cancelled, "cancelled"),
+        (StepStatusKind::Skipped, "skipped"),
+    ];
+    for (kind, wire) in expected {
+        let json = payload_json(EventPayload::WorkflowStepTransition {
+            step_name: "build".into(),
+            step_index: 0,
+            from_status: StepStatusKind::Pending,
+            to_status: kind,
+        });
+        assert_eq!(json["to_status"], wire, "{kind:?} must serialise as {wire}");
+        assert_eq!(
+            kind.to_string(),
+            wire,
+            "Display and the wire value must agree for {kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn command_status_kinds_serialise_to_their_documented_wire_values() {
+    use awman::data::execution_event::{CommandStatusKind, EventPayload};
+
+    for (kind, wire) in [
+        (CommandStatusKind::Done, "done"),
+        (CommandStatusKind::Paused, "paused"),
+        (CommandStatusKind::Aborted, "aborted"),
+        (CommandStatusKind::Error, "error"),
+    ] {
+        let json = payload_json(EventPayload::CommandStatus {
+            status: kind,
+            exit_code: None,
+            error: None,
+        });
+        assert_eq!(json["status"], wire, "{kind:?} must serialise as {wire}");
+        assert_eq!(kind.to_string(), wire);
+    }
+}
+
+#[tokio::test]
+async fn phase_status_kinds_serialise_to_their_documented_wire_values() {
+    use awman::data::execution_event::{EventPayload, PhaseStatusKind};
+
+    for (kind, wire) in [
+        (PhaseStatusKind::Running, "running"),
+        (PhaseStatusKind::Succeeded, "succeeded"),
+        (PhaseStatusKind::Failed, "failed"),
+        (PhaseStatusKind::Paused, "paused"),
+        (PhaseStatusKind::TeardownFailed, "teardown_failed"),
+    ] {
+        let json = payload_json(EventPayload::WorkflowPhaseTransition {
+            phase: "main".into(),
+            step_desc: "d".into(),
+            status: kind,
+        });
+        assert_eq!(json["status"], wire, "{kind:?} must serialise as {wire}");
+        assert_eq!(kind.to_string(), wire);
+    }
+}
+
+#[test]
+fn session_kinds_serialise_to_their_documented_wire_values() {
+    for (kind, wire) in [
+        (SessionKind::Local, "local"),
+        (SessionKind::Remote, "remote"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+        assert_eq!(kind.as_str(), wire);
+        assert_eq!(wire.parse::<SessionKind>().unwrap(), kind);
+    }
+    // Case-insensitive, matching what the API accepted when this was a
+    // lowercased `String` comparison.
+    assert_eq!("LOCAL".parse::<SessionKind>().unwrap(), SessionKind::Local);
+    assert!("neither".parse::<SessionKind>().is_err());
+}
+
+#[test]
+fn env_var_states_serialise_to_their_documented_wire_values() {
+    use awman::data::fs::daemon_env::EnvVarState;
+
+    for (state, wire) in [(EnvVarState::Set, "set"), (EnvVarState::Unmet, "unmet")] {
+        assert_eq!(serde_json::to_value(state).unwrap(), wire);
+        assert_eq!(state.to_string(), wire);
+    }
+}
+
+/// The `--type` flag's accepted values are `SessionKind`'s, not a second list.
+#[test]
+fn the_type_flag_offers_exactly_the_session_kinds() {
+    use awman::command::dispatch::catalogue::{CommandCatalogue, FlagKind};
+
+    let spec = CommandCatalogue::get()
+        .lookup(&["remote", "session", "start"])
+        .expect("`remote session start` declares --type");
+    let flag = spec.find_flag("type").expect("--type exists");
+    match flag.kind {
+        FlagKind::Enum(values) => {
+            let from_enum: Vec<&str> = SessionKind::ALL.iter().map(|k| k.as_str()).collect();
+            assert_eq!(
+                values,
+                &from_enum[..],
+                "the flag's values and SessionKind have drifted apart"
+            );
+        }
+        other => panic!("--type must be an enum flag, got {other:?}"),
+    }
 }

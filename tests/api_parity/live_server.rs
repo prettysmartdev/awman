@@ -13,7 +13,7 @@ use awman::command::dispatch::Engines;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -32,7 +32,7 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
-    let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(paths.root()));
+    let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(paths.root()));
 
     let engines = Engines {
         runtime: runtime.clone(),
@@ -43,6 +43,8 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
         auth_engine,
         agent_engine,
         workflow_state_store,
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
 
     Arc::new(AppState {

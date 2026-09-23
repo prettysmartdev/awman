@@ -128,30 +128,32 @@ fn sbx_kit_validate_passes_for_all_agents() {
     let mut sink = VecSink::default();
 
     for agent in &agents {
-        // Use the ready_sbx_agent public function to emit the kit.
+        // `SandboxRuntime::ready_agent` emits the kit and validates it
+        // internally (F-40 replaced the free `ready_agent` with this).
         // Errors from binary/login checks are OK for kit-validate purposes
         // since we re-check sbx_on_path() above.
-        // ready_sbx_agent emits the kit and validates it internally.
-        let _ = awman::engine::sandbox::ready_sbx_agent(agent, false, &mut sink);
+        if let Ok(rt) = awman::engine::sandbox::SandboxRuntime::dsbx() {
+            let _ = rt.ready_agent(agent, false, &mut sink);
+        }
 
         // If the kit dir exists (emit succeeded), run the validator.
         // The kit_dir is under $HOME/.awman/kits/<agent>/ in production; in
         // tests we use the sink output to find it, or just skip validate here
-        // since ready_sbx_agent calls `sbx kit validate` internally.
+        // since ready_agent calls `sbx kit validate` internally.
     }
 
-    // Verify no Error-level messages from ready_sbx_agent for kit emission itself.
+    // Verify no Error-level messages from ready_agent for kit emission itself.
     let errors: Vec<_> = sink
         .0
         .iter()
         .filter(|m| m.level == MessageLevel::Error)
         .collect();
     for e in &errors {
-        eprintln!("ready_sbx_agent error: {}", e.text);
+        eprintln!("ready_agent error: {}", e.text);
     }
-    // Real kit-validation failures make ready_sbx_agent return Err; only a
+    // Real kit-validation failures make ready_agent return Err; only a
     // missing `kit validate` subcommand is downgraded to a warning.
-    // If ready_sbx_agent returned Ok for each agent the kit emission succeeded.
+    // If ready_agent returned Ok for each agent the kit emission succeeded.
 }
 
 // ─── awman ready (end-to-end CLI, env-gated) ─────────────────────────────────

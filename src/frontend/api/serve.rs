@@ -4,8 +4,8 @@
 //! daemon (the squad daemon, WI 0101 Part 4) can bind, serve, and shut down over
 //! the exact same code path instead of duplicating it. Nothing here is
 //! API-specific: `serve_router` takes a fully-formed [`Router`] and
-//! `resolve_auth_mode` takes a [`DaemonPaths`], so both daemons drive them with
-//! their own state.
+//! `check_bearer_auth` takes the [`AuthMode`] its caller's engine resolved, so
+//! both daemons drive them with their own state.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,10 +14,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 
-use crate::command::commands::api_server::AuthMode;
 use crate::command::error::CommandError;
-use crate::data::fs::daemon_paths::DaemonPaths;
-use crate::engine::auth::TlsMaterial;
+use crate::engine::auth::{AuthEngine, AuthMode, AuthOutcome, TlsMaterial};
 
 /// The single JSON error envelope every awman HTTP daemon emits.
 #[derive(serde::Serialize)]
@@ -33,23 +31,28 @@ pub fn error_json(message: impl Into<String>) -> Json<ErrorResponse> {
     })
 }
 
-/// The one bearer-token authentication decision, shared by every awman daemon
-/// router.
+/// Extract the bearer token from `headers` and turn Layer 1's verdict into
+/// the 401 envelope, or `None` when the request may proceed.
 ///
-/// Returns `Some(response)` when the request must be rejected and `None` when
-/// it may proceed. Keeping SHA-256 hashing, the accepted header syntax, the
-/// constant-time comparison, and the two rejection messages in one function is
-/// what stops two security-sensitive implementations from drifting apart.
-pub fn check_bearer_auth(mode: &AuthMode, headers: &HeaderMap) -> Option<Response> {
-    let AuthMode::Enabled { ref key_hash } = *mode else {
-        return None;
-    };
+/// Everything security-sensitive — the accepted header syntax, the hashing
+/// and the constant-time comparison — is
+/// [`AuthEngine::verify_bearer`](crate::engine::auth::AuthEngine::verify_bearer).
+/// What is left here is transport: which header to read, and which of the two
+/// 401 bodies to emit. The two messages differ, but the *work* does not: a
+/// request with no header is still hashed and compared, so the reply's shape
+/// tells an attacker nothing its timing does not (WI 0114 F-14).
+pub fn check_bearer_auth(
+    auth: &AuthEngine,
+    mode: &AuthMode,
+    headers: &HeaderMap,
+) -> Option<Response> {
     let header = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty());
-    let Some(header) = header else {
-        return Some(
+    match auth.verify_bearer(mode, header) {
+        AuthOutcome::Authorized | AuthOutcome::Disabled => None,
+        AuthOutcome::Unauthorized if header.is_none() => Some(
             (
                 StatusCode::UNAUTHORIZED,
                 error_json(
@@ -58,31 +61,10 @@ pub fn check_bearer_auth(mode: &AuthMode, headers: &HeaderMap) -> Option<Respons
                 ),
             )
                 .into_response(),
-        );
-    };
-    let supplied = if header
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
-    {
-        &header[7..]
-    } else {
-        header
-    };
-    let supplied_hash = {
-        use ring::digest;
-        let digest = digest::digest(&digest::SHA256, supplied.as_bytes());
-        digest
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    use subtle::ConstantTimeEq;
-    let matches: bool = supplied_hash.as_bytes().ct_eq(key_hash.as_bytes()).into();
-    if matches {
-        None
-    } else {
-        Some((StatusCode::UNAUTHORIZED, error_json("Invalid API key.")).into_response())
+        ),
+        AuthOutcome::Unauthorized => {
+            Some((StatusCode::UNAUTHORIZED, error_json("Invalid API key.")).into_response())
+        }
     }
 }
 
@@ -210,31 +192,4 @@ fn bind_error(addr: SocketAddr, error: std::io::Error) -> CommandError {
         ));
     }
     CommandError::Other(format!("Server error: {error}"))
-}
-
-/// Resolve the [`AuthMode`] for a daemon from its key-hash file plus a
-/// skip-auth flag.
-///
-/// * `skip` short-circuits to [`AuthMode::Disabled`] (the
-///   `--dangerously-skip-auth` path).
-/// * Otherwise the daemon's `<key_stem>.hash` file must exist; its absence is
-///   an error naming `refresh_hint` (e.g. `awman api start --refresh-key`) so
-///   each daemon can point the user at its own refresh command.
-pub fn resolve_auth_mode(
-    paths: &DaemonPaths,
-    skip: bool,
-    refresh_hint: &str,
-) -> Result<AuthMode, CommandError> {
-    if skip {
-        return Ok(AuthMode::Disabled);
-    }
-    let hash = paths
-        .read_key_hash()
-        .map_err(CommandError::Data)?
-        .ok_or_else(|| {
-            CommandError::Other(format!(
-                "No API key hash on disk. Run `{refresh_hint}` to generate one."
-            ))
-        })?;
-    Ok(AuthMode::Enabled { key_hash: hash })
 }

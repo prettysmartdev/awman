@@ -11,22 +11,22 @@ use crate::data::config::repo::LaunchMode;
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
+use crate::data::setup_step::{AgentSetupStep, SetupStep};
+use crate::data::step_status::StepStatus;
 use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
 use crate::engine::auth::{AgentCredentials, CredentialDelivery, RefreshableCredentialDelivery};
 use crate::engine::container::options::{
     ContainerOption, EnvLiteral, EnvVar, ImageRef, PlanMode, YoloMode,
 };
-use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
 use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, OverlayRequest};
 use crate::engine::sandbox::options::SandboxOption;
-use crate::engine::step_status::StepStatus;
 
 pub mod agent_matrix;
 pub mod download;
 pub mod frontend;
 
-pub use frontend::AgentFrontend;
+pub use frontend::AgentImageFrontend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutoMode {
@@ -77,30 +77,44 @@ pub struct AgentRunOptions {
 #[derive(Clone)]
 pub struct AgentEngine {
     overlay_engine: Arc<OverlayEngine>,
-    container_runtime: Arc<ContainerRuntime>,
+    runtime: Arc<dyn AgentRuntimeEngine>,
     /// Temp files backing file/env-file system-prompt delivery. Retained as
     /// RAII guards so the files live as long as this engine instance and are
     /// removed on drop — no `/tmp` leakage.
     prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
+    /// Who registers credential-refresh leases for the containers this engine
+    /// builds options for (F-38). `None` — the default — disables leases, the
+    /// same behaviour the absent process-global monitor used to produce.
+    lease_factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
 }
 
 impl AgentEngine {
-    pub fn new(
-        overlay_engine: Arc<OverlayEngine>,
-        container_runtime: Arc<ContainerRuntime>,
-    ) -> Self {
+    pub fn new(overlay_engine: Arc<OverlayEngine>, runtime: Arc<dyn AgentRuntimeEngine>) -> Self {
         Self {
             overlay_engine,
-            container_runtime,
+            runtime,
             prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
+            lease_factory: None,
         }
     }
 
-    /// Cheap clone of the engine's `ContainerRuntime` arc — used by callers
-    /// that need to ask the runtime whether an image exists without doing
-    /// any container build work themselves.
-    pub fn container_runtime_arc(&self) -> &Arc<ContainerRuntime> {
-        &self.container_runtime
+    /// Attach the credential-refresh lease factory this engine's launches
+    /// should register with. The command layer calls this when the effective
+    /// config enables `authRefresh`; leaving it off keeps leases disabled.
+    pub fn with_lease_factory(
+        mut self,
+        factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
+    ) -> Self {
+        self.lease_factory = factory;
+        self
+    }
+
+    /// The runtime this engine prepares agents on. Callers that only need to
+    /// ask whether an image exists take a cheap clone rather than a second
+    /// handle of their own (F-40b replaced `container_runtime_arc`, which
+    /// forced them to name the container tier).
+    pub fn runtime(&self) -> &Arc<dyn AgentRuntimeEngine> {
+        &self.runtime
     }
 
     /// Ensure the agent's Dockerfile and image are available locally. Reports
@@ -115,7 +129,7 @@ impl AgentEngine {
         session: &Session,
         agent: &AgentName,
         _config: &EffectiveConfig,
-        frontend: &mut dyn AgentFrontend,
+        frontend: &mut dyn AgentImageFrontend,
         image_exists: impl Fn(&str) -> bool,
     ) -> Result<(), EngineError> {
         // Check for the project base image. If absent, fail with a structured
@@ -131,7 +145,10 @@ impl AgentEngine {
 
         // Ensure Dockerfile.<agent> is present.
         if !agent_dockerfile.exists() {
-            frontend.report_step_status("Downloading Dockerfile", StepStatus::Running);
+            frontend.report_step_status(
+                &AgentSetupStep::DownloadingDockerfile.into(),
+                StepStatus::Running,
+            );
             match download::download_agent_dockerfile(
                 agent.as_str(),
                 &agent_dockerfile,
@@ -139,10 +156,13 @@ impl AgentEngine {
             )
             .await
             {
-                Ok(()) => frontend.report_step_status("Downloading Dockerfile", StepStatus::Done),
+                Ok(()) => frontend.report_step_status(
+                    &AgentSetupStep::DownloadingDockerfile.into(),
+                    StepStatus::Done,
+                ),
                 Err(e) => {
                     frontend.report_step_status(
-                        "Downloading Dockerfile",
+                        &AgentSetupStep::DownloadingDockerfile.into(),
                         StepStatus::Failed(e.to_string()),
                     );
                     return Err(e);
@@ -152,12 +172,12 @@ impl AgentEngine {
 
         // Ensure agent image is built.
         if !image_exists(&agent_tag) {
-            frontend.report_step_status("Building image", StepStatus::Running);
+            frontend.report_step_status(&AgentSetupStep::BuildingImage.into(), StepStatus::Running);
             let _container = frontend.container_frontend();
             let mut sink = |line: &str| {
-                frontend.report_step_status(line, StepStatus::Running);
+                frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
             };
-            match self.container_runtime.build_image(
+            match self.runtime.build_image(
                 &agent_tag,
                 &agent_dockerfile,
                 session.git_root(),
@@ -165,11 +185,14 @@ impl AgentEngine {
                 &mut sink,
             ) {
                 Ok(()) => {
-                    frontend.report_step_status("Building image", StepStatus::Done);
+                    frontend.report_step_status(
+                        &AgentSetupStep::BuildingImage.into(),
+                        StepStatus::Done,
+                    );
                 }
                 Err(EngineError::ImageBuildExitNonzero { exit_code, .. }) => {
                     frontend.report_step_status(
-                        "Building image",
+                        &AgentSetupStep::BuildingImage.into(),
                         StepStatus::Failed(format!(
                             "agent image build exited with code {exit_code}"
                         )),
@@ -181,7 +204,10 @@ impl AgentEngine {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    frontend.report_step_status("Building image", StepStatus::Failed(msg.clone()));
+                    frontend.report_step_status(
+                        &AgentSetupStep::BuildingImage.into(),
+                        StepStatus::Failed(msg.clone()),
+                    );
                     return Err(e);
                 }
             }
@@ -211,31 +237,9 @@ impl AgentEngine {
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
-
-        // Validate plan mode support.
-        if matches!(run.plan, Some(PlanMode::Enabled)) && matrix.plan_flag.is_none() {
-            return Err(EngineError::PlanModeUnsupported {
-                agent: agent.as_str().to_string(),
-            });
-        }
-        // Validate ACP support. Every launch path (direct chat/exec prompt and
-        // each exec workflow step) funnels through build_options, so this single
-        // guard guarantees an agent that doesn't speak ACP can never reach a
-        // container with JSON-RPC framing, regardless of any Layer 2 pre-flight
-        // decision. Mirrors the plan-mode-unsupported check above.
-        if matches!(run.launch_mode, LaunchMode::Acp) && !matrix.supports_acp {
-            return Err(EngineError::AcpUnsupported {
-                agent: agent.as_str().to_string(),
-            });
-        }
-        // Plan + yolo are mutually exclusive — engine layer detection.
-        if matches!(run.plan, Some(PlanMode::Enabled))
-            && matches!(run.yolo, Some(YoloMode::Enabled))
-        {
-            return Err(EngineError::ConflictingOptions(
-                "plan and yolo modes are mutually exclusive".into(),
-            ));
-        }
+        // Plan-mode support, ACP support and the plan/yolo conflict are all
+        // matrix facts, checked identically on both paradigms.
+        matrix.validate_run(run, agent_matrix::RunParadigm::Container)?;
 
         let image_tag = run
             .image_tag_override
@@ -301,25 +305,7 @@ impl AgentEngine {
         }
 
         // Resolve per-agent mode flags into literal argv strings.
-        let mut mode_flags = Vec::new();
-        if matches!(run.yolo, Some(YoloMode::Enabled)) {
-            if let Some(flag) = matrix.yolo_flag {
-                mode_flags.push(flag.to_string());
-            }
-        }
-        if matches!(
-            run.auto,
-            Some(crate::engine::container::options::AutoMode::Enabled)
-        ) {
-            if let Some(flags) = matrix.auto_flag {
-                mode_flags.extend(flags.iter().map(|s| s.to_string()));
-            }
-        }
-        if matches!(run.plan, Some(PlanMode::Enabled)) {
-            if let Some(flags) = matrix.plan_flag {
-                mode_flags.extend(flags.iter().map(|s| s.to_string()));
-            }
-        }
+        let mode_flags = matrix.mode_flags(run);
         if !mode_flags.is_empty() {
             options.push(ContainerOption::AgentModeFlags(mode_flags));
         }
@@ -357,12 +343,12 @@ impl AgentEngine {
             options.push(ContainerOption::EnvPassthrough(EnvVar(name.clone())));
         }
 
-        // Per-agent static env vars.
-        if agent.as_str() == "copilot" {
+        // Per-agent static env vars, from the one per-agent table.
+        for (key, value) in matrix.static_env {
             options.push(ContainerOption::EnvLiteral(
                 crate::engine::container::options::EnvLiteral {
-                    key: "COPILOT_OFFLINE".into(),
-                    value: "true".into(),
+                    key: (*key).into(),
+                    value: (*value).into(),
                 },
             ));
         }
@@ -383,8 +369,10 @@ impl AgentEngine {
         // hasn't been rebuilt yet, in which case mounting at the
         // Dockerfile-derived path silently breaks credential passthrough.
         let container_home = self
-            .container_runtime
+            .runtime
             .image_home_dir(&image_tag)
+            .ok()
+            .flatten()
             .or_else(|| {
                 let home = dirs::home_dir().unwrap_or_default();
                 crate::engine::overlay::detect_container_home(
@@ -434,6 +422,12 @@ impl AgentEngine {
                 },
             ));
         }
+        // Who leases those credentials, carried explicitly (F-38). Emitted
+        // unconditionally when the engine has a factory so the backends never
+        // have to consult process-global state to find one.
+        if let Some(factory) = self.lease_factory.as_ref() {
+            options.push(ContainerOption::CredentialLeaseFactory(factory.clone()));
+        }
 
         // System prompt delivery (context overlays).
         if let Some(ref prompt_text) = run.system_prompt {
@@ -473,9 +467,11 @@ impl AgentEngine {
         agent: &AgentName,
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
-        runtime: &dyn AgentRuntimeEngine,
     ) -> Result<ResolvedAgentOptions, EngineError> {
-        if runtime.capabilities().kit_declarative {
+        // The runtime is the engine's own (F-40b): a caller passing a
+        // *different* one than the engine was built with could resolve
+        // sandbox options and then build them on a container runtime.
+        if self.runtime.capabilities().kit_declarative {
             let mut options = self.build_sandbox_options(session, agent, run)?;
             if !credentials.env_vars.is_empty() {
                 options.push(SandboxOption::AgentCredentials {
@@ -511,38 +507,14 @@ impl AgentEngine {
     ) -> Result<Vec<SandboxOption>, EngineError> {
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
 
-        // Parity validation with the container path so a sandbox-configured user
-        // gets the same up-front errors for unsupported mode combinations.
-        if matches!(run.plan, Some(PlanMode::Enabled)) && matrix.plan_flag.is_none() {
-            return Err(EngineError::PlanModeUnsupported {
-                agent: agent.as_str().to_string(),
-            });
-        }
-        // ACP guards. First the same `supports_acp` check the container path
-        // runs, so an unsupported agent surfaces `AcpUnsupported` identically on
-        // both paradigms. Then, because ACP is a container-paradigm-only launch
-        // mode (`ContainerOption::Acp` has no sandbox equivalent — the sandbox
-        // `ResolvedSandboxOptions` type carries no ACP-piping option), a sandbox
-        // launch that survived the first guard (e.g. cline under `docker-sbx-
-        // experimental`) is rejected as `NotImplemented` per the WI 0089
-        // convention rather than silently launching in the wrong (stdio) mode.
-        if matches!(run.launch_mode, LaunchMode::Acp) {
-            if !matrix.supports_acp {
-                return Err(EngineError::AcpUnsupported {
-                    agent: agent.as_str().to_string(),
-                });
-            }
-            return Err(EngineError::NotImplemented(
-                "ACP launch mode is not supported by sandbox-class runtimes",
-            ));
-        }
-        if matches!(run.plan, Some(PlanMode::Enabled))
-            && matches!(run.yolo, Some(YoloMode::Enabled))
-        {
-            return Err(EngineError::ConflictingOptions(
-                "plan and yolo modes are mutually exclusive".into(),
-            ));
-        }
+        // Parity validation with the container path so a sandbox-configured
+        // user gets the same up-front errors for unsupported mode
+        // combinations. The one asymmetry — ACP is a container-paradigm-only
+        // launch mode, so a sandbox launch that clears the `supports_acp`
+        // check is still refused as `NotImplemented` (WI 0089) rather than
+        // silently launching in the wrong (stdio) mode — lives in
+        // `validate_run` behind the `RunParadigm` it is given.
+        matrix.validate_run(run, agent_matrix::RunParadigm::Sandbox)?;
 
         let mut options = vec![
             SandboxOption::AgentId(agent.as_str().to_string()),
@@ -562,16 +534,11 @@ impl AgentEngine {
         if let Some(model) = run.model.as_deref() {
             let flag = agent_matrix::model_flag_for(&matrix, model)?;
             options.push(SandboxOption::Model { flag });
-            // Copilot's built-in template has no mixin-safe model config (the
-            // in-VM apply script also warns); surface that host-side instead
-            // of letting the flag vanish into the VM boot log.
-            if agent.as_str() == "copilot" {
-                options.push(SandboxOption::UnsupportedNote(
-                    "--model cannot be applied to copilot under the sandbox runtime \
-                     (no mixin-safe config); use the /model slash command inside the \
-                     session instead"
-                        .into(),
-                ));
+            // An agent whose built-in template has no mixin-safe model config
+            // (copilot; the in-VM apply script also warns) declares the note
+            // in the matrix, so the flag does not vanish into the VM boot log.
+            if let Some(note) = matrix.sandbox_model_note {
+                options.push(SandboxOption::UnsupportedNote(note.into()));
             }
         }
 
@@ -582,25 +549,7 @@ impl AgentEngine {
         // equivalent (`permissions.defaultMode`, rendered by its apply
         // script from `session.json`); the other mixins have none awman
         // manages, so the request is warned about rather than dropped.
-        let mut mode_flags = Vec::new();
-        if matches!(run.yolo, Some(YoloMode::Enabled)) {
-            if let Some(flag) = matrix.yolo_flag {
-                mode_flags.push(flag.to_string());
-            }
-        }
-        if matches!(
-            run.auto,
-            Some(crate::engine::container::options::AutoMode::Enabled)
-        ) {
-            if let Some(flags) = matrix.auto_flag {
-                mode_flags.extend(flags.iter().map(|s| s.to_string()));
-            }
-        }
-        if matches!(run.plan, Some(PlanMode::Enabled)) {
-            if let Some(flags) = matrix.plan_flag {
-                mode_flags.extend(flags.iter().map(|s| s.to_string()));
-            }
-        }
+        let mode_flags = matrix.mode_flags(run);
         if !mode_flags.is_empty() {
             match matrix.sbx_kit_kind {
                 agent_matrix::SbxKitKind::Agent => {
@@ -614,7 +563,7 @@ impl AgentEngine {
                     } else {
                         "auto"
                     };
-                    if agent.as_str() == "claude" {
+                    if matrix.sandbox_permission_mode_supported {
                         options.push(SandboxOption::PermissionMode(mode.to_string()));
                     } else {
                         options.push(SandboxOption::UnsupportedNote(format!(
@@ -664,10 +613,10 @@ impl AgentEngine {
         }
 
         // Per-agent static env vars (mirrors the container path).
-        if agent.as_str() == "copilot" {
+        for (key, value) in matrix.static_env {
             options.push(SandboxOption::EnvLiteral(EnvLiteral {
-                key: "COPILOT_OFFLINE".into(),
-                value: "true".into(),
+                key: (*key).into(),
+                value: (*value).into(),
             }));
         }
 
@@ -1047,6 +996,28 @@ mod tests {
         );
         let runtime = crate::engine::container::ContainerRuntime::docker();
         let engine = AgentEngine::new(Arc::new(overlay), Arc::new(runtime));
+        (engine, session)
+    }
+
+    /// Like [`make_agent_engine`], but over an explicit runtime — the
+    /// resolver reads the paradigm off the engine's own runtime (F-40b), so
+    /// a parity test has to build one engine per tier.
+    fn make_agent_engine_on(
+        home: &std::path::Path,
+        runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
+    ) -> (AgentEngine, crate::data::session::Session) {
+        let session_tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(session_tmp.path());
+        let session = crate::data::session::Session::open(
+            session_tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions::default(),
+        )
+        .unwrap();
+        let overlay = OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(home),
+        );
+        let engine = AgentEngine::new(Arc::new(overlay), runtime);
         (engine, session)
     }
 
@@ -1434,8 +1405,8 @@ mod tests {
         }
     }
 
-    impl AgentFrontend for FakeAgentFrontend {
-        fn report_step_status(&mut self, step: &str, status: StepStatus) {
+    impl AgentImageFrontend for FakeAgentFrontend {
+        fn report_step_status(&mut self, step: &SetupStep, status: StepStatus) {
             self.statuses.push((step.to_string(), status));
         }
         fn container_frontend(
@@ -2364,6 +2335,7 @@ mod tests {
                     dind: DindSupport::Always,
                     host_paths_visible: false,
                     session_label_supported: false,
+                    has_image_store: false,
                 },
             }
         }
@@ -2381,12 +2353,40 @@ mod tests {
                     dind: DindSupport::OnRequest,
                     host_paths_visible: true,
                     session_label_supported: true,
+                    has_image_store: true,
                 },
             }
         }
     }
 
     impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeRuntime {
+        fn ready_agent(
+            &self,
+            _agent: &str,
+            _opts: crate::engine::agent_runtime::ReadyAgentOptions,
+            _sink: &mut dyn crate::data::message::UserMessageSink,
+        ) -> Result<(), crate::engine::error::EngineError> {
+            Ok(())
+        }
+        fn image_exists(&self, _tag: &str) -> Result<bool, crate::engine::error::EngineError> {
+            Ok(true)
+        }
+        fn image_home_dir(
+            &self,
+            _tag: &str,
+        ) -> Result<Option<String>, crate::engine::error::EngineError> {
+            Ok(None)
+        }
+        fn build_image(
+            &self,
+            _tag: &str,
+            _dockerfile: &std::path::Path,
+            _context: &std::path::Path,
+            _no_cache: bool,
+            _on_line: &mut dyn FnMut(&str),
+        ) -> Result<(), crate::engine::error::EngineError> {
+            Ok(())
+        }
         fn runtime_name(&self) -> &'static str {
             if self.caps.kit_declarative {
                 "fake-sbx"
@@ -2458,15 +2458,14 @@ mod tests {
     #[test]
     fn resolve_agent_options_sandbox_runtime_yields_sandbox_variant() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
+        let (engine, session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
         let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let fake_sbx = FakeRuntime::sandbox();
         let result = engine.resolve_agent_options(
             &session,
             &agent,
             &AgentRunOptions::default(),
             &AgentCredentials::default(),
-            &fake_sbx,
         );
         assert!(
             matches!(
@@ -2482,15 +2481,14 @@ mod tests {
     #[test]
     fn resolve_agent_options_container_runtime_yields_container_variant() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
+        let (engine, session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::container()));
         let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let fake_container = FakeRuntime::container();
         let result = engine.resolve_agent_options(
             &session,
             &agent,
             &AgentRunOptions::default(),
             &AgentCredentials::default(),
-            &fake_container,
         );
         assert!(
             matches!(
@@ -2504,22 +2502,16 @@ mod tests {
     #[test]
     fn resolve_agent_options_credentials_become_agent_credentials_in_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
+        let (engine, session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
         let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let fake_sbx = FakeRuntime::sandbox();
         let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
         let credentials = AgentCredentials {
             env_vars: creds,
             ..Default::default()
         };
         let result = engine
-            .resolve_agent_options(
-                &session,
-                &agent,
-                &AgentRunOptions::default(),
-                &credentials,
-                &fake_sbx,
-            )
+            .resolve_agent_options(&session, &agent, &AgentRunOptions::default(), &credentials)
             .unwrap();
         if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
             assert!(
@@ -2537,9 +2529,9 @@ mod tests {
     #[test]
     fn resolve_agent_options_credentials_never_in_env_passthrough_or_env_literal_in_sandbox() {
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
+        let (engine, session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
         let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let fake_sbx = FakeRuntime::sandbox();
         let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
         let credentials = AgentCredentials {
             env_vars: creds,
@@ -2552,7 +2544,7 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .resolve_agent_options(&session, &agent, &run, &credentials, &fake_sbx)
+            .resolve_agent_options(&session, &agent, &run, &credentials)
             .unwrap();
         if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
             // Credentials from `creds` must not appear as EnvPassthrough env var
@@ -2576,7 +2568,10 @@ mod tests {
         // For a fixed set of flags, the sandbox and container variants must
         // carry the same agent, model, and tool intent.
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
+        let (sbx_engine, session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
+        let (ctr_engine, _ctr_session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::container()));
         let agent = crate::data::session::AgentName::new("claude").unwrap();
         let run = AgentRunOptions {
             model: Some("claude-sonnet-4-6".into()),
@@ -2587,23 +2582,11 @@ mod tests {
             ..Default::default()
         };
 
-        let sbx_result = engine
-            .resolve_agent_options(
-                &session,
-                &agent,
-                &run,
-                &AgentCredentials::default(),
-                &FakeRuntime::sandbox(),
-            )
+        let sbx_result = sbx_engine
+            .resolve_agent_options(&session, &agent, &run, &AgentCredentials::default())
             .unwrap();
-        let ctr_result = engine
-            .resolve_agent_options(
-                &session,
-                &agent,
-                &run,
-                &AgentCredentials::default(),
-                &FakeRuntime::container(),
-            )
+        let ctr_result = ctr_engine
+            .resolve_agent_options(&session, &agent, &run, &AgentCredentials::default())
             .unwrap();
 
         // Both must successfully build.
@@ -2657,7 +2640,8 @@ mod tests {
         // The prompt must appear in SeededPrompt exactly once, regardless of
         // system prompt or other options (no double-delivery).
         let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
+        let (engine, session) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
         let agent = crate::data::session::AgentName::new("claude").unwrap();
         let run = AgentRunOptions {
             initial_prompt: Some("run the tests".into()),
@@ -2665,13 +2649,7 @@ mod tests {
             ..Default::default()
         };
         let result = engine
-            .resolve_agent_options(
-                &session,
-                &agent,
-                &run,
-                &AgentCredentials::default(),
-                &FakeRuntime::sandbox(),
-            )
+            .resolve_agent_options(&session, &agent, &run, &AgentCredentials::default())
             .unwrap();
         if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
             assert_eq!(

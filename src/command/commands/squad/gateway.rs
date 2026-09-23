@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::command::commands::http_core::HttpCore;
 use crate::command::commands::squad::commands::resolved_git_root;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::Engines;
@@ -18,7 +17,7 @@ use crate::command::error::CommandError;
 use crate::data::config::env::DaemonEnvMap;
 use crate::data::config::global::GlobalConfig;
 use crate::data::config::repo::SquadConfig;
-use crate::data::fs::daemon_env::env_overlay_names;
+use crate::data::fs::daemon_env::{env_overlay_names, EnvPersistence};
 use crate::data::fs::task_store::{
     MountScope, Run, Task, TaskStatus, TaskStore, TaskUpdate, TaskWorkspace,
 };
@@ -26,6 +25,8 @@ use crate::data::fs::SquadPaths;
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::naming::validate_task_slug;
+use crate::engine::error::EngineError;
+use crate::engine::remote::HttpCore;
 use crate::engine::squad::env_state::{DaemonEnvState, RequiredEnvEntry};
 use crate::engine::squad::SchedulerStatus;
 
@@ -206,8 +207,10 @@ pub struct DaemonStatus {
     /// are (CONTRACT §5).
     ///
     /// [`EnvPersistence`]: crate::data::fs::daemon_env::EnvPersistence
+    /// `None` when the answer did not come from a live daemon — the pidfile
+    /// sidecar cannot know it.
     #[serde(default)]
-    pub env_persistence: String,
+    pub env_persistence: Option<EnvPersistence>,
     /// Required env names the daemon has no value for, sorted. Empty on the
     /// common path, which is why the CLI one-liner only mentions it when it is
     /// not.
@@ -232,7 +235,7 @@ pub struct EnvCoverage {
     pub salt: String,
     /// [`DaemonStatus::env_persistence`]'s value, so `awman squad env` needs
     /// only this one call.
-    pub persistence: String,
+    pub persistence: EnvPersistence,
     pub required: Vec<RequiredEnvEntry>,
 }
 
@@ -483,9 +486,13 @@ impl LocalTaskGateway {
     /// surfaces loudly on the scheduler's own tick.
     fn daemon_wide_env_names(&self) -> Vec<String> {
         let mut specs: Vec<String> = Vec::new();
-        if let Ok(config) = GlobalConfig::load() {
-            specs.extend(config.overlays.unwrap_or_default());
-        }
+        specs.extend(
+            self.engines
+                .global_config
+                .overlays
+                .clone()
+                .unwrap_or_default(),
+        );
         // `AWMAN_OVERLAYS` is one comma-separated string of specs; `env(NAME)`
         // never contains a comma, so splitting first is lossless.
         if let Some(raw) =
@@ -526,7 +533,7 @@ impl LocalTaskGateway {
     fn coverage(&self) -> EnvCoverage {
         EnvCoverage {
             salt: self.env_state.salt().to_hex(),
-            persistence: self.env_state.persistence().to_string(),
+            persistence: self.env_state.persistence(),
             required: self.env_state.entries(),
         }
     }
@@ -567,9 +574,12 @@ impl LocalTaskGateway {
         // picks its workflow's step agents from whichever pool applies, and
         // every one of them needs a Dockerfile in the repository (WI 0110).
         agents.extend(req.agents_to_models.keys().cloned());
-        if let Some(pool) = GlobalConfig::load()?
+        if let Some(pool) = self
+            .engines
+            .global_config
             .squad
-            .and_then(|cfg| cfg.agents_to_models)
+            .as_ref()
+            .and_then(|cfg| cfg.agents_to_models.clone())
         {
             agents.extend(pool.into_keys());
         }
@@ -681,8 +691,7 @@ impl LocalTaskGateway {
     /// user-influenced name against the tasks root before appending the fixed
     /// `workspace` leaf, so a crafted name cannot escape.
     fn ensure_durable_workspace(dir: &Path) -> Result<(), CommandError> {
-        std::fs::create_dir_all(dir)
-            .map_err(|error| CommandError::Data(crate::data::error::DataError::io(dir, error)))
+        crate::data::fs::TaskStore::ensure_workspace(dir).map_err(CommandError::Data)
     }
 
     /// Write (or remove) a task's own `config.json` (WI 0110).
@@ -701,15 +710,7 @@ impl LocalTaskGateway {
     ) -> Result<(), CommandError> {
         let path = self.paths.task_config_file(name)?;
         if agents_to_models.is_empty() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => {
-                    return Err(CommandError::Data(crate::data::error::DataError::io(
-                        &path, error,
-                    )));
-                }
-            }
+            return crate::data::fs::TaskStore::remove_config(&path).map_err(CommandError::Data);
         }
         let squad = SquadConfig {
             agents_to_models: Some(
@@ -728,15 +729,7 @@ impl LocalTaskGateway {
             squad: Some(squad),
             ..Default::default()
         };
-        let body = serde_json::to_string_pretty(&document)
-            .map_err(|source| crate::data::error::DataError::ConfigSerialize { source })?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                CommandError::Data(crate::data::error::DataError::io(parent, error))
-            })?;
-        }
-        std::fs::write(&path, body)
-            .map_err(|error| CommandError::Data(crate::data::error::DataError::io(&path, error)))
+        crate::data::fs::TaskStore::write_config(&path, &document).map_err(CommandError::Data)
     }
 }
 
@@ -975,7 +968,7 @@ impl TaskGateway for LocalTaskGateway {
     async fn status(&self) -> Result<DaemonStatus, CommandError> {
         let tasks = self.store.list()?;
         self.refresh_required_env_from(&tasks).await;
-        let env_persistence = self.env_state.persistence().to_string();
+        let env_persistence = Some(self.env_state.persistence());
         let unmet_env = self.env_state.unmet_names();
         let status = self.status.lock().expect("scheduler status mutex poisoned");
         Ok(DaemonStatus {
@@ -1050,9 +1043,7 @@ impl TaskGateway for LocalTaskGateway {
         let Some(path) = run.workflow_state_path else {
             return Ok(None);
         };
-        Ok(crate::data::EngineWorkflowStateStore::read_state_path(
-            &path,
-        )?)
+        Ok(crate::data::WorkflowStateStore::read_state_path(&path)?)
     }
 }
 
@@ -1259,8 +1250,8 @@ impl TaskGateway for RemoteTaskGateway {
         // leak into a frontend or a shared polling implementation.
         let response = match self.core.get(&["tasks", task, "workflow"]).await {
             Ok(response) => response,
-            Err(CommandError::RemoteHttpStatus { status: 404, .. }) => return Ok(None),
-            Err(error) => return Err(error),
+            Err(EngineError::RemoteHttpStatus { status: 404, .. }) => return Ok(None),
+            Err(error) => return Err(CommandError::from(error)),
         };
         serde_json::from_value(response.body)
             .map(Some)
@@ -1439,7 +1430,7 @@ mod tests {
     fn env_coverage_debug_redacts_the_salt_and_keeps_the_names() {
         let coverage = EnvCoverage {
             salt: "ab".repeat(32),
-            persistence: "keychain".to_string(),
+            persistence: EnvPersistence::Keychain,
             required: vec![RequiredEnvEntry {
                 name: "GITHUB_TOKEN".to_string(),
                 required_by: vec!["nightly".to_string()],

@@ -19,13 +19,7 @@
 use awman::command::dispatch::catalogue::{CommandCatalogue, CommandSpec};
 
 /// The API-frontend source files whose runtime code is under the layering rule.
-const API_SOURCE_FILES: &[&str] = &[
-    "command_frontend.rs",
-    "event_bus.rs",
-    "mod.rs",
-    "routes.rs",
-    "session_setup.rs",
-];
+const API_SOURCE_FILES: &[&str] = &["command_frontend.rs", "mod.rs", "routes.rs"];
 
 /// Load one `src/frontend/api/<file>` at compile time and drop the trailing
 /// `#[cfg(test)]` module so only runtime code is scanned. This retains the
@@ -34,10 +28,8 @@ const API_SOURCE_FILES: &[&str] = &[
 fn read_runtime_source(file: &str) -> String {
     let src = match file {
         "command_frontend.rs" => include_str!("../../src/frontend/api/command_frontend.rs"),
-        "event_bus.rs" => include_str!("../../src/frontend/api/event_bus.rs"),
         "mod.rs" => include_str!("../../src/frontend/api/mod.rs"),
         "routes.rs" => include_str!("../../src/frontend/api/routes.rs"),
-        "session_setup.rs" => include_str!("../../src/frontend/api/session_setup.rs"),
         _ => unreachable!("API_SOURCE_FILES contains only known API frontend files"),
     };
     match src.find("#[cfg(test)]") {

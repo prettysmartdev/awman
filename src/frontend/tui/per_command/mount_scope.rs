@@ -35,54 +35,7 @@ pub(crate) mod tests {
         std::sync::mpsc::Receiver<DialogRequest>,
         std::sync::mpsc::Sender<DialogResponse>,
     ) {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<DialogRequest>();
-        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<DialogResponse>();
-        let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-        let (stderr_tx, _stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let container_io = crate::engine::agent_runtime::frontend::AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: Some(resize_rx),
-            initial_size: Some((80, 24)),
-        };
-        let status_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let parsed = crate::command::dispatch::parsed_input::ParsedCommandBoxInput {
-            path: vec!["status".into()],
-            flags: Default::default(),
-            arguments: Default::default(),
-        };
-        let workflow_view = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let yolo_state = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let yolo_cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let pty_reset_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let frontend = TuiCommandFrontend::new(
-            parsed,
-            status_log,
-            req_tx,
-            resp_rx,
-            container_io,
-            workflow_view,
-            yolo_state,
-            yolo_cancel_flag,
-            pty_reset_flag,
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-            std::sync::Arc::new(std::sync::Mutex::new(
-                crate::command::commands::status::StatusCommandTuiContext::default(),
-            )),
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-        );
-        (frontend, req_rx, resp_tx)
+        crate::frontend::tui::tests::test_command_frontend(&["status"], Default::default())
     }
 
     #[test]

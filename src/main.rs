@@ -11,10 +11,11 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 
 use awman::command::dispatch::catalogue::CommandCatalogue;
+use awman::command::dispatch::RuntimeContext;
 use awman::command::startup::Startup;
 use awman::data::config::env::Env;
 use awman::engine::error::EngineError;
-use awman::frontend::cli::{self, RuntimeContext};
+use awman::frontend::cli;
 use awman::frontend::tui;
 
 #[tokio::main]
@@ -95,7 +96,7 @@ impl LaunchMode {
     fn from_matches(matches: &clap::ArgMatches) -> Self {
         if matches.subcommand_name().is_none() {
             Self::TuiNormal
-        } else if cli::is_bare_squad_tui_invocation(matches) {
+        } else if cli::is_bare_tui_invocation(matches) {
             Self::TuiSquad
         } else {
             Self::Cli

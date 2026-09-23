@@ -142,24 +142,13 @@ impl SquadDaemonHandles {
         self.engine.bind_addr()
     }
 
-    /// Bearer-auth state, in the shape the shared HTTP check consumes.
+    /// Bearer-auth state, as the daemon engine resolved it at Layer 1.
     ///
-    /// The daemon engine resolves it at Layer 1 (`engine::auth::AuthMode`);
-    /// this converts to the API frontend's transport-side enum so squad's
-    /// bearer check stays the *same* implementation as API mode's rather than
-    /// a second security-sensitive copy. WI 0113 Step 4 (F-03) is moving that
-    /// enum; when both land, the two collapse into the Layer 1 one.
-    pub fn auth_mode(&self) -> crate::command::commands::api_server::AuthMode {
-        match self.engine.auth_mode() {
-            crate::engine::auth::AuthMode::Disabled => {
-                crate::command::commands::api_server::AuthMode::Disabled
-            }
-            crate::engine::auth::AuthMode::Enabled { key_hash } => {
-                crate::command::commands::api_server::AuthMode::Enabled {
-                    key_hash: key_hash.clone(),
-                }
-            }
-        }
+    /// There is one `AuthMode` now (WI 0114 F-14), so squad's bearer check is
+    /// API mode's by construction and the conversion this used to perform is
+    /// gone.
+    pub fn auth_mode(&self) -> crate::engine::auth::AuthMode {
+        self.engine.auth_mode().clone()
     }
 
     /// Record the address a listener actually bound and return the endpoint

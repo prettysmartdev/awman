@@ -47,6 +47,7 @@ impl Tab {
             return;
         }
         let desired = self
+            .shared
             .active_worktree_path
             .lock()
             .ok()
@@ -61,7 +62,7 @@ impl Tab {
     /// the `stuck` flag for tab coloring.
     pub fn drain_stuck_events(&mut self) {
         // Pick up a new stuck sender from the engine if available.
-        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
+        if let Ok(mut guard) = self.shared.stuck_sender_shared.lock() {
             if let Some(sender) = guard.take() {
                 self.stuck_rx = Some(sender.subscribe());
             }

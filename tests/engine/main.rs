@@ -13,6 +13,7 @@ mod container_io;
 mod context_overlay_0087;
 mod credential_argv_docker;
 mod credential_refresh_integration;
+mod daemon_supervisor;
 mod git_engine;
 mod issue_e2e;
 mod issue_integration;

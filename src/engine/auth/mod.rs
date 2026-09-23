@@ -8,7 +8,6 @@ use std::time::SystemTime;
 
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
-use subtle::ConstantTimeEq;
 
 use crate::data::config::repo::AgentAuthMode;
 use crate::data::fs::api_paths::ApiPaths;
@@ -177,6 +176,10 @@ impl ApiKeyHash {
 pub enum AuthOutcome {
     Authorized,
     Unauthorized,
+    /// The daemon demands no key, so nothing was compared. Distinct from
+    /// `Authorized` so a caller can tell "this request proved a key" from
+    /// "this daemon asks for none".
+    Disabled,
 }
 
 /// Whether a daemon's HTTP surface demands a bearer key, and the hash it
@@ -455,19 +458,56 @@ impl AuthEngine {
         let on_disk = self.read_api_key_hash()?;
         let target = on_disk.unwrap_or_else(|| ApiKeyHash(SENTINEL_HASH.to_string()));
 
-        // Constant-time hex comparison. Both inputs are equal length (64
-        // hex chars from SHA-256); pad anyway for defense in depth.
-        let a = presented_hash.0.as_bytes();
-        let b = target.0.as_bytes();
-        let len = a.len().max(b.len());
-        let mut a_buf = vec![0u8; len];
-        let mut b_buf = vec![0u8; len];
-        a_buf[..a.len()].copy_from_slice(a);
-        b_buf[..b.len()].copy_from_slice(b);
-        if bool::from(a_buf.ct_eq(&b_buf)) {
+        if constant_time_hex_eq(&presented_hash.0, &target.0) {
             Ok(AuthOutcome::Authorized)
         } else {
             Ok(AuthOutcome::Unauthorized)
+        }
+    }
+
+    /// Resolve this daemon's [`AuthMode`] from its key-hash file.
+    ///
+    /// `skip` is the `--dangerously-skip-auth` flag. A missing hash with
+    /// `skip` unset is fatal and names the command that mints one: a daemon
+    /// that served with no hash would accept every request.
+    pub fn request_auth_mode(&self, skip: bool) -> Result<AuthMode, EngineError> {
+        AuthMode::resolve_for_daemon(&self.api_paths.daemon(), skip, API_KEY_REFRESH_HINT)
+    }
+
+    /// Verify a presented `Authorization` header value against `mode`.
+    ///
+    /// The header value is taken as the caller extracted it: `Bearer <key>`
+    /// (the prefix is matched case-insensitively) or a bare key. `None` means
+    /// the request carried no usable header.
+    ///
+    /// Two security properties live here rather than in a router, so neither
+    /// daemon can hold a second copy that drifts (WI 0114 F-14):
+    ///
+    /// * the comparison is constant-time over the hex digests;
+    /// * a request with no header still performs a full hash and compare
+    ///   against a sentinel, so an absent header, a malformed one and a wrong
+    ///   key all cost the same.
+    ///
+    /// [`AuthMode::Disabled`] authorises without comparing: there is nothing
+    /// to compare against, and the fact that auth is off is already public —
+    /// it is a flag the operator passed.
+    pub fn verify_bearer(&self, mode: &AuthMode, header: Option<&str>) -> AuthOutcome {
+        let AuthMode::Enabled { key_hash } = mode else {
+            return AuthOutcome::Disabled;
+        };
+        let supplied = header
+            .map(|value| match value.get(..7) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => &value[7..],
+                _ => value,
+            })
+            .unwrap_or("");
+        let supplied_hash = self.hash_api_key(&ApiKey(supplied.to_string()));
+        if constant_time_hex_eq(&supplied_hash.0, key_hash) {
+            // An absent header hashes to a real digest, never to the target:
+            // the empty string is not a key any minting path can produce.
+            AuthOutcome::Authorized
+        } else {
+            AuthOutcome::Unauthorized
         }
     }
 
@@ -627,6 +667,27 @@ impl AuthEngine {
 /// 64 hex zeros.
 const SENTINEL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The command that mints an API-mode key, named in the refusal a daemon
+/// raises when it finds no hash on disk.
+const API_KEY_REFRESH_HINT: &str = "awman api start --refresh-key";
+
+/// Constant-time comparison of two hex digests.
+///
+/// Both are 64 hex characters from SHA-256 in every real call; the buffers are
+/// padded to a common length anyway, so a caller that ever passes something
+/// shorter compares in constant time rather than returning early on length.
+fn constant_time_hex_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let len = a.len().max(b.len());
+    let mut a_buf = vec![0u8; len];
+    let mut b_buf = vec![0u8; len];
+    a_buf[..a.len()].copy_from_slice(a);
+    b_buf[..b.len()].copy_from_slice(b);
+    bool::from(a_buf.ct_eq(&b_buf))
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -664,6 +725,114 @@ mod tests {
 
     fn engine_with(home: &Path, api_root: &Path) -> AuthEngine {
         AuthEngine::with_paths(AuthPathResolver::at_home(home), ApiPaths::at_root(api_root))
+    }
+
+    // ── verify_bearer / request_auth_mode ────────────────────────────────────
+
+    fn enabled_for(key: &str) -> (AuthEngine, AuthMode) {
+        let tmp = tempfile::tempdir().expect("scratch");
+        let head = tmp.path().join("h");
+        std::fs::create_dir_all(&head).expect("api root");
+        let engine = engine_with(tmp.path(), &head);
+        let mode = AuthMode::Enabled {
+            key_hash: engine.hash_api_key(&ApiKey::from_string(key)).0,
+        };
+        std::mem::forget(tmp);
+        (engine, mode)
+    }
+
+    #[test]
+    fn verify_bearer_accepts_the_key_with_or_without_the_prefix() {
+        let (engine, mode) = enabled_for("s3cret");
+        for header in ["Bearer s3cret", "bearer s3cret", "BEARER s3cret", "s3cret"] {
+            assert_eq!(
+                engine.verify_bearer(&mode, Some(header)),
+                AuthOutcome::Authorized,
+                "{header:?} presents the right key"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_bearer_rejects_a_wrong_key() {
+        let (engine, mode) = enabled_for("s3cret");
+        assert_eq!(
+            engine.verify_bearer(&mode, Some("Bearer wrong")),
+            AuthOutcome::Unauthorized
+        );
+    }
+
+    /// The timing-shape property, mirroring `verify_with_no_hash_rejects_
+    /// constant_time`: an absent header takes the same path as a wrong key —
+    /// hash, then constant-time compare — rather than returning early. A
+    /// short-circuit here would let a caller distinguish "this daemon wants a
+    /// key" from "this key is wrong" by timing alone.
+    #[test]
+    fn verify_bearer_with_no_header_still_hashes_and_compares() {
+        let (engine, mode) = enabled_for("s3cret");
+        assert_eq!(
+            engine.verify_bearer(&mode, None),
+            AuthOutcome::Unauthorized,
+            "an absent header is unauthorized, not a separate outcome"
+        );
+        // The empty string is a real input to the same digest, and no minting
+        // path can produce a key that hashes to the empty string's digest.
+        assert_ne!(
+            engine.hash_api_key(&ApiKey::from_string("")).0,
+            engine.hash_api_key(&ApiKey::from_string("s3cret")).0
+        );
+    }
+
+    #[test]
+    fn verify_bearer_reports_disabled_without_comparing() {
+        let (engine, _) = enabled_for("s3cret");
+        assert_eq!(
+            engine.verify_bearer(&AuthMode::Disabled, None),
+            AuthOutcome::Disabled
+        );
+        assert_eq!(
+            engine.verify_bearer(&AuthMode::Disabled, Some("Bearer anything")),
+            AuthOutcome::Disabled
+        );
+    }
+
+    #[test]
+    fn request_auth_mode_skips_and_refuses_a_missing_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let head = tmp.path().join("h");
+        let engine = engine_with(tmp.path(), &head);
+
+        assert!(matches!(
+            engine.request_auth_mode(true).unwrap(),
+            AuthMode::Disabled
+        ));
+
+        let error = engine
+            .request_auth_mode(false)
+            .expect_err("no hash on disk must refuse rather than serve open");
+        let message = error.to_string();
+        assert!(
+            message.contains("awman api start --refresh-key"),
+            "the refusal must name the command that mints a key; got {message}"
+        );
+    }
+
+    #[test]
+    fn request_auth_mode_reads_the_hash_that_was_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let head = tmp.path().join("h");
+        std::fs::create_dir_all(&head).unwrap();
+        let engine = engine_with(tmp.path(), &head);
+        let key = engine.generate_api_key().unwrap();
+        engine
+            .write_api_key_hash(&engine.hash_api_key(&key))
+            .unwrap();
+
+        let mode = engine.request_auth_mode(false).unwrap();
+        assert_eq!(
+            engine.verify_bearer(&mode, Some(&format!("Bearer {}", key.as_str()))),
+            AuthOutcome::Authorized
+        );
     }
 
     #[test]

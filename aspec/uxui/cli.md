@@ -1,174 +1,152 @@
-# CLI Design
+# CLI & TUI UX Standards
 
 Binary name: `awman`
 Install path: `/usr/local/bin/`
 Storage location: `$HOME/.awman/`
 
-This document is the authoritative specification of the `awman` CLI surface. It is regenerated from `CommandCatalogue` (see `src/command/dispatch/catalogue.rs`); when you change a command, subcommand, flag, or alias, update this file. CI does not block on drift today, but every reviewer should treat divergence between this file and the catalogue as a defect.
+This document is the authoritative specification of `awman`'s interaction
+design: the conventions every command, flag, prompt, and dialog follows,
+across every frontend. It does not enumerate commands or flags — that
+surface is generated from `CommandCatalogue`
+(`src/command/dispatch/catalogue.rs`) into `docs/14-command-reference.md`,
+which can never drift from the code because it is the code, rendered.
+Anything below applies to the whole surface; nothing below names a specific
+command or flag.
 
 ## Design principles
 
-- **Single binary, two modes.** `awman` with no arguments launches a Ratatui TUI. `awman <subcommand> …` runs a single command and exits, with output on stdout/stderr.
-- **Catalogue-driven.** Every flag, subcommand, and default lives in `CommandCatalogue`. Frontends read from the catalogue rather than hard-coding strings.
-- **Non-interactive by default for scripts.** Flags like `--non-interactive` and `--json` are first-class for API and CI use. `--json` always implies `--non-interactive`.
-- **Container isolation.** Every agentic operation runs inside a Docker (or Apple Containers) container built from `Dockerfile.dev`. The host never executes agent code directly.
+- **Single binary, two modes.** `awman` with no arguments launches a
+  Ratatui TUI. `awman <subcommand> …` runs one command and exits, with
+  output on stdout/stderr.
+- **Catalogue-driven.** Every command, subcommand, flag, default, and
+  argument lives in `CommandCatalogue`. Frontends (CLI, TUI, API) project
+  from it; none of them hard-codes a command name, flag name, or default —
+  see the module-level doc on `src/command/dispatch/projections/`. A
+  convention that can't be expressed as catalogue data (a flag's kind,
+  default, `implies`/`conflicts_with`, or frontend visibility) doesn't
+  belong in a frontend either; it belongs in a new catalogue field.
+- **Container isolation.** Every agentic operation runs inside a container
+  built from `Dockerfile.dev`. The host never executes agent code directly
+  — see `aspec/architecture/security.md`.
 
-## Top-level commands
+## Naming and casing
 
-| Command | Summary |
+- Long flag names are lowercase, kebab-case, and describe the value or
+  toggle, not the implementation (`--skip-verification`, not `--no-tls-chk`).
+- A single-character short alias is reserved for flags common enough to
+  type constantly (non-interactive mode, skip-confirmation, follow-logs).
+  A short alias is never reused for a different meaning on a different
+  command.
+- A boolean flag is presence-only: `--foo` sets it, its absence doesn't;
+  there is no `--foo=true`/`--foo=false` form.
+- A value that repeats is a repeatable flag (`--foo a --foo b`), never a
+  single flag with a delimited list — delimiters force the frontend to own
+  parsing rules the catalogue can't express as a value kind.
+- An enum-valued flag's accepted values live in the catalogue as data (its
+  `FlagKind::Enum` payload) and are rendered wherever the flag is
+  documented or completed; they are never duplicated as a string in a
+  frontend or in prose here.
+
+## Positional vs. flag
+
+- A required, identifying value (a path, a name, a number the command
+  can't run without) is a positional argument.
+- Everything else — toggles, overrides, output shaping — is a flag, always
+  optional at the catalogue level even when a command's own validation
+  requires it in practice (so the same flag can be optional for one
+  subcommand and required for another without two catalogue entries).
+
+## Cross-cutting flag behavior
+
+- `--json` always implies non-interactive mode: a machine-readable output
+  mode can never block on a prompt. Any flag that changes output shape for
+  scripting implies the same.
+- Non-interactive mode suppresses every prompt. Where a prompt would have
+  supplied a required decision and none was given, the command refuses
+  with a usage error instead of guessing or blocking on stdin.
+- A flag that forces one outcome and thereby makes another flag's request
+  impossible to honor is declared as a conflict (`conflicts_with`) rather
+  than silently overridden; a flag that forces a prerequisite on for
+  correctness is declared as an implication (`implies`) rather than
+  silently required.
+
+## Exit codes
+
+Exit codes are classes of outcome, not per-command codes:
+
+| Exit code | Class |
 |---|---|
-| `awman` | Launch the interactive TUI. |
-| `awman init` | Initialize the current Git repo for use with awman. |
-| `awman ready` | Verify the Docker daemon, ensure `Dockerfile.dev`, build the dev image. |
-| `awman chat` | Freeform chat session with the configured agent. |
-| `awman specs <subcommand>` | Manage work item specs. |
-| `awman new <subcommand>` | Create a new awman artefact (spec, workflow, skill). |
-| `awman exec <subcommand>` | Run a one-shot prompt or workflow. |
-| `awman config <subcommand>` | View and edit global/repo configuration. |
-| `awman status` | Show all running awman containers. |
-| `awman api <subcommand>` | Run awman as an API HTTP server. |
-| `awman squad <subcommand>` | Manage the squad task daemon and scheduled tasks. |
-| `awman remote <subcommand>` | Connect to a remote API instance. |
+| 0 | Success. |
+| 1 | Runtime failure inside a lower layer (engine, data, transport). |
+| 2 | Invalid usage: bad flag value, missing required input, a conflict, or required interactive input unavailable in a non-interactive context. |
+| 3 | Container runtime unavailable. |
+| 4 | A referenced resource (file, work item, template) does not exist. |
+| 130 | Aborted by the user (Esc in the TUI, Ctrl-C on the CLI). |
 
-### Top-level flags (apply before any subcommand)
+A command that introduces a new failure mode maps it to the class it
+belongs to rather than inventing a new code.
 
-| Flag | Kind | Default | Description |
-|---|---|---|---|
-| `--build` | bool | false | Force rebuild of images on startup. |
-| `--no-cache` | bool | false | Disable Docker layer cache during builds. |
-| `--refresh` | bool | false | Refresh agent environment (run audit). |
-| `-h, --help` | bool | — | Print help. |
-| `-V, --version` | bool | — | Print version. |
+## Prompt and dialog conventions
 
-## Per-command surface
+- Every interactive choice shown to the user — a CLI stdin prompt or a TUI
+  modal alike — is described by one `Prompt<D>`-shaped value that Layer 2
+  owns: a title, an optional body, an ordered list of typed choices (each
+  with a key, a label, and a value), and an explicit default returned when
+  the user dismisses the prompt without choosing (or no default, which
+  makes dismissal an abort). A frontend renders that shape — mapping a
+  keystroke or a button to a choice's value — and holds no label, hotkey,
+  or default of its own.
+- A confirmation for a destructive or irreversible action always has a
+  flag that skips it for scripting, and refuses instead of guessing when
+  neither a TTY nor that flag is available.
+- Dismissing a prompt (Esc, or a "No"/"Cancel" choice) never partially
+  applies the action it was confirming.
 
-### `awman init`
+## Hint and help-text style
 
-Initialize the current Git repo for use with awman.
+- A command or flag's help text is one sentence: capitalized start,
+  trailing period, describing the effect, not the implementation.
+- A side effect that isn't obvious from the flag's name — an implied flag,
+  a value it forces, a frontend it's hidden from — is stated inline in
+  that same sentence, not left for the reader to infer from behavior.
+- Long-form help (a second paragraph of context, only where the one-line
+  summary isn't enough) is separate catalogue data from the summary, never
+  a concatenation the frontend builds itself.
 
-| Flag | Kind | Default | Description |
-|---|---|---|---|
-| `--agent <name>` | enum | `claude` | One of: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`. |
-| `--aspec` | bool | false | Download aspec templates into the project. |
+## Command-surface hygiene
 
-### `awman ready`
+- An unrecognized command path is corrected against its actual siblings
+  (not a hardcoded top-level list) within a small edit-distance threshold,
+  and reported as unknown — never silently guessed — outside that
+  threshold. The catalogue owns this lookup so every frontend suggests the
+  same correction from the same source.
+- A retired flag is recognized before parsing and answered with a
+  migration hint, not clap's generic unrecognized-argument error.
 
-| Flag | Kind | Default | Description |
-|---|---|---|---|
-| `--refresh` | bool | false | Run the Dockerfile agent audit. |
-| `--build` | bool | false | Force rebuild of the dev image. |
-| `--no-cache` | bool | false | Pass `--no-cache` to `docker build`. |
-| `-n, --non-interactive` | bool | false | Run the agent in non-interactive (print) mode. |
-| `--allow-docker` | bool | false | Mount the host Docker daemon socket into the agent container. |
-| `--json` | bool | false | Suppress human output and print structured JSON. **Implies `--non-interactive`.** |
+## Frontend visibility and parity
 
-### `awman chat`
+- Three frontend kinds exist: CLI, TUI, and API. A command or flag's
+  visibility across them is catalogue data, not a frontend-side branch —
+  see the visibility field on each catalogue entry and its projection into
+  `docs/14-command-reference.md`.
+- An interactive or PTY-bound command is excluded from the API frontend as
+  long-term policy: an HTTP request cannot safely own a PTY's terminal
+  lifecycle for the duration of the command. This exclusion is expressed
+  once, at the catalogue entry, never re-derived per frontend.
+- Where the same decision is available from more than one frontend, its
+  label, default, and behavior are identical — verified by parity tests
+  that assert against the catalogue and the shared prompt/dialog data, not
+  against a second copy of the literals.
 
-| Flag | Kind | Default | Description |
-|---|---|---|---|
-| `-n, --non-interactive` | bool | false | Non-interactive (print) mode. |
-| `--plan` | bool | false | Plan mode (read-only). |
-| `--allow-docker` | bool | false | Mount the host Docker daemon socket. |
-| `--yolo` | bool | false | Fully autonomous mode. |
-| `--auto` | bool | false | Auto permission mode. |
-| `--agent <name>` | string | — | Override the agent for this run. |
-| `--model <name>` | string | — | Override the model for this run. |
-| `--launch-mode <stdio\|acp>` | enum | `stdio` | Launch the agent over ACP (Agent Client Protocol) instead of raw container stdio. `acp` requires an agent that supports it (currently `cline`). See `docs/17-acp-mode.md`. |
-| `--overlay <spec>` | repeatable string | — | Overlay expression: `dir(host:container[:ro\|rw])`, `ssh()`, `env(VAR_NAME)`, `skill(*)`, or `skill(name)`. To mount `~/.ssh` read-only, pass `--overlay ssh()`. See `docs/08-overlays.md`. |
+## Output and configuration
 
-### `awman specs`
-
-| Subcommand | Arguments | Flags |
-|---|---|---|
-| `amend <work_item>` | `<work_item>` | `-n/--non-interactive`, `--allow-docker` |
-
-### `awman new`
-
-| Subcommand | Arguments | Flags |
-|---|---|---|
-| `spec` | — | `--interview`, `-n/--non-interactive`. |
-| `workflow` | — | `--interview`, `-n/--non-interactive`, `--global`, `--format <toml\|yaml\|md>` (default `toml`). |
-| `skill` | — | `--interview`, `-n/--non-interactive`, `--global`. |
-
-### `awman exec`
-
-| Subcommand | Arguments | Flags |
-|---|---|---|
-| `prompt <prompt>` | `<prompt>` | `-n/--non-interactive`, `--plan`, `--allow-docker`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). |
-| `workflow <path>` (alias `wf`) | `<path>` | `--work-item <num>`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--worktree`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). `--yolo`/`--auto` imply `--worktree`. ACP is not yet driven for workflow steps; a step that resolves to `acp` is rejected pre-flight (see `docs/17-acp-mode.md`). |
-
-`--overlay` accepts the same typed overlay expressions everywhere (CLI flags, `AWMAN_OVERLAYS`, repo/global config `overlays` array, and per-step `overlays` in workflow files): `dir(host:container[:ro|rw])`, `ssh()` (shorthand for `~/.ssh` read-only), `env(VAR_NAME)`, `skill(*)`, `skill(name)`. The legacy `--mount-ssh` flag has been removed; pass `--overlay ssh()` instead. See `docs/08-overlays.md` for the full reference.
-
-### `awman config`
-
-| Subcommand | Arguments | Flags |
-|---|---|---|
-| `show` | — | — |
-| `get <field>` | `<field>` | — |
-| `set <field> <value>` | `<field>`, `<value>` | `--global` (repo scope by default). |
-
-### `awman status`
-
-| Flag | Description |
-|---|---|
-| `--watch` | Continuously refresh every 3 seconds. The CLI emits `\x1b[H\x1b[J` clear sequences; the TUI swallows them. |
-
-### `awman api`
-
-| Subcommand | Flags |
-|---|---|
-| `start` | `--port <n>` (default `9876`), `--workdirs <path>` (repeatable), `--background`, `--refresh-key`, `--dangerously-skip-auth`, `--dangerously-skip-tls`. |
-| `kill` | — |
-| `logs` | — |
-| `status` | — |
-
-### `awman squad`
-
-Manage the squad task daemon and scheduled tasks. The parent flags
-belong to `awman squad` itself; pass them before a subcommand when using one:
-
-| Flag | Kind | Default | Description |
-|---|---|---|---|
-| `-n, --non-interactive` | bool | false | Print the squad status summary instead of opening the TUI. |
-| `--json` | bool | false | Emit JSON output. **Implies `--non-interactive`.** |
-
-| Subcommand | Arguments | Flags |
-|---|---|---|
-| _(bare)_ `awman squad` | — | Inherits the parent flags above. With a TTY and neither `-n` nor `--json`, opens the singleton squad TUI tab; with `-n`/`--non-interactive` or `--json`, prints the daemon status summary instead. |
-| `start` | — | `--port <n>` (u16, default `0`; `0` selects an OS-assigned port), `--background` (bool, default `false`), `--refresh-key` (bool, default `false`), `--dangerously-skip-auth` (bool, default `false`). On the first start — and with `--refresh-key` — a bearer key is minted and printed once as a shell-export snippet for `AWMAN_SQUAD_KEY`, tailored to the user's `SHELL`. `--dangerously-skip-auth` mints no key, writes no hash, warns that auth is off, and is acceptable only because the daemon binds `127.0.0.1` exclusively. |
-| `stop` (alias `kill`) | — | — |
-| `status` | — | `--json` (bool, default `false`). |
-| `logs` | — | `-f, --follow` (bool, default `false`). |
-| `add` | — | `--name <string>` (required; no default), `--description <string>` (required; no default), `--repo <path>` (default `—`; legacy synonym for `--workspace <path>`, ignored when `--workspace` is given), `--interval <string>` (default `6h`), `--agent <string>` (default `—`), `--model <string>` (default `—`), `--workspace <default\|path>` (no catalogue default; absent falls back to `--repo`, then to `default`), `--overlay <spec>` (repeatable, default empty; `dir()`/`ssh()`/`env()`/`skill()` syntax, syntax-validated at creation), `--mount-scope <cwd\|gitroot>` (default `gitroot`; only meaningful for a custom workspace that is a git repository), `--interview` (bool, default `false`), `-n, --non-interactive` (bool, default `false`; never prompt — refuses a confirmation instead of asking. Conflicts with `--interview`). |
-| `list` | — | `--json` (bool, default `false`). |
-| `show <name>` | `<name>` (required string) | `--json` (bool, default `false`). |
-| `remove <name>` | `<name>` (required string) | `-y, --yes` (bool, default `false`). |
-| `pause <name>` | `<name>` (required string) | — |
-| `resume <name>` | `<name>` (required string) | — |
-| `attach <name>` | `<name>` (required string) | `--container <string>` (default `—`; running container ID when multiple are active). |
-| `env` | — | `--push` (bool, default `false`), `--clear` (bool, default `false`), `--json` (bool, default `false`). Reports every environment variable the daemon needs, whether it holds a value, where that value came from (`this shell` / `pushed` / `keychain`) and how long any missing one has been missing. **Values are never printed** — only whether one is present — and the leaf is not API-allowed, so it can never be driven through `/v1/commands`. `--push` re-sends every value this shell has regardless of whether it differs (the ordinary check sends only what changed); `--clear` removes the daemon's persisted keychain item without disturbing the values a running daemon already holds. |
-
-**Task workspaces.** `--workspace default` (the default) binds the task to a durable `~/.awman/squad/tasks/<name>/workspace/` directory that is created once and never deleted, emptied, or replaced until the task is removed. Any other value binds the task to that folder or repository: the path must already exist (it is never created), and if it is not the root of a git repository the interview warns and offers to keep it or choose another. Whether a task's runs are worktree-isolated is decided once, at creation, from whether its effective root **is** a git repository root — a root-bound task always uses a worktree, and every other workspace (the default one, a plain directory, or a subdirectory of a repository) never does and is mounted exactly as given, so a run is never widened to an enclosing repository. Either way the durable per-task workspace is created and mounted into the task's containers at the `context(workflow)` path. A custom path that is a parent of the caller's current directory goes through the same parent-directory mount confirmation every other awman mount-scope flow applies — from `--workspace` as well as from the interview, and refused outright under `-n`. A plain-directory workspace has no repository to resolve agent images from, so on first run squad writes `Dockerfile.dev` and `.awman/Dockerfile.<agent>` into it from the bundled `awman init` templates, create-if-missing only.
-
-### `awman remote`
-
-| Subcommand | Arguments | Flags |
-|---|---|---|
-| `run <command…>` | trailing varargs forwarded verbatim | `--remote-addr <url>`, `--session <id>`, `-f/--follow`, `--api-key <key>`. |
-| `session start <dir>` | `<dir>` | — |
-| `session kill <session_id>` | `<session_id>` | — |
-
-## Inputs and outputs
-
-- The TUI takes over the terminal via Ratatui; ANSI escapes are forwarded to the agent's PTY.
-- CLI commands write human-readable output to stdout and diagnostics to stderr.
-- `--json` flips the renderer to a structured-JSON serializer.
-- Containers launched by awman plumb the developer's stdin/stdout/stderr through the chosen runtime so the agent runs interactively inside the TUI.
-
-## Configuration
-
-- Per-repo config: `<git-root>/.awman/config.json`.
-- Global config: `$HOME/.awman/config.json`.
-- Environment overrides: `AWMAN_*` variables (notably `AWMAN_OVERLAYS`, `AWMAN_API_KEY`, `AWMAN_SQUAD_KEY`, `AWMAN_API_ROOT`).
-
-Precedence (highest to lowest): CLI flag → environment variable → repo config → global config → built-in default.
+- Human-readable output goes to stdout, diagnostics to stderr. A
+  machine-readable output mode replaces the human renderer entirely rather
+  than appending structured data alongside it.
+- The TUI takes over the terminal via Ratatui; a container's own PTY
+  output is forwarded through it, ANSI escapes and all.
+- Configuration resolves in one order, highest precedence first: an
+  explicit flag, then an environment override, then repo-scoped config,
+  then global config, then the catalogue's built-in default. A command
+  never reads configuration through a path that skips a level of this
+  order.

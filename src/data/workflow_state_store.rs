@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::error::DataError;
-use crate::data::fs::workflow_state::{sanitize_name_for_filename, sha256_hex};
+use crate::data::fs::hash::{sanitize_name_for_filename, sha256_hex};
 use crate::data::session::Session;
 use crate::data::workflow_state::WorkflowState;
 

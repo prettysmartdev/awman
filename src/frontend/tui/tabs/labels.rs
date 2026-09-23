@@ -30,7 +30,7 @@ impl Tab {
     /// Yolo countdown label for background tabs: alternates emoji + countdown.
     /// Returns `None` when no yolo countdown is active.
     pub fn background_yolo_label(&self, tab_width: u16) -> Option<String> {
-        let state = self.yolo_state.lock().ok()?.as_ref()?.clone();
+        let state = self.shared.yolo_state.lock().ok()?.as_ref()?.clone();
         let label = if state.remaining_secs % 2 == 0 {
             format!("\u{26a0}\u{fe0f}  yolo in {}", state.remaining_secs)
         } else {
@@ -88,7 +88,7 @@ impl Tab {
     /// Build a workflow step suffix like "implement (2/5)" for the tab label.
     /// Returns empty string when no workflow is active or has no steps.
     fn workflow_step_suffix(&self) -> String {
-        let guard = match self.workflow_state.lock() {
+        let guard = match self.shared.workflow_state.lock() {
             Ok(g) => g,
             Err(_) => return String::new(),
         };
@@ -97,11 +97,15 @@ impl Tab {
             _ => return String::new(),
         };
         let total = view.steps.len();
-        let done_count = view.steps.iter().filter(|s| s.status == "done").count();
+        let done_count = view
+            .steps
+            .iter()
+            .filter(|s| s.status == StepViewStatus::Done)
+            .count();
         let current_name = view.current_step.as_deref().unwrap_or_else(|| {
             view.steps
                 .iter()
-                .find(|s| s.status == "running")
+                .find(|s| s.status == StepViewStatus::Running)
                 .map(|s| s.name.as_str())
                 .unwrap_or("")
         });

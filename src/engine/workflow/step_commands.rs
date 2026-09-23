@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::data::workflow_definition::{CloneConflictMode, SetupStep, TeardownStep};
 use crate::data::workflow_prompt_template::{extract_section, substitute_prompt, WorkItemContext};
+use crate::data::workflow_state::PhaseKind;
 
 /// Quote `s` as a single POSIX shell word so embedded whitespace, quotes, and
 /// metacharacters cannot break out of the argument. Workflow files are
@@ -311,6 +312,98 @@ pub fn substitute_teardown_step(
     }
 }
 
+/// The slice of a shell-phase step that `WorkflowEngine::run_phase` needs.
+///
+/// `SetupStep` and `TeardownStep` stay distinct types — they accept different
+/// actions — but the phase runner treats them identically, so before F-34 the
+/// engine carried two near-identical copies of every phase function. This
+/// trait is what lets one `run_phase` drive both.
+pub trait PhaseStepSpec: Sized {
+    /// Which phase steps of this type belong to. `run_phase` asserts (in
+    /// debug builds) that its `kind` argument agrees.
+    fn kind() -> PhaseKind;
+
+    /// Apply work-item template substitution to every string field.
+    fn substitute(&self, ctx: Option<&WorkItemContext>) -> Self;
+
+    /// One-line human description, used for state, logs and frontend events.
+    fn description(&self) -> String;
+
+    /// The shell command and per-step env overrides this step runs as.
+    /// Never called for a step whose [`PhaseStepSpec::poll_ci`] is `Some`.
+    fn to_shell(&self) -> (String, Option<HashMap<String, String>>);
+
+    /// `Some((interval_secs, max_retries))` when the step is a native CI poll
+    /// the engine runs itself rather than a command in a container.
+    fn poll_ci(&self) -> Option<(u32, u32)>;
+}
+
+impl PhaseStepSpec for SetupStep {
+    fn kind() -> PhaseKind {
+        PhaseKind::Setup
+    }
+
+    fn substitute(&self, ctx: Option<&WorkItemContext>) -> Self {
+        substitute_setup_step(self, ctx)
+    }
+
+    fn description(&self) -> String {
+        setup_step_description(self)
+    }
+
+    fn to_shell(&self) -> (String, Option<HashMap<String, String>>) {
+        setup_step_to_shell(self)
+    }
+
+    fn poll_ci(&self) -> Option<(u32, u32)> {
+        match self {
+            SetupStep::PollCi {
+                interval_secs,
+                max_retries,
+            } => Some((
+                interval_secs.unwrap_or(DEFAULT_POLL_CI_INTERVAL_SECS),
+                max_retries.unwrap_or(DEFAULT_POLL_CI_MAX_RETRIES),
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl PhaseStepSpec for TeardownStep {
+    fn kind() -> PhaseKind {
+        PhaseKind::Teardown
+    }
+
+    fn substitute(&self, ctx: Option<&WorkItemContext>) -> Self {
+        substitute_teardown_step(self, ctx)
+    }
+
+    fn description(&self) -> String {
+        teardown_step_description(self)
+    }
+
+    fn to_shell(&self) -> (String, Option<HashMap<String, String>>) {
+        teardown_step_to_shell(self)
+    }
+
+    fn poll_ci(&self) -> Option<(u32, u32)> {
+        match self {
+            TeardownStep::PollCi {
+                interval_secs,
+                max_retries,
+            } => Some((
+                interval_secs.unwrap_or(DEFAULT_POLL_CI_INTERVAL_SECS),
+                max_retries.unwrap_or(DEFAULT_POLL_CI_MAX_RETRIES),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Defaults for a `poll_ci` step that names neither value. Unchanged from the
+/// per-phase copies these replace.
+const DEFAULT_POLL_CI_INTERVAL_SECS: u32 = 30;
+const DEFAULT_POLL_CI_MAX_RETRIES: u32 = 10;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,10 +9,6 @@ use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
 impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
-    fn set_pty_active(&mut self, active: bool) {
-        self.pty_active = active;
-    }
-
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.messages.info(format!(
             "Workflow: {} completed, {} failed",

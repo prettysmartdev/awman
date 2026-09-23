@@ -20,7 +20,7 @@ use awman::data::fs::{
     ApiPaths, AuthPathResolver, DataPaths, MountScope, TaskStore, TaskWorkspace,
 };
 use awman::data::session::{AgentHandle, Session};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::agent_runtime::execution::AgentInstance;
 use awman::engine::agent_runtime::{
@@ -38,6 +38,33 @@ use awman::engine::squad::{EvaluationOutcome, EvaluationRequest, TaskEvaluator};
 struct FakeSandboxRuntime;
 
 impl AgentRuntimeEngine for FakeSandboxRuntime {
+    fn ready_agent(
+        &self,
+        _agent: &str,
+        _opts: awman::engine::agent_runtime::ReadyAgentOptions,
+        _sink: &mut dyn awman::data::message::UserMessageSink,
+    ) -> Result<(), awman::engine::error::EngineError> {
+        Ok(())
+    }
+    fn image_exists(&self, _tag: &str) -> Result<bool, awman::engine::error::EngineError> {
+        Ok(true)
+    }
+    fn image_home_dir(
+        &self,
+        _tag: &str,
+    ) -> Result<Option<String>, awman::engine::error::EngineError> {
+        Ok(None)
+    }
+    fn build_image(
+        &self,
+        _tag: &str,
+        _dockerfile: &std::path::Path,
+        _context: &std::path::Path,
+        _no_cache: bool,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), awman::engine::error::EngineError> {
+        Ok(())
+    }
     fn runtime_name(&self) -> &'static str {
         "docker-sbx-experimental"
     }
@@ -55,6 +82,7 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
             dind: DindSupport::Always,
             host_paths_visible: false,
             session_label_supported: false,
+            has_image_store: false,
         };
         &CAPS
     }
@@ -115,9 +143,10 @@ fn engines_with(
     let api_paths = ApiPaths::from_root(root);
     let auth_paths = AuthPathResolver::at_home(root);
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
-    let agent_engine_runtime = container_runtime
-        .clone()
-        .unwrap_or_else(|| Arc::new(ContainerRuntime::docker()));
+    // The agent engine holds the runtime under test, matching
+    // `Engines::from_detected`: it branches on `capabilities()`, so a Docker
+    // stand-in here would resolve the wrong paradigm's options.
+    let agent_engine_runtime = runtime.clone();
     Engines {
         runtime,
         container_runtime,
@@ -126,7 +155,9 @@ fn engines_with(
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, agent_engine_runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 

@@ -10,7 +10,7 @@ use awman::data::fs::{
     AuthPathResolver, DataPaths, MountScope, RunDetail, RunStatus, Task, TaskStatus, TaskStore,
     TaskWorkspace,
 };
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -55,7 +55,9 @@ fn test_engines(root: &std::path::Path) -> Engines {
         overlay_engine: overlay,
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
         agent_engine: agent,
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(root)),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(root)),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     }
 }
 

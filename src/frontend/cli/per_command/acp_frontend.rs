@@ -42,7 +42,7 @@ impl AcpFrontend for CliFrontend {
 
     fn request_permission(&mut self, request: PermissionRequest) -> PermissionDecision {
         if self.non_interactive {
-            return PermissionDecision::approve(&request.options);
+            return self.headless.acp_permission(&request.options);
         }
         println!(
             "{}",

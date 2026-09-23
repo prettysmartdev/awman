@@ -1,17 +1,16 @@
 //! Integration tests for on_failure step remediation and poll_ci phase steps
 //! (WI 0085).
 //!
-//! These tests exercise `WorkflowEngine::run_setup` and `run_teardown` through
+//! These tests exercise `WorkflowEngine::run_phase` for both phases through
 //! the full engine stack with mock containers — no Docker daemon required.
 
 use std::sync::{Arc, Mutex};
 
 use awman::data::session::Session;
-use awman::data::session::{SessionOpenOptions, StaticGitRootResolver};
 use awman::data::workflow_definition::{
     RemediationConfig, SetupStep, TeardownStep, Workflow, WorkflowStep,
 };
-use awman::data::workflow_state::PhaseStepStatus;
+use awman::data::workflow_state::{PhaseKind, PhaseStepStatus};
 use awman::engine::agent_runtime::background::{AgentExec, ExecOutput};
 use awman::engine::error::EngineError;
 use awman::engine::workflow::actions::{
@@ -19,21 +18,11 @@ use awman::engine::workflow::actions::{
     YoloTickOutcome,
 };
 use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
-use awman::engine::workflow::{Frontend, WorkflowEngine};
+use awman::engine::workflow::{Frontend, WorkflowEngine, WorkflowEngineDeps, WorkflowSpec};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 // ── Test infrastructure ────────────────────────────────────────────────────────
-
-fn make_session(tmp: &tempfile::TempDir) -> Session {
-    let resolver = StaticGitRootResolver::new(tmp.path());
-    Session::open(
-        tmp.path().to_path_buf(),
-        &resolver,
-        SessionOpenOptions::default(),
-    )
-    .unwrap()
-}
 
 fn minimal_workflow() -> Workflow {
     Workflow {
@@ -194,10 +183,11 @@ fn make_engine(
 ) -> WorkflowEngine {
     WorkflowEngine::new(
         session,
-        minimal_workflow(),
-        None,
-        Box::new(frontend),
-        Box::new(factory),
+        WorkflowSpec::new(minimal_workflow()).with_work_item_context(None),
+        WorkflowEngineDeps {
+            frontend: Box::new(frontend),
+            agent_factory: Box::new(factory),
+        },
     )
     .unwrap()
 }
@@ -244,7 +234,7 @@ async fn integration_run_shell_on_failure_retry_succeeds() {
 
     tokio::task::spawn_blocking(move || {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let frontend = RecordingFrontend {
             messages: Arc::clone(&msg_store_clone),
         };
@@ -261,7 +251,8 @@ async fn integration_run_shell_on_failure_retry_succeeds() {
         ]));
         let on_failure_configs = vec![Some(remediation(2))];
 
-        let result = engine.run_setup(
+        let result = engine.run_phase(
+            PhaseKind::Setup,
             &steps,
             &[false],
             &on_failure_configs,
@@ -310,7 +301,7 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
 
     tokio::task::spawn_blocking(move || {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let frontend = RecordingFrontend {
             messages: Arc::clone(&msg_store_clone),
         };
@@ -330,7 +321,8 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
         let on_failure_configs = vec![Some(remediation(2))];
 
         engine
-            .run_setup(
+            .run_phase(
+                PhaseKind::Setup,
                 &steps,
                 &[false],
                 &on_failure_configs,
@@ -373,7 +365,7 @@ async fn integration_run_shell_on_failure_exhausts_all_attempts() {
 async fn integration_teardown_on_failure_retry_succeeds_remaining_steps_run() {
     tokio::task::spawn_blocking(|| {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let (frontend, _msgs) = RecordingFrontend::new();
         let factory = FinishedFactory::always_success();
         let mut engine = make_engine(&session, factory, frontend);
@@ -396,20 +388,22 @@ async fn integration_teardown_on_failure_retry_succeeds_remaining_steps_run() {
         ]));
         let on_failure_configs = vec![Some(remediation(1)), None];
 
-        let (aborted, any_failed) = engine
-            .run_teardown(
+        let outcome = engine
+            .run_phase(
+                PhaseKind::Teardown,
                 &steps,
                 &[false, false],
                 &on_failure_configs,
-                true,
-                false,
                 make_mock_factory(Arc::clone(&mock)),
             )
             .unwrap();
 
-        assert!(!aborted, "teardown must not abort when retry succeeds");
         assert!(
-            !any_failed,
+            !outcome.aborted,
+            "teardown must not abort when retry succeeds"
+        );
+        assert!(
+            !outcome.any_failed,
             "any_failed must be false when all retries succeed"
         );
         assert_eq!(
@@ -431,7 +425,7 @@ async fn integration_teardown_on_failure_retry_succeeds_remaining_steps_run() {
 async fn integration_teardown_on_failure_exhausted_best_effort_continues() {
     tokio::task::spawn_blocking(|| {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let (frontend, _msgs) = RecordingFrontend::new();
         let factory = FinishedFactory::always_success();
         let mut engine = make_engine(&session, factory, frontend);
@@ -453,20 +447,19 @@ async fn integration_teardown_on_failure_exhausted_best_effort_continues() {
         ]));
         let on_failure_configs = vec![Some(remediation(1)), None];
 
-        let (aborted, any_failed) = engine
-            .run_teardown(
+        let outcome = engine
+            .run_phase(
+                PhaseKind::Teardown,
                 &steps,
                 &[false, false],
                 &on_failure_configs,
-                true,
-                false,
                 make_mock_factory(Arc::clone(&mock)),
             )
             .unwrap();
 
-        assert!(!aborted, "teardown must not abort (best-effort)");
+        assert!(!outcome.aborted, "teardown must not abort (best-effort)");
         assert!(
-            any_failed,
+            outcome.any_failed,
             "any_failed must be true when a step exhausts remediation"
         );
         assert!(
@@ -494,7 +487,7 @@ async fn integration_teardown_on_failure_exhausted_best_effort_continues() {
 async fn integration_poll_ci_setup_step_fails_when_not_a_git_repo() {
     tokio::task::spawn_blocking(|| {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         // The session's git_root is `tmp.path()` which is NOT a git repo,
         // so `detect_branch` → `git rev-parse` will fail.
         let (frontend, _msgs) = RecordingFrontend::new();
@@ -510,8 +503,8 @@ async fn integration_poll_ci_setup_step_fails_when_not_a_git_repo() {
             Err(EngineError::Other("should not be called for PollCi".into()))
         };
 
-        // run_setup continues past non-aborting failures.
-        let result = engine.run_setup(&steps, &[false], &[], empty_factory);
+        // run_phase continues past non-aborting failures.
+        let result = engine.run_phase(PhaseKind::Setup, &steps, &[false], &[], empty_factory);
         assert!(
             result.is_ok(),
             "non-aborting PollCi failure must not bubble: {result:?}"
@@ -543,7 +536,7 @@ async fn integration_poll_ci_teardown_with_on_failure_exhausts_and_continues() {
 
     tokio::task::spawn_blocking(move || {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let frontend = RecordingFrontend {
             messages: Arc::clone(&msg_store_clone),
         };
@@ -563,19 +556,21 @@ async fn integration_poll_ci_teardown_with_on_failure_exhausts_and_continues() {
         let mock = Arc::new(MockAgentExec::always_success()); // for the RunShell step only
         let on_failure_configs = vec![Some(remediation(1)), None];
 
-        let (aborted, any_failed) = engine
-            .run_teardown(
+        let outcome = engine
+            .run_phase(
+                PhaseKind::Teardown,
                 &steps,
                 &[false, false],
                 &on_failure_configs,
-                true,
-                false,
                 make_mock_factory(Arc::clone(&mock)),
             )
             .unwrap();
 
-        assert!(!aborted, "teardown must not abort (best-effort)");
-        assert!(any_failed, "any_failed must be true when poll_ci fails");
+        assert!(!outcome.aborted, "teardown must not abort (best-effort)");
+        assert!(
+            outcome.any_failed,
+            "any_failed must be true when poll_ci fails"
+        );
         assert!(
             matches!(
                 engine.state().teardown_step_states[0].status,
@@ -612,7 +607,7 @@ async fn integration_poll_ci_emits_polling_attempt_message_before_error() {
 
     tokio::task::spawn_blocking(move || {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let frontend = RecordingFrontend {
             messages: Arc::clone(&msg_store_clone),
         };
@@ -627,7 +622,7 @@ async fn integration_poll_ci_emits_polling_attempt_message_before_error() {
             Err(EngineError::Other("unreachable".into()))
         };
         engine
-            .run_setup(&steps, &[false], &[], empty_factory)
+            .run_phase(PhaseKind::Setup, &steps, &[false], &[], empty_factory)
             .unwrap();
     })
     .await
@@ -693,15 +688,16 @@ command = "cargo test"
     // Now exercise the workflow through the engine.
     tokio::task::spawn_blocking(move || {
         let tmp = tempfile::tempdir().unwrap();
-        let session = make_session(&tmp);
+        let session = crate::helpers::session_at(tmp.path());
         let (frontend, _msgs) = RecordingFrontend::new();
         let factory = FinishedFactory::always_success();
         let mut engine = WorkflowEngine::new(
             &session,
-            wf.clone(),
-            None,
-            Box::new(frontend),
-            Box::new(factory),
+            WorkflowSpec::new(wf.clone()).with_work_item_context(None),
+            WorkflowEngineDeps {
+                frontend: Box::new(frontend),
+                agent_factory: Box::new(factory),
+            },
         )
         .unwrap();
 
@@ -718,7 +714,8 @@ command = "cargo test"
             ("".into(), "".into(), 0),
         ]));
 
-        let result = engine.run_setup(
+        let result = engine.run_phase(
+            PhaseKind::Setup,
             &setup_steps,
             &setup_abort_flags,
             &setup_on_failure,

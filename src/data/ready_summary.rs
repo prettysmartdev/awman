@@ -44,4 +44,66 @@ impl ReadySummary {
             non_default_agent_images: Vec::new(),
         }
     }
+
+    /// The summary's rows, in display order, as `(label, status)`.
+    ///
+    /// One list for every frontend. Before WI 0114 F-23 the CLI, the TUI and
+    /// `remote session start` each assembled their own: the CLI omitted the
+    /// aspec and work-items rows entirely, the TUI called them "aspec folder"
+    /// and "Config", and the remote renderer called them "aspec/" and "Work
+    /// items config" and added an "Image rebuild" row the other two did not
+    /// have. Three tables for one summary is the mode drift the architecture
+    /// exists to prevent.
+    ///
+    /// The credential rows are classified here too. Turning an
+    /// [`AgentCredentialHealth`] into a status and a label is a reading of
+    /// the data, not a rendering choice, and both frontends had a
+    /// byte-identical copy of it.
+    pub fn rows(&self) -> Vec<(String, StepStatus)> {
+        let mut rows: Vec<(String, StepStatus)> = vec![
+            ("Dockerfile".to_string(), self.dockerfile.clone()),
+            ("Base image".to_string(), self.base_image.clone()),
+            ("Agent image".to_string(), self.agent_image.clone()),
+            ("Local agent".to_string(), self.local_agent.clone()),
+            ("Audit".to_string(), self.audit.clone()),
+            ("Image rebuild".to_string(), self.image_rebuild.clone()),
+            ("aspec folder".to_string(), self.aspec_folder.clone()),
+            (
+                "Work items config".to_string(),
+                self.work_items_config.clone(),
+            ),
+        ];
+        // The ready engine reports a single consolidated entry — either
+        // "Other agents" (all OK) or "Missing images" (warn) — and its label
+        // is rendered verbatim.
+        for (label, status) in &self.non_default_agent_images {
+            rows.push((label.clone(), status.clone()));
+        }
+        for health in &self.agent_credentials {
+            rows.push(health.row());
+        }
+        rows
+    }
+}
+
+impl AgentCredentialHealth {
+    /// This credential's summary row: `(label, status)`.
+    pub fn row(&self) -> (String, StepStatus) {
+        let status = if let Some(error) = &self.read_error {
+            StepStatus::Warn(format!("credential unreadable: {error}"))
+        } else if self.expired {
+            StepStatus::Warn("credential expired".to_string())
+        } else if self.expires_in_secs.is_some() {
+            StepStatus::Done
+        } else {
+            StepStatus::Warn("credential expiry unknown".to_string())
+        };
+        let label = match self.expires_in_secs {
+            Some(secs) if !self.expired && self.read_error.is_none() => {
+                format!("Credential {} ({secs}s remaining)", self.agent)
+            }
+            _ => format!("Credential {}", self.agent),
+        };
+        (label, status)
+    }
 }

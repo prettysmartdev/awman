@@ -67,6 +67,50 @@ pub struct PhaseStepState {
     pub status: PhaseStepStatus,
 }
 
+/// Which of the two shell phases a step belongs to.
+///
+/// Setup and teardown run through the same engine code path
+/// (`WorkflowEngine::run_phase`); this is the one value that tells the two
+/// apart, replacing the `is_setup: bool` flags and `phase: &str` strings that
+/// used to thread through it (F-34).
+///
+/// The on-disk `WorkflowState` shape is unchanged: the two step-state vectors
+/// stay as they are, and `PhaseKind` selects between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseKind {
+    Setup,
+    Teardown,
+}
+
+impl PhaseKind {
+    /// The phase's wire and log name. This is the string the API's
+    /// `StatusMessage.phase` field carries, so it must stay `"setup"` /
+    /// `"teardown"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            PhaseKind::Setup => "setup",
+            PhaseKind::Teardown => "teardown",
+        }
+    }
+
+    /// The `WorkflowPhase` the engine sits in while this phase runs.
+    pub fn workflow_phase(self) -> WorkflowPhase {
+        match self {
+            PhaseKind::Setup => WorkflowPhase::Setup,
+            PhaseKind::Teardown => WorkflowPhase::Teardown,
+        }
+    }
+
+    /// The `WorkflowPhase` the engine moves to once this phase completes.
+    pub fn next_workflow_phase(self) -> WorkflowPhase {
+        match self {
+            PhaseKind::Setup => WorkflowPhase::Main,
+            PhaseKind::Teardown => WorkflowPhase::Done,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
     #[serde(default = "default_schema_version")]
@@ -145,6 +189,33 @@ impl WorkflowState {
             teardown_completed: false,
             setup_step_states: Vec::new(),
             teardown_step_states: Vec::new(),
+        }
+    }
+
+    /// The step states for one phase. The two vectors keep their own
+    /// serialized fields (the on-disk shape is unchanged); this is how the
+    /// engine's one phase code path picks between them (F-34).
+    pub fn phase_step_states(&self, kind: PhaseKind) -> &[PhaseStepState] {
+        match kind {
+            PhaseKind::Setup => &self.setup_step_states,
+            PhaseKind::Teardown => &self.teardown_step_states,
+        }
+    }
+
+    /// Mutable counterpart of [`WorkflowState::phase_step_states`].
+    pub fn phase_step_states_mut(&mut self, kind: PhaseKind) -> &mut Vec<PhaseStepState> {
+        match kind {
+            PhaseKind::Setup => &mut self.setup_step_states,
+            PhaseKind::Teardown => &mut self.teardown_step_states,
+        }
+    }
+
+    /// Mark a phase as completed. Setup and teardown record completion in
+    /// their own flags.
+    pub fn set_phase_completed(&mut self, kind: PhaseKind) {
+        match kind {
+            PhaseKind::Setup => self.setup_completed = true,
+            PhaseKind::Teardown => self.teardown_completed = true,
         }
     }
 
@@ -296,6 +367,55 @@ impl WorkflowState {
     pub fn status_of(&self, step_name: &str) -> Option<&StepState> {
         self.step_states.get(step_name)
     }
+
+    /// Summarise this run for [`SessionState`](crate::data::session::SessionState).
+    pub fn summary(&self) -> WorkflowSummary {
+        WorkflowSummary {
+            invocation_id: self.invocation_id,
+            workflow_name: self.workflow_name.clone(),
+            work_item: self.work_item,
+            phase: self.current_phase,
+            total_steps: self.steps.len(),
+            completed_steps: self.completed_steps.len(),
+            failed_steps: self
+                .step_states
+                .values()
+                .filter(|s| matches!(s, StepState::Failed { .. }))
+                .count(),
+            current_step: self
+                .current_step_index
+                .and_then(|i| self.steps.get(i))
+                .map(|s| s.name.clone()),
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// What a session knows about the workflow running in it right now.
+///
+/// Derived from [`WorkflowState`] by [`WorkflowState::summary`] and mirrored
+/// into `SessionState::current_workflow` whenever the engine persists
+/// (WI 0114 F-30/F-22, decision Q3). It is deliberately a *projection*: the
+/// run's authoritative state is the `WorkflowState` the engine owns, and this
+/// carries only what a session view — the TUI's tab header, a status
+/// response — needs in order to render without loading the full state file.
+///
+/// Not to be confused with
+/// [`exec_workflow::WorkflowSummary`](crate::command::commands::exec_workflow::WorkflowSummary),
+/// which is the Layer 2 report of a run that has *finished*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    /// The run's id, stable across resumes.
+    pub invocation_id: uuid::Uuid,
+    pub workflow_name: String,
+    pub work_item: Option<u32>,
+    pub phase: WorkflowPhase,
+    pub total_steps: usize,
+    pub completed_steps: usize,
+    pub failed_steps: usize,
+    /// Name of the step the run is currently on, if any.
+    pub current_step: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -312,6 +432,59 @@ mod tests {
             overlays: None,
             abort_on_failure: false,
         }
+    }
+
+    // ── WorkflowSummary ──────────────────────────────────────────────────────
+
+    /// The projection `SessionState::current_workflow` carries (F-30). Counts
+    /// come from the live state, so a summary can never disagree with the run
+    /// it describes — which is what the deleted `WorkflowInvocation` model
+    /// could.
+    #[test]
+    fn summary_projects_counts_and_current_step_from_the_live_state() {
+        let steps = vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])];
+        let mut s = WorkflowState::new("deploy".into(), &steps, "h".into(), Some(114));
+        s.set_status("a", StepState::Succeeded);
+        s.set_status(
+            "b",
+            StepState::Failed {
+                exit_code: 2,
+                error_message: None,
+            },
+        );
+        s.current_step_index = Some(1);
+
+        let summary = s.summary();
+        assert_eq!(summary.invocation_id, s.invocation_id);
+        assert_eq!(summary.workflow_name, "deploy");
+        assert_eq!(summary.work_item, Some(114));
+        assert_eq!(summary.total_steps, 3);
+        assert_eq!(summary.completed_steps, 1);
+        assert_eq!(summary.failed_steps, 1);
+        assert_eq!(summary.current_step.as_deref(), Some("b"));
+        assert_eq!(summary.phase, s.current_phase);
+        assert_eq!(summary.updated_at, s.updated_at);
+    }
+
+    #[test]
+    fn summary_has_no_current_step_before_the_run_starts() {
+        let steps = vec![step("a", &[])];
+        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
+        let summary = s.summary();
+        assert!(summary.current_step.is_none());
+        assert_eq!(summary.completed_steps, 0);
+        assert_eq!(summary.failed_steps, 0);
+        assert_eq!(summary.total_steps, 1);
+    }
+
+    /// An index past the end of `steps` (a truncated dynamic run) must not
+    /// panic; the summary simply reports no current step.
+    #[test]
+    fn summary_tolerates_a_current_step_index_out_of_range() {
+        let steps = vec![step("a", &[])];
+        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
+        s.current_step_index = Some(9);
+        assert!(s.summary().current_step.is_none());
     }
 
     #[test]

@@ -14,14 +14,22 @@ use crate::engine::error::EngineError;
 #[derive(Debug, Error)]
 pub enum CommandError {
     #[error(transparent)]
-    Engine(#[from] EngineError),
+    Engine(EngineError),
 
     #[error(transparent)]
-    Data(#[from] DataError),
+    Data(DataError),
 
     // ── Dispatch / catalogue ─────────────────────────────────────────────
+    /// `suggestions` are full command paths the catalogue considers near
+    /// misses for what was typed, nearest first, and may be empty. They are
+    /// filled by whoever detects the unknown command — the catalogue knows
+    /// the command list, and a frontend must not (WI 0114 F-43). A frontend
+    /// chooses how to render them; it does not compute them.
     #[error("unknown command: {path:?}")]
-    UnknownCommand { path: Vec<String> },
+    UnknownCommand {
+        path: Vec<String>,
+        suggestions: Vec<String>,
+    },
 
     #[error("command '{command}' is not available via the {frontend} frontend")]
     NotAvailableForFrontend { command: String, frontend: String },
@@ -199,9 +207,11 @@ pub enum CommandError {
 }
 
 impl CommandError {
+    /// An unknown command, with the catalogue's near misses attached.
     pub fn unknown_command(path: &[&str]) -> Self {
         CommandError::UnknownCommand {
             path: path.iter().map(|s| s.to_string()).collect(),
+            suggestions: crate::command::dispatch::catalogue::CommandCatalogue::get().suggest(path),
         }
     }
 
@@ -242,6 +252,44 @@ impl CommandError {
             command: command.iter().map(|s| s.to_string()).collect(),
             a: a.into(),
             b: b.into(),
+        }
+    }
+}
+
+/// `EngineError` bubbles up as `CommandError::Engine` — except for the five
+/// remote-transport variants, which have Layer 2 twins this maps onto. The
+/// HTTP client moved to Layer 1 in WI 0114 F-28; Layer 2 code (the squad
+/// gateway, `remote.rs`) still raises and matches its own `Remote*` variants,
+/// and every CLI message and exit code stayed as it was.
+impl From<EngineError> for CommandError {
+    fn from(err: EngineError) -> Self {
+        match err {
+            EngineError::RemoteTimeout => CommandError::RemoteTimeout,
+            EngineError::RemoteConnectionRefused(reason) => {
+                CommandError::RemoteConnectionRefused(reason)
+            }
+            EngineError::RemoteHttpStatus { status, body } => {
+                CommandError::RemoteHttpStatus { status, body }
+            }
+            EngineError::MalformedSseEvent(msg) => CommandError::MalformedSseEvent(msg),
+            EngineError::RemoteTransport(msg) => CommandError::RemoteTransport(msg),
+            other => CommandError::Engine(other),
+        }
+    }
+}
+
+/// `DataError` bubbles up as `CommandError::Data` — except for the overlay
+/// grammar's rejection, which has a Layer 2 twin so that a malformed
+/// `overlays:` entry keeps the invalid-usage exit code and the message the
+/// CLI has always printed for it. The grammar moved to Layer 0 in WI 0114
+/// F-27; this mapping is what kept that move behaviour-preserving.
+impl From<DataError> for CommandError {
+    fn from(err: DataError) -> Self {
+        match err {
+            DataError::InvalidOverlaySpec { spec, reason } => {
+                CommandError::InvalidOverlaySpec { spec, reason }
+            }
+            other => CommandError::Data(other),
         }
     }
 }

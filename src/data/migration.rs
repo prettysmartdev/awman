@@ -111,7 +111,9 @@ mod tests {
 
     #[test]
     fn check_deprecated_env_vars_detects_legacy() {
-        let _guard = crate::CWD_LOCK.lock().unwrap();
+        // Recover a poisoned lock: a panic in another `CWD_LOCK` test is
+        // that test's failure to report, not a reason to fail this one too.
+        let _guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("AMUX_CONFIG_HOME", "/tmp/test");
         let warnings = check_deprecated_env_vars();
         std::env::remove_var("AMUX_CONFIG_HOME");
@@ -121,7 +123,9 @@ mod tests {
 
     #[test]
     fn check_deprecated_env_vars_empty_when_none_set() {
-        let _guard = crate::CWD_LOCK.lock().unwrap();
+        // Recover a poisoned lock: a panic in another `CWD_LOCK` test is
+        // that test's failure to report, not a reason to fail this one too.
+        let _guard = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear any AMUX_* var that another test may have left behind in the
         // shared process env before this one runs.
         for (old, _) in LEGACY_ENV_VARS {

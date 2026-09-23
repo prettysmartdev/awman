@@ -14,6 +14,99 @@ pub struct ExecutionEvent {
     pub payload: EventPayload,
 }
 
+/// How far a workflow step has got, on the wire.
+///
+/// `WorkflowStepTransition` carried these as two free-form `String`s (WI 0114
+/// F-48). Producing them meant a hand-written map from
+/// `WorkflowStepStatus` in the API frontend, and consuming them meant
+/// `match to_status.as_str()` in the queue worker — a client reading the
+/// stream had nothing but those two matches to learn the vocabulary from, and
+/// a typo in either was undetectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatusKind {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+impl std::fmt::Display for StepStatusKind {
+    /// The serialised spelling, so a log line and the wire agree.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            StepStatusKind::Pending => "pending",
+            StepStatusKind::Running => "running",
+            StepStatusKind::Succeeded => "succeeded",
+            StepStatusKind::Failed => "failed",
+            StepStatusKind::Cancelled => "cancelled",
+            StepStatusKind::Skipped => "skipped",
+        };
+        f.write_str(s)
+    }
+}
+
+/// How a whole command or workflow ended, on the wire.
+///
+/// Was a `String` whose five values were spelled out in
+/// `report_workflow_completed` and matched by `as_str()` in the queue worker
+/// (WI 0114 F-48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatusKind {
+    /// Ran to completion. `exit_code` says whether it succeeded.
+    Done,
+    /// Stopped at the user's request and can be resumed.
+    Paused,
+    /// Stopped without finishing and cannot be resumed.
+    Aborted,
+    /// Ended with an error; `error` carries the reason.
+    Error,
+}
+
+impl std::fmt::Display for CommandStatusKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CommandStatusKind::Done => "done",
+            CommandStatusKind::Paused => "paused",
+            CommandStatusKind::Aborted => "aborted",
+            CommandStatusKind::Error => "error",
+        };
+        f.write_str(s)
+    }
+}
+
+/// How a setup/teardown *phase* ended, on the wire.
+///
+/// A sixth free-form status string, produced beside `CommandStatusKind` and
+/// never matched anywhere but a log line's equality check against `"failed"`
+/// (WI 0114 F-48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseStatusKind {
+    Running,
+    Succeeded,
+    Failed,
+    Paused,
+    /// The main phase finished but teardown did not.
+    TeardownFailed,
+}
+
+impl std::fmt::Display for PhaseStatusKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            PhaseStatusKind::Running => "running",
+            PhaseStatusKind::Succeeded => "succeeded",
+            PhaseStatusKind::Failed => "failed",
+            PhaseStatusKind::Paused => "paused",
+            PhaseStatusKind::TeardownFailed => "teardown_failed",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
@@ -26,13 +119,13 @@ pub enum EventPayload {
     WorkflowStepTransition {
         step_name: String,
         step_index: usize,
-        from_status: String,
-        to_status: String,
+        from_status: StepStatusKind,
+        to_status: StepStatusKind,
     },
     WorkflowPhaseTransition {
         phase: String,
         step_desc: String,
-        status: String,
+        status: PhaseStatusKind,
     },
     /// One container in a parallel group (WI-0096) has started running.
     WorkflowParallelStepLaunched {
@@ -50,7 +143,7 @@ pub enum EventPayload {
     /// A parallel group (WI-0096) has fully drained; all its steps completed.
     WorkflowParallelGroupFinished,
     CommandStatus {
-        status: String,
+        status: CommandStatusKind,
         exit_code: Option<i32>,
         error: Option<String>,
     },

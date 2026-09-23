@@ -30,65 +30,30 @@ use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGat
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
-use awman::data::fs::{ApiPaths, AuthPathResolver, MountScope, Run, Task, TaskStatus};
-use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+use awman::data::fs::{MountScope, Run, Task, TaskStatus};
+use awman::data::session::{Session, SessionOpenOptions};
 use awman::data::session_manager::SessionManager;
-use awman::data::EngineWorkflowStateStore;
-use awman::engine::agent::AgentEngine;
-use awman::engine::auth::AuthEngine;
-use awman::engine::container::ContainerRuntime;
-use awman::engine::git::GitEngine;
-use awman::engine::overlay::OverlayEngine;
 use awman::frontend::tui::app::App;
 use awman::frontend::tui::squad_poll::{SquadTaskPoller, SQUAD_POLL_INTERVAL};
 use awman::frontend::tui::tabs::squad_state::SquadTabState;
 use awman::frontend::tui::tabs::{tab_color, ContainerSlot, Tab};
 
+#[path = "helpers/mod.rs"]
+mod helpers;
+
 // ─── Shared fixtures ────────────────────────────────────────────────────────
 
+/// A session over a fresh fixture root. The directory is removed as soon as
+/// the session is open: these tests assert on tab and poller state, never on
+/// the workdir's contents.
 fn make_session() -> Session {
     let tmp = tempfile::tempdir().unwrap();
-    let resolver = StaticGitRootResolver::new(tmp.path());
-    Session::open(
-        tmp.path().to_path_buf(),
-        &resolver,
-        SessionOpenOptions::default(),
-    )
-    .unwrap()
+    crate::helpers::session_at(tmp.path())
 }
 
-/// Mirrors `src/frontend/tui/tests/mod.rs::make_engines`, with the container
-/// runtime made optional so the sandbox-refusal path can be exercised without
-/// any real Docker/daemon dependency.
 fn make_engines(with_container_runtime: bool) -> Engines {
-    let runtime = Arc::new(ContainerRuntime::docker());
-    let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-        AuthPathResolver::at_home(std::path::PathBuf::from("/tmp")),
-    ));
-    let git_engine = Arc::new(GitEngine::new());
-    let agent_engine = Arc::new(AgentEngine::new(overlay.clone(), runtime.clone()));
-    let auth_engine = Arc::new(AuthEngine::with_paths(
-        AuthPathResolver::at_home("/tmp"),
-        ApiPaths::at_root("/tmp"),
-    ));
-    let workflow_state_store = {
-        let tmp = tempfile::tempdir().unwrap();
-        Arc::new(EngineWorkflowStateStore::at_git_root(tmp.path()))
-    };
-    Engines {
-        runtime: runtime.clone(),
-        container_runtime: if with_container_runtime {
-            Some(runtime)
-        } else {
-            None
-        },
-        sandbox_runtime: None,
-        git_engine,
-        overlay_engine: overlay,
-        auth_engine,
-        agent_engine,
-        workflow_state_store,
-    }
+    let tmp = tempfile::tempdir().unwrap();
+    crate::helpers::engines_at(tmp.path(), tmp.path(), with_container_runtime)
 }
 
 /// One multi-threaded runtime shared by every test in this file, rather than

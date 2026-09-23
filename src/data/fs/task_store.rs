@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
+use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 /// A persisted scheduled squad task.
@@ -348,6 +349,45 @@ impl TaskStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Create (idempotently) a task's durable workspace directory.
+    ///
+    /// Every task has one, whichever workspace mode it is bound to: a
+    /// custom-directory task's runs still mount this as a context overlay so
+    /// task-scoped persistent data survives across runs. Created once and
+    /// never deleted, emptied or replaced until the task is removed.
+    ///
+    /// Layer 0 owns the create (F-47); the caller supplies a path that came
+    /// from `SquadPaths::task_dir`, which has already validated the
+    /// user-influenced name against the tasks root.
+    pub fn ensure_workspace(dir: &Path) -> Result<(), DataError> {
+        std::fs::create_dir_all(dir).map_err(|error| DataError::io(dir, error))
+    }
+
+    /// Write a task's own `config.json`.
+    ///
+    /// The document is a whole [`GlobalConfig`] carrying only its `squad`
+    /// block, so the file the daemon writes and the file a user may hand-edit
+    /// are the same shape, parsed by the same loader.
+    pub fn write_config(path: &Path, config: &GlobalConfig) -> Result<(), DataError> {
+        let body = serde_json::to_string_pretty(config)
+            .map_err(|source| DataError::ConfigSerialize { source })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| DataError::io(parent, error))?;
+        }
+        std::fs::write(path, body).map_err(|error| DataError::io(path, error))
+    }
+
+    /// Remove a task's own `config.json`. A file that is already absent is a
+    /// success: "no task config" has exactly one on-disk representation, and
+    /// a task that gives up its pool goes back to inheriting the global one.
+    pub fn remove_config(path: &Path) -> Result<(), DataError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(DataError::io(path, error)),
+        }
     }
 
     /// Apply squad's schema. Idempotent: every statement is

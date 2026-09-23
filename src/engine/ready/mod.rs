@@ -3,251 +3,26 @@
 use std::sync::Arc;
 
 use crate::data::session::{AgentName, Session};
+use crate::data::setup_step::{ReadyStep, SetupStep};
+use crate::data::step_status::StepStatus;
 use crate::engine::agent::AgentEngine;
-use crate::engine::auth::credential::{HostRefreshAction, RefreshableCredentialSpec};
-use crate::engine::container::ContainerRuntime;
+use crate::engine::agent_runtime::{AgentRuntimeEngine, ReadyAgentOptions, ResolvedAgentOptions};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
-use crate::engine::step_status::StepStatus;
-
-pub const GREETINGS: [&str; 50] = [
-    "Hello",
-    "Hi there",
-    "Hey",
-    "Greetings",
-    "Good day",
-    "Howdy",
-    "Salutations",
-    "How are you",
-    "Good morning",
-    "Good afternoon",
-    "Good evening",
-    "Hi",
-    "Hey there",
-    "Ahoy",
-    "Yo",
-    "Hello there",
-    "Hiya",
-    "How's it going",
-    "How do you do",
-    "Pleased to meet you",
-    "Nice to meet you",
-    "How are things",
-    "What's new",
-    "How have you been",
-    "Welcome",
-    "Aloha",
-    "Bonjour",
-    "Ciao",
-    "Hola",
-    "Namaste",
-    "Howdy partner",
-    "Top of the morning to you",
-    "What's happening",
-    "How goes it",
-    "How's everything",
-    "How's life",
-    "Well hello",
-    "Hey friend",
-    "Good to see you",
-    "Hello friend",
-    "Greetings and salutations",
-    "Hey buddy",
-    "Sup",
-    "What's up",
-    "Long time no see",
-    "Rise and shine",
-    "How's your day going",
-    "Hope you're doing well",
-    "Great to hear from you",
-    "Glad you're here",
-];
-
-pub fn select_random_greeting() -> &'static str {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    GREETINGS[(secs % GREETINGS.len() as u64) as usize]
-}
-
-/// Result of the sanctioned host-side agent ping.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalAgentPingResult {
-    /// The agent replied. The greeting and response are the two lines that
-    /// the ready phase reports to its frontend.
-    Ok {
-        greeting: String,
-        response: String,
-    },
-    /// The agent ran but exited unsuccessfully, usually because it is not
-    /// authenticated.
-    Error,
-    NotInstalled,
-    CouldNotRun,
-}
-
-/// Build the fixed `(command, argv)` for the sanctioned host ping. Pure and
-/// side-effect free so it can be asserted in tests (INV-8). The prompt is drawn
-/// only from the hardcoded [`GREETINGS`] table and, for agents where a
-/// cheapest-model flag is known, the cheapest model is pinned so the ready-check
-/// refresh never bills a premium model (security.md §Guidance).
-pub(crate) fn ping_command(agent: &AgentName, greeting: &str) -> (String, Vec<String>) {
-    let owned = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let (cmd, args): (&str, Vec<String>) = match agent.as_str() {
-        // Pin the cheapest Claude model so the refresh ping never uses the
-        // account/user default (which may be a premium model).
-        "claude" => ("claude", owned(&["--model", "haiku", "--print", greeting])),
-        "codex" => ("codex", owned(&["exec", greeting])),
-        "opencode" => ("opencode", owned(&["run", greeting])),
-        "maki" => ("maki", owned(&["--print", greeting])),
-        "gemini" => ("gemini", owned(&["-p", greeting])),
-        "copilot" => ("copilot", owned(&["-p", "-i", greeting])),
-        "crush" => ("crush", owned(&["run", greeting])),
-        "cline" => ("cline", owned(&["task", greeting])),
-        _ => (agent.as_str(), owned(&["--print", greeting])),
-    };
-    (cmd.to_string(), args)
-}
-
-/// The one host-side agent execution permitted to awman.
-///
-/// Keep this invocation deliberately narrow: the prompt comes only from the
-/// hardcoded [`GREETINGS`] table, the command arguments are fixed per agent,
-/// and — crucially — the process runs in a dedicated empty directory OUTSIDE
-/// the repository (never the repo cwd), so a real code assistant launched this
-/// way cannot discover repository instructions or content, and a repo-planted
-/// `./claude` cannot be picked up via a relative lookup (INV-8, BLOCKING-2).
-/// Both `awman ready` and the credential refresh monitor use this function.
-pub async fn ping_local_agent(agent: &AgentName) -> LocalAgentPingResult {
-    let greeting = select_random_greeting();
-    let (cmd, args) = ping_command(agent, greeting);
-
-    // Run in a fresh empty 0700 directory so the host agent inherits no
-    // repository as its working directory. A dedicated TempDir is preferred; if
-    // it cannot be created, fall back to the system temp dir — anything but the
-    // repo cwd awman was started from.
-    let scratch = tempfile::Builder::new()
-        .prefix("awman-ready-ping-")
-        .tempdir()
-        .ok();
-    let work_dir = scratch
-        .as_ref()
-        .map(|d| d.path().to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
-
-    let mut command = tokio::process::Command::new(&cmd);
-    command.args(&args).current_dir(&work_dir);
-    match command.output().await {
-        Ok(output) if output.status.success() => {
-            let response = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            LocalAgentPingResult::Ok {
-                greeting: greeting.to_string(),
-                response,
-            }
-        }
-        Ok(_) => LocalAgentPingResult::Error,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LocalAgentPingResult::NotInstalled,
-        Err(_) => LocalAgentPingResult::CouldNotRun,
-    }
-}
-
-/// Result of trying to make the host agent rotate its credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HostRefreshOutcome {
-    /// The credential expiry advanced after the sanctioned ping.
-    Advanced { expires_at: std::time::SystemTime },
-    /// The ping completed, but the host credential did not advance. The
-    /// existing last-known-good credential remains usable until it expires.
-    NotAdvanced { remediation: String },
-    /// The sanctioned ping itself failed.
-    PingFailed { result: LocalAgentPingResult },
-}
-
-const HOST_REFRESH_REMEDIATION: &str = "run `claude` on the host / check login";
-
-/// Run a descriptor's host refresh action and verify that its credential's
-/// expiry actually advanced. A stale or unreadable post-refresh credential is
-/// reported as a warning outcome so callers can retain the last-known-good
-/// file; it is never promoted to an engine error.
-pub async fn refresh_host_credential(
-    spec: &RefreshableCredentialSpec,
-    binding: &crate::engine::auth::credential::CredentialBinding,
-) -> HostRefreshOutcome {
-    let source = binding.source_for(spec);
-    let before = match (spec.read)(&source) {
-        Ok(snapshot) => (spec.expiry)(&snapshot),
-        Err(reason) => {
-            tracing::warn!(
-                agent = spec.agent,
-                reason = %reason,
-                "could not read host credential before refresh"
-            );
-            return HostRefreshOutcome::NotAdvanced {
-                remediation: HOST_REFRESH_REMEDIATION.to_string(),
-            };
-        }
-    };
-
-    let ping_result = match (spec.host_refresh)() {
-        HostRefreshAction::ReadyCheckPing { agent } => {
-            let Ok(agent) = AgentName::new(agent) else {
-                return HostRefreshOutcome::PingFailed {
-                    result: LocalAgentPingResult::CouldNotRun,
-                };
-            };
-            ping_local_agent(&agent).await
-        }
-    };
-    if !matches!(&ping_result, LocalAgentPingResult::Ok { .. }) {
-        return HostRefreshOutcome::PingFailed {
-            result: ping_result,
-        };
-    }
-
-    let after = match (spec.read)(&source) {
-        Ok(snapshot) => (spec.expiry)(&snapshot),
-        Err(reason) => {
-            tracing::warn!(
-                agent = spec.agent,
-                reason = %reason,
-                "could not read host credential after refresh"
-            );
-            return HostRefreshOutcome::NotAdvanced {
-                remediation: HOST_REFRESH_REMEDIATION.to_string(),
-            };
-        }
-    };
-
-    match (before, after) {
-        (Some(before), Some(after)) if after > before => {
-            HostRefreshOutcome::Advanced { expires_at: after }
-        }
-        _ => {
-            tracing::warn!(
-                agent = spec.agent,
-                remediation = HOST_REFRESH_REMEDIATION,
-                "host credential expiry did not advance after refresh"
-            );
-            HostRefreshOutcome::NotAdvanced {
-                remediation: HOST_REFRESH_REMEDIATION.to_string(),
-            }
-        }
-    }
-}
 
 pub mod frontend;
-pub mod phase;
-pub mod summary;
+pub mod host_agent;
 
+pub use crate::data::ready_phase::{ReadyFailure, ReadyPhase};
+// Re-exported at the module root so the many call sites that name the ping
+// result or the greeting table keep their import path; the host execution
+// itself is reachable only through `HostAgentPinger`.
+pub use crate::data::ready_summary::ReadySummary;
 pub use frontend::ReadyFrontend;
-pub use phase::{ReadyFailure, ReadyPhase};
-pub use summary::ReadySummary;
+pub use host_agent::{
+    select_random_greeting, HostAgentPinger, HostRefreshOutcome, LocalAgentPingResult, GREETINGS,
+};
 
 #[derive(Debug, Clone)]
 pub struct ReadyEngineOptions {
@@ -265,7 +40,7 @@ pub struct ReadyEngine {
     session: Arc<Session>,
     git_engine: Arc<GitEngine>,
     overlay_engine: Arc<OverlayEngine>,
-    container_runtime: Arc<ContainerRuntime>,
+    runtime: Arc<dyn AgentRuntimeEngine>,
     agent_engine: Arc<AgentEngine>,
     options: ReadyEngineOptions,
     phase: ReadyPhase,
@@ -273,6 +48,10 @@ pub struct ReadyEngine {
     /// Hash of `Dockerfile.dev` captured just before the audit runs, so we can
     /// detect modifications made by the agent and trigger a rebuild.
     pre_audit_dockerfile_hash: Option<u64>,
+    /// The one handle permitted to execute an agent binary on the host
+    /// (F-38). `awman ready`'s local-agent check is authorized trigger (a)
+    /// in `security.md`.
+    host_agent: HostAgentPinger,
 }
 
 impl ReadyEngine {
@@ -280,21 +59,22 @@ impl ReadyEngine {
         session: Arc<Session>,
         git_engine: Arc<GitEngine>,
         overlay_engine: Arc<OverlayEngine>,
-        container_runtime: Arc<ContainerRuntime>,
+        runtime: Arc<dyn AgentRuntimeEngine>,
         agent_engine: Arc<AgentEngine>,
         options: ReadyEngineOptions,
     ) -> Self {
-        let runtime_name = container_runtime.runtime_name().to_string();
+        let runtime_name = runtime.runtime_name().to_string();
         Self {
             session,
             git_engine,
             overlay_engine,
-            container_runtime,
+            runtime,
             agent_engine,
             options,
             phase: ReadyPhase::Preflight,
             summary: ReadySummary::new(runtime_name),
             pre_audit_dockerfile_hash: None,
+            host_agent: HostAgentPinger::new(),
         }
     }
 
@@ -328,6 +108,43 @@ impl ReadyEngine {
         let git_root = self.session.git_root().to_path_buf();
         let _ = &self.git_engine;
         let _ = &self.overlay_engine;
+
+        // A kit-declarative runtime prepares an agent by emitting and
+        // validating a kit, not by building Docker images. The whole
+        // container phase machine is skipped in one step. F-40b moved this
+        // branch down here from `commands/ready.rs`: it is a paradigm
+        // decision, and Layer 1 is where paradigm decisions on
+        // `capabilities()` belong.
+        if self.runtime.capabilities().kit_declarative
+            && !matches!(self.phase, ReadyPhase::Complete)
+        {
+            let result = self.runtime.ready_agent(
+                self.options.agent.as_str(),
+                ReadyAgentOptions {
+                    no_cache: self.options.no_cache,
+                    build: self.options.build,
+                },
+                frontend,
+            );
+            // Every container-tier step is genuinely not applicable here, so
+            // the summary reports Skipped rather than a misleading Done.
+            self.summary.dockerfile = StepStatus::Skipped;
+            self.summary.base_image = StepStatus::Skipped;
+            self.summary.local_agent = StepStatus::Skipped;
+            self.summary.audit = StepStatus::Skipped;
+            self.summary.agent_image = match &result {
+                Ok(()) => StepStatus::Done,
+                Err(e) => StepStatus::Failed(e.to_string()),
+            };
+            frontend.report_step_status(
+                &ReadyStep::ApplyAgentKit.into(),
+                self.summary.agent_image.clone(),
+            );
+            self.phase = ReadyPhase::Complete;
+            frontend.report_summary(&self.summary);
+            result?;
+            return Ok(self.phase.clone());
+        }
 
         let next = match &self.phase {
             ReadyPhase::Preflight => {
@@ -364,7 +181,7 @@ impl ReadyEngine {
                 if dockerfile_path.exists() {
                     self.summary.dockerfile = StepStatus::Done;
                     frontend.report_step_status(
-                        &format!("Check {}", dockerfile_path.display()),
+                        &ReadyStep::CheckDockerfile(dockerfile_path.clone()).into(),
                         StepStatus::Done,
                     );
                     ReadyPhase::BuildingBaseImage
@@ -395,7 +212,7 @@ impl ReadyEngine {
                     .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
                 self.summary.dockerfile = StepStatus::Done;
                 frontend.report_step_status(
-                    &format!("Create {}", dockerfile_path.display()),
+                    &ReadyStep::CreateDockerfile(dockerfile_path.clone()).into(),
                     StepStatus::Done,
                 );
                 ReadyPhase::BuildingBaseImage
@@ -403,13 +220,16 @@ impl ReadyEngine {
             ReadyPhase::BuildingBaseImage => {
                 // Issue 22: Docker daemon pre-check — soft failure allows
                 // run_to_completion to surface a summary rather than aborting.
-                if !self.container_runtime.is_available() {
-                    let runtime = self.container_runtime.display_name();
+                if !self.runtime.is_available() {
+                    let runtime = self.runtime.display_name();
                     let msg = format!(
                         "{runtime} is not available. Ensure {runtime} is running and retry."
                     );
                     self.summary.base_image = StepStatus::Failed(msg.clone());
-                    frontend.report_step_status("Build base image", StepStatus::Failed(msg));
+                    frontend.report_step_status(
+                        &ReadyStep::BuildBaseImage.into(),
+                        StepStatus::Failed(msg),
+                    );
                     // Bypass the `self.phase = next` assignment below to short-
                     // circuit straight to the next phase, but DO advance self.phase
                     // first — otherwise `run_to_completion` re-enters this branch
@@ -421,21 +241,24 @@ impl ReadyEngine {
                 let tag = project_image_tag(&git_root);
                 // Rebuild when --build was passed or when the base image is
                 // missing. Otherwise skip (`awman ready` is idempotent).
-                let needs_build = self.options.build || !self.container_runtime.image_exists(&tag);
+                let needs_build =
+                    self.options.build || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.base_image = StepStatus::Done;
-                    frontend.report_step_status("Build base image", StepStatus::Done);
+                    frontend
+                        .report_step_status(&ReadyStep::BuildBaseImage.into(), StepStatus::Done);
                     ReadyPhase::BuildingAgentImage
                 } else {
-                    frontend.report_step_status("Build base image", StepStatus::Running);
+                    frontend
+                        .report_step_status(&ReadyStep::BuildBaseImage.into(), StepStatus::Running);
                     let dockerfile_path = self
                         .session
                         .repo_config()
                         .dockerfile_path_or_default(&git_root);
                     let mut sink = |line: &str| {
-                        frontend.report_step_status(line, StepStatus::Running);
+                        frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                     };
-                    let result = self.container_runtime.build_image(
+                    let result = self.runtime.build_image(
                         &tag,
                         &dockerfile_path,
                         &git_root,
@@ -445,13 +268,18 @@ impl ReadyEngine {
                     match result {
                         Ok(()) => {
                             self.summary.base_image = StepStatus::Done;
-                            frontend.report_step_status("Build base image", StepStatus::Done);
+                            frontend.report_step_status(
+                                &ReadyStep::BuildBaseImage.into(),
+                                StepStatus::Done,
+                            );
                         }
                         Err(e) => {
                             let msg = e.to_string();
                             self.summary.base_image = StepStatus::Failed(msg.clone());
-                            frontend
-                                .report_step_status("Build base image", StepStatus::Failed(msg));
+                            frontend.report_step_status(
+                                &ReadyStep::BuildBaseImage.into(),
+                                StepStatus::Failed(msg),
+                            );
                         }
                     }
                     ReadyPhase::BuildingAgentImage
@@ -463,13 +291,13 @@ impl ReadyEngine {
                 // from the network — the build would fail anyway. Mark as
                 // failed and continue, so the setup task exits promptly in
                 // sandboxed test environments.
-                if !self.container_runtime.is_available() {
-                    let msg = format!(
-                        "{} is not available.",
-                        self.container_runtime.display_name()
-                    );
+                if !self.runtime.is_available() {
+                    let msg = format!("{} is not available.", self.runtime.display_name());
                     self.summary.agent_image = StepStatus::Failed(msg.clone());
-                    frontend.report_step_status("Build agent image", StepStatus::Failed(msg));
+                    frontend.report_step_status(
+                        &ReadyStep::BuildAgentImage.into(),
+                        StepStatus::Failed(msg),
+                    );
                     return Ok({
                         self.phase = ReadyPhase::CheckingNonDefaultAgents;
                         self.phase.clone()
@@ -478,16 +306,19 @@ impl ReadyEngine {
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 let tag = agent_image_tag(&git_root, self.options.agent.as_str());
-                let needs_build = self.options.build || !self.container_runtime.image_exists(&tag);
+                let needs_build =
+                    self.options.build || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.agent_image = StepStatus::Done;
-                    frontend.report_step_status("Build agent image", StepStatus::Done);
+                    frontend
+                        .report_step_status(&ReadyStep::BuildAgentImage.into(), StepStatus::Done);
                     return Ok({
                         self.phase = ReadyPhase::CheckingNonDefaultAgents;
                         self.phase.clone()
                     });
                 }
-                frontend.report_step_status("Build agent image", StepStatus::Running);
+                frontend
+                    .report_step_status(&ReadyStep::BuildAgentImage.into(), StepStatus::Running);
                 if !agent_dockerfile.exists() {
                     // Try downloading the per-agent Dockerfile (best-effort).
                     let project_tag = project_image_tag(&git_root);
@@ -501,7 +332,7 @@ impl ReadyEngine {
                         let msg = e.to_string();
                         self.summary.agent_image = StepStatus::Failed(msg.clone());
                         frontend.report_step_status(
-                            "Download agent Dockerfile",
+                            &ReadyStep::DownloadAgentDockerfile.into(),
                             StepStatus::Failed(msg),
                         );
                         // Continue but mark agent image not built.
@@ -512,9 +343,9 @@ impl ReadyEngine {
                     }
                 }
                 let mut sink = |line: &str| {
-                    frontend.report_step_status(line, StepStatus::Running);
+                    frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                 };
-                let result = self.container_runtime.build_image(
+                let result = self.runtime.build_image(
                     &tag,
                     &agent_dockerfile,
                     &git_root,
@@ -524,12 +355,15 @@ impl ReadyEngine {
                 match result {
                     Ok(()) => {
                         self.summary.agent_image = StepStatus::Done;
-                        frontend.report_step_status("Build agent image", StepStatus::Done);
+                        frontend.report_step_status(
+                            &ReadyStep::BuildAgentImage.into(),
+                            StepStatus::Done,
+                        );
                     }
                     Err(e) => {
                         self.summary.agent_image = StepStatus::Failed(e.to_string());
                         frontend.report_step_status(
-                            "Build agent image",
+                            &ReadyStep::BuildAgentImage.into(),
                             StepStatus::Failed(e.to_string()),
                         );
                     }
@@ -545,13 +379,14 @@ impl ReadyEngine {
                         }
                         let other_tag = agent_image_tag(&git_root, agent_name);
                         frontend.report_step_status(
-                            &format!("Build agent image: {agent_name}"),
+                            &ReadyStep::BuildAgentImageFor(agent_name.to_string()).into(),
                             StepStatus::Running,
                         );
                         let mut agent_sink = |line: &str| {
-                            frontend.report_step_status(line, StepStatus::Running);
+                            frontend
+                                .report_step_status(&SetupStep::output(line), StepStatus::Running);
                         };
-                        let agent_result = self.container_runtime.build_image(
+                        let agent_result = self.runtime.build_image(
                             &other_tag,
                             agent_path,
                             &git_root,
@@ -561,13 +396,13 @@ impl ReadyEngine {
                         match agent_result {
                             Ok(()) => {
                                 frontend.report_step_status(
-                                    &format!("Build agent image: {agent_name}"),
+                                    &ReadyStep::BuildAgentImageFor(agent_name.to_string()).into(),
                                     StepStatus::Done,
                                 );
                             }
                             Err(e) => {
                                 frontend.report_step_status(
-                                    &format!("Build agent image: {agent_name}"),
+                                    &ReadyStep::BuildAgentImageFor(agent_name.to_string()).into(),
                                     StepStatus::Failed(e.to_string()),
                                 );
                             }
@@ -591,7 +426,7 @@ impl ReadyEngine {
                     }
                     count += 1;
                     let other_tag = agent_image_tag(&git_root, agent_name);
-                    if !self.container_runtime.image_exists(&other_tag) {
+                    if !self.runtime.image_exists(&other_tag).unwrap_or(false) {
                         all_ok = false;
                         missing_agents.push((agent_name.clone(), other_tag));
                     }
@@ -600,7 +435,8 @@ impl ReadyEngine {
                 if count > 0 {
                     if all_ok {
                         // All non-default agents have valid images → single consolidated row.
-                        frontend.report_step_status("Other agents", StepStatus::Done);
+                        frontend
+                            .report_step_status(&ReadyStep::OtherAgents.into(), StepStatus::Done);
                         self.summary
                             .non_default_agent_images
                             .push(("Other agents".to_string(), StepStatus::Done));
@@ -614,7 +450,8 @@ impl ReadyEngine {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let status = StepStatus::Warn(names_csv.clone());
-                        frontend.report_step_status("Missing images", status.clone());
+                        frontend
+                            .report_step_status(&ReadyStep::MissingImages.into(), status.clone());
                         self.summary
                             .non_default_agent_images
                             .push(("Missing images".to_string(), status));
@@ -635,26 +472,27 @@ impl ReadyEngine {
             // auth token before credentials are mounted into containerized
             // agents. Do not add other host-side agent invocations.
             ReadyPhase::CheckingLocalAgent => {
-                frontend.report_step_status("Check local agent", StepStatus::Running);
+                frontend
+                    .report_step_status(&ReadyStep::CheckLocalAgent.into(), StepStatus::Running);
                 let agent_name = self.options.agent.as_str();
-                match ping_local_agent(&self.options.agent).await {
-                    LocalAgentPingResult::Ok { greeting, response } => {
-                        frontend.write_message(crate::data::message::UserMessage {
-                            level: crate::data::message::MessageLevel::Info,
-                            text: format!("> {greeting}"),
-                        });
-                        frontend.write_message(crate::data::message::UserMessage {
-                            level: crate::data::message::MessageLevel::Info,
-                            text: format!("< {response}"),
-                        });
+                let ping = self.host_agent.ping(&self.options.agent).await;
+                // The engine reports the result; the frontend draws the
+                // transcript. The default impl writes the same two `>`/`<`
+                // lines this arm used to compose (F-45).
+                frontend.report_ping(&ping);
+                match ping {
+                    LocalAgentPingResult::Ok { .. } => {
                         self.summary.local_agent = StepStatus::Done;
-                        frontend.report_step_status("Check local agent", StepStatus::Done);
+                        frontend.report_step_status(
+                            &ReadyStep::CheckLocalAgent.into(),
+                            StepStatus::Done,
+                        );
                     }
                     LocalAgentPingResult::Error => {
                         self.summary.local_agent =
                             StepStatus::Failed(format!("{agent_name}: error (check auth)"));
                         frontend.report_step_status(
-                            "Check local agent",
+                            &ReadyStep::CheckLocalAgent.into(),
                             StepStatus::Failed(format!("{agent_name}: error (check auth)")),
                         );
                     }
@@ -662,7 +500,7 @@ impl ReadyEngine {
                         self.summary.local_agent =
                             StepStatus::Failed(format!("{agent_name}: not installed"));
                         frontend.report_step_status(
-                            "Check local agent",
+                            &ReadyStep::CheckLocalAgent.into(),
                             StepStatus::Failed(format!("{agent_name}: not installed")),
                         );
                     }
@@ -670,7 +508,7 @@ impl ReadyEngine {
                         self.summary.local_agent =
                             StepStatus::Failed(format!("{agent_name}: could not run"));
                         frontend.report_step_status(
-                            "Check local agent",
+                            &ReadyStep::CheckLocalAgent.into(),
                             StepStatus::Failed(format!("{agent_name}: could not run")),
                         );
                     }
@@ -733,9 +571,8 @@ impl ReadyEngine {
                         Err(e) => {
                             self.summary.audit = StepStatus::Failed(e.to_string());
                         }
-                        Ok(options) => match crate::engine::container::options::ResolvedContainerOptions::resolve(options)
-                            .map_err(crate::engine::error::EngineError::from)
-                            .and_then(|o| self.container_runtime.build(o))
+                        Ok(options) => match ResolvedAgentOptions::container(options)
+                            .and_then(|o| self.runtime.build(o))
                         {
                             Err(e) => {
                                 self.summary.audit = StepStatus::Failed(e.to_string());
@@ -783,13 +620,17 @@ impl ReadyEngine {
                         _ => true,
                     };
                     if changed {
-                        frontend.report_step_status("Rebuilding after audit", StepStatus::Running);
+                        frontend.report_step_status(
+                            &ReadyStep::RebuildingAfterAudit.into(),
+                            StepStatus::Running,
+                        );
                         let tag = project_image_tag(&git_root);
                         let dockerfile_path_clone = dockerfile_path.clone();
                         let mut sink = |line: &str| {
-                            frontend.report_step_status(line, StepStatus::Running);
+                            frontend
+                                .report_step_status(&SetupStep::output(line), StepStatus::Running);
                         };
-                        let result = self.container_runtime.build_image(
+                        let result = self.runtime.build_image(
                             &tag,
                             &dockerfile_path_clone,
                             &git_root,
@@ -800,15 +641,17 @@ impl ReadyEngine {
                             Ok(()) => {
                                 self.summary.base_image = StepStatus::Done;
                                 self.summary.image_rebuild = StepStatus::Done;
-                                frontend
-                                    .report_step_status("Rebuilding after audit", StepStatus::Done);
+                                frontend.report_step_status(
+                                    &ReadyStep::RebuildingAfterAudit.into(),
+                                    StepStatus::Done,
+                                );
                             }
                             Err(e) => {
                                 let msg = e.to_string();
                                 self.summary.base_image = StepStatus::Failed(msg.clone());
                                 self.summary.image_rebuild = StepStatus::Failed(msg.clone());
                                 frontend.report_step_status(
-                                    "Rebuilding after audit",
+                                    &ReadyStep::RebuildingAfterAudit.into(),
                                     StepStatus::Failed(msg),
                                 );
                             }
@@ -830,10 +673,12 @@ impl ReadyEngine {
                                                     &git_root, agent,
                                                 );
                                             let mut agent_sink = |line: &str| {
-                                                frontend
-                                                    .report_step_status(line, StepStatus::Running);
+                                                frontend.report_step_status(
+                                                    &SetupStep::output(line),
+                                                    StepStatus::Running,
+                                                );
                                             };
-                                            let _ = self.container_runtime.build_image(
+                                            let _ = self.runtime.build_image(
                                                 &agent_tag,
                                                 &entry.path(),
                                                 &git_root,
@@ -894,10 +739,10 @@ mod tests {
     use super::*;
     use crate::data::message::{UserMessage, UserMessageSink};
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+    use crate::data::step_status::StepStatus;
     use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
     use crate::engine::error::EngineError;
     use crate::engine::overlay::OverlayEngine;
-    use crate::engine::step_status::StepStatus;
 
     // ── Fake frontend ────────────────────────────────────────────────────────
 
@@ -958,15 +803,17 @@ mod tests {
             self.phases.push(phase.clone());
         }
 
-        fn report_step_status(&mut self, step: &str, status: StepStatus) {
+        fn report_summary(&mut self, _summary: &ReadySummary) {}
+    }
+
+    impl crate::engine::agent::AgentImageFrontend for FakeReadyFrontend {
+        fn report_step_status(&mut self, step: &SetupStep, status: StepStatus) {
             self.statuses.push((step.to_string(), status));
         }
 
         fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
             Box::new(FakeRuntimeFrontend)
         }
-
-        fn report_summary(&mut self, _summary: &ReadySummary) {}
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -993,7 +840,8 @@ mod tests {
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
         ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            Arc::new(crate::engine::container::ContainerRuntime::docker());
         let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
             overlay.clone(),
             runtime.clone(),
@@ -1026,24 +874,8 @@ mod tests {
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
-
-    /// INV-8 / BLOCKING-2: the Claude host ping pins the cheapest model, carries
-    /// the greeting drawn from the hardcoded table, and takes no other argument
-    /// (no user input, no repo content). The greeting is the only variable part.
-    #[test]
-    fn ping_command_for_claude_pins_cheapest_model_and_only_the_greeting() {
-        let agent = AgentName::new("claude").unwrap();
-        let greeting = super::select_random_greeting();
-        let (cmd, args) = super::ping_command(&agent, greeting);
-        assert_eq!(cmd, "claude");
-        assert_eq!(args, vec!["--model", "haiku", "--print", greeting]);
-        // Every argument except the greeting is a fixed literal, and the
-        // greeting itself is drawn only from the hardcoded table.
-        assert!(
-            super::GREETINGS.contains(&args.last().unwrap().as_str()),
-            "the ping's only variable argument must come from GREETINGS"
-        );
-    }
+    //
+    // The host-ping tests moved to `host_agent.rs` with the code they test.
 
     #[tokio::test]
     async fn awaiting_dockerfile_decision_false_leads_to_failed_phase() {
@@ -1087,7 +919,8 @@ mod tests {
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
         ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            Arc::new(crate::engine::container::ContainerRuntime::docker());
         let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
             overlay.clone(),
             runtime.clone(),
@@ -1149,7 +982,8 @@ mod tests {
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(git_root),
         ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            Arc::new(crate::engine::container::ContainerRuntime::docker());
         let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
             overlay.clone(),
             runtime.clone(),
@@ -1251,5 +1085,199 @@ mod tests {
             &ReadyPhase::BuildingBaseImage,
             "engine must advance directly to BuildingBaseImage after Preflight"
         );
+    }
+
+    // ── Kit-declarative (sandbox-tier) ready flow (F-40b) ────────────────
+    //
+    // `ReadyEngine` is runtime-agnostic: given a kit-declarative runtime it
+    // skips the whole container phase machine in one step. Before F-40b this
+    // branch lived in Layer 2 (`commands/ready.rs`) and keyed on
+    // `engines.sandbox_runtime.is_some()`.
+
+    /// A kit-declarative runtime that records the `ready_agent` call and
+    /// refuses every image-store operation, the way the sandbox tier does.
+    struct FakeKitRuntime {
+        caps: crate::engine::agent_runtime::Capabilities,
+        ready_calls:
+            std::sync::Mutex<Vec<(String, crate::engine::agent_runtime::ReadyAgentOptions)>>,
+    }
+
+    impl FakeKitRuntime {
+        fn new() -> Self {
+            let mut caps = crate::engine::container::ContainerRuntime::docker()
+                .capabilities()
+                .clone();
+            caps.kit_declarative = true;
+            caps.has_image_store = false;
+            Self {
+                caps,
+                ready_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeKitRuntime {
+        fn runtime_name(&self) -> &'static str {
+            "fake-kit"
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake Kit Runtime"
+        }
+        fn capabilities(&self) -> &crate::engine::agent_runtime::Capabilities {
+            &self.caps
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn build(
+            &self,
+            _: crate::engine::agent_runtime::ResolvedAgentOptions,
+        ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+            unimplemented!("FakeKitRuntime never launches an agent")
+        }
+        fn list_running(
+            &self,
+            _: &crate::data::session::Session,
+        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+            Ok(vec![])
+        }
+        fn list_running_all(&self) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+            Ok(vec![])
+        }
+        fn stats(
+            &self,
+            _: &crate::data::session::AgentHandle,
+        ) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
+            Ok(crate::engine::agent_runtime::AgentStats {
+                name: String::new(),
+                cpu_percent: 0.0,
+                memory_mb: 0.0,
+            })
+        }
+        fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Vec<String> {
+            vec![]
+        }
+        fn attach(
+            &self,
+            _: &crate::data::session::AgentHandle,
+        ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+            unimplemented!("FakeKitRuntime never attaches")
+        }
+        fn list_running_with_name_prefix(
+            &self,
+            _: &str,
+        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+            Ok(vec![])
+        }
+        fn cli_binary(&self) -> &'static str {
+            "fake-kit"
+        }
+        fn ready_agent(
+            &self,
+            agent: &str,
+            opts: crate::engine::agent_runtime::ReadyAgentOptions,
+            _sink: &mut dyn crate::data::message::UserMessageSink,
+        ) -> Result<(), EngineError> {
+            self.ready_calls
+                .lock()
+                .unwrap()
+                .push((agent.to_string(), opts));
+            Ok(())
+        }
+        fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
+            Err(EngineError::UnsupportedOnRuntime {
+                runtime: "fake-kit",
+                operation: "local image probe",
+            })
+        }
+        fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
+            Err(EngineError::UnsupportedOnRuntime {
+                runtime: "fake-kit",
+                operation: "image HOME lookup",
+            })
+        }
+        fn build_image(
+            &self,
+            _: &str,
+            _: &std::path::Path,
+            _: &std::path::Path,
+            _: bool,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<(), EngineError> {
+            Err(EngineError::UnsupportedOnRuntime {
+                runtime: "fake-kit",
+                operation: "image build",
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_on_a_kit_declarative_runtime_applies_the_kit_and_skips_image_phases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Arc::new(
+            crate::data::session::Session::open(
+                tmp.path().to_path_buf(),
+                &resolver,
+                SessionOpenOptions::default(),
+            )
+            .unwrap(),
+        );
+        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
+        ));
+        let kit = Arc::new(FakeKitRuntime::new());
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> = kit.clone();
+        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            overlay.clone(),
+            runtime.clone(),
+        ));
+        let mut engine = ReadyEngine::new(
+            session,
+            Arc::new(GitEngine::new()),
+            overlay,
+            runtime,
+            agent_engine,
+            ReadyEngineOptions {
+                agent: AgentName::new("claude").unwrap(),
+                refresh: false,
+                build: true,
+                no_cache: true,
+                allow_docker: false,
+                non_interactive: true,
+                env_passthrough: None,
+            },
+        );
+        let mut frontend = FakeReadyFrontend {
+            create_dockerfile: false,
+            run_audit: false,
+            phases: Vec::new(),
+            statuses: Vec::new(),
+            last_dockerfile_prompt_path: None,
+        };
+
+        let phase = engine.step(&mut frontend).await.unwrap();
+
+        assert_eq!(
+            phase,
+            ReadyPhase::Complete,
+            "one step, straight to Complete"
+        );
+        let calls = kit.ready_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the kit is applied exactly once");
+        assert_eq!(calls[0].0, "claude");
+        assert!(calls[0].1.no_cache, "no_cache must reach the runtime");
+
+        let summary = engine.summary();
+        assert_eq!(summary.agent_image, StepStatus::Done);
+        // Every container-tier step is not applicable, and says so rather
+        // than reporting a Done it never did.
+        assert_eq!(summary.dockerfile, StepStatus::Skipped);
+        assert_eq!(summary.base_image, StepStatus::Skipped);
+        assert_eq!(summary.local_agent, StepStatus::Skipped);
+        assert_eq!(summary.audit, StepStatus::Skipped);
     }
 }

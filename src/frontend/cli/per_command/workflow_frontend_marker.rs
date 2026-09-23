@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use crate::data::workflow_definition::WorkflowStep;
-use crate::data::workflow_state::WorkflowState;
+use crate::data::workflow_state::{PhaseKind, WorkflowState};
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
@@ -26,7 +26,7 @@ impl WorkflowFrontend for CliFrontend {
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
         if self.non_interactive {
-            return Ok(NextAction::LaunchNext);
+            return Ok(self.headless.workflow_next_action(available));
         }
 
         // If stdio is currently bound to a container PTY (e.g. the dialog
@@ -156,7 +156,7 @@ impl WorkflowFrontend for CliFrontend {
         }
 
         if self.non_interactive {
-            return Ok(YoloTickOutcome::Continue);
+            return Ok(self.headless.yolo_tick());
         }
 
         if self.yolo_stdin_rx.is_none() {
@@ -238,7 +238,7 @@ impl WorkflowFrontend for CliFrontend {
 
     fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
         if self.non_interactive {
-            return Ok(false);
+            return Ok(self.headless.confirm_resume());
         }
         eprintln!("awman: workflow file changed since last run; resume anyway? [y/n]");
         let mut buf = String::new();
@@ -337,20 +337,29 @@ impl WorkflowFrontend for CliFrontend {
         eprintln!();
     }
 
-    fn on_setup_step_started(&mut self, description: &str) {
-        eprintln!("awman: setup: {description}");
+    fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
+        eprintln!("awman: {}: {description}", kind.label());
     }
 
-    fn on_setup_step_output(&mut self, line: &str) {
+    fn on_phase_step_output(&mut self, _kind: PhaseKind, line: &str) {
         eprintln!("  {line}");
     }
 
-    fn on_setup_step_completed(&mut self, description: &str) {
-        eprintln!("awman: setup: {description} [ok]");
+    fn on_phase_step_completed(&mut self, kind: PhaseKind, description: &str) {
+        eprintln!("awman: {}: {description} [ok]", kind.label());
     }
 
-    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
-        eprintln!("awman: setup: {description} [failed exit={exit_code}]");
+    fn on_phase_step_failed(
+        &mut self,
+        kind: PhaseKind,
+        description: &str,
+        exit_code: i32,
+        stderr: &str,
+    ) {
+        eprintln!(
+            "awman: {}: {description} [failed exit={exit_code}]",
+            kind.label()
+        );
         if !stderr.is_empty() {
             for line in stderr.lines() {
                 eprintln!("  {line}");
@@ -358,51 +367,18 @@ impl WorkflowFrontend for CliFrontend {
         }
     }
 
-    fn on_teardown_step_started(&mut self, description: &str) {
-        eprintln!("awman: teardown: {description}");
-    }
-
-    fn on_teardown_step_output(&mut self, line: &str) {
-        eprintln!("  {line}");
-    }
-
-    fn on_teardown_step_completed(&mut self, description: &str) {
-        eprintln!("awman: teardown: {description} [ok]");
-    }
-
-    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
-        eprintln!("awman: teardown: {description} [failed exit={exit_code}]");
-        if !stderr.is_empty() {
-            for line in stderr.lines() {
-                eprintln!("  {line}");
-            }
-        }
-    }
-
+    /// Deliberately silent (F-15, decision Q6: delete the banner entirely).
+    ///
+    /// The trait method survives because the TUI uses it to refill its
+    /// container slot when an interactive step takes over the terminal; the
+    /// CLI has no slot to refill and prints nothing. The INTERACTIVE-mode box
+    /// art that used to live here is gone from every frontend.
     fn report_step_interactive_launch(
         &mut self,
         _step: &WorkflowStep,
-        agent: &str,
+        _agent: &str,
         _model: Option<&str>,
     ) {
-        if self.non_interactive {
-            return;
-        }
-        eprintln!();
-        eprintln!("╔══════════════════════════════════════════════════════════════╗");
-        eprintln!("║                                                              ║");
-        eprintln!("║     ╦╔╗╔╔╦╗╔═╗╦═╗╔═╗╔═╗╔╦╗╦╦  ╦╔═╗  ╔╦╗╔═╗╔╦╗╔═╗             ║");
-        eprintln!("║     ║║║║ ║ ║╣ ╠╦╝╠═╣║   ║ ║╚╗╔╝║╣   ║║║║ ║ ║║║╣              ║");
-        eprintln!("║     ╩╝╚╝ ╩ ╚═╝╩╚═╩ ╩╚═╝ ╩ ╩ ╚╝ ╚═╝  ╩ ╩╚═╝═╩╝╚═╝             ║");
-        eprintln!("║                                                              ║");
-        let label = format!("║  Agent '{}' is launching in INTERACTIVE mode.", agent);
-        let pad = 64usize.saturating_sub(label.chars().count() + 1);
-        eprintln!("{}{}║", label, " ".repeat(pad));
-        eprintln!("║  You will need to quit the agent (Ctrl+C or exit)            ║");
-        eprintln!("║  when its work is complete.                                  ║");
-        eprintln!("║                                                              ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════╝");
-        eprintln!();
     }
 }
 

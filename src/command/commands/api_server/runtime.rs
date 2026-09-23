@@ -13,20 +13,12 @@ use super::queue_worker::{ApiCommandFrontendFactory, QueueWorker, QueueWorkerDep
 use super::ApiServeConfig;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::data::config::global::GlobalConfig;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRootResolver};
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupError, SessionSetupStatus};
-
-/// Bearer-auth state prepared during daemon bootstrap. HTTP only maps this
-/// typed decision onto headers and responses.
-#[derive(Clone)]
-pub enum AuthMode {
-    Enabled { key_hash: String },
-    Disabled,
-}
+use crate::engine::auth::AuthMode;
 
 /// Outcome of the one API session drain-and-close state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,12 +118,12 @@ impl ApiServerRuntime {
             }
         }
 
-        let auth_mode = resolve_auth_mode(
-            &paths.daemon(),
-            config.dangerously_skip_auth,
-            "awman api start --refresh-key",
-        )?;
-        let global_config = GlobalConfig::load().unwrap_or_default();
+        let auth_mode = engines
+            .auth_engine
+            .request_auth_mode(config.dangerously_skip_auth)?;
+        // The config the daemon's engine bundle was assembled from, not a
+        // fresh read: the two could otherwise see different files (F-31).
+        let global_config = (*engines.global_config).clone();
 
         // Restore in-memory sessions for any active sessions persisted in SQLite
         // from a previous server lifetime. This ensures session continuity across
@@ -404,25 +396,6 @@ fn readiness_from_state(
             status: other.as_str().to_string(),
         },
     }
-}
-
-fn resolve_auth_mode(
-    paths: &crate::data::fs::daemon_paths::DaemonPaths,
-    skip: bool,
-    refresh_hint: &str,
-) -> Result<AuthMode, CommandError> {
-    if skip {
-        return Ok(AuthMode::Disabled);
-    }
-    let key_hash = paths
-        .read_key_hash()
-        .map_err(CommandError::Data)?
-        .ok_or_else(|| {
-            CommandError::Other(format!(
-                "No API key hash on disk. Run `{refresh_hint}` to generate one."
-            ))
-        })?;
-    Ok(AuthMode::Enabled { key_hash })
 }
 
 #[cfg(test)]

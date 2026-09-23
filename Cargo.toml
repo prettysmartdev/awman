@@ -172,3 +172,11 @@ path = "tests/squad_env_cli.rs"
 [[test]]
 name = "squad_env_daemon"
 path = "tests/squad_env_daemon.rs"
+
+# WI 0114 tests-audit: this one still builds against the current API; the
+# other thirteen unregistered `tests/*.rs` files reference the pre-WI-0072
+# `oldsrc` surface (`awman::commands`, `awman::workflow`, `awman::tui`, …)
+# and are recorded as dead in `40-tests-audit.md`.
+[[test]]
+name = "dockerfile_build"
+path = "tests/dockerfile_build.rs"

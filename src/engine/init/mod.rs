@@ -3,13 +3,17 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::data::config::repo::RepoConfig;
+use crate::data::prompt::Prompt;
 use crate::data::session::{AgentName, Session};
+use crate::data::setup_step::{InitStep, SetupStep};
+use crate::data::step_status::StepStatus;
 use crate::engine::agent::AgentEngine;
-use crate::engine::container::ContainerRuntime;
+use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
+use crate::engine::init::frontend::DockerfileSetupChoice;
 use crate::engine::overlay::OverlayEngine;
-use crate::engine::step_status::StepStatus;
 
 pub mod frontend;
 pub mod phase;
@@ -24,13 +28,22 @@ pub struct InitEngineOptions {
     pub agent: AgentName,
     pub run_aspec_setup: bool,
     pub git_root: PathBuf,
+    /// The Dockerfile-setup question, built by Layer 2
+    /// (`command::prompts::dockerfile_setup`).
+    ///
+    /// An engine cannot name a Layer 2 type, so prompt copy reaches Layer 1
+    /// the way `src/data/prompt.rs` prescribes: as a plain Layer 0
+    /// `Prompt<D>` handed down through the options struct. It carries the
+    /// answer a dismissal means, which both frontends used to choose for
+    /// themselves (WI 0114 F-19).
+    pub dockerfile_setup_prompt: Prompt<DockerfileSetupChoice>,
 }
 
 pub struct InitEngine {
     session: Arc<Session>,
     git_engine: Arc<GitEngine>,
     overlay_engine: Arc<OverlayEngine>,
-    container_runtime: Arc<ContainerRuntime>,
+    runtime: Arc<dyn AgentRuntimeEngine>,
     agent_engine: Arc<AgentEngine>,
     options: InitEngineOptions,
     phase: InitPhase,
@@ -41,6 +54,16 @@ pub struct InitEngine {
     /// into the existing file (via `SavingDockerfileConfig`) or fold the
     /// dockerfile field into the fresh write performed by `WritingConfig`.
     config_existed_at_start: bool,
+    /// The repo config this run is building, held across phases.
+    ///
+    /// `init` is the one engine that legitimately re-reads the repo config
+    /// mid-run — it is the thing writing it. It used to do that with five
+    /// separate `RepoConfig::load(&git_root).unwrap_or_default()` calls
+    /// (WI 0114 F-31), which meant five chances to disagree and five silent
+    /// `unwrap_or_default`s swallowing a malformed file. It now loads once in
+    /// `Preflight`, mutates this copy, and saves it — the saved file and the
+    /// engine's view can no longer diverge.
+    repo_config: RepoConfig,
 }
 
 impl InitEngine {
@@ -48,7 +71,7 @@ impl InitEngine {
         session: Arc<Session>,
         git_engine: Arc<GitEngine>,
         overlay_engine: Arc<OverlayEngine>,
-        container_runtime: Arc<ContainerRuntime>,
+        runtime: Arc<dyn AgentRuntimeEngine>,
         agent_engine: Arc<AgentEngine>,
         options: InitEngineOptions,
     ) -> Self {
@@ -56,13 +79,14 @@ impl InitEngine {
             session,
             git_engine,
             overlay_engine,
-            container_runtime,
+            runtime,
             agent_engine,
             options,
             phase: InitPhase::Preflight,
             summary: InitSummary::default(),
             pending_dockerfile_path: None,
             config_existed_at_start: false,
+            repo_config: RepoConfig::default(),
         }
     }
 
@@ -78,7 +102,6 @@ impl InitEngine {
         &mut self,
         frontend: &mut dyn InitFrontend,
     ) -> Result<InitPhase, EngineError> {
-        use crate::data::config::repo::RepoConfig;
         use crate::data::image_tags::project_image_tag;
         use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
         use crate::data::templates;
@@ -93,6 +116,14 @@ impl InitEngine {
                 // Snapshot before creating .awman/ so we can tell whether
                 // config.json already existed when init began.
                 self.config_existed_at_start = RepoConfig::path(&git_root).exists();
+                // One load for the whole run (F-31). A malformed file is
+                // reported here, where the user can still see which file and
+                // why, rather than being silently defaulted away five times.
+                self.repo_config = if self.config_existed_at_start {
+                    RepoConfig::load(&git_root)?
+                } else {
+                    RepoConfig::default()
+                };
                 let awman_dir = git_root.join(".awman");
                 if let Err(e) = std::fs::create_dir_all(&awman_dir) {
                     tracing::warn!("failed to create .awman directory: {e}");
@@ -123,9 +154,10 @@ impl InitEngine {
                 // Always try to download the aspec template — this phase is only
                 // reached when --aspec is passed or the user confirmed replacement.
                 let mut downloaded = false;
-                match crate::data::network::download_aspec_tarball().await {
+                let downloader = crate::engine::aspec::AspecDownloader::canonical();
+                match downloader.download().await {
                     Ok(bytes) => {
-                        match crate::data::network::extract_aspec_tarball(&bytes, &aspec_dir) {
+                        match crate::engine::aspec::AspecDownloader::extract(&bytes, &aspec_dir) {
                             Ok(()) => downloaded = true,
                             Err(e) => {
                                 frontend.write_message(crate::data::message::UserMessage {
@@ -158,8 +190,7 @@ impl InitEngine {
                 InitPhase::SettingUpDockerfile
             }
             InitPhase::SettingUpDockerfile => {
-                let repo_config = RepoConfig::load(&git_root).unwrap_or_default();
-                let dockerfile_path = repo_config.dockerfile_path_or_default(&git_root);
+                let dockerfile_path = self.repo_config.dockerfile_path_or_default(&git_root);
                 if dockerfile_path.exists() {
                     self.summary.dockerfile = StepStatus::Done;
                     InitPhase::SettingUpAgentDockerfile
@@ -169,7 +200,16 @@ impl InitEngine {
             }
             InitPhase::AwaitingDockerfileDecision => {
                 use crate::engine::init::frontend::DockerfileSetupDecision;
-                match frontend.ask_dockerfile_setup(&git_root)? {
+                let dockerfile_display = self
+                    .repo_config
+                    .dockerfile
+                    .clone()
+                    .unwrap_or_else(|| "Dockerfile.dev".to_string());
+                match frontend.ask_dockerfile_setup(
+                    &self.options.dockerfile_setup_prompt,
+                    &git_root,
+                    &dockerfile_display,
+                )? {
                     DockerfileSetupDecision::CreateNew => {
                         let paths = RepoDockerfilePaths::new(&git_root);
                         let dockerfile_path = paths.project_dockerfile();
@@ -198,9 +238,8 @@ impl InitEngine {
                 }
             }
             InitPhase::SavingDockerfileConfig => {
-                let mut repo_cfg = RepoConfig::load(&git_root).unwrap_or_default();
-                repo_cfg.dockerfile = self.pending_dockerfile_path.take();
-                repo_cfg.save(&git_root)?;
+                self.repo_config.dockerfile = self.pending_dockerfile_path.take();
+                self.repo_config.save(&git_root)?;
                 self.summary.dockerfile = StepStatus::Done;
                 InitPhase::SettingUpAgentDockerfile
             }
@@ -260,41 +299,38 @@ impl InitEngine {
             InitPhase::BuildingImage => {
                 // Issue 16: Docker daemon pre-check — soft failure allows
                 // run_to_completion to surface a summary rather than aborting.
-                if !self.container_runtime.is_available() {
+                if !self.runtime.is_available() {
                     let msg = "Docker daemon is not running. Install Docker and retry.".to_string();
                     self.summary.image_build = StepStatus::Failed(msg.clone());
                     self.summary.audit = StepStatus::Skipped;
                     self.summary.agent_image_build = StepStatus::Skipped;
                     self.summary.image_rebuild = StepStatus::Skipped;
-                    frontend.report_step_status("Build image", StepStatus::Failed(msg));
+                    frontend
+                        .report_step_status(&InitStep::BuildImage.into(), StepStatus::Failed(msg));
                     return Ok(InitPhase::AwaitingWorkItemsDecision);
                 }
 
-                let repo_cfg = RepoConfig::load(&git_root).unwrap_or_default();
-                let dockerfile_path = repo_cfg.dockerfile_path_or_default(&git_root);
+                let dockerfile_path = self.repo_config.dockerfile_path_or_default(&git_root);
                 let tag = project_image_tag(&git_root);
-                frontend.report_step_status("Build base image", StepStatus::Running);
+                frontend.report_step_status(&InitStep::BuildBaseImage.into(), StepStatus::Running);
                 let mut sink = |line: &str| {
-                    frontend.report_step_status(line, StepStatus::Running);
+                    frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                 };
-                let result = self.container_runtime.build_image(
-                    &tag,
-                    &dockerfile_path,
-                    &git_root,
-                    false,
-                    &mut sink,
-                );
+                let result =
+                    self.runtime
+                        .build_image(&tag, &dockerfile_path, &git_root, false, &mut sink);
                 match result {
                     Ok(()) => {
                         self.summary.image_build = StepStatus::Done;
-                        frontend.report_step_status("Build base image", StepStatus::Done);
+                        frontend
+                            .report_step_status(&InitStep::BuildBaseImage.into(), StepStatus::Done);
                         InitPhase::BuildingAgentImage
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         self.summary.image_build = StepStatus::Failed(msg.clone());
                         frontend.report_step_status(
-                            "Build base image",
+                            &InitStep::BuildBaseImage.into(),
                             StepStatus::Failed(msg.clone()),
                         );
                         // Skip audit; nothing to audit without a base image.
@@ -314,11 +350,12 @@ impl InitEngine {
                 let agent_tag = agent_image_tag(&git_root, self.options.agent.as_str());
 
                 if agent_dockerfile.exists() {
-                    frontend.report_step_status("Build agent image", StepStatus::Running);
+                    frontend
+                        .report_step_status(&InitStep::BuildAgentImage.into(), StepStatus::Running);
                     let mut sink = |line: &str| {
-                        frontend.report_step_status(line, StepStatus::Running);
+                        frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                     };
-                    let result = self.container_runtime.build_image(
+                    let result = self.runtime.build_image(
                         &agent_tag,
                         &agent_dockerfile,
                         &git_root,
@@ -328,13 +365,18 @@ impl InitEngine {
                     match result {
                         Ok(()) => {
                             self.summary.agent_image_build = StepStatus::Done;
-                            frontend.report_step_status("Build agent image", StepStatus::Done);
+                            frontend.report_step_status(
+                                &InitStep::BuildAgentImage.into(),
+                                StepStatus::Done,
+                            );
                         }
                         Err(e) => {
                             let msg = e.to_string();
                             self.summary.agent_image_build = StepStatus::Failed(msg.clone());
-                            frontend
-                                .report_step_status("Build agent image", StepStatus::Failed(msg));
+                            frontend.report_step_status(
+                                &InitStep::BuildAgentImage.into(),
+                                StepStatus::Failed(msg),
+                            );
                         }
                     }
                 } else {
@@ -384,11 +426,8 @@ impl InitEngine {
                         });
                     }
                     Ok(options) => {
-                        match crate::engine::container::options::ResolvedContainerOptions::resolve(
-                            options,
-                        )
-                        .map_err(crate::engine::error::EngineError::from)
-                        .and_then(|o| self.container_runtime.build(o))
+                        match ResolvedAgentOptions::container(options)
+                            .and_then(|o| self.runtime.build(o))
                         {
                             Err(e) => {
                                 self.summary.audit = StepStatus::Skipped;
@@ -433,15 +472,17 @@ impl InitEngine {
             // Issue 12: Post-audit image rebuild in init.
             InitPhase::RebuildingAfterAudit => {
                 if matches!(self.summary.audit, StepStatus::Done) {
-                    let repo_cfg = RepoConfig::load(&git_root).unwrap_or_default();
-                    let dockerfile_path = repo_cfg.dockerfile_path_or_default(&git_root);
+                    let dockerfile_path = self.repo_config.dockerfile_path_or_default(&git_root);
                     let paths = RepoDockerfilePaths::new(&git_root);
                     let tag = project_image_tag(&git_root);
-                    frontend.report_step_status("Rebuilding after audit", StepStatus::Running);
+                    frontend.report_step_status(
+                        &InitStep::RebuildingAfterAudit.into(),
+                        StepStatus::Running,
+                    );
                     let mut sink = |line: &str| {
-                        frontend.report_step_status(line, StepStatus::Running);
+                        frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                     };
-                    let result = self.container_runtime.build_image(
+                    let result = self.runtime.build_image(
                         &tag,
                         &dockerfile_path,
                         &git_root,
@@ -451,13 +492,16 @@ impl InitEngine {
                     match result {
                         Ok(()) => {
                             self.summary.image_rebuild = StepStatus::Done;
-                            frontend.report_step_status("Rebuilding after audit", StepStatus::Done);
+                            frontend.report_step_status(
+                                &InitStep::RebuildingAfterAudit.into(),
+                                StepStatus::Done,
+                            );
                         }
                         Err(e) => {
                             let msg = e.to_string();
                             self.summary.image_rebuild = StepStatus::Failed(msg.clone());
                             frontend.report_step_status(
-                                "Rebuilding after audit",
+                                &InitStep::RebuildingAfterAudit.into(),
                                 StepStatus::Failed(msg),
                             );
                         }
@@ -469,9 +513,12 @@ impl InitEngine {
                         if agent_dockerfile.exists() {
                             let agent_tag = agent_image_tag(&git_root, self.options.agent.as_str());
                             let mut agent_sink = |line: &str| {
-                                frontend.report_step_status(line, StepStatus::Running);
+                                frontend.report_step_status(
+                                    &SetupStep::output(line),
+                                    StepStatus::Running,
+                                );
                             };
-                            let _ = self.container_runtime.build_image(
+                            let _ = self.runtime.build_image(
                                 &agent_tag,
                                 &agent_dockerfile,
                                 &git_root,
@@ -493,9 +540,8 @@ impl InitEngine {
                 } else {
                     let cfg = frontend.ask_work_items_setup()?;
                     if let Some(work_items) = cfg {
-                        let mut repo_cfg = RepoConfig::load(&git_root)?;
-                        repo_cfg.set_work_items_config(Some(work_items));
-                        repo_cfg.save(&git_root)?;
+                        self.repo_config.set_work_items_config(Some(work_items));
+                        self.repo_config.save(&git_root)?;
                         InitPhase::WritingWorkItemsConfig
                     } else {
                         self.summary.work_items_setup = StepStatus::Skipped;
@@ -538,9 +584,28 @@ mod tests {
     use crate::data::config::repo::WorkItemsConfig;
     use crate::data::message::{UserMessage, UserMessageSink};
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+    use crate::data::step_status::StepStatus;
     use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
     use crate::engine::overlay::OverlayEngine;
-    use crate::engine::step_status::StepStatus;
+
+    /// A stand-in for the prompt Layer 2 hands down.
+    ///
+    /// Built here rather than imported from `command::prompts`: Layer 1 may
+    /// not name a Layer 2 item, and `#[cfg(test)]` code is not exempt from
+    /// that. These tests drive the engine's phase machine and answer through
+    /// `FakeInitFrontend::dockerfile_decision`, so only the shape matters.
+    fn test_dockerfile_prompt() -> Prompt<DockerfileSetupChoice> {
+        Prompt::new(
+            "test",
+            "",
+            vec![crate::data::prompt::Choice::new(
+                '1',
+                "create",
+                DockerfileSetupChoice::CreateNew,
+            )],
+            Some(DockerfileSetupChoice::CreateNew),
+        )
+    }
 
     // -- Fake frontend --------------------------------------------------------
 
@@ -609,7 +674,9 @@ mod tests {
 
         fn ask_dockerfile_setup(
             &mut self,
+            _prompt: &Prompt<DockerfileSetupChoice>,
             _git_root: &std::path::Path,
+            _dockerfile_path: &str,
         ) -> Result<crate::engine::init::frontend::DockerfileSetupDecision, EngineError> {
             Ok(self.dockerfile_decision.clone())
         }
@@ -618,13 +685,15 @@ mod tests {
             self.phases.push(phase.clone());
         }
 
-        fn report_step_status(&mut self, _step: &str, _status: StepStatus) {}
+        fn report_summary(&mut self, _: &InitSummary) {}
+    }
+
+    impl crate::engine::agent::AgentImageFrontend for FakeInitFrontend {
+        fn report_step_status(&mut self, _step: &SetupStep, _status: StepStatus) {}
 
         fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
             Box::new(FakeRuntimeFrontend)
         }
-
-        fn report_summary(&mut self, _: &InitSummary) {}
     }
 
     // -- Helpers --------------------------------------------------------------
@@ -647,7 +716,8 @@ mod tests {
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(git_root),
         ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            Arc::new(crate::engine::container::ContainerRuntime::docker());
         let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
             Arc::clone(&overlay),
             Arc::clone(&runtime),
@@ -656,6 +726,7 @@ mod tests {
             agent: AgentName::new("claude").unwrap(),
             run_aspec_setup: false,
             git_root: git_root.to_path_buf(),
+            dockerfile_setup_prompt: test_dockerfile_prompt(),
         };
         InitEngine::new(
             session,
@@ -1008,7 +1079,8 @@ mod tests {
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
         ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            Arc::new(crate::engine::container::ContainerRuntime::docker());
         let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
             Arc::clone(&overlay),
             Arc::clone(&runtime),
@@ -1023,6 +1095,7 @@ mod tests {
                 agent: crate::data::session::AgentName::new("claude").unwrap(),
                 run_aspec_setup: false,
                 git_root: tmp.path().to_path_buf(),
+                dockerfile_setup_prompt: test_dockerfile_prompt(),
             },
         );
 

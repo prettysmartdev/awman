@@ -14,9 +14,8 @@ pub fn is_tui_active() -> bool {
 }
 
 use crate::command::dispatch::catalogue::CommandCatalogue;
-use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
+use crate::command::dispatch::RuntimeContext;
 use crate::data::session_manager::SessionManager;
-use crate::frontend::cli::RuntimeContext;
 
 pub mod acp_view;
 pub mod app;
@@ -45,7 +44,7 @@ pub mod user_message;
 pub mod workflow_view;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use app::{App, SquadTabStart};
 use dialogs::Dialog;
@@ -104,12 +103,9 @@ pub async fn run(
                 // First run: the bearer key was minted a moment ago and lives
                 // only in memory. Show it before the event loop starts.
                 if let Some(key_setup) = key_setup {
-                    app.active_dialog = Some(Dialog::Notice {
-                        title: "squad authentication".to_string(),
-                        body: key_setup.body,
-                        copy_key: Some(key_setup.key),
-                        copy_zshrc_snippet: Some(key_setup.zshrc_snippet),
-                    });
+                    app.active_dialog = Some(crate::frontend::tui::per_command::key_setup_dialog(
+                        &key_setup,
+                    ));
                 }
                 (app, false)
             }
@@ -159,31 +155,8 @@ pub async fn run(
     // Auto-spawn startup command: `ready` for git repos, `status --watch`
     // for non-git directories. Skipped entirely for the squad tab.
     if run_startup_spawn {
-        let is_git = app.active_tab().session.git_root().join(".git").exists();
-        if is_git {
-            app.spawn_command(
-                "ready",
-                ParsedCommandBoxInput {
-                    path: vec!["ready".into()],
-                    flags: Default::default(),
-                    arguments: Default::default(),
-                },
-            );
-        } else {
-            let mut flags = std::collections::BTreeMap::new();
-            flags.insert(
-                "watch".to_string(),
-                crate::command::dispatch::parsed_input::FlagValue::Bool(true),
-            );
-            app.spawn_command(
-                "status --watch",
-                ParsedCommandBoxInput {
-                    path: vec!["status".into()],
-                    flags,
-                    arguments: Default::default(),
-                },
-            );
-        }
+        let startup = app.catalogue.startup_command(&app.active_tab().session);
+        app.spawn_command(startup);
     }
 
     // WI 0112: the bottom-row squad indicator probes the daemon for the

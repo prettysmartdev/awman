@@ -19,17 +19,19 @@ use async_trait::async_trait;
 
 use crate::command::commands::dynamic_repair::{RepairDecision, WorkflowRepairLoop};
 use crate::command::commands::exec_workflow::{
-    build_effective_agents_to_models, ensure_agent_image_with_build_output,
-    format_agents_with_models, format_available_agents, validate_generated_workflow,
-    BuildOutputTarget, ExecWorkflowCommand, ExecWorkflowCommandFlags, ExecWorkflowCommandFrontend,
-    LeaderSpec,
+    parse_leader_flag, ExecWorkflowCommand, ExecWorkflowCommandFlags, ExecWorkflowCommandFrontend,
 };
+// Decision Q13 (WI 0114 F-51): the shared preflight helpers are their own
+// module, so the evaluator no longer reaches into `exec_workflow` for them.
 use crate::command::commands::mount_scope::MountScopeDecision;
 use crate::command::commands::squad::overlay_summary::overlay_inventory;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
-use crate::command::commands::{
-    collect_all_overlay_specs, parse_overlay_list, CollectedOverlays, Command,
+use crate::command::commands::workflow_preflight::{
+    build_effective_agents_to_models, ensure_agent_image_with_build_output,
+    format_agents_with_models, format_available_agents, validate_generated_workflow,
+    BuildOutputTarget,
 };
+use crate::command::commands::{parse_overlay_list, CollectedOverlays, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::config::env::EnvSnapshot;
@@ -37,7 +39,7 @@ use crate::data::dynamic_workflow_assets::build_squad_leader_prompt;
 use crate::data::fs::task_store::{MountScope, Task};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session, SessionOpenOptions};
-use crate::data::EngineWorkflowStateStore;
+use crate::data::WorkflowStateStore;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::container::options::OverlayPermission;
@@ -60,13 +62,22 @@ pub const TASK_DIR_CONTAINER_PATH: &str = "/awman/context/workflow";
 /// implementation that never prompts and never blocks.
 pub trait SquadRunFrontends: Send + Sync {
     /// A frontend for one leader/repair agent launch. `label` is the repair
-    /// loop's attempt label (`leader`, `leader-repair-1`, …).
+    /// loop's attempt label (`leader`, `leader-repair-1`, …). `mount_scope`
+    /// is the same scope `workflow_frontend` receives — the one captured when
+    /// the task was created, which the frontend answers with and never widens.
+    ///
+    /// The parameter exists because the alternative is a frontend choosing it:
+    /// `UnattendedFrontends` used to pass `MountGitRoot` from Layer 3, which
+    /// meant which directory a squad *leader* mounts was decided by a frontend
+    /// literal and was invisible to the headless-profile table (Q4: a decision
+    /// left in `src/frontend/squad/` is wrong).
     fn leader_frontend(
         &self,
         task: &str,
         run_id: &crate::data::fs::RunId,
         run_log_dir: &Path,
         label: &str,
+        mount_scope: MountScopeDecision,
     ) -> Result<Box<dyn AgentFrontend>, CommandError>;
 
     /// A frontend for executing the generated workflow. `mount_scope` is the
@@ -267,7 +278,7 @@ pub fn resolve_leader(
     agents_to_models: Option<&std::collections::HashMap<String, Vec<String>>>,
     session_default_agent: Option<&str>,
 ) -> Result<ResolvedLeader, CommandError> {
-    let fallback = default_leader.map(LeaderSpec::parse).transpose()?;
+    let fallback = default_leader.map(parse_leader_flag).transpose()?;
 
     let agent = task
         .agent
@@ -372,7 +383,7 @@ impl LocalTaskEvaluator {
     /// images layer on top of.
     ///
     /// The file writes are create-if-missing (see
-    /// [`ensure_directory_workspace_project`]), so nothing already in the
+    /// [`SquadAgentLauncher::ensure_directory_workspace_project`]), so nothing already in the
     /// durable workspace is touched. The base-image build is the same
     /// `image_exists` → `build_image` pattern
     /// [`ensure_agent_image`] uses one layer up; agent images themselves are
@@ -384,7 +395,7 @@ impl LocalTaskEvaluator {
         sink: &mut dyn UserMessageSink,
         build_logs: &mut SquadBuildLogs,
     ) -> Result<(), CommandError> {
-        crate::engine::squad::ensure_directory_workspace_project(root, agents)
+        crate::engine::squad::SquadAgentLauncher::ensure_directory_workspace_project(root, agents)
             .map_err(CommandError::from)?;
 
         let runtime = self
@@ -491,6 +502,14 @@ impl LocalTaskEvaluator {
             session.default_agent().map(|a| a.as_str()),
         )?;
         let agent = AgentName::new(leader.agent.clone()).map_err(CommandError::Data)?;
+        // Tell the scheduler which agent/model this run actually uses, so its
+        // running-agent log reports the resolution rather than re-deriving it
+        // (F-46).
+        request.progress.leader_resolved(
+            &task.name,
+            leader.agent.as_str(),
+            leader.model.as_deref(),
+        );
         // WI 0110: build an image for every agent in the task's effective pool,
         // not just the leader's. The leader picks its generated workflow's step
         // agents from the listing it was shown, so an unbuilt pool agent would
@@ -602,6 +621,7 @@ impl LocalTaskEvaluator {
                         &request.run_id,
                         &request.run_log_dir,
                         &label,
+                        mount_scope_decision(task.mount_scope),
                     )?,
                 )
                 .await
@@ -923,7 +943,7 @@ impl LocalTaskEvaluator {
             .git_engine
             .resolve_root(&worktree)
             .unwrap_or(worktree);
-        Ok(EngineWorkflowStateStore::at_git_root(state_root).state_path(None, workflow_name))
+        Ok(WorkflowStateStore::at_git_root(state_root).state_path(None, workflow_name))
     }
 }
 
@@ -954,7 +974,7 @@ impl TaskEvaluator for LocalTaskEvaluator {
 /// each run, so it can neither carry stale state forward nor erase anything
 /// the leader or its workflow wrote.
 fn directory_workspace_state_path(run_log_dir: &Path, workflow_name: &str) -> PathBuf {
-    EngineWorkflowStateStore::at_git_root(run_log_dir.to_path_buf()).state_path(None, workflow_name)
+    WorkflowStateStore::at_git_root(run_log_dir.to_path_buf()).state_path(None, workflow_name)
 }
 
 /// The task's fully-merged overlay set: its own `overlays` on top of the
@@ -978,7 +998,10 @@ fn collect_task_overlays(
             }
         })?);
     }
-    collect_all_overlay_specs(session, cli_typed, None, None)
+    session
+        .effective_config()
+        .collected_overlays(cli_typed, None, None)
+        .map_err(CommandError::from)
 }
 
 /// The flags a squad-generated workflow always run with: interactive PTY mode
@@ -1042,7 +1065,7 @@ fn mount_scope_decision(scope: MountScope) -> MountScopeDecision {
 /// missing, so an image-exists fast path never leaves an empty file behind).
 pub(crate) struct SquadBuildLogs {
     task: String,
-    dir: std::path::PathBuf,
+    paths: crate::data::fs::SquadPaths,
     run_id: String,
     seq: u32,
     current: Option<(std::path::PathBuf, std::fs::File)>,
@@ -1055,16 +1078,9 @@ impl SquadBuildLogs {
         run_id: &crate::data::fs::RunId,
     ) -> Result<Self, CommandError> {
         let paths = crate::data::fs::SquadPaths::from_env(env).map_err(CommandError::Data)?;
-        let dir = paths.task_builds_dir(task).map_err(CommandError::Data)?;
-        std::fs::create_dir_all(&dir).map_err(|error| {
-            CommandError::Other(format!(
-                "preparing squad build-log directory {}: {error}",
-                dir.display()
-            ))
-        })?;
         Ok(Self {
             task: task.to_string(),
-            dir,
+            paths,
             run_id: run_id.as_str().to_string(),
             seq: 0,
             current: None,
@@ -1075,9 +1091,9 @@ impl SquadBuildLogs {
 impl BuildOutputTarget for SquadBuildLogs {
     fn begin(&mut self, image: &str) {
         self.seq += 1;
-        let path = self.dir.join(format!("{}-{}.log", self.run_id, self.seq));
-        match std::fs::File::create(&path) {
-            Ok(file) => {
+        // Layer 0 owns the directory, the filename and the create (F-47).
+        match self.paths.build_log(&self.task, &self.run_id, self.seq) {
+            Ok((path, file)) => {
                 tracing::info!(
                     task = %self.task,
                     image,
@@ -1092,7 +1108,6 @@ impl BuildOutputTarget for SquadBuildLogs {
                 tracing::error!(
                     task = %self.task,
                     image,
-                    log_path = %path.display(),
                     error = %error,
                     "squad failed to open container image build log"
                 );

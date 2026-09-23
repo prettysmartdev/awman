@@ -197,3 +197,225 @@ fn real_git_worktree_create_merge_remove_cycle() {
         "worktree dir must be gone after remove_worktree"
     );
 }
+
+// ─── Identity probe (F-39) ───────────────────────────────────────────────────
+//
+// `identity_configured` runs `git config` *at a path*, so a repo-local
+// identity is honoured. The pre-F-39 probe in `exec_workflow.rs` ran
+// `git config` with no working directory and only ever saw the global value,
+// which meant a correctly-configured repo still got the "git identity not
+// set" warning before every `commit_changes` teardown.
+//
+// These tests isolate the global level with `HOME`/`XDG_CONFIG_HOME` pointed
+// at a scratch directory and `GIT_CONFIG_*` overrides cleared, so the host's
+// real `~/.gitconfig` cannot decide the outcome.
+
+/// A bare repo with no identity of its own, plus a scratch `HOME` whose
+/// global git config is whatever `global` says (`None` = no global config).
+fn repo_with_isolated_global(
+    global: Option<(&str, &str)>,
+) -> (tempfile::TempDir, PathBuf, Vec<(&'static str, String)>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let run = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .status()
+            .expect("git invocation");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run(&["init", "--initial-branch=main"]);
+
+    if let Some((name, email)) = global {
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[user]\n\tname = {name}\n\temail = {email}\n"),
+        )
+        .unwrap();
+    }
+
+    // `GitEngine` shells out without overriding the environment, so the
+    // scratch HOME has to be installed in this process for the probe to see
+    // it. Returned so the caller can restore.
+    let saved = vec![
+        ("HOME", std::env::var("HOME").unwrap_or_default()),
+        (
+            "XDG_CONFIG_HOME",
+            std::env::var("XDG_CONFIG_HOME").unwrap_or_default(),
+        ),
+        (
+            "GIT_CONFIG_GLOBAL",
+            std::env::var("GIT_CONFIG_GLOBAL").unwrap_or_default(),
+        ),
+        (
+            "GIT_CONFIG_SYSTEM",
+            std::env::var("GIT_CONFIG_SYSTEM").unwrap_or_default(),
+        ),
+    ];
+    std::env::set_var("HOME", &home);
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+    match global {
+        Some(_) => std::env::set_var("GIT_CONFIG_GLOBAL", home.join(".gitconfig")),
+        // `/dev/null` is git's documented way to say "no global config".
+        None => std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null"),
+    }
+    std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+
+    (tmp, repo, saved)
+}
+
+fn restore_env(saved: Vec<(&'static str, String)>) {
+    for (key, value) in saved {
+        if value.is_empty() {
+            std::env::remove_var(key);
+        } else {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
+/// Serialises the identity tests: they mutate process-wide `HOME`.
+static IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn real_git_identity_configured_reads_the_global_identity() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let _lock = IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, repo, saved) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
+
+    let identity = GitEngine::new().identity_configured(&repo).unwrap();
+    restore_env(saved);
+
+    assert_eq!(identity.name.as_deref(), Some("Global User"));
+    assert_eq!(identity.email.as_deref(), Some("global@x.test"));
+    assert!(identity.is_complete());
+    assert!(identity.missing_keys().is_empty());
+}
+
+#[test]
+fn real_git_identity_configured_prefers_the_repo_local_override() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let _lock = IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, repo, saved) = repo_with_isolated_global(Some(("Global User", "global@x.test")));
+
+    for args in [
+        ["config", "user.name", "Repo User"],
+        ["config", "user.email", "repo@x.test"],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("git invocation");
+        assert!(status.success());
+    }
+
+    let identity = GitEngine::new().identity_configured(&repo).unwrap();
+    restore_env(saved);
+
+    // This is the behaviour change: the old probe ran without a working
+    // directory and would have reported the global values here.
+    assert_eq!(identity.name.as_deref(), Some("Repo User"));
+    assert_eq!(identity.email.as_deref(), Some("repo@x.test"));
+}
+
+#[test]
+fn real_git_identity_configured_reports_both_keys_missing() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let _lock = IDENTITY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, repo, saved) = repo_with_isolated_global(None);
+
+    let identity = GitEngine::new().identity_configured(&repo).unwrap();
+    restore_env(saved);
+
+    assert_eq!(identity.name, None);
+    assert_eq!(identity.email, None);
+    assert!(!identity.is_complete());
+    assert_eq!(identity.missing_keys(), vec!["user.name", "user.email"]);
+}
+
+// ─── remote_effective_url (WI 0114 F-29) ─────────────────────────────────────
+
+/// Real-git: `remote_effective_url` is `git remote get-url`, so it applies the
+/// user's `url.*.insteadOf` rewrites, while `remote_url` reports the stored
+/// value. The `context(repo)` directory slug is derived from the former —
+/// Layer 0's `ContextDirResolver` used to shell `git remote get-url` itself
+/// (WI 0114 F-29), and a repository with an `insteadOf` rewrite must keep the
+/// context directory it already has.
+#[test]
+fn real_git_remote_effective_url_applies_insteadof_where_remote_url_does_not() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let run = |args: &[&str]| {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .status()
+            .expect("git invocation")
+            .success());
+    };
+    run(&["remote", "add", "origin", "gh:org/repo.git"]);
+    run(&["config", "url.https://github.com/.insteadOf", "gh:"]);
+
+    let engine = GitEngine::new();
+    assert_eq!(
+        engine.remote_url(tmp.path(), "origin").unwrap(),
+        "gh:org/repo.git",
+        "remote_url reports the stored value"
+    );
+    assert_eq!(
+        engine.remote_effective_url(tmp.path(), "origin"),
+        Some("https://github.com/org/repo.git".to_string()),
+        "remote_effective_url applies the insteadOf rewrite"
+    );
+}
+
+/// Real-git: no remote at all is `None`, which is what makes the context
+/// directory fall back to `_local/{dirname}`.
+#[test]
+fn real_git_remote_effective_url_is_none_without_a_remote() {
+    use crate::helpers::git_available;
+    if !git_available() {
+        eprintln!("SKIP: git not available — run on a host with git");
+        return;
+    }
+    use awman::engine::git::GitEngine;
+
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    assert_eq!(
+        GitEngine::new().remote_effective_url(tmp.path(), "origin"),
+        None
+    );
+}

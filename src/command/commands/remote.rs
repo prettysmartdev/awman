@@ -8,6 +8,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::engine::error::EngineError;
 
 /// Build a `RemoteClient` for `addr`, pinning the locally-stored self-signed
 /// cert when (a) the target is loopback AND (b) the cert PEM is on disk.
@@ -24,7 +25,7 @@ fn build_remote_client(
     } else {
         None
     };
-    RemoteClient::new_with_pinned_cert(addr, api_key, pinned.as_deref())
+    RemoteClient::new_with_pinned_cert(addr, api_key, pinned.as_deref()).map_err(CommandError::from)
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +110,26 @@ pub enum RemoteOutcome {
 /// non-interactive choices (first option / declined save) so API dispatch
 /// "just works"; CLI/TUI override to actually prompt.
 pub trait RemoteCommandFrontend: UserMessageSink + Send + Sync {
+    /// Present a remote session's ready summary.
+    ///
+    /// Data down, rendering in Layer 3 (WI 0114 F-23): this used to be a box
+    /// string composed here in Layer 2, from a third row list that did not
+    /// match either frontend's. The default writes one line per row through
+    /// the sink; a frontend that draws the local `ready` summary as a box
+    /// overrides it so a remote session looks like a local one.
+    fn report_ready_summary(&mut self, summary: &crate::data::ready_summary::ReadySummary) {
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("Ready Summary ({})", summary.runtime_name),
+        });
+        for (label, status) in summary.rows() {
+            self.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!("{label}: {}", status.label()),
+            });
+        }
+    }
+
     /// Choose one of multiple sessions reported by the server. Default: first.
     fn ask_session_picker(&mut self, sessions: &[String]) -> Result<String, CommandError> {
         sessions
@@ -286,7 +307,7 @@ async fn run_remote_exec(
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteExecOutcome, CommandError> {
     use crate::command::commands::remote_client::{ExecJobResponse, ExecutionEventSink};
-    use crate::data::execution_event::EventPayload;
+    use crate::data::execution_event::{CommandStatusKind, EventPayload};
 
     let subcommand_name = params.subcommand_name;
     let addr = resolve_addr(session, params.remote_addr)?;
@@ -402,7 +423,10 @@ async fn run_remote_exec(
                         if let Some(err) = error {
                             text.push_str(&format!(" ({err})"));
                         }
-                        let level = if status == "error" || status == "aborted" {
+                        let level = if matches!(
+                            status,
+                            CommandStatusKind::Error | CommandStatusKind::Aborted
+                        ) {
                             MessageLevel::Error
                         } else {
                             MessageLevel::Info
@@ -441,7 +465,7 @@ async fn run_remote_exec(
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(e);
+                    last_err = Some(CommandError::from(e));
                     if attempt == 0 && !interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                         sink.sink.write_message(UserMessage {
                             level: MessageLevel::Warning,
@@ -570,7 +594,7 @@ async fn run_session_start(
     session: &crate::data::session::Session,
     engines: &Engines,
     flags: RemoteSessionStartFlags,
-    frontend: &mut dyn UserMessageSink,
+    frontend: &mut dyn RemoteCommandFrontend,
 ) -> Result<RemoteOutcome, CommandError> {
     use crate::command::commands::remote_client::StartSessionRequest;
 
@@ -710,13 +734,10 @@ async fn run_session_start(
         match st.status {
             crate::data::session_setup_event::SessionSetupStatus::Ready => {
                 ctrlc_task.abort();
-                // Render the full ready summary box.
+                // The summary goes to the frontend as data; how it is drawn
+                // is Layer 3's (F-23). Layer 2 used to build the box itself.
                 if let Some(summary) = &st.ready_summary {
-                    let box_str = render_ready_summary(summary);
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: box_str,
-                    });
+                    frontend.report_ready_summary(summary);
                 }
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Success,
@@ -761,23 +782,6 @@ async fn run_session_start(
     }
 }
 
-/// Render the ReadySummary into a multi-line box similar to the CLI/TUI
-/// `ready` rendering. Uses `render_summary_box` from the CLI helpers.
-fn render_ready_summary(summary: &crate::engine::ready::summary::ReadySummary) -> String {
-    use crate::data::step_status::{render_summary_box, StepStatus};
-    let rows: Vec<(&str, &StepStatus)> = vec![
-        ("Dockerfile", &summary.dockerfile),
-        ("Base image", &summary.base_image),
-        ("Agent image", &summary.agent_image),
-        ("Local agent", &summary.local_agent),
-        ("Audit", &summary.audit),
-        ("Image rebuild", &summary.image_rebuild),
-        ("aspec/", &summary.aspec_folder),
-        ("Work items config", &summary.work_items_config),
-    ];
-    render_summary_box(&format!("Ready Summary ({})", summary.runtime_name), &rows)
-}
-
 async fn run_session_kill(
     session: &crate::data::session::Session,
     engines: &Engines,
@@ -797,8 +801,8 @@ async fn run_session_kill(
 
     match client.kill_session(&session_id).await {
         Ok(()) => {}
-        Err(CommandError::RemoteHttpStatus { status: 404, .. }) => {}
-        Err(CommandError::RemoteHttpStatus { status, body }) => {
+        Err(EngineError::RemoteHttpStatus { status: 404, .. }) => {}
+        Err(EngineError::RemoteHttpStatus { status, body }) => {
             return Err(CommandError::RemoteSessionKillFailed {
                 session_id,
                 reason: format!("HTTP {status}: {body}"),
@@ -826,40 +830,26 @@ async fn run_session_kill(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::env::EnvSnapshot;
-    use crate::data::session::{Session, SessionOpenOptions};
+    use crate::data::session::Session;
 
+    /// `AWMAN_CONFIG_HOME` is pinned at the (empty) fixture dir so the session
+    /// cannot fall through to the developer's real `~/.awman/config.json`,
+    /// which on a working machine may legitimately have `remote.defaultAddr`
+    /// set and would silently invalidate the "no source" assertions.
     fn make_session_empty() -> (tempfile::TempDir, Session) {
         let tmp = tempfile::tempdir().unwrap();
-        // Pin `AWMAN_CONFIG_HOME` at an empty tempdir so the session can't
-        // fall through to the developer's real `~/.awman/config.json` (which
-        // on a working machine may legitimately have `remote.defaultAddr`
-        // configured and would silently invalidate the "no source" assertion).
-        let env =
-            EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
-        let opts = SessionOpenOptions {
-            env: Some(env),
-            ..Default::default()
-        };
-        let session =
-            Session::open_at_git_root(tmp.path().to_path_buf(), tmp.path().to_path_buf(), opts)
-                .unwrap();
+        let session = Session::for_tests_isolated(tmp.path(), tmp.path());
         (tmp, session)
     }
 
     fn make_session_with_remote_addr(addr: &str) -> (tempfile::TempDir, Session) {
         let tmp = tempfile::tempdir().unwrap();
-        let config_json = format!(r#"{{"remote":{{"defaultAddr":"{addr}"}}}}"#);
-        std::fs::write(tmp.path().join("config.json"), &config_json).unwrap();
-        let env =
-            EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
-        let opts = SessionOpenOptions {
-            env: Some(env),
-            ..Default::default()
-        };
-        let session =
-            Session::open_at_git_root(tmp.path().to_path_buf(), tmp.path().to_path_buf(), opts)
-                .unwrap();
+        std::fs::write(
+            tmp.path().join("config.json"),
+            format!(r#"{{"remote":{{"defaultAddr":"{addr}"}}}}"#),
+        )
+        .unwrap();
+        let session = Session::for_tests_isolated(tmp.path(), tmp.path());
         (tmp, session)
     }
 

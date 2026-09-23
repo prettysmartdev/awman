@@ -1,100 +1,122 @@
 //! Shared helpers for CLI per-command frontend impls.
+//!
+//! Each reads from stdin and nothing more. None of them tests whether stdin
+//! is a terminal and none of them invents an answer when it is not: that is
+//! the pattern F-50 step 1 removes. Whether this run can ask a human at all
+//! is `CliFrontend::non_interactive` — one resolved flag, computed once from
+//! Layer 2's `ResolvedFlags::is_non_interactive` — and *what to answer* when
+//! it cannot is the CLI profile in `src/command/headless.rs`. An `ask_*` body
+//! consults those two before reaching for anything here.
+//!
+//! Every helper returns `None` when stdin ends without an answer (EOF or a
+//! read error), so a caller that has no headless answer to fall back on can
+//! raise `CommandError::InteractiveInputUnavailable` rather than proceed on a
+//! value nobody supplied.
 
-use crate::engine::step_status::StepStatus;
+use crate::data::step_status::StepStatus;
 
-use super::super::output::stdin_is_tty;
-
-/// Prompt the user with `[Y/n]` or `[y/N]` when stdin is a TTY.
-/// Returns `default_yes` immediately when stdin is not a TTY.
-pub fn yes_no(prompt: &str, default_yes: bool) -> bool {
-    if !stdin_is_tty() {
-        return default_yes;
+/// Read one line from stdin, or `None` at EOF / on a read error.
+fn read_raw_line() -> Option<String> {
+    let mut buf = String::new();
+    match std::io::stdin().read_line(&mut buf) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(buf),
     }
+}
+
+/// Prompt with `[Y/n]` or `[y/N]` and read the answer.
+///
+/// `default_yes` is the answer an empty line accepts — the one shown in
+/// upper case in the suffix. It is not a headless default: stdin ending
+/// without an answer is `None`.
+pub fn yes_no(prompt: &str, default_yes: bool) -> Option<bool> {
     let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
     eprintln!("awman: {prompt} {suffix}");
-    let mut buf = String::new();
-    if std::io::stdin().read_line(&mut buf).is_err() {
-        return default_yes;
-    }
-    match buf.trim() {
+    let buf = read_raw_line()?;
+    Some(match buf.trim() {
         "y" | "Y" => true,
         "n" | "N" => false,
         _ => default_yes,
+    })
+}
+
+/// Ask a yes/no question that has no default at all, re-asking until the
+/// answer is `y` or `n`. `None` at EOF / on a read error.
+///
+/// The form for a question nobody may answer on the user's behalf: the squad
+/// interview's confirmations have no `HeadlessDefaults` row, and the TUI's
+/// `DialogRequest::YesNo` has no Enter-default either, so neither frontend
+/// invents one (F-19).
+pub fn yes_no_required(prompt: &str) -> Option<bool> {
+    loop {
+        eprintln!("awman: {prompt} [y/n]");
+        match read_raw_line()?.trim() {
+            "y" | "Y" => return Some(true),
+            "n" | "N" => return Some(false),
+            _ => eprintln!("awman: please answer y or n."),
+        }
     }
 }
 
-/// Read a single line from stdin when stdin is a TTY. Returns the trimmed
-/// content. Returns `None` when stdin is not a TTY (so callers can fall back
-/// to safe defaults).
+/// Read a single line from stdin and return the trimmed content, or `None`
+/// at EOF / on a read error.
 pub fn read_line(prompt: &str) -> Option<String> {
-    if !stdin_is_tty() {
-        return None;
-    }
     eprintln!("awman: {prompt}");
-    let mut buf = String::new();
-    if std::io::stdin().read_line(&mut buf).is_err() {
-        return None;
-    }
-    Some(buf.trim().to_string())
+    Some(read_raw_line()?.trim().to_string())
 }
 
-/// Read multiple lines from stdin until a blank line or EOF (Ctrl+D).
-/// Returns the collected text with embedded newlines. Returns `None` when
-/// stdin is not a TTY.
+/// Read lines from stdin until a blank line or EOF (Ctrl+D), joined with
+/// newlines. `None` only when stdin could not be read at all.
 pub fn read_multiline(prompt: &str) -> Option<String> {
     use std::io::BufRead as _;
-    if !stdin_is_tty() {
-        return None;
-    }
     eprintln!("awman: {prompt}");
     eprintln!("awman: (enter a blank line or press Ctrl+D when done)");
     let stdin = std::io::stdin();
     let mut lines: Vec<String> = Vec::new();
+    let mut read_anything = false;
     for line in stdin.lock().lines() {
         match line {
-            Ok(l) if l.is_empty() => break,
-            Ok(l) => lines.push(l),
+            Ok(l) if l.is_empty() => {
+                read_anything = true;
+                break;
+            }
+            Ok(l) => {
+                read_anything = true;
+                lines.push(l);
+            }
             Err(_) => break,
         }
     }
-    Some(lines.join("\n"))
+    read_anything.then(|| lines.join("\n"))
 }
 
-/// Present a numbered menu and return the 1-based index chosen by the user.
-/// Returns `default` when stdin is not a TTY or when the input is empty/invalid.
-pub fn pick_numbered(prompt: &str, options: &[&str], default: usize) -> usize {
-    if !stdin_is_tty() {
-        return default;
-    }
+/// Present a numbered menu and return the 1-based index chosen.
+///
+/// `default` is what an empty or unparseable line accepts — the value shown
+/// in the `Choice [n]:` hint. `None` at EOF / on a read error.
+pub fn pick_numbered(prompt: &str, options: &[&str], default: usize) -> Option<usize> {
     eprintln!("awman: {prompt}");
     for (i, opt) in options.iter().enumerate() {
         eprintln!("  [{}] {opt}", i + 1);
     }
     eprint!("Choice [{}]: ", default);
     let _ = std::io::Write::flush(&mut std::io::stderr());
-    let mut buf = String::new();
-    if std::io::stdin().read_line(&mut buf).is_err() {
-        return default;
-    }
+    let buf = read_raw_line()?;
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return default;
+        return Some(default);
     }
-    trimmed.parse::<usize>().unwrap_or(default)
+    Some(trimmed.parse::<usize>().unwrap_or(default))
 }
 
 pub fn step_status_label(status: &StepStatus) -> String {
     status.label()
 }
 
-pub fn render_summary_box(title: &str, rows: &[(&str, &StepStatus)]) -> String {
-    crate::data::step_status::render_summary_box(title, rows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::step_status::StepStatus;
+    use crate::data::step_status::StepStatus;
 
     #[test]
     fn step_status_label_all_variants() {
@@ -110,32 +132,5 @@ mod tests {
             step_status_label(&StepStatus::Failed("out of disk".into())),
             "failed: out of disk"
         );
-    }
-
-    #[test]
-    fn render_summary_box_contains_title_and_row_labels() {
-        let failed = StepStatus::Failed("timeout".into());
-        let rows: Vec<(&str, &StepStatus)> = vec![
-            ("Base image", &StepStatus::Done),
-            ("Audit", &StepStatus::Skipped),
-            ("Build", &failed),
-        ];
-        let s = render_summary_box("Test Summary", &rows);
-        assert!(s.contains("Test Summary"), "title must appear in box: {s}");
-        assert!(s.contains("Base image"), "row label must appear: {s}");
-        assert!(s.contains("Audit"), "row label must appear: {s}");
-        assert!(s.contains("done"), "Done status must appear: {s}");
-        assert!(s.contains("skipped"), "Skipped status must appear: {s}");
-        assert!(s.contains("failed"), "Failed status must appear: {s}");
-    }
-
-    #[test]
-    fn render_summary_box_has_border_characters() {
-        let rows: Vec<(&str, &StepStatus)> = vec![("Step", &StepStatus::Done)];
-        let s = render_summary_box("Box", &rows);
-        assert!(s.contains('┌'), "must contain top-left corner");
-        assert!(s.contains('┐'), "must contain top-right corner");
-        assert!(s.contains('└'), "must contain bottom-left corner");
-        assert!(s.contains('┘'), "must contain bottom-right corner");
     }
 }

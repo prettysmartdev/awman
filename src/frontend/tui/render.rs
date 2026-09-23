@@ -44,7 +44,11 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     let (wf_state, overview_state, container_state, has_summary, git_sidebar_state, slot_count) = {
         let tab = app.active_tab();
         (
-            tab.workflow_state.lock().ok().and_then(|g| g.clone()),
+            tab.shared
+                .workflow_state
+                .lock()
+                .ok()
+                .and_then(|g| g.clone()),
             tab.workflow_overview_state,
             tab.container_window_state,
             tab.last_container_summary.is_some(),

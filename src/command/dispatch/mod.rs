@@ -12,11 +12,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFrontend};
-use crate::command::commands::auth::AuthCommandFrontend;
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
-use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFrontend};
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFrontend};
 use crate::command::commands::init::{InitCommand, InitCommandFrontend};
@@ -33,17 +31,18 @@ use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::commands::squad::supervisor::SquadGatewayResolver;
 use crate::command::commands::status::{StatusCommand, StatusCommandFrontend};
 use crate::command::commands::Command;
-use crate::command::dispatch::catalogue::{CommandCatalogue, GatewayNeed};
+use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
 use crate::data::config::global::GlobalConfig;
 use crate::data::config::EffectiveConfig;
-use crate::data::fs::{ApiPaths, AuthPathResolver, DaemonKind, DataPaths, SquadPaths};
+use crate::data::fs::{ApiPaths, AuthPathResolver, DataPaths, SquadPaths};
 use crate::data::message::UserMessageSink;
 use crate::data::session::Session;
 use crate::engine::agent::AgentEngine;
 use crate::engine::agent_runtime::{self, AgentRuntimeEngine, DetectedRuntime};
 use crate::engine::auth::AuthEngine;
 use crate::engine::container::ContainerRuntime;
+use crate::engine::daemon::DaemonKind;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -51,28 +50,51 @@ use crate::engine::sandbox::SandboxRuntime;
 
 pub mod build;
 pub mod catalogue;
+pub mod frontend_action;
 pub mod parsed_input;
 pub mod projections;
 pub mod resolved;
+pub mod runtime_context;
 
+pub use frontend_action::FrontendAction;
 pub use parsed_input::ParsedCommandBoxInput;
 pub use resolved::{BuildContext, CallerContext, ResolvedArgs, ResolvedFlags};
+pub use runtime_context::RuntimeContext;
 
-/// Install the process-wide live credential monitor for this command session.
-/// The container backends intentionally have no command/session dependency, so
-/// this is the one command-layer bridge to their global no-op hook.
-pub fn install_credential_refresh(config: &EffectiveConfig) {
+/// Build the live credential monitor this engine bundle's launches register
+/// leases with, or `None` when `authRefresh.enabled` is false.
+///
+/// Before WI 0114 F-38 this installed a process-global `OnceLock` that the
+/// container backends reached behind everybody's back, and "no monitor
+/// installed" was how the kill switch was implemented. The monitor is now
+/// carried explicitly — attached to `AgentEngine` here, emitted onto
+/// `ResolvedContainerOptions` at build-options time, and read by the backends
+/// from the options they were handed. `None` means leases are disabled,
+/// exactly as an uninstalled global did.
+pub fn credential_refresh_monitor(
+    config: &EffectiveConfig,
+) -> Option<Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>> {
     let settings = config.auth_refresh();
-    if settings.enabled {
-        crate::engine::credential_refresh::install_global(
-            crate::engine::credential_refresh::CredentialRefreshMonitor::new(
-                crate::engine::credential_refresh::MonitorConfig {
-                    refresh_threshold: settings.threshold,
-                    tick_interval: settings.tick,
-                },
-            ),
-        );
+    if !settings.enabled {
+        return None;
     }
+    Some(
+        crate::engine::credential_refresh::CredentialRefreshMonitor::new(
+            crate::engine::credential_refresh::MonitorConfig {
+                refresh_threshold: settings.threshold,
+                tick_interval: settings.tick,
+            },
+        ),
+    )
+}
+
+/// The lease-factory handle for a monitor, or `None` when there is none.
+fn lease_factory_for(
+    monitor: Option<&Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>>,
+) -> Option<crate::engine::credential_refresh::LeaseFactoryHandle> {
+    monitor.map(|m| {
+        crate::engine::credential_refresh::LeaseFactoryHandle::new(Arc::new(Arc::clone(m)))
+    })
 }
 
 // ─── Pre-wired engines bundle ───────────────────────────────────────────────
@@ -102,7 +124,30 @@ pub struct Engines {
     pub overlay_engine: Arc<OverlayEngine>,
     pub auth_engine: Arc<AuthEngine>,
     pub agent_engine: Arc<AgentEngine>,
-    pub workflow_state_store: Arc<crate::data::EngineWorkflowStateStore>,
+    pub workflow_state_store: Arc<crate::data::WorkflowStateStore>,
+
+    /// The live credential-refresh monitor, or `None` when
+    /// `authRefresh.enabled` is false. Built once per engine bundle (F-38
+    /// replaced the process-global `OnceLock`). `agent_engine` already holds
+    /// it as a lease factory; this handle is for the callers that need the
+    /// monitor itself — the workflow pre-step guard and auth-failure
+    /// recovery, `security.md` triggers (c) and (d).
+    pub credential_monitor:
+        Option<Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>>,
+
+    /// The global config this bundle was assembled from.
+    ///
+    /// A **daemon's** single config source. Daemons have no `Session`, so
+    /// before WI 0114 F-31 the daemon-side code that needed a global setting
+    /// simply called `GlobalConfig::load()` wherever it stood — four separate
+    /// reads, each with its own `unwrap_or_default()` swallowing a malformed
+    /// file, and each able to see a different file than the one the daemon
+    /// started with.
+    ///
+    /// A **session-backed** host reads `session.effective_config()` instead:
+    /// that already merged this in, under the repo config, the environment
+    /// and the flags. This field is for the code that has no session.
+    pub global_config: Arc<GlobalConfig>,
 }
 
 impl Engines {
@@ -125,18 +170,34 @@ impl Engines {
     pub fn for_daemon(kind: DaemonKind, paths: &DataPaths) -> Result<Self, EngineError> {
         let auth_paths = AuthPathResolver::from_process_env()?;
         let api_paths = ApiPaths::from_process_env()?;
-        let global = GlobalConfig::load().unwrap_or_default();
+        // The daemon's one config read (F-31). A malformed file fails the
+        // start with a message naming the file and the offending key, rather
+        // than being defaulted away and leaving the daemon quietly running on
+        // settings the user did not write.
+        let global = GlobalConfig::load()?;
         let detected = agent_runtime::detect(&global)?;
         let runtime = detected.engine();
         let container_runtime = detected.container_runtime();
         let sandbox_runtime = detected.sandbox_runtime();
         let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
-        let agent_engine = Arc::new(AgentEngine::new(
-            overlay_engine.clone(),
-            container_runtime
-                .clone()
-                .unwrap_or_else(|| Arc::new(ContainerRuntime::docker())),
-        ));
+        // A daemon has no `Session`, so its credential-refresh settings come
+        // from the global config it just loaded plus the process env.
+        let daemon_config = EffectiveConfig::new(
+            Default::default(),
+            crate::data::config::env::Env::from_process(),
+            Default::default(),
+            global.clone(),
+        );
+        let credential_monitor = credential_refresh_monitor(&daemon_config);
+        // The *detected* runtime, not a fresh Docker handle: `AgentEngine`
+        // branches on `runtime.capabilities()` to decide which paradigm's
+        // options to resolve (F-40b), so handing it a Docker handle under a
+        // sandbox-class runtime resolves container options that the sandbox
+        // runtime then refuses to build.
+        let agent_engine = Arc::new(
+            AgentEngine::new(overlay_engine.clone(), runtime.clone())
+                .with_lease_factory(lease_factory_for(credential_monitor.as_ref())),
+        );
 
         let workflow_root = match kind {
             DaemonKind::Api => api_paths.root().to_path_buf(),
@@ -151,9 +212,11 @@ impl Engines {
             overlay_engine,
             auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
             agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
+            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
                 workflow_root,
             )),
+            credential_monitor,
+            global_config: Arc::new(global),
         })
     }
 
@@ -166,17 +229,21 @@ impl Engines {
         let sandbox_runtime = detected.sandbox_runtime();
         let overlay_engine = Arc::new(OverlayEngine::new(session)?);
         let auth_engine = Arc::new(AuthEngine::new(session)?);
-        // AgentEngine is container-paradigm-specific. Under a sandbox-class
-        // runtime it receives an inert Docker handle that is never exercised:
-        // every container-paradigm flow guards via
-        // `Engines::require_container_runtime()` first (sandbox flows land in
-        // WI 0090).
-        let agent_engine = Arc::new(AgentEngine::new(
-            overlay_engine.clone(),
-            container_runtime
-                .clone()
-                .unwrap_or_else(|| Arc::new(ContainerRuntime::docker())),
-        ));
+        // `AgentEngine` is given the *detected* runtime, whatever its
+        // paradigm. It is no longer container-specific: `resolve_agent_options`
+        // branches on `self.runtime.capabilities().kit_declarative` (F-40b), so
+        // the handle it holds decides which paradigm's options come out.
+        // Container-paradigm flows that genuinely need the concrete type still
+        // go through `Engines::require_container_runtime()`.
+        //
+        // A disabled `authRefresh` leaves the monitor unbuilt, making lease
+        // registration a no-op and preserving legacy env-var delivery — the
+        // same kill switch the uninstalled process-global used to be.
+        let credential_monitor = credential_refresh_monitor(&session.effective_config());
+        let agent_engine = Arc::new(
+            AgentEngine::new(overlay_engine.clone(), runtime.clone())
+                .with_lease_factory(lease_factory_for(credential_monitor.as_ref())),
+        );
 
         Ok(Self {
             runtime,
@@ -186,9 +253,13 @@ impl Engines {
             overlay_engine,
             auth_engine,
             agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
+            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(
                 session.git_root().to_path_buf(),
             )),
+            credential_monitor,
+            // The session already merged the global config; taking it from
+            // there rather than re-loading is the whole point of F-31.
+            global_config: Arc::new(session.effective_config().global().clone()),
         })
     }
 
@@ -207,9 +278,9 @@ impl Engines {
             overlay_engine,
             auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, ApiPaths::at_root(root))),
             agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                root,
-            )),
+            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::at_git_root(root)),
+            credential_monitor: None,
+            global_config: Arc::new(GlobalConfig::default()),
         }
     }
 
@@ -217,7 +288,6 @@ impl Engines {
     /// sandbox-class — a `NotImplemented` error. Container-paradigm flows
     /// (agent setup, image builds, background containers) call this instead
     /// of unwrapping `container_runtime` so a sandbox-configured user gets an
-    /// actionable error, never a panic or a silent Docker fallback.
     pub fn require_container_runtime(&self) -> Result<&Arc<ContainerRuntime>, EngineError> {
         self.container_runtime
             .as_ref()
@@ -225,6 +295,18 @@ impl Engines {
                 "this command does not yet route to the sandbox runtime \
                  (docker-sbx-experimental); set runtime to \"docker\" or \
                  \"apple-containers\" to use it here",
+            ))
+    }
+
+    /// The typed sandbox-tier handle, for the paradigm-specific operations
+    /// the cross-paradigm trait deliberately does not carry. Errors when the
+    /// active runtime is not sandbox-class.
+    pub fn require_sandbox_runtime(&self) -> Result<&Arc<SandboxRuntime>, EngineError> {
+        self.sandbox_runtime
+            .as_ref()
+            .ok_or(EngineError::NotImplemented(
+                "this operation is specific to the sandbox runtime \
+                 (docker-sbx-experimental)",
             ))
     }
 
@@ -296,6 +378,28 @@ impl Engines {
 /// command frontend traits (e.g. [`crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend`])
 /// for command-specific Q&A and reporting.
 pub trait CommandFrontend: UserMessageSink + Send + Sync {
+    /// Which frontend this is.
+    ///
+    /// The one fact about itself a frontend declares. Everything that used to
+    /// be derived from it per-frontend — whether a human is there, whether the
+    /// working directory is the user's — is decided once in Layer 2 from this
+    /// (WI 0114 F-49). No default: a new frontend must say what it is.
+    fn kind(&self) -> FrontendKind;
+
+    /// Whether there is somewhere to read an answer from right now.
+    ///
+    /// The frontend reports the *fact*; Layer 2 applies the rule
+    /// ([`ResolvedFlags::is_non_interactive`]). For the CLI the fact is
+    /// whether stdin is a terminal, which only the CLI can see; for every
+    /// other frontend it follows from the kind, which is why the default
+    /// answers from [`FrontendKind::can_ask_a_human`].
+    ///
+    /// Before WI 0114 F-50 the rule itself lived in Layer 3, in
+    /// `frontend::effective_non_interactive`, and each frontend re-applied it.
+    fn input_available(&self) -> bool {
+        self.kind().can_ask_a_human()
+    }
+
     fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError>;
 
     fn flag_string(
@@ -343,8 +447,6 @@ pub trait DispatchFrontend:
     + SquadAttachFrontend
     + RemoteCommandFrontend
     + NewCommandFrontend
-    + AuthCommandFrontend
-    + DownloadCommandFrontend
     + SpecsCommandFrontend
     + CleanCommandFrontend
     + 'static
@@ -365,8 +467,6 @@ impl<T> DispatchFrontend for T where
         + SquadAttachFrontend
         + RemoteCommandFrontend
         + NewCommandFrontend
-        + AuthCommandFrontend
-        + DownloadCommandFrontend
         + SpecsCommandFrontend
         + CleanCommandFrontend
         + 'static
@@ -393,8 +493,6 @@ pub enum CommandOutcome {
     Remote(crate::command::commands::remote::RemoteOutcome),
     New(crate::command::commands::new::NewOutcome),
     Specs(crate::command::commands::specs::SpecsOutcome),
-    Auth(crate::command::commands::auth::AuthOutcome),
-    Download(crate::command::commands::download::DownloadOutcome),
     Clean(crate::command::commands::clean::CleanOutcome),
     /// Trivial wrapper used by no-op leaf commands during the refactor.
     Empty,
@@ -405,8 +503,15 @@ impl CommandOutcome {
     /// still carry a failure: `new skill --pull-all` continues collecting
     /// libraries after one source fails, and must be visible to both CLI and
     /// API clients as a non-zero result.
+    ///
+    /// Every agent-session command reports the agent's own exit code. `Chat`
+    /// was missing from this list until WI 0114 F-22: the TUI read
+    /// `ChatOutcome::exit_code` itself while the CLI and API came through here
+    /// and saw 0, so the same failing `awman chat` exited 0 from a script and
+    /// showed red in the TUI.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::Chat(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
             Self::SquadAttach(outcome) => outcome.exit_code,
@@ -443,6 +548,31 @@ pub enum BuiltCommand {
     Clean(CleanCommand),
 }
 
+/// What a frontend draws around a running command, decided by Layer 2.
+///
+/// Produced by [`Dispatch::launch_display`]. A frontend renders these; it does
+/// not recompute them from flag names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchDisplay {
+    /// The agent this invocation will run, resolved with the same precedence
+    /// the command uses (`--agent`, then the session default, then `claude`).
+    /// Empty only when the command path does not resolve at all.
+    pub agent_display_name: String,
+    /// Whether the run is unattended — see [`ResolvedFlags::unattended`].
+    pub unattended: bool,
+}
+
+impl LaunchDisplay {
+    /// The display for an invocation Layer 2 cannot resolve. The frontend
+    /// still has to draw something; `run_command` reports the real error.
+    pub fn unknown() -> Self {
+        Self {
+            agent_display_name: String::new(),
+            unattended: false,
+        }
+    }
+}
+
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 pub struct Dispatch<F: CommandFrontend> {
@@ -455,11 +585,10 @@ pub struct Dispatch<F: CommandFrontend> {
 
 impl<F: CommandFrontend> Dispatch<F> {
     pub fn new(frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self {
-        // A disabled `authRefresh` leaves the monitor uninstalled, making lease
-        // registration a no-op and preserving legacy env-var delivery.
-        if let Ok(session_guard) = session.try_read() {
-            install_credential_refresh(&session_guard.effective_config());
-        }
+        // The credential monitor is attached to `engines.agent_engine` when
+        // the bundle is assembled (F-38); a disabled `authRefresh` leaves it
+        // absent, making lease registration a no-op and preserving legacy
+        // env-var delivery.
         Self {
             catalogue: CommandCatalogue::get(),
             frontend,
@@ -509,8 +638,18 @@ impl<F: CommandFrontend> Dispatch<F> {
         Ok(())
     }
 
-    /// Inject the daemon-local gateway for squad HTTP dispatch. CLI and TUI do
-    /// not receive this: they obtain a remote gateway through SquadSupervisor.
+    /// Offer a squad daemon gateway to whatever command is about to run.
+    ///
+    /// The handle is offered unconditionally; the catalogue decides whether a
+    /// command receives it, through [`CommandSpec::gateway_need`]. A caller
+    /// that already holds a gateway — the squad daemon, which is its own
+    /// gateway, the TUI, which resolved one when its squad tab opened, or a
+    /// test supplying a double — hands it over here, and [`Dispatch::admit`]
+    /// then skips resolving a second one.
+    ///
+    /// Callers used to gate this on `path.first() == Some("squad")`, a
+    /// command-name fact restated in Layer 3 (WI 0114 F-15). `gateway_need`
+    /// is the same fact where the catalogue can maintain it.
     pub fn with_squad_gateway(mut self, gateway: Arc<dyn TaskGateway>) -> Self {
         self.squad_gateway = Some(gateway);
         self
@@ -556,10 +695,56 @@ impl<F: CommandFrontend> Dispatch<F> {
             args: &args,
             engines: &self.engines,
             session,
-            gateway: self.squad_gateway.clone(),
-            caller: CallerContext::new(&canonical),
+            managed_session: Arc::clone(&self.session),
+            // A command that declares no `GatewayNeed` never sees the handle,
+            // even when one was offered: the catalogue, not the caller,
+            // decides which commands talk to a squad daemon.
+            gateway: match spec.gateway_need {
+                GatewayNeed::None => None,
+                _ => self.squad_gateway.clone(),
+            },
+            caller: CallerContext::new(&canonical, self.frontend.kind()),
         };
         (spec.build)(&ctx)
+    }
+
+    /// What a frontend should display while this invocation runs.
+    ///
+    /// Both facts used to be recomputed in `App::spawn_command` from the raw
+    /// parsed input — the agent name by reading the `"agent"` flag key and
+    /// re-running the engine's precedence rules, the unattended indicator as
+    /// `yolo || auto`. Both are Layer 2 decisions, and both drifted from what
+    /// the command itself would resolve as soon as a default moved.
+    ///
+    /// Answered from the same [`ResolvedFlags`] and [`Session`] the command
+    /// will be built from. It is *not* read off a `BuiltCommand`: a squad
+    /// command cannot be built until [`Dispatch::admit`] has resolved its
+    /// gateway, which is async, and the overlay title is needed before the
+    /// command is spawned.
+    ///
+    /// An unknown path or an unresolvable flag yields
+    /// [`LaunchDisplay::unknown`]; reporting the error is
+    /// [`Dispatch::run_command`]'s job, not this call's.
+    pub fn launch_display(&self, path: &[&str]) -> LaunchDisplay {
+        let canonical: Vec<&str> = self.catalogue.canonical_path(path).into_iter().collect();
+        let Some(spec) = self.catalogue.lookup(&canonical) else {
+            return LaunchDisplay::unknown();
+        };
+        let Ok(flags) = ResolvedFlags::resolve(&self.frontend, &canonical, spec) else {
+            return LaunchDisplay::unknown();
+        };
+        let Ok(session) = self.session.try_read() else {
+            return LaunchDisplay::unknown();
+        };
+        let agent_flag = spec.find_flag("agent").and_then(|_| flags.string("agent"));
+        let agent_display_name = crate::command::commands::LaunchPolicy::for_session(&session)
+            .resolve_agent(&agent_flag)
+            .map(|name| name.into_string())
+            .unwrap_or_else(|_| agent_flag.unwrap_or_default());
+        LaunchDisplay {
+            agent_display_name,
+            unattended: flags.unattended(),
+        }
     }
 
     /// Tokenize a raw TUI command-box string into typed
@@ -617,8 +802,103 @@ impl<F: DispatchFrontend> Dispatch<F> {
     /// Running is then one call through the [`Command`] trait.
     pub async fn run_command(mut self, path: &[&str]) -> Result<CommandOutcome, CommandError> {
         self.admit(path).await?;
+        let session = Arc::clone(&self.session);
         let built = self.build_command(path)?;
-        built.run_with_frontend(self.frontend).await
+
+        // Decision Q3: `SessionState` is the ruling record of what a session
+        // is doing, and Layer 2 is what writes it. Every frontend that runs a
+        // command runs it through here, so this is the one place the
+        // in-flight command is recorded (WI 0114 F-22).
+        session
+            .write()
+            .await
+            .state_mut()
+            .begin_command(path.join(" "), Vec::new());
+
+        // Armed for the whole run. If the command unwinds — a panic in a
+        // command thread — this future's locals drop during that unwind and
+        // the guard records the failure the code below never reaches. Without
+        // it, a panicked command leaves `SessionState` reading `Running`
+        // forever, which is why the TUI grew an outbox of its own (F-22).
+        let mut outcome_guard = UnfinishedCommandGuard::arm(Arc::clone(&session));
+
+        let result = built.run_with_frontend(self.frontend).await;
+
+        {
+            let mut guard = session.write().await;
+            let state = guard.state_mut();
+            match &result {
+                Ok(outcome) => state.finish_command(outcome.exit_code()),
+                Err(err) => state.fail_command(err.to_string()),
+            }
+            state.set_current_workflow(None);
+        }
+        outcome_guard.disarm();
+
+        result
+    }
+}
+
+/// Records a failure on the session when [`Dispatch::run_command`] does not
+/// reach its own outcome write — in practice, a panic in the command.
+///
+/// Decision Q3 says Layer 2 writes `SessionState`, and this is the case Layer
+/// 2 could not cover before: the panicking thread never runs the code that
+/// records an outcome, so the session stayed `Running` and whichever frontend
+/// noticed the dead thread had to write the outcome itself. Now nobody above
+/// Layer 2 does.
+///
+/// `try_write` rather than `write`, because `Drop` cannot await. The only
+/// writer inside `run_command` is scoped and has already been released by the
+/// time this drops, so the lock is free on the unwind path; a command that
+/// somehow left a writer alive keeps the `Running` state rather than
+/// deadlocking the unwind.
+struct UnfinishedCommandGuard {
+    session: Arc<RwLock<Session>>,
+    armed: bool,
+}
+
+impl UnfinishedCommandGuard {
+    fn arm(session: Arc<RwLock<Session>>) -> Self {
+        Self {
+            session,
+            armed: true,
+        }
+    }
+
+    /// The command recorded its own outcome; this guard has nothing to do.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// The message a session carries for a command that ended without one.
+    ///
+    /// Byte-identical to the text the TUI used to compose for this case,
+    /// including the pointer at the panic log — `PanicLog` is Layer 0, so
+    /// naming it here crosses nothing.
+    fn unexpected_end_message() -> String {
+        let log =
+            crate::data::fs::PanicLog::from_env(&crate::data::config::env::Env::from_process());
+        match log {
+            Some(log) => format!(
+                "command task ended unexpectedly (likely a panic — see {})",
+                log.path().display()
+            ),
+            None => "command task ended unexpectedly (likely a panic)".to_string(),
+        }
+    }
+}
+
+impl Drop for UnfinishedCommandGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut guard) = self.session.try_write() {
+            let state = guard.state_mut();
+            state.fail_command(Self::unexpected_end_message());
+            state.set_current_workflow(None);
+        }
     }
 }
 
@@ -745,6 +1025,9 @@ mod tests {
         pub usizes: std::collections::HashMap<String, usize>,
         pub args: std::collections::HashMap<String, String>,
         pub args_vec: std::collections::HashMap<String, Vec<String>>,
+        /// What this fake reports for
+        /// [`CommandFrontend::input_available`]. `true` unless a test sets it.
+        pub input_available: bool,
     }
 
     impl FakeCommandFrontend {
@@ -759,7 +1042,14 @@ mod tests {
                 usizes: Default::default(),
                 args: Default::default(),
                 args_vec: Default::default(),
+                input_available: true,
             }
+        }
+
+        /// A caller with nowhere to read an answer from — a pipe, a CI job.
+        pub fn without_input(mut self) -> Self {
+            self.input_available = false;
+            self
         }
     }
 
@@ -769,6 +1059,12 @@ mod tests {
     }
 
     impl CommandFrontend for FakeCommandFrontend {
+        fn kind(&self) -> FrontendKind {
+            FrontendKind::Cli
+        }
+        fn input_available(&self) -> bool {
+            self.input_available
+        }
         fn flag_bool(&self, _p: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
             Ok(self.bools.get(flag).copied())
         }
@@ -798,25 +1094,168 @@ mod tests {
         }
     }
 
-    fn make_engines() -> Engines {
-        Engines::for_tests(std::path::Path::new("/tmp"))
-    }
-
+    /// `Dispatch` takes a shared session, so this wraps the shared fixture
+    /// rather than re-spelling `Session::open`.
     fn make_session() -> Arc<RwLock<Session>> {
         let tmp = tempfile::tempdir().unwrap();
-        let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
-        let s = Session::open(
-            tmp.path().to_path_buf(),
-            &resolver,
-            crate::data::session::SessionOpenOptions::default(),
-        )
-        .unwrap();
-        Arc::new(RwLock::new(s))
+        Arc::new(RwLock::new(Session::for_tests(tmp.path())))
+    }
+
+    /// A malformed global config fails the daemon's start with a message
+    /// naming the file, instead of being `unwrap_or_default()`ed away (F-31).
+    #[test]
+    fn a_malformed_global_config_fails_the_daemon_bootstrap() {
+        use crate::data::fs::DataPaths;
+
+        let _lock = crate::data::config::env::DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::data::config::env::ConfigHomeGuard::set(tmp.path());
+        // `AWMAN_CONFIG_HOME` *is* the config home, so the file sits directly
+        // under it.
+        std::fs::write(tmp.path().join("config.json"), "{ \"runtime\": ").unwrap();
+
+        let paths = DataPaths::at_root(tmp.path());
+        let result = Engines::for_daemon(DaemonKind::Squad, &paths);
+
+        let error = result
+            .err()
+            .expect("a malformed config must fail the start");
+        let text = error.to_string();
+        assert!(
+            text.contains("config.json"),
+            "the error must name the file: {text}"
+        );
+    }
+
+    /// Who the caller is comes from the frontend's declared kind, once, at
+    /// construction — not from a per-frontend `is_local_user_session`
+    /// override (F-49).
+    #[test]
+    fn the_caller_context_records_the_frontend_and_whether_a_user_is_there() {
+        use crate::command::dispatch::catalogue::FrontendKind;
+        use crate::command::dispatch::resolved::CallerContext;
+
+        for (kind, local) in [
+            (FrontendKind::Cli, true),
+            (FrontendKind::Tui, true),
+            (FrontendKind::Api, false),
+        ] {
+            let caller = CallerContext::new(&["squad", "add"], kind);
+            assert_eq!(caller.frontend(), kind);
+            assert_eq!(caller.local_user(), local, "local_user for {kind:?}");
+            assert_eq!(caller.leaf(), "add");
+        }
+    }
+
+    /// A command that unwinds still leaves the session with a recorded
+    /// outcome, so no frontend has to write one (decision Q3, F-22).
+    ///
+    /// Driven through the guard directly rather than by panicking a real
+    /// command: what is under test is that dropping an armed guard records
+    /// the failure, which is exactly what the unwind does to it.
+    #[test]
+    fn an_unfinished_command_is_recorded_as_failed_on_the_session() {
+        use crate::data::session::CommandStatus;
+
+        let session = make_session();
+        {
+            let mut guard = session.try_write().unwrap();
+            guard
+                .state_mut()
+                .begin_command("exec workflow".to_string(), Vec::new());
+        }
+
+        drop(UnfinishedCommandGuard::arm(Arc::clone(&session)));
+
+        let guard = session.try_read().unwrap();
+        let command = guard
+            .state()
+            .current_command
+            .as_ref()
+            .expect("the command is still recorded");
+        match &command.status {
+            CommandStatus::Error(message) => assert!(
+                message.contains("ended unexpectedly"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A command that records its own outcome disarms the guard, so the guard
+    /// never overwrites it.
+    #[test]
+    fn a_disarmed_guard_leaves_the_recorded_outcome_alone() {
+        use crate::data::session::CommandStatus;
+
+        let session = make_session();
+        {
+            let mut guard = session.try_write().unwrap();
+            let state = guard.state_mut();
+            state.begin_command("status".to_string(), Vec::new());
+            state.finish_command(0);
+        }
+
+        let mut armed = UnfinishedCommandGuard::arm(Arc::clone(&session));
+        armed.disarm();
+        drop(armed);
+
+        let guard = session.try_read().unwrap();
+        let command = guard.state().current_command.as_ref().unwrap();
+        assert!(matches!(command.status, CommandStatus::Done));
+        assert_eq!(command.exit_code, Some(0));
+    }
+
+    /// `Engines::from_detected` must hand `AgentEngine` the runtime it
+    /// actually detected, not a fresh Docker handle.
+    ///
+    /// `AgentEngine::resolve_agent_options` branches on
+    /// `self.runtime.capabilities().kit_declarative` (F-40b). When the two
+    /// disagree, a sandbox user gets `ResolvedAgentOptions::Container` out of
+    /// the agent engine and `SandboxRuntime::build` then refuses it with
+    /// `OptionVariantMismatch` — every `chat`, `exec prompt` and `exec
+    /// workflow` fails. The other sandbox tests build an `AgentEngine`
+    /// directly, so only a test that goes through `Engines` catches it.
+    #[test]
+    fn a_sandbox_detected_runtime_gives_the_agent_engine_a_sandbox_runtime() {
+        use crate::engine::agent_runtime::{DetectedRuntime, ResolvedAgentOptions};
+        use crate::engine::sandbox::SandboxRuntime;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session::for_tests(tmp.path());
+
+        let detected = DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::for_tests()));
+        let engines = Engines::from_detected(detected, &session).unwrap();
+
+        assert!(
+            engines
+                .agent_engine
+                .runtime()
+                .capabilities()
+                .kit_declarative,
+            "the agent engine must hold the detected sandbox runtime"
+        );
+
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let resolved = engines
+            .agent_engine
+            .resolve_agent_options(&session, &agent, &Default::default(), &Default::default())
+            .expect("resolving options under a sandbox runtime");
+        assert!(
+            matches!(resolved, ResolvedAgentOptions::Sandbox(_)),
+            "a sandbox-class runtime must resolve sandbox options; got {resolved:?}"
+        );
     }
 
     #[test]
     fn build_status_command_with_no_flags() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["status"]).unwrap();
         match built {
             BuiltCommand::Status(_) => {}
@@ -826,7 +1265,11 @@ mod tests {
 
     #[test]
     fn build_bare_squad_uses_the_status_subcommand() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["squad"]).unwrap();
         match built {
             BuiltCommand::Squad(command) => assert!(matches!(
@@ -839,7 +1282,11 @@ mod tests {
 
     #[test]
     fn build_unknown_command_returns_unknown_command_error() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["bogus"]);
         match result {
             Err(CommandError::UnknownCommand { .. }) => {}
@@ -850,7 +1297,11 @@ mod tests {
 
     #[test]
     fn build_specs_amend_missing_argument_errors() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["specs", "amend"]);
         match result {
             Err(CommandError::MissingRequiredArgument { .. }) => {}
@@ -864,7 +1315,11 @@ mod tests {
         let mut frontend = FakeCommandFrontend::new();
         frontend.bools.insert("yolo".into(), true);
         frontend.bools.insert("plan".into(), true);
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["chat"]);
         match result {
             Err(CommandError::MutuallyExclusive { .. }) => {}
@@ -877,7 +1332,11 @@ mod tests {
     fn ready_json_implies_non_interactive_in_built_command() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.bools.insert("json".into(), true);
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["ready"]).unwrap();
         match built {
             BuiltCommand::Ready(cmd) => {
@@ -897,7 +1356,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
         match built {
             BuiltCommand::ExecWorkflow(cmd) => {
@@ -917,7 +1380,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
         match built {
             BuiltCommand::ExecWorkflow(cmd) => {
@@ -933,7 +1400,11 @@ mod tests {
 
     #[test]
     fn build_config_show_succeeds_with_no_args() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["config", "show"]).unwrap();
         assert!(matches!(built, BuiltCommand::Config(_)));
     }
@@ -944,14 +1415,22 @@ mod tests {
         frontend
             .args
             .insert("field".into(), "terminal_scrollback_lines".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["config", "get"]).unwrap();
         assert!(matches!(built, BuiltCommand::Config(_)));
     }
 
     #[test]
     fn build_config_get_missing_field_returns_missing_required_argument() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["config", "get"]);
         assert!(
             matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
@@ -963,7 +1442,11 @@ mod tests {
     fn build_new_workflow_with_format_flag() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.enums.insert("format".into(), "yaml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["new", "workflow"]).unwrap();
         assert!(matches!(built, BuiltCommand::New(_)));
     }
@@ -972,14 +1455,22 @@ mod tests {
     fn build_api_start_with_port() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.u16s.insert("port".into(), 1234);
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["api", "start"]).unwrap();
         assert!(matches!(built, BuiltCommand::ApiServer(_)));
     }
 
     #[test]
     fn build_chat_default_flags_all_false() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["chat"]).unwrap();
         match built {
             BuiltCommand::Chat(cmd) => {
@@ -996,7 +1487,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch
             .build_command(&["remote", "exec", "workflow"])
             .unwrap();
@@ -1007,7 +1502,11 @@ mod tests {
     fn build_remote_exec_prompt_with_prompt_argument() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.args.insert("prompt".into(), "hello".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch
             .build_command(&["remote", "exec", "prompt"])
             .unwrap();
@@ -1018,7 +1517,11 @@ mod tests {
     fn build_exec_prompt_with_prompt_argument() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.args.insert("prompt".into(), "do something".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "prompt"]).unwrap();
         assert!(matches!(built, BuiltCommand::ExecPrompt(_)));
     }
@@ -1029,7 +1532,11 @@ mod tests {
         // final validation (prompt-or-issue required) happens at run time.
         let mut frontend = FakeCommandFrontend::new();
         frontend.args.insert("prompt".into(), "   ".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "prompt"]);
         assert!(
             result.is_ok(),
@@ -1040,7 +1547,11 @@ mod tests {
     #[test]
     fn build_exec_workflow_missing_workflow_argument_returns_missing_required_argument() {
         // workflow is required and neither flag nor positional arg is set
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         assert!(
             matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
@@ -1054,7 +1565,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         // "wf" is a string alias under "exec"; dispatch should resolve it.
         let built = dispatch.build_command(&["exec", "wf"]).unwrap();
         assert!(
@@ -1138,7 +1653,11 @@ mod tests {
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
         // Neither yolo nor auto is set; worktree must not be implied.
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
         match built {
             BuiltCommand::ExecWorkflow(cmd) => {
@@ -1161,7 +1680,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
         match built {
             BuiltCommand::ExecWorkflow(cmd) => {
@@ -1186,7 +1709,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
         match built {
             BuiltCommand::ExecWorkflow(cmd) => {
@@ -1212,7 +1739,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         match result {
             Err(CommandError::MutuallyExclusive { .. }) => {}
@@ -1226,7 +1757,11 @@ mod tests {
         let mut frontend = FakeCommandFrontend::new();
         frontend.strings.insert("issue".into(), "42".into());
         // No positional prompt — that's ok at dispatch time (validated at runtime).
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let built = dispatch.build_command(&["exec", "prompt"]).unwrap();
         match built {
             BuiltCommand::ExecPrompt(cmd) => {
@@ -1248,7 +1783,11 @@ mod tests {
         frontend
             .strings
             .insert("issue".into(), "owner/repo#1".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "prompt"]);
         assert!(
             result.is_ok(),
@@ -1282,7 +1821,11 @@ mod tests {
         let mut frontend = FakeCommandFrontend::new();
         frontend.bools.insert("dynamic".into(), true);
         frontend.strings.insert("work-item".into(), "0042".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         assert!(
             result.is_ok(),
@@ -1311,7 +1854,11 @@ mod tests {
         let mut frontend = FakeCommandFrontend::new();
         frontend.bools.insert("dynamic".into(), true);
         // No work-item set.
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         match result {
             Err(e) => {
@@ -1335,7 +1882,11 @@ mod tests {
         frontend
             .args
             .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         match result {
             Err(e) => {
@@ -1357,7 +1908,11 @@ mod tests {
         frontend
             .strings
             .insert("leader".into(), "claude::claude-opus-4-8".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         assert!(
             result.is_ok(),
@@ -1387,7 +1942,11 @@ mod tests {
         frontend.bools.insert("dynamic".into(), true);
         frontend.bools.insert("plan".into(), true);
         frontend.strings.insert("work-item".into(), "0042".into());
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            frontend,
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         match result {
             Err(e) => {
@@ -1404,7 +1963,11 @@ mod tests {
     #[test]
     fn exec_workflow_static_without_path_returns_missing_required_argument() {
         // Non-dynamic invocation still requires the positional workflow path.
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
+        let dispatch = Dispatch::new(
+            FakeCommandFrontend::new(),
+            make_session(),
+            Engines::for_tests(std::path::Path::new("/tmp")),
+        );
         let result = dispatch.build_command(&["exec", "workflow"]);
         assert!(
             matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
@@ -1435,19 +1998,15 @@ mod tests {
     }
 
     fn with_daemon_global_config<T>(config: GlobalConfig, test: impl FnOnce() -> T) -> T {
-        let _guard = crate::CWD_LOCK
-            .lock()
-            .expect("process settings mutex poisoned");
         let home = tempfile::tempdir().expect("create global config home");
-        let previous = std::env::var_os("AWMAN_CONFIG_HOME");
-        std::env::set_var("AWMAN_CONFIG_HOME", home.path());
+        // `ConfigHomeGuard`, not `CWD_LOCK`: the variable this serialises is
+        // `AWMAN_CONFIG_HOME`, and the `clean` and `overlay` tests that also
+        // repoint it never touched `CWD_LOCK`. Holding the wrong lock let
+        // them move the config home mid-test, so `Engines::for_daemon` read a
+        // config it was never given and built the wrong runtime tier.
+        let _guard = crate::data::config::env::ConfigHomeGuard::set(home.path());
         config.save().expect("save global config");
-        let result = test();
-        match previous {
-            Some(value) => std::env::set_var("AWMAN_CONFIG_HOME", value),
-            None => std::env::remove_var("AWMAN_CONFIG_HOME"),
-        }
-        result
+        test()
     }
 
     #[test]

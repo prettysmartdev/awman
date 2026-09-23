@@ -1,7 +1,8 @@
 //! `WorktreeLifecycleFrontend` impl for the CLI.
 //!
-//! The CLI prompts on stdin (when it is a TTY) for each decision; when
-//! stdin is piped the CLI returns the safe non-interactive defaults.
+//! The CLI prompts on stdin (when it is a TTY) for each decision; when stdin
+//! is piped it returns the CLI profile's answers from
+//! `src/command/headless.rs`.
 
 use std::path::Path;
 
@@ -13,7 +14,6 @@ use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
-use crate::frontend::cli::output::stdin_is_tty;
 
 fn read_line_or_default(default_letter: char) -> char {
     let mut buf = String::new();
@@ -29,8 +29,10 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         files: &[String],
         suggested_message: &str,
     ) -> Result<PreWorktreeDecision, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(PreWorktreeDecision::UseLastCommit);
+        if self.non_interactive {
+            return Ok(self
+                .headless
+                .pre_worktree_uncommitted_files(suggested_message));
         }
         eprintln!(
             "awman: {} uncommitted file(s) in working tree:",
@@ -66,8 +68,8 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         path: &Path,
         branch: &str,
     ) -> Result<ExistingWorktreeDecision, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(ExistingWorktreeDecision::Resume);
+        if self.non_interactive {
+            return Ok(self.headless.existing_worktree());
         }
         eprintln!(
             "awman: worktree {} already exists for branch {branch}. [r]esume / [R]ecreate?",
@@ -93,8 +95,8 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         &mut self,
         prompt: &PostWorkflowWorktreePrompt,
     ) -> Result<PostWorkflowWorktreeAction, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(PostWorkflowWorktreeAction::Keep);
+        if self.non_interactive {
+            return Ok(self.headless.post_workflow_action(prompt));
         }
         eprintln!("awman: {}", prompt.body.replace('\n', " "));
         eprintln!(
@@ -114,8 +116,10 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         files: &[String],
         suggested_message: &str,
     ) -> Result<Option<String>, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(None);
+        if self.non_interactive {
+            return Ok(self
+                .headless
+                .worktree_commit_before_merge(suggested_message));
         }
         eprintln!(
             "awman: {} uncommitted file(s) in worktree {branch}:",
@@ -141,8 +145,8 @@ impl WorktreeLifecycleFrontend for CliFrontend {
     }
 
     fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(WorktreeMergeMode::LeaveBranch);
+        if self.non_interactive {
+            return Ok(self.headless.merge_mode());
         }
         eprintln!("awman: merge {branch} into HEAD?");
         eprintln!("  [m] merge (no squash) / [s] squash / [l] leave branch alone");
@@ -158,8 +162,8 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         branch: &str,
         path: &Path,
     ) -> Result<bool, CommandError> {
-        if !stdin_is_tty() {
-            return Ok(false);
+        if self.non_interactive {
+            return Ok(self.headless.confirm_worktree_cleanup());
         }
         eprintln!(
             "awman: delete worktree {} (branch {branch})? [y/n]",

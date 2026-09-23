@@ -123,7 +123,7 @@ src/
     agent/
       mod.rs              AgentEngine, AgentRunOptions
       agent_matrix.rs     Per-agent entrypoint/flag translation table
-      frontend.rs         AgentFrontend trait
+      frontend.rs         AgentImageFrontend trait
       download.rs         Dockerfile download URL constants
     ready/
       mod.rs              ReadyEngine, ReadyEngineOptions
@@ -153,14 +153,12 @@ src/
       command_trait.rs    Command trait (run_with_frontend)
       agent_auth.rs       AgentAuthFrontend trait, AgentAuthDecision
       agent_setup.rs      AgentSetupFrontend trait, AgentSetupDecision
-      auth.rs             AuthCommand, AuthCommandFrontend, AuthOutcome
       chat.rs             ChatCommand, ChatCommandFrontend, ChatCommandFlags, ChatOutcome
       config.rs           ConfigCommand, ConfigSubcommand, ConfigShowFlags, ConfigGetFlags, ConfigSetFlags, ConfigOutcome
-      download.rs         DownloadCommand, DownloadOutcome
       exec_prompt.rs      ExecPromptCommand, ExecPromptCommandFrontend, ExecPromptCommandFlags, ExecPromptOutcome
       exec_workflow.rs    ExecWorkflowCommand, ExecWorkflowCommandFrontend, ExecWorkflowCommandFlags, ExecWorkflowOutcome, WorkflowSummary
-      api.rs         ApiCommand, ApiSubcommand, ApiStartFlags, ApiKillFlags, ApiLogsFlags, ApiStatusFlags, ApiOutcome
-      API/
+      api_server.rs       ApiCommand, ApiSubcommand, ApiStartFlags, ApiKillFlags, ApiLogsFlags, ApiStatusFlags, ApiOutcome
+      api_server/
         banner.rs         Legacy API banner format constants
       prompt_templates.rs Interview/amend prompt builders for `specs amend` and `new {spec,workflow,skill}`
       init.rs             InitCommand, InitCommandFrontend, InitCommandFlags, InitOutcome
@@ -168,7 +166,7 @@ src/
       new.rs              NewCommand, NewSubcommand, NewSkillFlags, NewSpecFlags, NewWorkflowFlags, NewOutcome
       ready.rs            ReadyCommand, ReadyCommandFrontend, ReadyCommandFlags, ReadyOutcome
       remote.rs           RemoteCommand, RemoteSubcommand, RemoteRunFlags, RemoteSessionStartFlags, RemoteSessionKillFlags, RemoteOutcome
-      remote_client.rs    RemoteClient, RemoteResponse, RemoteEventSink
+      remote_client.rs    WorkflowStateSource, RemoteApiWorkflowSource, SquadTaskWorkflowSource, RemoteWorkflowPoller
       specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsOutcome
       status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
       worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
@@ -210,19 +208,17 @@ src/
         mod.rs
         agent_auth.rs     AgentAuthFrontend impl
         agent_setup.rs    AgentSetupFrontend impl
-        auth.rs           AuthCommandFrontend impl
         chat.rs           ChatCommandFrontend impl
         config.rs         ConfigCommandFrontend impl
         container_frontend.rs  ContainerFrontend impl
-        download.rs       DownloadCommandFrontend impl
         exec_prompt.rs    ExecPromptCommandFrontend impl
         exec_workflow.rs  ExecWorkflowCommandFrontend impl
-        api.rs       ApiCommandFrontend impl
+        api_server.rs     ApiCommandFrontend impl
         init.rs           InitCommandFrontend impl
         mount_scope.rs    MountScopeFrontend impl
         new.rs            NewCommandFrontend impl
         ready.rs          ReadyCommandFrontend impl
-        remote.rs         RemoteCommandFrontend impl
+        remote_frontend.rs RemoteCommandFrontend impl
         specs.rs          SpecsCommandFrontend impl
         status.rs         StatusCommandFrontend impl
         workflow_frontend.rs   WorkflowFrontend impl
@@ -757,7 +753,7 @@ Three rules govern every engine in this layer:
 
 ### `UserMessageSink` and `UserMessage` (`src/engine/message.rs`)
 
-`UserMessageSink` is a supertrait of every frontend trait in Layer 1. Any type that implements `ContainerFrontend`, `WorkflowFrontend`, `ReadyFrontend`, `InitFrontend`, or `AgentFrontend` also implements `UserMessageSink`, so engine code can call `frontend.info(…)`, `frontend.warning(…)`, etc. anywhere a frontend reference is held.
+`UserMessageSink` is a supertrait of every frontend trait in Layer 1. Any type that implements `ContainerFrontend`, `WorkflowFrontend`, `ReadyFrontend`, `InitFrontend`, or `AgentImageFrontend` also implements `UserMessageSink`, so engine code can call `frontend.info(…)`, `frontend.warning(…)`, etc. anywhere a frontend reference is held.
 
 ```rust
 pub struct UserMessage {
@@ -1202,7 +1198,7 @@ impl AgentEngine {
     /// Idempotent: no steps fire and no container_frontend is requested when
     /// both already exist.
     pub async fn ensure_available(
-        &self, agent, config, frontend: &mut dyn AgentFrontend,
+        &self, session, agent, config, frontend: &mut dyn AgentImageFrontend, image_exists,
     ) -> Result<(), EngineError>;
 
     /// Build the ContainerOption list for running an agent container.
@@ -1221,9 +1217,19 @@ impl AgentEngine {
 
 #### Agent matrix (`agent_matrix.rs`)
 
-All per-agent branching — entrypoints, non-interactive flags, plan-mode flags, yolo flags, model flags, image tags, Dockerfile paths, and download URLs — lives exclusively in `agent_matrix.rs`. Adding a new agent is a single-file edit.
+All per-agent branching — entrypoints, non-interactive flags, plan-mode
+flags, yolo flags, model flags, settings/skills mount points, credential
+source, the host-ping argv, static env vars, and the two sandbox-runtime
+capability flags (`sandbox_permission_mode_supported`,
+`sandbox_auth_env_vars`) — lives exclusively in `agent_matrix.rs`. Adding a
+new agent is a single-file edit. (Image tags and Dockerfile paths are a
+separate table, `data::image_tags` / `data::repo_dockerfile_paths` — they are
+per-repo build artifacts, not per-agent CLI behavior, and never lived here.)
+`AgentMatrix` and `ContainerBackend` are the only per-agent and per-backend
+tables in the tree — a new agent or a new container backend is
+a single-file edit to one of the two.
 
-Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`.
+Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
 
 Key per-agent distinctions:
 
@@ -1237,15 +1243,34 @@ Key per-agent distinctions:
 | `cline` | `cline` | `task` subcommand | `--plan` |
 | `crush` | `crush` | `run` subcommand | (unsupported — error) |
 | `maki` | `maki` | varies | (unsupported — error) |
+| `antigravity` | `agy` | `--print` | (unsupported — error) |
+
+`antigravity`'s `ping_argv` is `["antigravity", "--print"]` — a different
+binary from its `agy` interactive entrypoint. This is a known, deliberately
+preserved bug: the sanctioned host-side ready ping for
+antigravity runs a binary the agent doesn't ship, so `awman ready --agent
+antigravity` always reports the local-agent check as not installed, and the
+credential-refresh ping for antigravity can never succeed. Fixing it is a
+real behavior change to a security-sensitive path and needs its own work
+item.
 
 `AgentEngine::build_options` with `PlanMode::Enabled` for an agent that does not support plan returns `EngineError::PlanModeUnsupported { agent }`.
 
-#### `AgentFrontend` trait
+#### `AgentImageFrontend` trait
+
+Named `AgentFrontend` historically; renamed to leave `AgentFrontend` for the
+container-runtime's own frontend trait (`engine::agent_runtime::frontend::AgentFrontend`),
+which `container_frontend` below returns.
 
 ```rust
-pub trait AgentFrontend: UserMessageSink + Send + Sync {
-    fn report_step_status(&mut self, step: &str, status: StepStatus);
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+pub trait AgentImageFrontend: UserMessageSink + Send {
+    /// `step` is the closed `SetupStep` set — not a free-form `&str` key —
+    /// whose `Display` reproduces the strings a frontend printed before.
+    fn report_step_status(&mut self, step: &SetupStep, status: StepStatus);
+
+    /// The engine is about to build/run a container. Returns the runtime
+    /// frontend for streaming build output.
+    fn container_frontend(&mut self) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>;
 }
 ```
 
@@ -1316,14 +1341,30 @@ impl ReadyEngine {
 
 #### `ReadyFrontend` trait
 
+`report_step_status` and `container_frontend` come from `AgentImageFrontend`
+above — the ready flow reports image-setup steps through the same two
+methods the agent engine uses, so `ReadyFrontend` extends it rather than
+redeclaring them.
+
 ```rust
-pub trait ReadyFrontend: UserMessageSink + Send + Sync {
-    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError>;
+pub trait ReadyFrontend: AgentImageFrontend {
+    /// `dockerfile_path` is the resolved absolute path the engine expects
+    /// the user to confirm creating.
+    fn ask_create_dockerfile(&mut self, dockerfile_path: &Path) -> Result<bool, EngineError>;
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError>;
     fn report_phase(&mut self, phase: &ReadyPhase);
-    fn report_step_status(&mut self, step: &str, status: StepStatus);
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
     fn report_summary(&mut self, summary: &ReadySummary);
+
+    /// The sanctioned host-side agent ping (`HostAgentPinger::ping`)
+    /// finished with this result. The ready engine used to compose the
+    /// `> greeting` / `< response` transcript itself and push it through
+    /// `write_message`; it now reports the typed result and lets the
+    /// frontend decide how to draw it. The default impl writes those
+    /// same two lines for `LocalAgentPingResult::Ok`, byte-identical to
+    /// before, and stays silent for the three failure variants (those are
+    /// still reported via `report_step_status` alone) — so no frontend's
+    /// output changes unless it overrides this.
+    fn report_ping(&mut self, result: &LocalAgentPingResult) { /* ... */ }
 }
 ```
 
@@ -1386,14 +1427,26 @@ impl InitEngine {
 
 #### `InitFrontend` trait
 
+`report_step_status` and `container_frontend` come from `AgentImageFrontend`
+above, the same as `ReadyFrontend` — the init flow reports image-setup steps
+through the same two methods the agent engine uses.
+
 ```rust
-pub trait InitFrontend: UserMessageSink + Send + Sync {
+pub trait InitFrontend: AgentImageFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError>;
     fn ask_run_audit(&mut self) -> Result<bool, EngineError>;
     fn ask_work_items_setup(&mut self) -> Result<Option<WorkItemsConfig>, EngineError>;
+
+    /// Called when no project-base Dockerfile is found during init.
+    /// `dockerfile_path` is the path the engine looked at, already resolved
+    /// from the repo config, so the prompt can name it without loading
+    /// `RepoConfig` a second time itself.
+    fn ask_dockerfile_setup(
+        &mut self,
+        git_root: &Path,
+        dockerfile_path: &str,
+    ) -> Result<DockerfileSetupDecision, EngineError>;
     fn report_phase(&mut self, phase: &InitPhase);
-    fn report_step_status(&mut self, step: &str, status: StepStatus);
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
     fn report_summary(&mut self, summary: &InitSummary);
 }
 ```
@@ -1753,12 +1806,14 @@ pub enum CommandOutcome {
     Config(ConfigOutcome),
     ExecPrompt(ExecPromptOutcome),
     ExecWorkflow(ExecWorkflowOutcome),
-    API(ApiOutcome),
+    ApiServer(ApiServerOutcome),
+    Squad(SquadOutcome),
+    SquadAttach(SquadAttachOutcome),
     Remote(RemoteOutcome),
     New(NewOutcome),
     Specs(SpecsOutcome),
-    Auth(AuthOutcome),
-    Download(DownloadOutcome),
+    Clean(CleanOutcome),
+    /// Trivial wrapper used by no-op leaf commands.
     Empty,
 }
 
@@ -1796,11 +1851,13 @@ Each awman command is one module under `src/command/commands/` containing:
 | `status.rs` | `awman status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
 | `specs.rs` | `awman specs amend` | Review/amend agent runs; shares `create_new_spec` with `new spec` |
 | `config.rs` | `awman config {show,get,set}` | Config read/write; `config set --global` writes to global config |
-| `api.rs` | `awman api {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
-| `remote.rs` | `awman remote {run, session start, session kill}` | Uses `RemoteClient` for HTTP + SSE |
+| `api_server.rs` | `awman api {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
+| `remote.rs` | `awman remote {run, session start, session kill}` | Uses `RemoteClient` (`engine::remote`) for HTTP + SSE |
 | `new.rs` | `awman new {spec,workflow,skill}` | Work-item and artefact creation |
-| `auth.rs` | `awman auth` | Keychain credential accept/decline per-repo |
-| `download.rs` | `awman download` | Internal helper for Dockerfile downloads |
+| `squad/` | `awman squad {start,stop,status,logs,add,edit,list,show,remove,pause,resume,trigger,cancel,attach,env}` | Squad daemon lifecycle and task management |
+| `clean.rs` | `awman clean` | Removes containers, workflow files, and dangling images |
+
+This table is illustrative, not exhaustive — see [Command Reference](14-command-reference.md) for the current, generated list of every command, subcommand and flag.
 
 #### Agent-launching command canonical order
 
@@ -1965,39 +2022,67 @@ Decision handling by commands:
 
 ---
 
-### `RemoteClient` (`src/command/commands/remote_client.rs`)
+### `RemoteClient` (`src/engine/remote/client.rs`)
 
-A typed HTTP client for communicating with a remote awman api server. Constructed fresh per `RemoteCommand` invocation; not exported beyond `src/command/commands/`.
+A typed HTTP client for communicating with a remote awman api server. Layer 1:
+the routes, request/response bodies and the API-key resolution
+rule are the engine's typed API for talking to a remote awman. It is a thin
+façade over one `HttpCore` (`src/engine/remote/http_core.rs`, also the
+builder behind every other async HTTP client in the tree, including the
+CI poller) — `RemoteClient` owns only the route-specific methods, the generic
+transport (TLS, timeouts, bearer header) lives in the core.
+`send_command`/`send_command_with_headers`
+and the legacy SSE parser are `pub(crate)`; Layer 2's `RemoteCommand` and the
+`command::commands::remote_client` workflow-poller family (`WorkflowStateSource`,
+`RemoteApiWorkflowSource`, `SquadTaskWorkflowSource`, `RemoteWorkflowPoller`)
+are the callers.
 
 ```rust
 pub struct RemoteClient {
-    base_url: String,
-    http: reqwest::Client,
+    pub(super) core: HttpCore,
 }
 
-pub struct RemoteResponse {
-    pub status: u16,
-    pub body: serde_json::Value,
-}
+// Kept as a type alias so external references to `RemoteResponse` don't change.
+pub type RemoteResponse = HttpResponse;
 
+/// Test-only; production code streams through `ExecutionEventSink` instead.
+#[cfg(test)]
 pub trait RemoteEventSink: Send + Sync {
     fn on_event(&mut self, event_type: &str, data: &str);
     fn on_done(&mut self);
 }
 
+/// Sink for typed `ExecutionEvent`s streamed over SSE from a job's `/logs`
+/// endpoint. Default methods ignore everything; a callback returning `true`
+/// ends the stream early (e.g. on Ctrl-C).
+pub trait ExecutionEventSink: Send {
+    fn on_event(&mut self, event: ExecutionEvent) -> bool { false }
+    fn on_stream_end(&mut self) {}
+}
+
 impl RemoteClient {
-    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    pub const READ_TIMEOUT: Duration = Duration::from_secs(600);
+    pub const CONNECT_TIMEOUT: Duration = HttpCore::CONNECT_TIMEOUT; // 10s
+    pub const READ_TIMEOUT: Duration = HttpCore::READ_TIMEOUT;       // 600s
 
-    pub fn new(base_url: &str, api_key: Option<&ApiKey>) -> Result<Self, CommandError>;
+    pub fn new(base_url: &str, api_key: Option<&ApiKey>) -> Result<Self, EngineError>;
 
-    /// Resolution order: explicit arg > AWMAN_API_KEY env > GlobalConfig::remote.default_api_key
-    /// (only when target_addr matches GlobalConfig::remote.default_addr after URL canonicalization).
+    /// Additionally trusts a specific PEM-encoded cert — used for a loopback
+    /// awman API server's self-signed cert. Callers targeting a non-loopback
+    /// address MUST NOT pass a pinned cert; standard webpki verification stays
+    /// in force.
+    pub fn new_with_pinned_cert(base_url: &str, api_key: Option<&ApiKey>, pinned_cert_pem: Option<&str>) -> Result<Self, EngineError>;
+
+    pub fn is_loopback_addr(addr: &str) -> bool;
+
+    /// Resolution order: explicit arg > AWMAN_API_KEY (via `Session::env`) >
+    /// GlobalConfig::remote.default_api_key (only when target_addr matches
+    /// GlobalConfig::remote.default_addr after URL canonicalization).
     /// Returns None when no key is available (server may have --dangerously-skip-auth).
-    pub fn resolve_api_key(session: &Session, target_addr: &str, explicit: Option<&str>) -> Result<Option<ApiKey>, CommandError>;
+    pub fn resolve_api_key(session: &Session, target_addr: &str, explicit: Option<&str>) -> Result<Option<ApiKey>, EngineError>;
 
-    pub async fn send_command(&self, path: &[&str], flags: &[(&str, serde_json::Value)]) -> Result<RemoteResponse, CommandError>;
-    pub async fn stream_command(&self, path: &[&str], flags: &[(&str, serde_json::Value)], sink: &mut dyn RemoteEventSink) -> Result<(), CommandError>;
+    /// Stream typed `ExecutionEvent`s from `GET /v1/commands/{id}/logs` to a
+    /// sink; ends when the server sends `Done` or the sink returns `true`.
+    pub async fn stream_job_logs(&self, session_id: &str, job_id: &str, sink: &mut dyn ExecutionEventSink) -> Result<(), EngineError>;
 }
 ```
 
@@ -2137,7 +2222,7 @@ pub struct CliFrontend {
 }
 ```
 
-The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`AuthCommandFrontend`, `ConfigCommandFrontend`, `DownloadCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `ApiCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules.
+The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`ConfigCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules (`ApiStartCommandFrontend` and the rest of `per_command/`).
 
 `CliFrontend::new(matches)` pre-computes `command_path` so it doesn't re-traverse the matches tree on every call.
 
@@ -2195,16 +2280,22 @@ Each module in this directory implements the richer `*CommandFrontend` trait (an
 | `exec_prompt.rs` | `ExecPromptCommandFrontend` | Marker |
 | `exec_workflow.rs` | `ExecWorkflowCommandFrontend`, `ContainerFrontend`, `WorkflowFrontend` | Integrates container output, workflow control, and worktree lifecycle for the exec-workflow command path |
 | `api.rs` | `ApiStartCommandFrontend` | Hands `ApiServerRuntime` to `crate::frontend::api::serve` — a peer Layer 3 call, not an upward call |
-| `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config |
+| `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config, or answers headlessly per below |
 | `ready.rs` | `ReadyCommandFrontend`, `ReadyFrontend` | Reports `ReadyPhase` transitions to stderr; prompts for Dockerfile creation and legacy-migration decisions |
-| `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin; defaults to `DeclineOnce` when stdin is not a TTY |
-| `agent_setup.rs` | `AgentSetupFrontend` | Asks agent setup decision on stdin; defaults to `Setup` when stdin is not a TTY |
+| `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin, or answers `DeclineOnce` headlessly per below |
+| `agent_setup.rs` | `AgentSetupFrontend` | Asks agent setup decision on stdin, or answers `Setup` headlessly per below |
 | `container_frontend_marker.rs` | `ContainerFrontend` | Shared marker impl for commands that don't use a PTY container |
-| `mount_scope.rs` | `MountScopeFrontend` | Asks mount scope on stdin; defaults to `MountGitRoot` when stdin is not a TTY |
+| `mount_scope.rs` | `MountScopeFrontend` | Asks mount scope on stdin, or answers `MountGitRoot` headlessly per below |
 | `workflow_frontend_marker.rs` | `WorkflowFrontend` | Shared marker impl for commands that don't use workflows |
-| `worktree_lifecycle_marker.rs` | `WorktreeLifecycleFrontend` | Shared marker impl for commands that don't use worktrees |
+| `worktree_lifecycle_marker.rs` | `WorktreeLifecycleFrontend` | Shared marker impl for commands that don't use worktrees; answers headlessly per below |
+| `clean.rs` | `CleanCommandFrontend` | Prompts before deleting, or answers headlessly per below |
 
-The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matches the API defaults from WI 0069 §7u: interactive prompts return the non-destructive option rather than blocking.
+The **safe default (headless) policy** is applied by `CliFrontend::non_interactive`
+(`ResolvedFlags::is_non_interactive`): the run is headless when
+`--non-interactive`/`--json` was passed **or** stdin is not a TTY. Every
+`ask_*` method above consults that one resolved flag rather than testing the
+terminal itself, so `--non-interactive` is honoured on a real terminal too.
+Interactive prompts return the non-destructive option rather than blocking.
 
 ---
 
@@ -2340,9 +2431,14 @@ Global shortcuts (available in all contexts except `ContainerMaximized`):
 `parse_input(text)` tokenizes the raw command-box string by calling `Dispatch::parse_command_box_input`. Returns `Ok(ParsedCommandBoxInput)` or a `CommandError`.
 
 `format_parse_error(err)` converts a `CommandError` into a user-visible string:
-- `UnknownCommand` with a close match (Levenshtein ≤ 4): `"did you mean: <suggestion>?"`
+- `UnknownCommand` with a close match (Levenshtein ≤ 3, computed over the
+  unresolved path's subcommands so a typo nested under a valid parent command
+  is corrected too): `"did you mean: <suggestion>?"`
 - `UnknownCommand` with no close match: `"unknown command: <name>"`
-- `UnknownFlag`: `"unknown flag: --<name>"`
+- `UnknownFlag`: `"unknown flag: --<name>"`, or `"unknown flag: <token>"` when
+  the typed token itself starts with `-` (a short flag or short-flag cluster,
+  e.g. `-ab`), so the message never doubles the dash
+- `InvalidFlagValue` / other `CommandError` variants: their own `Display`
 - `CommandBoxParse`: the error message verbatim
 
 #### Hints and suggestions (`hints.rs`)

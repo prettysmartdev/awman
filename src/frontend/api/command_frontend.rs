@@ -8,15 +8,21 @@
 //! command's `output.log` file on disk. SSE clients tailing the log see
 //! new lines in real time.
 //!
-//! All interactive Q&A methods return safe non-interactive defaults (the
-//! same defaults the CLI uses when stdin is not a TTY).
+//! Every interactive Q&A method is a one-line delegation to
+//! [`HeadlessDefaults::api`](crate::command::headless::HeadlessDefaults::api),
+//! the Layer 2 profile that owns the API's headless answers. They are *not*
+//! the same as the CLI's or the squad daemon's — the differences are
+//! deliberate per-host policy, tabulated and explained in
+//! `src/command/headless.rs`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::data::execution_event::EventPayload;
-use crate::frontend::api::event_bus::EventBusSender;
+use crate::command::commands::api_server::event_bus::EventBusSender;
+use crate::data::execution_event::{
+    CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
+};
 
 use async_trait::async_trait;
 
@@ -24,11 +30,11 @@ use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend}
 use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
-use crate::command::commands::api_server::{ApiServerCommandFrontend, ApiServerRuntime};
-use crate::command::commands::auth::AuthCommandFrontend;
+use crate::command::commands::api_server::{
+    ApiKeyDisclosure, ApiServerCommandFrontend, ApiServerRuntime,
+};
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
-use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
 use crate::command::commands::exec_workflow::{
     ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
@@ -46,10 +52,15 @@ use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
+use crate::command::headless::HeadlessDefaults;
 use crate::data::config::repo::WorkItemsConfig;
-use crate::data::message::{UserMessage, UserMessageSink};
+use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::ready_phase::ReadyPhase;
+use crate::data::ready_summary::ReadySummary;
 use crate::data::session::AgentName;
+use crate::data::step_status::StepStatus;
 use crate::data::workflow_definition::WorkflowStep;
+use crate::data::workflow_state::PhaseKind;
 use crate::engine::acp::{AcpFrontend, PermissionDecision, PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
@@ -57,9 +68,6 @@ use crate::engine::init::frontend::InitFrontend;
 use crate::engine::init::phase::InitPhase;
 use crate::engine::init::summary::InitSummary;
 use crate::engine::ready::frontend::ReadyFrontend;
-use crate::engine::ready::phase::ReadyPhase;
-use crate::engine::ready::summary::ReadySummary;
-use crate::engine::step_status::StepStatus;
 use crate::engine::workflow::actions::{
     AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepStatus, YoloTickOutcome,
@@ -94,7 +102,16 @@ pub struct ApiDispatchFrontend {
     /// What the countdown currently being ticked will do when it expires
     /// (WI-0115 §3). An API consumer reading "auto-advancing" through a
     /// failure retry would draw the wrong conclusion about its run.
+    /// The command path this frontend was built for, e.g. "init", "ready",
+    /// "exec prompt". Used as the `phase` tag on agent-image setup events so
+    /// the one `AgentImageFrontend` impl keeps the per-command phase string
+    /// the separate `InitFrontend`/`ReadyFrontend` impls emitted (F-33).
+    command_path: String,
     countdown_kind: CountdownKind,
+    /// Every answer this frontend gives to a question it cannot ask a human.
+    /// See `src/command/headless.rs` for the table and why the API's row
+    /// differs from squad's and the CLI's.
+    headless: HeadlessDefaults,
 }
 
 #[async_trait::async_trait]
@@ -160,6 +177,15 @@ impl ApiDispatchFrontend {
             done_emitted: std::sync::atomic::AtomicBool::new(false),
             last_sink_message_time: None,
             countdown_kind: CountdownKind::StuckStep,
+            // The *catalogue's* spelling of the path, not the request's. This
+            // string is the `phase` label on every status event the merged
+            // `AgentImageFrontend` impl emits (F-33), and `subcommand` is a
+            // raw HTTP field: `{"subcommand": " ready"}` passes validation and
+            // would emit `phase: " ready"`. `canonical_path` also resolves
+            // aliases, so an aliased request labels its events the same as the
+            // canonical one.
+            command_path: CommandCatalogue::get().canonical_path(&path).join(" "),
+            headless: HeadlessDefaults::api(),
         }
     }
 
@@ -234,6 +260,10 @@ impl Drop for ApiDispatchFrontend {
 
 // ─── UserMessageSink ────────────────────────────────────────────────────────
 
+/// F-45: takes the default `command_started`, so the `$ git …` echo line
+/// is byte-identical to the one `run_git_logged` composed before.
+impl crate::engine::git::GitFrontend for ApiDispatchFrontend {}
+
 impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
         let phase = match msg.level {
@@ -266,6 +296,9 @@ impl ApiDispatchFrontend {
 }
 
 impl CommandFrontend for ApiDispatchFrontend {
+    fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
+        crate::command::dispatch::catalogue::FrontendKind::Api
+    }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         self.check_parse()?;
         Ok(self.parsed.flag_bool(flag))
@@ -337,9 +370,10 @@ impl CommandFrontend for ApiDispatchFrontend {
 /// errors, but the parse-stage variants carry only owned string data).
 fn clone_parse_error(e: &CommandError) -> CommandError {
     match e {
-        CommandError::UnknownCommand { path } => {
-            CommandError::UnknownCommand { path: path.clone() }
-        }
+        CommandError::UnknownCommand { path, suggestions } => CommandError::UnknownCommand {
+            path: path.clone(),
+            suggestions: suggestions.clone(),
+        },
         CommandError::UnknownFlag { command, flag } => CommandError::UnknownFlag {
             command: command.clone(),
             flag: flag.clone(),
@@ -478,6 +512,47 @@ impl HasAgentFrontend for ApiDispatchFrontend {
     }
 }
 
+// ─── AgentImageFrontend ─────────────────────────────────────────────────
+
+/// One `AgentImageFrontend` for the API frontend: `ReadyFrontend` and
+/// `InitFrontend` both extend it (F-33).
+///
+/// The separate `InitFrontend`/`ReadyFrontend` impls each tagged their
+/// status events with their own command name (`phase: "init"` /
+/// `phase: "ready"`, message prefix `Init step` / `Ready step`). The merged
+/// impl reads that label from `command_path`, so the event stream is
+/// unchanged for both commands.
+impl crate::engine::agent::AgentImageFrontend for ApiDispatchFrontend {
+    fn report_step_status(
+        &mut self,
+        step: &crate::data::setup_step::SetupStep,
+        status: StepStatus,
+    ) {
+        let phase = self.command_path.clone();
+        let label = title_case(&phase);
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase,
+            message: format!("{label} step '{step}': {status:?}"),
+        });
+    }
+
+    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
+        Box::new(ApiContainerSink {
+            event_bus: self.event_bus.clone(),
+        })
+    }
+}
+
+/// Upper-case the first character; used only to label setup-progress events
+/// with the command name the way the pre-merge impls spelled it.
+fn title_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Standalone container frontend that emits events to the EventBus.
 struct ApiContainerSink {
     event_bus: EventBusSender,
@@ -590,7 +665,7 @@ impl MountScopeFrontend for ApiDispatchFrontend {
         _git_root: &Path,
         _cwd: &Path,
     ) -> Result<MountScopeDecision, CommandError> {
-        Ok(MountScopeDecision::MountGitRoot)
+        Ok(self.headless.mount_scope())
     }
 }
 
@@ -604,11 +679,7 @@ impl AgentSetupFrontend for ApiDispatchFrontend {
         default_available: bool,
         _image_only: bool,
     ) -> Result<AgentSetupDecision, CommandError> {
-        if default_available {
-            Ok(AgentSetupDecision::Setup)
-        } else {
-            Ok(AgentSetupDecision::Abort)
-        }
+        Ok(self.headless.agent_setup(default_available))
     }
 
     fn record_fallback(&mut self, _requested: &AgentName, _fallback: &AgentName) {}
@@ -622,7 +693,7 @@ impl AgentAuthFrontend for ApiDispatchFrontend {
         _agent: &AgentName,
         _env_var_names: &[&str],
     ) -> Result<AgentAuthDecision, CommandError> {
-        Ok(AgentAuthDecision::Accept)
+        Ok(self.headless.agent_auth_consent())
     }
 }
 
@@ -634,11 +705,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         _state: &crate::data::workflow_state::WorkflowState,
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
-        if available.can_launch_next {
-            Ok(NextAction::LaunchNext)
-        } else {
-            Ok(NextAction::Abort)
-        }
+        Ok(self.headless.workflow_next_action(available))
     }
 
     fn yolo_countdown_tick(
@@ -664,7 +731,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             });
             self.last_sink_message_time = Some(std::time::Instant::now());
         }
-        Ok(YoloTickOutcome::Continue)
+        Ok(self.headless.yolo_tick())
     }
 
     fn yolo_countdown_started(&mut self, _step_name: &str, kind: CountdownKind) {
@@ -677,20 +744,22 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
-        let (from_str, to_str) = match &status {
+        // The `from` status is what the step must have been in for this
+        // transition to be reachable; the engine reports only the new one.
+        let (from, to) = match &status {
             WorkflowStepStatus::Pending => return,
-            WorkflowStepStatus::Running => ("pending", "running"),
-            WorkflowStepStatus::Succeeded => ("running", "succeeded"),
-            WorkflowStepStatus::Failed { .. } => ("running", "failed"),
-            WorkflowStepStatus::Cancelled => ("pending", "cancelled"),
-            WorkflowStepStatus::Skipped => ("pending", "skipped"),
+            WorkflowStepStatus::Running => (StepStatusKind::Pending, StepStatusKind::Running),
+            WorkflowStepStatus::Succeeded => (StepStatusKind::Running, StepStatusKind::Succeeded),
+            WorkflowStepStatus::Failed { .. } => (StepStatusKind::Running, StepStatusKind::Failed),
+            WorkflowStepStatus::Cancelled => (StepStatusKind::Pending, StepStatusKind::Cancelled),
+            WorkflowStepStatus::Skipped => (StepStatusKind::Pending, StepStatusKind::Skipped),
         };
         let idx = self.step_index_for(&step.name);
         self.event_bus.emit(EventPayload::WorkflowStepTransition {
             step_name: step.name.clone(),
             step_index: idx,
-            from_status: from_str.to_string(),
-            to_status: to_str.to_string(),
+            from_status: from,
+            to_status: to,
         });
     }
 
@@ -743,71 +812,53 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                     "Running workflow ({total} step{})",
                     if total == 1 { "" } else { "s" }
                 ),
-                status: "running".to_string(),
+                status: PhaseStatusKind::Running,
             });
         }
     }
 
     fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
-        Ok(true)
+        Ok(self.headless.confirm_resume())
     }
 
     // `supports_interactive_recovery` keeps its `false` default: an API run has
     // no user to ask, so a failed step takes the engine's countdown-and-retry
+
     // path (WI-0115 §3).
+    // One set of four for both phases (F-34). `PhaseKind::label()` is the
+    // `phase` string, so the event stream is unchanged: `"setup"` and
+    // `"teardown"` exactly as before.
 
-    fn on_setup_step_started(&mut self, description: &str) {
+    fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
         self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "setup".to_string(),
+            phase: kind.label().to_string(),
             message: format!("started: {description}"),
         });
     }
 
-    fn on_setup_step_output(&mut self, line: &str) {
+    fn on_phase_step_output(&mut self, kind: PhaseKind, line: &str) {
         self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "setup".to_string(),
+            phase: kind.label().to_string(),
             message: line.to_string(),
         });
     }
 
-    fn on_setup_step_completed(&mut self, description: &str) {
+    fn on_phase_step_completed(&mut self, kind: PhaseKind, description: &str) {
         self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "setup".to_string(),
+            phase: kind.label().to_string(),
             message: format!("completed: {description}"),
         });
     }
 
-    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+    fn on_phase_step_failed(
+        &mut self,
+        kind: PhaseKind,
+        description: &str,
+        exit_code: i32,
+        stderr: &str,
+    ) {
         self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "setup".to_string(),
-            message: format!("failed: {description} (exit {exit_code}): {stderr}"),
-        });
-    }
-
-    fn on_teardown_step_started(&mut self, description: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "teardown".to_string(),
-            message: format!("started: {description}"),
-        });
-    }
-
-    fn on_teardown_step_output(&mut self, line: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "teardown".to_string(),
-            message: line.to_string(),
-        });
-    }
-
-    fn on_teardown_step_completed(&mut self, description: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "teardown".to_string(),
-            message: format!("completed: {description}"),
-        });
-    }
-
-    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "teardown".to_string(),
+            phase: kind.label().to_string(),
             message: format!("failed: {description} (exit {exit_code}): {stderr}"),
         });
     }
@@ -815,48 +866,48 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         let (status, exit_code, error, phase_status, step_desc) = match outcome {
             WorkflowOutcome::Completed => (
-                "done".to_string(),
+                CommandStatusKind::Done,
                 Some(0),
                 None,
-                "succeeded",
+                PhaseStatusKind::Succeeded,
                 "Workflow completed".to_string(),
             ),
             WorkflowOutcome::Paused => (
-                "paused".to_string(),
+                CommandStatusKind::Paused,
                 None,
                 None,
-                "paused",
+                PhaseStatusKind::Paused,
                 "Workflow paused".to_string(),
             ),
             WorkflowOutcome::Aborted => (
-                "aborted".to_string(),
+                CommandStatusKind::Aborted,
                 Some(1),
                 None,
-                "failed",
+                PhaseStatusKind::Failed,
                 "Workflow aborted".to_string(),
             ),
             WorkflowOutcome::CompletedTeardownFailed => (
-                "done".to_string(),
+                CommandStatusKind::Done,
                 Some(1),
                 Some("Teardown failed".to_string()),
-                "teardown_failed",
+                PhaseStatusKind::TeardownFailed,
                 "Workflow completed but teardown failed".to_string(),
             ),
             WorkflowOutcome::Failed {
                 last_step,
                 exit_code,
             } => (
-                "error".to_string(),
+                CommandStatusKind::Error,
                 Some(*exit_code),
                 Some(format!("Step '{last_step}' failed")),
-                "failed",
+                PhaseStatusKind::Failed,
                 format!("Step '{last_step}' failed"),
             ),
         };
         self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
             phase: "main".to_string(),
             step_desc,
-            status: phase_status.to_string(),
+            status: phase_status,
         });
         self.event_bus.emit(EventPayload::CommandStatus {
             status,
@@ -874,9 +925,9 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         _files: &[String],
         suggested_message: &str,
     ) -> Result<PreWorktreeDecision, CommandError> {
-        Ok(PreWorktreeDecision::Commit {
-            message: suggested_message.to_string(),
-        })
+        Ok(self
+            .headless
+            .pre_worktree_uncommitted_files(suggested_message))
     }
 
     fn ask_existing_worktree(
@@ -884,7 +935,7 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         _path: &Path,
         _branch: &str,
     ) -> Result<ExistingWorktreeDecision, CommandError> {
-        Ok(ExistingWorktreeDecision::Resume)
+        Ok(self.headless.existing_worktree())
     }
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
@@ -898,11 +949,7 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         &mut self,
         prompt: &crate::command::commands::worktree_lifecycle::PostWorkflowWorktreePrompt,
     ) -> Result<PostWorkflowWorktreeAction, CommandError> {
-        if prompt.had_error {
-            Ok(PostWorkflowWorktreeAction::Keep)
-        } else {
-            Ok(PostWorkflowWorktreeAction::Merge)
-        }
+        Ok(self.headless.post_workflow_action(prompt))
     }
 
     fn ask_worktree_commit_before_merge(
@@ -911,12 +958,13 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         _files: &[String],
         suggested_message: &str,
     ) -> Result<Option<String>, CommandError> {
-        Ok(Some(suggested_message.to_string()))
+        Ok(self
+            .headless
+            .worktree_commit_before_merge(suggested_message))
     }
 
     fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
-        // Headless API runs keep the historical behaviour: squash merge.
-        Ok(WorktreeMergeMode::Squash)
+        Ok(self.headless.merge_mode())
     }
 
     fn confirm_worktree_cleanup(
@@ -924,7 +972,7 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         _branch: &str,
         _path: &Path,
     ) -> Result<bool, CommandError> {
-        Ok(true)
+        Ok(self.headless.confirm_worktree_cleanup())
     }
 
     fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, _git_root: &Path) {
@@ -956,36 +1004,27 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
 
 impl InitFrontend for ApiDispatchFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
-        Ok(false)
+        Ok(self.headless.replace_aspec())
     }
     fn ask_run_audit(&mut self) -> Result<bool, EngineError> {
-        Ok(false)
+        Ok(self.headless.run_audit())
     }
     fn ask_work_items_setup(&mut self) -> Result<Option<WorkItemsConfig>, EngineError> {
-        Ok(None)
+        Ok(self.headless.work_items_setup())
     }
     fn ask_dockerfile_setup(
         &mut self,
+        _prompt: &crate::data::prompt::Prompt<crate::engine::init::frontend::DockerfileSetupChoice>,
         _git_root: &std::path::Path,
+        _dockerfile_path: &str,
     ) -> Result<crate::engine::init::frontend::DockerfileSetupDecision, EngineError> {
-        Ok(crate::engine::init::frontend::DockerfileSetupDecision::CreateNew)
+        Ok(self.headless.dockerfile_setup())
     }
     fn report_phase(&mut self, phase: &InitPhase) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "init".to_string(),
             message: format!("Init phase: {phase:?}"),
         });
-    }
-    fn report_step_status(&mut self, step: &str, status: StepStatus) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "init".to_string(),
-            message: format!("Init step '{step}': {status:?}"),
-        });
-    }
-    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(ApiContainerSink {
-            event_bus: self.event_bus.clone(),
-        })
     }
     fn report_summary(&mut self, _summary: &InitSummary) {}
 }
@@ -997,10 +1036,10 @@ impl ReadyFrontend for ApiDispatchFrontend {
         &mut self,
         _dockerfile_path: &std::path::Path,
     ) -> Result<bool, EngineError> {
-        Ok(true)
+        Ok(self.headless.create_dockerfile())
     }
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
-        Ok(false)
+        Ok(self.headless.run_audit_on_template())
     }
     fn report_phase(&mut self, phase: &ReadyPhase) {
         self.event_bus.emit(EventPayload::StatusMessage {
@@ -1008,28 +1047,14 @@ impl ReadyFrontend for ApiDispatchFrontend {
             message: format!("Ready phase: {phase:?}"),
         });
     }
-    fn report_step_status(&mut self, step: &str, status: StepStatus) {
-        self.event_bus.emit(EventPayload::StatusMessage {
-            phase: "ready".to_string(),
-            message: format!("Ready step '{step}': {status:?}"),
-        });
-    }
-    fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(ApiContainerSink {
-            event_bus: self.event_bus.clone(),
-        })
-    }
     fn report_summary(&mut self, _summary: &ReadySummary) {}
 }
 
 // ─── Per-command frontend markers ───────────────────────────────────────────
 
 impl RemoteCommandFrontend for ApiDispatchFrontend {}
-impl DownloadCommandFrontend for ApiDispatchFrontend {}
 
 impl StatusCommandFrontend for ApiDispatchFrontend {}
-
-impl AuthCommandFrontend for ApiDispatchFrontend {}
 
 impl ConfigCommandFrontend for ApiDispatchFrontend {
     fn present_config_table(
@@ -1049,7 +1074,7 @@ impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFronte
         &mut self,
         _summary: &crate::command::commands::clean::CleanSummary,
     ) -> Result<bool, CommandError> {
-        Ok(false)
+        Ok(self.headless.confirm_deletion())
     }
 }
 
@@ -1063,9 +1088,26 @@ impl ApiServerCommandFrontend for ApiDispatchFrontend {
             "Cannot start a nested API server from within API dispatch".into(),
         ))
     }
+
+    /// The key as text, on the message stream the caller is already reading.
+    /// The API used to receive the CLI's banner and serialise the `═` runs
+    /// into JSON, which no HTTP client wanted.
+    fn show_api_key(&mut self, disclosure: &ApiKeyDisclosure) {
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "awman API key (store this — it will not be shown again): {}",
+                disclosure.key()
+            ),
+        });
+    }
 }
 
-impl ChatCommandFrontend for ApiDispatchFrontend {
+impl ChatCommandFrontend for ApiDispatchFrontend {}
+
+/// One `AgentLaunchFrontend` for the API frontend. There is no host terminal
+/// behind an HTTP request, so there is nothing for `set_pty_active` to gate.
+impl crate::command::commands::agent_setup::AgentLaunchFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
 }
 
@@ -1077,11 +1119,8 @@ impl AcpFrontend for ApiDispatchFrontend {
         });
     }
 
-    fn request_permission(&mut self, _request: PermissionRequest) -> PermissionDecision {
-        // Fail closed: `AcpSession` only reaches the frontend when neither
-        // `--yolo` nor `--auto` is set, and API dispatch has no way to ask a
-        // human, so it must deny rather than silently approve a tool call.
-        PermissionDecision::Cancelled
+    fn request_permission(&mut self, request: PermissionRequest) -> PermissionDecision {
+        self.headless.acp_permission(&request.options)
     }
 
     fn next_prompt(&mut self) -> Option<String> {
@@ -1093,7 +1132,6 @@ impl ExecPromptCommandFrontend for ApiDispatchFrontend {}
 
 #[async_trait]
 impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
-    fn set_pty_active(&mut self, _active: bool) {}
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "workflow".to_string(),
@@ -1103,13 +1141,11 @@ impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
             ),
         });
     }
-    /// No interactive prompt, so keep the API default of preserving work:
-    /// resume at the step the previous run stopped on.
     fn ask_workflow_resume(
         &mut self,
         prompt: &WorkflowResumePrompt,
     ) -> Result<WorkflowResumeDecision, CommandError> {
-        Ok(prompt.resume_from_stop_point())
+        Ok(self.headless.workflow_resume(prompt))
     }
 
     fn notify_dynamic_workflow_resume_unavailable(
@@ -1137,7 +1173,7 @@ mod tests {
     use super::*;
 
     fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
-        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let sender = bus.sender();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         ApiDispatchFrontend::new(subcommand, &args, sender)
@@ -1259,7 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn drop_emits_done_sentinel_when_emit_done_was_not_called() {
         use crate::engine::agent_runtime::frontend::AgentFrontend;
-        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
         let io = fe.take_io();
@@ -1282,7 +1318,7 @@ mod tests {
     #[tokio::test]
     async fn drop_flushes_partial_stdout_line_before_done() {
         use crate::engine::agent_runtime::frontend::AgentFrontend;
-        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
         let io = fe.take_io();
@@ -1307,7 +1343,7 @@ mod tests {
     #[tokio::test]
     async fn drop_flushes_partial_stderr_line_before_done() {
         use crate::engine::agent_runtime::frontend::AgentFrontend;
-        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
         let io = fe.take_io();
@@ -1329,7 +1365,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_emit_done_then_drop_does_not_double_emit() {
-        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
         fe.emit_done();
@@ -1384,7 +1420,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_retry_countdown_is_not_reported_as_auto_advancing() {
         use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
 
@@ -1429,7 +1465,7 @@ mod tests {
     #[tokio::test]
     async fn yolo_countdown_throttles_api_messages_within_window() {
         use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
 
@@ -1457,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn yolo_countdown_tick_emits_again_after_finished_resets_timer() {
         use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
 
@@ -1501,7 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn yolo_countdown_tick_emits_after_throttle_window_elapses() {
         use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
         let mut rx = bus.subscribe();
         let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
 

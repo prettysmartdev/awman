@@ -108,3 +108,37 @@ pub trait AgentFrontend: UserMessageSink + Send {
         DEFAULT_STUCK_TIMEOUT
     }
 }
+
+/// Forward a shared, mutex-guarded frontend to the frontend it wraps.
+///
+/// The companion to the `WorkflowFrontend` impl of the same shape (F-36):
+/// Layer 2 holds its frontend as `Arc<Mutex<Box<dyn …>>>` so an engine and an
+/// execution factory can share it, and this impl lets that handle be used as
+/// an `AgentFrontend` without a hand-written proxy struct that can drop a
+/// method to its trait default.
+///
+/// `take_io` forwards straight through, so a caller that needs to pair one
+/// container's I/O with that container's `Running` callback still wraps this
+/// handle in its own stateful proxy.
+#[async_trait]
+impl<F: AgentFrontend + ?Sized> AgentFrontend for std::sync::Arc<std::sync::Mutex<Box<F>>> {
+    fn report_status(&mut self, status: AgentStatus) {
+        self.lock().unwrap().report_status(status);
+    }
+
+    fn report_progress(&mut self, progress: AgentProgress) {
+        self.lock().unwrap().report_progress(progress);
+    }
+
+    fn take_io(&mut self) -> AgentIo {
+        self.lock().unwrap().take_io()
+    }
+
+    fn grace_timeout(&self) -> Duration {
+        self.lock().unwrap().grace_timeout()
+    }
+
+    fn stuck_timeout(&self) -> Duration {
+        self.lock().unwrap().stuck_timeout()
+    }
+}

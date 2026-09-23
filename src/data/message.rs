@@ -23,7 +23,7 @@ pub enum MessageLevel {
 }
 
 /// A sink for awman-authored status messages displayed in the awman UI, NOT
-/// inside a container's terminal window. Defined by Layer 1; implemented by
+/// inside a container's terminal window. Defined by Layer 0; implemented by
 /// Layer 3.
 pub trait UserMessageSink: Send + Sync {
     /// Write a message immediately if the output device is available, or queue
@@ -71,6 +71,23 @@ pub trait UserMessageSink: Send + Sync {
             level: MessageLevel::Success,
             text: text.into(),
         });
+    }
+}
+
+/// Forward a shared, mutex-guarded sink to the sink it wraps.
+///
+/// Layer 2 shares one frontend between an engine and an execution factory as
+/// `Arc<Mutex<Box<dyn …>>>`; this impl (with the matching ones on
+/// `WorkflowFrontend` and `AgentFrontend`) lets that handle be passed to the
+/// engine directly, instead of each command hand-writing a forwarding proxy
+/// that can silently drop a method to its trait default (F-36).
+impl<S: UserMessageSink + ?Sized> UserMessageSink for std::sync::Arc<std::sync::Mutex<Box<S>>> {
+    fn write_message(&mut self, msg: UserMessage) {
+        self.lock().unwrap().write_message(msg);
+    }
+
+    fn replay_queued(&mut self) {
+        self.lock().unwrap().replay_queued();
     }
 }
 

@@ -1,5 +1,6 @@
 use super::command_box::{command_box_scroll_offset, truncate_middle};
-use super::dialog::{cursor_window, render_config_show};
+use super::dialog::cursor_window;
+use super::dialog::render_config_show_for_tests as render_config_show;
 use super::execution_window::{apply_selection_highlight, capture_buffer_grid};
 use super::sidebar::{git_file_line, render_git_sidebar, truncate_path};
 use crate::engine::git::{GitDiffSummary, GitFileChangeType, GitFileEntry};
@@ -256,6 +257,7 @@ fn config_show_truncates_long_cell_and_shows_full_value_in_detail_line() {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
+            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
         }],
         selected: 0,
         editing: false,
@@ -309,6 +311,7 @@ fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
                 global_writable: true,
                 repo_writable: true,
                 value_hint: None,
+                shape: crate::command::commands::config::ConfigFieldShape::Scalar,
             })
             .collect();
         rows.push(dialogs::ConfigShowRow {
@@ -320,6 +323,7 @@ fn config_show_scrolls_to_reveal_rows_past_the_visible_window() {
             global_writable: false,
             repo_writable: true,
             value_hint: None,
+            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
         });
         rows
     }
@@ -413,6 +417,7 @@ fn config_show_editing_long_value_keeps_cursor_visible_in_cell() {
             global_writable: true,
             repo_writable: true,
             value_hint: None,
+            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
         }],
         selected: 0,
         editing: true,
@@ -485,6 +490,7 @@ fn config_show_ctrl_n_hint_only_on_agents_to_models_rows() {
                 global_writable: false,
                 repo_writable: true,
                 value_hint: None,
+                shape: crate::command::commands::config::ConfigFieldShape::Scalar,
             }],
             selected: 0,
             editing: false,
@@ -532,6 +538,7 @@ fn config_show_renders_rejection_reason_over_format_hint() {
             global_writable: false,
             repo_writable: true,
             value_hint: Some("agent::model".to_string()),
+            shape: crate::command::commands::config::ConfigFieldShape::Scalar,
         }],
         selected: 0,
         editing: true,

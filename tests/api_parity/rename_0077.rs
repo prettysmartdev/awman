@@ -3,11 +3,12 @@
 //! Verifies:
 //! - `ApiPaths` paths use "awman" not "amux" or "headless".
 //! - The database filename embeds "awman" (not "amux").
-//! - The API key banner uses "awman" branding.
 //! - `ApiServeConfig` type name uses "Api" terminology (compile-time evidence).
 //! - The API server startup log message contains "api" and not "headless"/"amux".
+//!
+//! The API key banner's "awman" branding is asserted beside the banner, which
+//! is drawn by `src/frontend/cli/per_command/api_server.rs`.
 
-use awman::command::commands::api_server::banner::render_api_key_banner;
 use awman::command::commands::api_server::ApiServeConfig;
 use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT};
 use awman::data::fs::api_paths::ApiPaths;
@@ -82,29 +83,6 @@ fn api_paths_honours_awman_api_root_override() {
     assert!(
         db.ends_with("data/awman.db"),
         "db path must live under <data_home>/data/awman.db; got {db:?}"
-    );
-}
-
-// ─── API key banner ──────────────────────────────────────────────────────────
-
-/// The API key banner presented to users on key generation must use "awman"
-/// branding, not "amux".
-#[test]
-fn api_key_banner_uses_awman_branding() {
-    let key = "a".repeat(64);
-    let banner = render_api_key_banner(&key);
-    let lower = banner.to_lowercase();
-    assert!(
-        lower.contains("awman"),
-        "API key banner must mention 'awman'; got:\n{banner}"
-    );
-    assert!(
-        !lower.contains("amux"),
-        "API key banner must not mention 'amux'; got:\n{banner}"
-    );
-    assert!(
-        !lower.contains("headless"),
-        "API key banner must not mention 'headless'; got:\n{banner}"
     );
 }
 
@@ -195,7 +173,7 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     use awman::command::dispatch::Engines;
     use awman::data::fs::api_db::SqliteSessionStore;
     use awman::data::fs::auth_paths::AuthPathResolver;
-    use awman::data::EngineWorkflowStateStore;
+    use awman::data::WorkflowStateStore;
     use awman::engine::agent::AgentEngine;
     use awman::engine::auth::AuthEngine;
     use awman::engine::container::ContainerRuntime;
@@ -213,7 +191,7 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
     let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
     let auth_engine = Arc::new(AuthEngine::with_paths(auth_paths, paths.clone()));
-    let workflow_state_store = Arc::new(EngineWorkflowStateStore::at_git_root(tmp.path()));
+    let workflow_state_store = Arc::new(WorkflowStateStore::at_git_root(tmp.path()));
 
     let engines = Engines {
         runtime: runtime.clone(),
@@ -224,6 +202,8 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
         auth_engine,
         agent_engine,
         workflow_state_store,
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
 
     let state = Arc::new(AppState {

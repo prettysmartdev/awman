@@ -2,6 +2,8 @@
 //! green-corner indicator, and the status-bar +/- summary.
 
 use super::*;
+use crate::command::commands::squad::commands::SquadCommand;
+use crate::command::dispatch::FrontendAction;
 use ratatui::style::Color;
 
 // ─── Git sidebar ──────────────────────────────────────────────────────────
@@ -551,12 +553,14 @@ fn acp_permission_request_modal_renders_through_the_dialog_framework() {
 
 /// Publish a parallel workflow of `n` sibling steps into the active tab.
 fn set_parallel_workflow(app: &App, n: usize) {
-    use crate::frontend::tui::tabs::{WorkflowStepKind, WorkflowStepView, WorkflowViewState};
-    *app.active_tab().workflow_state.lock().unwrap() = Some(WorkflowViewState {
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    };
+    *app.active_tab().shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
         steps: (0..n)
             .map(|i| WorkflowStepView {
                 name: format!("step-{i}"),
-                status: "running".into(),
+                status: StepViewStatus::Running,
                 agent: None,
                 model: None,
                 depends_on: vec![],
@@ -1380,13 +1384,13 @@ fn fg_of_symbol_on_row(buf: &ratatui::buffer::Buffer, y: u16, symbol: &str) -> O
         .map(|c| c.fg)
 }
 
-fn set_indicator(app: &App, state: crate::frontend::tui::squad_indicator::SquadIndicator) {
+fn set_indicator(app: &App, state: crate::engine::squad::SquadHealth) {
     *app.squad_indicator.lock().unwrap() = state;
 }
 
 #[test]
 fn the_squad_indicator_is_pinned_to_the_right_of_the_bottom_row_in_every_state() {
-    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    use crate::engine::squad::SquadHealth as SquadIndicator;
     for (state, colour) in [
         (SquadIndicator::Unknown, Color::DarkGray),
         (SquadIndicator::NotRunning, Color::DarkGray),
@@ -1419,7 +1423,7 @@ fn the_squad_indicator_is_pinned_to_the_right_of_the_bottom_row_in_every_state()
 
 #[test]
 fn the_squad_indicator_renders_on_the_squad_tab_too() {
-    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    use crate::engine::squad::SquadHealth as SquadIndicator;
     let mut app = make_app();
     push_squad_tab(&mut app);
     set_indicator(&app, SquadIndicator::Failed);
@@ -1430,7 +1434,7 @@ fn the_squad_indicator_renders_on_the_squad_tab_too() {
 
 #[test]
 fn the_squad_indicator_stays_right_aligned_when_suggestions_are_showing() {
-    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    use crate::engine::squad::SquadHealth as SquadIndicator;
     let mut app = make_app();
     set_indicator(&app, SquadIndicator::Healthy);
     for c in "cha".chars() {
@@ -1762,22 +1766,35 @@ fn the_squad_detail_modal_fits_every_hint_on_one_row() {
     );
 }
 
-/// The trigger/cancel/pause confirmation names its task and its keys.
+/// The trigger/cancel/pause confirmation draws the prompt it was handed:
+/// the title, the question and every choice under its own hotkey.
+///
+/// The words are asserted against the prompt rather than spelled here — the
+/// copy is `command::prompts`' (WI 0114 F-55), and a render test that
+/// repeated it would pin the frontend to a wording it does not own.
 #[test]
-fn the_squad_action_confirmation_names_the_task_and_its_keys() {
-    use crate::frontend::tui::dialogs::SquadConfirmAction;
+fn the_squad_action_confirmation_draws_layer_2s_prompt() {
+    let action = FrontendAction::CancelSquadRun;
+    let prompt =
+        SquadCommand::confirm_prompt(action, "issue-triage").expect("cancelling a run asks first");
     let mut app = make_app();
     push_squad_tab(&mut app);
     app.active_dialog = Some(Dialog::SquadActionConfirm {
-        action: SquadConfirmAction::Cancel,
+        action,
         name: "issue-triage".to_string(),
+        prompt: prompt.clone(),
     });
     let text = buffer_text(&render_app(&mut app, 120, 30));
-    assert!(text.contains("Cancel run"), "{text}");
-    assert!(
-        text.contains("Cancel the in-progress run of task \"issue-triage\""),
-        "{text}"
-    );
-    assert!(text.contains("[y] cancel run"), "{text}");
-    assert!(text.contains("[n / Esc] back"), "{text}");
+    assert!(text.contains(&prompt.title), "{text}");
+    assert!(text.contains(&prompt.body), "{text}");
+    for choice in &prompt.choices {
+        assert!(
+            text.contains(&format!("[{}] {}", choice.key, choice.label))
+                || text.contains(&format!("[{} / Esc] {}", choice.key, choice.label)),
+            "choice {:?} is not drawn: {text}",
+            choice.key
+        );
+    }
+    // Esc answers the dismissing choice, and is advertised only there.
+    assert!(text.contains("/ Esc] back"), "{text}");
 }

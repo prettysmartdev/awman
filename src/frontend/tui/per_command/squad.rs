@@ -10,16 +10,69 @@
 use std::path::{Path, PathBuf};
 
 use crate::command::commands::squad::commands::{SquadCommandFrontend, TaskWorkspaceChoice};
+use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::command::error::CommandError;
 use crate::data::fs::task_store::MountScope;
+use crate::data::prompt::{Prompt, TextPrompt};
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
-use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+use crate::frontend::tui::dialogs::{Dialog, DialogRequest, DialogResponse};
 
 /// The task-description modal's title. Deliberately short — it is drawn into
 /// the dialog rect's upper border, where a long sentence overflows or clips.
 /// The full instruction lives in the dialog body (`ask_task_description`'s
 /// prompt), which wraps and is always readable.
 pub const TASK_DESCRIPTION_TITLE: &str = "New squad task description";
+
+/// The title of the one-shot squad key disclosure, in the modal's border.
+pub(crate) const KEY_SETUP_TITLE: &str = "squad authentication";
+
+/// Draw the one-time squad key disclosure for the TUI.
+///
+/// The TUI's counterpart to the CLI's `render_key_setup` (WI 0114 F-56):
+/// Layer 2 supplies the key, the shell and the export line, and each frontend
+/// says them its own way. There is no box here — `Dialog::Notice` draws the
+/// frame, and box-drawing inside one would sit inside another.
+pub(crate) fn key_setup_body(setup: &SquadKeySetup) -> String {
+    format!(
+        "squad API key (store this — it will not be shown again):\n\n  \
+         {key}\n\n\
+         Add this to {rc_file} so the awman CLI and TUI can authenticate to \
+         squad:\n\n  {export_line}\n\n\
+         Until you do, export it in the current shell — `awman squad` commands \
+         without the key are refused by the daemon with 401 Unauthorized.\n\n\
+         Prefer to run without a key? Stop the daemon and start it with\n  \
+         awman squad start --dangerously-skip-auth\n\
+         which mints no key and accepts unauthenticated requests. squad binds \
+         to loopback (127.0.0.1) only, so nothing off this machine can reach it.",
+        key = setup.key,
+        rc_file = setup.rc_file(),
+        export_line = setup.export_line,
+    )
+}
+
+/// The key-disclosure notice, built the one way for all three sites that
+/// raise it (the command thread, and the two squad-tab startup paths).
+pub(crate) fn key_setup_notice(setup: &SquadKeySetup) -> DialogRequest {
+    DialogRequest::KeySetupNotice {
+        title: KEY_SETUP_TITLE.to_string(),
+        body: key_setup_body(setup),
+        copy_key: setup.key.clone(),
+        copy_zshrc_snippet: setup.export_line.clone(),
+    }
+}
+
+/// The same notice as a ready-built [`Dialog`], for the two startup paths that
+/// raise it straight on the `App` rather than through the command thread's
+/// `DialogRequest` channel. One spelling, so a first run and a key refresh
+/// cannot drift apart in what they show.
+pub(crate) fn key_setup_dialog(setup: &SquadKeySetup) -> Dialog {
+    Dialog::Notice {
+        title: KEY_SETUP_TITLE.to_string(),
+        body: key_setup_body(setup),
+        copy_key: Some(setup.key.clone()),
+        copy_zshrc_snippet: Some(setup.export_line.clone()),
+    }
+}
 
 impl TuiCommandFrontend {
     /// One optional-field edit prompt (WI 0110): prefilled with the current
@@ -49,26 +102,12 @@ impl TuiCommandFrontend {
 }
 
 impl SquadCommandFrontend for TuiCommandFrontend {
-    /// The TUI runs in the user's own terminal, so the process's current
-    /// directory is theirs and the mount-scope question can be put to them.
-    fn is_local_user_session(&self) -> bool {
-        true
-    }
-
     /// The same dismissable notice the squad tab raises on a first start,
     /// with the `[c]`/`[z]` copy actions the key snippet needs. Sent, not
     /// asked: a notice has no answer, so blocking the command thread on it
     /// would only stall the command that minted the key.
-    fn show_key_setup(
-        &mut self,
-        setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
-    ) {
-        let _ = self.dialog_tx.send(DialogRequest::KeySetupNotice {
-            title: "squad authentication".to_string(),
-            body: setup.body.clone(),
-            copy_key: setup.key.clone(),
-            copy_zshrc_snippet: setup.zshrc_snippet.clone(),
-        });
+    fn show_key_setup(&mut self, setup: &SquadKeySetup) {
+        let _ = self.dialog_tx.send(key_setup_notice(setup));
     }
 
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
@@ -104,23 +143,13 @@ impl SquadCommandFrontend for TuiCommandFrontend {
         }
     }
 
-    fn ask_task_workspace_choice(&mut self) -> Result<TaskWorkspaceChoice, CommandError> {
-        let response = self.ask_dialog(DialogRequest::KindSelect {
-            title: "Task Workspace".into(),
-            options: vec![
-                ("1".into(), "Default Task Workspace".into()),
-                ("2".into(), "Custom Folder / Repo".into()),
-            ],
-        })?;
-        match response {
-            DialogResponse::Char('2') | DialogResponse::Index(1) => {
-                Ok(TaskWorkspaceChoice::CustomFolderOrRepo)
-            }
-            DialogResponse::Char('1') | DialogResponse::Index(0) => {
-                Ok(TaskWorkspaceChoice::DefaultTaskWorkspace)
-            }
-            _ => Err(CommandError::Aborted),
-        }
+    /// The title and the options are `prompt`'s (F-19); this draws the
+    /// `KindSelect` dialog and maps the key or the index back.
+    fn ask_task_workspace_choice(
+        &mut self,
+        prompt: &Prompt<TaskWorkspaceChoice>,
+    ) -> Result<TaskWorkspaceChoice, CommandError> {
+        self.pick_from_prompt(prompt)
     }
 
     fn confirm_non_git_workspace(&mut self, path: &Path) -> Result<bool, CommandError> {
@@ -179,17 +208,16 @@ impl SquadCommandFrontend for TuiCommandFrontend {
         }
     }
 
-    fn ask_task_interval(&mut self) -> Result<String, CommandError> {
+    /// The wording and the default are `prompt`'s (F-19). Submitting an empty
+    /// box takes that default; dismissing the dialog abandons the interview.
+    fn ask_task_interval(&mut self, prompt: &TextPrompt) -> Result<String, CommandError> {
         let response = self.ask_dialog(DialogRequest::TextInput {
-            title: "Evaluation interval".into(),
-            prompt: "How often to evaluate (e.g. 6h, 1d):".into(),
-            default_text: Some("6h".into()),
+            title: prompt.title.clone(),
+            prompt: prompt.body.clone(),
+            default_text: prompt.default.clone(),
         })?;
         match response {
-            DialogResponse::Text(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
-            // Submitting an empty box takes the documented default; dismissing
-            // the dialog abandons the interview.
-            DialogResponse::Text(_) => Ok("6h".to_string()),
+            DialogResponse::Text(typed) => prompt.resolve(&typed).ok_or(CommandError::Aborted),
             _ => Err(CommandError::Aborted),
         }
     }
@@ -235,18 +263,15 @@ impl SquadCommandFrontend for TuiCommandFrontend {
         }
     }
 
-    fn ask_task_mount_scope(&mut self) -> Result<MountScope, CommandError> {
-        // "Yes" mounts the whole git root; "No" mounts the current directory
-        // only. The default (git root) is the safer, more useful scope.
-        let response = self.ask_dialog(DialogRequest::YesNo {
-            title: "Mount scope".into(),
-            body: "Mount the entire git root? (No = current directory only)".into(),
-        })?;
-        match response {
-            DialogResponse::No => Ok(MountScope::Cwd),
-            DialogResponse::Yes => Ok(MountScope::GitRoot),
-            _ => Err(CommandError::Aborted),
-        }
+    /// The choices are `prompt`'s (F-19). This was a `YesNo` dialog whose
+    /// "yes" meant the git root and whose "no" meant the current directory —
+    /// a two-value decision the frontend spelled for itself, worded
+    /// differently from the CLI's `[gitroot]/cwd` line.
+    fn ask_task_mount_scope(
+        &mut self,
+        prompt: &Prompt<MountScope>,
+    ) -> Result<MountScope, CommandError> {
+        self.pick_from_prompt(prompt)
     }
 
     // ── Task agent pool (WI 0110) ──────────────────────────────────────
@@ -438,10 +463,10 @@ mod tests {
             .ask_task_description()
             .map(|_| ()));
         assert_dismissal_aborts!("the interval step", |f: &mut TuiCommandFrontend| f
-            .ask_task_interval()
+            .ask_task_interval(&crate::command::prompts::squad_task_interval())
             .map(|_| ()));
         assert_dismissal_aborts!("the workspace-choice step", |f: &mut TuiCommandFrontend| f
-            .ask_task_workspace_choice()
+            .ask_task_workspace_choice(&crate::command::prompts::squad_task_workspace())
             .map(|_| ()));
         assert_dismissal_aborts!("the custom-path step", |f: &mut TuiCommandFrontend| f
             .ask_task_repo()
@@ -471,7 +496,7 @@ mod tests {
             .ask_task_model()
             .map(|_| ()));
         assert_dismissal_aborts!("the mount-scope step", |f: &mut TuiCommandFrontend| f
-            .ask_task_mount_scope()
+            .ask_task_mount_scope(&crate::command::prompts::squad_task_mount_scope())
             .map(|_| ()));
     }
 
@@ -482,7 +507,13 @@ mod tests {
     fn a_blank_submission_still_means_the_documented_default() {
         let (mut frontend, req_rx, resp_tx) = make_frontend();
         let handle = answer_with(req_rx, resp_tx, DialogResponse::Text(String::new()));
-        assert_eq!(frontend.ask_task_interval().unwrap(), "6h");
+        // The expected value is the prompt's own default, not a literal: that
+        // is the whole point of F-19.
+        let prompt = crate::command::prompts::squad_task_interval();
+        assert_eq!(
+            frontend.ask_task_interval(&prompt).unwrap(),
+            prompt.default.clone().unwrap()
+        );
         handle.join().unwrap();
 
         let (mut frontend, req_rx, resp_tx) = make_frontend();

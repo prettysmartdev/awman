@@ -24,7 +24,7 @@ use awman::command::dispatch::Engines;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::daemon_process::{DaemonProcess, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME};
 use awman::data::fs::{ApiPaths, AuthPathResolver, SquadPaths};
-use awman::data::EngineWorkflowStateStore;
+use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -137,7 +137,9 @@ async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, S
         overlay_engine: overlay_engine.clone(),
         auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths.clone())),
         agent_engine: Arc::new(AgentEngine::new(overlay_engine, container_runtime)),
-        workflow_state_store: Arc::new(EngineWorkflowStateStore::at_git_root(api_paths.root())),
+        workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(api_paths.root())),
+        credential_monitor: None,
+        global_config: std::sync::Arc::new(Default::default()),
     };
     let config = SquadServeConfig {
         port: 0,

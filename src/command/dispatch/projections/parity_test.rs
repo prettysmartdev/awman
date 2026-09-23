@@ -610,13 +610,7 @@ fn frontend_with_required_input(spec: &'static CommandSpec) -> FakeCommandFronte
 
 fn dispatch_for(frontend: FakeCommandFrontend) -> Dispatch<FakeCommandFrontend> {
     let tmp = tempfile::tempdir().expect("temp root");
-    let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
-    let session = crate::data::session::Session::open(
-        tmp.path().to_path_buf(),
-        &resolver,
-        crate::data::session::SessionOpenOptions::default(),
-    )
-    .expect("open test session");
+    let session = crate::data::session::Session::for_tests(tmp.path());
     Dispatch::new(
         frontend,
         Arc::new(tokio::sync::RwLock::new(session)),

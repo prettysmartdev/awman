@@ -24,6 +24,13 @@ In the TUI, the container window opens immediately and all keyboard input is for
 
 Press **Ctrl+C** to exit the agent session when you're done.
 
+`awman chat`'s own exit code is the agent's exit code — a session whose agent
+crashed or was killed is reported as a failure (non-zero), and the CLI, TUI
+tab colour, and any API client watching the command's status all agree on
+that result. This matters most for `awman chat --non-interactive` run from a
+script or CI job, where the exit code is how the caller finds out whether the
+agent succeeded.
+
 ---
 
 ## ACP launch mode
@@ -410,7 +417,7 @@ awman new spec
 new spec
 ```
 
-Prompts for a type (Feature, Bug, Task, or Enhancement) and a title, then creates a numbered work item file in the configured work items directory using the project's template.
+Prompts for a type (Feature, Bug, Task, or Enhancement) and a title, then creates a numbered work item file in the configured work items directory using the project's template. Answer with the digit shown next to your choice (`1`-`4`); the CLI and TUI accept exactly the same input here. Dismissing the question (Esc in the TUI, Ctrl-D on the CLI) aborts the interview rather than filing a Task by default.
 
 By default, awman writes to `aspec/work-items/` and uses `aspec/work-items/0000-template.md`. If neither exists, awman auto-discovers any `*template.md` file in the work items directory and prompts you to confirm it. You can also configure the paths explicitly:
 

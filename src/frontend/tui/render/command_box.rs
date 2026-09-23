@@ -222,8 +222,12 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
     let tab = app.active_tab();
     let working_dir = tab.session.working_dir();
     let git_root = tab.session.git_root();
-    let active_worktree: Option<std::path::PathBuf> =
-        tab.active_worktree_path.lock().ok().and_then(|g| g.clone());
+    let active_worktree: Option<std::path::PathBuf> = tab
+        .shared
+        .active_worktree_path
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
 
     let para = if let Some(wt) = active_worktree {
         let label = "  Using worktree: ";
@@ -258,7 +262,7 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
 /// the full width only the circle (and margin) is drawn; below two cells,
 /// nothing.
 fn squad_indicator_spans(app: &App, available: u16) -> Vec<Span<'static>> {
-    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    use crate::engine::squad::SquadHealth as SquadIndicator;
 
     let state = app
         .squad_indicator
@@ -292,10 +296,8 @@ fn squad_indicator_spans(app: &App, available: u16) -> Vec<Span<'static>> {
 /// `Unreachable` outranks `EnvUnmet` in `classify` anyway. An eighth colour to
 /// separate two states that never appear together would cost more than it
 /// explains.
-pub(crate) fn squad_indicator_color(
-    state: crate::frontend::tui::squad_indicator::SquadIndicator,
-) -> Color {
-    use crate::frontend::tui::squad_indicator::SquadIndicator;
+pub(crate) fn squad_indicator_color(state: crate::engine::squad::SquadHealth) -> Color {
+    use crate::engine::squad::SquadHealth as SquadIndicator;
     match state {
         SquadIndicator::Unknown | SquadIndicator::NotRunning => Color::DarkGray,
         SquadIndicator::Unreachable | SquadIndicator::EnvUnmet => Color::Yellow,
@@ -341,7 +343,7 @@ pub(super) fn status_level_color(level: &crate::data::message::MessageLevel) -> 
 #[cfg(test)]
 mod tests {
     use super::squad_indicator_color;
-    use crate::frontend::tui::squad_indicator::SquadIndicator;
+    use crate::engine::squad::SquadHealth as SquadIndicator;
     use ratatui::style::Color;
 
     /// WI 0116 §6c: the colour map, pinned independently of where the `●`
