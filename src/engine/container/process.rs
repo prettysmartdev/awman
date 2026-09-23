@@ -789,6 +789,28 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).unwrap();
+        // A concurrent test forking anywhere in this process can inherit the
+        // write descriptor `fs::write` held, so `execve` reports the script as
+        // busy (`ETXTBSY`) until that fork execs. Probe until one exec succeeds:
+        // after that no writer remains and nothing reopens the file for write.
+        for attempt in 0.. {
+            match std::process::Command::new(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut probe) => {
+                    let _ = probe.kill();
+                    let _ = probe.wait();
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 100 => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("fake cli never became executable: {e}"),
+            }
+        }
         path
     }
 
