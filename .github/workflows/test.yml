@@ -9,7 +9,7 @@ on:
 jobs:
   fast:
     name: Fast checks (lint, fmt, clippy, hermetic tests)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -44,7 +44,7 @@ jobs:
 
   full-linux-docker:
     name: Full tests with Docker (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: fast
     steps:
       - uses: actions/checkout@v7
