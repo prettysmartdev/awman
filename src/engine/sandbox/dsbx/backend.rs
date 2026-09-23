@@ -465,7 +465,7 @@ fn spawn_pty_bridged(
         })
         .map_err(|e| EngineError::Sandbox(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(SBX_BIN);
+    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(SBX_BIN));
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -515,7 +515,7 @@ fn spawn_piped(
 ) -> Result<AgentExecution, EngineError> {
     use std::process::{Command, Stdio};
 
-    let mut cmd = Command::new(SBX_BIN);
+    let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
     cmd.args(&argv);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -1300,6 +1300,7 @@ mod tests {
     // We use a thread-safe shared message log via Arc<Mutex<_>> so we can
     // inspect it after run_interactive takes ownership of the frontend.
 
+    #[cfg(unix)]
     #[test]
     fn cpu_limit_produces_warning_in_run_interactive() {
         use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -1346,12 +1347,16 @@ mod tests {
             SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
             SandboxOption::CpuLimit(2.0),
         ]);
-        // The warning is written before the spawn attempt, whether or not an
-        // `sbx` binary is reachable. A runtime is needed because a parallel
-        // test's fake sbx can make the launch reach the bridge's task spawns.
+        // The warning is written before the spawn attempt. The `sbx` on PATH
+        // is a stub that fails, so the launch stops at its first call instead
+        // of reaching a real `sbx`, which would create a real sandbox. A
+        // runtime is needed in case the launch gets as far as the bridge's
+        // task spawns.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let _ = run_interactive(options, frontend);
+        crate::engine::sandbox::dsbx::test_support::with_fake_sbx("#!/bin/sh\nexit 1\n", || {
+            rt.block_on(async {
+                let _ = run_interactive(options, frontend);
+            });
         });
 
         let msgs = messages.lock().unwrap();
@@ -1493,6 +1498,7 @@ mod tests {
 
     // ─── WI-0091: unsupported-feature notes surfaced as warnings ──────────
 
+    #[cfg(unix)]
     #[test]
     fn unsupported_notes_produce_warnings_in_run_interactive() {
         use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -1541,12 +1547,16 @@ mod tests {
                 "skill mounts are not supported under the sandbox runtime".into(),
             ),
         ]);
-        // The warning is written before the spawn attempt, whether or not an
-        // `sbx` binary is reachable. A runtime is needed because a parallel
-        // test's fake sbx can make the launch reach the bridge's task spawns.
+        // The warning is written before the spawn attempt. The `sbx` on PATH
+        // is a stub that fails, so the launch stops at its first call instead
+        // of reaching a real `sbx`, which would create a real sandbox. A
+        // runtime is needed in case the launch gets as far as the bridge's
+        // task spawns.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let _ = run_interactive(options, frontend);
+        crate::engine::sandbox::dsbx::test_support::with_fake_sbx("#!/bin/sh\nexit 1\n", || {
+            rt.block_on(async {
+                let _ = run_interactive(options, frontend);
+            });
         });
 
         let msgs = messages.lock().unwrap();

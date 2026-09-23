@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::Command;
 
 fn docker_available() -> bool {
-    Command::new("docker")
+    Command::new(awman::engine::host_cli::program("docker"))
         .args(["info"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -20,7 +20,7 @@ fn docker_available() -> bool {
 /// substitute the `{{AWMAN_BASE_IMAGE}}` placeholder in agent templates.
 fn build_base_image() -> String {
     let tag = "awman-test-base:latest";
-    let status = Command::new("docker")
+    let status = Command::new(awman::engine::host_cli::program("docker"))
         .args([
             "build",
             "-t",
@@ -58,7 +58,7 @@ fn build_template(template_path: &str, tag: &str) {
         .expect("failed to write temp Dockerfile");
     let tmp_path = tmp.path().to_path_buf();
 
-    let status = Command::new("docker")
+    let status = Command::new(awman::engine::host_cli::program("docker"))
         .args([
             "build",
             "-t",
@@ -78,7 +78,7 @@ fn build_template(template_path: &str, tag: &str) {
 
     // Clean up the test images.
     for image in &[tag, &base_tag as &str] {
-        let _ = Command::new("docker")
+        let _ = Command::new(awman::engine::host_cli::program("docker"))
             .args(["rmi", image])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

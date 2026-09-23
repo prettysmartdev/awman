@@ -19,7 +19,7 @@ use awman::engine::container::runtime::ContainerRuntime;
 use crate::helpers::docker_available;
 
 fn try_pull(image: &str) -> bool {
-    Command::new("docker")
+    Command::new(awman::engine::host_cli::program("docker"))
         .args(["pull", image])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -126,7 +126,7 @@ fn docker_background_container_start_exec_kill() {
     container.kill().expect("kill must succeed");
 
     // After kill, the container must no longer appear in `docker ps -a`.
-    let ps = Command::new("docker")
+    let ps = Command::new(awman::engine::host_cli::program("docker"))
         .args([
             "ps",
             "-a",
@@ -303,7 +303,7 @@ fn docker_hello_world_run_does_not_appear_in_amux_listing() {
         .list_running_all()
         .expect("list_running_all before");
 
-    let status = Command::new("docker")
+    let status = Command::new(awman::engine::host_cli::program("docker"))
         .args(["run", "--rm", "hello-world:latest"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

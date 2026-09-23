@@ -71,6 +71,8 @@ async fn fetch_workflow_runs_json(
     url: String,
     token: String,
 ) -> Result<serde_json::Value, EngineError> {
+    HttpCore::refuse_public_host_under_test_isolation(&url)
+        .map_err(|e| EngineError::Other(format!("poll_ci: {e}")))?;
     // The shared builder with every option left at its default, which is the
     // untimed client this poller has always used (WI 0114 F-28).
     let client = HttpCore::client(&HttpClientOptions::default())

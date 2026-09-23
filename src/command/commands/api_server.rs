@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
-use crate::data::config::env::Env;
 use crate::data::fs::daemon_process::{DaemonProcess, ServerMeta, API_PLIST_LABEL, API_UNIT_NAME};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
@@ -256,11 +255,13 @@ async fn run_start(
     // truly start a server (background spawn, foreground claim), so
     // `--refresh-key` and other non-serving early returns are unaffected.
     // Built from the *supplied* `api_paths` so the pidfile the guard claims is
-    // the same one `run_kill`/`run_status` read.
+    // the same one `run_kill`/`run_status` read, and from the session's env
+    // rather than the process's so a test session never sees a squad daemon
+    // actually running on the developer's machine.
     let guard = DaemonGuard::with_paths(
         DaemonKind::Api,
         api_paths,
-        &crate::data::fs::SquadPaths::from_env(&Env::from_process()).map_err(CommandError::Data)?,
+        &crate::data::fs::SquadPaths::from_env(session.env()).map_err(CommandError::Data)?,
     );
 
     // Resolve workdirs by merging CLI --workdirs with the configured API work
@@ -704,7 +705,7 @@ mod tests {
         let result = run_start(
             flags,
             &engines,
-            &Session::for_tests(tmp.path()),
+            &Session::for_tests_isolated(tmp.path(), tmp.path()),
             &mut frontend,
             &api_paths,
         )
@@ -736,7 +737,7 @@ mod tests {
         let result = run_start(
             flags,
             &engines,
-            &Session::for_tests(tmp.path()),
+            &Session::for_tests_isolated(tmp.path(), tmp.path()),
             &mut frontend,
             &api_paths,
         )
@@ -804,7 +805,7 @@ mod tests {
         let result = run_start(
             flags,
             &engines,
-            &Session::for_tests(tmp.path()),
+            &Session::for_tests_isolated(tmp.path(), tmp.path()),
             &mut frontend,
             &api_paths,
         )
@@ -873,7 +874,7 @@ mod tests {
         let result = run_start(
             flags,
             &engines,
-            &Session::for_tests(tmp.path()),
+            &Session::for_tests_isolated(tmp.path(), tmp.path()),
             &mut frontend,
             &api_paths,
         )

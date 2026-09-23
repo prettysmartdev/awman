@@ -11,7 +11,7 @@ Runs on every push and pull request. Three jobs:
 | Job | Runner | What it runs |
 |---|---|---|
 | `fast` | `ubuntu-latest` | `make architecture-lint`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `make test-fast`. Hermetic — no Docker, no real git, no real network. Should finish in under two minutes warm. |
-| `full-linux-docker` | `ubuntu-latest` | `make test-full` against the runner's Docker daemon. Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
+| `full-linux-docker` | `ubuntu-latest` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
 | `build-macos` | `macos-latest` | `cargo build --release` and `make test-fast`. Smoke-tests cross-platform compilation; does not run Docker tests (macOS hosted runners lack Docker). Depends on `fast`. |
 
 Cargo's registry, git cache, and `target/` are cached per-OS to keep warm runs fast.

@@ -18,7 +18,6 @@
 
 #![cfg(unix)]
 
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +31,10 @@ use awman::data::fs::{MountScope, SquadPaths, Task, TaskStatus};
 use awman::engine::squad::env_state::{coverage_digest, Salt};
 use tokio::sync::Mutex as AsyncMutex;
 use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+#[path = "helpers/fake_awman.rs"]
+mod fake_awman;
+use fake_awman::FakeAwmanProcess;
 
 static PROCESS_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -67,43 +70,6 @@ impl Drop for ScopedEnv {
                 None => std::env::remove_var(key),
             }
         }
-    }
-}
-
-/// A live process whose command name contains `awman`, so the pidfile check
-/// (`pid_is_awman`) accepts it as a running daemon. The same trick
-/// `tests/squad_cli_gateway.rs` uses to stand up an "already running" daemon
-/// without a real one.
-struct AwmanNamedHolder {
-    _dir: tempfile::TempDir,
-    child: std::process::Child,
-}
-
-impl AwmanNamedHolder {
-    fn spawn() -> Self {
-        let dir = tempfile::tempdir().expect("holder directory");
-        let executable = dir.path().join("awman-env-sync-holder");
-        std::fs::copy("/bin/sleep", &executable).expect("copy sleep holder");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-        let child = Command::new(&executable)
-            .arg("120")
-            .spawn()
-            .expect("holder must start");
-        Self { _dir: dir, child }
-    }
-
-    fn id(&self) -> u32 {
-        self.child.id()
-    }
-}
-
-impl Drop for AwmanNamedHolder {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -208,7 +174,7 @@ async fn ensure_running_against_a_live_daemon_learns_required_env_then_sends_the
     )
     .await;
 
-    let holder = AwmanNamedHolder::spawn();
+    let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
         ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
@@ -282,7 +248,7 @@ async fn a_matching_digest_costs_one_get_and_puts_no_secret_on_the_wire() {
     )
     .await;
 
-    let holder = AwmanNamedHolder::spawn();
+    let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
         ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
@@ -323,7 +289,7 @@ async fn a_rotated_value_is_pushed_to_an_already_running_daemon() {
     )
     .await;
 
-    let holder = AwmanNamedHolder::spawn();
+    let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
         ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
@@ -365,7 +331,7 @@ async fn a_read_only_probe_gateway_pushes_nothing() {
     )
     .await;
 
-    let holder = AwmanNamedHolder::spawn();
+    let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
         ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
@@ -438,7 +404,7 @@ async fn the_indicator_probe_makes_exactly_one_list_call_per_tick() {
     // what the probe chose to do, not about what happened to be reachable.
     mount_env_routes(&server, coverage_body(&Salt::random(), &[])).await;
 
-    let holder = AwmanNamedHolder::spawn();
+    let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
         ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),
@@ -511,7 +477,7 @@ async fn the_remote_gateway_reads_coverage_as_names_digests_and_timestamps() {
     )
     .await;
 
-    let holder = AwmanNamedHolder::spawn();
+    let holder = FakeAwmanProcess::spawn("env-sync");
     publish_running_daemon(tmp.path(), &server.uri(), holder.id());
     let mut env = ScopedEnv::set(&[
         ("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap()),

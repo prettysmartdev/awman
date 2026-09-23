@@ -36,12 +36,29 @@ use crate::engine::error::EngineError;
 /// is the same one the rest of the command reads.
 pub struct DaemonSupervisor {
     process: DaemonProcess,
+    /// Whether a background spawn may go through launchd / `systemd --user`.
+    /// Off under test isolation: the label and unit are fixed per daemon
+    /// kind, not per storage root, so a test daemon started through either
+    /// would boot out or replace the developer's real one.
+    service_manager: bool,
 }
 
 impl DaemonSupervisor {
     /// Supervise an already-built [`DaemonProcess`].
     pub fn new(process: DaemonProcess) -> Self {
-        Self { process }
+        Self {
+            process,
+            service_manager: !crate::data::config::env::test_isolation_active(),
+        }
+    }
+
+    /// Let background spawns use launchd / `systemd --user` even under test
+    /// isolation. Only for a test that has put stub `launchctl` /
+    /// `systemd-run` executables first on `PATH` and pointed `HOME` at a
+    /// temporary directory, so the routing it exercises reaches nothing real.
+    pub fn with_stubbed_service_manager(mut self) -> Self {
+        self.service_manager = true;
+        self
     }
 
     /// Supervise the daemon at `paths` under the given systemd unit name and
@@ -86,6 +103,7 @@ impl DaemonSupervisor {
             &paths.log_file(),
             self.process.unit_name(),
             self.process.plist_label(),
+            self.service_manager,
         )
         .map_err(|error| {
             let daemon = match self.process.unit_name() {
@@ -165,8 +183,13 @@ fn pid_is_awman(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn pid_is_awman(pid: u32) -> bool {
+    // `-ww`: BSD `ps` truncates its output to 79 columns when none of stdin,
+    // stdout or stderr is a terminal — always the case here, since stdout is
+    // captured — and `comm` is the executable's full path, with the "awman"
+    // at its end. Any install path past that width would make a live daemon
+    // look stale, and a second one would be started beside it.
     std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .args(["-ww", "-p", &pid.to_string(), "-o", "comm="])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("awman"))
         .unwrap_or(false)
@@ -247,6 +270,7 @@ pub(crate) fn spawn_background(
     log_path: &Path,
     unit_name: &str,
     plist_label: &str,
+    service_manager: bool,
 ) -> Result<u32, DataError> {
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
@@ -255,6 +279,13 @@ pub(crate) fn spawn_background(
     // launchd/systemd starts appending to it at the process umask. A daemon log
     // can capture startup diagnostics that should not be world-readable.
     ensure_private_log(log_path)?;
+
+    // See `DaemonSupervisor::service_manager`: under test isolation the daemon
+    // is only ever a plain child process.
+    if !service_manager {
+        let _ = (unit_name, plist_label);
+        return double_fork_spawn(binary_path, args, log_path);
+    }
 
     // Each happy path consumes only its own identity; silence the other on
     // platforms that don't use it.

@@ -445,6 +445,12 @@ fn fetch_rest_api_with_base_and_token(
     github_token: Option<&str>,
 ) -> Result<Issue, IssueSourceError> {
     let url = format!("{base_url}/repos/{owner}/{repo}/issues/{number}");
+    crate::engine::remote::HttpCore::refuse_public_host_under_test_isolation(&url).map_err(
+        |detail| IssueSourceError::Network {
+            provider: provider.to_string(),
+            detail,
+        },
+    )?;
     let client = reqwest::blocking::Client::builder()
         .user_agent("awman")
         .connect_timeout(std::time::Duration::from_secs(5))

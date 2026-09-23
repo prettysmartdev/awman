@@ -51,6 +51,8 @@ impl AspecDownloader {
 
     /// Download the tarball into memory.
     pub async fn download(&self) -> Result<Vec<u8>, AspecError> {
+        HttpCore::refuse_public_host_under_test_isolation(&self.url)
+            .map_err(AspecError::DownloadFailed)?;
         let client = HttpCore::client(
             &HttpClientOptions::default()
                 .with_timeouts(Self::CONNECT_TIMEOUT, Self::READ_TIMEOUT)

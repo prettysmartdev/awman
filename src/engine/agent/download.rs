@@ -55,9 +55,13 @@ pub async fn download_agent_dockerfile(
             .with_user_agent("awman"),
     );
 
-    let download_attempt: Result<Vec<u8>, String> = match client_result {
-        Err(e) => Err(format!("client init: {e}")),
-        Ok(client) => match client.get(&url).send().await {
+    let download_attempt: Result<Vec<u8>, String> = match (
+        HttpCore::refuse_public_host_under_test_isolation(&url),
+        client_result,
+    ) {
+        (Err(refused), _) => Err(refused),
+        (Ok(()), Err(e)) => Err(format!("client init: {e}")),
+        (Ok(()), Ok(client)) => match client.get(&url).send().await {
             Err(e) => Err(format!("GET {url}: {e}")),
             Ok(resp) => {
                 if !resp.status().is_success() {

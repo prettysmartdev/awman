@@ -172,9 +172,61 @@ fn read_antigravity_secret() -> Option<String> {
     }
 }
 
+// ── Keychain backend selection ──────────────────────────────────────────────
+
+/// Whether this process uses the in-memory keychain rather than the OS one:
+/// under test isolation, where the OS keychain is the developer's own — a test
+/// would otherwise read their real Claude credential and could overwrite or
+/// delete the squad daemon's stored environment.
+///
+/// Every function below that would reach the OS keychain checks this first, so
+/// there is no path around it.
+fn in_memory() -> bool {
+    crate::data::config::env::test_isolation_active()
+}
+
+/// A process-local stand-in for the OS keychain: generic-password items keyed
+/// by `(service, account)`, holding exactly the string the OS backend would.
+/// Starts empty, so every lookup is a clean "no such item" until something in
+/// the same process stores one.
+mod memory {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ITEMS: Mutex<BTreeMap<(String, String), String>> = Mutex::new(BTreeMap::new());
+
+    fn items() -> MutexGuard<'static, BTreeMap<(String, String), String>> {
+        // A poisoned map is still a whole map: every write replaces one entry.
+        ITEMS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `account: None` matches any account, as `security find-generic-password`
+    /// without `-a` does.
+    pub(super) fn lookup(service: &str, account: Option<&str>) -> Option<String> {
+        items()
+            .iter()
+            .find(|((s, a), _)| s == service && account.is_none_or(|want| want == a))
+            .map(|(_, value)| value.clone())
+    }
+
+    pub(super) fn store(service: &str, account: &str, value: &str) {
+        items().insert(
+            (service.to_string(), account.to_string()),
+            value.to_string(),
+        );
+    }
+
+    pub(super) fn clear(service: &str, account: &str) {
+        items().remove(&(service.to_string(), account.to_string()));
+    }
+}
+
 // ── Shared OS keychain shims ────────────────────────────────────────────────
 
 pub(crate) fn run_macos_keychain_lookup(service: &str, account: Option<&str>) -> Option<String> {
+    if in_memory() {
+        return memory::lookup(service, account);
+    }
     let mut cmd = Command::new("security");
     cmd.arg("find-generic-password").arg("-s").arg(service);
     if let Some(a) = account {
@@ -194,6 +246,9 @@ pub(crate) fn run_macos_keychain_lookup(service: &str, account: Option<&str>) ->
 }
 
 fn run_linux_secret_lookup(service: &str, account: &str) -> Option<String> {
+    if in_memory() {
+        return memory::lookup(service, Some(account));
+    }
     let out = Command::new("secret-tool")
         .args(["lookup", "service", service, "account", account])
         .output()
@@ -450,6 +505,9 @@ pub(crate) fn keychain_lookup(
     account: &str,
     cap: std::time::Duration,
 ) -> Result<Option<String>, KeychainCallError> {
+    if in_memory() {
+        return Ok(memory::lookup(service, Some(account)));
+    }
     if cfg!(target_os = "macos") {
         let mut cmd = Command::new("security");
         cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
@@ -490,6 +548,10 @@ pub(crate) fn keychain_store(
     envelope: &str,
     cap: std::time::Duration,
 ) -> Result<(), KeychainCallError> {
+    if in_memory() {
+        memory::store(service, account, envelope);
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         let script = crate::data::fs::daemon_env::security_add_generic_password_script(
             service, account, envelope,
@@ -527,6 +589,10 @@ pub(crate) fn keychain_clear(
     account: &str,
     cap: std::time::Duration,
 ) -> Result<(), KeychainCallError> {
+    if in_memory() {
+        memory::clear(service, account);
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
         let mut cmd = Command::new("security");
         cmd.args(["delete-generic-password", "-s", service, "-a", account]);
@@ -660,6 +726,55 @@ mod tests {
             decoded, payload,
             "the read side must unwrap exactly what the write side wrapped"
         );
+    }
+
+    /// Unit tests never reach the OS keychain: every read, write and delete
+    /// lands in the in-memory one, so a test run on a developer's machine
+    /// cannot see their credentials or disturb what their daemon stored.
+    #[test]
+    fn unit_tests_always_use_the_in_memory_keychain() {
+        assert!(in_memory());
+    }
+
+    #[test]
+    fn in_memory_keychain_round_trips_store_lookup_and_clear() {
+        let (service, account) = ("awman-test-round-trip", "acct");
+        let cap = std::time::Duration::from_secs(1);
+
+        assert_eq!(keychain_lookup(service, account, cap).unwrap(), None);
+        keychain_store(service, account, "first", cap).unwrap();
+        keychain_store(service, account, "second", cap).unwrap();
+        assert_eq!(
+            keychain_lookup(service, account, cap).unwrap().as_deref(),
+            Some("second"),
+            "a store replaces the existing item, as `security -U` does"
+        );
+
+        keychain_clear(service, account, cap).unwrap();
+        assert_eq!(keychain_lookup(service, account, cap).unwrap(), None);
+        keychain_clear(service, account, cap).expect("clearing a missing item is not an error");
+    }
+
+    #[test]
+    fn in_memory_lookup_without_an_account_matches_any_account() {
+        let service = "awman-test-any-account";
+        let cap = std::time::Duration::from_secs(1);
+        keychain_store(service, "someone", "value", cap).unwrap();
+
+        assert_eq!(
+            run_macos_keychain_lookup(service, None).as_deref(),
+            Some("value")
+        );
+        assert_eq!(
+            run_macos_keychain_lookup(service, Some("someone-else")),
+            None
+        );
+        assert_eq!(
+            run_linux_secret_lookup(service, "someone").as_deref(),
+            Some("value")
+        );
+
+        keychain_clear(service, "someone", cap).unwrap();
     }
 
     #[test]

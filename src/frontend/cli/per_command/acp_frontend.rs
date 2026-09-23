@@ -263,14 +263,17 @@ mod tests {
     use super::*;
     use crate::command::dispatch::catalogue::CommandCatalogue;
 
-    /// Build a `CliFrontend` for unit tests. In the test environment stdin
-    /// is never a TTY, so `non_interactive` is always `true` — exactly the
+    /// Build a non-interactive `CliFrontend` for unit tests — exactly the
     /// degrade path `request_permission`/`next_prompt` must take without
-    /// blocking on a read.
+    /// blocking on a read. Forced rather than inferred: `cargo test` run from
+    /// a terminal inherits a TTY stdin, so the mode cannot be left to
+    /// `stdin_is_tty()`.
     fn make_frontend() -> CliFrontend {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd.try_get_matches_from(["awman", "chat"]).unwrap();
-        CliFrontend::new(m)
+        let mut fe = CliFrontend::new(m);
+        fe.non_interactive = true;
+        fe
     }
 
     fn text_chunk(text: &str) -> ContentChunk {
@@ -494,14 +497,14 @@ mod tests {
     #[test]
     fn non_interactive_next_prompt_ends_session_without_blocking() {
         let mut fe = make_frontend();
-        assert!(fe.non_interactive, "test stdin is never a TTY");
+        assert!(fe.non_interactive);
         assert_eq!(AcpFrontend::next_prompt(&mut fe), None);
     }
 
     #[test]
     fn non_interactive_request_permission_auto_approves_without_blocking() {
         let mut fe = make_frontend();
-        assert!(fe.non_interactive, "test stdin is never a TTY");
+        assert!(fe.non_interactive);
         let options = vec![
             PermissionOption {
                 option_id: "deny".into(),

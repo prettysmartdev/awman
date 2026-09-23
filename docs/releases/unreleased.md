@@ -70,6 +70,36 @@ Several prompts used to pick an answer for you when there was nobody to ask:
 
 ## Fixes
 
+### Running the test suite no longer touches your keychain or your squad daemon
+
+On macOS, `make test` read your real Claude credential from the keychain, and
+the `awman clean` and squad daemon tests could overwrite or delete the squad
+daemon's stored environment (`squad.envPersistence`). Tests that started a
+squad daemon did so through launchd (`systemd --user` on Linux) under the same
+fixed label as your real daemon, stopping it and leaving a test daemon
+registered in its place. The TUI copy tests also overwrote your clipboard.
+
+`make test` now runs with a throwaway home directory and no global git config,
+and awman uses an in-memory keychain and clipboard and starts daemons as plain
+child processes. Tests that drive Docker, Apple's `container` or `sbx` no
+longer build, run or remove images and containers in your own daemon: they are
+skipped unless you opt in with `AWMAN_TEST_DOCKER=1` (or
+`AWMAN_TEST_APPLE_CONTAINER=1`, `AWMAN_TEST_SBX=1`). `make test-full` opts into
+Docker.
+
+If `make test` ran on your machine before this fix, check your daemon with
+`launchctl print gui/$(id -u)/io.awman.squad` (or `systemctl --user status
+awman-squad`). If it is not running, or its `AWMAN_SQUAD_ROOT` points into a
+temporary directory, restart it with `awman squad start` from a shell that has
+your task variables exported, so it stores them again.
+
+### A running daemon is no longer mistaken for a stale one on macOS
+
+awman checks that a daemon's PID still belongs to awman with `ps`, which
+truncated the executable path to 79 columns. With `awman` installed at a longer
+path, a running API or squad daemon looked stale: awman cleared its PID file
+and started a second daemon beside it. The full path is now read.
+
 ### GitHub issue references resolve from more remote URL shapes
 
 `--issue` derives `owner/repo` from your `origin` remote. It now also
@@ -193,6 +223,17 @@ but antigravity ships `agy` — which is what awman uses to launch it. The ping
 therefore always fails, and credential refresh for antigravity cannot succeed.
 This is long-standing, not new; fixing it changes behaviour on the one
 sanctioned host-side agent execution path and is tracked separately.
+
+## New environment variables
+
+- `AWMAN_TEST_ISOLATION` — set to `1` to keep awman off your per-user OS
+  resources: an in-memory keychain and clipboard, daemons started as plain
+  child processes rather than through launchd or `systemd --user`, and no
+  downloads from the internet, and `docker`, `container` and `sbx` treated as
+  not installed. For test runs; `make test` sets it.
+- `AWMAN_TEST_DOCKER`, `AWMAN_TEST_APPLE_CONTAINER`, `AWMAN_TEST_SBX` — with
+  `AWMAN_TEST_ISOLATION`, set one to `1` to let awman use that real CLI.
+  `make test-full` sets `AWMAN_TEST_DOCKER`.
 
 ## New environment variables documented
 

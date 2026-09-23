@@ -123,11 +123,12 @@ impl AgentRuntimeEngine for SandboxRuntime {
         // Probes `sbx ls` (per WI 0090): a missing binary and a logged-out
         // session both make the runtime unusable, and `sbx ls` fails for both.
         use std::process::Stdio;
-        let child = std::process::Command::new(self.backend.cli_binary())
-            .arg("ls")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let child =
+            std::process::Command::new(crate::engine::host_cli::program(self.backend.cli_binary()))
+                .arg("ls")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
         match child {
             Ok(child) => crate::engine::container::runtime::wait_with_timeout(
                 child,
@@ -375,7 +376,7 @@ impl AgentInstance for SandboxAttachInstance {
                     pixel_height: 0,
                 })
                 .map_err(|e| EngineError::Sandbox(format!("openpty: {e}")))?;
-            let mut cmd = CommandBuilder::new(self.cli_binary);
+            let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(self.cli_binary));
             for arg in &argv {
                 cmd.arg(arg);
             }
@@ -402,7 +403,7 @@ impl AgentInstance for SandboxAttachInstance {
 
         // Piped path.
         let argv = sbx_attach_argv(&handle.id, &[], &["bash"]);
-        let mut cmd = std::process::Command::new(self.cli_binary);
+        let mut cmd = std::process::Command::new(crate::engine::host_cli::program(self.cli_binary));
         cmd.args(&argv);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());

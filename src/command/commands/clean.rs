@@ -800,7 +800,10 @@ fn discover_squad_daemon_env(summary: &mut CleanSummary) {
     use crate::data::fs::daemon_env::{DAEMON_ENV_ACCOUNT, DAEMON_ENV_SERVICE};
     use crate::engine::squad::env_store::KeychainStore;
 
-    if !KeychainStore::platform_supported() {
+    // Under test the keychain is the in-memory one, shared by the whole test
+    // binary: an item a concurrent squad daemon test stored there must not
+    // turn up in some `clean` test's count.
+    if cfg!(test) || !KeychainStore::platform_supported() {
         return;
     }
     if KeychainStore::new().item_present().unwrap_or(false) {

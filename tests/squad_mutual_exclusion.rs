@@ -20,13 +20,16 @@
 //! would present.
 
 use std::path::Path;
-use std::process::{Child, Command};
 use std::sync::{Arc, Barrier};
 
 use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
 use awman::data::fs::{ApiPaths, SquadPaths};
-use awman::engine::daemon::{DaemonGuard, DaemonKind, DaemonSupervisor};
+use awman::engine::daemon::{DaemonGuard, DaemonKind};
 use awman::engine::error::EngineError;
+
+#[path = "helpers/fake_awman.rs"]
+mod fake_awman;
+use fake_awman::FakeAwmanProcess;
 
 /// `AWMAN_CONFIG_HOME` is scoped to a fixture too: `DaemonGuard`'s shared
 /// startup-arbitration lock lives beside the shared database, and a test must
@@ -39,79 +42,6 @@ fn env_for(api_root: &Path, squad_root: &Path) -> EnvSnapshot {
     ])
 }
 
-/// A real, live child process whose executable filename contains "awman", so
-/// `pid_is_awman` recognizes it the way it would a genuine daemon. Holds its
-/// own `TempDir` so the binary stays resolvable for as long as the child
-/// needs it.
-struct FakeAwmanProcess {
-    _dir: tempfile::TempDir,
-    child: Child,
-}
-
-impl FakeAwmanProcess {
-    fn spawn(label: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let exe_path = dir.path().join(format!("awman-fake-{label}"));
-        std::fs::copy("/bin/sleep", &exe_path).expect("copy /bin/sleep for the fake daemon");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&exe_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&exe_path, perms).unwrap();
-        }
-        // Under `cargo test`'s default concurrent-test-function execution,
-        // the kernel can transiently report a just-written, already-closed
-        // executable as busy (`ETXTBSY`) for a moment before `execve`
-        // succeeds. Retry briefly rather than require `--test-threads=1`.
-        let mut attempt = 0;
-        let child = loop {
-            match Command::new(&exe_path).arg("30").spawn() {
-                Ok(child) => break child,
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
-                    attempt += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => panic!("spawn fake awman-named process: {e}"),
-            }
-        };
-
-        // `spawn` returns once the child *exists*, not once it has finished
-        // `execve`. Until that exec lands, the child's command name is still
-        // the one it inherited from the spawning thread — under `cargo test`
-        // that is a test-function name like `api_running_blo`, which
-        // `pid_is_awman` correctly rejects. A guard checked inside that window
-        // reads the pidfile, decides it names a foreign process, and clears it
-        // as stale, so the daemon that should have been refused starts.
-        //
-        // Wait for the identity the daemon is being stood up to present. It is
-        // the only thing that makes this fixture a stand-in for a real daemon,
-        // so no test may observe it before it holds.
-        let mut child = child;
-        let pid = child.id();
-        for _ in 0..500 {
-            if DaemonSupervisor::pid_is_awman(pid) {
-                return Self { _dir: dir, child };
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("fake awman-named process (PID {pid}) never presented an awman command name");
-    }
-
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-}
-
-impl Drop for FakeAwmanProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 // ─── Both directions ──────────────────────────────────────────────────────
 
 #[test]
@@ -122,7 +52,7 @@ fn squad_running_blocks_api_start() {
 
     let fake_squad = FakeAwmanProcess::spawn("squad");
     let squad_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap();
-    squad_guard.acquire(fake_squad.pid()).unwrap();
+    squad_guard.acquire(fake_squad.id()).unwrap();
 
     let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
     let err = api_guard
@@ -144,7 +74,7 @@ fn api_running_blocks_squad_start() {
 
     let fake_api = FakeAwmanProcess::spawn("api");
     let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
-    api_guard.acquire(fake_api.pid()).unwrap();
+    api_guard.acquire(fake_api.id()).unwrap();
 
     let squad_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap();
     let err = squad_guard
@@ -192,8 +122,8 @@ fn concurrent_start_race_produces_exactly_one_winner_every_time() {
 
         let fake_api = FakeAwmanProcess::spawn(&format!("api-{attempt}"));
         let fake_squad = FakeAwmanProcess::spawn(&format!("squad-{attempt}"));
-        let api_pid = fake_api.pid();
-        let squad_pid = fake_squad.pid();
+        let api_pid = fake_api.id();
+        let squad_pid = fake_squad.id();
 
         let api_guard = Arc::new(DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap());
         let squad_guard = Arc::new(DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap());
@@ -366,7 +296,7 @@ async fn a_live_api_daemon_stops_squad_startup_before_any_store_pidfile_or_port(
     let fake_api = FakeAwmanProcess::spawn("api-live");
     let env = env_for(&api_root, &squad_root);
     let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
-    api_guard.acquire(fake_api.pid()).unwrap();
+    api_guard.acquire(fake_api.id()).unwrap();
 
     let _scoped = ScopedEnv::set(&[
         (AWMAN_API_ROOT, &api_root),
@@ -394,7 +324,7 @@ async fn a_live_api_daemon_stops_squad_startup_before_any_store_pidfile_or_port(
         "error must name awman api: {text}"
     );
     assert!(
-        text.contains(&fake_api.pid().to_string()),
+        text.contains(&fake_api.id().to_string()),
         "error must name the running PID: {text}"
     );
 

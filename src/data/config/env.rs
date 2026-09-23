@@ -74,6 +74,30 @@ pub const PATH: &str = "PATH";
 /// [`PATH`]: a launchd agent or `systemd --user` unit does not inherit it.
 pub const HOME: &str = "HOME";
 
+/// `AWMAN_TEST_ISOLATION` — set to a truthy value (`1`, `true`, `yes`, `on`)
+/// to keep awman off every per-user OS resource it would otherwise share with
+/// a real installation: the keychain becomes a process-local, in-memory one,
+/// and daemons are started as plain child processes, never through launchd or
+/// `systemd --user`. For test runs, where those resources are the developer's
+/// own: the squad daemon's stored env is one fixed keychain item, and its
+/// launchd label / systemd unit is one fixed name, so a test daemon would
+/// otherwise replace or stop the developer's real one. See
+/// [`test_isolation_active`].
+pub const AWMAN_TEST_ISOLATION: &str = "AWMAN_TEST_ISOLATION";
+
+/// `AWMAN_TEST_DOCKER` — under [`AWMAN_TEST_ISOLATION`], set to a truthy value
+/// to let awman run the real `docker` CLI. Off by default: the Docker tests
+/// build, run and remove images and containers in the developer's own daemon.
+pub const AWMAN_TEST_DOCKER: &str = "AWMAN_TEST_DOCKER";
+
+/// `AWMAN_TEST_APPLE_CONTAINER` — as [`AWMAN_TEST_DOCKER`], for Apple's
+/// `container` CLI.
+pub const AWMAN_TEST_APPLE_CONTAINER: &str = "AWMAN_TEST_APPLE_CONTAINER";
+
+/// `AWMAN_TEST_SBX` — as [`AWMAN_TEST_DOCKER`], for the Docker Sandboxes
+/// `sbx` CLI.
+pub const AWMAN_TEST_SBX: &str = "AWMAN_TEST_SBX";
+
 /// `RUST_LOG` — the `tracing` filter directive. Forwarded to a daemon job so
 /// an operator can start a daemon with the verbosity they asked for.
 pub const RUST_LOG: &str = "RUST_LOG";
@@ -262,6 +286,39 @@ impl EnvSnapshot {
             .map(PathBuf::from)
     }
 
+    /// Whether `AWMAN_TEST_ISOLATION` is set to `1`, `true`, `yes` or `on`
+    /// (case- and whitespace-insensitive). Any other value, or none, is off.
+    pub fn test_isolation(&self) -> bool {
+        self.truthy(AWMAN_TEST_ISOLATION)
+    }
+
+    /// Whether a truthy `AWMAN_TEST_DOCKER` opts back into the real `docker`.
+    pub fn test_docker(&self) -> bool {
+        self.truthy(AWMAN_TEST_DOCKER)
+    }
+
+    /// Whether a truthy `AWMAN_TEST_APPLE_CONTAINER` opts back into the real
+    /// `container`.
+    pub fn test_apple_container(&self) -> bool {
+        self.truthy(AWMAN_TEST_APPLE_CONTAINER)
+    }
+
+    /// Whether a truthy `AWMAN_TEST_SBX` opts back into the real `sbx`.
+    pub fn test_sbx(&self) -> bool {
+        self.truthy(AWMAN_TEST_SBX)
+    }
+
+    /// `key` is set to `1`, `true`, `yes` or `on` (case- and
+    /// whitespace-insensitive).
+    fn truthy(&self, key: &str) -> bool {
+        self.get(key).is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
     /// Whether the API server logs per-session setup lines at `info` rather
     /// than `debug`. `true` unless `AWMAN_API_VERBOSE_SETUP` is set to one of
     /// `0`, `false`, `no`, `off` (case- and whitespace-insensitive).
@@ -322,6 +379,10 @@ impl Env {
             SHELL,
             AWMAN_ATTACH_DIR,
             AWMAN_API_VERBOSE_SETUP,
+            AWMAN_TEST_ISOLATION,
+            AWMAN_TEST_DOCKER,
+            AWMAN_TEST_APPLE_CONTAINER,
+            AWMAN_TEST_SBX,
         ];
         let mut values = HashMap::new();
         for k in keys {
@@ -336,6 +397,21 @@ impl Env {
         }
         EnvSnapshot { values }
     }
+}
+
+/// Whether this process must stay off per-user OS resources (see
+/// [`AWMAN_TEST_ISOLATION`]).
+///
+/// Always true under `cfg(test)`, so a unit test cannot reach them however it
+/// is run. Integration tests and the `awman` binaries they spawn are not built
+/// with `cfg(test)`; they get it from the variable, which `make test` sets and
+/// which a daemon started as a child process inherits.
+///
+/// Every code path that would touch such a resource asks this first. Read
+/// fresh on each call rather than cached, so an integration test that sets the
+/// variable in-process is honoured from that point on.
+pub fn test_isolation_active() -> bool {
+    cfg!(test) || Env::from_process().test_isolation()
 }
 
 // ── Daemon environment overlay (WI 0116 §2) ─────────────────────────────────
@@ -820,6 +896,31 @@ mod tests {
         // class too, so a daemon started by systemd/launchd resolves the
         // same overlays the shell that ran `squad start` would have.
         assert!(ForwardedEnv::NAMES.contains(&AWMAN_OVERLAYS));
+    }
+
+    #[test]
+    fn test_isolation_parses_truthy_values_only() {
+        for (value, want) in [
+            ("1", true),
+            (" TRUE ", true),
+            ("yes", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("memory", false),
+            ("", false),
+        ] {
+            let env = EnvSnapshot::with_overrides([(AWMAN_TEST_ISOLATION, value)]);
+            assert_eq!(env.test_isolation(), want, "AWMAN_TEST_ISOLATION={value:?}");
+        }
+        assert!(!EnvSnapshot::empty().test_isolation());
+    }
+
+    /// Unit tests are isolated whatever the environment says: they cannot be
+    /// run in a way that reaches the developer's keychain or service manager.
+    #[test]
+    fn unit_tests_are_always_isolated() {
+        assert!(test_isolation_active());
     }
 
     /// `ForwardedEnv::from_process()` must emit only the names actually set in this

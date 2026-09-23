@@ -29,7 +29,7 @@ use crate::helpers::docker_available;
 const IMAGE: &str = "busybox:latest";
 
 fn try_pull(image: &str) -> bool {
-    Command::new("docker")
+    Command::new(awman::engine::host_cli::program("docker"))
         .args(["pull", image])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -42,7 +42,7 @@ fn try_pull(image: &str) -> bool {
 /// `docker.rs` does — the value goes on the child's environment, never argv —
 /// and return the raw bytes the container observed for `$KEY`.
 fn value_seen_inside_container(key: &str, value: &str) -> Vec<u8> {
-    let output = Command::new("docker")
+    let output = Command::new(awman::engine::host_cli::program("docker"))
         .args([
             "run",
             "--rm",
@@ -134,7 +134,7 @@ fn docker_credential_value_absent_from_proc_cmdline_during_launch() {
 
     // A container that lingers long enough for us to inspect the launching
     // client's cmdline before it exits.
-    let mut child = Command::new("docker")
+    let mut child = Command::new(awman::engine::host_cli::program("docker"))
         .args(["run", "--rm", "-e", key, IMAGE, "sleep", "3"])
         .env(key, value)
         .stdout(Stdio::null())
@@ -226,7 +226,7 @@ fn docker_file_delivered_credential_secret_is_only_in_staged_file() {
         "the staged path is permitted only as a -v mount argument"
     );
 
-    let output = Command::new("docker")
+    let output = Command::new(awman::engine::host_cli::program("docker"))
         .args(&args)
         .output()
         .expect("run docker");

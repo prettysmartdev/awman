@@ -40,8 +40,13 @@ use awman::frontend::cli::{command_path_from_matches, CliFrontend};
 use awman::frontend::tui::command_frontend::{DialogChannels, TuiCommandFrontend};
 use awman::frontend::tui::tabs::TabSharedState;
 
+#[cfg(unix)]
+#[path = "helpers/fake_awman.rs"]
+mod fake_awman;
 #[path = "helpers/mod.rs"]
 mod helpers;
+#[cfg(unix)]
+use fake_awman::FakeAwmanProcess;
 
 static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
@@ -551,7 +556,7 @@ async fn a_running_need_with_no_key_in_this_shell_is_refused_before_the_request(
 
     // A live process whose name contains "awman" — `check_already_running`
     // rejects a pidfile naming anything else, and the test binary is not it.
-    let holder = FakeAwmanProcess::spawn();
+    let holder = FakeAwmanProcess::spawn("squad");
     let paths = SquadPaths::from_root(&squad_root);
     let process = DaemonProcess::new(paths.daemon(), "awman-squad-test", "io.awman.squad.test");
     process.force_write_pidfile(holder.id()).expect("pidfile");
@@ -649,73 +654,6 @@ fn init_repo(path: &Path) {
 }
 
 #[cfg(unix)]
-struct FakeAwmanProcess {
-    _dir: tempfile::TempDir,
-    child: std::process::Child,
-}
-
-#[cfg(unix)]
-impl FakeAwmanProcess {
-    fn spawn() -> Self {
-        let dir = tempfile::tempdir().expect("fake awman process directory");
-        let executable = dir.path().join("awman-squad-test-holder");
-        std::fs::copy("/bin/sleep", &executable).expect("copy sleep holder");
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("holder metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).expect("holder permissions");
-        // Under `cargo test`'s default concurrent-test-function execution,
-        // another test can fork while this thread still holds the holder's
-        // write descriptor open; the kernel then reports the just-written
-        // executable as busy (`ETXTBSY`) until that fork execs. Retry briefly
-        // rather than require `--test-threads=1`, as the other squad fixtures do.
-        let mut attempt = 0;
-        let child = loop {
-            match Command::new(&executable).arg("60").spawn() {
-                Ok(child) => break child,
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
-                    attempt += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => panic!("awman-named holder must start: {e}"),
-            }
-        };
-
-        // `spawn` returns once the child *exists*, not once it has finished
-        // `execve`. Until that exec lands, the child's command name is still
-        // the test-function name it inherited, which `pid_is_awman` correctly
-        // rejects; a supervisor checked inside that window would treat the
-        // pidfile as stale and try to auto-start a daemon. Wait for the
-        // identity this fixture exists to present.
-        let mut child = child;
-        let pid = child.id();
-        for _ in 0..500 {
-            if DaemonSupervisor::pid_is_awman(pid) {
-                return Self { _dir: dir, child };
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("awman-named holder (PID {pid}) never presented an awman command name");
-    }
-
-    fn id(&self) -> u32 {
-        self.child.id()
-    }
-}
-
-#[cfg(unix)]
-impl Drop for FakeAwmanProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-#[cfg(unix)]
 async fn start_daemon(root: &Path) -> (tokio::task::JoinHandle<()>, String, FakeAwmanProcess) {
     let engines = engines_at(root);
     let previous_config = std::env::var("AWMAN_CONFIG_HOME").ok();
@@ -724,7 +662,7 @@ async fn start_daemon(root: &Path) -> (tokio::task::JoinHandle<()>, String, Fake
     std::env::set_var("AWMAN_SQUAD_ROOT", root.join("squad"));
     let daemon_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &Env::from_process())
         .expect("test daemon guard");
-    let holder = FakeAwmanProcess::spawn();
+    let holder = FakeAwmanProcess::spawn("squad");
     daemon_guard
         .acquire(holder.id())
         .expect("test daemon guard must claim squad");
@@ -943,8 +881,65 @@ fn run_binary(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("HOME", &home)
         .env("AWMAN_CONFIG_HOME", root)
         .env("AWMAN_SQUAD_ROOT", root.join("squad"))
+        // If this ever has to start a daemon, keep it off the keychain and
+        // launchd / systemd, whose squad item, label and unit are one fixed
+        // name each — and never send the developer's own squad key.
+        .env("AWMAN_TEST_ISOLATION", "1")
+        .env_remove("AWMAN_SQUAD_KEY")
         .output()
         .expect("awman subprocess must start")
+}
+
+/// The CLI must have reused the in-process test daemon: its pidfile still
+/// names the holder and no key was minted. If the CLI decided the holder was
+/// not a live awman process, it clears the pidfile, mints a key and starts a
+/// daemon of its own — which every later command then fails to authenticate
+/// to. Fail here instead, with what the CLI's liveness check would have seen.
+#[cfg(unix)]
+fn assert_still_serving_the_test_daemon(
+    root: &Path,
+    holder: &mut FakeAwmanProcess,
+    step: &str,
+    output: &Output,
+) {
+    let daemon = SquadPaths::from_root(root.join("squad")).daemon();
+    let pidfile = std::fs::read_to_string(daemon.pid_file()).ok();
+    let key_hash = daemon.read_key_hash().ok().flatten();
+    if pidfile.as_deref().map(str::trim) == Some(holder.id().to_string().as_str())
+        && key_hash.is_none()
+    {
+        return;
+    }
+    // `ps` exactly as the CLI runs it on macOS: stdin, stdout and stderr
+    // all without a terminal.
+    let ps = Command::new("ps")
+        .args(["-ww", "-p", &holder.id().to_string(), "-o", "comm="])
+        .output()
+        .map(|o| {
+            format!(
+                "status={:?} stdout={:?} stderr={:?}",
+                o.status,
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
+        .unwrap_or_else(|e| format!("could not run ps: {e}"));
+    panic!(
+        "`{step}` did not reuse the test daemon.\n\
+         pidfile: {pidfile:?} (holder PID {})\n\
+         key hash minted: {}\n\
+         holder alive (this process): {}\n\
+         holder is awman (this process): {}\n\
+         holder exit status: {:?}\n\
+         ps as the CLI runs it: {ps}\n\
+         `{step}` stderr:\n{}",
+        holder.id(),
+        key_hash.is_some(),
+        DaemonSupervisor::is_process_alive(holder.id()),
+        DaemonSupervisor::pid_is_awman(holder.id()),
+        holder.exit_status(),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -986,7 +981,7 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
     let root = tempfile::tempdir().expect("temporary squad root");
     let repo = root.path().join("repo");
     init_repo(&repo);
-    let (daemon, base, _holder) = start_daemon(root.path()).await;
+    let (daemon, base, mut holder) = start_daemon(root.path()).await;
 
     let repo_arg = repo.to_str().expect("repo path");
     let add = run_binary(
@@ -1010,6 +1005,7 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         "squad add failed: {}",
         String::from_utf8_lossy(&add.stderr)
     );
+    assert_still_serving_the_test_daemon(root.path(), &mut holder, "squad add", &add);
 
     let list_json = stdout_json(&run_binary(
         root.path(),

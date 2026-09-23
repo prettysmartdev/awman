@@ -202,7 +202,7 @@ fn unique_suffix() -> String {
 }
 
 fn cli_available(bin: &str, args: &[&str]) -> bool {
-    Command::new(bin)
+    Command::new(awman::engine::host_cli::program(bin))
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

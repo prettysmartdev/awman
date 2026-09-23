@@ -582,7 +582,7 @@ fn integration_spawn_choke_holds_lease_before_pty_piped_and_acp_on_docker_and_ap
 fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_untouched() {
     if !child_env() {
         if !crate::helpers::docker_available()
-            || !Command::new("docker")
+            || !Command::new(awman::engine::host_cli::program("docker"))
                 .args(["pull", "busybox:latest"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -642,7 +642,7 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
         std::thread::sleep(Duration::from_millis(10));
     }
     let exited_mount = format!("{}:/root/.claude:ro", exited.path().display());
-    assert!(Command::new("docker")
+    assert!(Command::new(awman::engine::host_cli::program("docker"))
         .args(["run", "--rm", "-v", &exited_mount, "busybox:latest", "true"])
         .status()
         .unwrap()
@@ -663,7 +663,7 @@ fn docker_e2e_live_container_observes_rotated_fingerprint_and_exited_stage_is_un
     }
     let live_mount = format!("{}:/root/.claude:ro", live.path().display());
     let agent_mount = format!("{}:/agent:ro", fake_agent_dir.path().display());
-    let mut child = Command::new("docker")
+    let mut child = Command::new(awman::engine::host_cli::program("docker"))
         .args([
             "run",
             "--rm",

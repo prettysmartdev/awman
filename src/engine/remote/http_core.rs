@@ -145,6 +145,38 @@ impl HttpCore {
         })
     }
 
+    /// Refuse a request to anything but loopback under test isolation.
+    ///
+    /// Called by every fetch that reaches the public internet (the aspec
+    /// tarball, the per-agent Dockerfile, the GitHub issue and Actions APIs)
+    /// before it sends anything. A test gets the same error path it would get offline;
+    /// requests to a test's own daemon or mock server on `localhost` /
+    /// `127.0.0.1` / `[::1]` are unaffected.
+    pub fn refuse_public_host_under_test_isolation(url: &str) -> Result<(), String> {
+        if !crate::data::config::env::test_isolation_active() {
+            return Ok(());
+        }
+        let loopback = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| {
+                let host = u.host_str()?.trim_start_matches('[').trim_end_matches(']');
+                Some(
+                    host == "localhost"
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback()),
+                )
+            })
+            .unwrap_or(false);
+        if loopback {
+            Ok(())
+        } else {
+            Err(format!(
+                "network access to {url} is disabled under test isolation (AWMAN_TEST_ISOLATION)"
+            ))
+        }
+    }
+
     /// The one `reqwest::Client` builder in the tree.
     ///
     /// Everything async in awman that speaks HTTP — the daemon clients here,
@@ -321,5 +353,37 @@ impl HttpCore {
             .unwrap_or(host_part);
         let host = host.trim_start_matches('[').trim_end_matches(']');
         matches!(host, "127.0.0.1" | "::1" | "localhost")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unit tests always run isolated: loopback is reachable, the internet is
+    /// not.
+    #[test]
+    fn test_isolation_allows_loopback_only() {
+        for url in [
+            "http://localhost:9876/v1/status",
+            "http://127.0.0.1:1/x",
+            "http://[::1]:8080/",
+        ] {
+            assert!(
+                HttpCore::refuse_public_host_under_test_isolation(url).is_ok(),
+                "{url} must stay reachable"
+            );
+        }
+        for url in [
+            "https://api.github.com/repos/o/r/issues/1",
+            "https://raw.githubusercontent.com/x",
+            "https://localhost.example.com/",
+            "not a url",
+        ] {
+            assert!(
+                HttpCore::refuse_public_host_under_test_isolation(url).is_err(),
+                "{url} must be refused"
+            );
+        }
     }
 }

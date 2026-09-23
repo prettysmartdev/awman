@@ -58,6 +58,10 @@ fn run(binary: &Path, root: &Path, extra: &[(&str, &str)], args: &[&str]) -> Out
         .env("AWMAN_CONFIG_HOME", root)
         .env("AWMAN_SQUAD_ROOT", root.join("squad"))
         .env("HOME", root)
+        // This spawns a real daemon. Keep it off the keychain and launchd /
+        // systemd, whose squad item, label and unit are one fixed name each:
+        // it would otherwise overwrite, stop or replace the developer's own.
+        .env("AWMAN_TEST_ISOLATION", "1")
         // Deterministic: never inherit the developer's own key or tokens.
         .env_remove("AWMAN_SQUAD_KEY")
         .env_remove("WI0116_CLI_TOKEN")
@@ -145,17 +149,6 @@ fn squad_env_arms_a_daemon_on_both_the_spawn_and_already_running_branches() {
     let root = tmp.path();
     let repo = root.join("repo");
     init_repo(&repo);
-
-    // This test spawns a *real* daemon. Its stored keychain item is a single
-    // fixed `awman-squad`/`daemon-env` pair, not keyed by storage root, so an
-    // isolated `AWMAN_CONFIG_HOME` does not isolate it: with the default
-    // `envPersistence: "keychain"` this test would overwrite the item a real
-    // daemon on the developer's machine is using with its own fixture token.
-    std::fs::write(
-        root.join("config.json"),
-        r#"{"squad":{"envPersistence":"none"}}"#,
-    )
-    .unwrap();
 
     // ── 1. create the task from an under-equipped shell ──────────────────────
     let created = run(

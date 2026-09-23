@@ -19,28 +19,26 @@ build:
 install: build
 	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
 
-# A failed `mktemp` must stop the run, not fall through with an empty TMPDIR.
-# Rust's `std::env::temp_dir()` honours TMPDIR verbatim, so TMPDIR="" makes
-# every `tempfile::tempdir()` a *relative* path: the fixtures land in the
-# checked-out repo instead of the fixture root, polluting the tree the teardown
-# then commits, and crawling when the workspace is a bind mount rather than the
-# container's own filesystem.
+# Every test target runs through tools/isolated-test.sh, which keeps the suite
+# off the developer's own machine: a throwaway HOME, no global git config, no
+# inherited awman variables, stdin from /dev/null, a per-run TMPDIR under
+# AWMAN_TEST_TMPROOT, and AWMAN_TEST_ISOLATION=1 so awman itself uses an
+# in-memory keychain and clipboard, never launchd or systemd, and no network
+# beyond loopback. See the script for why each one matters.
+#
+# The real container and sandbox CLIs are off too, unless opted into with
+# AWMAN_TEST_DOCKER=1, AWMAN_TEST_APPLE_CONTAINER=1 or AWMAN_TEST_SBX=1: their
+# tests build, run and remove images and containers in your own daemon.
+# `test-full` (the CI Docker job) opts into Docker; `test` and `test-fast`
+# never touch it.
 test:
-	@set -e; \
-		mkdir -p "$(AWMAN_TEST_TMPROOT)"; \
-		awman_test_tmpdir="$$(mktemp -d "$(AWMAN_TEST_TMPROOT)/test-run.XXXXXX")"; \
-		if [ -z "$$awman_test_tmpdir" ] || [ ! -d "$$awman_test_tmpdir" ]; then \
-			echo "make test: no fixture directory under $(AWMAN_TEST_TMPROOT)" >&2; \
-			exit 1; \
-		fi; \
-		trap 'rm -rf "$$awman_test_tmpdir"' EXIT; \
-		TMPDIR="$$awman_test_tmpdir" cargo test --quiet
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet
 
 test-fast:
-	cargo test --quiet -- --skip docker --skip real_git --skip real_network
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet -- --skip docker --skip real_git --skip real_network
 
 test-full:
-	cargo test --quiet
+	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet
 
 architecture-lint:
 	@bash tools/architecture-lint.sh

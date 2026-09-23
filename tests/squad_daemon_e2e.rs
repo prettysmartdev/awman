@@ -45,7 +45,7 @@ impl TaskEvaluator for NeverTriggeredEvaluator {
 }
 
 fn tool_available(bin: &str, arg: &str) -> bool {
-    Command::new(bin)
+    Command::new(awman::engine::host_cli::program(bin))
         .arg(arg)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -148,14 +148,12 @@ async fn start_daemon(root: &std::path::Path) -> (tokio::task::JoinHandle<()>, S
 
     // The stored keychain item is a single fixed `awman-squad`/`daemon-env`
     // pair, not keyed by storage root, so an isolated `AWMAN_CONFIG_HOME` does
-    // not isolate it. Opt this daemon out explicitly rather than letting the
-    // default overwrite the item a real daemon on this machine is using.
+    // not isolate it. Opting out with `envPersistence: "none"` is no answer
+    // either: opting out *clears* the item. The daemon runs in this process,
+    // so isolate the whole process (in-memory keychain, no launchd/systemd),
+    // and leave it isolated — a later persist must not reach the real one.
     std::fs::create_dir_all(root).unwrap();
-    std::fs::write(
-        root.join("config.json"),
-        r#"{"squad":{"envPersistence":"none"}}"#,
-    )
-    .unwrap();
+    std::env::set_var("AWMAN_TEST_ISOLATION", "1");
 
     let previous = std::env::var("AWMAN_CONFIG_HOME").ok();
     std::env::set_var("AWMAN_CONFIG_HOME", root);
@@ -533,7 +531,7 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
         eprintln!("SKIP: git not available");
         return;
     }
-    if !Command::new("docker")
+    if !Command::new(awman::engine::host_cli::program("docker"))
         .args(["pull", "alpine:latest"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -638,7 +636,7 @@ async fn docker_a_squad_task_env_overlay_value_reaches_its_container() {
         .expect("waiting on the container must succeed");
 
     // Best-effort cleanup; `--rm` normally handles it.
-    let _ = Command::new("docker")
+    let _ = Command::new(awman::engine::host_cli::program("docker"))
         .args(["rm", "-f", &name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

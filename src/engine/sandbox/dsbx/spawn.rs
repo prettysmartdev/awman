@@ -119,7 +119,7 @@ impl SbxCommand {
     /// (`list_running`, `stats`) that have no frontend to report through, and
     /// for availability probing.
     pub fn run_quiet(&self) -> Result<SbxOutput, EngineError> {
-        let mut cmd = Command::new(SBX_BIN);
+        let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
         cmd.args(&self.args);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

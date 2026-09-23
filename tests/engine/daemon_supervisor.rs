@@ -52,8 +52,10 @@ fn daemon(root: &Path, kind: DaemonKind) -> DaemonSupervisor {
 fn spawn_detached_identity_is_distinct_for_api_and_squad() {
     let api_root = tempfile::tempdir().unwrap();
     let squad_root = tempfile::tempdir().unwrap();
-    let api = daemon(api_root.path(), DaemonKind::Api);
-    let squad = daemon(squad_root.path(), DaemonKind::Squad);
+    // Both launchers are stubbed below, under a scoped `PATH` (and `HOME` on
+    // macOS), so the routing is exercised without reaching a real one.
+    let api = daemon(api_root.path(), DaemonKind::Api).with_stubbed_service_manager();
+    let squad = daemon(squad_root.path(), DaemonKind::Squad).with_stubbed_service_manager();
 
     assert_ne!(API_UNIT_NAME, SQUAD_UNIT_NAME);
     assert_ne!(API_PLIST_LABEL, SQUAD_PLIST_LABEL);

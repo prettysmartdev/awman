@@ -19,6 +19,7 @@ pub mod credential_refresh;
 pub mod daemon;
 pub mod error;
 pub mod git;
+pub mod host_cli;
 pub mod init;
 pub mod issue;
 pub mod overlay;

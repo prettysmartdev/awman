@@ -129,7 +129,7 @@ impl ContainerRuntime {
             dockerfile.display().to_string(),
             context.display().to_string(),
         ]);
-        let mut child = Command::new(cli_bin)
+        let mut child = Command::new(crate::engine::host_cli::program(cli_bin))
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -191,7 +191,7 @@ impl ContainerRuntime {
     pub fn image_exists(&self, tag: &str) -> bool {
         use std::process::{Command, Stdio};
         let cli_bin = self.backend.cli_binary();
-        let child = Command::new(cli_bin)
+        let child = Command::new(crate::engine::host_cli::program(cli_bin))
             .args(["image", "inspect", tag])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -306,7 +306,7 @@ impl ContainerRuntime {
         use std::process::Stdio;
         let cli_bin = self.backend.cli_binary();
         let args = self.backend.availability_probe_args();
-        let child = std::process::Command::new(cli_bin)
+        let child = std::process::Command::new(crate::engine::host_cli::program(cli_bin))
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -427,7 +427,7 @@ impl AgentRuntimeEngine for ContainerRuntime {
 /// Returns an error on a non-zero exit so callers can count per-item failures.
 fn run_removal(cli_bin: &str, subcommand: &str, target: &str) -> Result<(), EngineError> {
     use std::process::{Command, Stdio};
-    let output = Command::new(cli_bin)
+    let output = Command::new(crate::engine::host_cli::program(cli_bin))
         .args([subcommand, target])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

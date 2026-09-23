@@ -196,7 +196,7 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-        let output = Command::new("container")
+        let output = Command::new(crate::engine::host_cli::program("container"))
             .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -210,7 +210,7 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        let output = Command::new("container")
+        let output = Command::new(crate::engine::host_cli::program("container"))
             .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -225,7 +225,7 @@ impl ContainerBackend for AppleBackend {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let take_sample = |name: &str| -> Result<(u64, u64), EngineError> {
-            let out = Command::new("container")
+            let out = Command::new(crate::engine::host_cli::program("container"))
                 .args(["stats", "--no-stream", "--format", "json", name])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -319,7 +319,7 @@ impl ContainerBackend for AppleBackend {
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         // Apple has no server-side name filter; list everything and filter by
         // the prefix client-side.
-        let output = Command::new("container")
+        let output = Command::new(crate::engine::host_cli::program("container"))
             .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -353,7 +353,7 @@ impl ContainerBackend for AppleBackend {
         // list lives at `[0].variants[*].config.config.Env`. We pick the
         // first variant whose env contains a non-empty `HOME=…` entry, which
         // matches the runtime selection for single-platform images.
-        let output = Command::new("container")
+        let output = Command::new(crate::engine::host_cli::program("container"))
             .args(["image", "inspect", tag])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

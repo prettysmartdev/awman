@@ -127,7 +127,7 @@ pub(super) fn default_start_background(
     let name = crate::engine::container::naming::generate_container_name();
     let args = build_start_background_argv(&name, image, workdir, env, overlays);
 
-    let mut command = Command::new(cli_bin);
+    let mut command = Command::new(crate::engine::host_cli::program(cli_bin));
     command.args(&args);
     for (k, v) in env {
         command.env(k, v);
@@ -266,7 +266,7 @@ pub(super) fn default_exec_in_background(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let output = Command::new(cli_bin)
+    let output = Command::new(crate::engine::host_cli::program(cli_bin))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -312,7 +312,7 @@ pub(super) fn default_exec_in_background_streaming(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let mut child = Command::new(cli_bin)
+    let mut child = Command::new(crate::engine::host_cli::program(cli_bin))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -377,12 +377,12 @@ pub(super) fn default_exec_in_background_streaming(
 }
 
 pub(super) fn default_stop_and_remove(cli_bin: &str, container_id: &str) {
-    let _ = Command::new(cli_bin)
+    let _ = Command::new(crate::engine::host_cli::program(cli_bin))
         .args(["stop", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(cli_bin)
+    let _ = Command::new(crate::engine::host_cli::program(cli_bin))
         .args(["rm", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

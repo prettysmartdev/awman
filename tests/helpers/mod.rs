@@ -29,7 +29,7 @@ use awman::engine::overlay::OverlayEngine;
 
 /// Returns true when a Docker daemon is reachable.
 pub fn docker_available() -> bool {
-    std::process::Command::new("docker")
+    std::process::Command::new(awman::engine::host_cli::program("docker"))
         .arg("info")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

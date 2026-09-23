@@ -358,6 +358,29 @@ fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
 
 // ─── Clipboard ───────────────────────────────────────────────────────────────
 
+/// Put `text` on the system clipboard.
+///
+/// Under test isolation the "clipboard" is a process-local buffer instead:
+/// the real one is the developer's, and a copy test would otherwise replace
+/// whatever they had on it (with a squad key, at that).
+fn set_clipboard_text(text: &str) -> Result<(), String> {
+    if crate::data::config::env::test_isolation_active() {
+        *isolated_clipboard()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+        return Ok(());
+    }
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.set_text(text))
+        .map_err(|e| e.to_string())
+}
+
+/// The clipboard [`set_clipboard_text`] writes under test isolation.
+fn isolated_clipboard() -> &'static std::sync::Mutex<Option<String>> {
+    static CLIPBOARD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    &CLIPBOARD
+}
+
 fn copy_selection_to_clipboard(app: &mut App) {
     let tab = app.active_tab();
     let text = match tab.mouse_selection.as_ref() {
@@ -367,7 +390,7 @@ fn copy_selection_to_clipboard(app: &mut App) {
     if text.is_empty() {
         return;
     }
-    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+    match set_clipboard_text(&text) {
         Ok(()) => {
             // Drop the selection after a successful copy so the copy hint
             // disappears and a subsequent Ctrl+Y doesn't re-yank.
@@ -395,7 +418,7 @@ fn copy_selection_to_clipboard(app: &mut App) {
 /// its own success feedback: `label` (e.g. "squad key") names what was
 /// copied.
 pub(super) fn copy_dialog_text_to_clipboard(app: &mut App, label: &str, text: &str) {
-    let (level, message) = match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+    let (level, message) = match set_clipboard_text(text) {
         Ok(()) => (
             crate::data::message::MessageLevel::Info,
             format!("{label} copied to clipboard"),

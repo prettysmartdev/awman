@@ -150,7 +150,7 @@ pub(super) fn bridge_config_for(
     let container_name = name.0.clone();
     let bin = cli.bin;
     let cancel: CancelFn = Arc::new(move || {
-        let _ = Command::new(bin)
+        let _ = Command::new(crate::engine::host_cli::program(bin))
             .args(["stop", &container_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -308,7 +308,7 @@ fn piped_command(
     argv: &[String],
     options: &ResolvedContainerOptions,
 ) -> Command {
-    let mut cmd = Command::new(cli.bin);
+    let mut cmd = Command::new(crate::engine::host_cli::program(cli.bin));
     cmd.args(argv);
     for (k, v) in &options.agent_credentials {
         cmd.env(k, v);
@@ -386,7 +386,7 @@ pub(super) fn spawn_pty_bridged(
         })
         .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(cli.bin);
+    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(cli.bin));
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -591,12 +591,12 @@ pub(super) fn spawn_piped_interactive(
 /// The one place the stop-then-remove pair is written: `ContainerExecution`'s
 /// cancel paths and `ContainerBackend::stop` all route through it.
 pub(super) fn stop_and_remove(bin: &str, name: &str) {
-    let _ = Command::new(bin)
+    let _ = Command::new(crate::engine::host_cli::program(bin))
         .args(["stop", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(bin)
+    let _ = Command::new(crate::engine::host_cli::program(bin))
         .args(["rm", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

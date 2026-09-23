@@ -73,7 +73,7 @@ impl ContainerBackend for DockerBackend {
         let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
-            let output = Command::new("docker")
+            let output = Command::new(crate::engine::host_cli::program("docker"))
                 .args(*args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -125,7 +125,7 @@ impl ContainerBackend for DockerBackend {
         let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
-            let output = Command::new("docker")
+            let output = Command::new(crate::engine::host_cli::program("docker"))
                 .args(*args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -204,7 +204,7 @@ impl ContainerBackend for DockerBackend {
         let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
-            let output = Command::new("docker")
+            let output = Command::new(crate::engine::host_cli::program("docker"))
                 .args(*args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -250,7 +250,7 @@ impl ContainerBackend for DockerBackend {
     ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
         use crate::engine::container::runtime::ContainerImageInfo;
         let format = "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}";
-        let output = Command::new("docker")
+        let output = Command::new(crate::engine::host_cli::program("docker"))
             .args([
                 "images",
                 "--filter",
@@ -294,7 +294,7 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
-        let output = Command::new("docker")
+        let output = Command::new(crate::engine::host_cli::program("docker"))
             .args([
                 "stats",
                 "--no-stream",
@@ -332,7 +332,7 @@ impl ContainerBackend for DockerBackend {
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
-        let output = Command::new("docker")
+        let output = Command::new(crate::engine::host_cli::program("docker"))
             .args([
                 "ps",
                 "--filter",
@@ -396,7 +396,7 @@ impl ContainerBackend for DockerBackend {
         // Print one env entry per line so we can scan for `HOME=…` without
         // parsing JSON. `docker image inspect` exits 0 even when User/Env are
         // empty; the format expansion just produces nothing then.
-        let output = Command::new("docker")
+        let output = Command::new(crate::engine::host_cli::program("docker"))
             .args([
                 "image",
                 "inspect",
@@ -541,7 +541,7 @@ fn spawn_pty_bridged_attach(
         })
         .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new("docker");
+    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program("docker"));
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -581,7 +581,7 @@ fn spawn_piped_attach(
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<AgentExecution, EngineError> {
-    let mut cmd = Command::new("docker");
+    let mut cmd = Command::new(crate::engine::host_cli::program("docker"));
     cmd.args(&argv);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());

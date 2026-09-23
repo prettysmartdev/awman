@@ -18,19 +18,22 @@ fn make_api_frontend(subcommand: &str) -> (ApiDispatchFrontend, EventBus) {
     (fe, bus)
 }
 
+/// A non-interactive `CliFrontend`. The mode is asked for with
+/// `--non-interactive` rather than inferred: `cargo test` run from a terminal
+/// inherits a TTY stdin, which would otherwise select the interactive path.
 fn make_cli_frontend() -> CliFrontend {
     use awman::command::dispatch::catalogue::CommandCatalogue;
     let cmd = CommandCatalogue::get().build_clap_command();
     let m = cmd
-        .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
+        .try_get_matches_from(["awman", "exec", "workflow", "--non-interactive", "wf.toml"])
         .unwrap();
     CliFrontend::new(m)
 }
 
 // ─── CLI non-interactive AgentIo ────────────────────────────────────────
 
-/// `take_io()` on the CLI (always non-interactive in test env
-/// because stdin is not a TTY) must return live stdout/stderr senders.
+/// `take_io()` on the non-interactive CLI must return live stdout/stderr
+/// senders.
 #[tokio::test]
 async fn take_io_cli_non_interactive_stdout_sender_is_live() {
     let mut fe = make_cli_frontend();

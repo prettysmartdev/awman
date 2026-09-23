@@ -25,7 +25,7 @@ use awman::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgre
 use awman::engine::container::ContainerRuntime;
 
 fn docker_available() -> bool {
-    Command::new("docker")
+    Command::new(awman::engine::host_cli::program("docker"))
         .arg("info")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -85,7 +85,7 @@ impl AgentFrontend for TestAttachFrontend {
 }
 
 fn docker_inspect_running(name: &str) -> Option<bool> {
-    let out = Command::new("docker")
+    let out = Command::new(awman::engine::host_cli::program("docker"))
         .args(["inspect", "--format", "{{.State.Running}}", name])
         .output()
         .ok()?;
@@ -101,7 +101,7 @@ async fn attach_to_foreign_container_streams_output_and_exit_does_not_stop_it() 
         eprintln!("SKIP: Docker not available");
         return;
     }
-    if !Command::new("docker")
+    if !Command::new(awman::engine::host_cli::program("docker"))
         .args(["pull", "alpine:latest"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -128,7 +128,7 @@ async fn attach_to_foreign_container_streams_output_and_exit_does_not_stop_it() 
     // every agent PTY-backed, and `docker attach` reconnects to that primary
     // process's TTY (WI 0106 §3c), so the target must have one. PID 1 is an
     // interactive shell — the process attach must reach directly.
-    let status = Command::new("docker")
+    let status = Command::new(awman::engine::host_cli::program("docker"))
         .args([
             "run",
             "-dit",
@@ -149,7 +149,7 @@ async fn attach_to_foreign_container_streams_output_and_exit_does_not_stop_it() 
     );
 
     let cleanup = |name: &str| {
-        let _ = Command::new("docker")
+        let _ = Command::new(awman::engine::host_cli::program("docker"))
             .args(["rm", "-f", name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

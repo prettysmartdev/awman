@@ -11,7 +11,9 @@ Developer Loop:
 
 
 Local testing:
-- running `make test` should run all tests in the project
+- running `make test` should run all tests in the project that are safe to run on a developer's own machine
+- every `make test*` target runs through `tools/isolated-test.sh`: a throwaway `HOME`, no global git config, no inherited `AWMAN_*` or GitHub token variables, stdin from `/dev/null`, and `AWMAN_TEST_ISOLATION=1`, under which awman uses an in-memory keychain and clipboard, never starts daemons through launchd or `systemd --user`, and reaches no network beyond loopback. Unit tests (`cfg(test)`) are always isolated. No test may read or change the developer's real keychain, clipboard, daemons, home directory or git setup
+- tests that drive a real container or sandbox CLI are opt-in: they run only with `AWMAN_TEST_DOCKER=1`, `AWMAN_TEST_APPLE_CONTAINER=1` or `AWMAN_TEST_SBX=1`; otherwise awman and the tests see that CLI as not installed. `make test-full` sets `AWMAN_TEST_DOCKER=1`
 
 Version control:
 - Git is used for this project
