@@ -326,7 +326,7 @@ impl WorkflowEngine {
         };
 
         match action {
-            NextAction::Dismiss => {
+            NextAction::Dismiss | NextAction::RetryFailedStep { .. } => {
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
                         self.finalize_step(step_name, exit_result?)?,
@@ -428,7 +428,7 @@ impl WorkflowEngine {
         action: NextAction,
     ) -> Result<InterruptibleStepResult, EngineError> {
         match action {
-            NextAction::Dismiss | NextAction::LaunchNext => {
+            NextAction::Dismiss | NextAction::LaunchNext | NextAction::RetryFailedStep { .. } => {
                 Ok(InterruptibleStepResult::LoopContinue)
             }
             NextAction::FinishWorkflow => {
@@ -529,6 +529,9 @@ impl WorkflowEngine {
             }
             NextAction::Abort => {
                 self.msg_warning("Workflow aborted");
+            }
+            NextAction::RetryFailedStep { step_name } => {
+                self.msg_info(format!("Retrying failed step '{step_name}'"));
             }
         }
     }

@@ -589,12 +589,13 @@ fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEv
     let Some(Dialog::WorkflowControlBoard(state)) = &app.active_dialog else {
         return false;
     };
-    let (can_finish, can_launch_next, can_restart, can_go_back, can_continue) = (
+    let (can_finish, can_launch_next, can_restart, can_go_back, can_continue, can_retry) = (
         state.can_finish,
         state.can_launch_next,
         state.can_restart,
         state.can_go_back,
         state.can_continue_current,
+        state.retry_failed_step.is_some(),
     );
 
     let response = match key.code {
@@ -610,6 +611,9 @@ fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEv
         KeyCode::Enter if can_finish => DialogResponse::Char('f'),
         KeyCode::Enter if ctrl => return false,
         KeyCode::Char('c') if ctrl => DialogResponse::Char('a'),
+        // Retry a failed parallel peer. Only claimed when the board offers it:
+        // otherwise `r` keeps falling through to the generic handler.
+        KeyCode::Char('r') if can_retry && !ctrl => DialogResponse::Char('r'),
         _ => return false,
     };
     app.send_dialog_response(response);

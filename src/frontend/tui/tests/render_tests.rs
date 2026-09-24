@@ -1864,6 +1864,8 @@ fn plain_control_board() -> crate::frontend::tui::dialogs::WorkflowControlBoardS
         parallel_peer_count: 0,
         parallel_peers_running: 0,
         failure_lines: Vec::new(),
+        retry_failed_step: None,
+        in_parallel_group: false,
     }
 }
 
@@ -1968,4 +1970,75 @@ fn the_squad_action_confirmation_draws_layer_2s_prompt() {
     }
     // Esc answers the dismissing choice, and is advertised only there.
     assert!(text.contains("/ Esc] back"), "{text}");
+}
+
+/// A board opened mid-parallel-group after a peer failed offers a red
+/// `(r)etry failed step {name}` line below the arrow options and above the
+/// bottom key row; everything else is unchanged.
+#[test]
+fn control_board_offers_retry_of_a_failed_parallel_peer() {
+    let mut app = make_app();
+    let mut state = plain_control_board();
+    // What the engine sets on a board opened while peers still run.
+    state.can_restart = false;
+    state.can_go_back = false;
+    state.restart_unavailable_reason =
+        Some("Restart applies only to the focused container. Switch with Ctrl-S.".into());
+    state.cancel_to_previous_unavailable_reason =
+        Some("Cannot go back while other agents in this group are still running.".into());
+    state.finish_workflow_unavailable_reason =
+        Some("Cannot finish while other agents in this group are still running.".into());
+    state.can_dismiss = true;
+    state.retry_failed_step = Some("lint".into());
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(state));
+
+    let buf = render_app(&mut app, 90, 30);
+    let text = buffer_text(&buf);
+    let rows: Vec<&str> = text.lines().collect();
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?}: {text}"))
+    };
+    let retry_row = row_of("(r)etry failed step lint");
+    assert!(retry_row > row_of("Next: same container"), "{text}");
+    assert!(retry_row < row_of("[^C] Abort"), "{text}");
+    assert!(text.contains("Restart current step"), "{text}");
+
+    let byte = rows[retry_row].find("(r)etry").unwrap();
+    let x = rows[retry_row][..byte].chars().count() as u16;
+    let cell = buf.cell((x, retry_row as u16)).unwrap();
+    assert_eq!(cell.fg, ratatui::style::Color::Red, "the retry line is red");
+}
+
+#[test]
+fn control_board_without_a_failed_peer_has_no_retry_line() {
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(plain_control_board()));
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(!text.contains("(r)etry"), "{text}");
+}
+
+/// Mid-group, the arrows act on the whole group and say so; a single-step
+/// board keeps its ordinary labels.
+#[test]
+fn control_board_labels_are_group_aware() {
+    let mut app = make_app();
+    let mut state = plain_control_board();
+    state.can_dismiss = true;
+    state.in_parallel_group = true;
+    state.finish_workflow_unavailable_reason =
+        Some("Cannot finish while other agents in this group are still running.".into());
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(state));
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("Restart group / agent"), "{text}");
+    assert!(text.contains("Back (cancel group)"), "{text}");
+    assert!(text.contains("Next (cancel group)"), "{text}");
+
+    let mut app = make_app();
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(plain_control_board()));
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("Restart current step"), "{text}");
+    assert!(text.contains("Cancel to prev"), "{text}");
+    assert!(text.contains("Next: new container"), "{text}");
 }

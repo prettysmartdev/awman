@@ -155,6 +155,8 @@ fn setup_wcb_dialog(app: &mut App) -> std::sync::mpsc::Receiver<DialogResponse> 
             parallel_peer_count: 0,
             parallel_peers_running: 0,
             failure_lines: Vec::new(),
+            retry_failed_step: None,
+            in_parallel_group: false,
         },
     ));
     app.command_dialog_active = true;
@@ -239,6 +241,8 @@ fn wcb_enter_ignored_when_finish_unavailable() {
             parallel_peer_count: 0,
             parallel_peers_running: 0,
             failure_lines: Vec::new(),
+            retry_failed_step: None,
+            in_parallel_group: false,
         },
     ));
     app.command_dialog_active = true;
@@ -281,6 +285,8 @@ fn wcb_arrows_are_inert_for_actions_the_board_does_not_offer() {
                 parallel_peer_count: 0,
                 parallel_peers_running: 0,
                 failure_lines: vec!["Exit code: 1".into()],
+                retry_failed_step: None,
+                in_parallel_group: false,
             },
         ));
         app.command_dialog_active = true;
@@ -2457,4 +2463,17 @@ fn squad_list_plain_c_maps_to_cancel() {
         map_key(plain, FocusContext::SquadList, false,),
         Action::SquadCancel
     ));
+}
+
+/// `r` retries the failed parallel peer when the board offers one.
+#[test]
+fn wcb_r_sends_retry_when_a_failed_peer_is_offered() {
+    let mut app = make_app();
+    let rx = setup_wcb_dialog(&mut app);
+    if let Some(Dialog::WorkflowControlBoard(state)) = &mut app.active_dialog {
+        state.retry_failed_step = Some("lint".into());
+    }
+    press_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert!(matches!(rx.try_recv().unwrap(), DialogResponse::Char('r')));
+    assert!(app.active_dialog.is_none());
 }

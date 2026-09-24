@@ -86,9 +86,9 @@ impl WorkflowEngine {
                 .show_workflow_control_board(&self.state, &available)?;
             self.log_wcb_action(&action);
             match action {
-                NextAction::Dismiss | NextAction::LaunchNext => {
-                    return Ok(IterationOutcome::Continue)
-                }
+                NextAction::Dismiss
+                | NextAction::LaunchNext
+                | NextAction::RetryFailedStep { .. } => return Ok(IterationOutcome::Continue),
                 NextAction::ContinueInCurrentContainer { prompt } => {
                     self.handle_continue_in_current_container(&prompt)?;
                     return Ok(IterationOutcome::Continue);
@@ -202,6 +202,7 @@ impl WorkflowEngine {
             yolo_deadline: None,
             agent: resolved_agent.clone(),
             model: resolved_model.clone(),
+            launch_id: 0,
         }];
         self.current_step_name = Some(step.name.clone());
         self.current_step_agent = Some(resolved_agent);
@@ -489,6 +490,35 @@ impl WorkflowEngine {
         )>,
         stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<MidStepYoloResult, EngineError> {
+        Ok(
+            match self
+                .drive_yolo_countdown(step_name, wait_rx, stuck_rx)
+                .await?
+            {
+                MidStepYoloResult::StepCompleted((exec_back, exit_result)) => {
+                    self.set_focused_execution(exec_back);
+                    MidStepYoloResult::StepCompleted(self.finalize_step(step_name, exit_result?)?)
+                }
+                MidStepYoloResult::Advanced => MidStepYoloResult::Advanced,
+                MidStepYoloResult::Cancelled => MidStepYoloResult::Cancelled,
+                MidStepYoloResult::ShowControlBoard => MidStepYoloResult::ShowControlBoard,
+                MidStepYoloResult::Recovered => MidStepYoloResult::Recovered,
+            },
+        )
+    }
+
+    /// The stuck-container yolo countdown shared by workflow steps and
+    /// `on_failure` remediation agents: tick the frontend and stop on expiry,
+    /// Esc, recovery, the container exiting (its wait result is handed back
+    /// untouched) or Ctrl-W. Calls
+    /// `yolo_countdown_started` at the beginning and `yolo_countdown_finished`
+    /// before returning.
+    pub(super) async fn drive_yolo_countdown<T>(
+        &mut self,
+        step_name: &str,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<T>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Result<MidStepYoloResult<T>, EngineError> {
         self.msg_info(format!(
             "Starting yolo countdown for step '{}' ({}s)",
             step_name,
@@ -567,13 +597,10 @@ impl WorkflowEngine {
             tokio::select! {
                 biased;
                 result = &mut *wait_rx => {
-                    let (exec_back, exit_result) = result
+                    let result = result
                         .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
-                    self.set_focused_execution(exec_back);
                     self.frontend.yolo_countdown_finished(step_name);
-                    return Ok(MidStepYoloResult::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?
-                    ));
+                    return Ok(MidStepYoloResult::StepCompleted(result));
                 }
                 Some(event) = Self::recv_stuck(stuck_rx) => {
                     match event {

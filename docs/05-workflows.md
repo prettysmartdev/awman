@@ -386,6 +386,7 @@ Any setup or teardown step can include an optional `on_failure` block that autom
 2. If the step has an `on_failure` block, awman launches a container with the configured agent and model
 3. The agent runs the remediation prompt and has full access to the same workdir as the failed step
 4. After the agent completes (regardless of success), the original step is retried
+   - Under `--yolo` (and `--dynamic`, which implies it), a remediation agent that goes quiet gets the same 60-second yolo countdown as any other agent in the workflow. When the countdown expires, the agent is stopped and the step is retried. Esc, Ctrl-W, or fresh output from the agent cancels the countdown and leaves the agent running.
 5. If the retry succeeds, the workflow continues; if the retry still fails and `max_attempts` is exhausted, the step is marked failed and the workflow continues (or stops, depending on the step's `abort_on_failure` setting)
 
 **Configuration:**
@@ -1434,19 +1435,22 @@ See [Permission modes](03-agent-sessions.md#permission-modes) for the general co
 
 Opening the control board (**Ctrl-W** in the TUI) while more than one agent is running scopes its actions to whichever container is currently **focused** — the one you'd switch to with Ctrl-S. The board makes this explicit: it names the focused step and shows how many peers are still running.
 
-Some actions only make sense once the whole group has settled and are unavailable while any peer is still active:
+Restart, cancel-to-previous and next act on the group as a whole, and the board labels them that way: **↑ Restart group / agent**, **← Back (cancel group)**, **→ Next (cancel group)**. The other actions are scoped as follows:
 
 | Action | Behavior with active peers |
 |---|---|
-| Restart current step | Disabled while any other agent in the group is still running, with a reason pointing you at Ctrl-S — restarting always targets the focused container, but only once its siblings have finished. |
-| Cancel to previous step | Disabled while any peer is still running: rewinding a step in a group that's still mid-flight isn't well-defined until the group finishes. |
-| Finish workflow | Disabled while any peer is still running, for the same reason. |
+| Restart current step | Asks whether to restart the **whole group** or a **single agent**. Whole group: every running container is stopped and the entire group starts again from scratch, including agents that already finished. Single agent: pick any member of the group (running, finished, failed or still queued). That agent restarts in a fresh container while the others keep running. |
+| Cancel to previous step | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped and the workflow goes back to the step or group the group depends on. That step and everything after it runs again. Not available for a group with nothing before it. |
+| Next | Asks you to confirm cancelling the **entire group**. If you confirm, every running container in the group is stopped, members that haven't finished are marked skipped, and the workflow moves on to the steps that come after the group. If nothing comes after it, the workflow finishes. |
+| Finish workflow | Disabled while any peer is still running: the workflow can't finish while part of it is still in flight. |
 | Pause | Always available — suspends the whole workflow, killing every active container in the group. |
 | Abort | Always available — same, but marks the workflow aborted rather than paused. |
 
 When an action is unavailable, the reason is shown alongside it rather than just being greyed out silently.
 
-Each parallel step gets its own control board when it completes or gets stuck; you're never blocked from acting on one step because another is still busy — you just can't ask the workflow as a whole to move backward or forward (cancel to a previous step, or finish) until the whole group has drained.
+Each parallel step gets its own control board when it completes or gets stuck; you're never blocked from acting on one step because another is still busy — you just can't finish the workflow until the whole group has drained.
+
+**Retrying a failed step mid-group.** If a step in the group fails while its peers are still running, opening the control board (Ctrl-W) adds a red `(r)etry failed step <name>` line below the arrow options. Press **r** to relaunch that step immediately, alongside the peers that are still running. If more than one step has failed, the board offers the earliest failure first. Any failure you don't retry this way still gets its usual recovery board after the whole group finishes.
 
 ---
 

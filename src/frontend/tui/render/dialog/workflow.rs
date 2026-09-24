@@ -29,6 +29,20 @@ pub(crate) fn render_control_board(
     } else {
         0
     };
+    // The retry line, plus a spacer when a continue reason sits right above it.
+    let retry_label = state
+        .retry_failed_step
+        .as_ref()
+        .map(|name| format!("  (r)etry failed step {name}"));
+    let retry_height = match (&retry_label, &state.continue_unavailable_reason) {
+        (None, _) => 0,
+        (Some(_), None) => 1,
+        (Some(_), Some(_)) => 2,
+    };
+    let retry_w = retry_label
+        .as_deref()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s) as u16 + 4)
+        .unwrap_or(0);
     // Width fits the longest reason line (+ left margin) when present;
     // otherwise the diamond layout's natural minimum is comfortable.
     let max_reason_w = [
@@ -52,11 +66,13 @@ pub(crate) fn render_control_board(
     let width = max_reason_w
         .max(max_failure_w)
         .max(step_w)
+        .max(retry_w)
         .max(56)
         .min(area.width.saturating_sub(4));
     let dialog_area = dialogs::centered_fixed(
         width,
-        (base_height + extra_reasons + failure_height).min(area.height.saturating_sub(2)),
+        (base_height + extra_reasons + failure_height + retry_height)
+            .min(area.height.saturating_sub(2)),
         area,
     );
     let (title, frame_colour) = if failed {
@@ -118,6 +134,8 @@ pub(crate) fn render_control_board(
         Span::styled(
             if failed {
                 " Restart failed step"
+            } else if state.in_parallel_group {
+                " Restart group / agent"
             } else {
                 " Restart current step"
             },
@@ -135,7 +153,14 @@ pub(crate) fn render_control_board(
         // ← Cancel to prev    → Next: new container
         Line::from(vec![
             Span::styled("\u{2190}", left_arrow_style),
-            Span::styled(" Cancel to prev", left_label_style),
+            Span::styled(
+                if state.in_parallel_group {
+                    " Back (cancel group)"
+                } else {
+                    " Cancel to prev"
+                },
+                left_label_style,
+            ),
             Span::raw("   "),
             Span::styled("\u{2192}", right_arrow_style),
             Span::styled(
@@ -144,7 +169,11 @@ pub(crate) fn render_control_board(
                     state
                         .launch_next_label
                         .as_deref()
-                        .unwrap_or("Next: new container")
+                        .unwrap_or(if state.in_parallel_group {
+                            "Next (cancel group)"
+                        } else {
+                            "Next: new container"
+                        })
                 ),
                 right_label_style,
             ),
@@ -164,6 +193,15 @@ pub(crate) fn render_control_board(
         )));
     } else {
         lines.push(Line::from(""));
+    }
+    if let Some(label) = retry_label {
+        if state.continue_unavailable_reason.is_some() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::Red),
+        )));
     }
     if state.can_finish {
         lines.push(Line::from(""));

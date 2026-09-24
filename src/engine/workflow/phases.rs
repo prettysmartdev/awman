@@ -439,17 +439,83 @@ impl WorkflowEngine {
                 }
             };
 
+        // Countdown label: say which phase step this agent is fixing.
+        let label = match &failure {
+            Some(f) => format!("on_failure: {}", f.step_name),
+            None => "on_failure".to_string(),
+        };
         let handle = tokio::runtime::Handle::current();
-        let mut exec = execution;
-        match handle.block_on(exec.wait()) {
-            Ok(exit) => {
-                tracing::info!(
-                    exit_code = exit.exit_code,
-                    "on_failure agent completed (exit code ignored)"
-                );
+        match handle.block_on(self.wait_on_failure_agent(execution, &label)) {
+            Ok(exit_code) => {
+                tracing::info!(exit_code, "on_failure agent completed (exit code ignored)");
             }
             Err(e) => {
                 self.msg_warning(format!("on_failure: agent execution error: {e}"));
+            }
+        }
+    }
+
+    /// Wait for an `on_failure` agent to finish. Under `--yolo` (which
+    /// `--dynamic` implies) a stuck agent gets the same yolo countdown a
+    /// workflow step does: Esc or Ctrl-W cancels it (the agent keeps running),
+    /// fresh output cancels it, and expiry kills the agent so the failed phase
+    /// step is retried.
+    async fn wait_on_failure_agent(
+        &mut self,
+        mut exec: AgentExecution,
+        label: &str,
+    ) -> Result<i32, EngineError> {
+        use crate::engine::agent_runtime::execution::KILLED_EXIT_CODE;
+
+        if !self.yolo {
+            return exec.wait().await.map(|e| e.exit_code);
+        }
+
+        let cancel_handle = exec.cancel_handle();
+        let mut stuck_rx = Some(exec.subscribe_stuck());
+        // Same tab-colouring hookup a main step's container gets.
+        self.frontend
+            .attach_engine(EngineHandles::stuck(exec.stuck_sender()));
+
+        let (wait_tx, mut wait_rx) =
+            tokio::sync::oneshot::channel::<Result<AgentExitInfo, EngineError>>();
+        tokio::spawn(async move {
+            let _ = wait_tx.send(exec.wait().await);
+        });
+
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut wait_rx => {
+                    return result
+                        .map_err(|_| EngineError::Other("on_failure wait task dropped unexpectedly".into()))?
+                        .map(|e| e.exit_code);
+                }
+                Some(event) = Self::recv_stuck(&mut stuck_rx) => {
+                    if !matches!(event, StuckEvent::Stuck) {
+                        continue;
+                    }
+                    self.msg_warning(format!("'{label}' appears stuck (no output)"));
+                    match self
+                        .drive_yolo_countdown(label, &mut wait_rx, &mut stuck_rx)
+                        .await?
+                    {
+                        MidStepYoloResult::StepCompleted(result) => return result.map(|e| e.exit_code),
+                        MidStepYoloResult::Advanced => {
+                            self.msg_info(format!("Yolo auto-advancing past '{label}'"));
+                            if let Some(ch) = &cancel_handle {
+                                let _ = ch.cancel();
+                            }
+                            self.frontend.report_container_exited(KILLED_EXIT_CODE);
+                            return Ok(KILLED_EXIT_CODE);
+                        }
+                        // There is no control board during setup/teardown, so
+                        // Ctrl-W only cancels the countdown, like Esc.
+                        MidStepYoloResult::Cancelled
+                        | MidStepYoloResult::ShowControlBoard
+                        | MidStepYoloResult::Recovered => continue,
+                    }
+                }
             }
         }
     }

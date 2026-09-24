@@ -17,7 +17,11 @@ use crate::command::dispatch::catalogue::{CommandCatalogue, FlagDefault};
 use crate::command::dispatch::frontend_action::FrontendAction;
 use crate::data::fs::task_store::MountScope;
 use crate::data::prompt::{Choice, Prompt, TextPrompt};
+use crate::data::workflow_state::StepState;
 use crate::engine::init::frontend::DockerfileSetupChoice;
+use crate::engine::workflow::actions::{
+    GroupExit, GroupMember, ParallelGroupDecision, ParallelGroupPrompts,
+};
 
 /// Which kind of work item `awman new spec` / `awman specs` is creating.
 ///
@@ -195,9 +199,177 @@ pub fn squad_task_confirm(
     ))
 }
 
+/// The questions the workflow engine asks after a Workflow Control Board
+/// choice that affects a whole running parallel group. The engine authors no
+/// copy, so it is handed these builders and calls them with the facts.
+///
+/// Every one has `default_on_dismiss` = `KeepRunning`: walking away from any
+/// of them must leave the group exactly as it was.
+pub fn parallel_group_prompts() -> ParallelGroupPrompts {
+    ParallelGroupPrompts {
+        restart_scope: parallel_restart_scope,
+        restart_which: parallel_restart_which,
+        cancel_group: cancel_parallel_group,
+    }
+}
+
+fn parallel_restart_scope(group: &[String]) -> Prompt<ParallelGroupDecision> {
+    Prompt::new(
+        "Restart",
+        format!(
+            "Restart the whole parallel group ({}), or a single agent in it?",
+            group.join(", ")
+        ),
+        vec![
+            Choice::new('g', "Whole group", ParallelGroupDecision::RestartWholeGroup),
+            Choice::new('s', "Single agent", ParallelGroupDecision::RestartOneAgent),
+        ],
+        Some(ParallelGroupDecision::KeepRunning),
+    )
+}
+
+/// Hotkeys for the agent picker, in order. A group larger than this lists
+/// only its first members; no real workflow comes close.
+const AGENT_PICKER_KEYS: &str = "123456789abcdefghijklmnopqrstuvwxyz";
+
+fn parallel_restart_which(members: &[GroupMember]) -> Prompt<ParallelGroupDecision> {
+    let choices = members
+        .iter()
+        .zip(AGENT_PICKER_KEYS.chars())
+        .map(|((name, state), key)| {
+            let status = match state {
+                Some(StepState::Running { .. }) => "running",
+                Some(StepState::Succeeded) => "done",
+                Some(StepState::Failed { .. }) => "failed",
+                Some(StepState::Cancelled) => "cancelled",
+                Some(StepState::Skipped) => "skipped",
+                Some(StepState::Pending) | None => "queued",
+            };
+            Choice::new(
+                key,
+                format!("{name} ({status})"),
+                ParallelGroupDecision::RestartStep(name.clone()),
+            )
+        })
+        .collect();
+    Prompt::new(
+        "Restart which agent?",
+        "It restarts in a fresh container; the rest of the group keeps running.",
+        choices,
+        Some(ParallelGroupDecision::KeepRunning),
+    )
+}
+
+fn cancel_parallel_group(group: &[String], exit: &GroupExit) -> Prompt<ParallelGroupDecision> {
+    let quoted = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let then = match exit {
+        GroupExit::Back(steps) => format!("go back to {}", quoted(steps)),
+        GroupExit::Next(steps) if steps.is_empty() => "finish the workflow".to_string(),
+        GroupExit::Next(steps) => format!("move on to {}", quoted(steps)),
+    };
+    Prompt::new(
+        "Cancel parallel group?",
+        format!(
+            "Cancel the entire parallel group ({}), stopping any agents still running, \
+             and {then}?",
+            group.join(", ")
+        ),
+        vec![
+            Choice::new('y', "Cancel the group", ParallelGroupDecision::CancelGroup),
+            Choice::new('n', "Keep it running", ParallelGroupDecision::KeepRunning),
+        ],
+        Some(ParallelGroupDecision::KeepRunning),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every parallel-group question leaves the group running when walked
+    /// away from.
+    #[test]
+    fn parallel_group_prompts_dismiss_to_keep_running() {
+        let p = parallel_group_prompts();
+        let group = vec!["a".to_string(), "b".to_string()];
+        let members = vec![("a".to_string(), None)];
+        for prompt in [
+            (p.restart_scope)(&group),
+            (p.restart_which)(&members),
+            (p.cancel_group)(&group, &GroupExit::Next(vec![])),
+        ] {
+            assert_eq!(
+                prompt.default_on_dismiss,
+                Some(ParallelGroupDecision::KeepRunning),
+                "{}",
+                prompt.title
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_restart_scope_offers_group_or_single_agent() {
+        let prompt = (parallel_group_prompts().restart_scope)(&["a".into(), "b".into()]);
+        assert_eq!(
+            prompt.answer_for_key('g'),
+            Some(ParallelGroupDecision::RestartWholeGroup)
+        );
+        assert_eq!(
+            prompt.answer_for_key('s'),
+            Some(ParallelGroupDecision::RestartOneAgent)
+        );
+    }
+
+    #[test]
+    fn parallel_restart_which_lists_every_member_with_its_state() {
+        let members = vec![
+            ("a".to_string(), Some(StepState::Succeeded)),
+            (
+                "b".to_string(),
+                Some(StepState::Running { container_id: None }),
+            ),
+            (
+                "c".to_string(),
+                Some(StepState::Failed {
+                    exit_code: 1,
+                    error_message: None,
+                }),
+            ),
+            ("d".to_string(), Some(StepState::Pending)),
+        ];
+        let prompt = (parallel_group_prompts().restart_which)(&members);
+        let labels: Vec<&str> = prompt.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["a (done)", "b (running)", "c (failed)", "d (queued)"]
+        );
+        assert_eq!(
+            prompt.answer_for_key('3'),
+            Some(ParallelGroupDecision::RestartStep("c".into()))
+        );
+    }
+
+    #[test]
+    fn cancel_parallel_group_says_where_the_workflow_goes() {
+        let p = parallel_group_prompts();
+        let group = vec!["a".to_string(), "b".to_string()];
+        let back = (p.cancel_group)(&group, &GroupExit::Back(vec!["root".into()]));
+        assert!(back.body.contains("(a, b)") && back.body.contains("go back to 'root'"));
+        let next = (p.cancel_group)(&group, &GroupExit::Next(vec!["c".into()]));
+        assert!(next.body.contains("move on to 'c'"), "{}", next.body);
+        let last = (p.cancel_group)(&group, &GroupExit::Next(vec![]));
+        assert!(last.body.contains("finish the workflow"), "{}", last.body);
+        assert_eq!(
+            back.answer_for_key('y'),
+            Some(ParallelGroupDecision::CancelGroup)
+        );
+    }
 
     /// The interview's default *is* the flag's default. Before F-19 the string
     /// `"6h"` appeared in the catalogue, in `cli/command_frontend.rs` and twice

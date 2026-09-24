@@ -52,11 +52,16 @@ impl WorkflowEngine {
         while !self.active_steps.is_empty() {
             tokio::select! {
                 biased;
-                Some((name, result)) = waits.next() => {
+                Some((name, launch_id, result)) = waits.next() => {
                     // Guard against futures for steps already finalized out of
                     // band (yolo auto-advance kills the container but leaves its
-                    // wait future pending; it resolves here later as a no-op).
-                    if !self.active_steps.iter().any(|s| s.step_name == name) {
+                    // wait future pending; it resolves here later as a no-op),
+                    // and for a killed container whose step was relaunched.
+                    if !self
+                        .active_steps
+                        .iter()
+                        .any(|s| s.step_name == name && s.launch_id == launch_id)
+                    {
                         continue;
                     }
                     let exit = result?;
@@ -119,8 +124,27 @@ impl WorkflowEngine {
                     self.handle_parallel_stuck_event(&name, event);
                 }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
-                    if let Some(wo) = self.handle_parallel_engine_request(req)? {
-                        return Ok(GroupOutcome::Ended(wo));
+                    // The earliest failure still awaiting recovery is offered
+                    // as a retry on any board opened while the group runs.
+                    let retryable = failed.first().map(|(name, _)| name.clone());
+                    match self.handle_parallel_engine_request(
+                        req,
+                        &group_names,
+                        retryable.as_deref(),
+                    )? {
+                        ParallelRequestOutcome::Continue => {}
+                        ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
+                        ParallelRequestOutcome::Rewound => return Ok(GroupOutcome::Rewound),
+                        ParallelRequestOutcome::RestartStep(name) => {
+                            failed.retain(|(n, _)| *n != name);
+                            self.restart_parallel_step(
+                                &name,
+                                &mut waits,
+                                &mut queue,
+                                slot_cap,
+                                &stuck_tx,
+                            )?;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -233,10 +257,12 @@ impl WorkflowEngine {
         });
 
         let name = step.name.clone();
+        let launch_id = self.next_launch_id;
+        self.next_launch_id += 1;
         waits.push(Box::pin(async move {
             let mut execution = execution;
             let r = execution.wait().await;
-            (name, r)
+            (name, launch_id, r)
         }));
 
         self.active_steps.push(ActiveParallelStep {
@@ -250,6 +276,7 @@ impl WorkflowEngine {
             yolo_deadline: None,
             agent: resolved_agent,
             model: resolved_model,
+            launch_id,
         });
         Ok(())
     }
@@ -428,25 +455,29 @@ impl WorkflowEngine {
         Ok(())
     }
 
+    /// Kill every live container in the group and forget its slot. Returns
+    /// the names of the steps that were running.
+    fn kill_active_parallel_steps(&mut self) -> Vec<String> {
+        let killed: Vec<ActiveParallelStep> = self.active_steps.drain(..).collect();
+        for s in &killed {
+            if let Some(ch) = &s.cancel_handle {
+                let _ = ch.cancel();
+            }
+            if s.yolo_deadline.is_some() {
+                self.frontend
+                    .parallel_step_yolo_countdown_finished(&s.step_name);
+            }
+            self.frontend
+                .report_parallel_step_exited(&s.step_name, KILLED_EXIT_CODE);
+        }
+        killed.into_iter().map(|s| s.step_name).collect()
+    }
+
     /// Kill every live container in the current parallel group and cancel all
     /// not-yet-completed steps, then proceed with the standard abort path.
     pub(super) fn abort_parallel_group(&mut self) -> Result<WorkflowOutcome, EngineError> {
         self.abort_on_failure_triggered = true;
-        let names: Vec<String> = self
-            .active_steps
-            .iter()
-            .map(|s| s.step_name.clone())
-            .collect();
-        for s in &self.active_steps {
-            if let Some(ch) = &s.cancel_handle {
-                let _ = ch.cancel();
-            }
-        }
-        self.active_steps.clear();
-        for name in &names {
-            self.frontend
-                .report_parallel_step_exited(name, KILLED_EXIT_CODE);
-        }
+        self.kill_active_parallel_steps();
         for s in &self.workflow.steps {
             if !self.state.completed_steps.contains(&s.name) {
                 self.state.set_status(&s.name, StepState::Cancelled);
@@ -462,21 +493,8 @@ impl WorkflowEngine {
     /// WCB Pause during a parallel group: kill all live containers, reset the
     /// running steps to Pending so a resume replays them, and end the run.
     pub(super) fn pause_parallel_group(&mut self) -> Result<WorkflowOutcome, EngineError> {
-        let names: Vec<String> = self
-            .active_steps
-            .iter()
-            .map(|s| s.step_name.clone())
-            .collect();
-        for s in &self.active_steps {
-            if let Some(ch) = &s.cancel_handle {
-                let _ = ch.cancel();
-            }
-        }
-        self.active_steps.clear();
-        for name in &names {
-            self.frontend
-                .report_parallel_step_exited(name, KILLED_EXIT_CODE);
-            self.state.set_status(name, StepState::Pending);
+        for name in self.kill_active_parallel_steps() {
+            self.state.set_status(&name, StepState::Pending);
         }
         self.persist()?;
         self.frontend.report_parallel_group_finished();
@@ -485,38 +503,254 @@ impl WorkflowEngine {
         Ok(paused)
     }
 
+    /// WCB "restart one agent of the group": restart `name` in a fresh
+    /// container whatever state it is in — running (its container is killed
+    /// first), finished, failed, or still queued. Launches at once when a slot
+    /// is free, otherwise it goes to the front of the queue.
+    pub(super) fn restart_parallel_step(
+        &mut self,
+        name: &str,
+        waits: &mut ParallelWaits,
+        queue: &mut VecDeque<WorkflowStep>,
+        slot_cap: usize,
+        stuck_tx: &StuckFanIn,
+    ) -> Result<(), EngineError> {
+        if let Some(pos) = self.active_steps.iter().position(|s| s.step_name == name) {
+            let slot = self.active_steps.remove(pos);
+            if let Some(ch) = &slot.cancel_handle {
+                let _ = ch.cancel();
+            }
+            if slot.yolo_deadline.is_some() {
+                self.frontend.parallel_step_yolo_countdown_finished(name);
+            }
+            self.frontend
+                .report_parallel_step_exited(name, KILLED_EXIT_CODE);
+        }
+        queue.retain(|s| s.name != name);
+
+        let step = self.find_step(name)?;
+        if self.active_steps.len() < slot_cap {
+            self.launch_parallel_step(step, waits, stuck_tx, true)?;
+        } else {
+            self.state.set_status(name, StepState::Pending);
+            self.frontend
+                .report_step_status(&step, WorkflowStepStatus::Pending);
+            self.persist()?;
+            queue.push_front(step);
+        }
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        Ok(())
+    }
+
+    /// Kill the group's containers and reset every step in `names` to
+    /// Pending, ending the group so the outer loop starts again from whatever
+    /// is ready. Shared by "restart the whole group" and "go back".
+    fn rewind_parallel_group(&mut self, names: &[String]) -> Result<(), EngineError> {
+        self.kill_active_parallel_steps();
+        for name in names {
+            self.state.set_status(name, StepState::Pending);
+            let step = self.find_step(name)?;
+            self.frontend
+                .report_step_status(&step, WorkflowStepStatus::Pending);
+        }
+        self.persist()?;
+        self.frontend.report_parallel_group_finished();
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        Ok(())
+    }
+
+    /// WCB "next" mid-group: kill the group's containers and mark every member
+    /// that has not succeeded as Skipped, so the steps after the group become
+    /// ready (or the workflow completes, when nothing follows it).
+    fn skip_parallel_group(&mut self, group: &[String]) -> Result<(), EngineError> {
+        self.kill_active_parallel_steps();
+        for name in group {
+            if matches!(self.state.status_of(name), Some(StepState::Succeeded)) {
+                continue;
+            }
+            self.state.set_status(name, StepState::Skipped);
+            let step = self.find_step(name)?;
+            self.frontend
+                .report_step_status(&step, WorkflowStepStatus::Skipped);
+        }
+        self.persist()?;
+        self.frontend.report_parallel_group_finished();
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        Ok(())
+    }
+
+    /// The Workflow Control Board for a board opened mid-group. On top of the
+    /// focused-container scoping `compute_available_actions` applies, restart,
+    /// back and next act on the whole group, so each is offered whenever it
+    /// can do anything: restart and next always, back whenever the group has
+    /// a step to return to. All three depend on follow-up questions, so an
+    /// engine without their copy offers none of them.
+    fn parallel_group_board_actions(
+        &self,
+        group: &[String],
+        retryable: Option<&str>,
+    ) -> Result<AvailableActions, EngineError> {
+        let mut a = self.compute_available_actions()?;
+        a.retry_failed_step = retryable.map(str::to_string);
+        if self.parallel_group_prompts.is_none() {
+            a.can_restart_current_step = false;
+            a.can_cancel_to_previous_step = false;
+            a.can_launch_next = false;
+            return Ok(a);
+        }
+        let has_previous = !self.dependencies_of(group).is_empty();
+        a.acts_on_parallel_group = true;
+        a.can_restart_current_step = true;
+        a.restart_unavailable_reason = None;
+        a.can_cancel_to_previous_step = has_previous;
+        a.cancel_to_previous_unavailable_reason =
+            (!has_previous).then(|| "this parallel group is the first step".to_string());
+        a.can_launch_next = true;
+        Ok(a)
+    }
+
+    /// Put one of the Layer 2 follow-up questions to the frontend. Without
+    /// the copy there is no question to ask, which answers "keep running".
+    fn ask_parallel_group(
+        &mut self,
+        build: impl FnOnce(&ParallelGroupPrompts) -> Prompt<ParallelGroupDecision>,
+    ) -> Result<ParallelGroupDecision, EngineError> {
+        match &self.parallel_group_prompts {
+            Some(prompts) => {
+                let prompt = build(prompts);
+                self.frontend.ask_parallel_group(&prompt)
+            }
+            None => Ok(ParallelGroupDecision::KeepRunning),
+        }
+    }
+
+    /// A mid-group board chose restart, back or next — each acts on the whole
+    /// group. Ask the follow-up questions and carry out the answer; any
+    /// answer other than the expected one leaves the group running.
+    fn resolve_parallel_group_action(
+        &mut self,
+        action: NextAction,
+        group: &[String],
+    ) -> Result<ParallelRequestOutcome, EngineError> {
+        use ParallelGroupDecision as D;
+        match action {
+            NextAction::RestartCurrentStep => {
+                match self.ask_parallel_group(|p| (p.restart_scope)(group))? {
+                    D::RestartWholeGroup => {
+                        self.msg_info("Restarting the whole parallel group");
+                        self.rewind_parallel_group(group)?;
+                        Ok(ParallelRequestOutcome::Rewound)
+                    }
+                    D::RestartOneAgent => {
+                        let members: Vec<crate::engine::workflow::actions::GroupMember> = group
+                            .iter()
+                            .map(|n| (n.clone(), self.state.status_of(n).cloned()))
+                            .collect();
+                        match self.ask_parallel_group(|p| (p.restart_which)(&members))? {
+                            D::RestartStep(name) if group.contains(&name) => {
+                                self.msg_info(format!("Restarting step '{name}'"));
+                                Ok(ParallelRequestOutcome::RestartStep(name))
+                            }
+                            _ => Ok(ParallelRequestOutcome::Continue),
+                        }
+                    }
+                    _ => Ok(ParallelRequestOutcome::Continue),
+                }
+            }
+            // Going back cancels the whole group: the group, the steps it
+            // depends on, and anything already finished downstream of those
+            // all run again.
+            NextAction::CancelToPreviousStep => {
+                let back_to = self.dependencies_of(group);
+                if back_to.is_empty() {
+                    return Ok(ParallelRequestOutcome::Continue);
+                }
+                let exit = GroupExit::Back(back_to.clone());
+                if self.ask_parallel_group(|p| (p.cancel_group)(group, &exit))? != D::CancelGroup {
+                    return Ok(ParallelRequestOutcome::Continue);
+                }
+                self.msg_info("Cancelling the parallel group and going back");
+                let mut reset = back_to.clone();
+                reset.extend(self.dependents_of(&back_to));
+                reset.extend(group.iter().cloned());
+                reset.sort();
+                reset.dedup();
+                self.rewind_parallel_group(&reset)?;
+                Ok(ParallelRequestOutcome::Rewound)
+            }
+            // Moving on cancels the whole group: whatever has not finished is
+            // skipped, and the steps after the group run.
+            NextAction::LaunchNext => {
+                let exit = GroupExit::Next(self.direct_dependents_of(group));
+                if self.ask_parallel_group(|p| (p.cancel_group)(group, &exit))? != D::CancelGroup {
+                    return Ok(ParallelRequestOutcome::Continue);
+                }
+                self.msg_info("Cancelling the parallel group and moving on");
+                self.skip_parallel_group(group)?;
+                Ok(ParallelRequestOutcome::Rewound)
+            }
+            _ => Ok(ParallelRequestOutcome::Continue),
+        }
+    }
+
     /// Route an `EngineRequest` received while a parallel group is running.
-    /// Returns `Some(outcome)` when the request ends the workflow (WCB
-    /// pause/abort), `None` otherwise.
+    ///
+    /// `group` is every step of the running group. `retryable` names a peer
+    /// that already failed in it; a board opened now offers to relaunch it
+    /// (`NextAction::RetryFailedStep`) instead of leaving it until the whole
+    /// group drains.
     pub(super) fn handle_parallel_engine_request(
         &mut self,
         req: EngineRequest,
-    ) -> Result<Option<WorkflowOutcome>, EngineError> {
+        group: &[String],
+        retryable: Option<&str>,
+    ) -> Result<ParallelRequestOutcome, EngineError> {
         match req {
             EngineRequest::StepStuck { step_name } => {
                 self.handle_parallel_stuck_event(&step_name, StuckEvent::Stuck);
-                Ok(None)
+                Ok(ParallelRequestOutcome::Continue)
             }
             EngineRequest::StepUnstuck { step_name } => {
                 self.handle_parallel_stuck_event(&step_name, StuckEvent::Unstuck);
-                Ok(None)
+                Ok(ParallelRequestOutcome::Continue)
             }
             EngineRequest::OpenControlBoard { step_name } => {
                 // Scope the board to the focused container; peers keep running.
                 self.focus_parallel_step(&step_name);
-                let available = self.compute_available_actions()?;
+                let available = self.parallel_group_board_actions(group, retryable)?;
                 let action = self
                     .frontend
                     .show_workflow_control_board(&self.state, &available)?;
-                self.log_wcb_action(&action);
                 match action {
-                    NextAction::Pause => Ok(Some(self.pause_parallel_group()?)),
-                    NextAction::Abort => Ok(Some(self.abort_parallel_group()?)),
-                    // Back / finish / restart / continue / launch-next are all
-                    // scoped away while peers run (see compute_available_actions
-                    // §10); treat anything else as a dismiss — the group keeps
+                    NextAction::Pause => {
+                        self.log_wcb_action(&action);
+                        Ok(ParallelRequestOutcome::Ended(self.pause_parallel_group()?))
+                    }
+                    NextAction::Abort => {
+                        self.log_wcb_action(&action);
+                        Ok(ParallelRequestOutcome::Ended(self.abort_parallel_group()?))
+                    }
+                    NextAction::RetryFailedStep { ref step_name }
+                        if retryable == Some(step_name.as_str()) =>
+                    {
+                        self.log_wcb_action(&action);
+                        Ok(ParallelRequestOutcome::RestartStep(step_name.clone()))
+                    }
+                    // Narrated once the follow-up questions are answered.
+                    NextAction::RestartCurrentStep
+                    | NextAction::CancelToPreviousStep
+                    | NextAction::LaunchNext
+                        if available.acts_on_parallel_group =>
+                    {
+                        self.resolve_parallel_group_action(action, group)
+                    }
+                    // Finish / continue are scoped away while the group runs;
+                    // treat anything else as a dismiss — the group keeps
                     // running undisturbed.
-                    _ => Ok(None),
+                    _ => Ok(ParallelRequestOutcome::Continue),
                 }
             }
         }

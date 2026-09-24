@@ -831,6 +831,9 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **→** | Next step: advance in a new container |
 | **↓** | Next step: same container (reuse current container) |
 | **[d]** | Disable auto-advance for this step (toggle) |
+| **r** | Retry a step that failed while its parallel group is still running (shown in red only when available) |
+
+While a parallel group is running, **↑**, **←** and **→** act on the whole group and are labelled accordingly: restart the group or one agent, go back (cancelling the group), or move on (cancelling the group). Each asks a follow-up question first. See [the control board with multiple agents running](05-workflows.md#the-workflow-control-board-with-multiple-agents-running).
 | **Enter** | Confirm selected action (lightweight step-confirm dialog) |
 | **Ctrl+W** | Escalate from lightweight dialog to full control board (while dialog is open) |
 | **Esc** | Dismiss without changing anything (mid-step: step keeps running) |

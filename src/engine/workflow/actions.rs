@@ -2,6 +2,9 @@
 
 use std::time::Duration;
 
+use crate::data::prompt::Prompt;
+use crate::data::workflow_state::StepState;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NextAction {
     /// Launch a fresh container for the next ready step.
@@ -24,6 +27,10 @@ pub enum NextAction {
     /// Mid-step only: dismiss the control board dialog without affecting the
     /// running step. The step continues executing undisturbed.
     Dismiss,
+    /// Parallel group only: relaunch a peer step that already failed while
+    /// the rest of the group is still running. Only valid when
+    /// [`AvailableActions::retry_failed_step`] names that step.
+    RetryFailedStep { step_name: String },
 }
 
 /// Set of `NextAction` variants the frontend may present to the user. The
@@ -86,6 +93,64 @@ pub struct AvailableActions {
     /// makes it (WI 0114 F-18). A frontend that has no lightweight form
     /// ignores this and renders the board, exactly as the CLI does.
     pub simple_advance: Option<SimpleAdvance>,
+    /// A step in the still-running parallel group that has already failed
+    /// and can be relaunched right now via [`NextAction::RetryFailedStep`],
+    /// without waiting for the rest of the group to drain. `None` outside a
+    /// running parallel group or when no peer has failed.
+    pub retry_failed_step: Option<String>,
+    /// True when the board is opened while a parallel group is running. Then
+    /// `RestartCurrentStep`, `CancelToPreviousStep` and `LaunchNext` act on the
+    /// whole group, and the engine follows the choice up with questions of its
+    /// own ([`crate::engine::workflow::frontend::WorkflowFrontend::ask_parallel_group`]).
+    /// A frontend uses it only to label those actions accordingly.
+    pub acts_on_parallel_group: bool,
+}
+
+/// An answer to one of the engine's follow-up questions about a running
+/// parallel group, asked after a Workflow Control Board choice (restart,
+/// back or next) that affects the whole group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParallelGroupDecision {
+    /// Stop every running container and run the whole group from scratch.
+    RestartWholeGroup,
+    /// Restart just one agent; the engine then asks which.
+    RestartOneAgent,
+    /// Restart this member of the group in a fresh container.
+    RestartStep(String),
+    /// Yes: cancel the whole group (to go back, or to move on).
+    CancelGroup,
+    /// Leave the group running; the board choice is dropped.
+    KeepRunning,
+}
+
+/// Where the workflow goes once a running parallel group is cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupExit {
+    /// Back to these steps: the group's direct dependencies.
+    Back(Vec<String>),
+    /// On to these steps: those that depend directly on the group. Empty
+    /// when nothing does, so the workflow finishes.
+    Next(Vec<String>),
+}
+
+/// One member of a running parallel group and its current state, as handed to
+/// [`ParallelGroupPrompts::restart_which`].
+pub type GroupMember = (String, Option<StepState>);
+
+/// The questions the engine asks about a running parallel group.
+///
+/// An engine authors no prompt copy (`crate::data::prompt`): Layer 2 supplies
+/// these builders (`command::prompts::parallel_group_prompts`), and the engine
+/// calls them with the facts it knows. Each prompt's `default_on_dismiss` is
+/// [`ParallelGroupDecision::KeepRunning`].
+#[derive(Debug, Clone, Copy)]
+pub struct ParallelGroupPrompts {
+    /// Restart the whole group, or one agent? Takes the group's members.
+    pub restart_scope: fn(&[String]) -> Prompt<ParallelGroupDecision>,
+    /// Which agent to restart? Takes every member with its current state.
+    pub restart_which: fn(&[GroupMember]) -> Prompt<ParallelGroupDecision>,
+    /// Confirm cancelling the group, and where the workflow goes after.
+    pub cancel_group: fn(&[String], &GroupExit) -> Prompt<ParallelGroupDecision>,
 }
 
 impl AvailableActions {

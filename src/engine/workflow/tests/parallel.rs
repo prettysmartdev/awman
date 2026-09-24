@@ -35,6 +35,8 @@ struct ParallelRecord {
     unstuck: Vec<String>,
     group_finished: bool,
     available: Vec<AvailableActions>,
+    /// `(title, body)` of every follow-up question the engine asked.
+    group_prompts: Vec<(String, String)>,
 }
 
 struct ParallelTestFrontend {
@@ -43,6 +45,9 @@ struct ParallelTestFrontend {
     record: Arc<Mutex<ParallelRecord>>,
     /// Return value for every per-step parallel yolo tick.
     yolo_tick: YoloTickOutcome,
+    /// Answers to the engine's follow-up questions, in order; `KeepRunning`
+    /// once exhausted.
+    group_answers: Mutex<VecDeque<ParallelGroupDecision>>,
 }
 
 impl ParallelTestFrontend {
@@ -58,6 +63,7 @@ impl ParallelTestFrontend {
                 engine_tx,
                 record: record.clone(),
                 yolo_tick,
+                group_answers: Mutex::new(VecDeque::new()),
             },
             record,
         )
@@ -104,6 +110,22 @@ impl WorkflowFrontend for ParallelTestFrontend {
         if let Some(tx) = handles.requests {
             *self.engine_tx.lock().unwrap() = Some(tx);
         }
+    }
+    fn ask_parallel_group(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<ParallelGroupDecision>,
+    ) -> Result<ParallelGroupDecision, EngineError> {
+        self.record
+            .lock()
+            .unwrap()
+            .group_prompts
+            .push((prompt.title.clone(), prompt.body.clone()));
+        Ok(self
+            .group_answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(ParallelGroupDecision::KeepRunning))
     }
     fn report_parallel_step_launched(&mut self, step_name: &str, _: &str, _: Option<&str>) {
         self.record
@@ -498,6 +520,7 @@ async fn compute_available_actions_scopes_wcb_with_parallel_peers() {
         yolo_deadline: None,
         agent: AgentName::new("claude").unwrap(),
         model: None,
+        launch_id: 0,
     };
 
     // Two live slots, "a" focused → one running peer.
@@ -520,4 +543,609 @@ async fn compute_available_actions_scopes_wcb_with_parallel_peers() {
     let b = engine.compute_available_actions().unwrap();
     assert_eq!(b.parallel_peers_running, 0);
     assert!(b.restart_unavailable_reason.is_none());
+}
+
+/// A peer that fails while the rest of its group still runs is offered as a
+/// retry on the WCB; choosing it relaunches the step at once, and the group
+/// then drains cleanly with no post-group failure board.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_wcb_retries_failed_peer_mid_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-retry-mid-group"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+
+    let (cancel_a, completion_a) = make_blocking_entry();
+    let (cancel_b, completion_b) = make_blocking_entry();
+    let (cancel_retry, completion_retry) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (cancel_a, completion_a.clone()),
+        (cancel_b, completion_b.clone()),
+        (cancel_retry, completion_retry.clone()),
+    ]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [
+            NextAction::Dismiss,
+            NextAction::RetryFailedStep {
+                step_name: "a".into(),
+            },
+        ],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Before anything fails the board offers no retry.
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: "b".into(),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // "a" fails while "b" keeps running; the next board offers to retry it.
+    signal_completion(&completion_a, 1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: "b".into(),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    {
+        let r = record.lock().unwrap();
+        assert_eq!(r.available.len(), 2);
+        assert_eq!(r.available[0].retry_failed_step, None);
+        assert_eq!(r.available[1].retry_failed_step.as_deref(), Some("a"));
+        assert_eq!(
+            r.launched,
+            vec!["a", "b", "a"],
+            "the retry must relaunch 'a' while 'b' is still running"
+        );
+    }
+
+    signal_completion(&completion_retry, 0);
+    signal_completion(&completion_b, 0);
+    let result = engine_task.await.unwrap().unwrap();
+    assert_eq!(result, WorkflowOutcome::Completed);
+    assert_eq!(
+        record.lock().unwrap().available.len(),
+        2,
+        "a retried failure must not get a post-group failure board"
+    );
+}
+
+// ── Restart / back / next on a running parallel group ────────────────────
+
+/// Stand-in for Layer 2's copy: each prompt's body spells out the facts the
+/// engine passed in, so tests can check them.
+fn test_group_prompts() -> ParallelGroupPrompts {
+    use crate::data::prompt::{Choice, Prompt};
+    fn prompt(title: &str, body: String) -> Prompt<ParallelGroupDecision> {
+        Prompt::new(
+            title,
+            body,
+            vec![Choice::new('x', "x", ParallelGroupDecision::KeepRunning)],
+            Some(ParallelGroupDecision::KeepRunning),
+        )
+    }
+    ParallelGroupPrompts {
+        restart_scope: |group| prompt("scope", group.join(",")),
+        restart_which: |members| prompt("which", format!("{members:?}")),
+        cancel_group: |group, exit| prompt("cancel", format!("{}|{exit:?}", group.join(","))),
+    }
+}
+
+/// A parallel-test engine with the group prompts installed and `answers`
+/// queued for the follow-up questions.
+fn build_group_engine(
+    session: &Session,
+    workflow: Workflow,
+    factory: BlockingFactory,
+    frontend: ParallelTestFrontend,
+    answers: impl IntoIterator<Item = ParallelGroupDecision>,
+) -> WorkflowEngine {
+    *frontend.group_answers.lock().unwrap() = answers.into_iter().collect();
+    let mut engine = build_parallel_engine(session, workflow, factory, frontend);
+    engine.set_parallel_group_prompts(test_group_prompts());
+    engine
+}
+
+/// Open the WCB on `step` mid-group through the engine channel, then give the
+/// engine time to act on the frontend's queued answer.
+async fn open_board(tx: &tokio::sync::mpsc::UnboundedSender<EngineRequest>, step: &str) {
+    tx.send(EngineRequest::OpenControlBoard {
+        step_name: step.into(),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+}
+
+/// A mid-group board offers restart, back and next for the whole group;
+/// a group with nothing before it offers restart and next but not back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_board_offers_group_restart_back_and_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-group-board"),
+        Some("claude"),
+        vec![
+            make_step("root", &[], None),
+            make_step("a", &["root"], None),
+            make_step("b", &["root"], None),
+        ],
+    );
+    let (c0, root) = make_blocking_entry();
+    signal_completion(&root, 0);
+    let (ca, completion_a) = make_blocking_entry();
+    let (cb, completion_b) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (c0, root),
+        (ca, completion_a.clone()),
+        (cb, completion_b.clone()),
+    ]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::LaunchNext, NextAction::Dismiss],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(&session, workflow, factory, frontend, []);
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    open_board(&tx, "a").await;
+    {
+        let r = record.lock().unwrap();
+        let board = r.available.last().unwrap();
+        assert!(board.acts_on_parallel_group);
+        assert!(board.can_restart_current_step);
+        assert!(board.restart_unavailable_reason.is_none());
+        assert!(board.can_cancel_to_previous_step);
+        assert!(board.cancel_to_previous_unavailable_reason.is_none());
+        assert!(board.can_launch_next);
+    }
+    signal_completion(&completion_a, 0);
+    signal_completion(&completion_b, 0);
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+
+    // The first group has nothing to go back to.
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-first-group"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (ca, completion_a) = make_blocking_entry();
+    let (cb, completion_b) = make_blocking_entry();
+    let factory = BlockingFactory::new([(ca, completion_a.clone()), (cb, completion_b.clone())]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::Dismiss],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(&session, workflow, factory, frontend, []);
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, "a").await;
+    {
+        let r = record.lock().unwrap();
+        let board = r.available.last().unwrap();
+        assert!(board.can_restart_current_step);
+        assert!(board.can_launch_next);
+        assert!(!board.can_cancel_to_previous_step);
+        assert!(board.cancel_to_previous_unavailable_reason.is_some());
+    }
+    signal_completion(&completion_a, 0);
+    signal_completion(&completion_b, 0);
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+}
+
+/// An engine given no prompt copy cannot ask the follow-up questions, so it
+/// offers none of restart, back or next mid-group — never an enabled action
+/// that silently does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_board_without_prompts_offers_no_group_actions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-no-prompts"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (ca, completion_a) = make_blocking_entry();
+    let (cb, completion_b) = make_blocking_entry();
+    let factory = BlockingFactory::new([(ca, completion_a.clone()), (cb, completion_b.clone())]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::Dismiss],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, "a").await;
+    {
+        let r = record.lock().unwrap();
+        let board = r.available.last().unwrap();
+        assert!(!board.acts_on_parallel_group);
+        assert!(!board.can_restart_current_step);
+        assert!(!board.can_cancel_to_previous_step);
+        assert!(!board.can_launch_next);
+    }
+    signal_completion(&completion_a, 0);
+    signal_completion(&completion_b, 0);
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+}
+
+/// Restart → single agent → a running member: just its container is killed
+/// and relaunched while its peer keeps running, and the killed container's
+/// exit is ignored rather than read as the relaunched step failing. The
+/// picker is handed every member with its state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_restart_single_running_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-restart-one"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (cancel_a, completion_a) = make_blocking_entry();
+    let (cancel_b, completion_b) = make_blocking_entry();
+    let (cancel_a2, completion_a2) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (cancel_a.clone(), completion_a),
+        (cancel_b.clone(), completion_b.clone()),
+        (cancel_a2, completion_a2.clone()),
+    ]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::RestartCurrentStep],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(
+        &session,
+        workflow,
+        factory,
+        frontend,
+        [
+            ParallelGroupDecision::RestartOneAgent,
+            ParallelGroupDecision::RestartStep("a".into()),
+        ],
+    );
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    open_board(&tx, "b").await;
+    assert!(cancel_a.load(Ordering::Relaxed), "a's container is killed");
+    assert!(!cancel_b.load(Ordering::Relaxed), "b keeps running");
+    {
+        let r = record.lock().unwrap();
+        assert_eq!(r.launched, vec!["a", "b", "a"]);
+        assert_eq!(r.group_prompts[0], ("scope".to_string(), "a,b".to_string()));
+        assert_eq!(r.group_prompts[1].0, "which");
+        assert!(
+            r.group_prompts[1].1.contains("\"a\""),
+            "{:?}",
+            r.group_prompts
+        );
+        assert!(
+            r.group_prompts[1].1.contains("Running"),
+            "{:?}",
+            r.group_prompts
+        );
+    }
+
+    signal_completion(&completion_a2, 0);
+    signal_completion(&completion_b, 0);
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+    assert_eq!(
+        record.lock().unwrap().available.len(),
+        1,
+        "the killed container must not surface as a failure board"
+    );
+}
+
+/// Any member can be restarted, including one that already finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_restart_single_completed_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-restart-done"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (ca, completion_a) = make_blocking_entry();
+    let (cb, completion_b) = make_blocking_entry();
+    let (ca2, completion_a2) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (ca, completion_a.clone()),
+        (cb, completion_b.clone()),
+        (ca2, completion_a2.clone()),
+    ]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::RestartCurrentStep],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(
+        &session,
+        workflow,
+        factory,
+        frontend,
+        [
+            ParallelGroupDecision::RestartOneAgent,
+            ParallelGroupDecision::RestartStep("a".into()),
+        ],
+    );
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    signal_completion(&completion_a, 0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, "b").await;
+    assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "a"]);
+
+    signal_completion(&completion_a2, 0);
+    signal_completion(&completion_b, 0);
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+}
+
+/// Restart → whole group: what is running is killed and every member runs
+/// again from scratch, finished ones included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_restart_whole_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-restart-group"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (ca, completion_a) = make_blocking_entry();
+    let (cancel_b, completion_b) = make_blocking_entry();
+    let factory =
+        BlockingFactory::new([(ca, completion_a.clone()), (cancel_b.clone(), completion_b)]);
+    let execution_count = factory.execution_count.clone();
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::RestartCurrentStep],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(
+        &session,
+        workflow,
+        factory,
+        frontend,
+        [ParallelGroupDecision::RestartWholeGroup],
+    );
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    signal_completion(&completion_a, 0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, "b").await;
+
+    // The rerun uses instant-success containers (no blocking slots left).
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+    assert!(cancel_b.load(Ordering::Relaxed), "running b was killed");
+    assert_eq!(execution_count.load(Ordering::Relaxed), 4);
+    assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "a", "b"]);
+}
+
+/// Back, confirmed: the whole group is cancelled and the workflow returns to
+/// the step before it, then runs forward again from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_cancel_back_returns_to_previous_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-group-back"),
+        Some("claude"),
+        vec![
+            make_step("root", &[], None),
+            make_step("a", &["root"], None),
+            make_step("b", &["root"], None),
+        ],
+    );
+    let (c0, root) = make_blocking_entry();
+    signal_completion(&root, 0);
+    let (ca, completion_a) = make_blocking_entry();
+    let (cancel_b, completion_b) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (c0, root),
+        (ca, completion_a.clone()),
+        (cancel_b.clone(), completion_b),
+    ]);
+    let execution_count = factory.execution_count.clone();
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [
+            NextAction::LaunchNext,
+            NextAction::CancelToPreviousStep,
+            NextAction::LaunchNext,
+        ],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(
+        &session,
+        workflow,
+        factory,
+        frontend,
+        [ParallelGroupDecision::CancelGroup],
+    );
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // "a" has already finished; going back must rerun it too.
+    signal_completion(&completion_a, 0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, "b").await;
+
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+    assert!(cancel_b.load(Ordering::Relaxed), "running b was killed");
+    // root, a, b, then root, a, b again.
+    assert_eq!(execution_count.load(Ordering::Relaxed), 6);
+    let r = record.lock().unwrap();
+    assert_eq!(r.launched, vec!["a", "b", "a", "b"]);
+    assert_eq!(
+        r.group_prompts[0],
+        ("cancel".to_string(), "a,b|Back([\"root\"])".to_string())
+    );
+}
+
+/// Next, confirmed: the whole group is cancelled, its unfinished members
+/// are skipped, and the step after the group runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_cancel_next_skips_to_following_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-group-next"),
+        Some("claude"),
+        vec![
+            make_step("a", &[], None),
+            make_step("b", &[], None),
+            make_step("c", &["a", "b"], None),
+        ],
+    );
+    let (ca, completion_a) = make_blocking_entry();
+    let (cancel_b, completion_b) = make_blocking_entry();
+    let factory =
+        BlockingFactory::new([(ca, completion_a.clone()), (cancel_b.clone(), completion_b)]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        // The board, then the between-steps board after "c" is the last step.
+        [NextAction::LaunchNext, NextAction::FinishWorkflow],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(
+        &session,
+        workflow,
+        factory,
+        frontend,
+        [ParallelGroupDecision::CancelGroup],
+    );
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    signal_completion(&completion_a, 0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    open_board(&tx, "b").await;
+
+    let _ = engine_task.await.unwrap().unwrap();
+    assert!(cancel_b.load(Ordering::Relaxed), "running b was killed");
+    let r = record.lock().unwrap();
+    assert_eq!(
+        r.group_prompts[0],
+        ("cancel".to_string(), "a,b|Next([\"c\"])".to_string())
+    );
+    assert_eq!(r.launched, vec!["a", "b"], "the group is not rerun");
+}
+
+/// Declining the confirmation (or walking away from it) leaves the group
+/// running exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_group_declined_confirmation_keeps_group_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session_with_max_concurrent(&tmp, Some(2));
+    let workflow = make_workflow(
+        Some("wf-group-keep"),
+        Some("claude"),
+        vec![make_step("a", &[], None), make_step("b", &[], None)],
+    );
+    let (cancel_a, completion_a) = make_blocking_entry();
+    let (cancel_b, completion_b) = make_blocking_entry();
+    let factory = BlockingFactory::new([
+        (cancel_a.clone(), completion_a.clone()),
+        (cancel_b.clone(), completion_b.clone()),
+    ]);
+    let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+    let (frontend, record) = ParallelTestFrontend::new(
+        [NextAction::LaunchNext, NextAction::RestartCurrentStep],
+        engine_tx.clone(),
+        YoloTickOutcome::Continue,
+    );
+    let mut engine = build_group_engine(
+        &session,
+        workflow,
+        factory,
+        frontend,
+        [ParallelGroupDecision::KeepRunning],
+    );
+    let tx = engine_tx.lock().unwrap().clone().unwrap();
+    let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    open_board(&tx, "a").await; // next → declined
+    open_board(&tx, "a").await; // restart → scope question dismissed
+    assert!(!cancel_a.load(Ordering::Relaxed));
+    assert!(!cancel_b.load(Ordering::Relaxed));
+    assert_eq!(record.lock().unwrap().launched, vec!["a", "b"]);
+
+    signal_completion(&completion_a, 0);
+    signal_completion(&completion_b, 0);
+    assert_eq!(
+        engine_task.await.unwrap().unwrap(),
+        WorkflowOutcome::Completed
+    );
+}
+
+/// A frontend that does not implement `ask_parallel_group` answers every
+/// question with the prompt's dismissal answer: keep the group running.
+#[test]
+fn ask_parallel_group_defaults_to_keep_running() {
+    let (mut frontend, _) = super::phases::MessageCapturingFrontend::new();
+    let prompt = (test_group_prompts().restart_scope)(&["a".to_string()]);
+    assert_eq!(
+        frontend.ask_parallel_group(&prompt).unwrap(),
+        ParallelGroupDecision::KeepRunning
+    );
 }

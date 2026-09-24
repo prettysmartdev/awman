@@ -3,12 +3,13 @@
 use std::time::Duration;
 
 use crate::data::message::UserMessageSink;
+use crate::data::prompt::Prompt;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::{PhaseKind, WorkflowState};
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
-    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, CountdownKind, NextAction, ParallelGroupDecision, ResumeMismatch, StepOutput,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
@@ -56,6 +57,16 @@ impl WorkflowFrontend for TuiCommandFrontend {
             )))
             .map_err(|e| EngineError::Other(e.to_string()))?;
         Ok(wcb_response_to_action(response, available))
+    }
+
+    /// The engine's follow-up about a running parallel group. Its wording,
+    /// choices and dismissal answer are all `prompt`'s; this only draws it.
+    fn ask_parallel_group(
+        &mut self,
+        prompt: &Prompt<ParallelGroupDecision>,
+    ) -> Result<ParallelGroupDecision, EngineError> {
+        self.pick_from_keyed_prompt(prompt)
+            .map_err(|e| EngineError::Other(e.to_string()))
     }
 
     fn yolo_countdown_tick(
@@ -455,6 +466,8 @@ fn control_board_state(step_name: &str, available: &AvailableActions) -> Workflo
             .as_ref()
             .map(|f| f.detail_lines.clone())
             .unwrap_or_default(),
+        retry_failed_step: available.retry_failed_step.clone(),
+        in_parallel_group: available.acts_on_parallel_group,
     }
 }
 
@@ -469,6 +482,11 @@ fn wcb_response_to_action(response: DialogResponse, available: &AvailableActions
         DialogResponse::Char('<') => NextAction::CancelToPreviousStep,
         DialogResponse::Char('f') if available.can_finish_workflow => NextAction::FinishWorkflow,
         DialogResponse::Char('a') => NextAction::Abort,
+        DialogResponse::Char('r') if available.retry_failed_step.is_some() => {
+            NextAction::RetryFailedStep {
+                step_name: available.retry_failed_step.clone().unwrap_or_default(),
+            }
+        }
         DialogResponse::Char('p') if available.can_dismiss => NextAction::Pause,
         DialogResponse::Dismissed if available.can_dismiss => NextAction::Dismiss,
         DialogResponse::Dismissed => NextAction::Pause,
@@ -561,6 +579,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::data::workflow_state::PhaseKind;
+    use crate::engine::workflow::actions::{AvailableActions, ParallelGroupDecision};
     use crate::engine::workflow::frontend::WorkflowFrontend;
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;
     use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
@@ -1178,6 +1197,38 @@ mod tests {
     }
 
     #[test]
+    fn wcb_r_maps_to_retry_only_when_a_failed_peer_is_offered() {
+        use crate::engine::workflow::actions::{AvailableActions, NextAction};
+        use crate::frontend::tui::dialogs::DialogResponse;
+
+        let offered = AvailableActions {
+            can_dismiss: true,
+            retry_failed_step: Some("lint".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::wcb_response_to_action(DialogResponse::Char('r'), &offered),
+            NextAction::RetryFailedStep {
+                step_name: "lint".into()
+            }
+        );
+        assert_eq!(
+            super::control_board_state("b", &offered)
+                .retry_failed_step
+                .as_deref(),
+            Some("lint")
+        );
+
+        let not_offered = AvailableActions::default();
+        assert_ne!(
+            super::wcb_response_to_action(DialogResponse::Char('r'), &not_offered),
+            NextAction::RetryFailedStep {
+                step_name: String::new()
+            }
+        );
+    }
+
+    #[test]
     fn control_board_state_has_no_failure_lines_between_steps() {
         use crate::engine::workflow::actions::AvailableActions;
 
@@ -1187,5 +1238,64 @@ mod tests {
         };
         let state = super::control_board_state("implement", &available);
         assert!(state.failure_lines.is_empty());
+    }
+
+    /// A two-choice prompt, as the engine would hand one down.
+    fn group_prompt() -> crate::data::prompt::Prompt<ParallelGroupDecision> {
+        use crate::data::prompt::{Choice, Prompt};
+        Prompt::new(
+            "Cancel parallel group?",
+            "Cancel the entire parallel group (a, b) and go back to 'root'?",
+            vec![
+                Choice::new('y', "Cancel the group", ParallelGroupDecision::CancelGroup),
+                Choice::new('n', "Keep it running", ParallelGroupDecision::KeepRunning),
+            ],
+            Some(ParallelGroupDecision::KeepRunning),
+        )
+    }
+
+    /// The TUI draws the engine's prompt verbatim — title, body, each choice
+    /// under its own key — and answers with the chosen choice's value.
+    #[test]
+    fn ask_parallel_group_renders_the_prompt_and_maps_the_key() {
+        let (mut frontend, req_rx, resp_tx) = make_frontend();
+        resp_tx.send(DialogResponse::Char('y')).unwrap();
+        let answer = frontend.ask_parallel_group(&group_prompt()).unwrap();
+        assert_eq!(answer, ParallelGroupDecision::CancelGroup);
+        match req_rx.try_recv().unwrap() {
+            DialogRequest::Custom { title, body, keys } => {
+                assert_eq!(title, "Cancel parallel group?");
+                assert!(body.contains("go back to 'root'"), "{body}");
+                assert_eq!(
+                    keys,
+                    vec![
+                        ('y', "Cancel the group".to_string()),
+                        ('n', "Keep it running".to_string())
+                    ]
+                );
+            }
+            _ => panic!("expected a keyed dialog"),
+        }
+    }
+
+    /// Esc means whatever the prompt says a dismissal means.
+    #[test]
+    fn ask_parallel_group_dismissal_is_the_prompts_default() {
+        let (mut frontend, _req_rx, resp_tx) = make_frontend();
+        resp_tx.send(DialogResponse::Dismissed).unwrap();
+        assert_eq!(
+            frontend.ask_parallel_group(&group_prompt()).unwrap(),
+            ParallelGroupDecision::KeepRunning
+        );
+    }
+
+    #[test]
+    fn control_board_state_labels_follow_the_engines_group_flag() {
+        let available = AvailableActions {
+            acts_on_parallel_group: true,
+            ..Default::default()
+        };
+        assert!(super::control_board_state("b", &available).in_parallel_group);
+        assert!(!super::control_board_state("b", &AvailableActions::default()).in_parallel_group);
     }
 }

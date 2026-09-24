@@ -241,6 +241,7 @@ async fn awman_killed_container_writes_no_failure_log() {
         yolo_deadline: None,
         agent: AgentName::new("claude").unwrap(),
         model: None,
+        launch_id: 0,
     });
 
     engine.maybe_dump_step_failure("build", KILLED_EXIT_CODE);

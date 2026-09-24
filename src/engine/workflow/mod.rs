@@ -17,6 +17,7 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 
 use crate::data::config::effective::EffectiveConfig;
+use crate::data::prompt::Prompt;
 use crate::data::session::{AgentName, Session};
 use crate::data::workflow_dag::WorkflowDag;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
@@ -32,8 +33,9 @@ use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, CountdownKind, NextAction, ResumeMismatch, SimpleAdvance, StepFailureContext,
-    StepOutcome, WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, CountdownKind, GroupExit, NextAction, ParallelGroupDecision,
+    ParallelGroupPrompts, ResumeMismatch, SimpleAdvance, StepFailureContext, StepOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::{EngineHandles, WorkflowFrontend};
@@ -57,10 +59,12 @@ mod queries;
 mod single_step;
 
 /// Result of a mid-step yolo countdown (step is still running while
-/// the countdown ticks).
-enum MidStepYoloResult {
+/// the countdown ticks). `T` is what the container's completion carries:
+/// the finalized [`StepOutcome`] for a workflow step, or the raw wait result
+/// inside `WorkflowEngine::drive_yolo_countdown`.
+enum MidStepYoloResult<T = StepOutcome> {
     /// Step completed while the countdown was ticking.
-    StepCompleted(StepOutcome),
+    StepCompleted(T),
     /// Countdown expired or user pressed AdvanceNow.
     Advanced,
     /// User pressed Esc: cancel the countdown.
@@ -93,13 +97,17 @@ enum IterationOutcome {
 }
 
 /// A dynamically-sized set of container-wait futures, one per launched
-/// parallel step. Each future resolves to `(step_name, exit_result)` when its
-/// container terminates. Using `FuturesUnordered` (rather than a hand-rolled
+/// parallel step. Each future resolves to `(step_name, launch_id, exit_result)`
+/// when its container terminates; `launch_id` tells a relaunched step's live
+/// container apart from the one it replaced. Using `FuturesUnordered` (rather than a hand-rolled
 /// `select!` array) lets the engine poll an arbitrary number of concurrent
 /// containers.
 type ParallelWaits = FuturesUnordered<
     std::pin::Pin<
-        Box<dyn std::future::Future<Output = (String, Result<AgentExitInfo, EngineError>)> + Send>,
+        Box<
+            dyn std::future::Future<Output = (String, u64, Result<AgentExitInfo, EngineError>)>
+                + Send,
+        >,
     >,
 >;
 
@@ -121,6 +129,22 @@ enum GroupOutcome {
     Drained { failed: Vec<(String, i32)> },
     /// A workflow-level action ended the run (abort_on_failure, WCB abort/pause).
     Ended(WorkflowOutcome),
+    /// The WCB reset the group (restart it, or go back before it): its
+    /// containers are gone and the outer loop picks up whatever is ready now.
+    Rewound,
+}
+
+/// What an `EngineRequest` received mid-parallel-group asks the group loop to do.
+enum ParallelRequestOutcome {
+    /// Nothing changes; the group keeps running.
+    Continue,
+    /// A WCB pause/abort ended the run.
+    Ended(WorkflowOutcome),
+    /// Restart this member of the group in a fresh container now (WCB
+    /// "retry failed step", or restarting one agent of the group).
+    RestartStep(String),
+    /// The group was reset; end it and let the outer loop start over.
+    Rewound,
 }
 
 /// Result of `step_once_interruptible`.
@@ -194,6 +218,10 @@ struct ActiveParallelStep {
     yolo_deadline: Option<Instant>,
     agent: AgentName,
     model: Option<String>,
+    /// Which launch of this step the slot belongs to. The parallel path
+    /// ignores a wait future whose id no longer matches (its container was
+    /// killed and the step relaunched). Always `0` on the single-step path.
+    launch_id: u64,
 }
 
 /// What a workflow run is: the definition, the work item it serves, and where
@@ -278,6 +306,12 @@ pub struct WorkflowEngine {
     /// separate from `auth_retries_used` so a credential refresh and a failure
     /// retry cannot consume each other.
     auto_retried_steps: HashSet<String>,
+    /// Source of `ActiveParallelStep::launch_id` for parallel launches.
+    next_launch_id: u64,
+    /// Copy for the follow-up questions a mid-group board choice raises,
+    /// supplied by Layer 2. `None` means the engine cannot ask them, so the
+    /// board does not offer restart, back or next while a group runs.
+    parallel_group_prompts: Option<ParallelGroupPrompts>,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
     /// Where to mirror this run's summary after every persist, so a session
     /// view can render the run without loading the state file (decision Q3,
@@ -437,6 +471,12 @@ impl WorkflowEngine {
 
     pub fn set_yolo(&mut self, yolo: bool) {
         self.yolo = yolo;
+    }
+
+    /// Install the Layer 2 copy for the questions asked about a running
+    /// parallel group (restart scope, which agent, cancel the group).
+    pub fn set_parallel_group_prompts(&mut self, prompts: ParallelGroupPrompts) {
+        self.parallel_group_prompts = Some(prompts);
     }
 
     /// Override the active workflow-context overlay permission after the command
@@ -643,6 +683,8 @@ impl WorkflowEngine {
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
             auto_retried_steps: HashSet::new(),
+            next_launch_id: 0,
+            parallel_group_prompts: None,
             engine_rx: Some(rx),
             session_mirror: None,
         }
@@ -704,6 +746,7 @@ impl WorkflowEngine {
             if use_parallel {
                 match self.run_parallel_group(ready).await? {
                     GroupOutcome::Ended(wo) => return Ok(wo),
+                    GroupOutcome::Rewound => continue,
                     GroupOutcome::Drained { failed } => {
                         // One board (or one unattended retry) per failed step,
                         // in exit order. Recovering the first failure must not

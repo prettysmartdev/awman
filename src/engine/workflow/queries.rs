@@ -35,6 +35,63 @@ impl WorkflowEngine {
         }
     }
 
+    /// The direct dependencies of `steps` that are not themselves in `steps`,
+    /// in topological order: the step or group that ran before them.
+    pub(super) fn dependencies_of(&self, steps: &[String]) -> Vec<String> {
+        let deps: HashSet<&String> = self
+            .workflow
+            .steps
+            .iter()
+            .filter(|s| steps.contains(&s.name))
+            .flat_map(|s| s.depends_on.iter())
+            .filter(|d| !steps.contains(d))
+            .collect();
+        self.dag
+            .topological_order()
+            .into_iter()
+            .filter(|n| deps.contains(n))
+            .collect()
+    }
+
+    /// The steps outside `steps` that depend directly on one of them, in
+    /// topological order: the step or group that runs after them.
+    pub(super) fn direct_dependents_of(&self, steps: &[String]) -> Vec<String> {
+        let after: HashSet<&String> = self
+            .workflow
+            .steps
+            .iter()
+            .filter(|s| !steps.contains(&s.name))
+            .filter(|s| s.depends_on.iter().any(|d| steps.contains(d)))
+            .map(|s| &s.name)
+            .collect();
+        self.dag
+            .topological_order()
+            .into_iter()
+            .filter(|n| after.contains(n))
+            .collect()
+    }
+
+    /// Every step downstream of `roots` (transitively), excluding the roots.
+    pub(super) fn dependents_of(&self, roots: &[String]) -> Vec<String> {
+        let mut reached: HashSet<String> = roots.iter().cloned().collect();
+        let mut out = Vec::new();
+        loop {
+            let next: Vec<String> = self
+                .workflow
+                .steps
+                .iter()
+                .filter(|s| !reached.contains(&s.name))
+                .filter(|s| s.depends_on.iter().any(|d| reached.contains(d)))
+                .map(|s| s.name.clone())
+                .collect();
+            if next.is_empty() {
+                return out;
+            }
+            reached.extend(next.iter().cloned());
+            out.extend(next);
+        }
+    }
+
     pub(super) fn is_last_step(&self) -> bool {
         let curr = match self.current_step_name.as_ref() {
             Some(c) => c,

@@ -10,14 +10,15 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::data::message::UserMessageSink;
+use crate::data::prompt::Prompt;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::{PhaseKind, WorkflowState};
 use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
-    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, CountdownKind, NextAction, ParallelGroupDecision, ResumeMismatch, StepOutput,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::EngineRequest;
 
@@ -129,6 +130,24 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     // === User decisions (blocking) ===
 
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;
+
+    /// A follow-up question about a running parallel group, asked after a
+    /// Workflow Control Board choice that affects the whole group (restart:
+    /// whole group or one agent, and which; back or next: cancel the group?).
+    /// The wording, the choices and what a dismissal means are all `prompt`'s;
+    /// the frontend renders it and maps the answer back.
+    ///
+    /// Defaults to the prompt's dismissal answer — keep the group running —
+    /// so a frontend that cannot ask never restarts or cancels a group.
+    fn ask_parallel_group(
+        &mut self,
+        prompt: &Prompt<ParallelGroupDecision>,
+    ) -> Result<ParallelGroupDecision, EngineError> {
+        Ok(prompt
+            .default_on_dismiss
+            .clone()
+            .unwrap_or(ParallelGroupDecision::KeepRunning))
+    }
 
     // === Channel setup ===
 
@@ -376,6 +395,13 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
 
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
         self.lock().unwrap().confirm_resume(mismatch)
+    }
+
+    fn ask_parallel_group(
+        &mut self,
+        prompt: &Prompt<ParallelGroupDecision>,
+    ) -> Result<ParallelGroupDecision, EngineError> {
+        self.lock().unwrap().ask_parallel_group(prompt)
     }
 
     fn attach_engine(&mut self, handles: EngineHandles) {

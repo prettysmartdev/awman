@@ -320,6 +320,34 @@ impl TuiCommandFrontend {
         }
     }
 
+    /// Draw a `Prompt<D>` as a `Custom` dialog — title, body, and one line per
+    /// choice under its own hotkey — and map the answer back. For questions
+    /// whose body carries the substance (confirmations), which a
+    /// `KindSelect` would drop. A dismissal means `default_on_dismiss`, and
+    /// `Aborted` when the prompt has none, exactly as in `pick_from_prompt`.
+    pub(crate) fn pick_from_keyed_prompt<D: Clone>(
+        &self,
+        prompt: &crate::data::prompt::Prompt<D>,
+    ) -> Result<D, CommandError> {
+        let response = self.ask_dialog(DialogRequest::Custom {
+            title: prompt.title.clone(),
+            body: prompt.body.clone(),
+            keys: prompt
+                .choices
+                .iter()
+                .map(|choice| (choice.key, choice.label.clone()))
+                .collect(),
+        })?;
+        let answer = match response {
+            DialogResponse::Char(key) => prompt.answer_for_key(key),
+            _ => None,
+        };
+        match answer.or_else(|| prompt.default_on_dismiss.clone()) {
+            Some(value) => Ok(value),
+            None => Err(CommandError::Aborted),
+        }
+    }
+
     /// Check if a flag-path flag is a known Bool flag in the catalogue.
     fn is_known_bool_flag(&self, command_path: &[&str], flag: &str) -> bool {
         let cat = CommandCatalogue::get();

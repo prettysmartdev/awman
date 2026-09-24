@@ -437,6 +437,7 @@ pub(crate) async fn execute_prepared(
             engine = engine.mirror_into_session(Arc::clone(session));
         }
         engine.set_yolo(yolo);
+        engine.set_parallel_group_prompts(crate::command::prompts::parallel_group_prompts());
         engine.set_workflow_context_permission(active_workflow_context_permission);
 
         // Warn if the workflow will commit but git identity is not configured.

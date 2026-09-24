@@ -2197,3 +2197,166 @@ async fn teardown_failure_write_error_degrades_gracefully() {
     .await
     .unwrap();
 }
+
+// ── on_failure yolo countdown ─────────────────────────────────────────────
+
+/// Frontend for the on_failure yolo tests: hands the stuck channel of the
+/// launched on_failure agent to the test, records every countdown started,
+/// and answers every tick with `tick`.
+struct OnFailureYoloFrontend {
+    stuck_sender: Arc<Mutex<Option<Arc<tokio::sync::broadcast::Sender<StuckEvent>>>>>,
+    countdowns: Arc<Mutex<Vec<String>>>,
+    tick: YoloTickOutcome,
+}
+
+impl crate::data::message::UserMessageSink for OnFailureYoloFrontend {
+    fn write_message(&mut self, _: crate::data::message::UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+impl WorkflowFrontend for OnFailureYoloFrontend {
+    fn show_workflow_control_board(
+        &mut self,
+        _: &WorkflowState,
+        _: &AvailableActions,
+    ) -> Result<NextAction, EngineError> {
+        Ok(NextAction::Pause)
+    }
+    fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
+        Ok(true)
+    }
+    fn report_step_status(&mut self, _: &WorkflowStep, _: WorkflowStepStatus) {}
+    fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
+    fn yolo_countdown_tick(
+        &mut self,
+        _: &str,
+        _: Duration,
+        _: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        Ok(self.tick.clone())
+    }
+    fn yolo_countdown_started(&mut self, step_name: &str, _: CountdownKind) {
+        self.countdowns.lock().unwrap().push(step_name.to_string());
+    }
+    fn attach_engine(&mut self, handles: EngineHandles) {
+        if let Some(sender) = handles.stuck {
+            *self.stuck_sender.lock().unwrap() = Some(sender);
+        }
+    }
+}
+
+/// Run a setup phase whose single step fails once, with an on_failure agent
+/// that blocks until killed or completed. Once the agent is up, send it a
+/// `Stuck` event; if it is still running 300ms later, complete it. Returns
+/// (countdown labels started, whether the agent was killed, final status).
+fn run_stuck_on_failure_agent(
+    yolo: bool,
+) -> (
+    Vec<String>,
+    bool,
+    crate::data::workflow_state::PhaseStepStatus,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+
+    let (cancel_flag, completion) = make_blocking_entry();
+    let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+    let stuck_sender = Arc::new(Mutex::new(None));
+    let countdowns = Arc::new(Mutex::new(Vec::new()));
+    let frontend = OnFailureYoloFrontend {
+        stuck_sender: Arc::clone(&stuck_sender),
+        countdowns: Arc::clone(&countdowns),
+        tick: YoloTickOutcome::AdvanceNow,
+    };
+    let mut engine = WorkflowEngine::new(
+        &session,
+        WorkflowSpec::new(workflow).with_work_item_context(None),
+        WorkflowEngineDeps {
+            frontend: Box::new(frontend),
+            agent_factory: Box::new(factory),
+        },
+    )
+    .unwrap();
+    engine.set_yolo(yolo);
+
+    // Drives the agent from outside the blocked engine thread. Without
+    // yolo the engine never publishes the stuck channel, so fall back to
+    // completing the agent after the deadline.
+    let driver = {
+        let stuck_sender = Arc::clone(&stuck_sender);
+        let completion = completion.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                if let Some(tx) = stuck_sender.lock().unwrap().as_ref() {
+                    let _ = tx.send(StuckEvent::Stuck);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            signal_completion(&completion, 0);
+        })
+    };
+
+    let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+        command: "step".into(),
+        env: None,
+    }];
+    let mock = Arc::new(MockBackgroundContainer::with_results([
+        ("".into(), "error".into(), 1),
+        ("".into(), "".into(), 0),
+    ]));
+    engine
+        .run_phase(
+            PhaseKind::Setup,
+            &steps,
+            &[false],
+            &[Some(remediation_config(1))],
+            mock.factory(),
+        )
+        .unwrap();
+    driver.join().unwrap();
+
+    let status = engine.state().setup_step_states[0].status.clone();
+    let started = countdowns.lock().unwrap().clone();
+    (started, cancel_flag.load(Ordering::Relaxed), status)
+}
+
+// --yolo (and so --dynamic): a stuck on_failure agent gets the yolo
+// countdown; expiry kills it and the failed step is retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_failure_agent_stuck_in_yolo_runs_countdown_and_advances() {
+    use crate::data::workflow_state::PhaseStepStatus;
+
+    let (started, killed, status) =
+        tokio::task::spawn_blocking(|| run_stuck_on_failure_agent(true))
+            .await
+            .unwrap();
+    assert_eq!(started.len(), 1, "exactly one countdown: {started:?}");
+    assert!(
+        started[0].starts_with("on_failure"),
+        "countdown names the on_failure agent: {started:?}"
+    );
+    assert!(killed, "countdown expiry must kill the on_failure agent");
+    assert_eq!(
+        status,
+        PhaseStepStatus::Succeeded,
+        "the retry ran and passed"
+    );
+}
+
+// Without --yolo, a stuck on_failure agent keeps running with no countdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_failure_agent_without_yolo_has_no_countdown() {
+    use crate::data::workflow_state::PhaseStepStatus;
+
+    let (started, killed, status) =
+        tokio::task::spawn_blocking(|| run_stuck_on_failure_agent(false))
+            .await
+            .unwrap();
+    assert!(started.is_empty(), "no countdown without yolo: {started:?}");
+    assert!(!killed, "the agent must be left to finish on its own");
+    assert_eq!(status, PhaseStepStatus::Succeeded);
+}
