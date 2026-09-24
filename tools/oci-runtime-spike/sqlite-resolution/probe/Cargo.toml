@@ -1,0 +1,33 @@
+[package]
+name = "awman-msb-sqlite-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "../../strict-embed/probe/build.rs"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+awman = { path = "../../../.." }
+clap = { version = "4", features = ["derive"] }
+microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"] }
+microsandbox-db = "=0.7.2"
+microsandbox-migration = "=0.7.2"
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+sea-orm = { version = "2.0.0", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+serde_json = "1"
+tokio-util = "0.7"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = "debuginfo"

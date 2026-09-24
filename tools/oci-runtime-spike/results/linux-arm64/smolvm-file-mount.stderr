@@ -1,0 +1,1 @@
+Error: mount operation failed: validate host path: source path on host must be a directory (virtiofs limitation): /tmp/awman-oci-spike-20260924/fixtures/expected-config.json

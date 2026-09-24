@@ -1,0 +1,12 @@
+    Updating crates.io index
+     Locking 127 packages to latest compatible versions
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding rusqlite v0.39.0 (available: v0.40.2)
+ Downloading crates ...
+  Downloaded rusqlite v0.39.0
+libsqlite3-sys v0.37.0
+├── rusqlite v0.39.0
+│   └── sqlite-downgrade-candidate v0.0.0 (/tmp/awman-sqlite-spike/downgrade)
+└── sqlx-sqlite v0.9.0
+    └── sqlx v0.9.0
+        └── sqlite-downgrade-candidate v0.0.0 (/tmp/awman-sqlite-spike/downgrade)

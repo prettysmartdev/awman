@@ -1,0 +1,3 @@
+Error: config operation failed: machine run: no command specified.
+Use: smolvm machine run -- <command>
+Or:  smolvm machine run -it

@@ -1,0 +1,13 @@
+error: failed to select a version for `libsqlite3-sys`.
+    ... required by package `sqlx-sqlite v0.9.0`
+    ... which satisfies dependency `sqlx-sqlite = "=0.9.0"` of package `sqlx v0.9.0`
+    ... which satisfies dependency `sqlx = "=0.9.0"` (locked to 0.9.0) of package `awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)`
+versions that meet the requirements `>=0.30.1, <0.38.0` are: 0.37.0, 0.36.0, 0.35.0, 0.34.0, 0.33.0, 0.32.0, 0.31.0, 0.30.1
+
+package `libsqlite3-sys` links to the native library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well:
+package `libsqlite3-sys v0.38.2`
+    ... which satisfies dependency `libsqlite3-sys = "^0.38.2"` (locked to 0.38.2) of package `rusqlite v0.40.2`
+    ... which satisfies dependency `rusqlite = "=0.40.2"` (locked to 0.40.2) of package `awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)`
+Only one package in the dependency graph may specify the same links value. This helps ensure that only one copy of a native library is linked in the final binary. Try to adjust your dependencies so that only one package uses the `links = "sqlite3"` value. For more information, see https://doc.rust-lang.org/cargo/reference/resolver.html#links.
+
+failed to select a version for `libsqlite3-sys` which could resolve this conflict

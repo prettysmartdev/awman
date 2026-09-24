@@ -1,0 +1,17 @@
+--- a/src/api/vm.rs
++++ b/src/api/vm.rs
+@@ -1164,7 +1164,13 @@
+     let name = path
+         .map(|p| p.as_os_str().to_os_string())
+         .unwrap_or_else(|| std::ffi::OsString::from(KRUNFW_NAME));
+-    let library = unsafe { libloading::Library::new(&name) }.map_err(|e| {
++    let executable = std::env::current_exe().ok();
++    let library = if path == Some(std::path::Path::new("@awman-embedded"))
++        || (path.is_some() && path == executable.as_deref()) {
++        Ok(libloading::os::unix::Library::this().into())
++    } else {
++        unsafe { libloading::Library::new(&name) }
++    }.map_err(|e| {
+         Error::Build(BuildError::Krunfw(format!(
+             "load {}: {e}",
+             name.to_string_lossy()

@@ -1,0 +1,266 @@
+libsqlite3-sys v0.38.2
+├── libsqlite3-sys feature "bundled"
+│   ├── rusqlite feature "bundled"
+│   │   ├── awman v0.12.0 (/workspace)
+│   │   │   └── awman feature "default"
+│   │   │       └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+│   │   │           └── awman-msb-sqlite-probe feature "default" (command-line)
+│   │   └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│   └── sqlx-sqlite feature "bundled"
+│       └── sqlx feature "sqlite-bundled"
+│           └── sqlx feature "sqlite"
+│               ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│               └── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db)
+│                   └── microsandbox-db feature "default"
+│                       ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│                       ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust)
+│                       │   ├── microsandbox feature "local"
+│                       │   │   └── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli)
+│                       │   │       ├── microsandbox-cli feature "embed-binaries"
+│                       │   │       │   └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│                       │   │       └── microsandbox-cli feature "net"
+│                       │   │           └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│                       │   └── microsandbox feature "net"
+│                       │       └── microsandbox-cli feature "net" (*)
+│                       ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│                       └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime)
+│                           ├── microsandbox-runtime feature "client"
+│                           │   └── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│                           │   └── microsandbox-runtime feature "runner"
+│                           │       └── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│                           │       └── microsandbox-runtime feature "embed-binaries"
+│                           │           └── microsandbox-cli feature "embed-binaries" (*)
+│                           ├── microsandbox-runtime feature "embed-binaries" (*)
+│                           ├── microsandbox-runtime feature "microsandbox-filesystem"
+│                           │   └── microsandbox-runtime feature "embed-binaries" (*)
+│                           ├── microsandbox-runtime feature "net"
+│                           │   ├── microsandbox-cli feature "net" (*)
+│                           │   └── microsandbox feature "net" (*)
+│                           └── microsandbox-runtime feature "runner" (*)
+│               ├── sea-query-sqlx feature "sqlx-sqlite"
+│               │   ├── sea-orm feature "sqlx-sqlite"
+│               │   │   ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│               │   │   ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│               │   │   ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│               │   │   ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│               │   │   └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime) (*)
+│               │   │   └── sea-orm-migration feature "sqlx-sqlite"
+│               │   │       └── microsandbox-migration v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/migration)
+│               │   │           └── microsandbox-migration feature "default"
+│               │   │               ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│               │   │               ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│               │   │               └── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│               │   └── sea-schema feature "sqlx-sqlite"
+│               │       ├── sea-orm feature "sqlx-sqlite" (*)
+│               │       └── sea-orm-migration feature "sqlx-sqlite" (*)
+│               └── sea-schema feature "sqlx-sqlite" (*)
+├── libsqlite3-sys feature "bundled_bindings"
+│   ├── rusqlite feature "modern_sqlite"
+│   │   └── rusqlite feature "bundled" (*)
+│   └── libsqlite3-sys feature "bundled" (*)
+├── libsqlite3-sys feature "cc"
+│   └── libsqlite3-sys feature "bundled" (*)
+├── libsqlite3-sys feature "default"
+│   └── rusqlite v0.40.2
+│       ├── rusqlite feature "bundled" (*)
+│       ├── rusqlite feature "cache"
+│       │   └── rusqlite feature "default"
+│       │       ├── awman v0.12.0 (/workspace) (*)
+│       │       └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│       ├── rusqlite feature "default" (*)
+│       ├── rusqlite feature "ffi-sqlite-wasm-rs"
+│       │   └── rusqlite feature "default" (*)
+│       ├── rusqlite feature "hashlink"
+│       │   └── rusqlite feature "cache" (*)
+│       └── rusqlite feature "modern_sqlite" (*)
+├── libsqlite3-sys feature "min_sqlite_version_3_34_1"
+│   └── libsqlite3-sys feature "default" (*)
+├── libsqlite3-sys feature "pkg-config"
+│   └── sqlx-sqlite v0.9.0 (/tmp/awsq.LEziTZ/sqlx-sqlite-0.9.0)
+│       ├── sqlx-sqlite feature "bundled" (*)
+│       ├── sqlx-sqlite feature "chrono"
+│       │   └── sqlx feature "chrono"
+│       │       └── sea-query-sqlx feature "with-chrono"
+│       │           └── sea-orm feature "with-chrono"
+│       │               ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│       │               ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│       │               ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│       │               └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime) (*)
+│       │               └── sea-orm feature "default"
+│       │                   └── sea-orm-migration v2.0.3
+│       │                       ├── sea-orm-migration feature "runtime-tokio-rustls"
+│       │                       │   └── microsandbox-migration v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/migration) (*)
+│       │                       ├── sea-orm-migration feature "sqlx-dep"
+│       │                       │   └── sea-orm-migration feature "sqlx-sqlite" (*)
+│       │                       └── sea-orm-migration feature "sqlx-sqlite" (*)
+│       ├── sqlx-sqlite feature "default"
+│       │   └── sqlx v0.9.0
+│       │       ├── sea-orm v2.0.3
+│       │       │   ├── sea-orm feature "chrono"
+│       │       │   │   └── sea-orm feature "with-chrono" (*)
+│       │       │   ├── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "macros"
+│       │       │   │   ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│       │       │   │   ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│       │       │   │   ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│       │       │   │   └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime) (*)
+│       │       │   │   └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "runtime-tokio"
+│       │       │   │   └── sea-orm feature "runtime-tokio-rustls"
+│       │       │   │       ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│       │       │   │       ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│       │       │   │       ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│       │       │   │       ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│       │       │   │       └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime) (*)
+│       │       │   │       └── sea-orm-migration feature "runtime-tokio-rustls" (*)
+│       │       │   ├── sea-orm feature "runtime-tokio-rustls" (*)
+│       │       │   ├── sea-orm feature "rust_decimal"
+│       │       │   │   └── sea-orm feature "with-rust_decimal"
+│       │       │   │       └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "schema-sync"
+│       │       │   │   └── sea-orm-migration v2.0.3 (*)
+│       │       │   ├── sea-orm feature "sea-query-sqlx"
+│       │       │   │   └── sea-orm feature "sqlx-sqlite" (*)
+│       │       │   ├── sea-orm feature "sea-schema"
+│       │       │   │   └── sea-orm feature "schema-sync" (*)
+│       │       │   ├── sea-orm feature "serde_json"
+│       │       │   │   └── sea-orm feature "with-json"
+│       │       │   │       └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "sqlite-use-returning-for-3_35"
+│       │       │   │   ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+│       │       │   │   ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+│       │       │   │   ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│       │       │   │   └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime) (*)
+│       │       │   │   └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "sqlx"
+│       │       │   │   └── sea-orm feature "sqlx-dep"
+│       │       │   │       └── sea-orm feature "sqlx-sqlite" (*)
+│       │       │   ├── sea-orm feature "sqlx-core"
+│       │       │   │   └── sea-orm feature "sqlx-dep" (*)
+│       │       │   ├── sea-orm feature "sqlx-dep" (*)
+│       │       │   ├── sea-orm feature "sqlx-sqlite" (*)
+│       │       │   ├── sea-orm feature "stream"
+│       │       │   │   └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "time"
+│       │       │   │   └── sea-orm feature "with-time"
+│       │       │   │       └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "uuid"
+│       │       │   │   └── sea-orm feature "with-uuid"
+│       │       │   │       └── sea-orm feature "default" (*)
+│       │       │   ├── sea-orm feature "with-chrono" (*)
+│       │       │   ├── sea-orm feature "with-json" (*)
+│       │       │   ├── sea-orm feature "with-rust_decimal" (*)
+│       │       │   ├── sea-orm feature "with-time" (*)
+│       │       │   └── sea-orm feature "with-uuid" (*)
+│       │       ├── sea-query-sqlx v0.9.1
+│       │       │   ├── sea-orm v2.0.3 (*)
+│       │       │   └── sea-schema v0.18.1
+│       │       │       ├── sea-schema feature "def"
+│       │       │       │   ├── sea-schema feature "query"
+│       │       │       │   │   ├── sea-schema feature "parser"
+│       │       │       │   │   │   └── sea-schema feature "discovery"
+│       │       │       │   │   │       ├── sea-orm v2.0.3 (*)
+│       │       │       │   │   │       └── sea-orm-migration v2.0.3 (*)
+│       │       │       │   │   └── sea-schema feature "probe"
+│       │       │       │   │       ├── sea-orm v2.0.3 (*)
+│       │       │       │   │       └── sea-orm-migration v2.0.3 (*)
+│       │       │       │   └── sea-schema feature "writer"
+│       │       │       │       ├── sea-orm v2.0.3 (*)
+│       │       │       │       └── sea-orm-migration v2.0.3 (*)
+│       │       │       ├── sea-schema feature "discovery" (*)
+│       │       │       ├── sea-schema feature "parser" (*)
+│       │       │       ├── sea-schema feature "probe" (*)
+│       │       │       ├── sea-schema feature "query" (*)
+│       │       │       ├── sea-schema feature "runtime-tokio-rustls"
+│       │       │       │   └── sea-orm-migration feature "runtime-tokio-rustls" (*)
+│       │       │       ├── sea-schema feature "sea-query-sqlx"
+│       │       │       │   └── sea-schema feature "sqlx-sqlite" (*)
+│       │       │       ├── sea-schema feature "sqlite"
+│       │       │       │   └── sea-schema feature "sqlx-sqlite" (*)
+│       │       │       ├── sea-schema feature "sqlx"
+│       │       │       │   ├── sea-schema feature "sqlx-dep"
+│       │       │       │   │   └── sea-schema feature "sqlx-sqlite" (*)
+│       │       │       │   └── sea-schema feature "sqlx-sqlite" (*)
+│       │       │       ├── sea-schema feature "sqlx-dep" (*)
+│       │       │       ├── sea-schema feature "sqlx-sqlite" (*)
+│       │       │       └── sea-schema feature "writer" (*)
+│       │       │   ├── sea-query-sqlx feature "runtime-tokio"
+│       │       │   │   └── sea-query-sqlx feature "runtime-tokio-rustls"
+│       │       │   │       └── sea-schema feature "runtime-tokio-rustls" (*)
+│       │       │   ├── sea-query-sqlx feature "runtime-tokio-rustls" (*)
+│       │       │   ├── sea-query-sqlx feature "sqlx"
+│       │       │   │   └── sea-query-sqlx feature "sqlx-sqlite" (*)
+│       │       │   ├── sea-query-sqlx feature "sqlx-sqlite" (*)
+│       │       │   ├── sea-query-sqlx feature "tls-rustls"
+│       │       │   │   └── sea-query-sqlx feature "runtime-tokio-rustls" (*)
+│       │       │   ├── sea-query-sqlx feature "with-chrono" (*)
+│       │       │   ├── sea-query-sqlx feature "with-json"
+│       │       │   │   └── sea-orm feature "with-json" (*)
+│       │       │   ├── sea-query-sqlx feature "with-rust_decimal"
+│       │       │   │   └── sea-orm feature "with-rust_decimal" (*)
+│       │       │   ├── sea-query-sqlx feature "with-time"
+│       │       │   │   └── sea-orm feature "with-time" (*)
+│       │       │   └── sea-query-sqlx feature "with-uuid"
+│       │       │       └── sea-orm feature "with-uuid" (*)
+│       │       └── sea-schema v0.18.1 (*)
+│       │       ├── sqlx feature "_rt-tokio"
+│       │       │   └── sqlx feature "runtime-tokio"
+│       │       │       ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe) (*)
+│       │       │       └── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│       │       │       ├── sea-orm feature "runtime-tokio" (*)
+│       │       │       ├── sea-query-sqlx feature "runtime-tokio" (*)
+│       │       │       └── sea-schema feature "runtime-tokio-rustls" (*)
+│       │       ├── sqlx feature "_sqlite"
+│       │       │   └── sqlx feature "sqlite-bundled" (*)
+│       │       ├── sqlx feature "chrono" (*)
+│       │       ├── sqlx feature "json"
+│       │       │   └── sea-query-sqlx feature "with-json" (*)
+│       │       ├── sqlx feature "runtime-tokio" (*)
+│       │       ├── sqlx feature "rust_decimal"
+│       │       │   └── sea-query-sqlx feature "with-rust_decimal" (*)
+│       │       ├── sqlx feature "sqlite" (*)
+│       │       ├── sqlx feature "sqlite-bundled" (*)
+│       │       ├── sqlx feature "sqlite-deserialize"
+│       │       │   └── sqlx feature "sqlite" (*)
+│       │       ├── sqlx feature "sqlite-load-extension"
+│       │       │   └── sqlx feature "sqlite" (*)
+│       │       ├── sqlx feature "sqlite-unlock-notify"
+│       │       │   └── sqlx feature "sqlite" (*)
+│       │       ├── sqlx feature "sqlx-sqlite"
+│       │       │   ├── sqlx feature "sqlite-bundled" (*)
+│       │       │   ├── sqlx feature "sqlite-deserialize" (*)
+│       │       │   ├── sqlx feature "sqlite-load-extension" (*)
+│       │       │   └── sqlx feature "sqlite-unlock-notify" (*)
+│       │       ├── sqlx feature "time"
+│       │       │   └── sea-query-sqlx feature "with-time" (*)
+│       │       ├── sqlx feature "tls-rustls"
+│       │       │   └── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+│       │       │   ├── sea-orm feature "runtime-tokio-rustls" (*)
+│       │       │   ├── sea-query-sqlx feature "tls-rustls" (*)
+│       │       │   └── sea-schema feature "runtime-tokio-rustls" (*)
+│       │       ├── sqlx feature "tls-rustls-ring"
+│       │       │   └── sqlx feature "tls-rustls" (*)
+│       │       ├── sqlx feature "tls-rustls-ring-webpki"
+│       │       │   └── sqlx feature "tls-rustls-ring" (*)
+│       │       └── sqlx feature "uuid"
+│       │           └── sea-query-sqlx feature "with-uuid" (*)
+│       ├── sqlx-sqlite feature "deserialize"
+│       │   └── sqlx feature "sqlite-deserialize" (*)
+│       ├── sqlx-sqlite feature "json"
+│       │   └── sqlx feature "json" (*)
+│       ├── sqlx-sqlite feature "load-extension"
+│       │   └── sqlx feature "sqlite-load-extension" (*)
+│       ├── sqlx-sqlite feature "serde"
+│       │   └── sqlx-sqlite feature "json" (*)
+│       ├── sqlx-sqlite feature "time"
+│       │   └── sqlx feature "time" (*)
+│       ├── sqlx-sqlite feature "unlock-notify"
+│       │   └── sqlx feature "sqlite-unlock-notify" (*)
+│       └── sqlx-sqlite feature "uuid"
+│           └── sqlx feature "uuid" (*)
+│   └── libsqlite3-sys feature "min_sqlite_version_3_34_1" (*)
+├── libsqlite3-sys feature "unlock_notify"
+│   └── sqlx-sqlite feature "unlock-notify" (*)
+└── libsqlite3-sys feature "vcpkg"
+    └── sqlx-sqlite v0.9.0 (/tmp/awsq.LEziTZ/sqlx-sqlite-0.9.0) (*)
+    └── libsqlite3-sys feature "min_sqlite_version_3_34_1" (*)

@@ -978,6 +978,57 @@ fn ctrl_t_new_tab_dialog_prompt_is_the_working_directory_question_alone() {
     }
 }
 
+/// Submit `path` through the Ctrl-T New Tab dialog.
+fn submit_new_tab_path(app: &mut App, path: &std::path::Path) {
+    press_key(app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    match app.active_dialog.as_mut() {
+        Some(Dialog::TextInput { editor, .. }) => editor.set_text(&path.to_string_lossy()),
+        _ => panic!("Ctrl-T must open the New Tab TextInput dialog"),
+    }
+    press_key(app, KeyCode::Enter, KeyModifiers::NONE);
+}
+
+#[test]
+fn new_tab_with_malformed_repo_config_raises_error_modal() {
+    let mut app = make_app();
+    let tabs_before = app.tabs.len();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".awman")).unwrap();
+    std::fs::write(dir.path().join(".awman/config.json"), "{ not json").unwrap();
+
+    submit_new_tab_path(&mut app, dir.path());
+
+    assert_eq!(app.tabs.len(), tabs_before, "no tab may open on failure");
+    match &app.active_dialog {
+        Some(Dialog::Notice { title, body, .. }) => {
+            assert_eq!(title, "could not open new tab");
+            assert!(
+                body.starts_with("Failed to open session:"),
+                "modal must carry the error text, got: {body:?}"
+            );
+        }
+        _ => panic!("a failed new-tab open must raise a Notice modal"),
+    }
+}
+
+#[test]
+fn new_tab_with_missing_directory_raises_error_modal() {
+    let mut app = make_app();
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+
+    submit_new_tab_path(&mut app, &missing);
+
+    match &app.active_dialog {
+        Some(Dialog::Notice { body, .. }) => {
+            assert!(body.starts_with("Not a directory:"), "got: {body:?}");
+        }
+        _ => panic!("a missing directory must raise a Notice modal"),
+    }
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.active_dialog.is_none(), "Enter must dismiss the modal");
+}
+
 #[test]
 fn ctrl_s_in_new_tab_dialog_focuses_existing_squad_tab_and_closes_dialog() {
     let mut app = make_app();

@@ -1,0 +1,14 @@
+info Platform: Linux aarch64
+info Version: v0.7.2
+info MSB_HOME: /tmp/awman-oci-spike-20260924/host-results/msb-state
+   ✓ msb          /tmp/awman-oci-spike-20260924/msb-dist/msb
+   ✓ libkrunfw    /tmp/awman-oci-spike-20260924/msb-dist/libkrunfw.so.5.6.1
+   ! Root clone   copy fallback — reflink unavailable
+   ✗ KVM device   missing
+warn: MSB_HOME does not support reflink clones
+  → clone=auto will use independent sparse copies for flat sandbox roots
+  → sandbox creation may be slower and each private root may allocate more storage
+  → use a reflink-capable filesystem for MSB_HOME to enable copy-on-write clones
+error: /dev/kvm is not present
+  → the KVM kernel module is not loaded
+  → in containers or CI, the host must expose /dev/kvm to this environment

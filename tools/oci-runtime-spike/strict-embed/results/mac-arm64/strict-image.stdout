@@ -1,0 +1,11 @@
+entrypoint-marker
+PASS	image-user
+PASS	image-group
+PASS	image-workdir
+PASS	image-home
+PASS	image-env
+PASS	image-file-whiteout
+PASS	image-opaque-whiteout
+PASS	image-upper-layer
+PASS	image-executable-mode
+image-contract-pass

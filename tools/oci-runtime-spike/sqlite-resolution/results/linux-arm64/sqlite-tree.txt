@@ -1,0 +1,34 @@
+libsqlite3-sys v0.38.2
+├── rusqlite v0.40.2
+│   ├── awman v0.12.0 (/workspace)
+│   │   └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+│   └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+└── sqlx-sqlite v0.9.0 (/tmp/awsq.LEziTZ/sqlx-sqlite-0.9.0)
+    └── sqlx v0.9.0
+        ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+        ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db)
+        │   ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+        │   ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust)
+        │   │   └── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli)
+        │   │       └── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+        │   ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+        │   └── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime)
+        │       ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+        │       └── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+        ├── sea-orm v2.0.3
+        │   ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+        │   ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+        │   ├── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+        │   ├── microsandbox-db v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/db) (*)
+        │   ├── microsandbox-runtime v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/runtime) (*)
+        │   └── sea-orm-migration v2.0.3
+        │       └── microsandbox-migration v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/migration)
+        │           ├── awman-msb-sqlite-probe v0.0.0 (/workspace/tools/oci-runtime-spike/sqlite-resolution/probe)
+        │           ├── microsandbox v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/sdk/rust) (*)
+        │           └── microsandbox-cli v0.7.2 (/tmp/awman-oci-spike-20260924/microsandbox/crates/cli) (*)
+        ├── sea-query-sqlx v0.9.1
+        │   ├── sea-orm v2.0.3 (*)
+        │   └── sea-schema v0.18.1
+        │       ├── sea-orm v2.0.3 (*)
+        │       └── sea-orm-migration v2.0.3 (*)
+        └── sea-schema v0.18.1 (*)

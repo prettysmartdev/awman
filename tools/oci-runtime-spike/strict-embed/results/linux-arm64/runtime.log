@@ -1,0 +1,5 @@
+embedded-kernel-provider-called bytes=24576000
+
+thread 'main' (14281) panicked at /tmp/awman-oci-spike-20260924/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/msb_krun_vmm-0.1.39/src/linux/vstate.rs:488:30:
+Error creating the Kvm object: Error(2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

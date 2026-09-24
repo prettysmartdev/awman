@@ -603,6 +603,11 @@ The directory chosen in the New Tab dialog does not have to be a Git
 repository. For a non-Git directory, awman uses that directory as the tab's
 working directory and starts `status --watch`; Git-backed tabs start `ready`.
 
+If the tab cannot be opened — the path is not a directory, or its
+`.awman/config.json` (or your global config) fails to parse — no tab is
+created and a **could not open new tab** modal shows the error. Press
+**Enter** or **Esc** to dismiss it.
+
 ```
 Ctrl+T          open a new tab (prompts for working directory)
 Ctrl+A          switch to the previous tab

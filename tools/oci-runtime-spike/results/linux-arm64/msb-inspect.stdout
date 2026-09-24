@@ -1,0 +1,55 @@
+{
+  "architecture": "arm64",
+  "config": {
+    "cmd": [
+      "/compat/check-image"
+    ],
+    "digest": "sha256:217b519a75f7fca1a6807f01c249e3fed45abe043a0640cb9577043908dc2655",
+    "entrypoint": [
+      "/compat/entrypoint"
+    ],
+    "env": [
+      "HOME=/home/probe",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "IMAGE_ENV=image value"
+    ],
+    "labels": {
+      "awman.spike": "fixture"
+    },
+    "stop_signal": null,
+    "user": "probe",
+    "working_dir": "/image-work"
+  },
+  "created_at": "2026-09-24T14:09:49.676941879+00:00",
+  "digest": "sha256:7bceb96e783cae64b90aa83a69e00b45f3448b458a120d1208325a4f351e06b8",
+  "layer_count": 3,
+  "layers": [
+    {
+      "blob_digest": "sha256:c242c442b2cef318138ec6c68a86fe6d1b575024a998c9554195439f2729f124",
+      "compressed_size_bytes": 8824320,
+      "diff_id": "sha256:c242c442b2cef318138ec6c68a86fe6d1b575024a998c9554195439f2729f124",
+      "erofs_size_bytes": null,
+      "media_type": "application/vnd.oci.image.layer.v1.tar",
+      "position": 0
+    },
+    {
+      "blob_digest": "sha256:8e21fb8e89a64ea07158ef14a80556e9f187cae48d36189de9943eef5c61f359",
+      "compressed_size_bytes": 3072,
+      "diff_id": "sha256:8e21fb8e89a64ea07158ef14a80556e9f187cae48d36189de9943eef5c61f359",
+      "erofs_size_bytes": null,
+      "media_type": "application/vnd.oci.image.layer.v1.tar",
+      "position": 1
+    },
+    {
+      "blob_digest": "sha256:40189bfc5b8f6ccf774c2d4d063fd6bc9ced3e05ec6f143ae2f99e70ba939f93",
+      "compressed_size_bytes": 9216,
+      "diff_id": "sha256:40189bfc5b8f6ccf774c2d4d063fd6bc9ced3e05ec6f143ae2f99e70ba939f93",
+      "erofs_size_bytes": null,
+      "media_type": "application/vnd.oci.image.layer.v1.tar",
+      "position": 2
+    }
+  ],
+  "os": "linux",
+  "reference": "awman-spike/oci:latest",
+  "size_bytes": 8836608
+}

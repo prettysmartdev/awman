@@ -1,0 +1,6 @@
+Created machine: directory-probe
+  CPUs: 1, Memory: 512 MiB
+  Mounts: 1
+
+Use 'smolvm machine start --name directory-probe' to start the machine
+Then use 'smolvm machine exec --name directory-probe -- <command>' to run commands

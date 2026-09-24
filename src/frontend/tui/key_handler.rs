@@ -607,6 +607,20 @@ fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEv
     true
 }
 
+/// Raise a new-tab failure as a modal, and leave its text in the status bar
+/// behind it. A status-bar line alone is easy to miss, which made a failed
+/// open (e.g. a malformed `config.json`) look like Ctrl-T silently did nothing.
+fn report_new_tab_failure(app: &mut App, message: String) {
+    app.status_bar.text = message.clone();
+    app.active_dialog = Some(Dialog::Notice {
+        title: "could not open new tab".to_string(),
+        body: message,
+        copy_key: None,
+        copy_zshrc_snippet: None,
+    });
+    app.command_dialog_active = false;
+}
+
 /// Handle path selection from the new-tab dialog.
 pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
     let path = path.trim();
@@ -620,14 +634,14 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
         app.active_tab().session.working_dir().join(raw)
     };
     if !dir.is_dir() {
-        app.status_bar.text = format!("Not a directory: {path}");
+        report_new_tab_failure(app, format!("Not a directory: {path}"));
         return;
     }
 
     let idx = match app.add_tab(dir, crate::data::session::SessionOpenOptions::default()) {
         Ok(idx) => idx,
         Err(error) => {
-            app.status_bar.text = format!("Failed to open session: {error}");
+            report_new_tab_failure(app, format!("Failed to open session: {error}"));
             return;
         }
     };

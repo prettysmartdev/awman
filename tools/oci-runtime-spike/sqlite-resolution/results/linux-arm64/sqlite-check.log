@@ -1,0 +1,5 @@
+PASS actual awman session CRUD and task-store migrations
+PASS shared SQLite version=3.53.2 source=2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24
+PASS rusqlite/SQLx cross-read/write, BLOB binding and RETURNING
+PASS foreign keys, WAL visibility, SQLITE_BUSY, rollback, reopen and integrity
+PASS actual Microsandbox pools and 27 catalog migrations (idempotent)

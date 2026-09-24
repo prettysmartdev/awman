@@ -1,0 +1,20 @@
+[package]
+name = "awman-msb-full-embed-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "../probe/build.rs"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = "debuginfo"

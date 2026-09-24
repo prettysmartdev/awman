@@ -1,0 +1,9 @@
+FAIL	image-user
+FAIL	image-group
+FAIL	image-workdir
+FAIL	image-home
+FAIL	image-env
+PASS	image-file-whiteout
+FAIL	image-opaque-whiteout
+PASS	image-upper-layer
+PASS	image-executable-mode

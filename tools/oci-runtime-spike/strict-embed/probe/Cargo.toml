@@ -1,0 +1,16 @@
+[package]
+name = "awman-strict-embed-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+msb_krun = { version = "=0.1.39", features = ["blk", "net"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = "debuginfo"

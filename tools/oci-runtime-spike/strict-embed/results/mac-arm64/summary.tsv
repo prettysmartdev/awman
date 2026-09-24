@@ -1,0 +1,8 @@
+case	expected_exit	actual_exit
+import	0	0
+inspect	0	0
+strict-image	0	0
+strict-image-marker	0	0
+strict-exit	37	37
+strict-mounts	0	0
+embedded-kernel-observed	0	0

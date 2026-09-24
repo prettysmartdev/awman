@@ -1,0 +1,5 @@
+Starting ephemeral machine (vm-db752af4)...
+[2m2026-09-24T14:26:31.492349Z[0m [33m WARN[0m failed to pre-format disk on host [3merror[0m[2m=[0mstorage operation failed: find resize2fs: resize2fs not found - required to create a storage disk smaller than the 20 GiB template.
+  On macOS, install with: brew install e2fsprogs
+[2m2026-09-24T14:26:31.492377Z[0m [33m WARN[0m failed to pre-format overlay disk on host [3merror[0m[2m=[0mstorage operation failed: find resize2fs: resize2fs not found - required to create a overlay disk smaller than the 10 GiB template.
+  On macOS, install with: brew install e2fsprogs

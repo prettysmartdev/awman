@@ -1,0 +1,5 @@
+compat/opaque/new
+compat/mode
+compat/entrypoint
+compat/check-image
+compat/opaque/old

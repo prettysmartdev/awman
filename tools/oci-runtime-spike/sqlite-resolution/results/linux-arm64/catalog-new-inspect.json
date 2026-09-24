@@ -1,0 +1,21 @@
+Reference:      awman-spike/sqlite:latest
+Digest:         sha256:7bceb96e783cae64b90aa83a69e00b45f3448b458a120d1208325a4f351e06b8
+Architecture:   arm64
+OS:             linux
+Size:           8.4 MiB
+Created:        2026-09-24 15:47:53
+
+Config
+  Entrypoint:   /compat/entrypoint
+  Cmd:          /compat/check-image
+  WorkingDir:   /image-work
+  User:         probe
+  Env:
+    HOME=/home/probe
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    IMAGE_ENV=image value
+
+Layers (3)
+  1   sha256:c242c442b2ce8.4 MiB   application/vnd.oci.image.layer.v1.tar
+  2   sha256:8e21fb8e89a63.0 KiB   application/vnd.oci.image.layer.v1.tar
+  3   sha256:40189bfc5b8f9.0 KiB   application/vnd.oci.image.layer.v1.tar

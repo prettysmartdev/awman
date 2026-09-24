@@ -1,0 +1,30 @@
+PASS	linux
+PASS	directory-read
+PASS	directory-write
+PASS	directory-readonly
+UNSUPPORTED	file mounts, Claude config file, file/env prompts
+PASS	nested-mount
+PASS	nested-readonly
+PASS	skill-named
+PASS	context-global
+PASS	context-repo
+PASS	context-workflow
+PASS	context-readwrite
+PASS	settings-direct
+PASS	settings-claude-directory
+PASS	settings-antigravity
+PASS	credential-refresh-token-absent
+PASS	environment
+PASS	agents-md
+PASS	add-directory
+PASS	working-directory
+PASS	symlink-escape
+PASS	outside-host-secret
+PASS	rename
+PASS	hardlink
+PASS	executable-bit
+PASS	spaces
+PASS	readonly-remount
+PASS	live-atomic-host-refresh
+guest-stdout-marker
+guest-suite-complete
