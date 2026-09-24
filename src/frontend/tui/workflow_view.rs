@@ -36,6 +36,217 @@ use crate::frontend::tui::tabs::{
 /// Rows occupied by one step box (rounded border + one content row).
 pub const STEP_BOX_HEIGHT: u16 = 3;
 
+/// Narrowest a Workflow Overview column is allowed to get before the overview
+/// stops shrinking columns and scrolls horizontally instead.
+///
+/// At 18 cells a box keeps 12 characters for the step name (after
+/// [`step_box_label_and_style`]'s `width - 6` budget) and 16 for the
+/// agent/model title — enough for names like `implement-api` and labels like
+/// `claude/sonnet`.
+pub const MIN_COLUMN_WIDTH: u16 = 18;
+
+/// The horizontal slice of the overview's columns that fits in a given width.
+///
+/// Produced by [`horizontal_layout`] and returned by
+/// [`render_workflow_overview`], so callers can tell whether horizontal
+/// scrolling is active (`hidden_left + hidden_right > 0`) and which columns
+/// are on screen without redoing the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HorizontalLayout {
+    /// Index of the first visible column (the offset, clamped).
+    pub first: usize,
+    /// Number of columns drawn.
+    pub visible: usize,
+    /// Width of every visible column but the last (which takes the leftover).
+    pub col_w: u16,
+    /// Columns scrolled off to the left.
+    pub hidden_left: usize,
+    /// Columns scrolled off to the right.
+    pub hidden_right: usize,
+}
+
+impl HorizontalLayout {
+    /// Whether some columns are scrolled out of view.
+    pub fn overflows(&self) -> bool {
+        self.hidden_left + self.hidden_right > 0
+    }
+}
+
+/// Lay out `num_cols` overview columns across `width` cells, starting at
+/// column `offset`.
+///
+/// - **Fits** — every column gets at least [`MIN_COLUMN_WIDTH`] after the
+///   `num_cols - 1` one-cell arrow gaps: all columns are shown, `offset` is
+///   ignored, and `col_w` is the even split (the last column takes the
+///   leftover).
+/// - **Overflows** — a 1-cell gutter is reserved on each side for the `‹`/`›`
+///   edge markers, and as many columns of at least `MIN_COLUMN_WIDTH` as fit
+///   (with their arrow gaps) share the remaining width. `offset` is clamped to
+///   `0..=num_cols - visible`.
+/// - **Tiny terminal** — `width` cannot hold one `MIN_COLUMN_WIDTH` column
+///   plus both gutters: one column at the full width, no gutters.
+///
+/// Scrolling is column-granular: a partially drawn column is never shown.
+pub fn horizontal_layout(width: u16, num_cols: usize, offset: usize) -> HorizontalLayout {
+    // An empty area has nothing visible, like an empty workflow.
+    if num_cols == 0 || width == 0 {
+        return HorizontalLayout {
+            first: 0,
+            visible: 0,
+            col_w: 0,
+            hidden_left: 0,
+            hidden_right: 0,
+        };
+    }
+
+    // Fits: the even split (after the arrow gaps) is at least the minimum.
+    // More than `u16::MAX` columns can never fit in a `u16` width.
+    if let Ok(n) = u16::try_from(num_cols) {
+        let even = width.saturating_sub(n - 1) / n;
+        if even >= MIN_COLUMN_WIDTH {
+            return HorizontalLayout {
+                first: 0,
+                visible: num_cols,
+                col_w: even,
+                hidden_left: 0,
+                hidden_right: 0,
+            };
+        }
+    }
+
+    // Overflows. Tiny terminal: one full-width column, no gutters.
+    let (visible, col_w) = if width < MIN_COLUMN_WIDTH.saturating_add(2) {
+        (1usize, width)
+    } else {
+        let inner = width - 2;
+        // `+ 1` because the last visible column needs no arrow gap after it.
+        let fit = (inner as usize + 1) / (MIN_COLUMN_WIDTH as usize + 1);
+        let visible = fit.clamp(1, num_cols);
+        let gaps = (visible - 1) as u16;
+        (visible, inner.saturating_sub(gaps) / visible as u16)
+    };
+    let first = offset.min(num_cols - visible);
+    HorizontalLayout {
+        first,
+        visible,
+        col_w,
+        hidden_left: first,
+        hidden_right: num_cols - visible - first,
+    }
+}
+
+/// Width of the edge-marker gutter on each side of the overview: 1 while
+/// columns are scrolled out of view and the width can spare it, else 0.
+fn overview_gutter(layout: &HorizontalLayout, width: u16) -> u16 {
+    if layout.overflows() && width >= MIN_COLUMN_WIDTH.saturating_add(2) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The column follow mode keeps in view: a running setup/teardown phase,
+/// otherwise the one holding `state.current_step`, else the first column with
+/// a running step.
+///
+/// Only agent steps are matched by name, since setup/teardown steps never set
+/// `current_step` and may share a name with an agent step. The running-step
+/// fallback covers setup/teardown phases, which run with no current step.
+pub(crate) fn follow_column(
+    state: &WorkflowViewState,
+    columns: &[Vec<&WorkflowStepView>],
+) -> Option<usize> {
+    // Phase progress may arrive while a resumed snapshot still names the last
+    // agent as current. The running phase is the stage the user needs to see.
+    columns
+        .iter()
+        .position(|column| {
+            column
+                .iter()
+                .any(|s| s.kind != WorkflowStepKind::Agent && s.status == StepViewStatus::Running)
+        })
+        .or_else(|| {
+            state.current_step.as_ref().and_then(|name| {
+                columns.iter().position(|column| {
+                    column
+                        .iter()
+                        .any(|s| s.kind == WorkflowStepKind::Agent && &s.name == name)
+                })
+            })
+        })
+        .or_else(|| {
+            columns
+                .iter()
+                .position(|column| column.iter().any(|s| s.status == StepViewStatus::Running))
+        })
+}
+
+/// The horizontal offset follow mode requests so that `column` is visible,
+/// moving as little as possible: unchanged if it is already in view, else
+/// just far enough (so a column to the right ends up last in view). `None`
+/// keeps `offset`. The renderer still clamps the result.
+pub(crate) fn follow_hscroll_offset(
+    width: u16,
+    num_cols: usize,
+    offset: usize,
+    column: Option<usize>,
+) -> usize {
+    let Some(column) = column else {
+        return offset;
+    };
+    let layout = horizontal_layout(width, num_cols, offset);
+    if layout.visible == 0 {
+        offset
+    } else if column < layout.first {
+        column
+    } else if column >= layout.first + layout.visible {
+        column + 1 - layout.visible
+    } else {
+        layout.first
+    }
+}
+
+/// Whether a manually scrolled overview re-attaches follow mode after
+/// rendering `layout`: when everything fits, or when the view is scrolled all
+/// the way right and the followed `column` is in view. Re-attaching while the
+/// followed column is hidden would make follow snap the view straight back
+/// on the next frame. A degenerate frame (nothing visible) never re-attaches.
+pub(crate) fn hscroll_follow_reattaches(layout: &HorizontalLayout, column: Option<usize>) -> bool {
+    if layout.visible == 0 {
+        return false;
+    }
+    !layout.overflows()
+        || (layout.hidden_right == 0
+            && column.is_some_and(|c| c >= layout.first && c < layout.first + layout.visible))
+}
+
+/// Summarise the steps in scrolled-out columns for colouring an edge marker:
+/// `"error"` if any failed, else `"running"` if any is running, else
+/// `"plain"`. Error is checked first, then running, matching the colours of
+/// [`step_box_label_and_style`].
+fn hidden_status_hint(cols: &[Vec<&WorkflowStepView>]) -> &'static str {
+    let steps: Vec<&WorkflowStepView> = cols.iter().flatten().copied().collect();
+    match stage_status(&steps) {
+        StepViewStatus::Error => "error",
+        StepViewStatus::Running => "running",
+        // A remediation outranks running in `stage_status`, but a running
+        // step elsewhere should still tint the marker.
+        StepViewStatus::Fixing if steps.iter().any(|s| s.status == StepViewStatus::Running) => {
+            "running"
+        }
+        _ => "plain",
+    }
+}
+
+/// Style for a `‹`/`›` edge marker given [`hidden_status_hint`]'s summary.
+fn edge_marker_style(hint: &str) -> Style {
+    match hint {
+        "error" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "running" => Style::default().fg(Color::Blue),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
 /// Compute the rows the Workflow Overview wants, clamped to `max_height`.
 ///
 /// - Minimized → one box row (3 rows), whatever the shape of the workflow.
@@ -67,27 +278,62 @@ pub fn workflow_overview_height(
 }
 
 /// Render the Workflow Overview into the given area.
+///
+/// `hscroll_offset` is the requested first visible column. It is clamped by
+/// [`horizontal_layout`], and the resolved layout is returned so the caller
+/// can store the clamped offset and tell whether horizontal scrolling is
+/// active. Nothing is drawn, and an empty layout (`visible == 0`) is
+/// returned, when the area or the workflow is empty.
 pub fn render_workflow_overview(
     state: &WorkflowViewState,
     area: Rect,
     frame: &mut Frame,
     scroll_offset: usize,
+    hscroll_offset: usize,
     overview_state: WorkflowOverviewState,
-) {
-    if area.width == 0 || area.height == 0 || state.steps.is_empty() {
-        return;
+) -> HorizontalLayout {
+    let empty = horizontal_layout(area.width, 0, 0);
+    // Less than one box row tall: no column can be drawn, so draw nothing
+    // (not even edge markers).
+    if area.width == 0 || area.height < STEP_BOX_HEIGHT || state.steps.is_empty() {
+        return empty;
     }
 
     let columns = build_workflow_columns(state);
     let num_cols = columns.len();
     if num_cols == 0 {
-        return;
+        return empty;
     }
 
-    // Subtract one cell per inter-column arrow gap.
-    let arrow_chars = num_cols.saturating_sub(1) as u16;
-    let box_space = area.width.saturating_sub(arrow_chars);
-    let base_col_w = (box_space / num_cols as u16).max(4);
+    let layout = horizontal_layout(area.width, num_cols, hscroll_offset);
+    let gutter = overview_gutter(&layout, area.width);
+    let base_col_w = layout.col_w;
+    let first = layout.first;
+    let end = first + layout.visible;
+    // Right edge of the column area; the last visible column stretches to it.
+    let area_right = area.x.saturating_add(area.width);
+    let area_bottom = area.y.saturating_add(area.height);
+    let cols_right = area_right.saturating_sub(gutter);
+
+    // Edge markers for scrolled-out columns, on the arrows' row (the middle
+    // row of the first box row), coloured by the worst news they hide.
+    if gutter > 0 {
+        let marker_y = area.y.saturating_add(1);
+        if layout.hidden_left > 0 {
+            let style = edge_marker_style(hidden_status_hint(&columns[..first]));
+            frame.render_widget(
+                Paragraph::new("\u{2039}").style(style),
+                Rect::new(area.x, marker_y, 1, 1),
+            );
+        }
+        if layout.hidden_right > 0 {
+            let style = edge_marker_style(hidden_status_hint(&columns[end..]));
+            frame.render_widget(
+                Paragraph::new("\u{203a}").style(style),
+                Rect::new(cols_right, marker_y, 1, 1),
+            );
+        }
+    }
 
     // The number of vertical slots for parallel steps in this overview. The
     // minimized mode always draws exactly one row per stage.
@@ -104,11 +350,13 @@ pub fn render_workflow_overview(
         0
     };
 
-    let mut col_x = area.x;
-    for (col_idx, col_steps) in columns.iter().enumerate() {
-        // Last column absorbs the remainder so the overview fills the area.
-        let this_col_w = if col_idx + 1 == num_cols {
-            area.x + area.width - col_x
+    let mut col_x = area.x.saturating_add(gutter);
+    for (vis_idx, col_steps) in columns[first..end].iter().enumerate() {
+        let is_last_visible = vis_idx + 1 == layout.visible;
+        // Last visible column absorbs the remainder so the overview fills
+        // the area (up to the right gutter).
+        let this_col_w = if is_last_visible {
+            cols_right.saturating_sub(col_x)
         } else {
             base_col_w
         };
@@ -148,9 +396,11 @@ pub fn render_workflow_overview(
             // WI-0096 §11: truly-parallel siblings share the same box_x — no
             // per-row indent stagger (which used to imply sequential steps).
             let box_x = col_x;
-            let box_w = this_col_w.max(4);
-            let row_y = area.y + row_idx as u16 * STEP_BOX_HEIGHT;
-            if row_y + STEP_BOX_HEIGHT > area.y + area.height {
+            let box_w = this_col_w;
+            let row_y = area
+                .y
+                .saturating_add((row_idx as u16).saturating_mul(STEP_BOX_HEIGHT));
+            if row_y.saturating_add(STEP_BOX_HEIGHT) > area_bottom {
                 break;
             }
             let box_area = Rect::new(box_x, row_y, box_w, STEP_BOX_HEIGHT);
@@ -196,28 +446,33 @@ pub fn render_workflow_overview(
             }
             let para = Paragraph::new(label).block(block).style(style);
             frame.render_widget(para, box_area);
+        }
 
-            // Arrow between this column and the next, on the middle row of
-            // the FIRST row of boxes only (so it visually connects column
-            // headers without overlapping parallel siblings).
-            if col_idx + 1 < num_cols && row_idx == 0 {
-                let arrow_x = col_x + this_col_w;
-                if arrow_x < area.x + area.width {
-                    let arrow_area = Rect::new(arrow_x, row_y + 1, 1, 1);
-                    frame.render_widget(
-                        Paragraph::new("\u{2192}").style(Style::default().fg(Color::DarkGray)),
-                        arrow_area,
-                    );
-                }
+        // Arrow between this column and the next, on the middle row of the
+        // FIRST row of boxes only (so it visually connects column headers
+        // without overlapping parallel siblings). The first row always holds
+        // a box: a step, or the `+ N more…` marker when no step fits. None
+        // after the last visible column: either nothing follows it, or the
+        // `›` edge marker takes the arrow's place.
+        if !is_last_visible && (!rows_to_show.is_empty() || hidden > 0) {
+            let arrow_x = col_x.saturating_add(this_col_w);
+            if arrow_x < area_right {
+                let arrow_area = Rect::new(arrow_x, area.y.saturating_add(1), 1, 1);
+                frame.render_widget(
+                    Paragraph::new("\u{2192}").style(Style::default().fg(Color::DarkGray)),
+                    arrow_area,
+                );
             }
         }
 
         // Overflow indicator below the last drawn box when there are hidden
         // steps under the fold. Scrolling the overview reveals them.
         if hidden > 0 {
-            let row_y = area.y + rows_to_show.len() as u16 * STEP_BOX_HEIGHT;
-            if row_y + STEP_BOX_HEIGHT <= area.y + area.height {
-                let box_w = this_col_w.max(4);
+            let row_y = area
+                .y
+                .saturating_add((rows_to_show.len() as u16).saturating_mul(STEP_BOX_HEIGHT));
+            if row_y.saturating_add(STEP_BOX_HEIGHT) <= area_bottom {
+                let box_w = this_col_w;
                 let box_area = Rect::new(col_x, row_y, box_w, STEP_BOX_HEIGHT);
                 let more_label = format!("+ {} more\u{2026}", hidden);
                 let para = Paragraph::new(more_label)
@@ -232,8 +487,10 @@ pub fn render_workflow_overview(
             }
         }
 
-        col_x += this_col_w + 1;
+        col_x = col_x.saturating_add(this_col_w).saturating_add(1);
     }
+
+    layout
 }
 
 /// A single rendered row in a Workflow Overview column.
@@ -395,7 +652,7 @@ pub fn workflow_state_to_view_state(state: &WorkflowState) -> WorkflowViewState 
 /// set of dependencies at the same depth are grouped together — steps that
 /// depend on members of the previous parallel group all land in the next
 /// column regardless of which specific member they depend on.
-fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepView>> {
+pub(crate) fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepView>> {
     use std::collections::HashMap;
 
     // Only agent steps participate in the `depends_on` DAG — a setup or
@@ -949,7 +1206,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_workflow_overview(v, frame.area(), frame, 0, overview_state))
+            .draw(|frame| {
+                render_workflow_overview(v, frame.area(), frame, 0, 0, overview_state);
+            })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let area = *buf.area();
@@ -1121,5 +1380,744 @@ mod tests {
             .collect();
         // a, b (running) not queued; c, d (pending, index >= 2) queued.
         assert_eq!(queued, vec![false, false, true, true]);
+    }
+
+    // ── WI 0118: horizontal scrolling ───────────────────────────────────
+
+    fn layout(width: u16, n: usize, offset: usize) -> HorizontalLayout {
+        horizontal_layout(width, n, offset)
+    }
+
+    /// Total cells the layout occupies: gutters, columns and arrow gaps.
+    fn drawn_width(l: &HorizontalLayout, width: u16) -> usize {
+        let gutter = overview_gutter(l, width) as usize;
+        2 * gutter + l.visible * l.col_w as usize + l.visible.saturating_sub(1)
+    }
+
+    const EMPTY_LAYOUT: HorizontalLayout = HorizontalLayout {
+        first: 0,
+        visible: 0,
+        col_w: 0,
+        hidden_left: 0,
+        hidden_right: 0,
+    };
+
+    #[test]
+    fn horizontal_layout_fits_ignores_offset_and_shows_everything() {
+        let l = layout(100, 3, 2);
+        assert_eq!(l.first, 0);
+        assert_eq!(l.visible, 3);
+        assert_eq!(l.hidden_left, 0);
+        assert_eq!(l.hidden_right, 0);
+        assert!(!l.overflows());
+        // Even split after the two arrow gaps.
+        assert_eq!(l.col_w, (100 - 2) / 3);
+    }
+
+    #[test]
+    fn horizontal_layout_fits_matches_the_old_even_split() {
+        for n in 1usize..=6 {
+            let min_fit = 19 * n as u16 - 1;
+            for width in min_fit..=min_fit + 60 {
+                let l = layout(width, n, 0);
+                assert_eq!(l.visible, n, "width {width} n {n}");
+                assert_eq!(
+                    l.col_w,
+                    width.saturating_sub(n as u16 - 1) / n as u16,
+                    "width {width} n {n}"
+                );
+                assert!(l.col_w >= MIN_COLUMN_WIDTH);
+                assert!(!l.overflows());
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_overflow_at_common_widths_with_14_columns() {
+        // (width, expected visible)
+        for (width, expected_visible) in [(80u16, 4usize), (100, 5), (120, 6), (200, 10)] {
+            let l = layout(width, 14, 0);
+            assert_eq!(l.visible, expected_visible, "width {width}");
+            assert!(l.col_w >= MIN_COLUMN_WIDTH, "width {width}: {l:?}");
+            assert!(drawn_width(&l, width) <= width as usize, "width {width}");
+            assert!(l.overflows());
+            assert_eq!(l.first, 0);
+            assert_eq!(l.hidden_left, 0);
+            assert_eq!(l.hidden_right, 14 - expected_visible);
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_100_wide_14_columns_is_five_visible_at_minimum_width() {
+        let l = layout(100, 14, 0);
+        assert_eq!(l.visible, 5);
+        assert_eq!(l.col_w, MIN_COLUMN_WIDTH);
+    }
+
+    #[test]
+    fn horizontal_layout_offset_past_the_end_clamps_to_last_full_page() {
+        let l = layout(100, 14, 999);
+        assert_eq!(l.visible, 5);
+        assert_eq!(l.first, 14 - 5);
+        assert_eq!(l.hidden_left, 9);
+        assert_eq!(l.hidden_right, 0);
+        assert!(l.overflows());
+    }
+
+    #[test]
+    fn horizontal_layout_offset_exactly_at_the_last_page_is_kept() {
+        let l = layout(100, 14, 9);
+        assert_eq!(l.first, 9);
+        assert_eq!(l.hidden_right, 0);
+        let l = layout(100, 14, 10);
+        assert_eq!(l.first, 9);
+    }
+
+    #[test]
+    fn horizontal_layout_offset_zero_has_no_hidden_left() {
+        let l = layout(100, 14, 0);
+        assert_eq!(l.hidden_left, 0);
+        assert_eq!(l.hidden_right, 9);
+    }
+
+    #[test]
+    fn horizontal_layout_mid_offset_hides_both_sides() {
+        let l = layout(100, 14, 3);
+        assert_eq!(l.first, 3);
+        assert_eq!(l.hidden_left, 3);
+        assert_eq!(l.hidden_right, 14 - 5 - 3);
+        assert_eq!(l.first + l.visible + l.hidden_right, 14);
+    }
+
+    #[test]
+    fn horizontal_layout_fits_at_exactly_n_times_19_minus_1() {
+        for n in 2usize..=20 {
+            let fit_at = 19 * n as u16 - 1;
+            let fits = layout(fit_at, n, 0);
+            assert!(!fits.overflows(), "n {n} width {fit_at}");
+            assert_eq!(fits.visible, n);
+            assert_eq!(fits.col_w, MIN_COLUMN_WIDTH, "every column exactly minimum");
+
+            let over = layout(fit_at - 1, n, 0);
+            assert!(over.overflows(), "n {n} width {}", fit_at - 1);
+            assert!(over.visible < n);
+            assert!(over.col_w >= MIN_COLUMN_WIDTH);
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_two_columns_threshold_is_37() {
+        assert!(!layout(37, 2, 0).overflows());
+        assert!(layout(36, 2, 0).overflows());
+    }
+
+    #[test]
+    fn horizontal_layout_tiny_widths_show_one_column_without_underflow() {
+        for width in [1u16, 2, 10, 19] {
+            let l = layout(width, 5, 0);
+            assert_eq!(l.visible, 1, "width {width}");
+            assert_eq!(l.col_w, width, "width {width}");
+            assert_eq!(l.first, 0);
+            assert_eq!(l.hidden_left, 0);
+            assert_eq!(l.hidden_right, 4);
+            assert_eq!(overview_gutter(&l, width), 0, "no gutters when tiny");
+            assert!(drawn_width(&l, width) <= width as usize);
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_tiny_width_can_still_scroll_one_column_at_a_time() {
+        let l = layout(10, 5, 3);
+        assert_eq!(l.first, 3);
+        assert_eq!(l.visible, 1);
+        assert_eq!(l.hidden_left, 3);
+        assert_eq!(l.hidden_right, 1);
+        let l = layout(10, 5, 99);
+        assert_eq!(l.first, 4);
+        assert_eq!(l.hidden_right, 0);
+    }
+
+    #[test]
+    fn horizontal_layout_width_zero_is_empty() {
+        assert_eq!(layout(0, 5, 0), EMPTY_LAYOUT);
+        assert_eq!(layout(0, 5, 3), EMPTY_LAYOUT);
+        assert_eq!(layout(0, 1, 0), EMPTY_LAYOUT);
+    }
+
+    #[test]
+    fn horizontal_layout_zero_columns_is_empty() {
+        for width in [0u16, 1, 20, 100, u16::MAX] {
+            assert_eq!(layout(width, 0, 0), EMPTY_LAYOUT, "width {width}");
+            assert_eq!(layout(width, 0, 7), EMPTY_LAYOUT, "width {width}");
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_single_column_never_overflows() {
+        for width in [1u16, 2, 10, 17, 18, 19, 20, 100, 200] {
+            let l = layout(width, 1, 5);
+            assert_eq!(l.visible, 1, "width {width}");
+            assert_eq!(l.first, 0);
+            assert_eq!(l.col_w, width);
+            assert!(!l.overflows(), "width {width}");
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_minimum_overflow_width_shows_one_column_with_gutters() {
+        // 20 = one 18-wide column + two gutters.
+        let l = layout(20, 2, 0);
+        assert_eq!(l.visible, 1);
+        assert_eq!(l.col_w, MIN_COLUMN_WIDTH);
+        assert_eq!(l.hidden_right, 1);
+        assert_eq!(overview_gutter(&l, 20), 1);
+        // One narrower and the gutters are dropped.
+        let l = layout(19, 2, 0);
+        assert_eq!(l.col_w, 19);
+        assert_eq!(overview_gutter(&l, 19), 0);
+    }
+
+    #[test]
+    fn horizontal_layout_more_columns_than_u16_always_overflows() {
+        let l = layout(100, 70_000, 0);
+        assert!(l.overflows());
+        assert_eq!(l.visible, 5);
+        assert_eq!(l.hidden_right, 70_000 - 5);
+    }
+
+    #[test]
+    fn horizontal_layout_maximum_width_does_not_overflow_arithmetic() {
+        let l = layout(u16::MAX, 5, 0);
+        assert_eq!(l.visible, 5);
+        assert!(!l.overflows());
+        let l = layout(u16::MAX, 5000, 0);
+        assert!(l.overflows());
+        assert!(drawn_width(&l, u16::MAX) <= u16::MAX as usize);
+    }
+
+    #[test]
+    fn horizontal_layout_invariants_hold_across_a_sweep() {
+        for width in 0u16..=300 {
+            for n in 0usize..=20 {
+                for offset in [0usize, 1, 3, 7, 100] {
+                    let l = layout(width, n, offset);
+                    let ctx = format!("width {width} n {n} offset {offset}: {l:?}");
+                    if n == 0 || width == 0 {
+                        assert_eq!(l, EMPTY_LAYOUT, "{ctx}");
+                        continue;
+                    }
+                    assert!(l.visible >= 1 && l.visible <= n, "{ctx}");
+                    assert_eq!(l.hidden_left, l.first, "{ctx}");
+                    assert_eq!(l.first + l.visible + l.hidden_right, n, "{ctx}");
+                    assert!(drawn_width(&l, width) <= width as usize, "{ctx}");
+                    // Only a lone column squeezed into a tiny width may be
+                    // narrower than the minimum.
+                    if l.visible > 1 || width >= MIN_COLUMN_WIDTH {
+                        assert!(l.col_w >= MIN_COLUMN_WIDTH, "{ctx}");
+                    }
+                    if !l.overflows() {
+                        assert_eq!(l.first, 0, "{ctx}");
+                        assert_eq!(l.visible, n, "{ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── hidden_status_hint ──────────────────────────────────────────────
+
+    fn hint_of(statuses: &[&[&str]]) -> &'static str {
+        let owned: Vec<Vec<WorkflowStepView>> = statuses
+            .iter()
+            .enumerate()
+            .map(|(c, col)| {
+                col.iter()
+                    .enumerate()
+                    .map(|(r, s)| step(&format!("s{c}-{r}"), s, vec![]))
+                    .collect()
+            })
+            .collect();
+        let cols: Vec<Vec<&WorkflowStepView>> = owned.iter().map(|c| c.iter().collect()).collect();
+        hidden_status_hint(&cols)
+    }
+
+    #[test]
+    fn hidden_status_hint_empty_input_is_plain() {
+        assert_eq!(hidden_status_hint(&[]), "plain");
+        assert_eq!(hidden_status_hint(&[Vec::new()]), "plain");
+    }
+
+    #[test]
+    fn hidden_status_hint_plain_when_nothing_notable() {
+        assert_eq!(hint_of(&[&["done"], &["pending", "skipped"]]), "plain");
+        assert_eq!(hint_of(&[&["cancelled"]]), "plain");
+    }
+
+    #[test]
+    fn hidden_status_hint_running_beats_plain() {
+        assert_eq!(hint_of(&[&["done"], &["pending", "running"]]), "running");
+    }
+
+    #[test]
+    fn hidden_status_hint_error_beats_running_and_plain() {
+        assert_eq!(hint_of(&[&["running"], &["error"]]), "error");
+        assert_eq!(hint_of(&[&["error", "running", "done"]]), "error");
+        assert_eq!(hint_of(&[&["done"], &["error"], &["pending"]]), "error");
+    }
+
+    #[test]
+    fn hidden_status_hint_fixing_alone_is_plain_but_fixing_with_running_is_running() {
+        assert_eq!(hint_of(&[&["fixing"]]), "plain");
+        assert_eq!(hint_of(&[&["fixing"], &["running"]]), "running");
+    }
+
+    #[test]
+    fn edge_marker_style_matches_the_hint() {
+        assert_eq!(
+            edge_marker_style("error"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            edge_marker_style("running"),
+            Style::default().fg(Color::Blue)
+        );
+        assert_eq!(
+            edge_marker_style("plain"),
+            Style::default().fg(Color::DarkGray)
+        );
+    }
+
+    // ── follow helpers ──────────────────────────────────────────────────
+
+    /// A chain of `n` sequential agent steps `s0 → s1 → …`, one per column.
+    fn chain(n: usize, statuses: &[(usize, &str)]) -> WorkflowViewState {
+        let steps = (0..n)
+            .map(|i| {
+                let status = statuses
+                    .iter()
+                    .find(|(idx, _)| *idx == i)
+                    .map_or("pending", |(_, s)| s);
+                let deps = if i == 0 {
+                    vec![]
+                } else {
+                    vec![format!("s{}", i - 1)]
+                };
+                let mut s = step(&format!("s{i}"), status, vec![]);
+                s.depends_on = deps;
+                s
+            })
+            .collect();
+        view(steps)
+    }
+
+    #[test]
+    fn follow_column_uses_current_step_column() {
+        let mut v = chain(14, &[(2, "running")]);
+        v.current_step = Some("s9".into());
+        let cols = build_workflow_columns(&v);
+        assert_eq!(follow_column(&v, &cols), Some(9));
+    }
+
+    #[test]
+    fn follow_column_falls_back_to_first_running_step() {
+        let v = chain(14, &[(6, "running"), (8, "running")]);
+        let cols = build_workflow_columns(&v);
+        assert_eq!(follow_column(&v, &cols), Some(6));
+    }
+
+    #[test]
+    fn follow_column_is_none_with_nothing_current_or_running() {
+        let v = chain(5, &[(0, "done")]);
+        let cols = build_workflow_columns(&v);
+        assert_eq!(follow_column(&v, &cols), None);
+    }
+
+    #[test]
+    fn follow_column_falls_back_for_a_running_setup_phase() {
+        let v = view(vec![
+            phase_step(WorkflowStepKind::Setup, "clone repo", "running"),
+            step("a", "pending", vec![]),
+        ]);
+        let cols = build_workflow_columns(&v);
+        assert_eq!(follow_column(&v, &cols), Some(0));
+    }
+
+    #[test]
+    fn follow_column_falls_back_for_a_running_teardown_phase() {
+        let mut v = view(vec![
+            step("build", "done", vec![]),
+            phase_step(WorkflowStepKind::Teardown, "clean up", "running"),
+        ]);
+        // A resumed snapshot can still name the completed agent.
+        v.current_step = Some("build".into());
+        let cols = build_workflow_columns(&v);
+        assert_eq!(follow_column(&v, &cols), Some(1));
+        assert_eq!(follow_hscroll_offset(20, cols.len(), 0, Some(1)), 1);
+    }
+
+    #[test]
+    fn follow_column_current_step_matches_agent_steps_only() {
+        // A teardown step named like the current agent step must not win.
+        let mut v = view(vec![
+            step("deploy", "running", vec![]),
+            phase_step(WorkflowStepKind::Teardown, "deploy", "pending"),
+        ]);
+        v.current_step = Some("deploy".into());
+        let cols = build_workflow_columns(&v);
+        assert_eq!(follow_column(&v, &cols), Some(0));
+    }
+
+    #[test]
+    fn follow_hscroll_offset_keeps_offset_when_column_visible() {
+        // width 100 / 14 columns: 5 visible.
+        assert_eq!(follow_hscroll_offset(100, 14, 3, Some(3)), 3);
+        assert_eq!(follow_hscroll_offset(100, 14, 3, Some(7)), 3);
+    }
+
+    #[test]
+    fn follow_hscroll_offset_moves_left_to_the_column() {
+        assert_eq!(follow_hscroll_offset(100, 14, 6, Some(2)), 2);
+    }
+
+    #[test]
+    fn follow_hscroll_offset_moves_right_so_the_column_is_last_in_view() {
+        assert_eq!(follow_hscroll_offset(100, 14, 0, Some(8)), 8 + 1 - 5);
+        assert_eq!(follow_hscroll_offset(100, 14, 0, Some(13)), 9);
+    }
+
+    #[test]
+    fn follow_hscroll_offset_without_a_column_keeps_the_offset() {
+        assert_eq!(follow_hscroll_offset(100, 14, 4, None), 4);
+    }
+
+    #[test]
+    fn follow_hscroll_offset_on_an_empty_layout_keeps_the_offset() {
+        assert_eq!(follow_hscroll_offset(0, 14, 4, Some(9)), 4);
+        assert_eq!(follow_hscroll_offset(100, 0, 4, Some(9)), 4);
+    }
+
+    #[test]
+    fn hscroll_follow_reattaches_when_everything_fits() {
+        assert!(hscroll_follow_reattaches(&layout(200, 3, 0), None));
+        assert!(hscroll_follow_reattaches(&layout(200, 3, 0), Some(1)));
+    }
+
+    #[test]
+    fn hscroll_follow_reattaches_at_the_right_end_only_with_the_column_in_view() {
+        let at_end = layout(100, 14, 99);
+        assert_eq!(at_end.hidden_right, 0);
+        assert!(hscroll_follow_reattaches(&at_end, Some(12)));
+        assert!(!hscroll_follow_reattaches(&at_end, Some(2)));
+        assert!(!hscroll_follow_reattaches(&at_end, None));
+    }
+
+    #[test]
+    fn hscroll_follow_does_not_reattach_while_columns_are_hidden_on_the_right() {
+        let mid = layout(100, 14, 2);
+        assert!(!hscroll_follow_reattaches(&mid, Some(3)));
+    }
+
+    #[test]
+    fn hscroll_follow_never_reattaches_on_a_degenerate_layout() {
+        assert!(!hscroll_follow_reattaches(&EMPTY_LAYOUT, Some(0)));
+        assert!(!hscroll_follow_reattaches(&layout(0, 5, 0), None));
+    }
+
+    // ── rendering with horizontal scroll ────────────────────────────────
+
+    /// Render into a `width`×`height` terminal, returning the text, the
+    /// buffer and the resolved layout.
+    fn render_hscroll(
+        v: &WorkflowViewState,
+        width: u16,
+        height: u16,
+        hscroll: usize,
+    ) -> (String, ratatui::buffer::Buffer, HorizontalLayout) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut resolved = EMPTY_LAYOUT;
+        terminal
+            .draw(|frame| {
+                resolved = render_workflow_overview(
+                    v,
+                    frame.area(),
+                    frame,
+                    0,
+                    hscroll,
+                    WorkflowOverviewState::Minimized,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, buf, resolved)
+    }
+
+    #[test]
+    fn render_returns_the_resolved_layout() {
+        let v = chain(14, &[]);
+        let (_, _, l) = render_hscroll(&v, 100, 3, 99);
+        assert_eq!(l, layout(100, 14, 99));
+    }
+
+    #[test]
+    fn render_overflow_shows_right_marker_only_at_offset_zero() {
+        let v = chain(14, &[]);
+        let (text, _, l) = render_hscroll(&v, 100, 3, 0);
+        assert_eq!(l.visible, 5);
+        assert!(text.contains('\u{203a}'), "missing ›:\n{text}");
+        assert!(!text.contains('\u{2039}'), "unexpected ‹:\n{text}");
+        for name in ["s0", "s1", "s2", "s3", "s4"] {
+            assert!(text.contains(name), "missing {name}:\n{text}");
+        }
+        assert!(!text.contains("s5"), "s5 should be hidden:\n{text}");
+    }
+
+    #[test]
+    fn render_mid_scroll_shows_both_markers() {
+        let v = chain(14, &[]);
+        let (text, _, l) = render_hscroll(&v, 100, 3, 4);
+        assert_eq!(l.first, 4);
+        assert!(text.contains('\u{2039}'), "missing ‹:\n{text}");
+        assert!(text.contains('\u{203a}'), "missing ›:\n{text}");
+        assert!(text.contains("s4") && text.contains("s8"), "{text}");
+        assert!(!text.contains("s3") && !text.contains("s9"), "{text}");
+    }
+
+    #[test]
+    fn render_scrolled_to_the_end_shows_only_the_left_marker() {
+        let v = chain(14, &[]);
+        let (text, _, l) = render_hscroll(&v, 100, 3, 999);
+        assert_eq!(l.hidden_right, 0);
+        assert!(text.contains('\u{2039}'), "{text}");
+        assert!(!text.contains('\u{203a}'), "{text}");
+        assert!(text.contains("s13"), "{text}");
+    }
+
+    #[test]
+    fn render_scrolled_phase_columns_keep_their_titles() {
+        let v = view(vec![
+            phase_step(WorkflowStepKind::Setup, "prepare", "done"),
+            step("build", "done", vec![]),
+            phase_step(WorkflowStepKind::Teardown, "clean up", "running"),
+        ]);
+        let (first, _, _) = render_hscroll(&v, 20, 3, 0);
+        let (last, _, layout) = render_hscroll(&v, 20, 3, 2);
+        assert!(first.contains("[setup]"), "{first}");
+        assert!(last.contains("[teardown]"), "{last}");
+        assert_eq!(layout.first, 2);
+    }
+
+    #[test]
+    fn horizontal_scroll_preserves_parallel_queue_and_vertical_more_box() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut v = view(vec![
+            step("root", "done", vec![]),
+            step("a", "running", vec!["root"]),
+            step("b", "running", vec!["root"]),
+            step("c", "pending", vec!["root"]),
+            step("d", "pending", vec!["root"]),
+            step("tail", "pending", vec!["a"]),
+        ]);
+        v.max_concurrent = Some(2);
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        let mut draw = |vertical_offset| {
+            terminal
+                .draw(|frame| {
+                    render_workflow_overview(
+                        &v,
+                        frame.area(),
+                        frame,
+                        vertical_offset,
+                        1,
+                        WorkflowOverviewState::Maximized,
+                    );
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            (0..buf.area().height)
+                .flat_map(|y| {
+                    (0..buf.area().width)
+                        .map(move |x| buf.cell((x, y)).unwrap().symbol().to_string())
+                })
+                .collect::<String>()
+        };
+        let first = draw(0);
+        assert!(first.contains("+ 3 more…"), "{first}");
+        let scrolled = draw(2);
+        assert!(
+            scrolled.contains("· c") && scrolled.contains("· d"),
+            "{scrolled}"
+        );
+    }
+
+    #[test]
+    fn render_markers_sit_on_the_middle_row_at_the_area_edges() {
+        let v = chain(14, &[]);
+        let (_, buf, _) = render_hscroll(&v, 100, 3, 4);
+        assert_eq!(buf.cell((0, 1)).unwrap().symbol(), "\u{2039}");
+        assert_eq!(buf.cell((99, 1)).unwrap().symbol(), "\u{203a}");
+    }
+
+    #[test]
+    fn render_marker_is_red_when_a_hidden_column_failed() {
+        let v = chain(14, &[(10, "error")]);
+        let (_, buf, _) = render_hscroll(&v, 100, 3, 0);
+        let marker = buf.cell((99, 1)).unwrap();
+        assert_eq!(marker.symbol(), "\u{203a}");
+        assert_eq!(marker.fg, Color::Red);
+        assert!(marker.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn render_marker_is_blue_for_a_hidden_running_step_and_gray_otherwise() {
+        let running = chain(14, &[(10, "running")]);
+        let (_, buf, _) = render_hscroll(&running, 100, 3, 0);
+        assert_eq!(buf.cell((99, 1)).unwrap().fg, Color::Blue);
+
+        let quiet = chain(14, &[]);
+        let (_, buf, _) = render_hscroll(&quiet, 100, 3, 0);
+        assert_eq!(buf.cell((99, 1)).unwrap().fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn render_left_marker_reflects_only_left_hidden_columns() {
+        let v = chain(14, &[(1, "error")]);
+        let (_, buf, _) = render_hscroll(&v, 100, 3, 4);
+        assert_eq!(buf.cell((0, 1)).unwrap().fg, Color::Red);
+        assert_ne!(buf.cell((99, 1)).unwrap().fg, Color::Red);
+    }
+
+    #[test]
+    fn render_workflow_that_fits_has_no_markers_and_ignores_offset() {
+        let v = chain(3, &[]);
+        let (a, _, la) = render_hscroll(&v, 100, 3, 0);
+        let (b, _, lb) = render_hscroll(&v, 100, 3, 7);
+        assert_eq!(a, b);
+        assert_eq!(la, lb);
+        assert!(!a.contains('\u{2039}') && !a.contains('\u{203a}'), "{a}");
+        assert!(a.contains("s0") && a.contains("s1") && a.contains("s2"));
+    }
+
+    #[test]
+    fn render_arrow_is_drawn_between_visible_columns_but_not_after_the_last() {
+        let v = chain(14, &[]);
+        let (text, _, l) = render_hscroll(&v, 100, 3, 0);
+        let middle = text.lines().nth(1).unwrap();
+        let arrows = middle.matches('\u{2192}').count();
+        assert_eq!(arrows, l.visible - 1, "{middle}");
+    }
+
+    #[test]
+    fn render_tiny_widths_do_not_panic_or_draw_markers() {
+        let v = chain(14, &[(3, "error")]);
+        for width in [0u16, 1, 2, 5, 10, 19] {
+            let (text, _, l) = render_hscroll(&v, width, 3, 5);
+            assert!(
+                !text.contains('\u{2039}') && !text.contains('\u{203a}'),
+                "{width}"
+            );
+            if width == 0 {
+                assert_eq!(l, EMPTY_LAYOUT);
+            } else {
+                assert_eq!(l.visible, 1, "width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_too_short_area_draws_nothing_and_returns_an_empty_layout() {
+        let v = chain(14, &[]);
+        for height in [1u16, 2] {
+            let (text, _, l) = render_hscroll(&v, 100, height, 4);
+            assert_eq!(l, EMPTY_LAYOUT, "height {height}");
+            assert!(text.trim().is_empty(), "height {height}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn render_empty_workflow_returns_an_empty_layout() {
+        let v = view(vec![]);
+        let (_, _, l) = render_hscroll(&v, 100, 3, 0);
+        assert_eq!(l, EMPTY_LAYOUT);
+    }
+
+    #[test]
+    fn render_draws_nothing_outside_the_given_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let v = chain(14, &[(10, "error")]);
+        let area = Rect::new(5, 2, 60, 3);
+        for hscroll in [0usize, 4, 99] {
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_workflow_overview(
+                        &v,
+                        area,
+                        frame,
+                        0,
+                        hscroll,
+                        WorkflowOverviewState::Minimized,
+                    );
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            for y in 0..8u16 {
+                for x in 0..80u16 {
+                    let inside = x >= area.x
+                        && x < area.x + area.width
+                        && y >= area.y
+                        && y < area.y + area.height;
+                    if !inside {
+                        assert_eq!(
+                            buf.cell((x, y)).unwrap().symbol(),
+                            " ",
+                            "cell ({x},{y}) drawn outside area at hscroll {hscroll}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_shows_full_step_names_at_the_minimum_column_width() {
+        let steps = (0..14)
+            .map(|i| {
+                let mut s = step(&format!("implement-{i}"), "pending", vec![]);
+                if i > 0 {
+                    s.depends_on = vec![format!("implement-{}", i - 1)];
+                }
+                s
+            })
+            .collect();
+        let v = view(steps);
+        let (text, _, l) = render_hscroll(&v, 100, 3, 0);
+        assert_eq!(l.visible, 5);
+        for i in 0..5 {
+            assert!(text.contains(&format!("implement-{i}")), "{text}");
+        }
+    }
+
+    #[test]
+    fn render_fourteen_step_chain_never_panics_at_any_width_or_offset() {
+        let v = chain(14, &[(0, "done"), (5, "running"), (9, "error")]);
+        for width in (0u16..=120).step_by(7).chain([200, 300]) {
+            for offset in [0usize, 1, 6, 13, 99] {
+                for height in [0u16, 1, 3, 6] {
+                    let (_, _, l) = render_hscroll(&v, width, height, offset);
+                    assert!(l.first + l.visible + l.hidden_right <= 14);
+                }
+            }
+        }
     }
 }

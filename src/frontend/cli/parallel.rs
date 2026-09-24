@@ -59,11 +59,15 @@ struct ChromeState {
 }
 
 /// Background thread that watches for Ctrl-S while the chrome is active and
-/// advances the focused step. Stopped and joined whenever the chrome
+/// advances the focused step. Signalled to stop whenever the chrome
 /// deactivates (group finished, or the running count drops back to <= 1).
+///
+/// The thread is detached rather than joined: on a cooked (non-raw) terminal
+/// crossterm can block inside `event::poll` on a blocking `/dev/tty` read
+/// until more input arrives, so joining it could hang the workflow
+/// indefinitely. The thread exits on its own once that read returns.
 struct CtrlSWatcher {
     stop: Arc<AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
 }
 
 pub struct CliParallelFrontend {
@@ -183,9 +187,12 @@ impl CliParallelFrontend {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let state = Arc::clone(&self.state);
-        let handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             while !stop_for_thread.load(Ordering::Relaxed) {
                 match event::poll(Duration::from_millis(150)) {
+                    // Stopped while blocked in `poll`: leave the input for
+                    // whoever reads the terminal next.
+                    Ok(true) if stop_for_thread.load(Ordering::Relaxed) => return,
                     Ok(true) => {
                         if let Ok(Event::Key(key)) = event::read() {
                             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -205,13 +212,12 @@ impl CliParallelFrontend {
                 }
             }
         });
-        self.watcher = Some(CtrlSWatcher { stop, handle });
+        self.watcher = Some(CtrlSWatcher { stop });
     }
 
     fn stop_ctrl_s_watcher(&mut self) {
         if let Some(w) = self.watcher.take() {
             w.stop.store(true, Ordering::Relaxed);
-            let _ = w.handle.join();
         }
     }
 }

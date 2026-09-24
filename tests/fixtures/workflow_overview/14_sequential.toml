@@ -1,0 +1,68 @@
+[[step]]
+name = "stage-01"
+prompt = "Run stage 01"
+
+[[step]]
+name = "stage-02"
+depends_on = ["stage-01"]
+prompt = "Run stage 02"
+
+[[step]]
+name = "stage-03"
+depends_on = ["stage-02"]
+prompt = "Run stage 03"
+
+[[step]]
+name = "stage-04"
+depends_on = ["stage-03"]
+prompt = "Run stage 04"
+
+[[step]]
+name = "stage-05"
+depends_on = ["stage-04"]
+prompt = "Run stage 05"
+
+[[step]]
+name = "stage-06"
+depends_on = ["stage-05"]
+prompt = "Run stage 06"
+
+[[step]]
+name = "stage-07"
+depends_on = ["stage-06"]
+prompt = "Run stage 07"
+
+[[step]]
+name = "stage-08"
+depends_on = ["stage-07"]
+prompt = "Run stage 08"
+
+[[step]]
+name = "stage-09"
+depends_on = ["stage-08"]
+prompt = "Run stage 09"
+
+[[step]]
+name = "stage-10"
+depends_on = ["stage-09"]
+prompt = "Run stage 10"
+
+[[step]]
+name = "stage-11"
+depends_on = ["stage-10"]
+prompt = "Run stage 11"
+
+[[step]]
+name = "stage-12"
+depends_on = ["stage-11"]
+prompt = "Run stage 12"
+
+[[step]]
+name = "stage-13"
+depends_on = ["stage-12"]
+prompt = "Run stage 13"
+
+[[step]]
+name = "stage-14"
+depends_on = ["stage-13"]
+prompt = "Run stage 14"

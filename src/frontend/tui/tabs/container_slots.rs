@@ -358,5 +358,9 @@ impl Tab {
         if let Ok(mut view) = self.shared.workflow_state.lock() {
             *view = None;
         }
+        if let Ok(mut invocation_id) = self.shared.workflow_invocation_id.lock() {
+            *invocation_id = None;
+        }
+        self.last_workflow_invocation_id = None;
     }
 }

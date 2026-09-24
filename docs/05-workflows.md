@@ -1181,6 +1181,8 @@ The overview shows a parallel group in one of two ways, toggled with **Ctrl-O**:
 
 The maximized overview grows to fill the vertical space between the tab bar and the command box — half of it when a container window is maximized too, since **Ctrl-O** and **Ctrl-M** are independent and neither puts the other away. If a group is larger than the overview's height, the last box becomes a `+ N more…` marker — use the **mouse wheel** over the overview to scroll through the rest.
 
+Workflows with many stages scroll the other way: once the stages no longer fit side by side, the overview scrolls horizontally instead of shrinking columns further. See [Wide workflows scroll horizontally](02-using-the-tui.md#wide-workflows-scroll-horizontally) for the `‹`/`›` markers and the **Shift+←/→** / horizontal wheel controls.
+
 In the TUI, running steps beyond the concurrency cap wait their turn with a `·` prefix on their name until a slot frees up.
 
 See [Parallel workflows](05-workflows.md#parallel-workflows) for the full scheduling model, and [Using the TUI](02-using-the-tui.md#parallel-containers) for how multiple running containers are displayed and switched between.
@@ -1517,7 +1519,7 @@ Each parallel step gets its own control board when it completes or gets stuck; y
 | Agent failure mid-workflow | Step marked Error; user prompted to retry or abort |
 | Very long step names | Truncated to 12 characters with `…` in the TUI Workflow Overview |
 | Large number of parallel steps | Capped at 3 visible rows; extra shown as `+ N more…` |
-| Large number of sequential steps | `+ N more…` box at the far right of the Workflow Overview |
+| Large number of sequential steps | Workflow Overview scrolls horizontally; scroll with **Shift+←/→** or the mouse wheel |
 | **d** pressed; auto-popup suppressed | Auto-open skipped until workflow advances; Ctrl+W still works |
 | Container window maximized (auto-open) | Dialog opens over the maximized terminal; input routes to dialog |
 | Another dialog already open | Both Ctrl+W and auto-open suppressed until open dialog is dismissed |

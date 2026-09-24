@@ -5,21 +5,57 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
 use super::app::App;
-use super::{mouse, tabs};
+use super::{key_handler, keymap, mouse, tabs};
 
 pub(super) fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
     match mouse.kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => {
             let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            let horizontal = match mouse.kind {
+                MouseEventKind::ScrollLeft => Some(false),
+                MouseEventKind::ScrollRight => Some(true),
+                MouseEventKind::ScrollUp if mouse.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(false)
+                }
+                MouseEventKind::ScrollDown if mouse.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(true)
+                }
+                _ => None,
+            };
 
             // Workflow Overview scroll takes priority.
             if let Some(overview_rect) = app.active_tab().last_overview_rect {
                 if mouse.row >= overview_rect.y
-                    && mouse.row < overview_rect.y + overview_rect.height
+                    && mouse.row < overview_rect.y.saturating_add(overview_rect.height)
                     && mouse.column >= overview_rect.x
-                    && mouse.column < overview_rect.x + overview_rect.width
+                    && mouse.column < overview_rect.x.saturating_add(overview_rect.width)
                 {
+                    // Like the Shift-arrow keys, horizontal scroll is off while
+                    // a dialog or the squad task list owns input.
+                    let hscroll_allowed = !matches!(
+                        key_handler::focus_context(app),
+                        keymap::FocusContext::Dialog | keymap::FocusContext::SquadList
+                    );
                     let tab = app.active_tab_mut();
+                    if let Some(right) = horizontal {
+                        if hscroll_allowed
+                            && tab
+                                .last_overview_hlayout
+                                .is_some_and(|layout| layout.overflows())
+                        {
+                            tab.scroll_workflow_overview_horizontal(right);
+                            return;
+                        }
+                        if matches!(
+                            mouse.kind,
+                            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                        ) {
+                            return;
+                        }
+                    }
                     if is_up {
                         tab.workflow_overview_scroll_offset =
                             tab.workflow_overview_scroll_offset.saturating_sub(1);
@@ -28,6 +64,13 @@ pub(super) fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEv
                     }
                     return;
                 }
+            }
+
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+            ) {
+                return;
             }
 
             let tab = app.active_tab_mut();

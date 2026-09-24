@@ -597,6 +597,177 @@ fn frame_overview_defaults_to_minimized_and_ctrl_o_maximizes_it() {
     }
 }
 
+fn set_sequential_workflow(app: &App, n: usize, failed: Option<usize>) {
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    };
+    *app.active_tab().shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
+        steps: (0..n)
+            .map(|i| WorkflowStepView {
+                name: format!("stage-{i}"),
+                status: if failed == Some(i) {
+                    StepViewStatus::Error
+                } else {
+                    StepViewStatus::Pending
+                },
+                agent: Some("agent".into()),
+                model: None,
+                depends_on: if i == 0 {
+                    vec![]
+                } else {
+                    vec![format!("stage-{}", i - 1)]
+                },
+                kind: WorkflowStepKind::Agent,
+            })
+            .collect(),
+        current_step: None,
+        max_concurrent: None,
+    });
+}
+
+fn set_running_workflow(app: &mut App, n: usize) {
+    set_sequential_workflow(app, n, None);
+    app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+        command: "exec workflow".into(),
+    };
+}
+
+#[test]
+fn wide_workflow_shows_full_visible_names_and_coloured_edge_markers() {
+    use ratatui::style::Color;
+    let mut app = make_app();
+    set_sequential_workflow(&app, 14, Some(13));
+    let first = render_app(&mut app, 100, 40);
+    let text = buffer_text(&first);
+    for name in ["stage-0", "stage-1", "stage-2", "stage-3", "stage-4"] {
+        assert!(
+            text.contains(name),
+            "visible step name {name} is rendered: {text}"
+        );
+    }
+    let layout = app.active_tab().last_overview_hlayout.unwrap();
+    let rect = app.active_tab().last_overview_rect.unwrap();
+    assert_eq!(layout.visible, 5);
+    assert_eq!(
+        first
+            .cell((rect.x + rect.width - 1, rect.y + 1))
+            .unwrap()
+            .symbol(),
+        "›"
+    );
+    assert_eq!(
+        first
+            .cell((rect.x + rect.width - 1, rect.y + 1))
+            .unwrap()
+            .fg,
+        Color::Red,
+        "an error in hidden right columns makes the right marker red"
+    );
+    assert_eq!(
+        first.cell((rect.x, rect.y + 1)).unwrap().symbol(),
+        " ",
+        "no left marker at offset zero"
+    );
+
+    app.active_tab_mut().workflow_overview_hscroll_follow = false;
+    app.active_tab_mut().workflow_overview_hscroll_offset = 4;
+    let middle = render_app(&mut app, 100, 40);
+    let rect = app.active_tab().last_overview_rect.unwrap();
+    assert_eq!(middle.cell((rect.x, rect.y + 1)).unwrap().symbol(), "‹");
+    assert_eq!(
+        middle
+            .cell((rect.x + rect.width - 1, rect.y + 1))
+            .unwrap()
+            .symbol(),
+        "›"
+    );
+}
+
+#[test]
+fn workflow_hint_tracks_overflow_and_is_shown_with_maximized_container() {
+    use crate::frontend::tui::tabs::{ContainerWindowState, WorkflowOverviewState};
+    let mut app = make_app();
+    set_running_workflow(&mut app, 14);
+    let text = buffer_text(&render_app(&mut app, 100, 40));
+    assert!(
+        text.contains("shift-←/→ scroll stages (1–5 of 14)"),
+        "{text}"
+    );
+
+    set_sequential_workflow(&app, 3, None);
+    let text = buffer_text(&render_app(&mut app, 100, 40));
+    assert!(
+        !text.contains("shift-←/→ scroll stages"),
+        "fit workflow has no hint: {text}"
+    );
+
+    set_running_workflow(&mut app, 14);
+    app.active_tab_mut().workflow_overview_state = WorkflowOverviewState::Maximized;
+    push_stdio_slot(&mut app, "overview-hint");
+    app.active_tab_mut().container_window_state = ContainerWindowState::Maximized;
+    let text = buffer_text(&render_app(&mut app, 100, 40));
+    assert!(
+        text.contains("shift-←/→ scroll stages"),
+        "maximized-container branch keeps hint: {text}"
+    );
+}
+
+#[test]
+fn workflow_scroll_hint_is_hidden_while_a_dialog_owns_the_keys() {
+    let mut app = make_app();
+    set_running_workflow(&mut app, 14);
+    app.active_dialog = Some(Dialog::Notice {
+        title: "Notice".into(),
+        body: "Workflow paused".into(),
+        copy_key: None,
+        copy_zshrc_snippet: None,
+    });
+
+    let text = buffer_text(&render_app(&mut app, 100, 40));
+    assert!(!text.contains("shift-←/→ scroll stages"), "{text}");
+}
+
+#[test]
+fn a_new_remote_workflow_invocation_resets_manual_horizontal_scroll() {
+    let mut app = make_app();
+    set_running_workflow(&mut app, 14);
+    let first_id = uuid::Uuid::new_v4();
+    *app.active_tab()
+        .shared
+        .workflow_invocation_id
+        .lock()
+        .unwrap() = Some(first_id);
+    render_app(&mut app, 100, 40);
+
+    app.active_tab_mut().workflow_overview_hscroll_offset = 8;
+    app.active_tab_mut().workflow_overview_hscroll_follow = false;
+    render_app(&mut app, 100, 40);
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 8);
+
+    *app.active_tab()
+        .shared
+        .workflow_invocation_id
+        .lock()
+        .unwrap() = Some(uuid::Uuid::new_v4());
+    render_app(&mut app, 100, 40);
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 0);
+    assert!(app.active_tab().workflow_overview_hscroll_follow);
+}
+
+#[test]
+fn git_sidebar_can_narrow_workflow_overview_into_horizontal_overflow() {
+    use crate::frontend::tui::git_sidebar::GitSidebarState;
+    let mut app = make_app();
+    set_sequential_workflow(&app, 5, None);
+    let closed = render_app(&mut app, 100, 40);
+    assert!(!app.active_tab().last_overview_hlayout.unwrap().overflows());
+    app.active_tab_mut().git_sidebar_state = GitSidebarState::Open;
+    let open = render_app(&mut app, 100, 40);
+    assert!(app.active_tab().last_overview_hlayout.unwrap().overflows());
+    assert!(has_green_sidebar_corner(&open).is_some());
+    assert!(has_green_sidebar_corner(&closed).is_none());
+}
+
 /// Append one stdio container slot named `container_name`, the way a parallel
 /// workflow group fills the tab (`start_container` replaces the whole group,
 /// so it cannot build a multi-slot tab).

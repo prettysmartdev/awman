@@ -16,6 +16,12 @@ pub enum Action {
     /// one-box-per-stage view and its maximized every-step view. Independent of
     /// `CycleContainerWindow` (Ctrl-M) — neither min/max affects the other.
     ToggleWorkflowOverview,
+    /// Shift-Left — scroll the Workflow Overview one stage to the left while
+    /// its columns overflow the available width.
+    ScrollWorkflowOverviewLeft,
+    /// Shift-Right — scroll the Workflow Overview one stage to the right while
+    /// its columns overflow the available width.
+    ScrollWorkflowOverviewRight,
     OpenConfigShow,
     WorkflowControl,
     ToggleGitSidebar,
@@ -107,9 +113,28 @@ pub enum FocusContext {
 }
 
 /// Map a key event + focus context to an [`Action`].
-pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
+pub fn map_key(key: KeyEvent, ctx: FocusContext, overview_hscroll_active: bool) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // Agents lose Shift-arrows only while a too-wide overview is on screen.
+    // Exactly Shift: Alt/Ctrl+Shift-arrows still reach the command box / PTY.
+    // Ctrl-[ / Ctrl-] cannot provide a safe pair: terminals send Ctrl-[ as ESC.
+    if overview_hscroll_active
+        && key.modifiers == KeyModifiers::SHIFT
+        && matches!(
+            ctx,
+            FocusContext::CommandBox
+                | FocusContext::ExecutionWindow
+                | FocusContext::ContainerMaximized
+        )
+    {
+        match key.code {
+            KeyCode::Left => return Action::ScrollWorkflowOverviewLeft,
+            KeyCode::Right => return Action::ScrollWorkflowOverviewRight,
+            _ => {}
+        }
+    }
 
     // Global shortcuts — available in most contexts including maximized container.
     // Tab switching (Ctrl-A/D) is suppressed in Dialog context to prevent
@@ -277,6 +302,10 @@ fn map_dialog_key(key: KeyEvent, ctrl: bool) -> Action {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
+        super::map_key(key, ctx, false)
+    }
 
     /// WI 0112 Part 4: the squad grid has no command box to hand focus to.
     #[test]
@@ -813,5 +842,178 @@ mod tests {
         let k = key(KeyCode::Char('t'), KeyModifiers::CONTROL);
         let action = map_key(k, FocusContext::ContainerMaximized);
         assert_eq!(action, Action::OpenNewTabDialog);
+    }
+
+    // ── WI 0118: horizontal Workflow Overview scrolling ─────────────────
+
+    fn map_hscroll(k: KeyEvent, ctx: FocusContext, active: bool) -> Action {
+        super::map_key(k, ctx, active)
+    }
+
+    const HSCROLL_CONTEXTS: [FocusContext; 3] = [
+        FocusContext::CommandBox,
+        FocusContext::ExecutionWindow,
+        FocusContext::ContainerMaximized,
+    ];
+
+    #[test]
+    fn shift_left_scrolls_overview_when_active_in_capturing_contexts() {
+        for ctx in HSCROLL_CONTEXTS {
+            let k = key(KeyCode::Left, KeyModifiers::SHIFT);
+            assert_eq!(
+                map_hscroll(k, ctx, true),
+                Action::ScrollWorkflowOverviewLeft,
+                "{ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_right_scrolls_overview_when_active_in_capturing_contexts() {
+        for ctx in HSCROLL_CONTEXTS {
+            let k = key(KeyCode::Right, KeyModifiers::SHIFT);
+            assert_eq!(
+                map_hscroll(k, ctx, true),
+                Action::ScrollWorkflowOverviewRight,
+                "{ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_arrows_keep_existing_behaviour_when_overview_not_scrollable() {
+        let left = key(KeyCode::Left, KeyModifiers::SHIFT);
+        let right = key(KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(
+            map_hscroll(left, FocusContext::CommandBox, false),
+            Action::CursorLeft
+        );
+        assert_eq!(
+            map_hscroll(right, FocusContext::CommandBox, false),
+            Action::CursorRight
+        );
+        assert_eq!(
+            map_hscroll(left, FocusContext::ExecutionWindow, false),
+            Action::None
+        );
+        assert_eq!(
+            map_hscroll(right, FocusContext::ExecutionWindow, false),
+            Action::None
+        );
+        assert_eq!(
+            map_hscroll(left, FocusContext::ContainerMaximized, false),
+            Action::ForwardToPty(left)
+        );
+        assert_eq!(
+            map_hscroll(right, FocusContext::ContainerMaximized, false),
+            Action::ForwardToPty(right)
+        );
+    }
+
+    #[test]
+    fn shift_arrows_never_scroll_overview_in_dialog_or_squad_list() {
+        let left = key(KeyCode::Left, KeyModifiers::SHIFT);
+        let right = key(KeyCode::Right, KeyModifiers::SHIFT);
+        for active in [false, true] {
+            assert_eq!(
+                map_hscroll(left, FocusContext::Dialog, active),
+                Action::CursorLeft
+            );
+            assert_eq!(
+                map_hscroll(right, FocusContext::Dialog, active),
+                Action::CursorRight
+            );
+            assert_eq!(
+                map_hscroll(left, FocusContext::SquadList, active),
+                Action::SquadMoveLeft
+            );
+            assert_eq!(
+                map_hscroll(right, FocusContext::SquadList, active),
+                Action::SquadMoveRight
+            );
+        }
+    }
+
+    #[test]
+    fn plain_arrows_are_unaffected_by_active_overview_scroll() {
+        let left = key(KeyCode::Left, KeyModifiers::NONE);
+        let right = key(KeyCode::Right, KeyModifiers::NONE);
+        for active in [false, true] {
+            assert_eq!(
+                map_hscroll(left, FocusContext::CommandBox, active),
+                Action::CursorLeft
+            );
+            assert_eq!(
+                map_hscroll(right, FocusContext::CommandBox, active),
+                Action::CursorRight
+            );
+            assert_eq!(
+                map_hscroll(left, FocusContext::ContainerMaximized, active),
+                Action::ForwardToPty(left)
+            );
+            assert_eq!(
+                map_hscroll(right, FocusContext::ContainerMaximized, active),
+                Action::ForwardToPty(right)
+            );
+            assert_eq!(
+                map_hscroll(left, FocusContext::ExecutionWindow, active),
+                Action::None
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_arrows_are_unaffected_by_active_overview_scroll() {
+        let left = key(KeyCode::Left, KeyModifiers::CONTROL);
+        let right = key(KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(
+            map_hscroll(left, FocusContext::CommandBox, true),
+            Action::CursorWordLeft
+        );
+        assert_eq!(
+            map_hscroll(right, FocusContext::CommandBox, true),
+            Action::CursorWordRight
+        );
+        assert_eq!(
+            map_hscroll(left, FocusContext::ContainerMaximized, true),
+            Action::ForwardToPty(left)
+        );
+    }
+
+    #[test]
+    fn shift_combined_with_other_modifiers_is_not_captured() {
+        for mods in [
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ] {
+            let k = key(KeyCode::Left, mods);
+            assert_eq!(
+                map_hscroll(k, FocusContext::ContainerMaximized, true),
+                Action::ForwardToPty(k),
+                "{mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_shift_keys_are_not_captured_when_overview_scrollable() {
+        let up = key(KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(
+            map_hscroll(up, FocusContext::ContainerMaximized, true),
+            Action::ForwardToPty(up)
+        );
+        assert_eq!(
+            map_hscroll(up, FocusContext::ExecutionWindow, true),
+            Action::ScrollUp
+        );
+    }
+
+    #[test]
+    fn global_shortcuts_still_win_when_overview_scrollable() {
+        let k = key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(
+            map_hscroll(k, FocusContext::ContainerMaximized, true),
+            Action::ToggleWorkflowOverview
+        );
     }
 }

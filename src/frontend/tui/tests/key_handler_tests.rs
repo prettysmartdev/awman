@@ -748,6 +748,143 @@ fn scroll_clamped_at_bounds() {
     );
 }
 
+fn install_horizontal_overview(app: &mut App, n: usize, current: Option<&str>) {
+    use crate::frontend::tui::tabs::{
+        ExecutionPhase, StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    };
+    let tab = app.active_tab();
+    *tab.shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
+        steps: (0..n)
+            .map(|i| WorkflowStepView {
+                name: format!("stage-{i}"),
+                status: if current == Some(format!("stage-{i}").as_str()) {
+                    StepViewStatus::Running
+                } else {
+                    StepViewStatus::Pending
+                },
+                agent: Some("agent".into()),
+                model: None,
+                depends_on: if i == 0 {
+                    vec![]
+                } else {
+                    vec![format!("stage-{}", i - 1)]
+                },
+                kind: WorkflowStepKind::Agent,
+            })
+            .collect(),
+        current_step: current.map(str::to_string),
+        max_concurrent: None,
+    });
+    app.active_tab_mut().execution_phase = ExecutionPhase::Running {
+        command: "exec workflow".into(),
+    };
+    app.active_tab_mut().last_overview_hlayout = Some(
+        crate::frontend::tui::workflow_view::horizontal_layout(100, n, 0),
+    );
+}
+
+#[test]
+fn horizontal_keys_detach_follow_and_right_end_reattaches_it() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = make_app();
+    install_horizontal_overview(&mut app, 14, Some("stage-13"));
+    app.active_tab_mut().workflow_overview_state =
+        crate::frontend::tui::tabs::WorkflowOverviewState::Maximized;
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    press_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+    terminal
+        .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
+        .unwrap();
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 1);
+    assert!(!app.active_tab().workflow_overview_hscroll_follow);
+    for _ in 0..8 {
+        press_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        terminal
+            .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
+            .unwrap();
+    }
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 9);
+    assert!(app.active_tab().workflow_overview_hscroll_follow);
+}
+
+#[test]
+fn follow_only_moves_current_stage_while_follow_is_enabled() {
+    use crate::frontend::tui::tabs::WorkflowOverviewState;
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = make_app();
+    install_horizontal_overview(&mut app, 14, Some("stage-13"));
+    app.active_tab_mut().workflow_overview_state = WorkflowOverviewState::Maximized;
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
+        .unwrap();
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 9);
+
+    app.active_tab_mut().workflow_overview_hscroll_offset = 0;
+    app.active_tab_mut().workflow_overview_hscroll_follow = false;
+    terminal
+        .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
+        .unwrap();
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 0);
+}
+
+#[test]
+fn ctrl_o_and_horizontal_keys_only_change_horizontal_state_on_active_tab() {
+    use crate::frontend::tui::tabs::Tab;
+    let mut app = make_app();
+    install_horizontal_overview(&mut app, 14, None);
+    app.active_tab_mut().workflow_overview_hscroll_offset = 3;
+    app.active_tab_mut().workflow_overview_hscroll_follow = false;
+    press_key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 3);
+    assert!(!app.active_tab().workflow_overview_hscroll_follow);
+
+    app.tabs.push(Tab::new(make_session()));
+    app.active_tab = 1;
+    press_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+    assert_eq!(app.tabs[0].workflow_overview_hscroll_offset, 3);
+    assert_eq!(app.tabs[1].workflow_overview_hscroll_offset, 0);
+}
+
+#[test]
+fn horizontal_offset_is_clamped_after_width_and_column_count_shrink() {
+    use crate::frontend::tui::tabs::WorkflowOverviewState;
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = make_app();
+    install_horizontal_overview(&mut app, 14, None);
+    app.active_tab_mut().workflow_overview_state = WorkflowOverviewState::Maximized;
+    app.active_tab_mut().workflow_overview_hscroll_follow = false;
+    app.active_tab_mut().workflow_overview_hscroll_offset = 9;
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
+        .unwrap();
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 8);
+    *app.active_tab().shared.workflow_state.lock().unwrap() =
+        Some(crate::frontend::tui::tabs::WorkflowViewState {
+            steps: (0..3)
+                .map(|i| crate::frontend::tui::tabs::WorkflowStepView {
+                    name: format!("stage-{i}"),
+                    status: crate::frontend::tui::tabs::StepViewStatus::Pending,
+                    agent: None,
+                    model: None,
+                    depends_on: if i == 0 {
+                        vec![]
+                    } else {
+                        vec![format!("stage-{}", i - 1)]
+                    },
+                    kind: crate::frontend::tui::tabs::WorkflowStepKind::Agent,
+                })
+                .collect(),
+            current_step: None,
+            max_concurrent: None,
+        });
+    terminal
+        .draw(|f| crate::frontend::tui::render::render_frame(&mut app, f))
+        .unwrap();
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 0);
+}
+
 // ─── Panic log ────────────────────────────────────────────────────────────
 
 #[test]
@@ -1641,6 +1778,7 @@ fn ctrl_backslash_maps_to_detach_in_every_context_and_ctrl_c_still_reaches_the_p
                     state: KeyEventState::NONE,
                 },
                 ctx,
+                false,
             ),
             Action::DetachContainers,
             "ctrl-\\ must detach in {ctx:?}"
@@ -1658,6 +1796,7 @@ fn ctrl_backslash_maps_to_detach_in_every_context_and_ctrl_c_still_reaches_the_p
                     state: KeyEventState::NONE,
                 },
                 ctx,
+                false,
             ),
             Action::DetachContainers,
             "ctrl-\\'s legacy-terminal encoding (ctrl+'4') must detach in {ctx:?}"
@@ -1673,6 +1812,7 @@ fn ctrl_backslash_maps_to_detach_in_every_context_and_ctrl_c_still_reaches_the_p
                 state: KeyEventState::NONE,
             },
             FocusContext::ContainerMaximized,
+            false,
         ),
         Action::ForwardToPty(_)
     ));
@@ -1806,7 +1946,10 @@ fn ctrl_t_on_the_squad_tab_still_opens_a_new_tab_rather_than_triggering() {
     use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
     let key = crossterm::event::KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
     assert!(
-        !matches!(map_key(key, FocusContext::SquadList), Action::SquadTrigger),
+        !matches!(
+            map_key(key, FocusContext::SquadList, false,),
+            Action::SquadTrigger
+        ),
         "Ctrl-T keeps its global meaning on the squad tab"
     );
 }
@@ -1817,7 +1960,7 @@ fn ctrl_c_on_the_squad_tab_does_not_cancel_a_run() {
     use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
     let key = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(!matches!(
-        map_key(key, FocusContext::SquadList),
+        map_key(key, FocusContext::SquadList, false,),
         Action::SquadCancel
     ));
 }
@@ -2311,7 +2454,7 @@ fn squad_list_plain_c_maps_to_cancel() {
     use crate::frontend::tui::keymap::{map_key, Action, FocusContext};
     let plain = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
     assert!(matches!(
-        map_key(plain, FocusContext::SquadList),
+        map_key(plain, FocusContext::SquadList, false,),
         Action::SquadCancel
     ));
 }

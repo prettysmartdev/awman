@@ -45,6 +45,7 @@ pub struct TuiCommandFrontend {
     pub(crate) container_io: Option<AgentIo>,
     pub(crate) status_log: SharedStatusLog,
     pub(crate) workflow_view: SharedWorkflowViewState,
+    pub(crate) workflow_invocation_id: std::sync::Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) yolo_state: SharedYoloState,
     pub(crate) yolo_cancel_flag: SharedYoloCancelFlag,
     pub(crate) pty_reset_flag: SharedPtyResetFlag,
@@ -130,7 +131,7 @@ impl TuiCommandFrontend {
 
     /// Build the frontend for one command run in one tab.
     ///
-    /// `shared` is the tab's [`TabSharedState`] — the fifteen cross-thread
+    /// `shared` is the tab's [`TabSharedState`] — the sixteen cross-thread
     /// slots this frontend and the tab both observe. It is destructured here
     /// so each slot keeps its own field and doc comment; the tab hands the
     /// whole bundle over so that no slot can be forgotten at a call site.
@@ -142,6 +143,7 @@ impl TuiCommandFrontend {
     ) -> Self {
         let TabSharedState {
             workflow_state: workflow_view,
+            workflow_invocation_id,
             yolo_state,
             yolo_cancel_flag,
             status_log,
@@ -171,6 +173,7 @@ impl TuiCommandFrontend {
             container_io: Some(container_io),
             status_log,
             workflow_view,
+            workflow_invocation_id,
             yolo_state,
             yolo_cancel_flag,
             pty_reset_flag,

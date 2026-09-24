@@ -664,7 +664,14 @@ impl App {
         if let Ok(mut guard) = tab.shared.workflow_state.lock() {
             *guard = None;
         }
+        if let Ok(mut guard) = tab.shared.workflow_invocation_id.lock() {
+            *guard = None;
+        }
         tab.last_overview_rect = None;
+        tab.last_overview_hlayout = None;
+        tab.last_workflow_invocation_id = None;
+        tab.workflow_overview_hscroll_offset = 0;
+        tab.workflow_overview_hscroll_follow = true;
         if let Ok(mut guard) = tab.shared.yolo_state.lock() {
             *guard = None;
         }

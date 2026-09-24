@@ -34,7 +34,7 @@ mod tab;
 /// Decided before the keymap is consulted, because the same key means
 /// different things in a dialog, in a maximised container, and in the command
 /// box.
-fn focus_context(app: &App) -> FocusContext {
+pub(super) fn focus_context(app: &App) -> FocusContext {
     if app.active_dialog.is_some() {
         FocusContext::Dialog
     } else if app.active_tab().container_overlay_active()
@@ -190,7 +190,11 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         return;
     }
 
-    let action = keymap::map_key(key, ctx);
+    let overview_hscroll_active = app
+        .active_tab()
+        .last_overview_hlayout
+        .is_some_and(|layout| layout.overflows());
+    let action = keymap::map_key(key, ctx, overview_hscroll_active);
 
     match action {
         Action::OpenNewTabDialog
@@ -249,6 +253,13 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         Action::ForwardToPty(key_event) => {
             forward_key_to_pty(app, key_event);
         }
+
+        Action::ScrollWorkflowOverviewLeft => app
+            .active_tab_mut()
+            .scroll_workflow_overview_horizontal(false),
+        Action::ScrollWorkflowOverviewRight => app
+            .active_tab_mut()
+            .scroll_workflow_overview_horizontal(true),
 
         Action::None => {
             // When the execution window is focused and the command is finished,

@@ -589,13 +589,15 @@ pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<Contai
 /// `TuiCommandFrontend` built for a command keeps the other, and both observe
 /// the same value. They travel together — a frontend that received some of
 /// them and not others would render against a tab it is only half wired to —
-/// so they are one clonable bundle rather than fifteen constructor
+/// so they are one clonable bundle rather than sixteen constructor
 /// parameters.
 #[derive(Clone)]
 pub struct TabSharedState {
     /// Workflow view state written by the engine's `WorkflowFrontend` impl and
     /// read by the Workflow Overview renderer.
     pub workflow_state: SharedWorkflowViewState,
+    /// Invocation id of the latest remote workflow snapshot, when available.
+    pub workflow_invocation_id: Arc<Mutex<Option<uuid::Uuid>>>,
     /// Yolo countdown state, rendered as a non-modal overlay.
     pub yolo_state: SharedYoloState,
     /// Cancel flag for the yolo countdown; set on Esc, read and cleared by
@@ -632,6 +634,7 @@ impl TabSharedState {
     pub fn new() -> Self {
         Self {
             workflow_state: Arc::new(Mutex::new(None)),
+            workflow_invocation_id: Arc::new(Mutex::new(None)),
             yolo_state: Arc::new(Mutex::new(None)),
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
             status_log: Arc::new(Mutex::new(Vec::new())),
@@ -733,11 +736,16 @@ pub struct Tab {
     pub status_log_collapsed: bool,
     pub scroll_offset: usize,
     pub workflow_overview_scroll_offset: usize,
+    pub workflow_overview_hscroll_offset: usize,
+    pub workflow_overview_hscroll_follow: bool,
     /// Whether the Workflow Overview shows one box per stage (the default) or
     /// every parallel step of every stage. Toggled with `Ctrl-O`, independently
     /// of the container PTY's `Ctrl-M` min/max.
     pub workflow_overview_state: WorkflowOverviewState,
     pub last_overview_rect: Option<Rect>,
+    pub last_overview_hlayout: Option<crate::frontend::tui::workflow_view::HorizontalLayout>,
+    /// Last remote workflow invocation rendered on this tab.
+    pub last_workflow_invocation_id: Option<uuid::Uuid>,
     pub mouse_selection: Option<TextSelection>,
     /// Fixed tab kind. A squad tab is not bound to a project directory and
     /// renders squad content in place of the execution window. Never toggled
@@ -817,6 +825,25 @@ impl Drop for Tab {
 }
 
 impl Tab {
+    /// Apply a manual one-column scroll while the overview overflows, and
+    /// detach follow mode. The next render clamps the requested offset, and
+    /// re-attaches follow once the view is scrolled all the way right with
+    /// the running stage in view (see `hscroll_follow_reattaches`).
+    pub(crate) fn scroll_workflow_overview_horizontal(&mut self, right: bool) {
+        if !self
+            .last_overview_hlayout
+            .is_some_and(|layout| layout.overflows())
+        {
+            return;
+        }
+        self.workflow_overview_hscroll_offset = if right {
+            self.workflow_overview_hscroll_offset.saturating_add(1)
+        } else {
+            self.workflow_overview_hscroll_offset.saturating_sub(1)
+        };
+        self.workflow_overview_hscroll_follow = false;
+    }
+
     pub fn new(session: Session) -> Self {
         Self::new_with_git_engine(session, Arc::new(GitEngine::new()))
     }
@@ -898,8 +925,12 @@ impl Tab {
             status_log_collapsed: false,
             scroll_offset: 0,
             workflow_overview_scroll_offset: 0,
+            workflow_overview_hscroll_offset: 0,
+            workflow_overview_hscroll_follow: true,
             workflow_overview_state: WorkflowOverviewState::Minimized,
             last_overview_rect: None,
+            last_overview_hlayout: None,
+            last_workflow_invocation_id: None,
             mouse_selection: None,
             is_squad: false,
             squad: None,

@@ -173,18 +173,61 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         }
     }
 
+    // A squad attach may observe another invocation without spawning a new
+    // command on this tab. Give that run a fresh horizontal viewport.
+    let invocation_id = app
+        .active_tab()
+        .shared
+        .workflow_invocation_id
+        .lock()
+        .ok()
+        .and_then(|id| *id);
+    if let Some(id) = invocation_id {
+        let tab = app.active_tab_mut();
+        if tab.last_workflow_invocation_id != Some(id) {
+            tab.workflow_overview_hscroll_offset = 0;
+            tab.workflow_overview_hscroll_follow = true;
+            tab.last_workflow_invocation_id = Some(id);
+        }
+    }
+
     if let Some(wf_state) = wf_state.as_ref() {
         let scroll_offset = app.active_tab().workflow_overview_scroll_offset;
-        workflow_view::render_workflow_overview(
+        let mut hscroll_offset = app.active_tab().workflow_overview_hscroll_offset;
+        let follow = app.active_tab().workflow_overview_hscroll_follow;
+        let columns = workflow_view::build_workflow_columns(wf_state);
+        let follow_column = workflow_view::follow_column(wf_state, &columns);
+        if follow {
+            hscroll_offset = workflow_view::follow_hscroll_offset(
+                chunks[3].width,
+                columns.len(),
+                hscroll_offset,
+                follow_column,
+            );
+        }
+        let layout = workflow_view::render_workflow_overview(
             wf_state,
             chunks[3],
             frame,
             scroll_offset,
+            hscroll_offset,
             overview_state,
         );
-        app.active_tab_mut().last_overview_rect = Some(chunks[3]);
+        let tab = app.active_tab_mut();
+        // A degenerate frame (nothing drawn) keeps the requested offset; the
+        // next real frame clamps it.
+        if layout.visible > 0 {
+            tab.workflow_overview_hscroll_offset = layout.first;
+        }
+        if !follow && workflow_view::hscroll_follow_reattaches(&layout, follow_column) {
+            tab.workflow_overview_hscroll_follow = true;
+        }
+        tab.last_overview_rect = Some(chunks[3]);
+        tab.last_overview_hlayout = Some(layout);
     } else {
-        app.active_tab_mut().last_overview_rect = None;
+        let tab = app.active_tab_mut();
+        tab.last_overview_rect = None;
+        tab.last_overview_hlayout = None;
     }
 
     status_bar::render_status_bar(app, chunks[4], frame, sidebar_area.is_some());

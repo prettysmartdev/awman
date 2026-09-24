@@ -18,7 +18,7 @@ use awman::command::error::CommandError;
 use awman::data::fs::{ApiPaths, AuthPathResolver};
 use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use awman::data::session_manager::SessionManager;
-use awman::data::workflow_definition::WorkflowStep;
+use awman::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
 use awman::data::workflow_state::{StepState, WorkflowState};
 use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
@@ -475,8 +475,9 @@ async fn poller_driven_overview_uses_existing_grouping_and_shows_every_sibling()
                 Rect::new(0, 0, 70, 9),
                 frame,
                 0,
+                0,
                 WorkflowOverviewState::Maximized,
-            )
+            );
         })
         .unwrap();
     let text = buffer_text(terminal.backend().buffer());
@@ -644,5 +645,56 @@ fn neither_attach_frontend_names_a_concrete_runtime_backend() {
             !source.contains("\"docker\""),
             "attach must not name the Docker backend"
         );
+    }
+}
+
+#[test]
+fn fourteen_step_fixture_renders_inside_narrow_overview_rect() {
+    let workflow = Workflow::parse(
+        include_str!("fixtures/workflow_overview/14_sequential.toml"),
+        WorkflowFormat::Toml,
+    )
+    .unwrap();
+    assert!(workflow.steps.len() >= 14);
+    let state = WorkflowState::new(
+        "narrow-render-test".into(),
+        &workflow.steps,
+        "fixture".into(),
+        None,
+    );
+    let view = workflow_state_to_view_state(&state);
+    let backend = TestBackend::new(40, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let overview = Rect::new(5, 2, 28, 15);
+    terminal
+        .draw(|frame| {
+            let layout = render_workflow_overview(
+                &view,
+                overview,
+                frame,
+                0,
+                0,
+                WorkflowOverviewState::Maximized,
+            );
+            assert_eq!(layout.visible, 1);
+            assert!(layout.hidden_right > 0);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    for y in 0..20 {
+        for x in 0..40 {
+            if x < overview.x
+                || x >= overview.x + overview.width
+                || y < overview.y
+                || y >= overview.y + overview.height
+            {
+                assert_eq!(
+                    buffer.cell((x, y)).unwrap().symbol(),
+                    " ",
+                    "draw escaped overview rect at ({x},{y})"
+                );
+            }
+        }
     }
 }

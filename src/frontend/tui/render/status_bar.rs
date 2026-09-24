@@ -160,6 +160,16 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
     // A live workflow always has the Workflow Overview on screen, so advertise
     // the Ctrl-O min/max in whichever direction it can currently go.
     if workflow_active {
+        if let Some(layout) = tab
+            .last_overview_hlayout
+            .filter(|layout| app.active_dialog.is_none() && layout.overflows())
+        {
+            let total = layout.first + layout.visible + layout.hidden_right;
+            spans.push(Span::styled(
+                overview_scroll_hint(layout.first, layout.visible, total),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         let label = if tab.workflow_overview_state.is_maximized() {
             " \u{00b7} ctrl-o minimize workflow overview "
         } else {
@@ -198,6 +208,16 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
     frame.render_widget(bar, area);
 }
 
+/// The visible one-based stage range for a horizontally scrolled overview.
+pub(crate) fn overview_scroll_hint(first: usize, visible: usize, total: usize) -> String {
+    format!(
+        " \u{00b7} shift-\u{2190}/\u{2192} scroll stages ({}\u{2013}{} of {}) ",
+        first + 1,
+        first + visible,
+        total
+    )
+}
+
 /// The hint-bar text for a squad action that failed. `command` is the command
 /// line the key binding dispatched (`squad pause nightly`); it is empty only
 /// when a failure arrives before one was recorded, which is why the fallback
@@ -207,5 +227,52 @@ pub(crate) fn squad_failure_text(command: &str, message: &str) -> String {
         format!("squad action failed: {message}")
     } else {
         format!("{command} failed: {message}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overview_scroll_hint;
+
+    #[test]
+    fn overview_scroll_hint_at_the_left_edge() {
+        assert_eq!(
+            overview_scroll_hint(0, 5, 14),
+            " \u{00b7} shift-\u{2190}/\u{2192} scroll stages (1\u{2013}5 of 14) "
+        );
+    }
+
+    #[test]
+    fn overview_scroll_hint_mid_scroll_is_one_based() {
+        let hint = overview_scroll_hint(2, 6, 14);
+        assert!(hint.contains("(3\u{2013}8 of 14)"), "{hint}");
+    }
+
+    #[test]
+    fn overview_scroll_hint_mid_scroll_of_five() {
+        let hint = overview_scroll_hint(2, 5, 14);
+        assert!(hint.contains("(3\u{2013}7 of 14)"), "{hint}");
+    }
+
+    #[test]
+    fn overview_scroll_hint_at_the_right_edge() {
+        let hint = overview_scroll_hint(9, 5, 14);
+        assert!(hint.contains("(10\u{2013}14 of 14)"), "{hint}");
+    }
+
+    #[test]
+    fn overview_scroll_hint_single_visible_column() {
+        let hint = overview_scroll_hint(3, 1, 14);
+        assert!(hint.contains("(4\u{2013}4 of 14)"), "{hint}");
+    }
+
+    #[test]
+    fn overview_scroll_hint_is_padded_and_names_the_keys() {
+        let hint = overview_scroll_hint(0, 1, 2);
+        assert!(
+            hint.contains("shift-\u{2190}/\u{2192} scroll stages"),
+            "{hint}"
+        );
+        assert!(hint.starts_with(' ') && hint.ends_with(' '));
     }
 }

@@ -513,6 +513,14 @@ Every step of every stage gets its own box, so you can see the whole fan-out at 
 
 Finished steps are never rolled up into a summary — each keeps its own box, name, agent label, and colour for the whole run.
 
+### Wide workflows scroll horizontally
+
+When there are more stages than fit comfortably across the terminal, the overview scrolls sideways instead of squeezing every stage into an unreadably narrow column. A `‹` appears at the left edge when earlier stages are scrolled out of view, and a `›` at the right edge when later ones are. Each marker takes the colour of whatever is hidden behind it: red and bold if a hidden stage has failed, blue if a hidden stage is still running, or dark gray otherwise.
+
+The overview automatically follows the currently running stage, scrolling to keep it in view as the workflow advances. Once you scroll by hand, awman stops following so you can look around. It starts following again when you reach the rightmost stages with the running stage in view, or when the whole workflow fits on screen.
+
+Scroll with **Shift+←** / **Shift+→**, a horizontal mouse wheel, or the mouse wheel while holding **Shift**, anywhere over the overview — a plain wheel still scrolls an oversized parallel stage vertically. Horizontal scrolling is active only while the stages do not fit. When they fit, Shift+wheel scrolls vertically as usual. While they do not fit and no dialog is open, a hint such as `shift-←/→ scroll stages (1–5 of 14)` appears in the status bar next to the Ctrl-O hint, showing which stages are currently visible out of the total.
+
 ### Sharing the screen with the container window
 
 A maximized Workflow Overview never puts the container window away, and maximizing a container never shrinks the overview back down. The two share the rows between the tab bar and the command box:
@@ -765,6 +773,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (independent of Ctrl+M) |
+| **Shift+← / Shift+→** | Scroll the Workflow Overview sideways (only while it doesn't fit at full width; mouse wheel and Shift+mouse wheel also scroll it) |
 | **Ctrl+\\** | Detach from the container view, leaving every container running (see [Detaching](#detaching-from-a-container)) |
 | **Ctrl+S** | Switch focus to the next running container (only when [multiple parallel containers](#parallel-containers) are running; otherwise passed to the container's PTY) |
 | **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
@@ -807,6 +816,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | Type | Forward input directly to the agent |
 | **Ctrl+M** | Minimize the container window |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (intercepted before the agent, like Ctrl+M) |
+| **Shift+← / Shift+→** | Scroll the Workflow Overview sideways instead of forwarding to the agent (only while it doesn't fit at full width) |
 | **Ctrl+\\** | Detach from the container view (intercepted before the agent — never reaches it) |
 | Mouse scroll | Scroll terminal scrollback history (5 lines per tick) |
 | Mouse drag | Select text in the terminal (highlighted with inverted colors) |
@@ -830,8 +840,10 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | Key | Action |
 |-----|--------|
 | **Ctrl+O** | Minimize / maximize the Workflow Overview |
+| **Shift+← / Shift+→** | Scroll the overview left / right (only while it doesn't fit at full width) |
 | Mouse wheel (scroll up) | Scroll an oversized parallel stage upward (reveal hidden steps) |
 | Mouse wheel (scroll down) | Scroll an oversized parallel stage downward |
+| Horizontal mouse wheel, or mouse wheel + Shift | Scroll the overview left / right (only while it doesn't fit at full width) |
 
 ### Configuration dialog
 

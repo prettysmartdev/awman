@@ -18,6 +18,74 @@ fn make_mouse_event(kind: MouseEventKind, col: u16, row: u16, mods: KeyModifiers
     }
 }
 
+fn install_overflowing_overview(app: &mut App) {
+    use crate::frontend::tui::tabs::{
+        StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,
+    };
+    use crate::frontend::tui::workflow_view::horizontal_layout;
+    *app.active_tab().shared.workflow_state.lock().unwrap() = Some(WorkflowViewState {
+        steps: (0..14)
+            .map(|i| WorkflowStepView {
+                name: format!("stage-{i}"),
+                status: StepViewStatus::Pending,
+                agent: None,
+                model: None,
+                depends_on: if i == 0 {
+                    vec![]
+                } else {
+                    vec![format!("stage-{}", i - 1)]
+                },
+                kind: WorkflowStepKind::Agent,
+            })
+            .collect(),
+        current_step: None,
+        max_concurrent: None,
+    });
+    let tab = app.active_tab_mut();
+    tab.last_overview_rect = Some(Rect::new(0, 10, 100, 9));
+    tab.last_overview_hlayout = Some(horizontal_layout(100, 14, 0));
+}
+
+#[test]
+fn horizontal_wheel_and_shift_wheel_scroll_overview_only_when_overflowing() {
+    let mut app = make_app();
+    install_overflowing_overview(&mut app);
+    crate::frontend::tui::mouse_handler::handle_mouse_event(
+        &mut app,
+        make_mouse_event(MouseEventKind::ScrollRight, 20, 12, KeyModifiers::NONE),
+    );
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 1);
+    assert_eq!(app.active_tab().scroll_offset, 0);
+
+    crate::frontend::tui::mouse_handler::handle_mouse_event(
+        &mut app,
+        make_mouse_event(MouseEventKind::ScrollDown, 20, 12, KeyModifiers::SHIFT),
+    );
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 2);
+    assert_eq!(app.active_tab().workflow_overview_scroll_offset, 0);
+
+    crate::frontend::tui::mouse_handler::handle_mouse_event(
+        &mut app,
+        make_mouse_event(MouseEventKind::ScrollDown, 20, 12, KeyModifiers::NONE),
+    );
+    assert_eq!(app.active_tab().workflow_overview_scroll_offset, 1);
+}
+
+#[test]
+fn horizontal_wheel_is_ignored_for_a_fitting_overview() {
+    let mut app = make_app();
+    install_overflowing_overview(&mut app);
+    app.active_tab_mut().last_overview_hlayout = Some(
+        crate::frontend::tui::workflow_view::horizontal_layout(100, 4, 0),
+    );
+    crate::frontend::tui::mouse_handler::handle_mouse_event(
+        &mut app,
+        make_mouse_event(MouseEventKind::ScrollRight, 20, 12, KeyModifiers::NONE),
+    );
+    assert_eq!(app.active_tab().workflow_overview_hscroll_offset, 0);
+    assert_eq!(app.active_tab().workflow_overview_scroll_offset, 0);
+}
+
 /// Install a container slot, set the active tab to Maximized with a
 /// known inner area, and wire the slot's PTY stdin channel; returns the
 /// receiving end for assertions.

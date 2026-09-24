@@ -241,6 +241,9 @@ impl SquadAttachFrontend for TuiCommandFrontend {
         if let Ok(mut view) = self.workflow_view.lock() {
             *view = Some(workflow_state_to_view_state(state));
         }
+        if let Ok(mut invocation_id) = self.workflow_invocation_id.lock() {
+            *invocation_id = Some(state.invocation_id);
+        }
     }
 
     fn reachable_flag(&self) -> Option<Arc<AtomicBool>> {
