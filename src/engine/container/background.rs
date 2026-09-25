@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::engine::agent_runtime::background::{AgentExec, ExecOutput};
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::options::OverlaySpec;
+use crate::engine::container::process::ContainerCli;
 use crate::engine::error::EngineError;
 
 /// A running background container that accepts `exec` calls.
@@ -115,10 +116,11 @@ impl AgentExec for BackgroundContainer {
 // ─── Default backend implementations ─────────────────────────────────────────
 //
 // The Docker and Apple Containers CLIs share identical argv for these
-// operations. The default `ContainerBackend` trait methods delegate here.
+// operations. Both backends' explicit `ContainerBackend` implementations
+// delegate here with their own `ContainerCli`.
 
 pub(super) fn default_start_background(
-    cli_bin: &str,
+    cli: ContainerCli,
     image: &str,
     workdir: &Path,
     env: &HashMap<String, String>,
@@ -127,7 +129,7 @@ pub(super) fn default_start_background(
     let name = crate::engine::container::naming::generate_container_name();
     let args = build_start_background_argv(&name, image, workdir, env, overlays);
 
-    let mut command = Command::new(crate::engine::host_cli::program(cli_bin));
+    let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
     command.args(&args);
     for (k, v) in env {
         command.env(k, v);
@@ -140,10 +142,10 @@ pub(super) fn default_start_background(
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 EngineError::ContainerRuntimeUnavailable {
-                    binary: cli_bin.into(),
+                    binary: cli.bin.into(),
                 }
             } else {
-                EngineError::Container(format!("spawn {cli_bin} run -d: {e}"))
+                EngineError::Container(format!("spawn {} run -d: {e}", cli.bin))
             }
         })?;
 
@@ -240,7 +242,7 @@ pub(super) fn build_start_background_argv(
 }
 
 pub(super) fn default_exec_in_background(
-    cli_bin: &str,
+    cli: ContainerCli,
     container_id: &str,
     command: &str,
     working_dir: &str,
@@ -266,7 +268,7 @@ pub(super) fn default_exec_in_background(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let output = Command::new(crate::engine::host_cli::program(cli_bin))
+    let output = Command::new(crate::engine::host_cli::program(cli.bin))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -285,7 +287,7 @@ pub(super) fn default_exec_in_background(
 }
 
 pub(super) fn default_exec_in_background_streaming(
-    cli_bin: &str,
+    cli: ContainerCli,
     container_id: &str,
     command: &str,
     working_dir: &str,
@@ -312,7 +314,7 @@ pub(super) fn default_exec_in_background_streaming(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let mut child = Command::new(crate::engine::host_cli::program(cli_bin))
+    let mut child = Command::new(crate::engine::host_cli::program(cli.bin))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -376,13 +378,13 @@ pub(super) fn default_exec_in_background_streaming(
     })
 }
 
-pub(super) fn default_stop_and_remove(cli_bin: &str, container_id: &str) {
-    let _ = Command::new(crate::engine::host_cli::program(cli_bin))
+pub(super) fn default_stop_and_remove(cli: ContainerCli, container_id: &str) {
+    let _ = Command::new(crate::engine::host_cli::program(cli.bin))
         .args(["stop", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(crate::engine::host_cli::program(cli_bin))
+    let _ = Command::new(crate::engine::host_cli::program(cli.bin))
         .args(["rm", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -392,8 +394,10 @@ pub(super) fn default_stop_and_remove(cli_bin: &str, container_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::message::UserMessageSink;
     use crate::data::session::{AgentHandle, Session};
     use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
+    use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
     use crate::engine::container::backend::ContainerBackend;
     use crate::engine::container::options::ResolvedContainerOptions;
     use std::sync::Mutex;
@@ -434,8 +438,8 @@ mod tests {
             _wd: &str,
             _ep: &[&str],
             _env: &[(&str, &str)],
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> Option<Vec<String>> {
+            None
         }
         fn attach(&self, _h: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
             unimplemented!("not exercised by BackgroundContainer lifecycle tests")
@@ -452,11 +456,58 @@ mod tests {
         fn display_name(&self) -> &'static str {
             "Recording"
         }
-        fn cli_binary(&self) -> &'static str {
-            "recording-cli"
+        fn capabilities(&self) -> &'static Capabilities {
+            &crate::engine::container::runtime::CONTAINER_CAPABILITIES
         }
-        fn availability_probe_args(&self) -> &'static [&'static str] {
-            &["probe"]
+        fn host_cli(&self) -> Option<&'static str> {
+            None
+        }
+        fn reattach_after_owner_exit(&self) -> bool {
+            false
+        }
+        fn is_available(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+            Ok(Vec::new())
+        }
+        fn remove_agent(&self, _id: &str) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn image_exists(&self, _tag: &str) -> Result<bool, EngineError> {
+            Ok(false)
+        }
+        fn image_home_dir(&self, _tag: &str) -> Result<Option<String>, EngineError> {
+            Ok(None)
+        }
+        fn build_image(
+            &self,
+            _tag: &str,
+            _dockerfile: &std::path::Path,
+            _context: &std::path::Path,
+            _no_cache: bool,
+            _on_line: &mut dyn FnMut(&str),
+        ) -> Result<(), EngineError> {
+            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
+        }
+        fn import_image(
+            &self,
+            _request: &ImageImportRequest,
+            _sink: &mut dyn UserMessageSink,
+        ) -> Result<ImportedImage, EngineError> {
+            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
+        }
+        fn list_dangling_images(
+            &self,
+        ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError>
+        {
+            Ok(Vec::new())
+        }
+        fn remove_image(&self, _id: &str) -> Result<(), EngineError> {
+            Ok(())
         }
         fn start_background(
             &self,
@@ -486,6 +537,16 @@ mod tests {
                 stderr: String::new(),
                 exit_code: 0,
             })
+        }
+        fn exec_in_background_streaming(
+            &self,
+            _id: &str,
+            _command: &str,
+            _wd: &str,
+            _env: Option<&HashMap<String, String>>,
+            _on_line: &mut dyn FnMut(&str),
+        ) -> Result<ExecOutput, EngineError> {
+            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
         }
         fn stop_and_remove(&self, container_id: &str) -> Result<(), EngineError> {
             self.events

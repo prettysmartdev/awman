@@ -13,8 +13,27 @@ Runs on every push and pull request. Three jobs:
 | `fast` | `ubuntu-latest` | `make architecture-lint`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `make test-fast`. Hermetic — no Docker, no real git, no real network. Should finish in under two minutes warm. |
 | `full-linux-docker` | `ubuntu-latest` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
 | `build-macos` | `macos-latest` | `cargo build --release` and `make test-fast`. Smoke-tests cross-platform compilation; does not run Docker tests (macOS hosted runners lack Docker). Depends on `fast`. |
+| `builtin-build` | native Linux ARM64 runner | Opt-in `builtin-runtime` feature build and hermetic runtime/import tests. The target's kernel payload record must be `verified`; this is a build gate, not proof of guest execution. |
+| `builtin-integration` | self-hosted/native Apple Silicon, Linux ARM64, Linux x86_64 | Opt-in guest integration matrix (`AWMAN_TEST_BUILTIN=1`): same-executable worker boot, image import, execution, and artifact helper/dependency scans. Linux runners require accessible KVM; Apple Silicon requires Hypervisor.framework entitlement. The Apple and x86_64 jobs stay disabled/blocked until native kernel extraction and manifest verification succeed. |
 
 Cargo's registry, git cache, and `target/` are cached per-OS to keep warm runs fast.
+
+The builtin integration gate is separate from `test-fast` and `full-linux-docker`;
+those jobs never boot a guest by default. Each native job first checks host
+architecture, verified payload hashes, and KVM or Apple entitlement access. A
+missing prerequisite or unavailable runner is reported as **SKIP** or
+**BLOCKED**, with the reason and unblocking condition recorded; it cannot be
+reported as a successful execution test. Required hardware coverage is Apple
+Silicon macOS and both Linux architectures (ARM64 and x86_64), not cross-builds
+on another host.
+
+Changes to SQLx, rusqlite, or native SQLite rerun the SQLite resolution gate on
+supported native targets: one bundled `libsqlite3-sys`, combined link, awman
+store tests, msb migrations, cross-driver transactions, and old/new catalog
+round trips. Missing fixtures or target hardware block the relevant subcheck.
+Builtin artifacts also receive minimal-PATH/offline execution checks, dynamic
+dependency inspection, and helper-extraction scans; no runtime step may depend
+on developer spike scripts or temporary files.
 
 ### `Release` (`.github/workflows/release.yml`)
 

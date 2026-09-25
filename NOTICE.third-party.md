@@ -1,0 +1,7 @@
+# Embedded runtime notices and source obligations
+
+WI 0119 embeds a Linux kernel and guest-agent release payload from Microsandbox v0.7.2 (`60d4dc8a436fb9365491567ec21d073e924e3c6d`) and libkrun firmware originating at `2bd0f84ad0956f3032e0490d3b8512b6851eca12`. The kernel is GPL-2.0; distributors must provide corresponding source, kernel configuration and any required source offer. The release asset checksums and extraction process are in `third_party/msb-payloads/manifest.toml` and `tools/msb-payloads/`.
+
+`msb_krun` and `microsandbox-filesystem` are Apache-2.0 licensed; their vendored license files are in each directory. `sqlx-sqlite` is MIT OR Apache-2.0 licensed; both license files are retained. `libcap-ng` 0.8.3 is LGPL-2.1-or-later and statically linked on Linux. Its source archive URL and checksum are in `third_party/native/libcap-ng/SOURCE.md`. Distribution must provide a compliant relinking route, such as retained object files and instructions, as well as notices and corresponding source. This approach needs maintainer legal review before release.
+
+The executable still uses ordinary host ABI libraries and macOS system frameworks. It is not exclusively Rust.

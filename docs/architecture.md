@@ -106,7 +106,15 @@ src/
       backend.rs          ContainerBackend trait (pub(super) — opaque to callers)
       docker.rs           DockerBackend (pub(super))
       apple.rs            AppleBackend (pub(super); macOS only)
+      host_cli_backend.rs Shared body of the CLI-driven backends (Docker, Apple)
+      builtin/            BuiltinBackend: embedded microVM runtime (feature `builtin-runtime`; Linux x86_64/arm64, macOS arm64) — driver, exec bridge, worker entry, state paths
       naming.rs           generate_container_name()
+    oci/
+      mod.rs              ImageAcquirer contract, CachingAcquirer, private archive cache
+      resolve.rs          Image-source resolution and the external-build hint
+      registry.rs         OCI registry client
+      docker_engine.rs    Docker Engine API export
+      archive.rs          Archive validation (digests, platform, layer safety)
     workflow/
       mod.rs              WorkflowEngine struct + all public methods
       actions.rs          NextAction, AvailableActions, WorkflowOutcome, StepOutcome, …
@@ -846,7 +854,9 @@ impl ContainerRuntime {
 }
 ```
 
-Backend selection rules: `"docker"` or absent → Docker; `"apple-containers"` on macOS → Apple; `"apple-containers"` on non-macOS → `EngineError::BackendUnsupportedOnPlatform`; unknown value → warn + Docker.
+Backend selection rules: `"docker"` or absent → Docker; `"apple-containers"` on macOS → Apple; `"apple-containers"` on non-macOS → `EngineError::BackendUnsupportedOnPlatform`; `"builtin"` → the embedded microVM backend (an error if this build, host, or environment cannot run it); unknown value → fatal `UnknownRuntime` error (no Docker fallback).
+
+Backends declare `Capabilities`, including how images are obtained: `Build` (Docker, Apple: `awman ready` builds from Dockerfiles), `Import` (builtin: `awman ready` imports a finished OCI image from a configured source) or `Kit` (Docker Sandboxes). Callers branch on the capability, never on the runtime name. The builtin backend boots each session in a VM through a separate process that is the same awman executable re-invoked with a reserved internal argument; see [Runtimes](11-runtimes.md#builtin-microvm).
 
 #### `ContainerOption`
 

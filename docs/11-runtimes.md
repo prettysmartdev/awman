@@ -1,6 +1,6 @@
 # Runtimes
 
-awman supports three agent runtimes. The runtime controls how agent processes are isolated from your host machine. All three use the same `awman` commands, the same workflow files, and the same agent names — the runtime is a configuration choice, not a different tool.
+awman supports four agent runtimes. The runtime controls how agent processes are isolated from your host machine. All four use the same `awman` commands, the same workflow files, and the same agent names — the runtime is a configuration choice, not a different tool.
 
 ---
 
@@ -11,6 +11,7 @@ awman supports three agent runtimes. The runtime controls how agent processes ar
 | `docker` (default) | Linux, macOS, Windows | Linux container (shared kernel) | Docker daemon |
 | `apple-containers` | macOS 26+ only | Lightweight VM per container | macOS 26 Tahoe |
 | `docker-sbx-experimental` | macOS arm64; Windows x86_64 | MicroVM per session | `sbx` CLI + Docker account |
+| `builtin` | Linux x86_64 / arm64 (KVM); macOS Apple Silicon | MicroVM per session, embedded in awman | An awman build that includes the runtime, plus KVM or the macOS hypervisor entitlement. No Docker, `container`, or `sbx` needed to *run* agents |
 
 Set the runtime in your global config:
 
@@ -18,11 +19,12 @@ Set the runtime in your global config:
 awman config set --global runtime docker                   # default
 awman config set --global runtime apple-containers         # macOS 26+ only
 awman config set --global runtime docker-sbx-experimental  # experimental
+awman config set --global runtime builtin                  # embedded microVM; see below
 ```
 
 You can switch runtimes at any time — each keeps its own separate state and does not interfere with the others. See [Switching runtimes](#switching-runtimes).
 
-**Invalid values are a fatal error.** If the `runtime` field holds anything other than the three strings above, awman refuses to start — it does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. CLI commands print the invalid value and the valid options, then exit immediately; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). Fix the `runtime` value in `$HOME/.awman/config.json` and relaunch.
+**Invalid values are a fatal error.** If the `runtime` field holds anything other than the four strings above, awman refuses to start — it does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. CLI commands print the invalid value and the valid options, then exit immediately; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). Fix the `runtime` value in `$HOME/.awman/config.json` and relaunch.
 
 ---
 
@@ -55,6 +57,195 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 - `--allow-docker` (host Docker socket mount) is not supported under this runtime.
 
 **`awman ready` for Apple Containers** builds the same per-agent images used by Docker, using `container build` instead of `docker build`. The workflow is identical.
+
+---
+
+## Builtin microVM
+
+`builtin` is designed to run each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable**. Each VM starts another process of that same executable. No separately installed execution runtime is required.
+
+**Isolation model:** a hardware-virtualized VM with its own kernel per session. The hypervisor, device emulation, and shared-filesystem implementations form part of the security boundary. The configured project, settings, and overlay mounts grant access to host files. There is no host Docker socket bridge.
+
+> **Status:** the builtin runtime is new. Its configuration, image import, archive validation, and lifecycle logic are covered by automated tests, but starting a real guest, and everything that happens *inside* one (PTY and ACP sessions, resource limits, networking, credential-file access by a non-root user, squad and workflow runs), has so far been exercised only against simulated drivers, not on real KVM or Apple Silicon hosts. Treat it as a preview and see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what is known to differ.
+
+### Where it is available
+
+| Host | Requirement |
+|---|---|
+| Linux x86_64 or arm64 | Read/write access to `/dev/kvm` (KVM enabled; usually membership of the `kvm` group) |
+| macOS on Apple Silicon | The awman binary must carry the `com.apple.security.hypervisor` entitlement |
+| macOS on Intel, Windows, other architectures | Not supported. Selecting `builtin` reports `not supported on <os>/<arch>; supported platforms: linux/x86_64, linux/aarch64, macos/aarch64` |
+
+The runtime is only present in awman builds compiled with it. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
+
+- **Release configuration:** only `awman-linux-arm64` is configured to include the builtin runtime. This does not establish that a published or boot-tested release exists. The Linux x86_64 and macOS assets are configured without it.
+- **Building from source:** run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. `make install` includes the runtime automatically when the payloads for your host are verified and otherwise builds the existing runtimes only. Payloads for Linux x86_64 and macOS Apple Silicon are not yet verified, so a source build cannot include the runtime on those hosts yet.
+- **macOS entitlement:** a macOS binary that includes the runtime must be code-signed with the `com.apple.security.hypervisor` entitlement, or the VM cannot start (`embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …`). Signed macOS builds that include the runtime are not yet distributed.
+
+### Setup
+
+```sh
+awman config set --global runtime builtin
+awman ready
+```
+
+`awman ready` does not build anything for this runtime. It **imports** a finished image from a source you choose, so the first `awman ready` tells you what to do — see [Getting an agent image](#getting-an-agent-image).
+
+### Getting an agent image
+
+Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. The builtin runtime never builds. Build the same images yourself with Docker (or any OCI builder), then tell awman where to import the result from.
+
+**1. Build the images** from the repo root, in this order (the agent image is `FROM` the project image). Running `awman ready` first prints these exact commands for your project and agent, and downloads `.awman/Dockerfile.<agent>` if it is missing:
+
+```sh
+docker build -t awman-myproject:latest -f Dockerfile.dev .
+docker build -t awman-myproject-claude:latest -f .awman/Dockerfile.claude .
+```
+
+Build for the host's architecture (`linux/amd64` on x86_64 hosts, `linux/arm64` on ARM hosts, including Apple Silicon). The build can happen on another machine.
+
+**2. Choose an image source** in `builtin.imageSource` (or per image in `builtin.images`) in your global or repo config JSON:
+
+```jsonc
+// one of:
+{ "type": "docker-store" }                                   // export from a local Docker Engine
+{ "type": "archive", "path": "/abs/path/claude.tar" }        // after: docker save awman-myproject-claude:latest -o /abs/path/claude.tar
+{ "type": "registry", "registry": "ghcr.io", "reference": "acme/awman-myproject-claude:latest" }  // after pushing
+```
+
+**3. Import:**
+
+```sh
+awman ready
+```
+
+The image is imported into awman's private store. Docker is used only as a *source* at this step (awman talks to the Engine API directly and never runs the `docker` CLI). Agents never run in Docker under this runtime, and after import Docker does not need to be running.
+
+There is no default source. With none configured, `awman ready` fails with `no image source is configured for '<tag>'` followed by the build commands above, rather than guessing a registry or daemon.
+
+**`awman init` and `builtin`.** `awman init` builds images through the configured runtime, so with `runtime` set to `builtin` its build step fails (`image building; build externally and import with ready is not supported on the builtin runtime`) and the agent audit is skipped. Run `awman init` before selecting `builtin` (or with `docker` temporarily selected), then switch the runtime and run `awman ready` after building externally.
+
+### Image sources
+
+Every source is explicit. A source never falls back to another one, and the same name from a registry and from a Docker daemon are treated as different images. Each source has a `type`; unknown `type` values and unknown fields are rejected.
+
+| `type` | Fields | Behavior |
+|---|---|---|
+| `registry` | `registry`, `reference` (at least one required) | Pulls the image for the host platform from an OCI registry. `reference` defaults to the awman image tag on `registry`; a `reference` naming a different registry than `registry` is refused. Docker Hub names are normalized (`library/`). Manifests and blobs are verified against their digests. |
+| `docker-store` | `host`, `tls`, `reference` (all optional) | Exports the image from a Docker Engine over its API (Engine API 1.41 or newer). `host` defaults to `$DOCKER_HOST`, then the platform default socket (`/var/run/docker.sock`; on macOS `~/.docker/run/docker.sock` is tried first). `host` must start with `unix://` or `tcp://`; plain `tcp://` is allowed only for loopback addresses. `ssh://` and `npipe://` are refused as unsupported. `tls` (`ca`, optional `cert` and `key`, `verify` default `true`) applies only to `tcp://` hosts; `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` are honored when the host comes from `DOCKER_HOST`. |
+| `archive` | `path` (absolute) | Reads a tar from disk: `docker save` output, an OCI image layout, or either one gzip-compressed. Re-imported automatically when the file changes. |
+| `apple-store` | `reference` | **Blocked.** Apple provides no supported export API, and awman will not run the `container` helper or read Apple's private store. Selecting it fails with `apple-store image source is blocked` and tells you to run `container image save <ref> -o <file>` yourself and use an `archive` source instead. That archive route is a workaround, not Apple-store support. |
+
+`reference` defaults to the awman image tag (`awman-<project>-<agent>:latest`) when omitted.
+
+**Per-image overrides.** `builtin.images` maps an awman image tag to its own source; it wins over `builtin.imageSource` for that tag:
+
+```json
+{
+  "builtin": {
+    "imageSource": { "type": "docker-store" },
+    "images": {
+      "awman-myproject-claude:latest": { "type": "archive", "path": "/opt/images/claude.tar" }
+    }
+  }
+}
+```
+
+**Registry settings.** `builtin.registries` is keyed by `host[:port]`:
+
+```json
+{
+  "builtin": {
+    "registries": {
+      "registry.example.com": {
+        "caCert": "/etc/ssl/corp-ca.pem",
+        "auth": { "type": "env", "usernameVar": "REG_USER", "passwordVar": "REG_PASS" }
+      },
+      "localhost:5000": { "insecure": true }
+    }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `insecure` | `true` allows plain HTTP for this host only (default `false`) |
+| `caCert` | PEM bundle of extra trusted CAs for this host |
+| `auth` | Where credentials come from; secrets are never stored in config. `{"type":"anonymous"}`; `{"type":"env","usernameVar":…,"passwordVar":…}` reads named environment variables; `{"type":"keychain","service":…}` reads an item from awman's OS keychain (account = registry host, value `username:password`); `{"type":"docker-config"}` reads inline `auths` entries from `~/.docker/config.json` |
+
+`docker-config` supports inline credentials only. If the file names a `credsStore` or `credHelpers` entry, awman reports an authentication error naming the helper and does **not** execute it; use `env` or `keychain` instead. Credentials are sent only to the registry itself (and Docker Hub's own token service); a token server on any other host is contacted anonymously. Registry pulls honor `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
+
+### What `awman ready` does under `builtin`
+
+- The base project image is reported as **skipped** (it is only an input to your external build). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
+- With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
+- `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged.
+- If a Dockerfile changed after you built, `ready` warns you to rebuild externally and re-run `awman ready --build`.
+- Older acquisition-cache references without per-source metadata must be acquired again once. Installed images remain runnable without their source.
+- Workflow setup/teardown steps use the imported agent image of the repo's configured agent (default `claude`) unless the workflow or config sets an explicit `baseImage`, which must already be imported. A workflow whose agent image is not imported stops at pre-flight with the build instructions instead of offering to build.
+
+Importing enforces safety limits: a total archive of up to 32 GiB, up to 8 GiB per layer after decompression, up to 256 layers, and at least 1 GiB of free disk space. Archive metadata and the selected image's layers are validated before import: digests must match, the image must be for the host's Linux platform, and selected images with path traversal, writes through symlinks, device nodes, unsafe hard links, or malformed whiteouts are rejected (`image archive … rejected: <reason>`). Only the selected image and requested tag reach the runtime importer; unselected images and unrelated tags are excluded, while selected config and layer bytes are preserved. zstd-compressed and non-distributable layers are not supported. Launching a session never pulls or reads any source: it uses only the already-imported image.
+
+### Configuration
+
+The `runtime` key is global; the `builtin` block can be set in the global config and per repo. Repo values override global ones per field, and the `images` and `registries` maps merge per key.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `builtin.stateDir` | `~/.awman/builtin` (under the awman data home) | Private state root. Must be an absolute path without `..`, owned by you with mode `0700`, and contain no symlinks. Keep it short: control sockets live below it and paths are limited to about 100 bytes (`socket path … is longer than the … limit; configure a shorter builtin state directory`). The `AWMAN_BUILTIN_STATE_DIR` environment variable overrides it. |
+| `builtin.vcpus` | `2` | Whole vCPUs per session VM, 1–255. Fractional values are rejected, never rounded. |
+| `builtin.memoryMib` | `4096` | Guest memory in MiB, 128 or more. |
+| `builtin.imageSource` | unset | Default image source (see above). |
+| `builtin.images` | `{}` | Per-image-tag sources. |
+| `builtin.registries` | `{}` | Per-registry settings. |
+
+`vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The three object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin`, and an invalid one is an error naming the bad key.
+
+### Session lifecycle
+
+- Each agent session, and each workflow setup/teardown environment, is its own microVM, removed when the session ends.
+- Ctrl-C sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed.
+- **The awman process that launched a session must keep running.** If it exits, the session's VM stops. Detaching and reattaching works while that process is alive; reattaching after it has exited is not supported. Checkpoint restore is not supported.
+- `awman status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.
+- If you replace the awman binary while a session is running, new operations report `awman was replaced on disk while this session was running; restart awman to use the builtin runtime`. An awman with a different internal protocol version refuses to adopt sandboxes created by another version (`builtin runtime worker protocol mismatch … stop running agents started by an older awman and retry`): stop those agents with the awman that started them first.
+
+### Parity limits versus Docker and Apple Containers
+
+| | Docker / Apple Containers | Builtin |
+|---|---|---|
+| Image creation | `ready` builds from Dockerfiles | `ready` imports; you build externally |
+| Fractional CPU | Supported | Rejected (`cannot honour …`): whole vCPUs only |
+| Resource limit enforcement | Container-level limits | VM allocation; enforcement is not yet verified in a real guest |
+| `--allow-docker` | Mounts the host Docker socket (Docker only) | **Rejected.** No socket is ever mounted and there is no host daemon bridge |
+| Reattach after the launching awman exits | Docker: yes. Apple: no | No |
+| Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; services on the host's loopback are not reachable that way. Guest networking is not yet verified |
+| Tool allow/deny lists for an agent with no matching flag | See [Agent Sessions](03-agent-sessions.md) | Rejected with an error instead of being silently discarded |
+| Named image `USER` (like `awman` in the templates) | Handled by the container engine | Resolved to a numeric id from the imported image's `/etc/passwd` and `/etc/group`; an unresolvable user is refused. Reading a staged credential file as that user inside a guest is not yet verified |
+| Image `HOME` | From the image | From the imported image; a missing or non-absolute `HOME` is refused |
+| Overlays (`dir`, `skill`, `env`, `context`), agent settings and system prompts | Bind mounts / env | Same overlay semantics. Directories are directory mounts and single files are single-file mounts (the parent directory is never mounted). Sockets can't be mounted as overlays |
+
+### Troubleshooting
+
+| Message | Cause and fix |
+|---|---|
+| `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature` | This awman build lacks the runtime. Use an asset that includes it or build from source (see above), or select another runtime. |
+| `… not supported on <os>/<arch>; supported platforms: …` | Unsupported host. |
+| `cannot access /dev/kvm: …; enable KVM and grant this user read/write access` | Enable virtualization in firmware or VM settings and add your user to the `kvm` group (log out and in). |
+| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | The VM process could not start: repeat the KVM check on Linux; on macOS the binary is missing the hypervisor entitlement. |
+| `the builtin runtime refuses to start while MSB_PATH is set …` | `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, or `MSB_BACKEND` would replace the embedded runtime. Unset the variable. |
+| `a Microsandbox configuration exists at <path> …` | An existing Microsandbox `config.json` could change the embedded runtime. Move or rename it, or use another runtime. |
+| `no image source is configured for '<tag>'` | Set `builtin.imageSource` or `builtin.images` (see [Getting an agent image](#getting-an-agent-image)). |
+| `image <tag> is not imported; run awman ready with an explicit image source`, or `… is not in the builtin image cache …` | Run `awman ready`. |
+| `image '<ref>' was not found in the Docker Engine at <endpoint>` | Build it first, or fix `reference`. |
+| `apple-store image source is blocked` | Use an `archive` source (see above). |
+| `digest mismatch …`, `platform mismatch … wanted linux/arm64, found …` | A corrupt transfer, or the image was built for another architecture. Rebuild for the host platform. |
+| `image archive <path> rejected: …` | The archive failed validation; the reason names the problem. |
+| `not enough disk space at <path> …` | Free space on the state directory's filesystem. |
+| `the builtin runtime cannot honour <request>: …` | Fractional CPU, out-of-range memory, or an unsupported agent option. |
+| `Docker socket bridge is not supported on the builtin runtime` | You passed `--allow-docker`. Drop the flag; it is not available under `builtin`. |
+| `builtin runtime is busy: another awman process held …` | Retry shortly; another awman is importing an image or updating its catalog. |
+
+See [Cleaning Up](13-cleaning-up.md#builtin-runtime-state) for reclaiming disk space.
 
 ---
 
@@ -338,7 +529,9 @@ You can switch between runtimes at any time by changing the `runtime` setting. E
 - **Docker / Apple Containers:** per-repo `.awman/Dockerfile.<agent>` files and the local Docker / containerd image store. These are unchanged when you switch to sbx.
 - **Docker Sandboxes:** `~/.awman/kits/<agent>/` (host-global kit files) and `<workspace>/.awman/session.json` (per-launch dynamic config written just before each launch). These are not touched when you switch to Docker or Apple Containers.
 
-Switching runtimes does not delete state for the other runtimes. You can keep all three ready simultaneously.
+- **Builtin:** the private state directory (`~/.awman/builtin` by default) holding imported images and session VMs. Its images are separate from the Docker and Apple image stores.
+
+Switching runtimes does not delete state for the other runtimes. You can keep all four ready simultaneously.
 
 **Switching mid-project:** if you run `awman chat` under Docker and then switch to sbx and run `awman chat` against the same worktree, you start a fresh sbx sandbox. In-VM state from the Docker container is not transferred (containers and microVMs are completely separate environments). Your Git repo state is shared — both runtimes see the same files on disk.
 
@@ -359,7 +552,7 @@ awman config set --global runtime docker
 awman chat --agent claude                   # runs in Docker container, unchanged
 ```
 
-`awman ready` is per-runtime: running it with `runtime: "docker"` does not touch sbx kits; running it with `runtime: "docker-sbx-experimental"` does not touch Docker images.
+`awman ready` is per-runtime: running it with `runtime: "docker"` does not touch sbx kits; running it with `runtime: "docker-sbx-experimental"` does not touch Docker images; running it with `runtime: "builtin"` imports into the builtin store and never builds.
 
 ---
 

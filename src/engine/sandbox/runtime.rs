@@ -32,6 +32,8 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
     host_paths_visible: false,
     session_label_supported: false,
     has_image_store: false,
+    image_acquisition: crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+    fractional_cpu: false,
 };
 
 pub struct SandboxRuntime {
@@ -175,7 +177,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
         _working_dir: &str,
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         // `sbx exec -it [--env K=V…] <sandbox-name> <entrypoint…>`.
         //
         // `agent_id` carries the deterministic sandbox name for re-attach.
@@ -191,7 +193,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
         }
         args.push(agent_id.to_string());
         args.extend(entrypoint.iter().map(|s| s.to_string()));
-        args
+        Some(args)
     }
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
@@ -208,8 +210,8 @@ impl AgentRuntimeEngine for SandboxRuntime {
         Ok(running)
     }
 
-    fn cli_binary(&self) -> &'static str {
-        self.backend.cli_binary()
+    fn host_cli(&self) -> Option<&'static str> {
+        Some(self.backend.cli_binary())
     }
 
     fn ready_agent(

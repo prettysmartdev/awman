@@ -1,0 +1,265 @@
+//! Included only by the binary, before its async/frontend startup.
+#[cfg(awman_builtin)]
+#[path = "embedded/kernel.rs"]
+mod kernel;
+#[cfg(awman_builtin)]
+#[path = "embedded/version.rs"]
+mod version;
+
+/// Return true only for the reserved, first-argument internal routes.
+pub fn dispatch(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> bool {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let worker = is_worker_invocation(&arguments);
+    let info = arguments.first().map(std::ffi::OsString::as_os_str)
+        == Some(std::ffi::OsStr::new("__awman-builtin-info"));
+    if !worker && !info {
+        return false;
+    }
+    // The binary supplies OS strings so non-UTF-8 overrides cannot disappear
+    // through the data layer's String-based environment snapshot. Never print
+    // values. Build-time payload variables do not affect runtime resolution.
+    for (key, _) in environment {
+        if matches!(
+            key.to_str(),
+            Some(
+                "MSB_PATH"
+                    | "MSB_LIBKRUNFW_PATH"
+                    | "MSB_AGENTD_PATH"
+                    | "MSB_HOME"
+                    | "MSB_BACKEND"
+                    | "MSB_CONFIG_PATH"
+                    | "MSB_PROFILE"
+            )
+        ) {
+            eprintln!("awman: ambient Microsandbox overrides are forbidden for the private embedded worker");
+            std::process::exit(64);
+        }
+    }
+    #[cfg(awman_builtin)]
+    {
+        version::retain();
+        if info {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "msb_version": "0.7.2", "worker_protocol": "0.7.2/18/awman-1",
+                    "target_os": std::env::consts::OS, "target_arch": std::env::consts::ARCH,
+                    "libkrun_commit": "2bd0f84ad0956f3032e0490d3b8512b6851eca12",
+                    "kernel_sha256": kernel::KERNEL_SHA256,
+                    "embedded_kernel": true, "embedded_guest_agent": true,
+                    "host_helpers": false, "reattach_after_owner_exit": false,
+                    "checkpoint_restore": false
+                })
+            );
+            return true;
+        }
+        enter();
+    }
+    #[cfg(not(awman_builtin))]
+    {
+        eprintln!("awman: this build has no builtin runtime worker");
+        std::process::exit(70);
+    }
+}
+
+#[cfg(awman_builtin)]
+fn enter() -> ! {
+    use clap::Parser;
+    #[derive(Parser)]
+    #[command(disable_help_flag = true, disable_version_flag = true)]
+    struct Worker {
+        #[command(flatten)]
+        args: microsandbox_cli::machine_cmd::MachineArgs,
+    }
+    // Parse errors are deliberately generic: private invocations must not echo argv.
+    let parsed = Worker::try_parse_from(std::env::args_os().skip(1));
+    let Ok(parsed) = parsed else {
+        eprintln!("awman: invalid private worker invocation (inherited descriptors required)");
+        std::process::exit(64);
+    };
+    let args = parsed.args;
+    let descriptors = WorkerDescriptors {
+        config: args.config_fd,
+        parent_watch: args.parent_watch_fd,
+        lifecycle_lock: args.lifecycle_lock_fd,
+        startup: args.startup_fd,
+    };
+    if !descriptors.valid() || args.config_file.is_some() || args.restore {
+        eprintln!("awman: private worker requires distinct inherited descriptors; file transport and restore are disabled");
+        std::process::exit(64);
+    }
+    if let Err(error) = kernel::register() {
+        eprintln!("awman: {error}");
+        std::process::exit(70);
+    }
+    // The SDK adopts descriptors exactly once, installs watchdog/startup/lock
+    // ownership, enters the VMM and exits the process on VM termination.
+    microsandbox_cli::machine_cmd::run(args)
+}
+
+/// The worker route is taken only for the SDK's private argv shape: first
+/// argument `machine` plus an inherited `--config-fd`. A human typing
+/// `awman machine --help` falls through to clap's normal error instead.
+fn is_worker_invocation(arguments: &[std::ffi::OsString]) -> bool {
+    arguments.first().map(std::ffi::OsString::as_os_str) == Some(std::ffi::OsStr::new("machine"))
+        && arguments.iter().skip(1).any(|argument| {
+            argument
+                .to_str()
+                .is_some_and(|a| a == "--config-fd" || a.starts_with("--config-fd="))
+        })
+}
+
+/// Inherited descriptors named on the private worker argv.
+///
+/// awman always spawns attached (`msb_driver.rs`), and SDK 0.7.2 then passes
+/// `--config-fd`, `--parent-watch-fd` and (launch contract patch 18)
+/// `--lifecycle-lock-fd`. `--startup-fd` exists only for detached spawns
+/// (`microsandbox/lib/runtime/spawn.rs`), so it is optional and checked only
+/// when present.
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
+struct WorkerDescriptors {
+    config: Option<i32>,
+    parent_watch: Option<i32>,
+    lifecycle_lock: Option<i32>,
+    startup: Option<i32>,
+}
+
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
+impl WorkerDescriptors {
+    fn valid(&self) -> bool {
+        let required = [self.config, self.parent_watch, self.lifecycle_lock];
+        if required.iter().any(Option::is_none) {
+            return false;
+        }
+        let mut fds: Vec<i32> = required
+            .into_iter()
+            .chain([self.startup])
+            .flatten()
+            .collect();
+        fds.sort_unstable();
+        fds.iter().all(|fd| *fd >= 3) && fds.windows(2).all(|pair| pair[0] != pair[1])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn argv(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    fn descriptors(
+        config: Option<i32>,
+        parent_watch: Option<i32>,
+        lifecycle_lock: Option<i32>,
+        startup: Option<i32>,
+    ) -> WorkerDescriptors {
+        WorkerDescriptors {
+            config,
+            parent_watch,
+            lifecycle_lock,
+            startup,
+        }
+    }
+
+    /// Regression: the SDK never passes `--startup-fd` for attached spawns,
+    /// which is the only mode awman uses. The worker must accept that shape.
+    #[test]
+    fn attached_sdk_descriptor_shape_is_accepted() {
+        assert!(descriptors(Some(3), Some(5), Some(4), None).valid());
+    }
+
+    #[test]
+    fn detached_shape_with_startup_fd_is_accepted() {
+        assert!(descriptors(Some(3), Some(5), Some(4), Some(6)).valid());
+    }
+
+    #[test]
+    fn missing_required_descriptor_is_rejected() {
+        assert!(!descriptors(None, Some(5), Some(4), None).valid());
+        assert!(!descriptors(Some(3), None, Some(4), None).valid());
+        assert!(!descriptors(Some(3), Some(5), None, None).valid());
+    }
+
+    #[test]
+    fn stdio_or_duplicate_descriptors_are_rejected() {
+        assert!(!descriptors(Some(2), Some(5), Some(4), None).valid());
+        assert!(!descriptors(Some(3), Some(3), Some(4), None).valid());
+        assert!(!descriptors(Some(3), Some(5), Some(4), Some(5)).valid());
+        assert!(!descriptors(Some(3), Some(5), Some(4), Some(0)).valid());
+    }
+
+    #[test]
+    fn worker_route_requires_machine_and_config_fd() {
+        // Exact attached argv shape rendered by SDK 0.7.2 `spawn.rs`.
+        assert!(is_worker_invocation(&argv(&[
+            "machine",
+            "--name",
+            "awman-x",
+            "--sandbox-id",
+            "7",
+            "--parent-watch-fd",
+            "5",
+            "--vcpus",
+            "2",
+            "--memory-mib",
+            "2048",
+            "--config-fd",
+            "3",
+            "--lifecycle-lock-fd",
+            "4",
+        ])));
+        assert!(is_worker_invocation(&argv(&["machine", "--config-fd=3"])));
+        assert!(!is_worker_invocation(&argv(&["machine", "--help"])));
+        assert!(!is_worker_invocation(&argv(&["machine"])));
+        assert!(!is_worker_invocation(&argv(&[
+            "status",
+            "--config-fd",
+            "3"
+        ])));
+    }
+
+    /// Regression for the attached launch: parse the SDK-rendered argv with
+    /// the SDK's own `MachineArgs` and run the worker's descriptor check.
+    #[cfg(awman_builtin)]
+    #[test]
+    fn sdk_attached_argv_parses_and_validates() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Worker {
+            #[command(flatten)]
+            args: microsandbox_cli::machine_cmd::MachineArgs,
+        }
+        let parsed = Worker::try_parse_from([
+            "machine",
+            "--name",
+            "awman-x",
+            "--sandbox-id",
+            "7",
+            "--parent-watch-fd",
+            "5",
+            "--vcpus",
+            "2",
+            "--memory-mib",
+            "2048",
+            "--config-fd",
+            "3",
+            "--lifecycle-lock-fd",
+            "4",
+        ])
+        .expect("SDK attached argv must parse")
+        .args;
+        assert!(parsed.startup_fd.is_none());
+        assert!(WorkerDescriptors {
+            config: parsed.config_fd,
+            parent_watch: parsed.parent_watch_fd,
+            lifecycle_lock: parsed.lifecycle_lock_fd,
+            startup: parsed.startup_fd,
+        }
+        .valid());
+    }
+}

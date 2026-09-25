@@ -16,18 +16,26 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             artifact: awman-linux-amd64
+            # Payload manifest status is `unverified` (build.rs refuses it); enable
+            # once tools/msb-payloads/fetch.sh has run natively and recorded hashes.
+            builtin: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
+            os: ubuntu-24.04-arm
             artifact: awman-linux-arm64
+            builtin: true
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: awman-macos-amd64
+            builtin: false
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: awman-macos-arm64
+            # Unverified payload and no hardened-runtime signing step yet (B-02, B-05).
+            builtin: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: awman-windows-amd64.exe
+            builtin: false
 
     steps:
       - uses: actions/checkout@v7
@@ -38,15 +46,50 @@ jobs:
           toolchain: "1.94.0"
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Prepare builtin payloads and native archive
+        if: matrix.builtin
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          bash tools/msb-payloads/fetch.sh ${{ matrix.target }}
+          if [ "${{ runner.os }}" = Linux ]; then bash third_party/native/libcap-ng/build.sh ${{ matrix.target }}; fi
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ "${{ matrix.builtin }}" = true ]; then
+            cargo build --locked --release --features builtin-runtime --target ${{ matrix.target }}
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
+          fi
+
+      - name: Inspect release dependencies and extracted helpers
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dependency-listing state-smoke
+          if [ "${{ runner.os }}" = macOS ]; then
+            otool -L target/${{ matrix.target }}/release/awman > dependency-listing/${{ matrix.target }}.txt
+          else
+            ldd target/${{ matrix.target }}/release/awman > dependency-listing/${{ matrix.target }}.txt
+          fi
+          HOME="$PWD/state-smoke" target/${{ matrix.target }}/release/awman --version
+          find state-smoke -type f \( -name 'msb' -o -name 'agentd' -o -name 'libkrunfw*' \) > dependency-listing/${{ matrix.target }}-helpers.txt
+          test ! -s dependency-listing/${{ matrix.target }}-helpers.txt
+
+      - name: Scan the optimized artifact (dependencies, .msbver section, helper extraction, worker refusals)
+        if: matrix.builtin
+        env:
+          AWMAN_TEST_BUILTIN_ARTIFACT: ${{ github.workspace }}/target/${{ matrix.target }}/release/awman
+        run: >-
+          bash tools/isolated-test.sh --locked --release --features builtin-runtime
+          --target ${{ matrix.target }} --test builtin_runtime --
+          builtin_dependency builtin_binary_carries builtin_no_helper builtin_info
+          builtin_ambient builtin_worker builtin_version builtin_trace
+
+      - name: Upload dependency listing
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-listing-${{ matrix.target }}
+          path: dependency-listing/
 
       - name: Rename binary (unix)
         if: runner.os != 'Windows'
@@ -79,7 +122,7 @@ jobs:
       - name: Collect binaries
         run: |
           mkdir -p release
-          find artifacts -type f -exec cp {} release/ \;
+          find artifacts -path '*/awman-*/*' -type f -exec cp {} release/ \;
           ls -la release/
 
       - name: Extract tag version

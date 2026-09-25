@@ -1,0 +1,7 @@
+*/kernel.bin
+*/kernel.meta
+*/agentd
+*/extract-kernel
+*/*.tar.gz
+*/*.dylib
+*/*.so*

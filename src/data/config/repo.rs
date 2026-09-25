@@ -404,6 +404,10 @@ pub struct RepoConfig {
     pub auth_refresh: Option<AuthRefreshConfig>,
     #[serde(rename = "launchMode", skip_serializing_if = "Option::is_none")]
     pub launch_mode: Option<LaunchMode>,
+    /// Per-repo settings for the builtin microVM runtime, merged over the
+    /// global `builtin` block field by field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<crate::data::config::builtin_runtime::BuiltinRuntimeConfig>,
 }
 
 impl RepoConfig {

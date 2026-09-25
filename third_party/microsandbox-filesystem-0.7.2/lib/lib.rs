@@ -1,0 +1,59 @@
+//! `microsandbox-filesystem` provides filesystem backends and utilities for microsandbox,
+//! including the embedded agentd binary and the passthrough filesystem backend.
+
+#![warn(missing_docs)]
+// New lints introduced in rustc 1.95 fire on a few test fixtures;
+// cleanup tracked separately.
+#![allow(
+    clippy::useless_conversion,
+    clippy::needless_update,
+    clippy::manual_c_str_literals,
+    clippy::manual_contains
+)]
+
+//--------------------------------------------------------------------------------------------------
+// Exports
+//--------------------------------------------------------------------------------------------------
+
+pub mod agentd;
+#[cfg(any(unix, windows))]
+pub mod backends;
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(any(unix, windows))]
+pub use backends::passthroughfs::ExternalCheckpointOptions;
+#[cfg(windows)]
+pub use backends::passthroughfs::{
+    HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
+};
+#[cfg(any(unix, windows))]
+pub use backends::passthroughfs::{
+    OwnedDirectoryCheckpoint, OwnedDirectoryPayload, OwnedDirectorySnapshot,
+};
+#[cfg(windows)]
+pub use backends::singlefilefs::SingleFileFs;
+#[cfg(any(unix, windows))]
+pub use backends::unavailable::UnavailableFs;
+#[cfg(unix)]
+pub use backends::{
+    dualfs::{
+        BackendAFallbackToBackendBRead, BackendAOnly, CachePolicy as DualCachePolicy, DualFs,
+        DualFsConfig, MergeReadsBackendAPrecedence, ReadBackendBWriteBackendA,
+    },
+    memfs::{CachePolicy as MemCachePolicy, MemFs, MemFsConfig},
+    passthroughfs::{
+        BindIdentityMap, BindIdentityMapHandle, CachePolicy, HostPermissions, PassthroughConfig,
+        PassthroughFs, PassthroughFsBuilder, StatVirtualization,
+    },
+    singlefilefs::SingleFileFs,
+};
+pub use microsandbox_utils::size::{ByteSize, Bytes, Mebibytes, SizeExt};
+#[cfg(any(unix, windows))]
+pub use msb_krun::backends::fs::{
+    AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
+    GetxattrReply, ListxattrReply, OpenOptions, RemovemappingOne, SetattrValid, ZeroCopyReader,
+    ZeroCopyWriter, stat64, statvfs64,
+};

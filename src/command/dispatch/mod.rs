@@ -157,7 +157,13 @@ impl Engines {
     /// the binary entrypoint. Runtime selection is deliberately here rather
     /// than in a frontend so every session-backed host gets the same tier.
     pub fn build(global: &GlobalConfig, session: &Session) -> Result<Self, EngineError> {
-        let detected = agent_runtime::detect(global)?;
+        let effective = EffectiveConfig::new(
+            session.flags().clone(),
+            session.env().clone(),
+            session.repo_config().clone(),
+            global.clone(),
+        );
+        let detected = agent_runtime::detect_effective(&effective)?;
         Self::from_detected(detected, session)
     }
 
@@ -337,7 +343,28 @@ impl Engines {
         config: &GlobalConfig,
         command_path: &[&str],
     ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
-        match agent_runtime::detect(config) {
+        Self::detect_result(catalogue, agent_runtime::detect(config), command_path)
+    }
+
+    /// Session-backed runtime selection includes repo overrides for builtin settings.
+    pub fn detect_effective(
+        catalogue: &CommandCatalogue,
+        config: &EffectiveConfig,
+        command_path: &[&str],
+    ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
+        Self::detect_result(
+            catalogue,
+            agent_runtime::detect_effective(config),
+            command_path,
+        )
+    }
+
+    fn detect_result(
+        catalogue: &CommandCatalogue,
+        result: Result<DetectedRuntime, EngineError>,
+        command_path: &[&str],
+    ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
+        match result {
             Ok(detected) => Ok((detected, None)),
             Err(e @ EngineError::UnknownRuntime { .. }) => {
                 // Invalid `runtime:` is fatal. CLI invocations bubble the error

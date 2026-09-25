@@ -25,6 +25,10 @@
     (`awman api start` / `awman squad start`'s detached child) — a distinct
     exception for a distinct purpose.
 - **Credential delivery** — For Claude on container-class runtimes, credentials are delivered as an awman-authored, refresh-token-free credential file inside the staged settings overlay (mode `0600`, atomically replaced via `rename`); the host's own credential files and refresh tokens are never mounted into a container.
+- **Builtin microVM boundary** — The builtin runtime executes untrusted agent code inside a Linux microVM. Its worker is the same awman executable re-executed in a private internal mode; the kernel and guest-agent payloads are embedded build inputs with pinned provenance and verified hashes. Runtime execution must not extract or download a host executable, firmware DSO, or helper bundle. KVM on Linux or the required Hypervisor.framework entitlement on Apple Silicon is mandatory; missing access is a clear startup error, never a host-execution or weaker-backend fallback.
+- **Private runtime state** — Builtin state, worker control sockets, locks, logs, and writable disk images live under a user-private runtime directory with restrictive permissions and collision-safe ownership. Unix socket paths must fit the platform limit; configuration must leave room for derived paths. Do not use predictable world-writable socket locations or place credentials in worker argv, logs, or persistent runtime metadata.
+- **Image provenance and source isolation** — Image acquisition uses an explicit typed source (registry, Docker Engine store, Apple store, or archive), platform selection, and content digests. A source daemon or registry is used only to acquire an image; execution uses the imported local image. Never scrape private daemon storage or resolve a source against another source kind. Unsupported or blocked source adapters fail explicitly; there is no implicit fallback to another source or runtime.
+- **Opt-in Docker socket bridge** — The builtin runtime does not expose a host Docker socket. If a future builtin bridge is implemented, it must require an explicit user opt-in, mount only the selected socket at the documented guest path, and receive its own threat review and integration gate. The existing `--allow-docker` bridge remains a Docker CLI-backend-only exception and stays off by default.
 - Never mount any directory to any Docker container other than the current directory. If any parent directories are a Git repo root, the aspec CLI will prompt the user if the mounted directory should be limited to the current CWD or can be expanded to the Git repo root. Follow this instruction for every single container launched.
   - **Sanctioned exception — the Docker socket.** `--allow-docker` mounts the
     host's `docker.sock` into the container (`/var/run/docker.sock` on
@@ -35,3 +39,11 @@
     reach beyond its filesystem mount: a socket, not a directory, and
     off by default. `docker.rs`'s `allow_docker` argv builder is the only
     place this mount is constructed.
+
+Builtin image-import validation applies to the selected image. Before invoking
+Microsandbox's load-all archive API, awman projects the archive to exactly that
+image and the requested awman tag. Unselected images, layers and extra tags are
+not passed to the SDK. Config and layer blobs remain byte-identical; rewriting
+outer selection metadata does not flatten the root filesystem. Acquisition
+cache references retain their own identity and source metadata even when their
+archive bytes are shared.

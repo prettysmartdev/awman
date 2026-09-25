@@ -9,7 +9,17 @@
 //! (`initial_size`/`resize` are `Some`), the engine opens a PTY via
 //! `portable-pty`. Otherwise it uses `Stdio::piped()`.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
+
+use crate::data::message::UserMessageSink;
+use crate::engine::agent_runtime::background::ExecOutput;
+use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
+use crate::engine::container::options::OverlaySpec;
+use crate::engine::container::runtime::CONTAINER_CAPABILITIES;
+use crate::engine::container::{background, host_cli_backend};
+
 use std::process::{Command, Stdio};
 
 use crate::data::session::{AgentHandle, Session};
@@ -384,43 +394,164 @@ impl ContainerBackend for DockerBackend {
         "Docker"
     }
 
-    fn cli_binary(&self) -> &'static str {
-        "docker"
+    fn capabilities(&self) -> &'static Capabilities {
+        &CONTAINER_CAPABILITIES
     }
 
-    fn availability_probe_args(&self) -> &'static [&'static str] {
-        &["info", "--format", "{{.ServerVersion}}"]
+    fn host_cli(&self) -> Option<&'static str> {
+        Some(ContainerCli::DOCKER.bin)
     }
 
-    fn image_home_dir(&self, tag: &str) -> Option<String> {
-        // Print one env entry per line so we can scan for `HOME=…` without
-        // parsing JSON. `docker image inspect` exits 0 even when User/Env are
-        // empty; the format expansion just produces nothing then.
-        let output = Command::new(crate::engine::host_cli::program("docker"))
-            .args([
-                "image",
-                "inspect",
-                "--format",
-                "{{range .Config.Env}}{{println .}}{{end}}",
-                tag,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some(rest) = line.strip_prefix("HOME=") {
-                let v = rest.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
+    fn reattach_after_owner_exit(&self) -> bool {
+        true
+    }
+
+    fn is_available(&self) -> Result<(), EngineError> {
+        host_cli_backend::cli_is_available(
+            ContainerCli::DOCKER,
+            &["info", "--format", "{{.ServerVersion}}"],
+        )
+    }
+
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        crate::engine::container::process::stop_and_remove(ContainerCli::DOCKER.bin, &handle.name);
+        Ok(())
+    }
+
+    fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
+        host_cli_backend::cli_remove(ContainerCli::DOCKER, "rm", id)
+    }
+
+    fn exec_args(
+        &self,
+        agent_id: &str,
+        working_dir: &str,
+        entrypoint: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> Option<Vec<String>> {
+        Some(host_cli_backend::cli_exec_args(
+            agent_id,
+            working_dir,
+            entrypoint,
+            env_vars,
+        ))
+    }
+
+    fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
+        host_cli_backend::cli_image_exists(ContainerCli::DOCKER, tag)
+    }
+
+    fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &Path,
+        context: &Path,
+        no_cache: bool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        host_cli_backend::cli_build_image(
+            ContainerCli::DOCKER,
+            tag,
+            dockerfile,
+            context,
+            no_cache,
+            on_line,
+        )
+    }
+
+    fn import_image(
+        &self,
+        _request: &ImageImportRequest,
+        _sink: &mut dyn UserMessageSink,
+    ) -> Result<ImportedImage, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.name(),
+            operation: "image import",
+        })
+    }
+
+    fn remove_image(&self, id: &str) -> Result<(), EngineError> {
+        host_cli_backend::cli_remove(ContainerCli::DOCKER, "rmi", id)
+    }
+
+    fn start_background(
+        &self,
+        image: &str,
+        workdir: &Path,
+        env: &HashMap<String, String>,
+        overlays: &[OverlaySpec],
+    ) -> Result<String, EngineError> {
+        background::default_start_background(ContainerCli::DOCKER, image, workdir, env, overlays)
+    }
+
+    fn exec_in_background(
+        &self,
+        id: &str,
+        command: &str,
+        working_dir: &str,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<ExecOutput, EngineError> {
+        background::default_exec_in_background(ContainerCli::DOCKER, id, command, working_dir, env)
+    }
+
+    fn exec_in_background_streaming(
+        &self,
+        id: &str,
+        command: &str,
+        working_dir: &str,
+        env: Option<&HashMap<String, String>>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ExecOutput, EngineError> {
+        background::default_exec_in_background_streaming(
+            ContainerCli::DOCKER,
+            id,
+            command,
+            working_dir,
+            env,
+            on_line,
+        )
+    }
+
+    fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
+        background::default_stop_and_remove(ContainerCli::DOCKER, id);
+        Ok(())
+    }
+
+    fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        Ok(docker_image_home_dir(tag))
+    }
+}
+
+/// Read `HOME` from `tag`'s image config via `docker image inspect`. `None` when
+/// the image is missing, the CLI is unreachable, or no `HOME` is declared.
+fn docker_image_home_dir(tag: &str) -> Option<String> {
+    // Print one env entry per line so we can scan for `HOME=…` without
+    // parsing JSON. `docker image inspect` exits 0 even when User/Env are
+    // empty; the format expansion just produces nothing then.
+    let output = Command::new(crate::engine::host_cli::program("docker"))
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            tag,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(rest) = line.strip_prefix("HOME=") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
             }
         }
-        None
     }
+    None
 }
 
 // ─── Attach (re-attach into a foreign, already-running container) ───────────
@@ -1767,7 +1898,7 @@ mod tests {
         // collapse to `None` too.
         let backend = DockerBackend;
         let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
-        assert!(backend.image_home_dir(bogus).is_none());
+        assert!(backend.image_home_dir(bogus).unwrap().is_none());
     }
 
     #[test]

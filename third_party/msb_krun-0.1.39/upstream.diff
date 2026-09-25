@@ -1,0 +1,127 @@
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -29,6 +29,7 @@
+ 
+ pub mod builder;
+ pub mod builders;
++pub mod embedded_kernel;
+ pub mod error;
+ pub mod exit_handle;
+ pub mod metrics;
+--- a/src/api/vm.rs
++++ b/src/api/vm.rs
+@@ -36,6 +36,7 @@
+ use vmm::vmm_config::vsock::VsockDeviceConfig;
+ 
+ use super::builders::PlacementObserver;
++use super::embedded_kernel::{embedded_kernel, EmbeddedKernel};
+ use super::error::{BuildError, Error, Result, RuntimeError};
+ use super::exit_handle::ExitHandle;
+ use super::metrics::MetricsHandle;
+@@ -716,12 +717,20 @@
+         let mut kernel_entry_addr: u64 = 0;
+         let mut kernel_size: usize = 0;
+ 
+-        let kernel_host_addr = unsafe {
+-            (krunfw.get_kernel)(
+-                &mut kernel_guest_addr as *mut u64,
+-                &mut kernel_entry_addr as *mut u64,
+-                &mut kernel_size as *mut usize,
+-            )
++        let kernel_host_addr = match &krunfw {
++            KrunfwBindings::Embedded(kernel) => {
++                kernel_guest_addr = kernel.guest_address;
++                kernel_entry_addr = kernel.entry_address;
++                kernel_size = kernel.bytes.len();
++                kernel.bytes.as_ptr() as *mut std::ffi::c_char
++            }
++            KrunfwBindings::Dynamic { get_kernel, .. } => unsafe {
++                get_kernel(
++                    &mut kernel_guest_addr as *mut u64,
++                    &mut kernel_entry_addr as *mut u64,
++                    &mut kernel_size as *mut usize,
++                )
++            },
+         };
+ 
+         let kernel_bundle = KernelBundle {
+@@ -749,7 +758,9 @@
+         }
+ 
+         // Keep the library alive so the kernel memory pointers remain valid.
+-        self._krunfw_library = Some(krunfw.library);
++        if let KrunfwBindings::Dynamic { library, .. } = krunfw {
++            self._krunfw_library = Some(library);
++        }
+ 
+         Ok(())
+     }
+@@ -1143,9 +1154,12 @@
+ }
+ 
+ /// Bindings to libkrunfw functions.
+-struct KrunfwBindings {
+-    get_kernel: unsafe extern "C" fn(*mut u64, *mut u64, *mut usize) -> *mut std::ffi::c_char,
+-    library: libloading::Library,
++enum KrunfwBindings {
++    Embedded(EmbeddedKernel),
++    Dynamic {
++        get_kernel: unsafe extern "C" fn(*mut u64, *mut u64, *mut usize) -> *mut std::ffi::c_char,
++        library: libloading::Library,
++    },
+ }
+ 
+ /// Library name for libkrunfw.
+@@ -1161,6 +1175,16 @@
+ /// If `path` is provided, loads from that exact path. Otherwise falls back to the
+ /// default library name, which lets the OS dynamic linker search standard paths.
+ fn load_krunfw_library(path: Option<&std::path::Path>) -> Result<KrunfwBindings> {
++    // The SDK currently requires a real firmware path in its launch contract.
++    // The embedding executable is that path until WI 0120 provides a typed SDK origin.
++    let is_self = path.and_then(|p| p.canonicalize().ok())
++        .zip(std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()))
++        .is_some_and(|(requested, executable)| requested == executable);
++    if is_self || path == Some(std::path::Path::new("@embedded-kernel")) {
++        return embedded_kernel().map(KrunfwBindings::Embedded).ok_or_else(|| {
++            Error::Build(BuildError::Krunfw("embedded kernel not registered".into()))
++        });
++    }
+     let name = path
+         .map(|p| p.as_os_str().to_os_string())
+         .unwrap_or_else(|| std::ffi::OsString::from(KRUNFW_NAME));
+@@ -1179,7 +1203,7 @@
+             .map_err(|e| Error::Build(BuildError::Krunfw(format!("krunfw_get_kernel: {e}"))))?
+     };
+ 
+-    Ok(KrunfwBindings {
++    Ok(KrunfwBindings::Dynamic {
+         get_kernel,
+         library,
+     })
+--- /dev/null
++++ b/src/api/embedded_kernel.rs
+@@ -0,0 +1,24 @@
++//! Process-lifetime kernel provider for a statically embedded application kernel.
++
++use std::sync::OnceLock;
++
++/// The caller owns these bytes for the entire process lifetime. Addresses are
++/// guest physical addresses; callers must validate them against pinned inputs.
++#[derive(Debug, Clone, Copy)]
++pub struct EmbeddedKernel {
++    pub bytes: &'static [u8],
++    pub guest_address: u64,
++    pub entry_address: u64,
++}
++
++static KERNEL: OnceLock<EmbeddedKernel> = OnceLock::new();
++
++/// Register exactly one kernel in this process.
++pub fn register_embedded_kernel(kernel: EmbeddedKernel) -> Result<(), EmbeddedKernel> {
++    KERNEL.set(kernel)
++}
++
++/// Return the registered process-lifetime kernel, if any.
++pub fn embedded_kernel() -> Option<EmbeddedKernel> {
++    KERNEL.get().copied()
++}

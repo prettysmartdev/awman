@@ -3,6 +3,12 @@
 Title: Builtin OCI agent runtime using strictly embedded Microsandbox
 Issue: n/a
 
+Follow-up: [WI 0121 — completion and native verification](0121-complete-builtin-runtime-and-native-verification.md)
+tracks every outstanding deficiency from the
+[final adversarial review](../review-notes/0119-final-adversarial-verification.md).
+This item remains incomplete until its failed/blocked acceptance criteria have
+the required evidence; creating the follow-up does not close them.
+
 ## Summary:
 - Implement a builtin, container-class backend using Microsandbox, with its VM
   code, Linux kernel and guest agent embedded in the single awman executable.
@@ -259,24 +265,49 @@ an unbounded permanent fork.
 - [ ] Actual awman links and ships as a single host executable on required
   targets; no extracted executable/firmware DSO or separately installed runtime
   is used. Unsupported platforms retain their previous builds/backends.
+  **BLOCKED (B-01, B-02, B-15, B-18):** only Linux ARM64 feature build and
+  worker-to-KVM failure were exercised here; native x86_64/macOS payloads and
+  actual awman guest boots were not verified.
 - [ ] Reproducible local dependency patch, pinned payloads and native dependency
   handling are owned by the repository; clean-checkout builds work.
+  **BLOCKED (B-02, B-15, B-16):** patch diffs and the ARM64 payload/native
+  library were checked, but other native payloads remain unverified and a
+  clean-checkout/commit check was unavailable.
 - [ ] The selected SQLx backport (or its validated released replacement)
   resolves exactly one bundled native SQLite package without changing awman's
   rusqlite baseline or database contracts; the recorded SQLite spike checks
   pass on supported targets.
+  **BLOCKED (B-14, B-15):** one `libsqlite3-sys 0.38.2` and the combined link
+  were verified, but the complete spike checks and all supported native targets
+  were not run.
 - [ ] Native guest execution succeeds on Apple Silicon and Linux ARM64/x86_64
   with KVM; source inspection or blocked hardware tests are not reported as pass.
+  **BLOCKED (B-01, B-18, B-31, B-32):** no guest boot was available in this run.
 - [ ] All mandatory image-source adapters work, including actual Apple-store
   and local/remote Docker-store round trips; cached execution works without them.
+  **FAIL:** the mandatory Apple-store adapter is unimplemented and returns
+  `ImageSourceBlocked` (B-03/B-23). Actual local/remote Docker-store and private
+  registry round trips are separately **BLOCKED** here (B-04/B-24).
 - [ ] All overlay/config/prompt strategies and agreed runtime/frontend/squad
   contracts pass automated tests; known differences are explicit and bounded.
+  **FAIL:** required guest network-policy/denied-egress, OOM and real
+  workflow/squad integration coverage is absent. Guest-level ownership,
+  credential visibility, PTY/ACP, lifecycle and resource verification are
+  separately **BLOCKED** on hardware (B-18, B-21, B-29, B-30, B-33, B-55).
 - [ ] Final optimized/LTO and signed artifacts preserve the embedded provider,
   boot successfully, and pass the relevant distribution/security checks.
-- [ ] Documentation/spec changes describe the builtin backend accurately;
+  **BLOCKED (B-05, B-12, B-18, B-31):** optimized artifact, signing, notarizing,
+  and provider boot checks require unavailable native hosts and credentials.
+- [x] Documentation/spec changes describe the builtin backend accurately;
   existing Docker/Apple behavior is regression-tested; no SBX model is adopted.
-- [ ] WI 0120 has a precise patch inventory and replacement/removal path;
+  Documentation was updated in this run. Existing backend unit/regression
+  tests and feature-graph checks passed; real Docker/Apple round trips remain
+  **SKIP (B-16)** and are not claimed here.
+- [x] WI 0120 has a precise patch inventory and replacement/removal path;
   upstream acceptance is not a completion dependency for this item.
+  The inventory was added in this run, covering the SQLx backport,
+  `msb_krun` loader, target-aware guest-agent build input, and awman-side worker
+  glue, each with an independent replacement/removal gate.
 
 ## Edge Case Considerations:
 - Reject wrong-platform images/payloads, malformed or oversized archives,

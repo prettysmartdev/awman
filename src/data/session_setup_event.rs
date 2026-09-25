@@ -121,6 +121,8 @@ impl SessionSetupState {
             ReadyPhase::CreatingDockerfile => "Creating Dockerfile.dev...".into(),
             ReadyPhase::BuildingBaseImage => "Building base image...".into(),
             ReadyPhase::BuildingAgentImage => "Building agent image...".into(),
+            ReadyPhase::ImportingBaseImage => "Checking base image...".into(),
+            ReadyPhase::ImportingAgentImage => "Importing agent image...".into(),
             ReadyPhase::CheckingNonDefaultAgents => "Checking non-default agent images...".into(),
             ReadyPhase::CheckingLocalAgent => "Checking local agent...".into(),
             ReadyPhase::RunningAudit => "Running audit...".into(),

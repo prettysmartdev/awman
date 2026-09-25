@@ -852,6 +852,8 @@ Use the default agent (claude) for steps that specify 'codex'? [y/N]:
 
 If all required images are already available, the pre-flight check completes silently and the first step launches immediately.
 
+**Builtin runtime.** The builtin runtime never builds, so it does not offer to build a missing agent image. If a required agent image is not imported, the workflow stops before the first step with the external build commands and the `builtin.imageSource` options (or, when a source is already configured, tells you to run `awman ready`). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm).
+
 ### Unknown agents
 
 An unknown agent name in an `agent` field is caught at parse time, before any container runs, and exits with a list of valid options.

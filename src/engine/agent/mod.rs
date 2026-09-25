@@ -128,10 +128,36 @@ impl AgentEngine {
         &self,
         session: &Session,
         agent: &AgentName,
-        _config: &EffectiveConfig,
+        config: &EffectiveConfig,
         frontend: &mut dyn AgentImageFrontend,
         image_exists: impl Fn(&str) -> bool,
     ) -> Result<(), EngineError> {
+        if self.runtime.capabilities().image_acquisition
+            == crate::engine::agent_runtime::ImageAcquisition::Import
+        {
+            let tag = agent_image_tag(session.git_root(), agent.as_str());
+            if image_exists(&tag) {
+                return Ok(());
+            }
+            let paths = RepoDockerfilePaths::new(session.git_root());
+            let hint = crate::engine::oci::BuildHint {
+                agent_dockerfile: paths.agent_dockerfile(agent.as_str()),
+                project: Some((
+                    paths.project_dockerfile(),
+                    project_image_tag(session.git_root()),
+                )),
+                context: session.git_root().to_path_buf(),
+            };
+            if config.builtin_runtime().image_source_for(&tag).is_some() {
+                return Err(EngineError::Config(format!(
+                    "builtin image {tag} is not imported; run awman ready to acquire its configured source"
+                )));
+            }
+            return Err(EngineError::ImageSourceUnconfigured {
+                tag: tag.clone(),
+                hint: crate::engine::oci::external_build_hint(&tag, &hint),
+            });
+        }
         // Check for the project base image. If absent, fail with a structured
         // error: agent images are layered FROM the project image.
         let project_tag = project_image_tag(session.git_root());
@@ -368,19 +394,21 @@ impl AgentEngine {
         // two can diverge when the Dockerfile was changed but the image
         // hasn't been rebuilt yet, in which case mounting at the
         // Dockerfile-derived path silently breaks credential passthrough.
-        let container_home = self
-            .runtime
-            .image_home_dir(&image_tag)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                let home = dirs::home_dir().unwrap_or_default();
-                crate::engine::overlay::detect_container_home(
-                    &home,
-                    agent.as_str(),
-                    session.git_root(),
-                )
-            });
+        let image_home = self.runtime.image_home_dir(&image_tag).ok().flatten();
+        if self.runtime.capabilities().image_acquisition
+            == crate::engine::agent_runtime::ImageAcquisition::Import
+            && image_home
+                .as_deref()
+                .is_none_or(|home| !home.starts_with('/'))
+        {
+            return Err(EngineError::Config(format!(
+                "builtin image {image_tag} has no absolute effective HOME"
+            )));
+        }
+        let container_home = image_home.or_else(|| {
+            let home = dirs::home_dir().unwrap_or_default();
+            crate::engine::overlay::detect_container_home(&home, agent.as_str(), session.git_root())
+        });
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
             include_all_skills: run.include_all_skills,
@@ -2336,6 +2364,9 @@ mod tests {
                     host_paths_visible: false,
                     session_label_supported: false,
                     has_image_store: false,
+                    image_acquisition:
+                        crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+                    fractional_cpu: false,
                 },
             }
         }
@@ -2354,6 +2385,9 @@ mod tests {
                     host_paths_visible: true,
                     session_label_supported: true,
                     has_image_store: true,
+                    image_acquisition:
+                        crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
+                    fractional_cpu: true,
                 },
             }
         }
@@ -2433,8 +2467,14 @@ mod tests {
         fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
-        fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Vec<String> {
-            vec![]
+        fn exec_args(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+        ) -> Option<Vec<String>> {
+            None
         }
         fn attach(
             &self,
@@ -2450,8 +2490,8 @@ mod tests {
         ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
             Ok(vec![])
         }
-        fn cli_binary(&self) -> &'static str {
-            "fake"
+        fn host_cli(&self) -> Option<&'static str> {
+            Some("fake")
         }
     }
 

@@ -478,7 +478,11 @@ pub(crate) async fn execute_prepared(
         // the small number of setup steps in real workflows.
         let mut setup_failed = false;
         if !setup_steps.is_empty() && !engine.state().setup_completed {
-            let base_image = resolve_base_image(&session, &git_root_for_scope);
+            let base_image = resolve_phase_image(
+                &session,
+                &git_root_for_scope,
+                engines.runtime.capabilities().image_acquisition,
+            );
             let resolved = resolve_phase_overlays(
                 engines,
                 &session,
@@ -589,7 +593,11 @@ pub(crate) async fn execute_prepared(
         if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
             let should_run = teardown_on_failure || workflow_succeeded;
             if should_run {
-                let base_image = resolve_base_image(&session, &git_root_for_scope);
+                let base_image = resolve_phase_image(
+                    &session,
+                    &git_root_for_scope,
+                    engines.runtime.capabilities().image_acquisition,
+                );
                 let resolved = resolve_phase_overlays(
                     engines,
                     &session,
@@ -891,6 +899,25 @@ pub(crate) fn resolve_base_image(session: &Session, git_root: &std::path::Path) 
     crate::data::image_tags::project_image_tag(git_root)
 }
 
+fn resolve_phase_image(
+    session: &Session,
+    git_root: &std::path::Path,
+    acquisition: crate::engine::agent_runtime::ImageAcquisition,
+) -> String {
+    if acquisition == crate::engine::agent_runtime::ImageAcquisition::Import
+        && session.effective_config().base_image().is_none()
+    {
+        // The project image is a build input under an importing runtime.
+        // Its agent image contains that base and is the cached runnable image.
+        let agent = session
+            .effective_config()
+            .agent()
+            .unwrap_or_else(|| "claude".into());
+        return crate::data::image_tags::agent_image_tag(git_root, &agent);
+    }
+    resolve_base_image(session, git_root)
+}
+
 /// Collect overlay specs and env vars for a single setup or teardown entry.
 ///
 /// Merges the entry's own overlays with the global / repo / `AWMAN_OVERLAYS`
@@ -1019,4 +1046,34 @@ pub(crate) fn resolve_phase_overlays(
             Ok((overlays, env))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn import_setup_uses_runnable_agent_image_while_build_keeps_project_image() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = Session::for_tests_isolated(root.path(), home.path());
+        let project = crate::data::image_tags::project_image_tag(root.path());
+        let agent = crate::data::image_tags::agent_image_tag(root.path(), "claude");
+        assert_eq!(
+            resolve_phase_image(
+                &session,
+                root.path(),
+                crate::engine::agent_runtime::ImageAcquisition::Build
+            ),
+            project
+        );
+        assert_eq!(
+            resolve_phase_image(
+                &session,
+                root.path(),
+                crate::engine::agent_runtime::ImageAcquisition::Import
+            ),
+            agent
+        );
+    }
 }

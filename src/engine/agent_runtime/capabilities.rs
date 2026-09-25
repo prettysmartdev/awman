@@ -37,6 +37,12 @@ pub struct Capabilities {
     /// agent environments are declared by kit and have no image layer cache
     /// of awman's own to sweep.
     pub has_image_store: bool,
+    /// How the runtime obtains an agent image. `Build`: container (Docker,
+    /// Apple); `Import`: builtin; `Kit`: sandbox.
+    pub image_acquisition: ImageAcquisition,
+    /// CPU limits may be fractional (`--cpus 1.5`). true: container; false:
+    /// builtin (whole vCPUs) and sandbox (no CPU limits at all).
+    pub fractional_cpu: bool,
 }
 
 impl Capabilities {
@@ -52,6 +58,17 @@ impl Capabilities {
         self.arbitrary_host_mounts
     }
 }
+/// How a runtime obtains the image an agent runs from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageAcquisition {
+    /// Built locally from a Dockerfile by the runtime (`build_image`).
+    Build,
+    /// Imported from an explicit, already-built source (`import_image`).
+    Import,
+    /// Declared by a kit or template; no image of awman's own (`ready_agent`).
+    Kit,
+}
+
 /// How a runtime provides Docker-in-Docker to its agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DindSupport {
@@ -101,6 +118,8 @@ mod tests {
             "docker supports session labels"
         );
         assert!(caps.has_image_store, "docker keeps a local image store");
+        assert_eq!(caps.image_acquisition, ImageAcquisition::Build);
+        assert!(caps.fractional_cpu, "docker accepts fractional --cpus");
     }
 
     #[test]
@@ -146,6 +165,8 @@ mod tests {
                     !caps.has_image_store,
                     "sandbox has no local image store to reclaim"
                 );
+                assert_eq!(caps.image_acquisition, ImageAcquisition::Kit);
+                assert!(!caps.fractional_cpu, "sandbox has no cpu limits");
             }
             Err(_) => {
                 // Unsupported platform — platform guard test covers this branch.

@@ -305,6 +305,9 @@ mod tests {
                     host_paths_visible: true,
                     session_label_supported: true,
                     has_image_store: true,
+                    image_acquisition:
+                        crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
+                    fractional_cpu: true,
                 },
             }
         }
@@ -322,6 +325,9 @@ mod tests {
                     host_paths_visible: false,
                     session_label_supported: false,
                     has_image_store: false,
+                    image_acquisition:
+                        crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+                    fractional_cpu: false,
                 },
             }
         }
@@ -395,8 +401,14 @@ mod tests {
         fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
-        fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Vec<String> {
-            vec![]
+        fn exec_args(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+        ) -> Option<Vec<String>> {
+            None
         }
         fn attach(
             &self,
@@ -410,8 +422,8 @@ mod tests {
         ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
             Ok(vec![])
         }
-        fn cli_binary(&self) -> &'static str {
-            "fake"
+        fn host_cli(&self) -> Option<&'static str> {
+            Some("fake")
         }
     }
 

@@ -1,23 +1,27 @@
 //! `ContainerRuntime` — the container-class `AgentRuntimeEngine` impl.
 //!
-//! Holds a `Box<dyn ContainerBackend>` chosen by the `docker()` / `apple()`
-//! constructors (selection between runtimes happens in
+//! Holds an `Arc<dyn ContainerBackend>` chosen by the `docker()` / `apple()` /
+//! `builtin()` constructors (selection between runtimes happens in
 //! `agent_runtime::detect`). The concrete backend is invisible outside this
-//! module.
+//! module, and every operation below delegates to one explicit backend
+//! operation — nothing here shells out itself.
 //!
 //! Container-paradigm-specific operations — `build_image`, `image_exists`,
-//! `image_home_dir`, `start_background` — are inherent methods only; they
-//! deliberately do NOT appear on the `AgentRuntimeEngine` trait. Code that
-//! needs them must hold a typed `Arc<ContainerRuntime>`.
+//! `image_home_dir`, `start_background` — are inherent methods; the
+//! cross-paradigm subset is also reachable through `AgentRuntimeEngine`.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::data::config::effective::EffectiveConfig;
+use crate::data::config::env::test_isolation_active;
+use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
+use crate::data::oci_identity::ImageIdentity;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
-    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ReadyAgentOptions,
-    ResolvedAgentOptions,
+    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ImageAcquisition,
+    ImageImportRequest, ImportedImage, ReadyAgentOptions, ResolvedAgentOptions,
 };
 use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
@@ -38,10 +42,10 @@ pub struct ContainerImageInfo {
     pub size: String,
 }
 
-/// Capabilities shared by container-class backends (Docker, Apple
-/// Containers): image-based, ephemeral, arbitrary mounts/env, label-based
-/// session attribution.
-static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
+/// Capabilities shared by the CLI-driven container backends (Docker, Apple
+/// Containers): image-based, built locally, ephemeral, arbitrary mounts/env,
+/// label-based session attribution, fractional CPU limits.
+pub(super) static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     arbitrary_env_vars: true,
     arbitrary_host_mounts: true,
     cpu_limits: true,
@@ -52,7 +56,55 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     host_paths_visible: true,
     session_label_supported: true,
     has_image_store: true,
+    image_acquisition: ImageAcquisition::Build,
+    fractional_cpu: true,
 };
+
+/// Everything the builtin microVM backend needs, resolved from global config,
+/// repo config and the environment by the caller (Layer 2, or
+/// `agent_runtime::detect`) before `ContainerRuntime::builtin` is called.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinRuntimeSettings {
+    /// Private state root (catalog, caches, control sockets).
+    pub state_dir: PathBuf,
+    /// Whole vCPUs per agent VM.
+    pub vcpus: u8,
+    /// Guest memory per agent VM, in MiB.
+    pub memory_mib: u32,
+    /// Default image source for images that are not cached.
+    pub image_source: Option<ImageSourceSpec>,
+    /// Per-image source overrides keyed by awman image tag.
+    pub images: BTreeMap<String, ImageSourceSpec>,
+    /// Registry host settings keyed by `host[:port]`.
+    pub registries: BTreeMap<String, RegistryHostConfig>,
+    /// The ambient `MSB_*` overrides present in the environment. Any entry
+    /// makes the backend refuse to start (`AmbientRuntimeOverride`).
+    pub ambient_overrides: Vec<&'static str>,
+    /// Running under test isolation without `AWMAN_TEST_BUILTIN`: the real
+    /// runtime must not be touched.
+    pub test_isolation: bool,
+}
+
+impl BuiltinRuntimeSettings {
+    /// Resolve from the effective config (repo `builtin` block merged over the
+    /// global one) and its environment snapshot. Invalid values — zero
+    /// resources, a meaningless image source — are a configuration error.
+    pub fn resolve(config: &EffectiveConfig) -> Result<Self, EngineError> {
+        let builtin = config.builtin_runtime();
+        builtin.validate().map_err(EngineError::Config)?;
+        let env = config.env();
+        Ok(Self {
+            state_dir: config.builtin_state_dir()?,
+            vcpus: builtin.vcpus_or_default(),
+            memory_mib: builtin.memory_mib_or_default(),
+            image_source: builtin.image_source,
+            images: builtin.images,
+            registries: builtin.registries,
+            ambient_overrides: env.ambient_msb_overrides(),
+            test_isolation: test_isolation_active() && !env.test_builtin(),
+        })
+    }
+}
 
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
@@ -75,6 +127,16 @@ impl ContainerRuntime {
         }
     }
 
+    /// Construct with the builtin microVM backend. Errors — never panics —
+    /// when awman was built without the runtime, on an unsupported target,
+    /// when an ambient `MSB_*` override is set, or when the state directory
+    /// cannot be secured.
+    pub fn builtin(settings: BuiltinRuntimeSettings) -> Result<Self, EngineError> {
+        Ok(Self {
+            backend: crate::engine::container::builtin::open(settings)?,
+        })
+    }
+
     /// Static name of the chosen backend (e.g. `"docker"`).
     pub fn runtime_name(&self) -> &'static str {
         self.backend.name()
@@ -86,9 +148,14 @@ impl ContainerRuntime {
         self.backend.display_name()
     }
 
-    /// Static description of what container-class runtimes can do.
+    /// Static description of what the chosen backend can do.
     pub fn capabilities(&self) -> &Capabilities {
-        &CONTAINER_CAPABILITIES
+        self.backend.capabilities()
+    }
+
+    /// The host CLI the chosen backend drives, if any.
+    pub fn host_cli(&self) -> Option<&'static str> {
+        self.backend.host_cli()
     }
 
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
@@ -103,76 +170,19 @@ impl ContainerRuntime {
         self.backend.list_running(session)
     }
 
-    /// Shell out to the underlying CLI to build a container image. Streams
-    /// stdout+stderr line-by-line through `on_line`. Returns an error when the
-    /// build fails.
+    /// Build a container image, streaming output line-by-line through
+    /// `on_line`. Returns an error when the build fails or the backend
+    /// cannot build images.
     pub fn build_image(
         &self,
         tag: &str,
-        dockerfile: &std::path::Path,
-        context: &std::path::Path,
+        dockerfile: &Path,
+        context: &Path,
         no_cache: bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
-        // Both "docker" and "container" share the same `build` argv shape.
-        let cli_bin = self.backend.cli_binary();
-        let mut args: Vec<String> = vec!["build".into()];
-        if no_cache {
-            args.push("--no-cache".into());
-        }
-        args.extend([
-            "-t".into(),
-            tag.to_string(),
-            "-f".into(),
-            dockerfile.display().to_string(),
-            context.display().to_string(),
-        ]);
-        let mut child = Command::new(crate::engine::host_cli::program(cli_bin))
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| EngineError::Container(format!("spawn {cli_bin} build: {e}")))?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        // Combine stdout + stderr into a single sequenced stream by spawning two
-        // threads that funnel into a channel.
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        let tx_out = tx.clone();
-        let stdout_handle = std::thread::spawn(move || {
-            if let Some(out) = stdout {
-                let r = BufReader::new(out);
-                for line in r.lines().map_while(Result::ok) {
-                    let _ = tx_out.send(line);
-                }
-            }
-        });
-        let stderr_handle = std::thread::spawn(move || {
-            if let Some(err) = stderr {
-                let r = BufReader::new(err);
-                for line in r.lines().map_while(Result::ok) {
-                    let _ = tx.send(line);
-                }
-            }
-        });
-        for line in rx {
-            on_line(&line);
-        }
-        let _ = stdout_handle.join();
-        let _ = stderr_handle.join();
-        let status = child
-            .wait()
-            .map_err(|e| EngineError::Container(format!("wait {cli_bin} build: {e}")))?;
-        if !status.success() {
-            return Err(EngineError::ImageBuildExitNonzero {
-                tag: tag.to_string(),
-                exit_code: status.code().unwrap_or(-1),
-            });
-        }
-        Ok(())
+        self.backend
+            .build_image(tag, dockerfile, context, no_cache, on_line)
     }
 
     /// Read the image's baked-in `$HOME` from its config. Used by
@@ -180,28 +190,17 @@ impl ContainerRuntime {
     /// path the running container's user actually reads — when the
     /// `Dockerfile.<agent>` has been changed but the image hasn't been
     /// rebuilt, the image's User/HOME is the authority, not the Dockerfile.
-    /// Returns `None` when the image is missing or the runtime CLI is
+    /// Returns `None` when the image is missing or the runtime is
     /// unreachable.
     pub fn image_home_dir(&self, tag: &str) -> Option<String> {
-        self.backend.image_home_dir(tag)
+        self.backend.image_home_dir(tag).ok().flatten()
     }
 
     /// Best-effort check whether an image tag exists locally on the runtime.
-    /// Times out after 10 seconds to avoid hanging when the daemon is unresponsive.
+    /// Probes time out after 10 seconds to avoid hanging when the daemon is
+    /// unresponsive.
     pub fn image_exists(&self, tag: &str) -> bool {
-        use std::process::{Command, Stdio};
-        let cli_bin = self.backend.cli_binary();
-        let child = Command::new(crate::engine::host_cli::program(cli_bin))
-            .args(["image", "inspect", tag])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match child {
-            Ok(child) => wait_with_timeout(child, std::time::Duration::from_secs(10))
-                .map(|s| s.success())
-                .unwrap_or(false),
-            Err(_) => false,
-        }
+        self.backend.image_exists(tag).unwrap_or(false)
     }
 
     /// List all running awman containers without requiring a session.
@@ -234,31 +233,31 @@ impl ContainerRuntime {
     /// (e.g. the container transitioned back to running between discovery and
     /// deletion). Used by `awman clean` for per-item failure handling.
     pub fn remove_container(&self, id: &str) -> Result<(), EngineError> {
-        run_removal(self.cli_binary(), "rm", id)
+        self.backend.remove_agent(id)
     }
 
     /// Remove an image by id. Returns an error when the runtime refuses (e.g.
     /// the image is still referenced by a container). Used by `awman clean`.
     pub fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        run_removal(self.cli_binary(), "rmi", id)
+        self.backend.remove_image(id)
     }
 
-    /// Build CLI arguments for `docker exec -it` (or equivalent) into a running
-    /// container. Returns args suitable for `Command::new(cli_binary).args(...)`.
+    /// Argv (after the host CLI name) for `exec -it` into a running
+    /// container. `None` when the backend drives no host CLI.
     pub fn exec_args(
         &self,
         container_id: &str,
         working_dir: &str,
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         self.backend
             .exec_args(container_id, working_dir, entrypoint, env_vars)
     }
 
     /// Attach to an already-running container this process did not start.
-    /// Delegates to the backend; the returned instance runs `<cli> exec`
-    /// through the existing `run_with_frontend` path.
+    /// Delegates to the backend; the returned instance runs through the
+    /// existing `run_with_frontend` path.
     pub fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         self.backend.attach(handle)
     }
@@ -271,15 +270,9 @@ impl ContainerRuntime {
         self.backend.list_running_with_name_prefix(prefix)
     }
 
-    /// The CLI binary name for this runtime (`"docker"` or `"container"`).
-    pub fn cli_binary(&self) -> &'static str {
-        self.backend.cli_binary()
-    }
-
     /// Start a background container for setup/teardown execution.
     ///
-    /// Delegates to the backend's `start_background` (default impl in
-    /// `ContainerBackend` shells out to the runtime's CLI). The returned
+    /// Delegates to the backend's `start_background`. The returned
     /// `BackgroundContainer` retains a shared reference to the backend so
     /// later `exec` and `kill` calls flow through the same trait.
     pub fn start_background(
@@ -300,23 +293,16 @@ impl ContainerRuntime {
         ))
     }
 
-    /// Best-effort check whether the container runtime daemon is reachable.
+    /// Best-effort check whether the container runtime is reachable.
     /// Returns `false` when `docker info` (or equivalent) fails or times out.
     pub fn is_available(&self) -> bool {
-        use std::process::Stdio;
-        let cli_bin = self.backend.cli_binary();
-        let args = self.backend.availability_probe_args();
-        let child = std::process::Command::new(crate::engine::host_cli::program(cli_bin))
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match child {
-            Ok(child) => wait_with_timeout(child, std::time::Duration::from_secs(10))
-                .map(|s| s.success())
-                .unwrap_or(false),
-            Err(_) => false,
-        }
+        self.backend.is_available().is_ok()
+    }
+
+    /// Why the runtime is unreachable, or `Ok` when it is reachable. The
+    /// detailed form of [`Self::is_available`].
+    pub fn availability(&self) -> Result<(), EngineError> {
+        self.backend.is_available()
     }
 }
 
@@ -335,6 +321,10 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn is_available(&self) -> bool {
         ContainerRuntime::is_available(self)
+    }
+
+    fn availability(&self) -> Result<(), EngineError> {
+        ContainerRuntime::availability(self)
     }
 
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
@@ -369,7 +359,7 @@ impl AgentRuntimeEngine for ContainerRuntime {
         working_dir: &str,
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         ContainerRuntime::exec_args(self, agent_id, working_dir, entrypoint, env_vars)
     }
 
@@ -381,8 +371,16 @@ impl AgentRuntimeEngine for ContainerRuntime {
         ContainerRuntime::list_running_with_name_prefix(self, prefix)
     }
 
-    fn cli_binary(&self) -> &'static str {
-        ContainerRuntime::cli_binary(self)
+    fn host_cli(&self) -> Option<&'static str> {
+        ContainerRuntime::host_cli(self)
+    }
+
+    fn reattach_after_owner_exit(&self) -> bool {
+        self.backend.reattach_after_owner_exit()
+    }
+
+    fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
+        self.backend.remove_agent(id)
     }
 
     fn ready_agent(
@@ -393,10 +391,10 @@ impl AgentRuntimeEngine for ContainerRuntime {
     ) -> Result<(), EngineError> {
         // Only defined for kit-declarative runtimes, and only ever called
         // behind `capabilities().kit_declarative` (see `ReadyEngine`). The
-        // container tier prepares an agent by building its image, which
-        // `ReadyEngine` drives through `build_image` because the step in
-        // front of it — downloading the per-agent Dockerfile — belongs to
-        // `engine::agent::download`, not to a runtime.
+        // container tier prepares an agent by building (or importing) its
+        // image, which `ReadyEngine` drives through `build_image` because the
+        // step in front of it — downloading the per-agent Dockerfile —
+        // belongs to `engine::agent::download`, not to a runtime.
         Err(EngineError::UnsupportedOnRuntime {
             runtime: self.runtime_name(),
             operation: "kit-declarative agent preparation",
@@ -414,40 +412,25 @@ impl AgentRuntimeEngine for ContainerRuntime {
     fn build_image(
         &self,
         tag: &str,
-        dockerfile: &std::path::Path,
-        context: &std::path::Path,
+        dockerfile: &Path,
+        context: &Path,
         no_cache: bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         ContainerRuntime::build_image(self, tag, dockerfile, context, no_cache, on_line)
     }
-}
 
-/// Shell out to the runtime CLI to remove a container (`rm`) or image (`rmi`).
-/// Returns an error on a non-zero exit so callers can count per-item failures.
-fn run_removal(cli_bin: &str, subcommand: &str, target: &str) -> Result<(), EngineError> {
-    use std::process::{Command, Stdio};
-    let output = Command::new(crate::engine::host_cli::program(cli_bin))
-        .args([subcommand, target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                EngineError::ContainerRuntimeUnavailable {
-                    binary: cli_bin.to_string(),
-                }
-            } else {
-                EngineError::Container(format!("{cli_bin} {subcommand} {target}: {e}"))
-            }
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(EngineError::Container(format!(
-            "{cli_bin} {subcommand} {target} failed: {stderr}"
-        )));
+    fn import_image(
+        &self,
+        request: &ImageImportRequest,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+    ) -> Result<ImportedImage, EngineError> {
+        self.backend.import_image(request, sink)
     }
-    Ok(())
+
+    fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
+        self.backend.image_identity(tag)
+    }
 }
 
 /// Wait for a child process with a timeout. Kills the process and returns
@@ -525,6 +508,70 @@ mod tests {
             }
             Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn cli_backends_state_their_host_cli_and_reattach_model() {
+        let docker = ContainerRuntime::docker();
+        let apple = ContainerRuntime::apple();
+        assert_eq!(docker.host_cli(), Some("docker"));
+        assert_eq!(apple.host_cli(), Some("container"));
+        assert!(<ContainerRuntime as AgentRuntimeEngine>::reattach_after_owner_exit(&docker));
+        assert!(!<ContainerRuntime as AgentRuntimeEngine>::reattach_after_owner_exit(&apple));
+        for rt in [&docker, &apple] {
+            let args = rt
+                .exec_args("ctr", "/w", &["sh"], &[])
+                .expect("CLI backends have exec argv");
+            assert_eq!(args, vec!["exec", "-it", "-w", "/w", "ctr", "sh"]);
+        }
+    }
+
+    #[test]
+    fn builtin_settings_apply_defaults_and_reject_invalid_config() {
+        use crate::data::config::builtin_runtime::{
+            BuiltinRuntimeConfig, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS,
+        };
+        use crate::data::config::env::{EnvSnapshot, AWMAN_BUILTIN_STATE_DIR, MSB_PATH};
+        use crate::data::config::{FlagConfig, GlobalConfig, RepoConfig};
+
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_BUILTIN_STATE_DIR, "/s"),
+            (MSB_PATH, "/elsewhere/msb"),
+        ]);
+        let effective = |builtin: BuiltinRuntimeConfig| {
+            EffectiveConfig::new(
+                FlagConfig::default(),
+                env.clone(),
+                RepoConfig::default(),
+                GlobalConfig {
+                    builtin: Some(builtin),
+                    ..Default::default()
+                },
+            )
+        };
+        let settings =
+            BuiltinRuntimeSettings::resolve(&effective(BuiltinRuntimeConfig::default())).unwrap();
+        assert_eq!(settings.state_dir, PathBuf::from("/s"));
+        assert_eq!(settings.vcpus, DEFAULT_VCPUS);
+        assert_eq!(settings.memory_mib, DEFAULT_MEMORY_MIB);
+        assert_eq!(settings.ambient_overrides, vec![MSB_PATH]);
+        assert!(settings.test_isolation, "unit tests are always isolated");
+
+        let invalid = effective(BuiltinRuntimeConfig {
+            vcpus: Some(0),
+            ..Default::default()
+        });
+        assert!(matches!(
+            BuiltinRuntimeSettings::resolve(&invalid),
+            Err(EngineError::Config(_))
+        ));
+
+        // The ambient override is refused before anything else.
+        match ContainerRuntime::builtin(settings) {
+            Err(EngineError::AmbientRuntimeOverride { variable }) => assert_eq!(variable, MSB_PATH),
+            Err(e) => panic!("expected AmbientRuntimeOverride, got {e:?}"),
+            Ok(_) => panic!("expected an error"),
         }
     }
 }

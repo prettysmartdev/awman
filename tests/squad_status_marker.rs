@@ -88,6 +88,8 @@ impl AgentRuntimeEngine for FakeRuntime {
             host_paths_visible: true,
             session_label_supported: false,
             has_image_store: false,
+            image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+            fractional_cpu: false,
         };
         &CAPS
     }
@@ -120,7 +122,7 @@ impl AgentRuntimeEngine for FakeRuntime {
         _working_dir: &str,
         _entrypoint: &[&str],
         _env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         unimplemented!("not exercised by the status test")
     }
     fn attach(&self, _handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
@@ -134,8 +136,8 @@ impl AgentRuntimeEngine for FakeRuntime {
             .cloned()
             .collect())
     }
-    fn cli_binary(&self) -> &'static str {
-        "fake"
+    fn host_cli(&self) -> Option<&'static str> {
+        Some("fake")
     }
 }
 

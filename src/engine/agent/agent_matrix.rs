@@ -1266,3 +1266,71 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod family_coverage_tests {
+    //! Every settings family and prompt mode is realised by at least one agent,
+    //! so the builtin runtime's compatibility tests cannot silently miss one.
+    use super::*;
+
+    #[test]
+    fn every_settings_family_and_prompt_mode_belongs_to_some_agent() {
+        let mut settings = [false; 4];
+        let mut prompts = [false; 7];
+        for agent in SUPPORTED_AGENTS {
+            let matrix = matrix_for(agent).unwrap();
+            settings[match matrix.settings_mount {
+                SettingsMount::None => 0,
+                SettingsMount::Direct(_) => 1,
+                SettingsMount::Claude => 2,
+                SettingsMount::Antigravity => 3,
+            }] = true;
+            prompts[match matrix.system_prompt_delivery {
+                SystemPromptMode::Append => 0,
+                SystemPromptMode::AppendInline { .. } => 1,
+                SystemPromptMode::Replace => 2,
+                SystemPromptMode::AgentsMd => 3,
+                SystemPromptMode::EnvFile { .. } => 4,
+                SystemPromptMode::AddDir { .. } => 5,
+                SystemPromptMode::Unsupported => 6,
+            }] = true;
+        }
+        assert_eq!(settings, [true; 4], "a SettingsMount family has no agent");
+        assert_eq!(prompts, [true; 7], "a SystemPromptMode has no agent");
+    }
+
+    #[test]
+    fn direct_settings_paths_are_relative_and_cannot_escape_home() {
+        for agent in SUPPORTED_AGENTS {
+            if let SettingsMount::Direct(relative) = matrix_for(agent).unwrap().settings_mount {
+                let path = std::path::Path::new(relative);
+                assert!(path.is_relative(), "{agent}: {relative}");
+                assert!(
+                    path.components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "{agent}: {relative}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_delivery_parameters_are_well_formed() {
+        for agent in SUPPORTED_AGENTS {
+            match matrix_for(agent).unwrap().system_prompt_delivery {
+                SystemPromptMode::EnvFile { var } => {
+                    assert!(
+                        var.chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                        "{agent}: {var}"
+                    );
+                }
+                SystemPromptMode::AddDir { flag } => {
+                    assert!(flag.starts_with("--"), "{agent}: {flag}")
+                }
+                SystemPromptMode::AppendInline { key } => assert!(!key.is_empty(), "{agent}"),
+                _ => {}
+            }
+        }
+    }
+}

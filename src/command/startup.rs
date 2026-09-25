@@ -12,7 +12,6 @@ use anyhow::{Context, Result};
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::Engines;
 use crate::data::config::env::EnvSnapshot;
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 use crate::data::migration;
 use crate::data::session::{GitRootResolver, Session, SessionOpenOptions};
@@ -48,19 +47,7 @@ impl Startup {
         }
         messages.extend(migration::check_deprecated_env_vars());
 
-        let global_config = GlobalConfig::load_with(&env).unwrap_or_default();
         let path_refs: Vec<&str> = self.command_path.iter().map(String::as_str).collect();
-        // Runtime detection + the CLI/TUI fallback policy live on the Layer 2
-        // `Engines` type. `fatal_runtime_error` is `Some` only when the configured
-        // `runtime:` is invalid and the TUI is about to start: the TUI boots just
-        // far enough to present a fatal modal with this message and quits on Enter.
-        let (detected, fatal_runtime_error) =
-            Engines::detect(CommandCatalogue::get(), &global_config, &path_refs).map_err(
-                |error| match error {
-                    EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
-                    other => anyhow::Error::new(other).context("failed to detect agent runtime"),
-                },
-            )?;
         let git_engine = GitEngine::new();
 
         // Resolve git root first so we can migrate the repo-local `.amux/` → `.awman/`
@@ -87,16 +74,19 @@ impl Startup {
             },
         )
         .context("failed to open session")?;
-        // The ordinary path intentionally enters through the public builder.
-        // The bare-TUI unknown-runtime path already has an inert fallback
-        // runtime from `Engines::detect`, so it must retain that exact handle
-        // to reach the fatal modal.
-        let engines = if fatal_runtime_error.is_some() {
-            Engines::from_detected(detected, &session)
-        } else {
-            Engines::build(&global_config, &session)
-        }
-        .context("failed to construct engines")?;
+        // Detect after opening the session so repo builtin settings participate
+        // in the same effective configuration used by command execution.
+        let (detected, fatal_runtime_error) = Engines::detect_effective(
+            CommandCatalogue::get(),
+            &session.effective_config(),
+            &path_refs,
+        )
+        .map_err(|error| match error {
+            EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
+            other => anyhow::Error::new(other).context("failed to detect agent runtime"),
+        })?;
+        let engines =
+            Engines::from_detected(detected, &session).context("failed to construct engines")?;
 
         Ok(StartupOutcome::new(
             session,

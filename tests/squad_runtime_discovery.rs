@@ -76,6 +76,8 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
             host_paths_visible: true,
             session_label_supported: false,
             has_image_store: false,
+            image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+            fractional_cpu: false,
         };
         &CAPS
     }
@@ -106,7 +108,7 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
         _working_dir: &str,
         _entrypoint: &[&str],
         _env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         unimplemented!("not exercised by discovery tests")
     }
     fn attach(
@@ -115,8 +117,8 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
     ) -> Result<Box<dyn awman::engine::agent_runtime::execution::AgentInstance>, EngineError> {
         unimplemented!("not exercised by discovery tests")
     }
-    fn cli_binary(&self) -> &'static str {
-        "no-label-fake"
+    fn host_cli(&self) -> Option<&'static str> {
+        Some("no-label-fake")
     }
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         // Mirrors the sandbox tier's own filter (`retain(|h| h.name.starts_with(prefix))`)

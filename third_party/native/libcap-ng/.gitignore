@@ -1,0 +1,4 @@
+*.tar.gz
+lib/
+*-unknown-linux-gnu/
+build.*/

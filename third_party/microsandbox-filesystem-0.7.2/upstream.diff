@@ -1,0 +1,28 @@
+--- a/build.rs
++++ b/build.rs
+@@ -16,6 +16,7 @@
+ fn main() {
+     println!("cargo:rerun-if-changed=build.rs");
+     println!("cargo:rerun-if-env-changed=MSB_EMBED_ARTIFACTS_DIR");
++    println!("cargo:rerun-if-env-changed=MSB_EMBED_ARTIFACTS_ROOT");
+ 
+     #[cfg(feature = "embed-binaries")]
+     {
+@@ -31,6 +32,17 @@
+     let target_arch =
+         std::env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture is set");
+ 
++    if let Some(root) = std::env::var_os("MSB_EMBED_ARTIFACTS_ROOT").map(PathBuf::from) {
++        let source = root.join(&target_arch).join(AGENTD_BINARY);
++        if !source.is_file() {
++            panic!("MSB_EMBED_ARTIFACTS_ROOT lacks target agent: {}", source.display());
++        }
++        println!("cargo:rerun-if-changed={}", source.display());
++        validate_agentd_file(&source, &target_arch);
++        copy_agentd(&source, &destination);
++        return;
++    }
++
+     if let Some(artifacts_dir) = std::env::var_os("MSB_EMBED_ARTIFACTS_DIR").map(PathBuf::from) {
+         let source = artifacts_dir.join(AGENTD_BINARY);
+         if !source.is_file() {
