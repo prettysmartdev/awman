@@ -60,7 +60,7 @@ impl Tab {
                     (format!("{:.1}%", cpu_avg), format!("{:.0}MiB", mem_avg))
                 };
                 self.last_container_summary = Some(LastContainerSummary {
-                    agent_display_name: info.agent_display_name.clone(),
+                    agent_display_name: info.display_name().to_string(),
                     container_name: info.container_name.clone(),
                     avg_cpu,
                     avg_memory,

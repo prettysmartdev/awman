@@ -255,6 +255,13 @@ pub type SharedPtyResetFlag = Arc<AtomicBool>;
 /// polling.
 pub type SharedContainerName = Arc<Mutex<Option<String>>>;
 
+/// Title for the next container the workflow launches, when it is a
+/// setup/teardown step rather than an agent (e.g. `[setup] install deps`).
+/// Set by the workflow frontend before that container starts and cleared
+/// before an agent container starts; the TUI event loop copies it into the
+/// focused slot's `ContainerInfo` when that container's name arrives.
+pub type SharedContainerTitle = Arc<Mutex<Option<String>>>;
+
 /// Shared container exit code. Set by the workflow frontend when the engine
 /// reports `report_container_exited` — the step's container has actually
 /// terminated (killed by awman or the agent process exited). The TUI event
@@ -332,6 +339,20 @@ pub struct ContainerInfo {
     /// `docker-sbx-experimental`) rather than container-class. Drives the
     /// overlay title — "(sandboxed)" vs "(containerized)".
     pub sandboxed: bool,
+    /// Set when this container runs a workflow setup/teardown step instead of
+    /// an agent: the step's title, shown in place of the agent name.
+    pub phase_step_title: Option<String>,
+}
+
+impl ContainerInfo {
+    /// What the container window, its minimized bar and the post-exit
+    /// summary call this container: the setup/teardown step it runs, or
+    /// else the agent's display name.
+    pub fn display_name(&self) -> &str {
+        self.phase_step_title
+            .as_deref()
+            .unwrap_or(&self.agent_display_name)
+    }
 }
 
 /// Summary captured after a containerized command exits, displayed in a
@@ -473,6 +494,7 @@ impl ContainerSlot {
                 latest_stats: None,
                 stats_history: Vec::new(),
                 sandboxed: false,
+                phase_step_title: None,
             }),
             container_stdout_rx: None,
             container_stdin_tx: None,
@@ -514,7 +536,7 @@ impl ContainerSlot {
     pub fn agent_name(&self) -> &str {
         self.container_info
             .as_ref()
-            .map(|i| i.agent_display_name.as_str())
+            .map(|i| i.display_name())
             .unwrap_or("agent")
     }
 
@@ -598,6 +620,7 @@ pub struct TabSharedState {
     pub workflow_state: SharedWorkflowViewState,
     /// Invocation id of the latest remote workflow snapshot, when available.
     pub workflow_invocation_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    pub workflow_context_path: Arc<Mutex<Option<std::path::PathBuf>>>,
     /// Yolo countdown state, rendered as a non-modal overlay.
     pub yolo_state: SharedYoloState,
     /// Cancel flag for the yolo countdown; set on Esc, read and cleared by
@@ -613,6 +636,8 @@ pub struct TabSharedState {
     pub pty_reset_flag: SharedPtyResetFlag,
     /// Name of the running container, published by the container frontend.
     pub container_name_shared: SharedContainerName,
+    /// Title for a setup/teardown step's container; see [`SharedContainerTitle`].
+    pub container_title_shared: SharedContainerTitle,
     /// Exit code of a mid-workflow container that actually terminated.
     pub container_exit_shared: SharedContainerExitCode,
     /// Stdin sender slot, republished on each workflow step transition.
@@ -635,6 +660,7 @@ impl TabSharedState {
         Self {
             workflow_state: Arc::new(Mutex::new(None)),
             workflow_invocation_id: Arc::new(Mutex::new(None)),
+            workflow_context_path: Arc::new(Mutex::new(None)),
             yolo_state: Arc::new(Mutex::new(None)),
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
             status_log: Arc::new(Mutex::new(Vec::new())),
@@ -642,6 +668,7 @@ impl TabSharedState {
             container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             pty_reset_flag: Arc::new(AtomicBool::new(false)),
             container_name_shared: Arc::new(Mutex::new(None)),
+            container_title_shared: Arc::new(Mutex::new(None)),
             container_exit_shared: Arc::new(Mutex::new(None)),
             stdin_tx_shared: Arc::new(Mutex::new(None)),
             resize_tx_shared: Arc::new(Mutex::new(None)),
@@ -667,7 +694,9 @@ impl TabSharedState {
     /// previous command cannot be observed by the new one. The log, workflow
     /// view and dashboard slots persist for the life of the tab.
     pub fn reset_for_new_command(&mut self) {
+        self.workflow_context_path = Arc::new(Mutex::new(None));
         self.container_name_shared = Arc::new(Mutex::new(None));
+        self.container_title_shared = Arc::new(Mutex::new(None));
         self.container_exit_shared = Arc::new(Mutex::new(None));
         self.stdin_tx_shared = Arc::new(Mutex::new(None));
         self.resize_tx_shared = Arc::new(Mutex::new(None));
@@ -825,6 +854,13 @@ impl Drop for Tab {
 }
 
 impl Tab {
+    pub(crate) fn active_workflow_context_path(&self) -> Option<std::path::PathBuf> {
+        if !matches!(self.execution_phase, ExecutionPhase::Running { .. }) {
+            return None;
+        }
+        self.shared.workflow_context_path.lock().ok()?.clone()
+    }
+
     /// Apply a manual one-column scroll while the overview overflows, and
     /// detach follow mode. The next render clamps the requested offset, and
     /// re-attaches follow once the view is scrolled all the way right with

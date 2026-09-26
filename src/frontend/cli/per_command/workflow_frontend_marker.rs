@@ -527,6 +527,36 @@ mod tests {
     }
 
     #[test]
+    fn a_non_interactive_cli_keeps_phase_steps_headless() {
+        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
+        let mut fe = make_frontend();
+        fe.non_interactive = true;
+        assert!(!fe.supports_interactive_phase_steps());
+        fe.non_interactive = false;
+        assert!(fe.supports_interactive_phase_steps());
+    }
+
+    /// A phase step never gets a terminal `report_step_status`, so its
+    /// container's exit is what hands the terminal back.
+    #[test]
+    fn a_phase_step_container_exit_releases_the_terminal() {
+        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
+        use crate::data::workflow_state::PhaseKind;
+        let mut fe = make_frontend();
+        fe.raw_mode_guard = Some(RawModeGuard);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        fe.container_stdin_tx = Some(tx);
+
+        fe.report_phase_step_container_exited(PhaseKind::Setup, 1);
+
+        assert!(fe.raw_mode_guard.is_none(), "cooked mode must be restored");
+        assert!(
+            fe.container_stdin_tx.is_none(),
+            "the dead container's stdin must not be rebound later"
+        );
+    }
+
+    #[test]
     fn raw_mode_guard_dropped_on_step_cancelled() {
         let mut fe = make_frontend();
         fe.raw_mode_guard = Some(RawModeGuard);

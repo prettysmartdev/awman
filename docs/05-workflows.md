@@ -256,7 +256,7 @@ Workflows can include optional `setup` and `teardown` sections to prepare the en
 - Pushing branches to a remote
 - Cleanup operations
 
-All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. No shell commands are ever executed directly on the host. Each phase uses its own container instance: a setup container runs all setup steps, then is killed; later, a teardown container is started for all teardown steps.
+All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. No shell commands are ever executed directly on the host. Each step gets its own fresh container, built with only that step's overlays, which is removed as soon as the step finishes. In the TUI and in an interactive CLI session, each step's container is shown to you just like an agent step's — see [Container execution model](#container-execution-model).
 
 ### Setup step types
 
@@ -634,17 +634,22 @@ If any teardown step fails, the error is logged and execution continues to the n
 
 ### Container execution model
 
-**Setup container lifecycle:**
-1. Before setup runs, awman starts a background container from the base image with the session workdir mounted
-2. Each setup step is executed via `exec` into the running container
-3. After all setup steps complete (or if any step fails), the setup container is killed
-4. If setup fails, the main workflow steps do not run
+Every setup and teardown step that runs a command (every step type except `poll_ci`, which awman runs itself) gets its own container from the base image, with the session workdir mounted and only that step's overlays applied. How that container runs depends on where you started the workflow:
 
-**Teardown container lifecycle:**
-1. After all main steps complete, awman starts a fresh teardown container (separate from the setup container)
-2. Each teardown step is executed via `exec` into the teardown container
-3. After all teardown steps complete, the teardown container is killed
-4. If `teardown_on_failure = false` and the workflow failed, teardown is skipped entirely
+**Interactive (TUI, or CLI on a terminal):**
+1. The step's command is the container's only process, and the container runs in the foreground attached to a terminal — exactly like an agent step's container
+2. In the TUI, the container window opens and shows the command's live output; in the CLI, the output appears directly in your terminal. You can type into it, so a command that asks a question (a confirmation prompt, a passphrase) can be answered
+3. When the command exits, the container exits and is removed. In the TUI the container window closes, leaving the summary bar
+4. All of the command's output is also recorded, so a failing step's [`on_failure` agent](#step-remediation-with-on_failure) still gets it in its failure file. A terminal merges a command's stdout and stderr into one stream, so the whole transcript appears under `STDOUT` and `STDERR` reads `(empty)`; color codes are stripped
+
+**Headless (`--non-interactive` CLI, the API server, and squad):**
+1. awman starts a background container, runs the step's command in it with no terminal attached, then removes the container
+2. Each line of output is streamed into the status log (or the API/squad event stream) as it's printed
+3. stdout and stderr are captured separately for the `on_failure` failure file
+
+In both modes:
+- If a setup step fails with `abort_on_failure`, the main workflow steps do not run
+- Teardown runs after all main steps complete; if `teardown_on_failure = false` and the workflow failed, teardown is skipped entirely
 
 All environment variables configured for the project (via overlays, config, or per-step `env` fields) are inherited by both setup and teardown containers, just as they are for main workflow steps.
 

@@ -203,6 +203,11 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext, overview_hscroll_active: bool) 
     }
 }
 
+pub(super) fn is_workflow_context_copy_key(key: KeyEvent) -> bool {
+    key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+}
+
 /// Key bindings for the squad task list (WI 0102). Reached only through
 /// `FocusContext::SquadList`; the global `ctrl` block in `map_key` runs first,
 /// so `Ctrl-T`/`Ctrl-A`/`Ctrl-D`/`Ctrl-M`/`Ctrl-O`/`Ctrl-W`/`Ctrl-G`/`Ctrl-C`/

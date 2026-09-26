@@ -797,12 +797,22 @@ impl App {
                     .ok()
                     .and_then(|mut g| g.take());
                 if let Some(name) = name {
+                    // The frontend sets (or clears) the title before the
+                    // container it belongs to starts, so reading it as the
+                    // name arrives binds it to this container.
+                    let phase_step_title = tab
+                        .shared
+                        .container_title_shared
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone());
                     if let Some(info) = tab
                         .focused_slot_mut()
                         .and_then(|s| s.container_info.as_mut())
                     {
                         info.container_name = name;
                         info.latest_stats = None;
+                        info.phase_step_title = phase_step_title;
                     }
                     // A fresh container is running — let its output
                     // auto-open the window again after a mid-workflow
@@ -1711,6 +1721,7 @@ mod tests {
             }),
             stats_history: Vec::new(),
             sandboxed: false,
+            phase_step_title: None,
         };
 
         let title = crate::frontend::tui::container_view::build_stats_title_from_info(&info);

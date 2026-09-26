@@ -70,9 +70,9 @@ pub fn render_container_maximized(
 
     // Title strings.
     let info = focused_slot.container_info.as_ref();
-    let agent_name = info
-        .map(|i| i.agent_display_name.as_str())
-        .unwrap_or("Agent");
+    // A setup/teardown step's container is titled with the step itself.
+    let agent_name = info.map(|i| i.display_name()).unwrap_or("Agent");
+    let is_phase_step = info.is_some_and(|i| i.phase_step_title.is_some());
     let runtime_label = if info.is_some_and(|i| i.sandboxed) {
         "sandboxed"
     } else {
@@ -81,16 +81,21 @@ pub fn render_container_maximized(
     // While a workflow runs, show the step this container is executing: the
     // slot's own step (parallel group slots), otherwise the workflow's
     // current step (sequential steps run in the backbone slot, whose
-    // step_name is empty).
-    let step_name: Option<String> = Some(focused_slot.step_name.clone())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            tab.shared
-                .workflow_state
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
-        });
+    // step_name is empty). A setup/teardown step already names itself in
+    // place of the agent, so it gets no suffix.
+    let step_name: Option<String> = if is_phase_step {
+        None
+    } else {
+        Some(focused_slot.step_name.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                tab.shared
+                    .workflow_state
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
+            })
+    };
     let left_title = match step_name {
         Some(step) => format!(
             " \u{1F512} {} ({}) \u{2014} {} ",

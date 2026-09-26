@@ -433,6 +433,39 @@ fn run_setup_failure_records_failed_state() {
     );
 }
 
+/// A PTY-attached phase step returns everything as stdout, so its stderr is
+/// empty on failure; the recorded error must still say what happened.
+#[test]
+fn a_failure_with_no_stderr_records_the_exit_code() {
+    use crate::data::workflow_state::PhaseStepStatus;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+
+    use crate::data::workflow_definition::SetupStep;
+    let steps = vec![SetupStep::RunShell {
+        command: "quiet-fail".into(),
+        env: None,
+    }];
+    let mock = Arc::new(MockBackgroundContainer::with_results([(
+        "merged pty output".into(),
+        "".into(),
+        3,
+    )]));
+
+    engine
+        .run_phase(PhaseKind::Setup, &steps, &[], &[], mock.factory())
+        .unwrap();
+
+    let states = &engine.state().setup_step_states;
+    assert!(
+        matches!(&states[0].status, PhaseStepStatus::Failed { error }
+            if error == "command exited with code 3"),
+        "got {:?}",
+        states[0].status
+    );
+}
+
 #[test]
 fn run_teardown_transitions_phase_to_done() {
     use crate::data::workflow_state::WorkflowPhase;

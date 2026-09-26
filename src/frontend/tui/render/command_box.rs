@@ -169,12 +169,77 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
         };
         frame.render_widget(Paragraph::new(Line::from(indicator)), indicator_area);
     }
-    let area = content_area;
+    let mut area = content_area;
+    let show_suggestions = app.focus == Focus::CommandBox && !app.suggestion_row.is_empty();
+    let tab = app.active_tab();
+    let working_dir = tab.session.working_dir();
+    let active_worktree = tab
+        .shared
+        .active_worktree_path
+        .lock()
+        .ok()
+        .and_then(|path| path.clone());
+    let (directory_label, directory_path, directory_color) =
+        if let Some(worktree) = active_worktree.as_deref() {
+            ("  Using worktree: ", worktree, Color::Blue)
+        } else if working_dir != tab.session.git_root() {
+            ("  Using worktree: ", working_dir, Color::Blue)
+        } else {
+            ("  CWD: ", working_dir, Color::DarkGray)
+        };
+    let directory_text = directory_path.to_string_lossy();
+    let directory_width =
+        directory_label.len() + unicode_width::UnicodeWidthStr::width(directory_text.as_ref()) + 2;
+    let primary_width = if show_suggestions {
+        (area.width / 3).min(24)
+    } else {
+        directory_width.min(area.width as usize) as u16
+    };
+    if let Some(path) = app.active_tab().active_workflow_context_path() {
+        let label = " Context: ";
+        let hint = " [Ctrl-Shift-C copy] ";
+        let fixed_width = (label.len() + hint.len()) as u16;
+        let available = area.width.saturating_sub(primary_width);
+        let widget_width = if available > fixed_width {
+            available
+        } else {
+            0
+        };
+        let widget_area = Rect {
+            x: area.x + area.width - widget_width,
+            width: widget_width,
+            ..area
+        };
+        let hint_width = (hint.len() as u16).min(widget_width);
+        let path_area = Rect {
+            width: widget_width.saturating_sub(hint_width),
+            ..widget_area
+        };
+        let hint_area = Rect {
+            x: widget_area.x + path_area.width,
+            width: hint_width,
+            ..widget_area
+        };
+        let path_width = (path_area.width as usize).saturating_sub(label.len());
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Blue)),
+                Span::styled(
+                    truncate_middle(&path.to_string_lossy(), path_width),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            path_area,
+        );
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::Cyan)),
+            hint_area,
+        );
+        area.width -= widget_width;
+    }
     if area.width == 0 {
         return;
     }
-
-    let show_suggestions = app.focus == Focus::CommandBox && !app.suggestion_row.is_empty();
 
     if show_suggestions {
         let mut spans: Vec<Span> = Vec::with_capacity(app.suggestion_row.len() * 2);
@@ -219,41 +284,14 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
     //      session was opened directly on a worktree path — e.g. exec workflow
     //      with --worktree opened a fresh session there).
     //   3. The CWD itself.
-    let tab = app.active_tab();
-    let working_dir = tab.session.working_dir();
-    let git_root = tab.session.git_root();
-    let active_worktree: Option<std::path::PathBuf> = tab
-        .shared
-        .active_worktree_path
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
-
-    let para = if let Some(wt) = active_worktree {
-        let label = "  Using worktree: ";
-        let max_path_w = (area.width as usize).saturating_sub(label.len() + 2);
-        let wt_str = truncate_middle(&wt.to_string_lossy(), max_path_w);
-        Paragraph::new(Line::from(vec![
-            Span::styled(label, Style::default().fg(Color::Blue)),
-            Span::styled(wt_str, Style::default().fg(Color::DarkGray)),
-        ]))
-    } else if working_dir != git_root {
-        let label = "  Using worktree: ";
-        let max_path_w = (area.width as usize).saturating_sub(label.len() + 2);
-        let wt_str = truncate_middle(&working_dir.to_string_lossy(), max_path_w);
-        Paragraph::new(Line::from(vec![
-            Span::styled(label, Style::default().fg(Color::Blue)),
-            Span::styled(wt_str, Style::default().fg(Color::DarkGray)),
-        ]))
-    } else {
-        let label = "  CWD: ";
-        let max_path_w = (area.width as usize).saturating_sub(label.len() + 2);
-        let cwd_str = truncate_middle(&working_dir.to_string_lossy(), max_path_w);
-        Paragraph::new(Line::from(vec![
-            Span::styled(label, Style::default().fg(Color::DarkGray)),
-            Span::styled(cwd_str, Style::default().fg(Color::DarkGray)),
-        ]))
-    };
+    let max_path_width = (area.width as usize).saturating_sub(directory_label.len() + 2);
+    let para = Paragraph::new(Line::from(vec![
+        Span::styled(directory_label, Style::default().fg(directory_color)),
+        Span::styled(
+            truncate_middle(&directory_text, max_path_width),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
     frame.render_widget(para, area);
 }
 

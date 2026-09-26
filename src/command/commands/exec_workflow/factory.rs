@@ -203,6 +203,16 @@ impl AgentExecutionFactory for CommandLayerFactory {
             }
         }
 
+        if let Some(overlay) = context_overlays
+            .iter()
+            .find(|overlay| overlay.scope == crate::engine::overlay::ContextScope::Workflow)
+        {
+            self.shared
+                .lock()
+                .unwrap()
+                .report_workflow_context_path(&overlay.host_path);
+        }
+
         // Use the original repo root for image tag derivation so worktree-
         // based runs resolve the correct image for both the Image option AND
         // for image_home_dir inspection (which determines overlay mount paths).

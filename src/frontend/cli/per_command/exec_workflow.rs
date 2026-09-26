@@ -11,10 +11,26 @@ use crate::command::commands::exec_workflow::{
 };
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::workflow_state::PhaseKind;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl ExecWorkflowCommandFrontend for CliFrontend {
+    /// On a TTY the terminal is handed to the phase step's container, as it
+    /// is to an agent step's; `--non-interactive` keeps the headless path.
+    fn supports_interactive_phase_steps(&self) -> bool {
+        !self.non_interactive
+    }
+
+    /// Take the terminal back from the exited container: stop the raw stdin
+    /// reader and restore cooked mode before the step's result is printed.
+    /// Agent steps get the same release from their terminal
+    /// `report_step_status`, which a phase step never receives.
+    fn report_phase_step_container_exited(&mut self, _kind: PhaseKind, _exit_code: i32) {
+        self.unbind_container_stdio();
+        self.container_stdin_tx = None;
+    }
+
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
         self.write_message(UserMessage {
             level: MessageLevel::Info,

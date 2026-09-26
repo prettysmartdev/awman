@@ -106,6 +106,31 @@ pub trait ExecWorkflowCommandFrontend:
 {
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary);
 
+    fn report_workflow_context_path(&mut self, _host_path: &std::path::Path) {}
+
+    /// Whether setup/teardown shell steps should run in a foreground,
+    /// PTY-attached container the user can see and type into, the way agent
+    /// steps do. `false` keeps the headless path: a background container
+    /// whose output is streamed line by line through `on_phase_step_output`.
+    ///
+    /// Defaults to `false` so the API server and the squad daemon — which
+    /// have no terminal to hand a PTY to — never opt in by accident.
+    fn supports_interactive_phase_steps(&self) -> bool {
+        false
+    }
+
+    /// An interactive setup/teardown container is about to launch. Frontends
+    /// prepare fresh container I/O here, exactly as they do in
+    /// `report_step_interactive_launch` for an agent step.
+    fn report_phase_step_interactive_launch(&mut self, _kind: PhaseKind) {}
+
+    /// An interactive setup/teardown container has exited. The default
+    /// reports it as an ordinary container exit, which closes the TUI's
+    /// container window; the CLI also releases the terminal here.
+    fn report_phase_step_container_exited(&mut self, _kind: PhaseKind, exit_code: i32) {
+        self.report_container_exited(exit_code);
+    }
+
     /// A previous run of this workflow left resumable state on disk. Offer to
     /// pick it back up from one of the named steps, to discard that state and
     /// start over, or to cancel the command (WI-0115 §2).
@@ -407,6 +432,7 @@ mod dynamic;
 mod execute;
 mod factory;
 mod issue;
+mod phase_container;
 mod prepare;
 
 #[cfg(test)]

@@ -7,6 +7,106 @@ use super::*;
 use crate::command::commands::squad::commands::SquadCommand;
 use crate::command::dispatch::FrontendAction;
 
+#[test]
+fn workflow_context_copy_intercepts_both_key_encodings_before_pty_or_dialog() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+
+    for code in ['c', 'C'] {
+        for with_dialog in [false, true] {
+            let mut app = make_app();
+            activate_workflow_context(&mut app, "/host/context/current");
+            app.active_tab_mut()
+                .start_container("claude".into(), "container".into(), 80, 24);
+            app.active_tab_mut().container_window_state = ContainerWindowState::Maximized;
+            app.focus = Focus::ExecutionWindow;
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            app.active_tab_mut()
+                .focused_slot_mut()
+                .unwrap()
+                .container_stdin_tx = Some(sender);
+            if with_dialog {
+                app.active_dialog = Some(Dialog::Notice {
+                    title: "Workflow".into(),
+                    body: "Status".into(),
+                    copy_key: None,
+                    copy_zshrc_snippet: None,
+                });
+            }
+
+            press_key(
+                &mut app,
+                KeyCode::Char(code),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(app.active_dialog.is_some(), with_dialog);
+            assert!(app
+                .active_tab()
+                .shared
+                .status_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry.text == "Workflow context path copied to clipboard" }));
+        }
+    }
+}
+
+#[test]
+fn workflow_context_copy_does_not_capture_keys_without_an_active_overlay() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+
+    let mut app = make_app();
+    activate_workflow_context(&mut app, "/host/context/background");
+    app.tabs.push(Tab::new(make_session()));
+    app.active_tab = 1;
+    app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+        command: "chat".into(),
+    };
+    app.active_tab_mut()
+        .start_container("claude".into(), "container".into(), 80, 24);
+    app.active_tab_mut().container_window_state = ContainerWindowState::Maximized;
+    app.focus = Focus::ExecutionWindow;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    app.active_tab_mut()
+        .focused_slot_mut()
+        .unwrap()
+        .container_stdin_tx = Some(sender);
+
+    press_key(
+        &mut app,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert_eq!(receiver.try_recv().unwrap(), vec![3]);
+
+    activate_workflow_context(&mut app, "/host/context/foreground");
+    press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(receiver.try_recv().unwrap(), vec![3]);
+    assert!(app
+        .active_tab()
+        .shared
+        .status_log
+        .lock()
+        .unwrap()
+        .is_empty());
+
+    app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Idle;
+    press_key(
+        &mut app,
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert!(app
+        .active_tab()
+        .shared
+        .status_log
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
 // ─── Autocomplete cycling ─────────────────────────────────────────────────
 
 #[test]

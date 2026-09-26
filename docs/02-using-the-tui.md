@@ -309,6 +309,8 @@ If awman hits an internal error (a panic) while the TUI is running, the full err
 
 Whenever awman launches a container to run a code agent, a **container window** appears overlaying the execution window. This window contains a full terminal emulator — all keyboard input, ANSI colour codes, cursor movement, and interactive TUI apps (like Claude Code's own UI) work exactly as they would in a real terminal.
 
+Workflow [setup and teardown](05-workflows.md#container-execution-model) steps get the same window: each step's shell command runs in its own container, its output appears here live, and you can type into it if the command asks for input. The window closes when the command exits.
+
 ```
 ╭─ 🔒 Claude Code (containerized) ── myproject | 5% | 200mb ──╮
 │                                                               │
@@ -765,12 +767,15 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 
 ### Global shortcuts (anywhere in TUI)
 
+While the current tab is running a workflow with a workflow context overlay, the bottom row shows its host directory alongside the CWD or worktree and the squad indicator. **Ctrl+Shift+C** copies the full directory path, even when the displayed path is shortened. The CWD/worktree and squad indicator take priority: the context widget uses only the remaining space and hides if its label, shortened path, and copy hint cannot fit. The copy shortcut remains available while the widget is hidden for lack of space. The widget and shortcut disappear when the workflow ends or you switch to a tab without an active workflow context overlay.
+
 | Key | Action |
 |-----|--------|
 | **Ctrl+T** | Open a new tab (prompts for working directory) |
 | **Ctrl+A** | Switch to the previous tab |
 | **Ctrl+D** | Switch to the next tab |
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
+| **Ctrl+Shift+C** | Copy the workflow context host directory (only while the current tab has an active workflow context overlay) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (independent of Ctrl+M) |
 | **Shift+← / Shift+→** | Scroll the Workflow Overview sideways (only while it doesn't fit at full width; mouse wheel and Shift+mouse wheel also scroll it) |

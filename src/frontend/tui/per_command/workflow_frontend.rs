@@ -232,6 +232,11 @@ impl WorkflowFrontend for TuiCommandFrontend {
         if let Ok(mut name) = self.container_name_shared.lock() {
             *name = None;
         }
+        // An agent container (including a setup/teardown step's `on_failure`
+        // agent) is titled with the agent, never a phase step.
+        if let Ok(mut title) = self.container_title_shared.lock() {
+            *title = None;
+        }
 
         self.messages
             .info(format!("Launching agent '{}' in new container...", agent));
@@ -268,6 +273,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
+        self.current_phase_step_title = Some(format!("[{}] {description}", kind.label()));
         self.messages
             .info(format!("{}: {description}", kind.label()));
         upsert_phase_step(
@@ -591,6 +597,44 @@ mod tests {
         std::sync::mpsc::Sender<DialogResponse>,
     ) {
         crate::frontend::tui::tests::test_command_frontend(&["workflow"], Default::default())
+    }
+
+    #[test]
+    fn workflow_context_path_survives_main_completion_until_the_final_summary() {
+        use crate::command::commands::exec_workflow::{
+            ExecWorkflowCommandFrontend, WorkflowSummary,
+        };
+        use crate::engine::workflow::actions::WorkflowOutcome;
+
+        for outcome in [
+            WorkflowOutcome::Completed,
+            WorkflowOutcome::CompletedTeardownFailed,
+            WorkflowOutcome::Paused,
+            WorkflowOutcome::Aborted,
+            WorkflowOutcome::Failed {
+                last_step: "build".into(),
+                exit_code: 1,
+            },
+        ] {
+            let (mut frontend, _, _) = make_frontend();
+            let path = std::path::Path::new("/host/.awman/context/workflow/resumed-invocation");
+            frontend.report_workflow_context_path(path);
+            frontend.report_workflow_progress(&[]);
+            assert_eq!(
+                frontend.workflow_context_path.lock().unwrap().as_deref(),
+                Some(path)
+            );
+            frontend.report_workflow_completed(&outcome);
+            assert_eq!(
+                frontend.workflow_context_path.lock().unwrap().as_deref(),
+                Some(path)
+            );
+            frontend.report_workflow_summary(&WorkflowSummary {
+                steps_completed: 1,
+                steps_failed: 0,
+            });
+            assert!(frontend.workflow_context_path.lock().unwrap().is_none());
+        }
     }
 
     #[test]
@@ -1036,6 +1080,63 @@ mod tests {
             }
             _ => panic!("expected YoloFinished event"),
         }
+    }
+
+    /// The phase step's container is titled with the step that started it,
+    /// and the next agent container (here an `on_failure` agent) is not.
+    #[test]
+    fn a_phase_step_launch_publishes_its_title_and_an_agent_launch_clears_it() {
+        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.on_phase_step_started(PhaseKind::Setup, "run_shell: make deps");
+        frontend.report_phase_step_interactive_launch(PhaseKind::Setup);
+        assert_eq!(
+            frontend.container_title_shared.lock().unwrap().as_deref(),
+            Some("[setup] run_shell: make deps")
+        );
+
+        let on_failure = crate::data::workflow_definition::WorkflowStep {
+            name: "__on_failure__".into(),
+            depends_on: vec![],
+            prompt_template: "".into(),
+            agent: None,
+            model: None,
+            overlays: None,
+            abort_on_failure: false,
+        };
+        frontend.report_step_interactive_launch(&on_failure, "claude", None);
+        assert!(frontend.container_title_shared.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_phase_step_launch_readies_the_container_window_like_an_agent_step() {
+        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        assert!(frontend.supports_interactive_phase_steps());
+        let _ = frontend.container_io.take();
+        *frontend.container_name_shared.lock().unwrap() = Some("old".into());
+
+        frontend.report_phase_step_interactive_launch(PhaseKind::Teardown);
+
+        assert!(
+            frontend.container_io.is_some(),
+            "fresh PTY channels must be ready"
+        );
+        assert!(frontend
+            .pty_reset_flag
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(frontend.container_name_shared.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_phase_step_container_exit_closes_the_container_window() {
+        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
+
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.report_phase_step_container_exited(PhaseKind::Setup, 2);
+        assert_eq!(*frontend.container_exit_shared.lock().unwrap(), Some(2));
     }
 
     #[test]

@@ -185,6 +185,12 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
 }
 
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    if keymap::is_workflow_context_copy_key(key) {
+        if let Some(path) = app.active_tab().active_workflow_context_path() {
+            copy_dialog_text_to_clipboard(app, "Workflow context path", &path.to_string_lossy());
+            return;
+        }
+    }
     let ctx = focus_context(app);
     if intercept_dialog_keys(app, key) {
         return;

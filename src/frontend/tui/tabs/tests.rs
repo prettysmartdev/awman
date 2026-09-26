@@ -1546,3 +1546,15 @@ fn refresh_from_session_adopts_the_phase_workflow_and_container() {
         Some("awman-build")
     );
 }
+
+#[test]
+fn new_command_drops_workflow_context_and_ignores_late_reports() {
+    let mut shared = super::TabSharedState::new();
+    let old_frontend_path = shared.workflow_context_path.clone();
+    *old_frontend_path.lock().unwrap() = Some("/host/context/previous".into());
+
+    shared.reset_for_new_command();
+    assert!(shared.workflow_context_path.lock().unwrap().is_none());
+    *old_frontend_path.lock().unwrap() = Some("/host/context/late-report".into());
+    assert!(shared.workflow_context_path.lock().unwrap().is_none());
+}

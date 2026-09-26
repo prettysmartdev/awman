@@ -465,6 +465,8 @@ impl ExecWorkflowCommand {
                 CommandError::Other("failed to resolve workflow context directory".into())
             })?;
 
+        frontend.report_workflow_context_path(&context_dir);
+
         // ── Seed the context dir: remove stale workflow.toml, write refs. ───
         let generated_path = context_dir.join("workflow.toml");
         let _ = std::fs::remove_file(&generated_path);

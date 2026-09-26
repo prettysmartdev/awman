@@ -165,7 +165,15 @@ impl WorkflowEngine {
         };
 
         if result.exit_code != 0 {
-            self.set_phase_step_failed(kind, idx, &result.stderr);
+            // An interactive (PTY) run merges stderr into stdout, and a quiet
+            // command may print nothing at all; either way the recorded error
+            // should still say something.
+            let error = if result.stderr.trim().is_empty() {
+                format!("command exited with code {}", result.exit_code)
+            } else {
+                result.stderr.clone()
+            };
+            self.set_phase_step_failed(kind, idx, &error);
             return PhaseStepOutcome::failed(result.stdout, result.stderr);
         }
 

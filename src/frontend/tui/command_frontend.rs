@@ -46,10 +46,18 @@ pub struct TuiCommandFrontend {
     pub(crate) status_log: SharedStatusLog,
     pub(crate) workflow_view: SharedWorkflowViewState,
     pub(crate) workflow_invocation_id: std::sync::Arc<Mutex<Option<uuid::Uuid>>>,
+    pub(crate) workflow_context_path: std::sync::Arc<Mutex<Option<PathBuf>>>,
     pub(crate) yolo_state: SharedYoloState,
     pub(crate) yolo_cancel_flag: SharedYoloCancelFlag,
     pub(crate) pty_reset_flag: SharedPtyResetFlag,
     pub(crate) container_name_shared: SharedContainerName,
+    /// Title for a setup/teardown step's container; see
+    /// [`crate::frontend::tui::tabs::SharedContainerTitle`].
+    pub(crate) container_title_shared: crate::frontend::tui::tabs::SharedContainerTitle,
+    /// The setup/teardown step the engine most recently started, as its
+    /// container title. Recorded by `on_phase_step_started`, which always
+    /// precedes that step's container launch (and any retry of it).
+    pub(crate) current_phase_step_title: Option<String>,
     /// Shared exit-code slot: written when the engine reports a workflow
     /// container actually terminated; the TUI event loop takes it and closes
     /// the container window.
@@ -144,6 +152,7 @@ impl TuiCommandFrontend {
         let TabSharedState {
             workflow_state: workflow_view,
             workflow_invocation_id,
+            workflow_context_path,
             yolo_state,
             yolo_cancel_flag,
             status_log,
@@ -151,6 +160,7 @@ impl TuiCommandFrontend {
             container_slot_events,
             pty_reset_flag,
             container_name_shared,
+            container_title_shared,
             container_exit_shared,
             stdin_tx_shared,
             resize_tx_shared,
@@ -174,10 +184,13 @@ impl TuiCommandFrontend {
             status_log,
             workflow_view,
             workflow_invocation_id,
+            workflow_context_path,
             yolo_state,
             yolo_cancel_flag,
             pty_reset_flag,
             container_name_shared,
+            container_title_shared,
+            current_phase_step_title: None,
             container_exit_shared,
             stdout_tx,
             stdin_tx_shared,

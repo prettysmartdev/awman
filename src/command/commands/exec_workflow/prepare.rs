@@ -6,6 +6,7 @@
 //! Split out of `commands/exec_workflow.rs` by WI 0114 F-51. A child module
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
+use super::phase_container::InteractivePhaseContainer;
 use super::*;
 
 /// Emit the deprecation warning for `agent`, if its vendor has deprecated it.
@@ -468,6 +469,15 @@ pub(crate) async fn execute_prepared(
             }
         }
 
+        // Interactive frontends (the CLI on a TTY, the TUI) run each
+        // setup/teardown shell step as a foreground, PTY-attached container
+        // the user can watch and type into, like an agent step. Everything
+        // else — the API server, the squad daemon, a `--non-interactive` CLI
+        // — keeps the headless background container. A squad-generated
+        // workflow is always headless, whichever frontend is driving it.
+        let interactive_phase_steps =
+            squad_identity.is_none() && shared.lock().unwrap().supports_interactive_phase_steps();
+
         // === SETUP PHASE ===
         //
         // Each setup entry runs in its own container built from THAT
@@ -522,6 +532,17 @@ pub(crate) async fn execute_prepared(
                             })?
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
+                        if interactive_phase_steps {
+                            return Ok(Box::new(InteractivePhaseContainer::new(
+                                Arc::clone(&runtime),
+                                Arc::clone(&shared_for_factory),
+                                PhaseKind::Setup,
+                                &base,
+                                mount.clone(),
+                                env.clone(),
+                                overlays.clone(),
+                            )));
+                        }
                         let container = runtime.start_background(&base, &mount, env, overlays)?;
                         Ok(Box::new(container))
                     };
@@ -618,6 +639,17 @@ pub(crate) async fn execute_prepared(
                             })?
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
+                        if interactive_phase_steps {
+                            return Ok(Box::new(InteractivePhaseContainer::new(
+                                Arc::clone(&runtime),
+                                Arc::clone(&shared),
+                                PhaseKind::Teardown,
+                                &base_image,
+                                mount.clone(),
+                                env.clone(),
+                                overlays.clone(),
+                            )));
+                        }
                         let container =
                             runtime.start_background(&base_image, &mount, env, overlays)?;
                         Ok(Box::new(container))

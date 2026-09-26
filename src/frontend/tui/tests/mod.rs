@@ -117,6 +117,17 @@ fn press_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     );
 }
 
+fn activate_workflow_context(app: &mut App, path: &str) {
+    app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+        command: "exec workflow".into(),
+    };
+    *app.active_tab()
+        .shared
+        .workflow_context_path
+        .lock()
+        .unwrap() = Some(path.into());
+}
+
 fn press_char(app: &mut App, c: char) {
     press_key(app, KeyCode::Char(c), KeyModifiers::NONE);
 }

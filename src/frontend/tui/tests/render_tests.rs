@@ -1555,6 +1555,153 @@ fn fg_of_symbol_on_row(buf: &ratatui::buffer::Buffer, y: u16, symbol: &str) -> O
         .map(|c| c.fg)
 }
 
+#[test]
+fn workflow_context_footer_shows_host_path_with_cwd_or_worktree_and_squad() {
+    let mut app = make_app();
+    let path = "/home/user/.awman/context/workflow/invocation";
+    activate_workflow_context(&mut app, path);
+    for worktree in [None, Some(std::path::PathBuf::from("/worktrees/current"))] {
+        *app.active_tab().shared.active_worktree_path.lock().unwrap() = worktree.clone();
+        let row = bottom_row(&render_app(&mut app, 200, 24));
+        assert!(row.contains(path), "{row}");
+        assert!(row.contains("Context:"), "{row}");
+        assert!(row.contains("[Ctrl-Shift-C copy]"), "{row}");
+        assert!(row.ends_with("squad ●"), "{row}");
+        if worktree.is_some() {
+            assert!(row.contains("Using worktree: /worktrees/current"), "{row}");
+        } else {
+            assert!(row.contains("CWD:"), "{row}");
+        }
+    }
+}
+
+#[test]
+fn workflow_context_footer_preserves_hint_and_squad_on_narrow_screens() {
+    let mut app = make_app();
+    *app.active_tab().shared.active_worktree_path.lock().unwrap() = Some("/work".into());
+    activate_workflow_context(
+        &mut app,
+        "/home/user/very-long-host-directory/上下文/.awman/context/workflow/invocation",
+    );
+    for width in [80, 100, 120] {
+        let row = bottom_row(&render_app(&mut app, width, 24));
+        assert!(row.contains("Using worktree: /work"), "{row}");
+        assert!(row.contains("Context:"), "{row}");
+        assert!(row.contains("[Ctrl-Shift-C copy]"), "{row}");
+        assert!(row.contains('…'), "{row}");
+        assert!(row.ends_with("squad ●"), "{row}");
+    }
+    for width in 1..40 {
+        render_app(&mut app, width, 24);
+    }
+}
+
+#[test]
+fn workflow_context_footer_yields_to_the_full_directory_and_squad_indicator() {
+    let mut app = make_app();
+    for worktree in [
+        None,
+        Some(std::path::PathBuf::from(
+            "/worktrees/a-long-project/feature-branch",
+        )),
+        Some(std::path::PathBuf::from("/worktrees/上下文/feature-branch")),
+    ] {
+        *app.active_tab().shared.active_worktree_path.lock().unwrap() = worktree.clone();
+        let directory = worktree
+            .as_deref()
+            .unwrap_or(app.active_tab().session.working_dir());
+        let label = if worktree.is_some() {
+            "  Using worktree: "
+        } else {
+            "  CWD: "
+        };
+        let primary = format!("{label}{}", directory.display());
+        let primary_width = unicode_width::UnicodeWidthStr::width(primary.as_str());
+        let primary_cells: String = primary
+            .chars()
+            .map(|character| {
+                let padding = unicode_width::UnicodeWidthChar::width(character)
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                format!("{character}{}", " ".repeat(padding))
+            })
+            .collect();
+
+        for width in [6, 30, 60, 80, 120, 200] {
+            *app.active_tab()
+                .shared
+                .workflow_context_path
+                .lock()
+                .unwrap() = None;
+            let without_context = render_app(&mut app, width, 24);
+            activate_workflow_context(
+                &mut app,
+                "/host/context/workflow/very-long-invocation-directory",
+            );
+            let with_context = render_app(&mut app, width, 24);
+            let row = bottom_row(&with_context);
+            if width as usize >= primary_width + 10 {
+                assert!(row.contains(&primary_cells), "{row}");
+            }
+            if (width as usize).saturating_sub(8) < primary_width + 2 + 30 {
+                assert_eq!(bottom_row(&without_context), row);
+            } else {
+                assert!(row.contains("Context:"), "{row}");
+                assert!(row.contains("[Ctrl-Shift-C copy]"), "{row}");
+            }
+            assert!(row.ends_with('●'), "{row}");
+        }
+    }
+}
+
+#[test]
+fn workflow_context_footer_tracks_the_active_tab_and_execution_lifecycle() {
+    use crate::frontend::tui::tabs::ExecutionPhase;
+
+    let mut app = make_app();
+    activate_workflow_context(&mut app, "/host/context/first");
+    app.tabs.push(Tab::new(make_session()));
+    app.active_tab = 1;
+    app.active_tab_mut().execution_phase = ExecutionPhase::Running {
+        command: "exec workflow".into(),
+    };
+    assert!(!bottom_row(&render_app(&mut app, 200, 24)).contains("Context:"));
+    activate_workflow_context(&mut app, "/host/context/second");
+    assert!(bottom_row(&render_app(&mut app, 200, 24)).contains("/host/context/second"));
+    app.active_tab = 0;
+    assert!(bottom_row(&render_app(&mut app, 200, 24)).contains("/host/context/first"));
+
+    for phase in [
+        ExecutionPhase::Idle,
+        ExecutionPhase::Done {
+            command: "exec workflow".into(),
+            exit_code: 0,
+        },
+        ExecutionPhase::Error {
+            command: "exec workflow".into(),
+            message: "failed".into(),
+        },
+    ] {
+        app.active_tab_mut().execution_phase = phase;
+        let row = bottom_row(&render_app(&mut app, 200, 24));
+        assert!(!row.contains("Context:"), "{row}");
+        assert!(!row.contains("Ctrl-Shift-C"), "{row}");
+    }
+}
+
+#[test]
+fn workflow_context_footer_remains_visible_with_suggestions() {
+    let mut app = make_app();
+    activate_workflow_context(&mut app, "/host/context/current");
+    app.focus = Focus::CommandBox;
+    app.suggestion_row = vec!["chat".into()];
+    let row = bottom_row(&render_app(&mut app, 160, 24));
+    assert!(row.contains("chat"), "{row}");
+    assert!(row.contains("/host/context/current"), "{row}");
+    assert!(row.contains("[Ctrl-Shift-C copy]"), "{row}");
+    assert!(row.ends_with("squad ●"), "{row}");
+}
+
 fn set_indicator(app: &App, state: crate::engine::squad::SquadHealth) {
     *app.squad_indicator.lock().unwrap() = state;
 }
@@ -2041,4 +2188,48 @@ fn control_board_labels_are_group_aware() {
     assert!(text.contains("Restart current step"), "{text}");
     assert!(text.contains("Cancel to prev"), "{text}");
     assert!(text.contains("Next: new container"), "{text}");
+}
+
+// ─── Container window title for setup/teardown steps ────────────────────────
+
+/// A setup/teardown step's container is titled with the step, not the agent,
+/// and still says it is containerized.
+#[test]
+fn a_setup_step_container_window_is_titled_with_the_step() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+    let mut app = make_app();
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("Claude Code".into(), "awman-abc".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        let info = tab
+            .focused_slot_mut()
+            .and_then(|s| s.container_info.as_mut())
+            .unwrap();
+        info.phase_step_title = Some("[setup] run_shell: make deps".into());
+    }
+
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(
+        text.contains("[setup] run_shell: make deps (containerized)"),
+        "title must name the step: {text}"
+    );
+    assert!(
+        !text.contains("Claude Code"),
+        "a shell step's window must not be titled with the agent: {text}"
+    );
+}
+
+#[test]
+fn an_agent_container_window_keeps_the_agent_title() {
+    use crate::frontend::tui::tabs::ContainerWindowState;
+    let mut app = make_app();
+    {
+        let tab = app.active_tab_mut();
+        tab.start_container("Claude Code".into(), "awman-abc".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+    }
+
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(text.contains("Claude Code (containerized)"), "{text}");
 }
