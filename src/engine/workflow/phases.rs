@@ -11,7 +11,8 @@ use super::*;
 impl WorkflowEngine {
     /// Run one shell phase, asking the caller for a fresh container per step.
     ///
-    /// `container_for_step(idx)` is invoked once per step and must return a
+    /// `container_for_step(step)` is invoked once per step (and again for
+    /// each `on_failure` retry) and must return a
     /// container with that step's overlays/env applied — and only that step's.
     /// The returned container is dropped when the step finishes, which kills
     /// the container via `BackgroundContainer::drop`. This is what gives each
@@ -43,7 +44,7 @@ impl WorkflowEngine {
     ) -> Result<PhaseOutcome, EngineError>
     where
         S: PhaseStepSpec,
-        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus};
 
@@ -76,36 +77,38 @@ impl WorkflowEngine {
 
             self.frontend.on_phase_step_started(kind, &desc);
 
-            let step_outcome = self.run_single_phase_step(kind, step, idx, &mut container_for_step);
+            let mut step_outcome =
+                self.run_single_phase_step(kind, step, idx, &mut container_for_step);
 
-            let ultimately_failed = if step_outcome.failed {
+            if step_outcome.failed {
                 let rem = on_failure_configs
                     .get(idx)
                     .and_then(|c| c.as_ref())
                     .cloned();
-                match rem {
-                    Some(rem_config) => !self.run_phase_remediation(
+                if let Some(rem_config) = rem {
+                    step_outcome = self.run_phase_remediation(
                         kind,
                         &rem_config,
                         step,
                         idx,
-                        &step_outcome.stdout,
-                        &step_outcome.stderr,
+                        step_outcome,
                         &mut container_for_step,
-                    ),
-                    None => true,
+                    );
                 }
-            } else {
-                false
-            };
+            }
 
-            if !ultimately_failed {
+            if !step_outcome.failed {
                 self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Succeeded;
                 self.persist()?;
                 self.frontend.on_phase_step_completed(kind, &desc);
             } else {
                 let error = self.phase_step_failed_error(kind, idx);
-                self.frontend.on_phase_step_failed(kind, &desc, 1, &error);
+                self.frontend.on_phase_step_failed(
+                    kind,
+                    &desc,
+                    step_outcome.reported_exit_code(),
+                    &error,
+                );
                 outcome.any_failed = true;
                 if abort {
                     outcome.aborted = true;
@@ -165,16 +168,11 @@ impl WorkflowEngine {
         };
 
         if result.exit_code != 0 {
-            // An interactive (PTY) run merges stderr into stdout, and a quiet
-            // command may print nothing at all; either way the recorded error
-            // should still say something.
-            let error = if result.stderr.trim().is_empty() {
-                format!("command exited with code {}", result.exit_code)
-            } else {
-                result.stderr.clone()
-            };
-            self.set_phase_step_failed(kind, idx, &error);
-            return PhaseStepOutcome::failed(result.stdout, result.stderr);
+            // The exit code travels in the outcome to `on_phase_step_failed`;
+            // wording a failure (including one with nothing on stderr, as an
+            // interactive run's never has) is the frontend's job (F-45).
+            self.set_phase_step_failed(kind, idx, &result.stderr);
+            return PhaseStepOutcome::exited(result.exit_code, result.stdout, result.stderr);
         }
 
         PhaseStepOutcome::succeeded()
@@ -253,7 +251,7 @@ impl WorkflowEngine {
     ) -> PhaseStepOutcome
     where
         S: PhaseStepSpec,
-        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         if let Some((interval_secs, max_retries)) = step.poll_ci() {
             let failed = self.run_poll_ci_phase_step(interval_secs, max_retries, kind, idx);
@@ -267,7 +265,12 @@ impl WorkflowEngine {
         }
 
         let (command, env) = step.to_shell();
-        match container_for_step(idx) {
+        let step_ref = PhaseStepRef {
+            kind,
+            index: idx,
+            description: self.state.phase_step_states(kind)[idx].description.clone(),
+        };
+        match container_for_step(&step_ref) {
             Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), kind, idx),
             Err(e) => {
                 let error = e.to_string();
@@ -277,11 +280,12 @@ impl WorkflowEngine {
         }
     }
 
-    /// Run on_failure remediation for a phase step. Returns `true` if
-    /// remediation succeeded.
+    /// Run on_failure remediation for a phase step. Returns the outcome of
+    /// the last retry: succeeded if remediation fixed the step, otherwise the
+    /// final failure (with its exit code). With no attempt made, `failure`
+    /// comes back unchanged.
     ///
-    /// `stdout` / `stderr` carry the output of the failure that triggered this
-    /// remediation. Each retry that fails again overwrites the failure file
+    /// `failure` is the outcome that triggered this remediation. Each retry that fails again overwrites the failure file
     /// with its own fresh output, so the agent always sees the most recent
     /// failure.
     #[allow(clippy::too_many_arguments)]
@@ -291,19 +295,17 @@ impl WorkflowEngine {
         config: &crate::data::workflow_definition::RemediationConfig,
         step: &S,
         idx: usize,
-        stdout: &str,
-        stderr: &str,
+        failure: PhaseStepOutcome,
         container_for_step: &mut F,
-    ) -> bool
+    ) -> PhaseStepOutcome
     where
         S: PhaseStepSpec,
-        F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
+        F: FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError>,
     {
         use crate::data::workflow_state::PhaseStepStatus;
 
         let desc = self.state.phase_step_states(kind)[idx].description.clone();
-        let mut cur_stdout = stdout.to_string();
-        let mut cur_stderr = stderr.to_string();
+        let mut last = failure;
         for attempt in 1..=config.max_attempts {
             self.msg_info(format!(
                 "Step failed — launching on_failure agent (attempt {attempt}/{})...",
@@ -323,8 +325,8 @@ impl WorkflowEngine {
                 Some(PhaseFailureContext {
                     kind,
                     step_name: &desc,
-                    stdout: &cur_stdout,
-                    stderr: &cur_stderr,
+                    stdout: &last.stdout,
+                    stderr: &last.stderr,
                 }),
             );
 
@@ -336,12 +338,11 @@ impl WorkflowEngine {
                 self.msg_info(format!(
                     "on_failure remediation succeeded on attempt {attempt}"
                 ));
-                return true;
+                return outcome;
             }
-            // Retain the freshest failure output so the next attempt's file
-            // reflects this retry, not the original failure.
-            cur_stdout = outcome.stdout;
-            cur_stderr = outcome.stderr;
+            // Retain the freshest failure so the next attempt's file reflects
+            // this retry, not the original failure.
+            last = outcome;
 
             if attempt == config.max_attempts {
                 self.msg_warning(format!(
@@ -351,7 +352,7 @@ impl WorkflowEngine {
             }
         }
 
-        false
+        last
     }
 
     /// Launch the on_failure agent container and wait for it to complete.

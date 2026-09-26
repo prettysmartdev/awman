@@ -526,16 +526,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_non_interactive_cli_keeps_phase_steps_headless() {
-        use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
-        let mut fe = make_frontend();
-        fe.non_interactive = true;
-        assert!(!fe.supports_interactive_phase_steps());
-        fe.non_interactive = false;
-        assert!(fe.supports_interactive_phase_steps());
-    }
-
     /// A phase step never gets a terminal `report_step_status`, so its
     /// container's exit is what hands the terminal back.
     #[test]

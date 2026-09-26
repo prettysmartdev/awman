@@ -8,6 +8,7 @@
 
 use super::phase_container::InteractivePhaseContainer;
 use super::*;
+use crate::engine::workflow::PhaseStepRef;
 
 /// Emit the deprecation warning for `agent`, if its vendor has deprecated it.
 ///
@@ -469,14 +470,15 @@ pub(crate) async fn execute_prepared(
             }
         }
 
-        // Interactive frontends (the CLI on a TTY, the TUI) run each
-        // setup/teardown shell step as a foreground, PTY-attached container
-        // the user can watch and type into, like an agent step. Everything
-        // else — the API server, the squad daemon, a `--non-interactive` CLI
-        // — keeps the headless background container. A squad-generated
-        // workflow is always headless, whichever frontend is driving it.
+        // When a person is at the frontend (the CLI on a TTY, the TUI), each
+        // setup/teardown shell step runs as a foreground, PTY-attached
+        // container they can watch and type into, like an agent step.
+        // Everything else — the API server, the squad daemon, a
+        // `--non-interactive` CLI — keeps the headless background container.
+        // A squad-generated workflow is always headless, whichever frontend
+        // is driving it.
         let interactive_phase_steps =
-            squad_identity.is_none() && shared.lock().unwrap().supports_interactive_phase_steps();
+            squad_identity.is_none() && shared.lock().unwrap().supports_interactive_recovery();
 
         // === SETUP PHASE ===
         //
@@ -519,10 +521,11 @@ pub(crate) async fn execute_prepared(
                 let base = base_image.clone();
                 let shared_for_factory = Arc::clone(&shared);
                 let setup_result = tokio::task::block_in_place(|| {
-                    let factory = |idx: usize| -> Result<
+                    let factory = |step: &PhaseStepRef| -> Result<
                         Box<dyn crate::engine::agent_runtime::background::AgentExec>,
                         EngineError,
                     > {
+                        let idx = step.index;
                         let (overlays, env) = resolved
                             .get(idx)
                             .ok_or_else(|| {
@@ -536,7 +539,7 @@ pub(crate) async fn execute_prepared(
                             return Ok(Box::new(InteractivePhaseContainer::new(
                                 Arc::clone(&runtime),
                                 Arc::clone(&shared_for_factory),
-                                PhaseKind::Setup,
+                                step,
                                 &base,
                                 mount.clone(),
                                 env.clone(),
@@ -626,10 +629,11 @@ pub(crate) async fn execute_prepared(
                 );
                 let mount = mount_path.clone();
                 teardown_outcome = tokio::task::block_in_place(|| {
-                    let factory = |idx: usize| -> Result<
+                    let factory = |step: &PhaseStepRef| -> Result<
                         Box<dyn crate::engine::agent_runtime::background::AgentExec>,
                         EngineError,
                     > {
+                        let idx = step.index;
                         let (overlays, env) = resolved
                             .get(idx)
                             .ok_or_else(|| {
@@ -643,7 +647,7 @@ pub(crate) async fn execute_prepared(
                             return Ok(Box::new(InteractivePhaseContainer::new(
                                 Arc::clone(&runtime),
                                 Arc::clone(&shared),
-                                PhaseKind::Teardown,
+                                step,
                                 &base_image,
                                 mount.clone(),
                                 env.clone(),

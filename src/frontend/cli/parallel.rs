@@ -424,12 +424,9 @@ impl ExecWorkflowCommandFrontend for CliParallelFrontend {
         self.inner.report_workflow_summary(summary);
     }
 
-    fn supports_interactive_phase_steps(&self) -> bool {
-        self.inner.supports_interactive_phase_steps()
-    }
-
-    fn report_phase_step_interactive_launch(&mut self, kind: PhaseKind) {
-        self.inner.report_phase_step_interactive_launch(kind);
+    fn report_phase_step_interactive_launch(&mut self, kind: PhaseKind, description: &str) {
+        self.inner
+            .report_phase_step_interactive_launch(kind, description);
     }
 
     fn report_phase_step_container_exited(&mut self, kind: PhaseKind, exit_code: i32) {

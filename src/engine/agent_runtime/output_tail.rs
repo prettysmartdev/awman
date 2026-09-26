@@ -9,9 +9,16 @@
 //!
 //! Combined stdout+stderr: the bridge's reader threads funnel both streams into
 //! the same tail, matching what the user saw interleaved on screen.
+//!
+//! A tail can also be unbounded ([`OutputTail::unbounded`]) to hold a
+//! container's whole transcript. The reader threads write through
+//! [`TailWriter`] handles, so a caller that needs every byte can wait for them
+//! to finish ([`OutputTail::wait_for_writers`]) after the container exits —
+//! the process exiting does not mean its last output has been read yet.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// Default number of lines retained. "~100 lines" per the feature spec.
 pub const DEFAULT_OUTPUT_TAIL_LINES: usize = 100;
@@ -28,6 +35,30 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 pub struct OutputTail {
     capacity: usize,
     inner: Mutex<Inner>,
+    /// Live [`TailWriter`]s — reader threads still feeding this tail.
+    writers: Mutex<usize>,
+    /// Signalled whenever a writer finishes.
+    writer_done: Condvar,
+}
+
+/// A reader thread's handle for feeding an [`OutputTail`]. Dropping it (when
+/// the thread's stream reaches EOF) tells the tail that this writer is done.
+pub struct TailWriter {
+    tail: Arc<OutputTail>,
+}
+
+impl TailWriter {
+    pub fn push_bytes(&self, bytes: &[u8]) {
+        self.tail.push_bytes(bytes);
+    }
+}
+
+impl Drop for TailWriter {
+    fn drop(&mut self) {
+        let mut writers = self.tail.writers.lock().unwrap_or_else(|p| p.into_inner());
+        *writers = writers.saturating_sub(1);
+        self.tail.writer_done.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -64,12 +95,48 @@ impl OutputTail {
         Self {
             capacity: capacity.max(1),
             inner: Mutex::new(Inner::default()),
+            writers: Mutex::new(0),
+            writer_done: Condvar::new(),
         }
     }
 
     /// Create a tail with the default (`DEFAULT_OUTPUT_TAIL_LINES`) capacity.
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_OUTPUT_TAIL_LINES)
+    }
+
+    /// Create a tail that keeps every line: a container's full transcript.
+    pub fn unbounded() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    /// Register a writer. Take it before spawning the reader thread, so a
+    /// caller that waits for writers can never miss one that has not started.
+    pub fn writer(self: &Arc<Self>) -> TailWriter {
+        *self.writers.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+        TailWriter {
+            tail: Arc::clone(self),
+        }
+    }
+
+    /// Block until every [`TailWriter`] has been dropped — i.e. every byte the
+    /// container wrote is in the tail — or `limit` passes. Returns whether
+    /// all writers finished.
+    pub fn wait_for_writers(&self, limit: Duration) -> bool {
+        let writers = self.writers.lock().unwrap_or_else(|p| p.into_inner());
+        let (writers, _) = self
+            .writer_done
+            .wait_timeout_while(writers, limit, |n| *n > 0)
+            .unwrap_or_else(|p| p.into_inner());
+        *writers == 0
+    }
+
+    /// The retained output as plain text: terminal escape sequences removed
+    /// and a bare `\r` (a progress line redrawing itself) turned into a line
+    /// break, so the redraws stay separate lines.
+    pub fn plain_text(&self) -> String {
+        let text = self.snapshot_text().replace('\r', "\n");
+        strip_ansi_escapes::strip_str(text)
     }
 
     /// Append a raw byte chunk from the container, splitting on `\n`. A chunk
@@ -202,5 +269,52 @@ mod tests {
         tail.push_bytes(b"err1\n");
         tail.push_bytes(b"out2\n");
         assert_eq!(tail.snapshot(), vec!["out1", "err1", "out2"]);
+    }
+
+    #[test]
+    fn an_unbounded_tail_keeps_every_line() {
+        let tail = OutputTail::unbounded();
+        for i in 0..(DEFAULT_OUTPUT_TAIL_LINES * 3) {
+            tail.push_bytes(format!("line {i}\n").as_bytes());
+        }
+        assert_eq!(tail.snapshot().len(), DEFAULT_OUTPUT_TAIL_LINES * 3);
+        assert_eq!(tail.snapshot()[0], "line 0");
+    }
+
+    #[test]
+    fn plain_text_strips_escapes_and_splits_carriage_return_redraws() {
+        let tail = OutputTail::new(10);
+        tail.push_bytes(b"\x1b[32mok\x1b[0m\r\nstep 1\rstep 2\r\ndone");
+        assert_eq!(tail.plain_text(), "ok\nstep 1\nstep 2\ndone\n");
+    }
+
+    #[test]
+    fn plain_text_of_nothing_is_empty() {
+        assert_eq!(OutputTail::new(10).plain_text(), "");
+    }
+
+    #[test]
+    fn waiting_for_writers_returns_once_the_last_writer_is_dropped() {
+        let tail = Arc::new(OutputTail::unbounded());
+        let writer = tail.writer();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            writer.push_bytes(b"late\n");
+        });
+        assert!(tail.wait_for_writers(Duration::from_secs(5)));
+        assert_eq!(tail.snapshot(), vec!["late"]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn waiting_for_writers_gives_up_at_the_limit() {
+        let tail = Arc::new(OutputTail::unbounded());
+        let _writer = tail.writer();
+        assert!(!tail.wait_for_writers(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn a_tail_with_no_writers_is_already_flushed() {
+        assert!(OutputTail::new(1).wait_for_writers(Duration::ZERO));
     }
 }

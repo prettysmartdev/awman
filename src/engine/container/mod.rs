@@ -19,6 +19,7 @@ pub mod instance;
 pub mod io_bridge;
 pub mod naming;
 pub mod options;
+pub mod phase_step;
 mod process;
 pub mod runtime;
 pub mod timing;
@@ -31,4 +32,5 @@ pub use options::{
     EnvVar, ImageRef, MemoryLimit, ModelFlagForm, OverlayPermission, OverlaySpec, PlanMode,
     YoloMode,
 };
+pub use phase_step::PhaseStepContainerSpec;
 pub use runtime::ContainerRuntime;

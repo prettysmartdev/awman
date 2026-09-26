@@ -604,12 +604,12 @@ impl MockBackgroundContainer {
     fn factory<'a>(
         self: &'a Arc<Self>,
     ) -> impl FnMut(
-        usize,
+        &PhaseStepRef,
     ) -> Result<
         Box<dyn crate::engine::agent_runtime::background::AgentExec>,
         EngineError,
     > + 'a {
-        move |_idx| {
+        move |_step: &PhaseStepRef| {
             *self.container_handouts.lock().unwrap() += 1;
             Ok(Box::new(SharedMockExec(Arc::clone(self))))
         }

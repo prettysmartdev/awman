@@ -240,11 +240,18 @@ impl AgentInstance for ContainerInstance {
         // Read per-frontend timeouts before draining `take_io`, which leaves
         // the frontend in a state where any further calls are
         // implementation-defined.
-        let grace_timeout = frontend.grace_timeout();
+        let grace_timeout = self
+            .options
+            .startup_grace
+            .unwrap_or_else(|| frontend.grace_timeout());
         let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_io();
 
-        let bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        let mut bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        if self.options.full_transcript {
+            bridge_cfg.output_tail =
+                Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::unbounded());
+        }
         let req = SpawnRequest {
             io,
             argv,

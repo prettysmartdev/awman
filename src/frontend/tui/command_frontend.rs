@@ -54,10 +54,6 @@ pub struct TuiCommandFrontend {
     /// Title for a setup/teardown step's container; see
     /// [`crate::frontend::tui::tabs::SharedContainerTitle`].
     pub(crate) container_title_shared: crate::frontend::tui::tabs::SharedContainerTitle,
-    /// The setup/teardown step the engine most recently started, as its
-    /// container title. Recorded by `on_phase_step_started`, which always
-    /// precedes that step's container launch (and any retry of it).
-    pub(crate) current_phase_step_title: Option<String>,
     /// Shared exit-code slot: written when the engine reports a workflow
     /// container actually terminated; the TUI event loop takes it and closes
     /// the container window.
@@ -190,7 +186,6 @@ impl TuiCommandFrontend {
             pty_reset_flag,
             container_name_shared,
             container_title_shared,
-            current_phase_step_title: None,
             container_exit_shared,
             stdout_tx,
             stdin_tx_shared,

@@ -16,28 +16,19 @@ impl ExecWorkflowCommandFrontend for TuiCommandFrontend {
         }
     }
 
-    /// A TUI always has a container window to show a phase step in.
-    fn supports_interactive_phase_steps(&self) -> bool {
-        true
-    }
-
     /// Same slot preparation a sequential agent step gets in
     /// `report_step_interactive_launch`: fresh PTY channels, a parser reset so
     /// the previous container's screen is cleared, and no stale container name.
     /// The window is titled with the step, not the agent.
-    fn report_phase_step_interactive_launch(&mut self, kind: PhaseKind) {
+    fn report_phase_step_interactive_launch(&mut self, kind: PhaseKind, description: &str) {
         self.pty_reset_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.recreate_container_io();
         if let Ok(mut name) = self.container_name_shared.lock() {
             *name = None;
         }
-        let title = self
-            .current_phase_step_title
-            .clone()
-            .unwrap_or_else(|| format!("[{}]", kind.label()));
-        if let Ok(mut slot) = self.container_title_shared.lock() {
-            *slot = Some(title);
+        if let Ok(mut title) = self.container_title_shared.lock() {
+            *title = Some(format!("[{}] {description}", kind.label()));
         }
         self.messages.info(format!(
             "Launching {} step in new container...",

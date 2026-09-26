@@ -273,7 +273,6 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn on_phase_step_started(&mut self, kind: PhaseKind, description: &str) {
-        self.current_phase_step_title = Some(format!("[{}] {description}", kind.label()));
         self.messages
             .info(format!("{}: {description}", kind.label()));
         upsert_phase_step(
@@ -1082,15 +1081,14 @@ mod tests {
         }
     }
 
-    /// The phase step's container is titled with the step that started it,
-    /// and the next agent container (here an `on_failure` agent) is not.
+    /// The phase step's container is titled with the step it was launched
+    /// for, and the next agent container (here an `on_failure` agent) is not.
     #[test]
     fn a_phase_step_launch_publishes_its_title_and_an_agent_launch_clears_it() {
         use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
-        frontend.on_phase_step_started(PhaseKind::Setup, "run_shell: make deps");
-        frontend.report_phase_step_interactive_launch(PhaseKind::Setup);
+        frontend.report_phase_step_interactive_launch(PhaseKind::Setup, "run_shell: make deps");
         assert_eq!(
             frontend.container_title_shared.lock().unwrap().as_deref(),
             Some("[setup] run_shell: make deps")
@@ -1114,11 +1112,11 @@ mod tests {
         use crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend;
 
         let (mut frontend, _req_rx, _resp_tx) = make_frontend();
-        assert!(frontend.supports_interactive_phase_steps());
+        assert!(frontend.supports_interactive_recovery());
         let _ = frontend.container_io.take();
         *frontend.container_name_shared.lock().unwrap() = Some("old".into());
 
-        frontend.report_phase_step_interactive_launch(PhaseKind::Teardown);
+        frontend.report_phase_step_interactive_launch(PhaseKind::Teardown, "clean up");
 
         assert!(
             frontend.container_io.is_some(),

@@ -213,6 +213,14 @@ pub enum ContainerOption {
         flag: String,
         container_path: PathBuf,
     },
+    /// How long the container may stay silent at startup before it is
+    /// considered failed to start and stopped. Overrides the frontend's
+    /// `grace_timeout`: that default suits an agent, but a shell command may
+    /// legitimately print nothing for a long time.
+    StartupGrace(std::time::Duration),
+    /// Keep the container's whole output in its `OutputTail` instead of the
+    /// last `DEFAULT_OUTPUT_TAIL_LINES` lines.
+    FullTranscript,
 }
 
 /// Injection-time dedup: drop any entry from `agent_credentials` whose
@@ -452,6 +460,10 @@ pub struct ResolvedContainerOptions {
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
+    /// From `ContainerOption::StartupGrace`; `None` uses the frontend's.
+    pub startup_grace: Option<std::time::Duration>,
+    /// From `ContainerOption::FullTranscript`.
+    pub full_transcript: bool,
 }
 
 impl ResolvedContainerOptions {
@@ -527,6 +539,8 @@ impl ResolvedContainerOptions {
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,
+            ContainerOption::StartupGrace(v) => self.startup_grace = Some(v),
+            ContainerOption::FullTranscript => self.full_transcript = true,
             ContainerOption::SystemPromptFile {
                 host_path,
                 container_path,

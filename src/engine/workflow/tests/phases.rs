@@ -273,11 +273,11 @@ fn run_teardown_continues_after_per_step_agent_factory_failure() {
     // Factory fails on step 0 (returns Err), succeeds on step 1.
     let mock = Arc::new(MockBackgroundContainer::always_success());
     let mock_for_factory = Arc::clone(&mock);
-    let factory = move |idx: usize| -> Result<
+    let factory = move |step: &PhaseStepRef| -> Result<
         Box<dyn crate::engine::agent_runtime::background::AgentExec>,
         EngineError,
     > {
-        if idx == 0 {
+        if step.index == 0 {
             Err(EngineError::Other(
                 "simulated overlay resolve failure".into(),
             ))
@@ -433,14 +433,24 @@ fn run_setup_failure_records_failed_state() {
     );
 }
 
-/// A PTY-attached phase step returns everything as stdout, so its stderr is
-/// empty on failure; the recorded error must still say what happened.
+/// The engine reports a failed command's real exit code and records only
+/// what the command wrote to stderr — nothing of its own. A foreground (PTY)
+/// run has an empty stderr; saying what that means is the frontend's job.
 #[test]
-fn a_failure_with_no_stderr_records_the_exit_code() {
+fn a_failed_command_reports_its_exit_code_and_no_engine_written_text() {
     use crate::data::workflow_state::PhaseStepStatus;
 
     let tmp = tempfile::tempdir().unwrap();
-    let mut engine = make_minimal_engine(&tmp);
+    let session = make_session(&tmp);
+    let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+    let (frontend, _msgs) = MessageCapturingFrontend::new();
+    let failures = frontend.phase_failures_handle();
+    let mut engine = make_engine_capturing(
+        &session,
+        workflow,
+        FakeAgentExecutionFactory::always_success(),
+        frontend,
+    );
 
     use crate::data::workflow_definition::SetupStep;
     let steps = vec![SetupStep::RunShell {
@@ -457,13 +467,152 @@ fn a_failure_with_no_stderr_records_the_exit_code() {
         .run_phase(PhaseKind::Setup, &steps, &[], &[], mock.factory())
         .unwrap();
 
-    let states = &engine.state().setup_step_states;
     assert!(
-        matches!(&states[0].status, PhaseStepStatus::Failed { error }
-            if error == "command exited with code 3"),
+        matches!(&engine.state().setup_step_states[0].status,
+            PhaseStepStatus::Failed { error } if error.is_empty()),
         "got {:?}",
-        states[0].status
+        engine.state().setup_step_states[0].status
     );
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].1, 3,
+        "the command's own exit code must be reported"
+    );
+    assert_eq!(failures[0].2, "");
+}
+
+/// A step whose container never started has no exit code of its own; it is
+/// reported with the documented stand-in.
+#[test]
+fn a_step_whose_container_never_started_reports_the_stand_in_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = make_session(&tmp);
+    let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+    let (frontend, _msgs) = MessageCapturingFrontend::new();
+    let failures = frontend.phase_failures_handle();
+    let mut engine = make_engine_capturing(
+        &session,
+        workflow,
+        FakeAgentExecutionFactory::always_success(),
+        frontend,
+    );
+
+    use crate::data::workflow_definition::SetupStep;
+    let steps = vec![SetupStep::RunShell {
+        command: "x".into(),
+        env: None,
+    }];
+    engine
+        .run_phase(PhaseKind::Setup, &steps, &[], &[], |_: &PhaseStepRef| {
+            Err(EngineError::Other("no runtime".into()))
+        })
+        .unwrap();
+
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures[0].1, 1);
+    assert_eq!(failures[0].2, "no runtime");
+}
+
+/// The container factory is told which step it is building for, with the
+/// same (work-item-substituted) description the frontend was given.
+#[test]
+fn the_container_factory_is_told_which_step_it_is_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut engine = make_minimal_engine(&tmp);
+
+    use crate::data::workflow_definition::TeardownStep;
+    let steps = vec![
+        TeardownStep::RunShell {
+            command: "first".into(),
+            env: None,
+        },
+        TeardownStep::RunShell {
+            command: "second".into(),
+            env: None,
+        },
+    ];
+    let expected: Vec<String> = steps.iter().map(|s| s.description()).collect();
+    let mock = Arc::new(MockBackgroundContainer::always_success());
+    let seen = Arc::new(Mutex::new(Vec::<PhaseStepRef>::new()));
+    let seen_in_factory = Arc::clone(&seen);
+    let mock_for_factory = Arc::clone(&mock);
+    engine
+        .run_phase(
+            PhaseKind::Teardown,
+            &steps,
+            &[],
+            &[],
+            move |step: &PhaseStepRef| -> Result<
+                Box<dyn crate::engine::agent_runtime::background::AgentExec>,
+                EngineError,
+            > {
+                seen_in_factory.lock().unwrap().push(step.clone());
+                Ok(Box::new(SharedMockExec(Arc::clone(&mock_for_factory))))
+            },
+        )
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        vec![
+            PhaseStepRef {
+                kind: PhaseKind::Teardown,
+                index: 0,
+                description: expected[0].clone(),
+            },
+            PhaseStepRef {
+                kind: PhaseKind::Teardown,
+                index: 1,
+                description: expected[1].clone(),
+            },
+        ]
+    );
+}
+
+/// After `on_failure` is exhausted, the exit code reported is the last
+/// retry's, not the original failure's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exhausted_remediation_reports_the_last_retrys_exit_code() {
+    tokio::task::spawn_blocking(|| {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+        let (frontend, _msgs) = MessageCapturingFrontend::new();
+        let failures = frontend.phase_failures_handle();
+        let mut engine = make_engine_capturing(
+            &session,
+            workflow,
+            FakeAgentExecutionFactory::always_success(),
+            frontend,
+        );
+
+        let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+            command: "step".into(),
+            env: None,
+        }];
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "first".into(), 2),
+            ("".into(), "retry".into(), 5),
+        ]));
+        engine
+            .run_phase(
+                PhaseKind::Setup,
+                &steps,
+                &[false],
+                &[Some(remediation_config(1))],
+                mock.factory(),
+            )
+            .unwrap();
+
+        let failures = failures.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1, 5);
+        assert_eq!(failures[0].2, "retry");
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -538,6 +687,8 @@ fn run_setup_phase_persistence_verified_from_store() {
 pub(super) struct MessageCapturingFrontend {
     messages: Arc<Mutex<Vec<crate::data::message::UserMessage>>>,
     interactive_launches: Arc<Mutex<Vec<String>>>,
+    /// Every `on_phase_step_failed` call: `(description, exit_code, stderr)`.
+    phase_failures: Arc<Mutex<Vec<(String, i32, String)>>>,
 }
 
 impl MessageCapturingFrontend {
@@ -547,6 +698,7 @@ impl MessageCapturingFrontend {
             Self {
                 messages: Arc::clone(&store),
                 interactive_launches: Arc::new(Mutex::new(Vec::new())),
+                phase_failures: Arc::new(Mutex::new(Vec::new())),
             },
             store,
         )
@@ -556,6 +708,11 @@ impl MessageCapturingFrontend {
     /// Grab before moving the frontend into the engine.
     fn launches_handle(&self) -> Arc<Mutex<Vec<String>>> {
         Arc::clone(&self.interactive_launches)
+    }
+
+    /// Handle to the recorded `on_phase_step_failed` calls.
+    fn phase_failures_handle(&self) -> Arc<Mutex<Vec<(String, i32, String)>>> {
+        Arc::clone(&self.phase_failures)
     }
 }
 
@@ -598,6 +755,19 @@ impl WorkflowFrontend for MessageCapturingFrontend {
         Ok(YoloTickOutcome::Cancel)
     }
     fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
+    fn on_phase_step_failed(
+        &mut self,
+        _kind: PhaseKind,
+        description: &str,
+        exit_code: i32,
+        stderr: &str,
+    ) {
+        self.phase_failures.lock().unwrap().push((
+            description.to_string(),
+            exit_code,
+            stderr.to_string(),
+        ));
+    }
 }
 
 pub(super) fn make_engine_capturing(
@@ -982,6 +1152,7 @@ async fn on_failure_emits_launch_and_success_messages() {
         let frontend = MessageCapturingFrontend {
             messages: Arc::clone(&msg_store_clone),
             interactive_launches: Arc::new(Mutex::new(Vec::new())),
+            phase_failures: Arc::new(Mutex::new(Vec::new())),
         };
         let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -1048,6 +1219,7 @@ async fn on_failure_exhausted_emits_warning_message() {
         let frontend = MessageCapturingFrontend {
             messages: Arc::clone(&msg_store_clone),
             interactive_launches: Arc::new(Mutex::new(Vec::new())),
+            phase_failures: Arc::new(Mutex::new(Vec::new())),
         };
         let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 

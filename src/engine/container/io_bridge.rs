@@ -211,7 +211,8 @@ pub(crate) fn bridge_pty(
     let stdout_tx = io.stdout;
     let act = Arc::clone(&activity);
     let fb = Arc::clone(&first_byte);
-    let tail = Arc::clone(&config.output_tail);
+    // A writer handle, so a caller can wait for this thread to finish.
+    let tail = config.output_tail.writer();
     let broadcast = config.output_broadcast.clone();
     std::thread::spawn(move || {
         use std::io::Read;
@@ -319,7 +320,8 @@ pub(crate) fn bridge_piped(
         let stdout_tx = io.stdout;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
-        let tail = Arc::clone(&config.output_tail);
+        // A writer handle, so a caller can wait for this thread to finish.
+        let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -352,7 +354,8 @@ pub(crate) fn bridge_piped(
         let stderr_tx = io.stderr;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
-        let tail = Arc::clone(&config.output_tail);
+        // A writer handle, so a caller can wait for this thread to finish.
+        let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
         std::thread::spawn(move || {
             use std::io::Read;

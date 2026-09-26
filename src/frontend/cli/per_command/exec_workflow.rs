@@ -16,12 +16,6 @@ use crate::data::workflow_state::PhaseKind;
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl ExecWorkflowCommandFrontend for CliFrontend {
-    /// On a TTY the terminal is handed to the phase step's container, as it
-    /// is to an agent step's; `--non-interactive` keeps the headless path.
-    fn supports_interactive_phase_steps(&self) -> bool {
-        !self.non_interactive
-    }
-
     /// Take the terminal back from the exited container: stop the raw stdin
     /// reader and restore cooked mode before the step's result is printed.
     /// Agent steps get the same release from their terminal

@@ -18,7 +18,9 @@ use awman::engine::workflow::actions::{
     YoloTickOutcome,
 };
 use awman::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
-use awman::engine::workflow::{Frontend, WorkflowEngine, WorkflowEngineDeps, WorkflowSpec};
+use awman::engine::workflow::{
+    Frontend, PhaseStepRef, WorkflowEngine, WorkflowEngineDeps, WorkflowSpec,
+};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -203,9 +205,9 @@ fn remediation(max_attempts: u32) -> RemediationConfig {
 
 fn make_mock_factory(
     mock: Arc<MockAgentExec>,
-) -> impl FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError> {
+) -> impl FnMut(&PhaseStepRef) -> Result<Box<dyn AgentExec>, EngineError> {
     let mock = Arc::clone(&mock);
-    move |_idx| Ok(Box::new(SharedMockExec(Arc::clone(&mock))))
+    move |_step: &PhaseStepRef| Ok(Box::new(SharedMockExec(Arc::clone(&mock))))
 }
 
 /// Trampoline so the factory closure can produce a fresh `Box<dyn AgentExec>`
@@ -499,7 +501,7 @@ async fn integration_poll_ci_setup_step_fails_when_not_a_git_repo() {
             max_retries: Some(1),
         }];
         // PollCi bypasses the container factory, so the factory is never called.
-        let empty_factory = |_idx: usize| -> Result<Box<dyn AgentExec>, EngineError> {
+        let empty_factory = |_step: &PhaseStepRef| -> Result<Box<dyn AgentExec>, EngineError> {
             Err(EngineError::Other("should not be called for PollCi".into()))
         };
 
@@ -618,7 +620,7 @@ async fn integration_poll_ci_emits_polling_attempt_message_before_error() {
             interval_secs: Some(0),
             max_retries: Some(3),
         }];
-        let empty_factory = |_idx: usize| -> Result<Box<dyn AgentExec>, EngineError> {
+        let empty_factory = |_step: &PhaseStepRef| -> Result<Box<dyn AgentExec>, EngineError> {
             Err(EngineError::Other("unreachable".into()))
         };
         engine

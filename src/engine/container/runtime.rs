@@ -24,6 +24,7 @@ use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
+use crate::engine::container::phase_step::PhaseStepContainerSpec;
 use crate::engine::error::EngineError;
 
 /// A container image row returned by image-listing queries. Used by
@@ -274,6 +275,18 @@ impl ContainerRuntime {
     /// The CLI binary name for this runtime (`"docker"` or `"container"`).
     pub fn cli_binary(&self) -> &'static str {
         self.backend.cli_binary()
+    }
+
+    /// Build a foreground container for one setup/teardown step: the step's
+    /// command is its only process and a frontend's PTY attaches through
+    /// `run_with_frontend`, exactly as for an agent. The interactive
+    /// counterpart of [`ContainerRuntime::start_background`]; see
+    /// [`PhaseStepContainerSpec`] for the container's shape.
+    pub fn build_phase_step(
+        &self,
+        spec: &PhaseStepContainerSpec<'_>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build(ResolvedContainerOptions::resolve(spec.options())?)
     }
 
     /// Start a background container for setup/teardown execution.

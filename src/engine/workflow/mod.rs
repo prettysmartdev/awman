@@ -794,20 +794,42 @@ pub struct PhaseOutcome {
     pub any_failed: bool,
 }
 
-/// Outcome of one phase shell step: whether it failed, plus the
-/// captured stdout/stderr (populated on failure, fed to the remediation
-/// agent's failure file). Kept deliberately narrow rather
-/// than storing a full `ExecOutput` in `PhaseStepStatus`.
+/// The setup/teardown step a phase container is being asked for. Handed to
+/// the caller's per-step container factory so it can say which step a
+/// container runs (for example, to title a foreground container) without
+/// re-deriving the engine's step description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseStepRef {
+    pub kind: PhaseKind,
+    /// Position of the step within its phase.
+    pub index: usize,
+    /// The step's description, with work-item variables substituted — the
+    /// same string `on_phase_step_started` carried.
+    pub description: String,
+}
+
+/// Outcome of one phase shell step: whether it failed, the command's exit
+/// code when it ran to one, plus the captured stdout/stderr (populated on
+/// failure, fed to the remediation agent's failure file). Kept deliberately
+/// narrow rather than storing a full `ExecOutput` in `PhaseStepStatus`.
 struct PhaseStepOutcome {
     failed: bool,
+    /// `None` when the step failed without a command exit code: the
+    /// container could not start, or a native `poll_ci` step failed.
+    exit_code: Option<i32>,
     stdout: String,
     stderr: String,
 }
+
+/// Exit code reported for a phase step that failed without one of its own
+/// (see [`PhaseStepOutcome::exit_code`]).
+const PHASE_STEP_FAILED_WITHOUT_EXIT_CODE: i32 = 1;
 
 impl PhaseStepOutcome {
     fn succeeded() -> Self {
         Self {
             failed: false,
+            exit_code: Some(0),
             stdout: String::new(),
             stderr: String::new(),
         }
@@ -816,9 +838,25 @@ impl PhaseStepOutcome {
     fn failed(stdout: String, stderr: String) -> Self {
         Self {
             failed: true,
+            exit_code: None,
             stdout,
             stderr,
         }
+    }
+
+    fn exited(exit_code: i32, stdout: String, stderr: String) -> Self {
+        Self {
+            failed: true,
+            exit_code: Some(exit_code),
+            stdout,
+            stderr,
+        }
+    }
+
+    /// The exit code to report for a failed step.
+    fn reported_exit_code(&self) -> i32 {
+        self.exit_code
+            .unwrap_or(PHASE_STEP_FAILED_WITHOUT_EXIT_CODE)
     }
 }
 
