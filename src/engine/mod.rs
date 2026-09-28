@@ -22,6 +22,7 @@ pub mod git;
 pub mod host_cli;
 pub mod init;
 pub mod issue;
+pub mod oci;
 pub mod overlay;
 pub mod ready;
 pub mod remote;

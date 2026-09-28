@@ -9,7 +9,7 @@ New to awman? Skim [Concepts](01-concepts.md) after this for the mental model be
 ## Prerequisites
 
 - **Git** — your project must be in a Git repository
-- **A container runtime** — Docker (all platforms, daemon running), Apple Containers (macOS 26+), or Docker Sandboxes (`sbx` CLI, macOS arm64 / Windows)
+- **A container runtime** — Docker (all platforms, daemon running), Apple Containers (macOS 26+), Docker Sandboxes (`sbx` CLI, macOS arm64 / Windows), or the builtin microVM runtime (Linux with KVM, or macOS Apple Silicon; needs an awman build that includes it — see [Runtimes](11-runtimes.md#builtin-microvm))
 - **An account with a supported agent** — Claude Code, OpenAI Codex, OpenCode, Maki, Google Gemini, GitHub Copilot CLI, Crush, Cline, or Google Antigravity
 
 ## 1. Install
@@ -70,7 +70,7 @@ That's it — you have an isolated agent working in your repo.
 - [Permission modes](03-agent-sessions.md#permission-modes) — `--plan`, `--auto`, and fully autonomous `--yolo`
 - [GitHub Integration](10-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--issue`
 - [squad](12-squad.md) — hand recurring work to a group of agents that watches for it and runs a workflow unattended
-- [Runtimes](11-runtimes.md) — Docker, Apple Containers, and Docker Sandboxes (microVM) isolation
+- [Runtimes](11-runtimes.md) — Docker, Apple Containers, Docker Sandboxes, and the builtin embedded microVM runtime
 
 ---
 
@@ -87,6 +87,8 @@ That's it — you have an isolated agent working in your repo.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 
+The **builtin microVM runtime** is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. It is present only in builds that include it — the release configuration enables it only for Linux ARM64, and source builds there use `make payloads && make install` — and needs KVM access on Linux or the hypervisor entitlement on macOS. Enable it with `awman config set --global runtime builtin`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image): under this runtime `awman ready` imports an image you built externally rather than building one. `awman init` builds images with the configured runtime, so under `builtin` its image-build step fails and the agent audit is skipped: run `awman init` while `runtime` is `docker` (or another building runtime), then switch.
+
 ### `awman init`
 
 | Flag | Effect |
@@ -99,11 +101,11 @@ Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `
 | Flag | Effect |
 |------|--------|
 | `--refresh` | Re-run the agent audit and update `Dockerfile.dev` (use after toolchain changes) |
-| `--build` | Force-rebuild the images |
-| `--no-cache` | Disable the Docker layer cache during builds |
+| `--build` | Force-rebuild the images (builtin runtime: re-import them from the configured image source; nothing is built) |
+| `--no-cache` | Disable the Docker layer cache during builds (builtin runtime: re-import from the source) |
 | `-n`, `--non-interactive` | Run the verification agent in non-interactive mode |
 | `--json` | Print structured JSON instead of human output (implies `-n`) |
-| `--allow-docker` | Mount the host Docker socket into the agent container |
+| `--allow-docker` | Mount the host Docker socket into the agent container (not supported by the builtin runtime) |
 
 ---
 

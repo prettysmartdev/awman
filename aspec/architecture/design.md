@@ -50,7 +50,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 **Constraint**: Imports only from `std`, third-party crates, and `crate::data::*`
 
 ### Layer 1: Engine (`src/engine/`)
-- Container runtime (Docker/Apple containers)
+- Container-class runtime backends (Docker, Apple containers, builtin microVM)
 - Workflow execution engine
 - Git operations (init, worktree, merge)
 - Overlay management (mounts, env vars, auth)
@@ -107,11 +107,52 @@ Output to user
 
 ## Execution Isolation
 
-All agent code execution occurs inside isolated containers managed by the `ContainerRuntime` (Layer 1). The host is never directly exposed to untrusted code.
+All agent code execution occurs inside an isolated container or microVM managed by the `ContainerRuntime` (Layer 1). The host is never directly exposed to untrusted code. The builtin backend uses a Linux microVM; selecting it does not run agent code on the host.
 
 - **Mount scope validation**: Git root, current working directory, or abort
 - **Auth isolation**: API keys stored in secure hashing, env vars injected at container startup only
 - **TLS enforcement**: Self-signed certificates with stable fingerprints
+
+The builtin VM worker is the same awman executable re-executed with a private
+internal worker-mode descriptor. The binary routes that reserved mode before
+normal frontend, Tokio, and TUI startup; normal invocations continue through
+the standard binary-to-frontend path. The worker takes over its process for the
+VM lifetime. It is not hosted in the main process or a thread, and it is not a
+separately extracted helper executable. Kernel and guest-agent payloads are
+compiled into the executable; writable disks, image caches, databases, sockets,
+and logs remain runtime state on disk.
+
+### Runtime backend operations
+
+The engine owns a backend contract expressed as operations, not as a required
+CLI binary. It selects a backend, checks availability, creates/attaches/stops
+agent instances, streams execution, lists and removes agents, inspects/removes
+images, and either builds or imports images according to backend capabilities.
+Docker and Apple container backends implement these operations through their
+host CLIs. The builtin backend implements them through the embedded SDK and
+microVM worker; it has no host runtime CLI, and operations that do not apply
+are reported as unsupported. Command orchestration chooses operations from
+backend capabilities (including build, import, or kit image acquisition), and
+frontends render shared outcomes. Docker-shaped argv is private to the CLI
+backends and is not the general runtime contract.
+
+### Builtin backend capabilities and image sources
+
+The builtin backend imports existing Linux OCI images and executes cached
+images. It does not build images. Images can be acquired from an explicitly
+selected OCI registry, a Docker Engine image store, or an archive; Apple
+Containers store acquisition is currently blocked pending a supported export
+API. A source is typed and explicit, so a registry reference cannot resolve
+against a same-named daemon image. Image identity records reference, platform,
+content digests, and source kind. Users build images externally with the
+existing project Dockerfiles, then configure or import the resulting image.
+Source acquisition is not required after an image is cached.
+
+Image-source configuration belongs to the data layer, acquisition and import
+to the engine, and `ready` orchestration to the command layer. Backends do not
+silently switch sources or substitute Docker, Apple containers, SBX, an
+installed Microsandbox runtime, a host agent, or a downloaded/extracted helper
+when an operation is unavailable.
 
 ## Key Components
 

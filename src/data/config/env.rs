@@ -98,6 +98,56 @@ pub const AWMAN_TEST_APPLE_CONTAINER: &str = "AWMAN_TEST_APPLE_CONTAINER";
 /// `sbx` CLI.
 pub const AWMAN_TEST_SBX: &str = "AWMAN_TEST_SBX";
 
+/// `AWMAN_TEST_BUILTIN` — as [`AWMAN_TEST_DOCKER`], for the builtin microVM
+/// runtime. Off by default: the builtin tests boot guests and write the
+/// runtime's state directory.
+pub const AWMAN_TEST_BUILTIN: &str = "AWMAN_TEST_BUILTIN";
+
+/// `AWMAN_BUILTIN_STATE_DIR` — overrides the builtin runtime's private state
+/// directory (default `<data home>/builtin`). Keep it short: control sockets
+/// live beneath it.
+pub const AWMAN_BUILTIN_STATE_DIR: &str = "AWMAN_BUILTIN_STATE_DIR";
+
+/// `MSB_PATH` — Microsandbox's worker-binary override. awman never honours it:
+/// the builtin runtime refuses to start while it (or any other name in
+/// [`AMBIENT_MSB_OVERRIDES`]) is set, because the SDK lets it outrank the
+/// embedded runtime. Read only to detect it; never forwarded.
+pub const MSB_PATH: &str = "MSB_PATH";
+
+/// `MSB_LIBKRUNFW_PATH` — Microsandbox's firmware override. See [`MSB_PATH`].
+pub const MSB_LIBKRUNFW_PATH: &str = "MSB_LIBKRUNFW_PATH";
+
+/// `MSB_AGENTD_PATH` — Microsandbox's guest-agent override. See [`MSB_PATH`].
+pub const MSB_AGENTD_PATH: &str = "MSB_AGENTD_PATH";
+
+/// `MSB_HOME` — Microsandbox's home-directory override. See [`MSB_PATH`].
+pub const MSB_HOME: &str = "MSB_HOME";
+
+/// `MSB_BACKEND` — Microsandbox's backend override. See [`MSB_PATH`].
+pub const MSB_BACKEND: &str = "MSB_BACKEND";
+
+/// Every ambient Microsandbox override the builtin runtime refuses to run
+/// under. Never add these to [`ForwardedEnv::NAMES`].
+pub const AMBIENT_MSB_OVERRIDES: &[&str] = &[
+    MSB_PATH,
+    MSB_LIBKRUNFW_PATH,
+    MSB_AGENTD_PATH,
+    MSB_HOME,
+    MSB_BACKEND,
+];
+
+/// `DOCKER_HOST` — the Docker Engine endpoint (`unix://`, `tcp://`,
+/// `npipe://`). Read only when a `docker-store` image source names no host.
+pub const DOCKER_HOST: &str = "DOCKER_HOST";
+
+/// `DOCKER_CERT_PATH` — directory holding `ca.pem`, `cert.pem`, `key.pem` for
+/// a TLS Docker Engine endpoint.
+pub const DOCKER_CERT_PATH: &str = "DOCKER_CERT_PATH";
+
+/// `DOCKER_TLS_VERIFY` — any non-empty value enables TLS verification of the
+/// Docker Engine endpoint (the Docker CLI's own rule).
+pub const DOCKER_TLS_VERIFY: &str = "DOCKER_TLS_VERIFY";
+
 /// `RUST_LOG` — the `tracing` filter directive. Forwarded to a daemon job so
 /// an operator can start a daemon with the verbosity they asked for.
 pub const RUST_LOG: &str = "RUST_LOG";
@@ -308,6 +358,50 @@ impl EnvSnapshot {
         self.truthy(AWMAN_TEST_SBX)
     }
 
+    /// Whether a truthy `AWMAN_TEST_BUILTIN` opts back into the real builtin
+    /// runtime under test isolation.
+    pub fn test_builtin(&self) -> bool {
+        self.truthy(AWMAN_TEST_BUILTIN)
+    }
+
+    /// `AWMAN_BUILTIN_STATE_DIR`, when set and non-empty.
+    pub fn builtin_state_dir(&self) -> Option<PathBuf> {
+        self.get(AWMAN_BUILTIN_STATE_DIR)
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// The [`AMBIENT_MSB_OVERRIDES`] present in this snapshot, in list order.
+    /// Set counts, even to an empty value: the SDK does not distinguish.
+    pub fn ambient_msb_overrides(&self) -> Vec<&'static str> {
+        AMBIENT_MSB_OVERRIDES
+            .iter()
+            .copied()
+            .filter(|name| self.get(name).is_some())
+            .collect()
+    }
+
+    /// `DOCKER_HOST`, when set and non-empty.
+    pub fn docker_host(&self) -> Option<String> {
+        self.get(DOCKER_HOST)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    }
+
+    /// `DOCKER_CERT_PATH`, when set and non-empty.
+    pub fn docker_cert_path(&self) -> Option<PathBuf> {
+        self.get(DOCKER_CERT_PATH)
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Whether `DOCKER_TLS_VERIFY` is set to any non-empty value.
+    pub fn docker_tls_verify(&self) -> bool {
+        self.get(DOCKER_TLS_VERIFY)
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+
     /// `key` is set to `1`, `true`, `yes` or `on` (case- and
     /// whitespace-insensitive).
     fn truthy(&self, key: &str) -> bool {
@@ -383,6 +477,16 @@ impl Env {
             AWMAN_TEST_DOCKER,
             AWMAN_TEST_APPLE_CONTAINER,
             AWMAN_TEST_SBX,
+            AWMAN_TEST_BUILTIN,
+            AWMAN_BUILTIN_STATE_DIR,
+            MSB_PATH,
+            MSB_LIBKRUNFW_PATH,
+            MSB_AGENTD_PATH,
+            MSB_HOME,
+            MSB_BACKEND,
+            DOCKER_HOST,
+            DOCKER_CERT_PATH,
+            DOCKER_TLS_VERIFY,
         ];
         let mut values = HashMap::new();
         for k in keys {
@@ -878,6 +982,47 @@ mod tests {
                 "{pretty:?} leaked {forbidden:?}"
             );
         }
+    }
+
+    // ── Builtin runtime env (WI 0119) ─────────────────────────────────────
+
+    #[test]
+    fn ambient_msb_overrides_are_detected_and_never_forwarded() {
+        let env = EnvSnapshot::with_overrides([(MSB_HOME, ""), (MSB_PATH, "/x/msb")]);
+        assert_eq!(env.ambient_msb_overrides(), vec![MSB_PATH, MSB_HOME]);
+        assert!(EnvSnapshot::empty().ambient_msb_overrides().is_empty());
+        for name in AMBIENT_MSB_OVERRIDES {
+            assert!(
+                !ForwardedEnv::NAMES.contains(name),
+                "{name} must not be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_and_docker_accessors() {
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_TEST_BUILTIN, "yes"),
+            (AWMAN_BUILTIN_STATE_DIR, "/s"),
+            (DOCKER_HOST, " tcp://h:2376 "),
+            (DOCKER_CERT_PATH, "/certs"),
+            (DOCKER_TLS_VERIFY, "1"),
+        ]);
+        assert!(env.test_builtin());
+        assert_eq!(env.builtin_state_dir(), Some(PathBuf::from("/s")));
+        assert_eq!(env.docker_host().as_deref(), Some("tcp://h:2376"));
+        assert_eq!(env.docker_cert_path(), Some(PathBuf::from("/certs")));
+        assert!(env.docker_tls_verify());
+
+        let empty = EnvSnapshot::with_overrides([
+            (AWMAN_BUILTIN_STATE_DIR, ""),
+            (DOCKER_HOST, ""),
+            (DOCKER_TLS_VERIFY, ""),
+        ]);
+        assert!(!empty.test_builtin());
+        assert_eq!(empty.builtin_state_dir(), None);
+        assert_eq!(empty.docker_host(), None);
+        assert!(!empty.docker_tls_verify());
     }
 
     // ── ForwardedEnv (WI 0114 F-29) ──────────────────────────────────────

@@ -898,6 +898,7 @@ guardrails to every run rather than leaving them optional:
   `stop`, and `logs`, task commands, and the TUI — fails with a clear error
   naming the configured runtime rather than degrading silently.
   Set `runtime` to `docker` or `apple-containers` to use squad.
+- **The builtin runtime works with squad, with limits.** Squad discovers and attaches to its agents by name and label as on the other runtimes, and its tasks need imported images (`awman ready` with a configured image source) because the builtin runtime never builds. Like Apple Containers, a builtin session can be reattached only while the awman process that launched it (the squad daemon, for squad tasks) is still running; if the daemon exits, the agent VMs it launched stop with it. Squad on `builtin` has not yet been verified against real guests. See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm).
 
 ---
 

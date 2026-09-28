@@ -323,6 +323,20 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             | crate::engine::error::EngineError::SquadDaemonStartup(_)
             | crate::engine::error::EngineError::SquadDaemonConflict(_)
             | crate::engine::error::EngineError::SquadDaemonUnreachable(_) => format!("{e}"),
+            // Builtin runtime and image acquisition (WI 0119): the engine's own
+            // messages already name the cause and the fix.
+            crate::engine::error::EngineError::BuiltinRuntimeUnavailable { .. }
+            | crate::engine::error::EngineError::AmbientRuntimeOverride { .. }
+            | crate::engine::error::EngineError::UnsupportedImageSource { .. }
+            | crate::engine::error::EngineError::ImageSourceBlocked { .. }
+            | crate::engine::error::EngineError::ImageSourceUnconfigured { .. }
+            | crate::engine::error::EngineError::ImageDigestMismatch { .. }
+            | crate::engine::error::EngineError::ImagePlatformMismatch { .. }
+            | crate::engine::error::EngineError::ImageArchiveRejected { .. }
+            | crate::engine::error::EngineError::InsufficientDiskSpace { .. }
+            | crate::engine::error::EngineError::UnsupportedResourceRequest { .. }
+            | crate::engine::error::EngineError::SocketPathTooLong { .. }
+            | crate::engine::error::EngineError::WorkerProtocolMismatch { .. } => format!("{e}"),
             crate::engine::error::EngineError::Git(msg) => {
                 format!("git operation failed: {msg}")
             }

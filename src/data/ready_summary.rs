@@ -26,6 +26,11 @@ pub struct ReadySummary {
     #[serde(default)]
     pub agent_credentials: Vec<AgentCredentialHealth>,
     pub non_default_agent_images: Vec<(String, StepStatus)>,
+    /// Where the agent image came from, for runtimes that import images
+    /// instead of building them (builtin). `None` on build runtimes, which
+    /// show no row for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<StepStatus>,
 }
 
 impl ReadySummary {
@@ -42,6 +47,7 @@ impl ReadySummary {
             work_items_config: StepStatus::Pending,
             agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
+            image_source: None,
         }
     }
 
@@ -73,6 +79,9 @@ impl ReadySummary {
                 self.work_items_config.clone(),
             ),
         ];
+        if let Some(status) = &self.image_source {
+            rows.insert(3, ("Image source".to_string(), status.clone()));
+        }
         // The ready engine reports a single consolidated entry — either
         // "Other agents" (all OK) or "Missing images" (warn) — and its label
         // is rendered verbatim.
@@ -105,5 +114,30 @@ impl AgentCredentialHealth {
             _ => format!("Credential {}", self.agent),
         };
         (label, status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_runtimes_show_no_image_source_row() {
+        let summary = ReadySummary::new("docker");
+        assert!(summary
+            .rows()
+            .iter()
+            .all(|(label, _)| label != "Image source"));
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("image_source"), "{json}");
+    }
+
+    #[test]
+    fn image_source_row_follows_the_agent_image_row() {
+        let mut summary = ReadySummary::new("builtin");
+        summary.image_source = Some(StepStatus::Done);
+        let labels: Vec<String> = summary.rows().into_iter().map(|(l, _)| l).collect();
+        let agent = labels.iter().position(|l| l == "Agent image").unwrap();
+        assert_eq!(labels[agent + 1], "Image source");
     }
 }

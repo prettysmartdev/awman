@@ -2,6 +2,16 @@
 //! `container` CLI is a near-drop-in replacement (it shares the docker `run`
 //! / `list` / `stats` / `stop` surface).
 
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::data::message::UserMessageSink;
+use crate::engine::agent_runtime::background::ExecOutput;
+use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
+use crate::engine::container::options::OverlaySpec;
+use crate::engine::container::runtime::{ContainerImageInfo, CONTAINER_CAPABILITIES};
+use crate::engine::container::{background, host_cli_backend};
+
 use std::process::{Command, Stdio};
 
 use crate::data::session::{AgentHandle, Session};
@@ -340,49 +350,177 @@ impl ContainerBackend for AppleBackend {
         "Apple Containers"
     }
 
-    fn cli_binary(&self) -> &'static str {
-        "container"
+    fn capabilities(&self) -> &'static Capabilities {
+        &CONTAINER_CAPABILITIES
     }
 
-    fn availability_probe_args(&self) -> &'static [&'static str] {
-        &["system", "status"]
+    fn host_cli(&self) -> Option<&'static str> {
+        Some(ContainerCli::APPLE.bin)
     }
 
-    fn image_home_dir(&self, tag: &str) -> Option<String> {
-        // `container image inspect` emits a JSON array of variants; the env
-        // list lives at `[0].variants[*].config.config.Env`. We pick the
-        // first variant whose env contains a non-empty `HOME=…` entry, which
-        // matches the runtime selection for single-platform images.
-        let output = Command::new(crate::engine::host_cli::program("container"))
-            .args(["image", "inspect", tag])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let arr: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-        let variants = arr.get(0)?.get("variants")?.as_array()?;
-        for variant in variants {
-            let env = variant
-                .get("config")
-                .and_then(|c| c.get("config"))
-                .and_then(|c| c.get("Env"))
-                .and_then(|v| v.as_array());
-            let Some(env) = env else { continue };
-            for entry in env {
-                if let Some(rest) = entry.as_str().and_then(|s| s.strip_prefix("HOME=")) {
-                    let v = rest.trim();
-                    if !v.is_empty() {
-                        return Some(v.to_string());
-                    }
+    fn reattach_after_owner_exit(&self) -> bool {
+        false
+    }
+
+    fn is_available(&self) -> Result<(), EngineError> {
+        host_cli_backend::cli_is_available(ContainerCli::APPLE, &["system", "status"])
+    }
+
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        crate::engine::container::process::stop_and_remove(ContainerCli::APPLE.bin, &handle.name);
+        Ok(())
+    }
+
+    fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
+        host_cli_backend::cli_remove(ContainerCli::APPLE, "rm", id)
+    }
+
+    fn exec_args(
+        &self,
+        agent_id: &str,
+        working_dir: &str,
+        entrypoint: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> Option<Vec<String>> {
+        Some(host_cli_backend::cli_exec_args(
+            agent_id,
+            working_dir,
+            entrypoint,
+            env_vars,
+        ))
+    }
+
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        // Apple's CLI cannot enumerate stopped containers by awman ownership.
+        Ok(Vec::new())
+    }
+
+    fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
+        // Apple's CLI has no dangling-image filter.
+        Ok(Vec::new())
+    }
+
+    fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
+        host_cli_backend::cli_image_exists(ContainerCli::APPLE, tag)
+    }
+
+    fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &Path,
+        context: &Path,
+        no_cache: bool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        host_cli_backend::cli_build_image(
+            ContainerCli::APPLE,
+            tag,
+            dockerfile,
+            context,
+            no_cache,
+            on_line,
+        )
+    }
+
+    fn import_image(
+        &self,
+        _request: &ImageImportRequest,
+        _sink: &mut dyn UserMessageSink,
+    ) -> Result<ImportedImage, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.name(),
+            operation: "image import",
+        })
+    }
+
+    fn remove_image(&self, id: &str) -> Result<(), EngineError> {
+        host_cli_backend::cli_remove(ContainerCli::APPLE, "rmi", id)
+    }
+
+    fn start_background(
+        &self,
+        image: &str,
+        workdir: &Path,
+        env: &HashMap<String, String>,
+        overlays: &[OverlaySpec],
+    ) -> Result<String, EngineError> {
+        background::default_start_background(ContainerCli::APPLE, image, workdir, env, overlays)
+    }
+
+    fn exec_in_background(
+        &self,
+        id: &str,
+        command: &str,
+        working_dir: &str,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<ExecOutput, EngineError> {
+        background::default_exec_in_background(ContainerCli::APPLE, id, command, working_dir, env)
+    }
+
+    fn exec_in_background_streaming(
+        &self,
+        id: &str,
+        command: &str,
+        working_dir: &str,
+        env: Option<&HashMap<String, String>>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ExecOutput, EngineError> {
+        background::default_exec_in_background_streaming(
+            ContainerCli::APPLE,
+            id,
+            command,
+            working_dir,
+            env,
+            on_line,
+        )
+    }
+
+    fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
+        background::default_stop_and_remove(ContainerCli::APPLE, id);
+        Ok(())
+    }
+
+    fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        Ok(apple_image_home_dir(tag))
+    }
+}
+
+/// Read `HOME` from `tag`'s image config via `container image inspect`. `None`
+/// when the image is missing, the CLI is unreachable, or no `HOME` is declared.
+fn apple_image_home_dir(tag: &str) -> Option<String> {
+    // `container image inspect` emits a JSON array of variants; the env
+    // list lives at `[0].variants[*].config.config.Env`. We pick the
+    // first variant whose env contains a non-empty `HOME=…` entry, which
+    // matches the runtime selection for single-platform images.
+    let output = Command::new(crate::engine::host_cli::program("container"))
+        .args(["image", "inspect", tag])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let arr: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let variants = arr.get(0)?.get("variants")?.as_array()?;
+    for variant in variants {
+        let env = variant
+            .get("config")
+            .and_then(|c| c.get("config"))
+            .and_then(|c| c.get("Env"))
+            .and_then(|v| v.as_array());
+        let Some(env) = env else { continue };
+        for entry in env {
+            if let Some(rest) = entry.as_str().and_then(|s| s.strip_prefix("HOME=")) {
+                let v = rest.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
                 }
             }
         }
-        None
     }
+    None
 }
 
 /// Resize the PTY behind an attach client's resize request, guaranteeing the
@@ -637,7 +775,7 @@ mod apple_tests {
         // covers the case where the `container` CLI itself isn't installed.
         let backend = AppleBackend;
         let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
-        assert!(backend.image_home_dir(bogus).is_none());
+        assert!(backend.image_home_dir(bogus).unwrap().is_none());
     }
 
     /// A same-size attach resize must still land on the requested size after

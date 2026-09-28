@@ -28,6 +28,8 @@ pub struct ReadyOutcome {
     pub dockerfile: StepStatus,
     pub base_image: StepStatus,
     pub agent_image: StepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<StepStatus>,
     pub local_agent: StepStatus,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
@@ -49,6 +51,7 @@ impl From<ReadySummary> for ReadyOutcome {
             dockerfile: s.dockerfile,
             base_image: s.base_image,
             agent_image: s.agent_image,
+            image_source: s.image_source,
             local_agent: s.local_agent,
             audit: s.audit,
             image_rebuild: s.image_rebuild,
@@ -90,6 +93,7 @@ impl ReadyOutcome {
         let any_failed = matches!(self.dockerfile, StepStatus::Failed(_))
             || matches!(self.base_image, StepStatus::Failed(_))
             || matches!(self.agent_image, StepStatus::Failed(_))
+            || matches!(self.image_source, Some(StepStatus::Failed(_)))
             || matches!(self.local_agent, StepStatus::Failed(_))
             || matches!(self.image_rebuild, StepStatus::Failed(_));
 
@@ -110,7 +114,7 @@ impl ReadyOutcome {
             StepStatus::Skipped
         };
 
-        serde_json::json!({
+        let mut result = serde_json::json!({
             "ready": !any_failed,
             "runtime": self.runtime,
             "agent_credentials": self.agent_credentials,
@@ -124,7 +128,11 @@ impl ReadyOutcome {
                 "refresh": step_to_json(&refresh),
                 "image_rebuild": step_to_json(&self.image_rebuild),
             }
-        })
+        });
+        if let Some(source) = &self.image_source {
+            result["steps"]["image_source"] = step_to_json(source);
+        }
+        result
     }
 }
 
@@ -231,6 +239,9 @@ impl Command for ReadyCommand {
             text: "Checking agent image…".into(),
         });
 
+        let sources = crate::engine::oci::ImageSources::from_config(
+            &session.effective_config().builtin_runtime(),
+        );
         let mut engine = ReadyEngine::new(
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
@@ -241,7 +252,8 @@ impl Command for ReadyCommand {
                 .clone(),
             self.engines.agent_engine.clone(),
             options,
-        );
+        )
+        .with_image_sources(sources);
         engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
         let summary = match engine.run_to_completion(frontend.as_mut()).await {
             Ok(s) => s,
@@ -311,4 +323,20 @@ fn credential_health(
         expired,
         read_error: status.read_error.map(|error| error.to_string()),
     }]
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_image_source_is_visible_without_changing_docker_json() {
+        let base = ReadySummary::new("docker");
+        let docker = ReadyOutcome::from(base.clone()).to_legacy_json();
+        assert!(docker["steps"].get("image_source").is_none());
+        let mut builtin = base;
+        builtin.image_source = Some(StepStatus::Done);
+        let json = ReadyOutcome::from(builtin).to_legacy_json();
+        assert_eq!(json["steps"]["image_source"]["status"], "ok");
+    }
 }

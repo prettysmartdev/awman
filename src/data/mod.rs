@@ -16,6 +16,7 @@ pub mod issue;
 pub mod message;
 pub mod migration;
 pub mod network;
+pub mod oci_identity;
 pub mod prompt;
 pub mod ready_phase;
 pub mod ready_summary;

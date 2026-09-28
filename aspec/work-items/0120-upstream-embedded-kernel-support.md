@@ -147,6 +147,28 @@ So I can: reduce divergence while retaining the validated strict runtime.
   or declined, leave the tested local patch owned and documented, with an
   explicit maintenance decision; do not block or mislabel WI 0119's completion.
 
+### WI 0119 downstream patch inventory and migration
+
+WI 0119 carries three patched published crates, plus awman-owned integration
+glue. Each item has a separate replacement gate; replacing one does not imply
+the others are removable.
+
+| Carried change | Exact current scope | Replacement | Removal gate |
+|---|---|---|---|
+| SQLx SQLite bound backport | `third_party/sqlx-sqlite-0.9.0/`: only the `libsqlite3-sys` upper bound changes from `<0.38.0` to `<0.39.0`, matching upstream SQLx commit `94aafe3a68884d923b0798a767c8d7f6cfda89d2`. This resolves the `rusqlite 0.40.2` / `libsqlite3-sys 0.38.2` native-links conflict. It is independent of embedded-kernel work. | A published compatible `sqlx-sqlite` release containing the same bound fix. | Update the dependency and lockfile, remove the `[patch.crates-io]` path and vendor tree, then pass the combined awman/msb link, exactly-one-bundled-SQLite check, awman store tests, msb migrations, cross-driver checks, and old/new catalog round trips on supported targets. Do not wait for or couple this to libkrun review. |
+| libkrun kernel-provider loader | `third_party/msb_krun-0.1.39/`: the typed, process-lifetime `EmbeddedKernel` registry and loader branch in `load_krunfw_library`; ordinary external firmware paths retain the published DSO behavior. It does not export a C getter or search process symbols. | An accepted and pinned libkrun API that accepts an owned/process-lifetime typed kernel provider with equivalent validation and lifetime. | Adapt awman's provider registration to the public API, update the pinned crate, then boot and run the strict fixture on Apple Silicon and Linux ARM64/x86_64 with KVM, plus external-firmware regressions and release artifact scans. Remove the vendored `msb_krun` patch/tree only after those gates pass. |
+| Microsandbox guest-agent artifact-root glue | `third_party/microsandbox-filesystem-0.7.2/`: only `build.rs` adds target-aware lookup at `MSB_EMBED_ARTIFACTS_ROOT/<target-arch>/agentd`; existing input paths remain. This supplies an embedded guest agent at build time, not an extracted host helper. | An equivalent upstream target-aware artifact-root/build-input API in the filesystem crate. | Pin the release/commit, remove the vendor patch and path override, and verify clean builds for all required targets plus guest-agent hash/architecture checks. |
+| Awman-side worker and provider integration (not a vendored dependency patch) | `src/engine/container/builtin/embedded/{kernel.rs,version.rs,mod.rs}`, `src/engine/container/builtin/worker.rs`, `src/engine/container/builtin/msb_driver.rs`, and the early route in `src/main.rs`: compile/register the selected kernel, embed worker protocol metadata, recognize the private same-executable `machine` invocation, and configure the SDK paths used to reach the local `msb_krun` provider. There is currently no patched `microsandbox` CLI/runtime crate. | Use libkrun's typed public provider directly. Remove the firmware-path transport and setter calls when the SDK/runtime can represent embedded origin directly. Keep awman's worker protocol and early dispatch only for as long as the SDK still launches the same executable through that protocol. If a separate Microsandbox runtime patch becomes necessary, scope it as its own upstream change and record its exact files/API here before carrying it. | Update and test worker launch/version compatibility first; then remove only the glue made redundant by the upstream API. Verify same-executable boot, external installed-runtime behavior, protocol compatibility, and no symbol/path workaround before deleting compatibility code. |
+
+The currently carried dependency sources and their existing patch notes are
+enumerated in [`third_party/README.md`](../../third_party/README.md),
+`third_party/sqlx-sqlite-0.9.0/PATCH.md`,
+`third_party/msb_krun-0.1.39/PATCH.md`, and
+`third_party/microsandbox-filesystem-0.7.2/PATCH.md`. No patch acceptance or
+release is assumed by WI 0119. The historical spike under
+`tools/oci-runtime-spike/` remains evidence only and is not a production
+runtime dependency.
+
 ### Acceptance criteria
 
 - [ ] A focused reviewable patch against a recorded libkrun upstream base

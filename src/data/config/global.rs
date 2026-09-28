@@ -6,10 +6,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::config::repo::{
     validate_auth_refresh, ApiConfig, AuthRefreshConfig, RemoteConfig, SquadConfig,
 };
+use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::error::DataError;
 use crate::data::fs::SquadPaths;
 
@@ -68,9 +70,18 @@ pub struct GlobalConfig {
     pub launch_mode_fallback: Option<LaunchModeFallback>,
     #[serde(rename = "authRefresh", skip_serializing_if = "Option::is_none")]
     pub auth_refresh: Option<AuthRefreshConfig>,
+    /// Settings for the builtin microVM runtime (`runtime: "builtin"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<BuiltinRuntimeConfig>,
 }
 
 impl GlobalConfig {
+    /// The runtime `runtime` selects. Unset or blank is Docker; an unknown
+    /// value is an error, never a silent fall back.
+    pub fn runtime_selection(&self) -> Result<RuntimeSelection, UnknownRuntimeValue> {
+        RuntimeSelection::parse(self.runtime.as_deref())
+    }
+
     pub fn workers(&self) -> u8 {
         self.workers.unwrap_or(2)
     }
@@ -237,6 +248,7 @@ mod tests {
             runtime: Some("docker".to_string()),
             yolo_disallowed_tools: Some(vec!["rm".to_string()]),
             legacy_env_passthrough: None,
+            builtin: None,
             api: Some(ApiConfig {
                 work_dirs: Some(vec!["/work".to_string()]),
                 always_non_interactive: Some(true),
@@ -384,5 +396,38 @@ mod tests {
             home, awman_dir,
             "AWMAN_CONFIG_HOME must win over XDG_CONFIG_HOME"
         );
+    }
+
+    #[test]
+    fn runtime_selection_defaults_to_docker_and_parses_builtin() {
+        assert_eq!(
+            GlobalConfig::default().runtime_selection(),
+            Ok(RuntimeSelection::Docker)
+        );
+        let cfg = GlobalConfig {
+            runtime: Some("builtin".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.runtime_selection(), Ok(RuntimeSelection::Builtin));
+        let bad = GlobalConfig {
+            runtime: Some("blarg".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            bad.runtime_selection(),
+            Err(UnknownRuntimeValue("blarg".into()))
+        );
+    }
+
+    #[test]
+    fn builtin_block_is_omitted_when_unset_and_round_trips_when_set() {
+        let json = serde_json::to_string(&GlobalConfig::default()).unwrap();
+        assert!(!json.contains("builtin"), "{json}");
+        let cfg: GlobalConfig =
+            serde_json::from_str(r#"{"runtime":"builtin","builtin":{"vcpus":4}}"#).unwrap();
+        assert_eq!(cfg.builtin.as_ref().and_then(|b| b.vcpus), Some(4));
+        let back: GlobalConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
     }
 }

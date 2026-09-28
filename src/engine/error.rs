@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::data::config::image_source::ImageSourceKind;
 use crate::data::error::DataError;
 
 #[derive(Debug, Error)]
@@ -165,6 +166,80 @@ pub enum EngineError {
 
     #[error("remote transport error: {0}")]
     RemoteTransport(String),
+
+    // ── Builtin runtime and image acquisition (WI 0119) ───────────────────
+    //
+    // The image-source fields are named `source_kind`, not `source`: thiserror
+    // treats a field called `source` as the wrapped error.
+    /// The builtin microVM runtime cannot run here: built without it, an
+    /// unsupported platform, no hypervisor access, a missing entitlement.
+    /// Layer 2 treats it like an unreachable Docker daemon.
+    #[error("the builtin runtime is unavailable: {reason}")]
+    BuiltinRuntimeUnavailable { reason: String },
+
+    #[error(
+        "the builtin runtime refuses to start while {variable} is set: it would \
+         replace awman's embedded runtime. Unset {variable} and retry."
+    )]
+    AmbientRuntimeOverride { variable: String },
+
+    #[error("{source_kind} image source is not supported: {reason}")]
+    UnsupportedImageSource {
+        source_kind: ImageSourceKind,
+        reason: String,
+    },
+
+    #[error("{source_kind} image source is blocked: {reason}")]
+    ImageSourceBlocked {
+        source_kind: ImageSourceKind,
+        reason: String,
+    },
+
+    #[error("no image source is configured for '{tag}': {hint}")]
+    ImageSourceUnconfigured { tag: String, hint: String },
+
+    #[error("digest mismatch for '{reference}': expected {expected}, got {actual}")]
+    ImageDigestMismatch {
+        reference: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("platform mismatch for '{reference}': wanted {wanted}, found {found}")]
+    ImagePlatformMismatch {
+        reference: String,
+        wanted: String,
+        found: String,
+    },
+
+    #[error("image archive {path} rejected: {reason}")]
+    ImageArchiveRejected { path: PathBuf, reason: String },
+
+    #[error("not enough disk space at {path}: {needed} bytes needed, {available} bytes available")]
+    InsufficientDiskSpace {
+        path: PathBuf,
+        needed: u64,
+        available: u64,
+    },
+
+    #[error("the {runtime} runtime cannot honour {request}: {reason}")]
+    UnsupportedResourceRequest {
+        runtime: &'static str,
+        request: String,
+        reason: String,
+    },
+
+    #[error(
+        "socket path {path} is longer than the {limit}-byte limit; configure a shorter \
+         builtin state directory"
+    )]
+    SocketPathTooLong { path: PathBuf, limit: usize },
+
+    #[error(
+        "builtin runtime worker protocol mismatch: expected {expected}, found {found}; \
+         stop running agents started by an older awman and retry"
+    )]
+    WorkerProtocolMismatch { expected: String, found: String },
 
     #[error("{0}")]
     Other(String),

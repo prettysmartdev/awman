@@ -346,6 +346,16 @@ awman exec workflow workflow.toml --yolo > workflow.log 2>&1
 
 An agent that needs full-screen terminal control (e.g. an interactive editor) requires a real TTY and cannot run headlessly. Either refactor the workflow to avoid full-screen features, run it on a machine with a terminal, or provide a virtual TTY (tmux/screen) inside the container — rarely needed.
 
+### Headless runs on the builtin runtime
+
+Headless, CI, and API-server runs work the same way under `runtime: "builtin"`, with these differences:
+
+- The host needs KVM access (`/dev/kvm`) on Linux — a CI runner or container without it fails with `cannot access /dev/kvm`. There is no Docker daemon requirement to run agents, but every agent image must already be imported: run `awman ready` (with a configured `builtin.imageSource`) as a setup step before `exec` commands. A missing image fails fast with build-and-import instructions rather than building.
+- Each session's microVM lives and dies with the awman process that launched it. Under `awman api start`, that is the API server; stopping the server stops the VMs it launched.
+- `awman ready --json` includes an `image_source` entry when images were imported.
+
+See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm).
+
 ---
 
 ## Starting the server

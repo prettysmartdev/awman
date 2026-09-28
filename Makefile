@@ -9,12 +9,21 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
-.PHONY: all build install test test-fast test-full clean release architecture-lint pre-push docs-reference
+.PHONY: all build install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference
 
 all: build
 
 build:
-	cargo build --release
+	@if bash tools/msb-payloads/verify.sh "$$(rustc -vV | sed -n 's/^host: //p')" >/dev/null 2>&1; then \
+		cargo build --release --features builtin-runtime; \
+	else \
+		echo 'Builtin payloads unavailable for this host; building existing backends'; \
+		cargo build --release; \
+	fi
+
+payloads:
+	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
+	@case "$$(uname -s)" in Linux) bash third_party/native/libcap-ng/build.sh "$$(rustc -vV | sed -n 's/^host: //p')";; esac
 
 install: build
 	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
@@ -35,7 +44,14 @@ test:
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet
 
 test-fast:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet -- --skip docker --skip real_git --skip real_network
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet -- --skip docker --skip real_git --skip real_network --skip builtin_hw
+
+# Only the targets that exercise the builtin runtime: every test executable links the
+# whole embedded VM stack (hundreds of MB each in debug), so building all of them
+# with the feature is needlessly slow and can exhaust memory or disk on CI runners.
+# `--examples` builds the real-guest driver used by the builtin_hw_* tests.
+test-builtin:
+	@AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --quiet
 
 test-full:
 	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet

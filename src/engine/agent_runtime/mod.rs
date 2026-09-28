@@ -12,9 +12,17 @@
 
 use std::sync::Arc;
 
+use crate::data::config::effective::EffectiveConfig;
+use crate::data::config::env::Env;
+use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::GlobalConfig;
+use crate::data::config::image_source::ImageSourceSpec;
+use crate::data::config::repo::RepoConfig;
+use crate::data::config::runtime_selection::RuntimeSelection;
+use crate::data::oci_identity::{ImageIdentity, OciPlatform};
 use crate::data::session::Session;
 use crate::engine::container::options::ResolvedContainerOptions;
+use crate::engine::container::runtime::BuiltinRuntimeSettings;
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::options::ResolvedSandboxOptions;
@@ -27,7 +35,7 @@ pub mod frontend;
 pub mod output_tail;
 
 pub use background::{AgentExec, ExecOutput};
-pub use capabilities::{Capabilities, DindSupport};
+pub use capabilities::{Capabilities, DindSupport, ImageAcquisition};
 pub use execution::{
     AgentExecution, AgentExitInfo, AgentHandle, AgentHandlePreview, AgentInstance, AgentStats,
     CancelHandle, StuckEvent,
@@ -105,6 +113,19 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// Probe whether the underlying tooling is reachable. Times out on its own.
     fn is_available(&self) -> bool;
 
+    /// Why the runtime is unreachable (`Ok` when reachable). Runtimes with a
+    /// detailed probe override this; the default reports only the boolean.
+    fn availability(&self) -> Result<(), EngineError> {
+        if self.is_available() {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!(
+                "{} is not available",
+                self.display_name()
+            )))
+        }
+    }
+
     /// Construct a configured `AgentInstance` from typed options — the first
     /// half of the two-step build/run pattern (no spawn happens here). The
     /// runtime rejects options whose paradigm doesn't fit with
@@ -143,14 +164,16 @@ pub trait AgentRuntimeEngine: Send + Sync {
     ///   - sandbox:   stop (preserve persistent volume)
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
-    /// Build argv for an exec/re-attach against an existing agent.
+    /// Argv (after the host CLI name) for an exec/re-attach against an
+    /// existing agent through [`Self::host_cli`]. `None` when the runtime has no
+    /// host CLI (builtin); callers must handle `None` and use [`Self::attach`].
     fn exec_args(
         &self,
         agent_id: &str,
         working_dir: &str,
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
-    ) -> Vec<String>;
+    ) -> Option<Vec<String>>;
 
     /// Attach to an already-running agent this process did not start.
     ///
@@ -168,8 +191,26 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// The name prefix is the one identity channel all three tiers share.
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError>;
 
-    /// Name of the CLI binary this runtime drives ("docker", "container", "sbx").
-    fn cli_binary(&self) -> &'static str;
+    /// The host CLI this runtime drives (`"docker"`, `"container"`, `"sbx"`),
+    /// or `None` for a runtime that drives no host CLI (builtin). Every
+    /// runtime states its own, so adding one cannot forget to.
+    fn host_cli(&self) -> Option<&'static str>;
+
+    /// Whether [`Self::attach`] still reaches an agent after the process that
+    /// launched it has exited. Docker: yes (`docker attach`). Apple: no (the
+    /// launcher hosts the attach socket). Default: no.
+    fn reattach_after_owner_exit(&self) -> bool {
+        false
+    }
+
+    /// Remove a stopped agent by id or name (`awman clean`). Returns an error
+    /// when the runtime refuses, so callers can count per-item failures.
+    fn remove_agent(&self, _id: &str) -> Result<(), EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "agent removal",
+        })
+    }
 
     // ─── Agent environment preparation (F-40b) ───────────────────────────
     //
@@ -206,6 +247,51 @@ pub trait AgentRuntimeEngine: Send + Sync {
         no_cache: bool,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError>;
+
+    /// Import an already-built image from an explicit source into this
+    /// runtime's store. Only runtimes whose
+    /// `capabilities().image_acquisition` is `Import` implement it.
+    fn import_image(
+        &self,
+        _request: &ImageImportRequest,
+        _sink: &mut dyn crate::data::message::UserMessageSink,
+    ) -> Result<ImportedImage, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "image import",
+        })
+    }
+
+    /// Content identity (digests, platform, source) of a cached image, when
+    /// the runtime records one. `Ok(None)`: no identity is recorded, which
+    /// is always the case for build runtimes.
+    fn image_identity(&self, _tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
+        Ok(None)
+    }
+}
+
+/// What [`AgentRuntimeEngine::import_image`] should import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageImportRequest {
+    /// The awman tag the image is stored under (`awman-<stem>-<agent>:latest`).
+    pub tag: String,
+    /// The explicit source. Never inferred from `tag`.
+    pub source: ImageSourceSpec,
+    /// The platform the image must match.
+    pub platform: OciPlatform,
+    /// Re-acquire even when an identity for `tag` is already cached.
+    pub refresh: bool,
+}
+
+/// The result of a successful [`AgentRuntimeEngine::import_image`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedImage {
+    pub tag: String,
+    pub identity: ImageIdentity,
+    /// The image config's `HOME`, when it declares one.
+    pub home_dir: Option<String>,
+    /// The image config's `User`, when it declares one.
+    pub user: Option<String>,
 }
 
 /// The concrete runtime `detect()` chose, exposing both the cross-paradigm
@@ -243,32 +329,55 @@ impl DetectedRuntime {
     }
 }
 
-/// Every value `GlobalConfig::runtime` accepts. Quoted in the fatal
-/// invalid-runtime error so the user can see what to fix the config to.
-pub const VALID_RUNTIMES: &[&str] = &["docker", "apple-containers", "docker-sbx-experimental"];
+/// Every value `GlobalConfig::runtime` accepts, in `RuntimeSelection::ALL`
+/// order. Quoted in the fatal invalid-runtime error so the user can see what
+/// to fix the config to.
+pub const VALID_RUNTIMES: &[&str] = &[
+    RuntimeSelection::Docker.as_str(),
+    RuntimeSelection::AppleContainers.as_str(),
+    RuntimeSelection::DockerSbxExperimental.as_str(),
+    RuntimeSelection::Builtin.as_str(),
+];
 
 /// Factory: pick the right runtime based on `GlobalConfig::runtime`.
 ///
-/// - `None` / `"docker"` → `ContainerRuntime` with the Docker backend
+/// Reads the builtin runtime's settings from `global_config` and the process
+/// environment only; a caller holding repo config uses [`detect_effective`].
+pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineError> {
+    detect_effective(&EffectiveConfig::new(
+        FlagConfig::default(),
+        Env::from_process(),
+        RepoConfig::default(),
+        global_config.clone(),
+    ))
+}
+
+/// Factory: pick the right runtime based on the effective config.
+///
+/// - unset / blank / `"docker"` → `ContainerRuntime` with the Docker backend
 /// - `"apple-containers"` → `ContainerRuntime` with the Apple backend
 ///   (macOS only)
 /// - `"docker-sbx-experimental"` → `SandboxRuntime` with the (stubbed)
 ///   Docker Sandbox backend (macOS arm64 / Windows only; see WI 0090)
+/// - `"builtin"` → `ContainerRuntime` with the builtin microVM backend, or
+///   the precise reason it cannot run here (`BuiltinRuntimeUnavailable`,
+///   `AmbientRuntimeOverride`). Never a fall back to another runtime.
 /// - anything else → `EngineError::UnknownRuntime`. A misspelled runtime is
 ///   a fatal configuration error, never a silent fall back to Docker: the
 ///   user asked for an isolation model awman can't identify, and launching
 ///   agents under a different one than they configured is unsafe.
-pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineError> {
-    let runtime_name = global_config
-        .runtime
-        .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
-    match runtime_name {
-        Some("docker") | None => Ok(DetectedRuntime::Container(Arc::new(
+pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, EngineError> {
+    let selection = config
+        .runtime_selection()
+        .map_err(|unknown| EngineError::UnknownRuntime {
+            value: unknown.0,
+            valid: RuntimeSelection::valid_values(),
+        })?;
+    match selection {
+        RuntimeSelection::Docker => Ok(DetectedRuntime::Container(Arc::new(
             ContainerRuntime::docker(),
         ))),
-        Some("apple-containers") => {
+        RuntimeSelection::AppleContainers => {
             if cfg!(target_os = "macos") {
                 Ok(DetectedRuntime::Container(Arc::new(
                     ContainerRuntime::apple(),
@@ -280,13 +389,15 @@ pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineErr
                 })
             }
         }
-        Some("docker-sbx-experimental") => {
+        RuntimeSelection::DockerSbxExperimental => {
             Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
         }
-        Some(other) => Err(EngineError::UnknownRuntime {
-            value: other.to_string(),
-            valid: VALID_RUNTIMES.join(", "),
-        }),
+        RuntimeSelection::Builtin => {
+            let settings = BuiltinRuntimeSettings::resolve(config)?;
+            Ok(DetectedRuntime::Container(Arc::new(
+                ContainerRuntime::builtin(settings)?,
+            )))
+        }
     }
 }
 
@@ -413,6 +524,67 @@ mod tests {
         );
         assert!(msg.contains("apple-containers"), "{msg}");
         assert!(msg.contains("docker-sbx-experimental"), "{msg}");
+    }
+
+    #[test]
+    fn valid_runtimes_follow_runtime_selection() {
+        let from_selection: Vec<&str> = RuntimeSelection::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(VALID_RUNTIMES, from_selection.as_slice());
+        assert!(VALID_RUNTIMES.contains(&"builtin"));
+    }
+
+    /// Selecting `builtin` yields the builtin runtime or the precise reason it
+    /// cannot run — never Docker, never a panic.
+    #[test]
+    fn detect_builtin_never_falls_back_to_another_runtime() {
+        let cfg = GlobalConfig {
+            runtime: Some("builtin".into()),
+            ..Default::default()
+        };
+        match detect(&cfg) {
+            Ok(rt) => assert_eq!(rt.engine().runtime_name(), "builtin"),
+            Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
+                assert!(!reason.is_empty())
+            }
+            Err(EngineError::AmbientRuntimeOverride { variable }) => {
+                assert!(variable.starts_with("MSB_"))
+            }
+            Err(e) => panic!("expected the builtin runtime or its unavailability, got: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn build_runtimes_do_not_import_images() {
+        use crate::data::config::image_source::ImageSourceSpec;
+        use crate::data::message::{UserMessage, UserMessageSink};
+        struct Sink;
+        impl UserMessageSink for Sink {
+            fn write_message(&mut self, _msg: UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        let rt = detect(&docker_cfg()).unwrap().engine();
+        let request = ImageImportRequest {
+            tag: "awman-x-claude:latest".into(),
+            source: ImageSourceSpec::Archive {
+                path: "/nonexistent.tar".into(),
+            },
+            platform: OciPlatform::host_linux(),
+            refresh: false,
+        };
+        match rt.import_image(&request, &mut Sink) {
+            Err(EngineError::UnsupportedOnRuntime { runtime, operation }) => {
+                assert_eq!(runtime, "docker");
+                assert_eq!(operation, "image import");
+            }
+            other => panic!("expected UnsupportedOnRuntime, got {other:?}"),
+        }
+        assert!(rt
+            .image_identity("awman-x-claude:latest")
+            .unwrap()
+            .is_none());
+        assert_eq!(rt.host_cli(), Some("docker"));
+        assert!(rt.reattach_after_owner_exit());
+        assert_eq!(rt.capabilities().image_acquisition, ImageAcquisition::Build);
     }
 
     // ─── Runtime switching (host-side, no live sbx needed) ───────────────────

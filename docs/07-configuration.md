@@ -247,9 +247,10 @@ Or per-invocation: `awman chat --overlay "env(ANTHROPIC_API_KEY)"`. See [Overlay
 awman config set --global runtime docker                  # default
 awman config set --global runtime apple-containers        # macOS only
 awman config set --global runtime docker-sbx-experimental # experimental
+awman config set --global runtime builtin                  # embedded microVM
 ```
 
-See [Runtimes](#runtimes) below.
+See [Runtimes](#runtimes) below. The `builtin` runtime also has its own `builtin` block of settings (VM size, image sources); see [Builtin runtime settings](#builtin-runtime-settings).
 
 ### Choose ACP launch mode
 
@@ -384,10 +385,48 @@ The global `runtime` key selects how agent processes are isolated from your host
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple-containers` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
 | `docker-sbx-experimental` | macOS arm64, Windows x86_64 | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](11-runtimes.md) |
+| `builtin` | Linux x86_64 / arm64 (KVM), macOS Apple Silicon | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Requires an awman build that includes it. `awman ready` imports images from a configured source instead of building them. See [Runtimes](11-runtimes.md#builtin-microvm) |
 
 An unrecognized value (e.g. a typo) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). Fix the value in `$HOME/.awman/config.json` and relaunch.
 
 `awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](11-runtimes.md).
+
+### Builtin runtime settings
+
+The optional `builtin` object is read only when `runtime` is `builtin`. It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected.
+
+```json
+{
+  "runtime": "builtin",
+  "builtin": {
+    "vcpus": 4,
+    "memoryMib": 8192,
+    "imageSource": { "type": "docker-store" },
+    "images": {
+      "awman-myproject-claude:latest": { "type": "archive", "path": "/opt/images/claude.tar" }
+    },
+    "registries": {
+      "registry.example.com": {
+        "caCert": "/etc/ssl/corp-ca.pem",
+        "auth": { "type": "env", "usernameVar": "REG_USER", "passwordVar": "REG_PASS" }
+      }
+    }
+  }
+}
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images and session VMs; mode `0700`, no symlinks, keep it short. `AWMAN_BUILTIN_STATE_DIR` overrides it |
+| `builtin.vcpus` | integer 1–255 | `2` | Whole vCPUs per session VM |
+| `builtin.memoryMib` | integer ≥ 128 | `4096` | Guest memory in MiB |
+| `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-store`, `archive`, or `apple-store` (blocked) |
+| `builtin.images` | object (image tag → source) | `{}` | Per-image source; wins over `imageSource` for that tag |
+| `builtin.registries` | object (`host[:port]` → settings) | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
+
+Every source object, its fields, the registry settings, and the `apple-store` limitation are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to build and import an image instead of guessing.
+
+`builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The three object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 
 ---
 
@@ -432,6 +471,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
 | `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
 | `dynamicWorkflows.guidance` | string array | (unset → no guidance block) | Project-specific instructions injected into the leader prompt as a bullet list — see [Dynamic Workflows](06-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per entry as `dynamicWorkflows.guidance.<index>` (empty value removes) |
+| `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`) |
 | `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 | `authRefresh` | object | (unset) | Live credential-refresh settings for Claude — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
 
@@ -441,7 +481,8 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 |----------|------|---------|---------|-------------------------------------|
 | `default_agent` | string | (unset) | Agent used when no repo agent is configured | yes |
 | `terminal_scrollback_lines` | integer | 10000 | Default scrollback for all repos | yes |
-| `runtime` | string | `docker` | Container runtime: `docker`, `apple-containers`, `docker-sbx-experimental` | yes |
+| `runtime` | string | `docker` | Container runtime: `docker`, `apple-containers`, `docker-sbx-experimental`, `builtin` | yes |
+| `builtin` | object | (unset) | Builtin microVM runtime settings; see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`); edit the rest in the file |
 | `yoloDisallowedTools` | string array | `[]` | Machine-wide yolo tool denylist (unless a repo overrides it) | yes |
 | `overlays` | string array | `[]` | Overlay specs applied to every project; additive with other sources | yes |
 | `agentStuckTimeout` | integer (seconds) | 30 | Default agent-stuck timeout | yes |
@@ -479,6 +520,10 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `agentStuckTimeout` | repo or global |
 | `maxConcurrentAgents` | repo or global |
 | `runtime` | global only |
+| `builtin.stateDir` | repo or global |
+| `builtin.vcpus` | repo or global |
+| `builtin.memoryMib` | repo or global |
+| `builtin.imageSource`, `builtin.images`, `builtin.registries` | repo or global; shown read-only, edit the JSON |
 | `default_agent` | global only |
 | `api` | global only |
 | `remote` | global only in practice (see note) |
@@ -517,6 +562,10 @@ Value handling:
 | `XDG_CONFIG_HOME` | Global config goes to `$XDG_CONFIG_HOME/awman/` |
 | `XDG_DATA_HOME` | Global data (workflows, skills, worktrees, API state, and the shared database) goes to `$XDG_DATA_HOME/awman/` |
 | `AWMAN_API_ROOT` | Relocate only the API server storage root |
+| `AWMAN_BUILTIN_STATE_DIR` | Relocate the builtin runtime's private state directory; beats `builtin.stateDir` |
+| `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | Read only when importing a builtin image from a `docker-store` source that sets no `host` |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | Honored when the builtin runtime pulls from a `registry` source |
+| `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, `MSB_BACKEND` | Must be **unset** under the builtin runtime; if any is set, awman refuses to start it because it would replace the embedded runtime |
 | `AWMAN_OVERLAYS` | Comma-separated overlay specs (e.g. `env(TOKEN),dir(/a:/b:ro)`); merged with config and flags — see [Overlays](08-overlays.md) |
 | `AWMAN_LAUNCH_MODE` | Choose `stdio` or `acp`; overrides repo `launchMode` and is overridden by `--launch-mode` |
 | `AWMAN_MAX_CONCURRENT_AGENTS` | Cap on concurrently-running workflow steps; beats `maxConcurrentAgents` in repo/global config, beaten by `--max-concurrent` — see [Parallel workflows](05-workflows.md#parallel-workflows) |
@@ -527,7 +576,7 @@ Value handling:
 | `AWMAN_ATTACH_DIR` | Relocate the directory attach sockets live in; defaults to `~/.awman/attach/` |
 | `AWMAN_API_VERBOSE_SETUP` | Demote the API server's per-session setup logging from `info` to `debug`; set to `0`, `false`, `no` or `off` (case-insensitive) to quiet it. Verbose is the default. |
 | `AWMAN_TEST_ISOLATION` | Set to `1` (or `true`, `yes`, `on`) to keep awman off your per-user OS resources: keychain reads, writes and deletes stay inside the awman process instead of reaching the macOS Keychain or Linux Secret Service; the TUI's copy actions go to an in-process buffer instead of the system clipboard; daemons start as plain background processes instead of through `launchd` or `systemd --user`; and downloads from the internet (the aspec template, agent Dockerfiles, GitHub issues and CI status) fail as if offline. Agent credentials stored in the keychain are not found, the squad daemon's `envPersistence` item lives only as long as the daemon, and a daemon started this way is not restarted at login. Intended for test runs; `make test` sets it. |
-| `AWMAN_TEST_DOCKER` / `AWMAN_TEST_APPLE_CONTAINER` / `AWMAN_TEST_SBX` | Only matter when `AWMAN_TEST_ISOLATION` is set, where `docker`, Apple's `container` and `sbx` are treated as not installed. Set one to `1` to let awman use that real CLI again. `make test-full` sets `AWMAN_TEST_DOCKER`. |
+| `AWMAN_TEST_DOCKER` / `AWMAN_TEST_APPLE_CONTAINER` / `AWMAN_TEST_SBX` | Only matter when `AWMAN_TEST_ISOLATION` is set, where `docker`, Apple's `container` and `sbx` are treated as not installed. Set one to `1` to let awman use that real CLI again. `make test-full` sets `AWMAN_TEST_DOCKER`. `AWMAN_TEST_BUILTIN` does the same for the builtin runtime, which is otherwise disabled under isolation; `make test-builtin` sets it. |
 
 When the API or squad daemon is started as a background service (`systemd --user` on Linux, `launchd` on macOS), the launching process forwards a small, non-secret allowlist of variables into that service's environment, so the daemon resolves the same config and storage root as the process that started it: `PATH`, `HOME`, `RUST_LOG`, `AWMAN_CONFIG_HOME`, `AWMAN_API_ROOT`, `AWMAN_SQUAD_ROOT`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `AWMAN_OVERLAYS`, `AWMAN_MAX_CONCURRENT_AGENTS` and `AWMAN_LAUNCH_MODE`. Bearer keys (`AWMAN_API_KEY`, `AWMAN_SQUAD_KEY`) are never forwarded this way — the daemon authenticates against the key hash it reads from its storage root instead.
 

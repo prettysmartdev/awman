@@ -24,7 +24,7 @@ target
 .claude/worktrees
 .awman/workflows
 .awman/session.json
-.cargo
+.cargo/*
+!.cargo/config.toml
 .antigravitycli
 .crush
-

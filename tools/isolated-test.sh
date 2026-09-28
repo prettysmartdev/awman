@@ -28,6 +28,8 @@
 #     AWMAN_TEST_APPLE_CONTAINER=1 or AWMAN_TEST_SBX=1 (`make test-full` sets
 #     the first). With Docker opted in, the docker CLI keeps the real
 #     ~/.docker, which is where its daemon context lives.
+#   * Builtin hardware tests opt in with AWMAN_TEST_BUILTIN=1 and additionally
+#     require KVM or Apple's Hypervisor framework. The test home isolates state.
 #   * stdin is /dev/null, as in CI. From a terminal, code that asks "is stdin
 #     a terminal?" would take its interactive path, and a test could block on
 #     a prompt or put the terminal into raw mode.
@@ -45,7 +47,8 @@ if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
     echo "isolated-test: no fixture directory under $tmproot" >&2
     exit 1
 fi
-trap 'rm -rf "$run_dir"' EXIT
+cleanup() { rm -rf "$run_dir" "${builtin_state:-}"; }
+trap cleanup EXIT
 
 # Resolve cargo's and rustup's homes from the real HOME before replacing it.
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
@@ -69,7 +72,25 @@ unset AWMAN_CONFIG_HOME AWMAN_API_ROOT AWMAN_SQUAD_ROOT AWMAN_ATTACH_DIR \
     AWMAN_SQUAD_KEY AWMAN_MAX_CONCURRENT_AGENTS AWMAN_LAUNCH_MODE \
     GITHUB_TOKEN GH_TOKEN
 
+# Ambient Microsandbox settings would make awman refuse the builtin runtime (an
+# `MSB_PATH` would outrank the embedded worker), so none may leak in.
+unset MSB_PATH MSB_LIBKRUNFW_PATH MSB_AGENTD_PATH MSB_HOME MSB_BACKEND \
+    MSB_CONFIG_PATH MSB_PROFILE MSB_CACHE_DIR MSB_SANDBOXES_DIR MSB_VOLUMES_DIR \
+    MSB_SNAPSHOTS_DIR MSB_LOGS_DIR MSB_SECRETS_DIR AWMAN_BUILTIN_STATE_DIR
+
 export AWMAN_TEST_ISOLATION=1
+
+# The builtin runtime stays unavailable unless AWMAN_TEST_BUILTIN is opted into.
+# When it is, its state root must be short: the control socket
+# `<root>/run/agent/<32 hex>.control.sock` has to fit sockaddr_un (103 bytes on
+# macOS), which the throwaway HOME under AWMAN_TEST_TMPROOT does not.
+case "${AWMAN_TEST_BUILTIN:-}" in
+    1 | true | yes | on)
+        builtin_state="$(mktemp -d /tmp/awman-b.XXXXXX)"
+        export AWMAN_BUILTIN_STATE_DIR="$builtin_state"
+        ;;
+    *) unset AWMAN_TEST_BUILTIN ;;
+esac
 export TMPDIR="$run_dir"
 
 cargo test "$@" < /dev/null

@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "awman"
 path = "src/lib.rs"
 
+[features]
+default = []
+builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:msb_krun", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
+
 [dependencies]
 anyhow = "1"
 tracing = "0.1"
@@ -59,9 +63,28 @@ thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 which = "8"
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "rustls-native-certs"], optional = true }
+
+[build-dependencies]
+sha2 = "0.11"
+toml = "1"
+
+[target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies]
+microsandbox = { version = "=0.7.2", default-features = false, features = ["local", "net"], optional = true }
+microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"], optional = true }
+microsandbox-image = { version = "=0.7.2", optional = true }
+msb_krun = { version = "=0.1.39", optional = true }
+
+[patch.crates-io]
+sqlx-sqlite = { path = "third_party/sqlx-sqlite-0.9.0" }
+msb_krun = { path = "third_party/msb_krun-0.1.39" }
+microsandbox-filesystem = { path = "third_party/microsandbox-filesystem-0.7.2" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process", "fs", "poll"] }
+nix = { version = "0.31", features = ["signal", "process", "fs", "poll", "user"] }
 libc = "0.2"
 
 [dev-dependencies]
@@ -75,6 +98,14 @@ wiremock = "0.6"
 [[test]]
 name = "data_layer"
 path = "tests/data_layer/main.rs"
+
+[[test]]
+name = "builtin_runtime"
+path = "tests/builtin_runtime/main.rs"
+
+[[test]]
+name = "oci_import"
+path = "tests/oci_import/main.rs"
 
 [[test]]
 name = "engine_tests"
@@ -95,6 +126,15 @@ path = "tests/api_parity/main.rs"
 [[test]]
 name = "binary_smoke"
 path = "tests/binary_smoke/main.rs"
+
+# Real-guest driver for the `builtin_hw_*` tests (WI 0119). It must be its own
+# executable: the embedded worker re-runs the current executable, and Cargo's
+# test executables (in `deps/`) are refused as worker hosts. Built only with
+# the builtin feature (`make test-builtin`).
+[[example]]
+name = "builtin_hw_driver"
+path = "tests/builtin_runtime/hw_driver.rs"
+required-features = ["builtin-runtime"]
 
 # ── WI 0101 squad test coverage (tests-squad step) ──────────────────────────────
 # `autotests = false` above means top-level `tests/*.rs` files are NOT

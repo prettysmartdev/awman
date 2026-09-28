@@ -4,13 +4,17 @@
 //! method on `EffectiveConfig`. The merge precedence is encoded once, in this
 //! module, and is the single source of truth.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::data::config::builtin_runtime::{BuiltinRuntimeConfig, DEFAULT_STATE_SUBDIR};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
 use crate::data::config::repo::{AgentAuthMode, LaunchMode, RepoConfig};
+use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::config::{DEFAULT_AGENT_STUCK_TIMEOUT_SECS, DEFAULT_SCROLLBACK_LINES};
+use crate::data::error::DataError;
 
 /// Merged view of every configuration source, in precedence order.
 ///
@@ -228,6 +232,35 @@ impl EffectiveConfig {
     /// and repository configuration do not override it.
     pub fn launch_mode_fallback(&self) -> LaunchModeFallback {
         self.global.launch_mode_fallback.unwrap_or_default()
+    }
+
+    /// Effective runtime selection (global only, like [`Self::runtime`]).
+    pub fn runtime_selection(&self) -> Result<RuntimeSelection, UnknownRuntimeValue> {
+        self.global.runtime_selection()
+    }
+
+    /// Effective builtin-runtime settings: the repo `builtin` block merged over
+    /// the global one field by field (map entries per key). Defaults for
+    /// unset fields are applied by the reader.
+    pub fn builtin_runtime(&self) -> BuiltinRuntimeConfig {
+        let global = self.global.builtin.clone().unwrap_or_default();
+        match &self.repo.builtin {
+            Some(repo) => repo.merged_over(&global),
+            None => global,
+        }
+    }
+
+    /// Effective builtin-runtime state directory:
+    /// `AWMAN_BUILTIN_STATE_DIR` > `builtin.stateDir` (repo > global) >
+    /// `<data home>/builtin`.
+    pub fn builtin_state_dir(&self) -> Result<PathBuf, DataError> {
+        if let Some(dir) = self.env.builtin_state_dir() {
+            return Ok(dir);
+        }
+        if let Some(dir) = self.builtin_runtime().state_dir {
+            return Ok(dir);
+        }
+        Ok(GlobalConfig::data_home_with(&self.env)?.join(DEFAULT_STATE_SUBDIR))
     }
 
     /// Effective base image tag for setup/teardown containers (repo > global > None).
@@ -1235,5 +1268,91 @@ mod tests {
         assert!(settings.enabled);
         assert_eq!(settings.threshold, Duration::from_secs(45 * 60));
         assert_eq!(settings.tick, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn builtin_runtime_merges_repo_over_global() {
+        let global = GlobalConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                vcpus: Some(2),
+                memory_mib: Some(8192),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let repo = RepoConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                vcpus: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let eff = make_effective(FlagConfig::default(), EnvSnapshot::default(), repo, global);
+        let merged = eff.builtin_runtime();
+        assert_eq!(merged.vcpus, Some(4));
+        assert_eq!(merged.memory_mib, Some(8192));
+        assert_eq!(
+            EffectiveConfig::default().builtin_runtime(),
+            BuiltinRuntimeConfig::default()
+        );
+    }
+
+    #[test]
+    fn builtin_state_dir_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_str().unwrap().to_string();
+        let env = EnvSnapshot::with_overrides([(
+            crate::data::config::env::AWMAN_CONFIG_HOME,
+            home.as_str(),
+        )]);
+        let eff = make_effective(
+            FlagConfig::default(),
+            env.clone(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(
+            eff.builtin_state_dir().unwrap(),
+            tmp.path().join(DEFAULT_STATE_SUBDIR)
+        );
+
+        let global = GlobalConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                state_dir: Some("/cfg-state".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let eff = make_effective(
+            FlagConfig::default(),
+            env,
+            RepoConfig::default(),
+            global.clone(),
+        );
+        assert_eq!(
+            eff.builtin_state_dir().unwrap(),
+            PathBuf::from("/cfg-state")
+        );
+
+        let env = EnvSnapshot::with_overrides([
+            (crate::data::config::env::AWMAN_CONFIG_HOME, home.as_str()),
+            (
+                crate::data::config::env::AWMAN_BUILTIN_STATE_DIR,
+                "/env-state",
+            ),
+        ]);
+        let eff = make_effective(FlagConfig::default(), env, RepoConfig::default(), global);
+        assert_eq!(
+            eff.builtin_state_dir().unwrap(),
+            PathBuf::from("/env-state")
+        );
+    }
+
+    #[test]
+    fn runtime_selection_is_global_only_and_defaults_to_docker() {
+        assert_eq!(
+            EffectiveConfig::default().runtime_selection(),
+            Ok(RuntimeSelection::Docker)
+        );
     }
 }

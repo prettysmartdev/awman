@@ -1,6 +1,6 @@
 # Cleaning Up
 
-awman creates and manages various resources — Docker containers, workflow data files, database migration backups, and images — as you use the tool. Over time, completed workflows leave behind data that can accumulate. The `awman clean` command safely removes these resources.
+awman creates and manages various resources — Docker containers (or builtin microVM sessions), workflow data files, database migration backups, and images — as you use the tool. Over time, completed workflows leave behind data that can accumulate. The `awman clean` command safely removes these resources.
 
 ---
 
@@ -19,6 +19,17 @@ awman creates and manages various resources — Docker containers, workflow data
 5. **Pre-migration database backup** — The retained `awman.db.pre-migration` backup from an automatic database migration (and any matching SQLite sidecar backups). The live database at `~/.awman/data/awman.db` is never removed or modified by `awman clean`.
 
 6. **Squad daemon environment** — The OS keychain item (`awman-squad` / `daemon-env`) in which the squad daemon persists the values it holds for tasks' `env()` names, so a daemon the OS restarts comes back already armed. Offered whenever the item exists, listed as "squad daemon environment (awman-squad/daemon-env, OS keychain)". Not a file: it is removed through `security` (macOS) or `secret-tool` (Linux). This is the only category that is not on disk, and the only one that may hold a secret — see [Squad: Persisting values across a restart](12-squad.md#persisting-values-across-a-restart). Removing it does **not** disturb a running daemon, which keeps the values it already holds in memory; it removes only what a future restart would have read back. On a platform with no keychain, or with `secret-tool` not installed, there is nothing to find and the category is simply absent.
+
+### Builtin runtime state
+
+With `runtime` set to `builtin`, `awman clean` applies to the builtin runtime's own state like this:
+
+- **Stopped containers** lists and removes builtin sessions that have stopped or crashed (their VM records and disks). Running and paused sessions are never listed.
+- **Dangling images** is always empty: the builtin runtime only tracks images it imported by name, and `awman clean` never runs a global image prune against the store.
+- **Downloaded archive cache.** Importing an image keeps a validated copy of its archive in `<builtin state dir>/oci-cache/` (`~/.awman/builtin/oci-cache/` by default). It is only read during `awman ready`, never when launching a session, and `awman clean` does not remove it. To reclaim the space, delete that directory while no `awman ready` is running; the next import simply re-acquires the image from its source.
+- **Everything else.** To remove all builtin state (imported images, session disks, the cache), stop or finish every builtin session, then delete the state directory (`builtin.stateDir`, or `AWMAN_BUILTIN_STATE_DIR`). The next `awman ready` re-imports your images. Do not delete it while sessions are running.
+
+Sessions started by an awman with a different internal protocol version are refused rather than adopted or cleaned up (`builtin runtime worker protocol mismatch`); stop them with the awman version that started them first.
 
 ---
 

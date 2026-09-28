@@ -1,0 +1,1137 @@
+//! Passthrough filesystem backend.
+//!
+//! Exposes a single host directory to the guest VM via virtio-fs, with
+//! stat virtualization (uid/gid/mode via xattr), init.krun injection,
+//! and name validation.
+
+pub(crate) mod builder;
+mod create_ops;
+mod dir_ops;
+mod file_ops;
+mod host_mode;
+pub(crate) mod inode;
+mod metadata;
+mod mobility;
+mod remove_ops;
+mod special;
+mod xattr_ops;
+
+use std::{
+    collections::BTreeMap,
+    ffi::{CStr, CString},
+    fs::File,
+    io,
+    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::unix::ffi::OsStrExt,
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use crate::{
+    AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
+    GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
+    backends::shared::{
+        handle_table::HandleData,
+        init_binary,
+        inode_table::{InodeAltKey, InodeData, MultikeyBTreeMap},
+        platform, stat_override,
+    },
+    stat64, statvfs64,
+};
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Cache policy for the passthrough filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Never cache — every access goes to the host filesystem.
+    Never,
+    /// Let the kernel decide (default).
+    Auto,
+    /// Aggressively cache — assume the host filesystem is static.
+    Always,
+}
+
+/// Stat virtualization policy for the passthrough filesystem.
+///
+/// Controls how the guest-visible `stat` is derived from the host filesystem
+/// via the `user.msb.override_stat` extended attribute.
+///
+/// See `design/filesystems/stat-virtualization.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatVirtualization {
+    /// Fail-closed: require xattr support; eager probe at mount time.
+    ///
+    /// Read-only mounts require readable xattrs. Writable mounts require
+    /// writable xattrs so every guest metadata operation can be persisted.
+    Strict,
+
+    /// Opportunistic: apply the overlay if present; tolerate missing xattr support.
+    ///
+    /// Reads/writes the override xattr when possible, but does not probe
+    /// the root and does not fail on unsupported-xattr reads. Corrupt
+    /// override values still fail with `EIO`.
+    Relaxed,
+
+    /// Literal host metadata: do not read or apply the override xattr.
+    ///
+    /// Guest sees the real host uid/gid/mode/type. Metadata-changing
+    /// operations that require xattr-only virtualization
+    /// (`mknod` for special types, file-backed symlinks on Linux,
+    /// guest-side chown) are rejected with a clear errno. `chmod`
+    /// operates directly on the host inode.
+    Off,
+}
+
+/// Host permission propagation policy for the passthrough filesystem.
+///
+/// Controls whether guest `chmod`/create permission bits mutate the real
+/// host inode. Independent of [`StatVirtualization`].
+///
+/// See `design/filesystems/stat-virtualization.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPermissions {
+    /// Guest permission changes live in the metadata overlay only.
+    ///
+    /// Host inodes keep a conservative mode (owner rw for files, owner rwx
+    /// for directories).
+    Private,
+
+    /// Mirror ordinary rwx bits for regular files and directories to the host.
+    ///
+    /// Only `0o777` perm bits are mirrored — never uid/gid, file type,
+    /// device ids, setuid, or setgid. An owner-access floor is always
+    /// applied so the host process keeps access to its own inodes.
+    Mirror,
+}
+
+/// Configuration for the passthrough filesystem backend.
+#[derive(Debug, Clone)]
+pub struct PassthroughConfig {
+    /// Seal owned namespace/data and reconstruct private linked or detached objects.
+    pub owned_checkpoint: Option<super::OwnedDirectoryCheckpoint>,
+    /// Capture external-object identity and apply explicit destination reconciliation.
+    pub external_checkpoint: Option<super::ExternalCheckpointOptions>,
+    /// Path to the root directory on the host.
+    pub root_dir: PathBuf,
+
+    /// Resolve `root_dir` treating no component of the path as trusted.
+    ///
+    /// When `true`, `root_dir` is resolved from the real filesystem root with
+    /// symlink following disabled for *every* component, and `..` is refused.
+    /// A symlink anywhere in the path — tenant-created or not — fails the mount
+    /// rather than being followed, so a caller cannot escape the intended target
+    /// by planting a symlink or by injecting `..` into a path segment it
+    /// influences. Because nothing is trusted, the caller must pass a fully
+    /// resolved (symlink-free, absolute) path; a legitimately symlinked prefix
+    /// must be canonicalized before it reaches this backend.
+    ///
+    /// `false` preserves the legacy behavior of opening `root_dir` directly,
+    /// following symlinks, with the caller vouching for the whole path.
+    pub no_symlink_root: bool,
+
+    /// Stat virtualization policy.
+    ///
+    /// Default: [`StatVirtualization::Strict`].
+    pub stat_virtualization: StatVirtualization,
+
+    /// Host permission propagation policy.
+    ///
+    /// Default: [`HostPermissions::Private`].
+    pub host_permissions: HostPermissions,
+
+    /// Whether mutating guest filesystem operations should be rejected.
+    ///
+    /// This is host-side defense in depth for read-only virtiofs volume mounts.
+    /// The guest mount also uses `MS_RDONLY`, but a privileged guest process can
+    /// attempt to remount; the backend must still deny writes.
+    pub readonly: bool,
+
+    /// FUSE entry cache timeout.
+    pub entry_timeout: Duration,
+
+    /// FUSE attribute cache timeout.
+    pub attr_timeout: Duration,
+
+    /// Cache policy.
+    pub cache_policy: CachePolicy,
+
+    /// Whether to enable writeback caching.
+    pub writeback: bool,
+
+    /// Whether to expose the synthetic `init.krun` entry at the mount root.
+    pub inject_init: bool,
+
+    /// Optional user-volume identity map for host metadata fallback.
+    pub bind_identity_map: Option<stat_override::BindIdentityMapHandle>,
+
+    /// Optional guest-write byte budget for this mount's subtree.
+    ///
+    /// `None` means unbounded. When set, guest-attributable growth past this
+    /// many bytes is rejected with `ENOSPC`.
+    pub quota_bytes: Option<u64>,
+
+    /// Optional quota accounting root when it differs from `root_dir`.
+    ///
+    /// Single-file mounts anchor pathname resolution at the parent directory,
+    /// while accounting only the selected file. `None` uses `root_dir`.
+    pub quota_root: Option<PathBuf>,
+}
+
+/// Passthrough filesystem backend.
+///
+/// Implements [`DynFileSystem`] by mapping guest filesystem operations to
+/// the host filesystem, with stat virtualization via xattr.
+pub struct PassthroughFs {
+    /// Invalid restored node identities are never reused when a path later reappears.
+    pub(crate) invalid_inodes: RwLock<std::collections::BTreeSet<u64>>,
+    /// Configuration.
+    pub(crate) cfg: PassthroughConfig,
+
+    /// Open file descriptor for the root directory.
+    pub(crate) root_fd: File,
+
+    /// Inode table with dual-key lookup (FUSE inode + host identity).
+    pub(crate) inodes: RwLock<MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>>,
+
+    /// Next FUSE inode number to allocate (starts at 3, after root=1 and init=2).
+    pub(crate) next_inode: AtomicU64,
+
+    /// Open file handle table.
+    pub(crate) handles: RwLock<BTreeMap<u64, Arc<HandleData>>>,
+
+    /// Open directory handle table.
+    pub(crate) dir_handles: RwLock<BTreeMap<u64, Arc<PassthroughDirHandle>>>,
+
+    /// Next file handle number to allocate (starts at 1, after init_handle=0).
+    pub(crate) next_handle: AtomicU64,
+
+    /// Whether writeback caching is negotiated.
+    pub(crate) writeback: AtomicBool,
+
+    /// File containing the init binary bytes (memfd on Linux, tmpfile on macOS).
+    pub(crate) init_file: File,
+
+    /// Whether `openat2` with `RESOLVE_BENEATH` is available (Linux 5.6+).
+    #[cfg(target_os = "linux")]
+    pub(crate) has_openat2: AtomicBool,
+
+    /// Open fd to /proc/self/fd (Linux only).
+    ///
+    /// Used by `open_inode_fd` to reopen tracked inodes via procfd handles
+    /// after first rejecting real host symlinks on the pinned inode.
+    #[cfg(target_os = "linux")]
+    pub(crate) proc_self_fd: File,
+
+    /// Optional guest-write byte budget for this mount's subtree.
+    pub(crate) quota: Option<super::quota::DirQuota>,
+}
+
+/// Open directory handle with a lazy point-in-time snapshot.
+pub(crate) struct PassthroughDirHandle {
+    /// Guest-visible inode that owns this directory handle.
+    pub inode: u64,
+
+    /// Guest open flags used when the handle was admitted.
+    pub flags: u32,
+
+    /// Real open fd for directory operations.
+    pub file: RwLock<File>,
+
+    /// Snapshot built on the first readdir call.
+    pub snapshot: Mutex<Option<DirSnapshot>>,
+}
+
+/// Snapshot of one directory handle's entries.
+pub(crate) struct DirSnapshot {
+    /// Guest-visible entries for this handle.
+    pub entries: Vec<PassthroughDirEntry>,
+}
+
+/// One passthrough directory entry in a snapshot.
+pub(crate) struct PassthroughDirEntry {
+    /// Guest-visible inode number.
+    pub inode: u64,
+
+    /// Entry name bytes.
+    pub name: Vec<u8>,
+
+    /// Stable synthetic offset cookie.
+    pub offset: u64,
+
+    /// Guest-visible directory entry type.
+    pub file_type: u32,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl PassthroughFs {
+    /// Validate external checkpoint structure without resolving or creating host paths.
+    pub fn validate_external_state(bytes: &[u8]) -> io::Result<()> {
+        mobility::validate_unavailable(bytes)
+    }
+
+    /// Validate the single-file facade's inner namespace before translating its selected name.
+    pub(crate) fn prepare_single_file_state(
+        bytes: &[u8],
+        source: &CStr,
+        destination: &CStr,
+    ) -> io::Result<(Vec<u8>, super::ExternalSingleFileIndex)> {
+        mobility::prepare_single_file_state(bytes, source, destination)
+    }
+    /// Create a builder for constructing a `PassthroughFs` instance.
+    pub fn builder() -> builder::PassthroughFsBuilder {
+        builder::PassthroughFsBuilder::new()
+    }
+
+    /// Create a new passthrough filesystem backend.
+    ///
+    /// Opens the root directory and optionally probes for xattr support.
+    pub fn new(cfg: PassthroughConfig) -> io::Result<Self> {
+        Self::new_with_stat_probe(cfg, None)
+    }
+
+    /// Create a passthrough backend whose strict-stat probe targets one child.
+    ///
+    /// A single-file facade uses this to verify the only exposed inode instead
+    /// of the otherwise-hidden parent directory. The normal directory backend
+    /// continues to probe its root because every child is guest-visible.
+    pub(crate) fn new_with_stat_probe(
+        cfg: PassthroughConfig,
+        probe_name: Option<&CStr>,
+    ) -> io::Result<Self> {
+        if cfg.owned_checkpoint.is_some() && (cfg.external_checkpoint.is_some() || cfg.inject_init)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned directory checkpoints require an ordinary, non-external directory backend",
+            ));
+        }
+        // Open the root directory, contained beneath the anchor when one is set.
+        let root_fd = open_root(&cfg)?;
+
+        let probe_file = match probe_name {
+            Some(name) => {
+                let access_mode = if cfg.readonly() {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_WRONLY
+                };
+                let fd = unsafe {
+                    libc::openat(
+                        root_fd.as_raw_fd(),
+                        name.as_ptr(),
+                        access_mode | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if fd < 0 {
+                    return Err(platform::linux_error(io::Error::last_os_error()));
+                }
+                Some(unsafe { File::from_raw_fd(fd) })
+            }
+            None => None,
+        };
+        let probe_fd = probe_file
+            .as_ref()
+            .map_or_else(|| root_fd.as_raw_fd(), AsRawFd::as_raw_fd);
+        probe_strict_xattr_support(&cfg, probe_fd)?;
+
+        // Create the init binary file.
+        let init_file = init_binary::create_init_file()?;
+
+        // Probe openat2 / RESOLVE_BENEATH availability (Linux 5.6+).
+        #[cfg(target_os = "linux")]
+        let has_openat2 = AtomicBool::new(platform::probe_openat2());
+
+        // Open /proc/self/fd on Linux for efficient path resolution.
+        #[cfg(target_os = "linux")]
+        let proc_self_fd = {
+            let path = std::ffi::CString::new("/proc/self/fd").unwrap();
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                return Err(platform::linux_error(io::Error::last_os_error()));
+            }
+            unsafe { File::from_raw_fd(fd) }
+        };
+
+        let quota = cfg.quota_bytes.map(|limit| {
+            super::quota::DirQuota::new(
+                cfg.quota_root
+                    .clone()
+                    .unwrap_or_else(|| cfg.root_dir.clone()),
+                limit,
+            )
+        });
+
+        Ok(Self {
+            invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
+            cfg,
+            root_fd,
+            inodes: RwLock::new(MultikeyBTreeMap::new()),
+            next_inode: AtomicU64::new(3), // 1=root, 2=init
+            handles: RwLock::new(BTreeMap::new()),
+            dir_handles: RwLock::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1), // 0=init handle
+            writeback: AtomicBool::new(false),
+            init_file,
+            #[cfg(target_os = "linux")]
+            has_openat2,
+            #[cfg(target_os = "linux")]
+            proc_self_fd,
+            quota,
+        })
+    }
+}
+
+impl PassthroughFs {
+    /// Register root inode (inode 1) in the inode table.
+    ///
+    /// Called during `init()`. The guest kernel sends GETATTR on the root inode
+    /// immediately after FUSE_INIT, so the root must be in the table before any
+    /// other FUSE operations are processed.
+    fn register_root_inode(&self) -> io::Result<()> {
+        let root_fd = self.root_fd.as_raw_fd();
+
+        #[cfg(target_os = "linux")]
+        let (st, mnt_id) = {
+            let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::statx(
+                    root_fd,
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_SYNC_AS_STAT,
+                    libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+                    &mut stx,
+                )
+            };
+            if ret < 0 {
+                return Err(platform::linux_error(io::Error::last_os_error()));
+            }
+            (platform::statx_to_stat64(&stx), stx.stx_mnt_id)
+        };
+
+        #[cfg(target_os = "macos")]
+        let st = platform::fstat(root_fd)?;
+
+        #[cfg(target_os = "linux")]
+        let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
+
+        #[cfg(target_os = "macos")]
+        let alt_key = InodeAltKey::new(platform::stat_ino(&st), platform::stat_dev(&st));
+
+        let data = Arc::new(InodeData {
+            inode: 1, // ROOT_ID
+            ino: platform::stat_ino(&st),
+            dev: platform::stat_dev(&st),
+            refcount: AtomicU64::new(2), // libfuse convention: root gets refcount 2
+            #[cfg(target_os = "linux")]
+            mnt_id,
+            #[cfg(target_os = "linux")]
+            anchor_parent: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            anchor_name: RwLock::new(Vec::new()),
+            #[cfg(target_os = "linux")]
+            aliases: RwLock::new(std::collections::BTreeSet::new()),
+            #[cfg(target_os = "linux")]
+            anchor_children: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            retained_fd: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            unlinked_fd: std::sync::atomic::AtomicI64::new(-1),
+        });
+
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(1, alt_key, data);
+
+        Ok(())
+    }
+
+    /// Get the `OpenOptions` for file opens based on cache policy.
+    pub(crate) fn cache_open_options(&self) -> OpenOptions {
+        match self.cfg.cache_policy {
+            CachePolicy::Never => OpenOptions::DIRECT_IO,
+            CachePolicy::Auto => OpenOptions::empty(),
+            CachePolicy::Always => OpenOptions::KEEP_CACHE,
+        }
+    }
+
+    /// Get the `OpenOptions` for directory opens based on cache policy.
+    pub(crate) fn cache_dir_options(&self) -> OpenOptions {
+        match self.cfg.cache_policy {
+            CachePolicy::Never => OpenOptions::DIRECT_IO,
+            CachePolicy::Auto => OpenOptions::empty(),
+            CachePolicy::Always => OpenOptions::CACHE_DIR,
+        }
+    }
+
+    /// Whether this mount exposes the synthetic init binary.
+    pub(crate) fn injects_init(&self) -> bool {
+        self.cfg.inject_init
+    }
+
+    /// Whether a root entry name is reserved for the synthetic init binary.
+    pub(crate) fn is_reserved_init_name(&self, parent: u64, name: &[u8]) -> bool {
+        self.injects_init() && parent == 1 && init_binary::is_init_name(name)
+    }
+
+    /// Whether the given inode refers to the synthetic init binary.
+    pub(crate) fn is_virtual_init_inode(&self, inode: u64) -> bool {
+        self.injects_init() && inode == init_binary::INIT_INODE
+    }
+
+    /// Charge the quota for growing an open file to `new_end` bytes.
+    pub(crate) fn quota_charge_to(&self, fd: std::os::fd::RawFd, new_end: u64) -> io::Result<()> {
+        if let Some(quota) = &self.quota {
+            quota.charge(new_end.saturating_sub(super::quota::fd_size(fd)))?;
+        }
+        Ok(())
+    }
+
+    /// Capture the quota baseline now if it has not been captured yet.
+    ///
+    /// The first write-intent operation pays the one-time directory walk so
+    /// pre-existing host files become baseline instead of guest growth.
+    pub(crate) fn quota_ensure_baseline(&self) {
+        if let Some(quota) = &self.quota {
+            quota.ensure_baseline();
+        }
+    }
+}
+
+impl PassthroughConfig {
+    /// Whether the override xattr is read/applied to stat results.
+    ///
+    /// True for [`StatVirtualization::Strict`] and [`StatVirtualization::Relaxed`].
+    /// False for [`StatVirtualization::Off`].
+    pub(crate) fn xattr_enabled(&self) -> bool {
+        !matches!(self.stat_virtualization, StatVirtualization::Off)
+    }
+
+    /// Whether xattr support is required at mount time (eager probe + hard errors).
+    ///
+    /// True only for [`StatVirtualization::Strict`]. Relaxed/Off skip the probe
+    /// and tolerate `EOPNOTSUPP` on reads.
+    pub(crate) fn strict_enabled(&self) -> bool {
+        matches!(self.stat_virtualization, StatVirtualization::Strict)
+    }
+
+    /// Whether guest chmod/create perm bits should be mirrored to the host inode.
+    pub(crate) fn mirror_host_permissions(&self) -> bool {
+        matches!(self.host_permissions, HostPermissions::Mirror)
+    }
+
+    /// Whether the backend should reject guest-side mutations.
+    pub(crate) fn readonly(&self) -> bool {
+        self.readonly
+    }
+}
+
+impl Default for PassthroughConfig {
+    fn default() -> Self {
+        Self {
+            owned_checkpoint: None,
+            external_checkpoint: None,
+            root_dir: PathBuf::new(),
+            no_symlink_root: false,
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            readonly: false,
+            entry_timeout: Duration::from_secs(5),
+            attr_timeout: Duration::from_secs(5),
+            cache_policy: CachePolicy::Auto,
+            writeback: false,
+            inject_init: true,
+            bind_identity_map: None,
+            quota_bytes: None,
+            quota_root: None,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use stat_override::{BindIdentityMap, BindIdentityMapHandle};
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl DynFileSystem for PassthroughFs {
+    fn request_error(&self, inode: u64) -> Option<i32> {
+        self.invalid_inodes
+            .read()
+            .unwrap()
+            .contains(&inode)
+            .then_some(116)
+    }
+    fn capture_state(&self) -> io::Result<Vec<u8>> {
+        mobility::capture(self)
+    }
+
+    fn validate_state(&self, state: &[u8]) -> io::Result<()> {
+        mobility::prepare(self, state).map(drop)
+    }
+
+    fn restore_state(&self, state: &[u8]) -> io::Result<()> {
+        mobility::restore(self, state)
+    }
+
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Register root inode (inode 1) in the inode table.
+        // The guest kernel issues GETATTR on the root inode immediately after FUSE_INIT.
+        // Without this entry, stat_inode(1) fails and the guest cannot resolve any paths.
+        self.register_root_inode()?;
+
+        let mut opts = FsOptions::empty();
+
+        // DONT_MASK: we handle umask ourselves in create/mkdir/mknod.
+        if capable.contains(FsOptions::DONT_MASK) {
+            opts |= FsOptions::DONT_MASK;
+        }
+        if capable.contains(FsOptions::BIG_WRITES) {
+            opts |= FsOptions::BIG_WRITES;
+        }
+        if capable.contains(FsOptions::ASYNC_READ) {
+            opts |= FsOptions::ASYNC_READ;
+        }
+        if capable.contains(FsOptions::PARALLEL_DIROPS) {
+            opts |= FsOptions::PARALLEL_DIROPS;
+        }
+        if capable.contains(FsOptions::MAX_PAGES) {
+            opts |= FsOptions::MAX_PAGES;
+        }
+        if capable.contains(FsOptions::HANDLE_KILLPRIV_V2) {
+            opts |= FsOptions::HANDLE_KILLPRIV_V2;
+        }
+        if capable.contains(FsOptions::DO_READDIRPLUS) {
+            opts |= FsOptions::DO_READDIRPLUS;
+        }
+
+        // Enable writeback cache if requested and supported.
+        if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
+            opts |= FsOptions::WRITEBACK_CACHE;
+            self.writeback.store(true, Ordering::Relaxed);
+        }
+
+        // Clear umask so the client can set all mode bits.
+        unsafe { libc::umask(0o000) };
+
+        Ok(opts)
+    }
+
+    fn destroy(&self) {
+        self.handles.write().unwrap().clear();
+        self.dir_handles.write().unwrap().clear();
+        self.inodes.write().unwrap().clear();
+    }
+
+    fn lookup(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+        // Handle init.krun lookup in root directory.
+        if self.is_reserved_init_name(parent, name.to_bytes()) {
+            return Ok(init_binary::init_entry(
+                self.cfg.entry_timeout,
+                self.cfg.attr_timeout,
+            ));
+        }
+        inode::do_lookup(self, parent, name)
+    }
+
+    fn forget(&self, _ctx: Context, ino: u64, count: u64) {
+        if self.is_virtual_init_inode(ino) {
+            return;
+        }
+        inode::forget_one(self, ino, count);
+    }
+
+    fn batch_forget(&self, _ctx: Context, requests: Vec<(u64, u64)>) {
+        // Single lock acquisition for all entries (O(1) instead of O(n) locks).
+        // batch_forget is called with hundreds of entries after directory traversals.
+        let mut inodes = self.inodes.write().unwrap();
+        for (ino, count) in requests {
+            if self.is_virtual_init_inode(ino) {
+                continue;
+            }
+            inode::forget_one_locked(&mut inodes, ino, count);
+        }
+    }
+
+    fn getattr(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: Option<u64>,
+    ) -> io::Result<(stat64, Duration)> {
+        metadata::do_getattr(self, ctx, ino, handle)
+    }
+
+    fn setattr(
+        &self,
+        ctx: Context,
+        ino: u64,
+        attr: stat64,
+        handle: Option<u64>,
+        valid: SetattrValid,
+    ) -> io::Result<(stat64, Duration)> {
+        metadata::do_setattr(self, ctx, ino, attr, handle, valid)
+    }
+
+    fn readlink(&self, ctx: Context, ino: u64) -> io::Result<Vec<u8>> {
+        create_ops::do_readlink(self, ctx, ino)
+    }
+
+    fn symlink(
+        &self,
+        ctx: Context,
+        linkname: &CStr,
+        parent: u64,
+        name: &CStr,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        create_ops::do_symlink(self, ctx, linkname, parent, name, extensions)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mknod(
+        &self,
+        ctx: Context,
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        create_ops::do_mknod(self, ctx, parent, name, mode, rdev, umask, extensions)
+    }
+
+    fn mkdir(
+        &self,
+        ctx: Context,
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<Entry> {
+        create_ops::do_mkdir(self, ctx, parent, name, mode, umask, extensions)
+    }
+
+    fn unlink(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
+        remove_ops::do_unlink(self, ctx, parent, name)
+    }
+
+    fn rmdir(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
+        remove_ops::do_rmdir(self, ctx, parent, name)
+    }
+
+    fn rename(
+        &self,
+        ctx: Context,
+        olddir: u64,
+        oldname: &CStr,
+        newdir: u64,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        remove_ops::do_rename(self, ctx, olddir, oldname, newdir, newname, flags)
+    }
+
+    fn link(&self, ctx: Context, ino: u64, newparent: u64, newname: &CStr) -> io::Result<Entry> {
+        create_ops::do_link(self, ctx, ino, newparent, newname)
+    }
+
+    fn open(
+        &self,
+        ctx: Context,
+        ino: u64,
+        kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<(Option<u64>, OpenOptions)> {
+        file_ops::do_open(self, ctx, ino, kill_priv, flags)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        &self,
+        ctx: Context,
+        parent: u64,
+        name: &CStr,
+        mode: u32,
+        kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        extensions: Extensions,
+    ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
+        create_ops::do_create(
+            self, ctx, parent, name, mode, kill_priv, flags, umask, extensions,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        w: &mut dyn ZeroCopyWriter,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        file_ops::do_read(self, ctx, ino, handle, w, size, offset)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        r: &mut dyn ZeroCopyReader,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        file_ops::do_write(self, ctx, ino, handle, r, size, offset, kill_priv)
+    }
+
+    fn flush(&self, ctx: Context, ino: u64, handle: u64, _lock_owner: u64) -> io::Result<()> {
+        file_ops::do_flush(self, ctx, ino, handle)
+    }
+
+    fn fsync(&self, ctx: Context, ino: u64, datasync: bool, handle: u64) -> io::Result<()> {
+        special::do_fsync(self, ctx, ino, datasync, handle)
+    }
+
+    fn fallocate(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        mode: u32,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<()> {
+        special::do_fallocate(self, ctx, ino, handle, mode, offset, length)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn release(
+        &self,
+        ctx: Context,
+        ino: u64,
+        _flags: u32,
+        handle: u64,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        file_ops::do_release(self, ctx, ino, handle)
+    }
+
+    fn statfs(&self, ctx: Context, ino: u64) -> io::Result<statvfs64> {
+        special::do_statfs(self, ctx, ino)
+    }
+
+    fn setxattr(
+        &self,
+        ctx: Context,
+        ino: u64,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        xattr_ops::do_setxattr(self, ctx, ino, name, value, flags)
+    }
+
+    fn getxattr(
+        &self,
+        ctx: Context,
+        ino: u64,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        xattr_ops::do_getxattr(self, ctx, ino, name, size)
+    }
+
+    fn listxattr(&self, ctx: Context, ino: u64, size: u32) -> io::Result<ListxattrReply> {
+        xattr_ops::do_listxattr(self, ctx, ino, size)
+    }
+
+    fn removexattr(&self, ctx: Context, ino: u64, name: &CStr) -> io::Result<()> {
+        xattr_ops::do_removexattr(self, ctx, ino, name)
+    }
+
+    fn opendir(
+        &self,
+        ctx: Context,
+        ino: u64,
+        flags: u32,
+    ) -> io::Result<(Option<u64>, OpenOptions)> {
+        dir_ops::do_opendir(self, ctx, ino, flags)
+    }
+
+    fn readdir(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+    ) -> io::Result<Vec<DirEntry<'static>>> {
+        dir_ops::do_readdir(self, ctx, ino, handle, size, offset)
+    }
+
+    fn readdir_for_each(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut AddDirEntry<'_>,
+    ) -> io::Result<()> {
+        dir_ops::do_readdir_for_each(self, ctx, ino, handle, size, offset, add_entry)
+    }
+
+    fn readdirplus(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+    ) -> io::Result<Vec<(DirEntry<'static>, Entry)>> {
+        dir_ops::do_readdirplus(self, ctx, ino, handle, size, offset)
+    }
+
+    fn readdirplus_for_each(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        add_entry: &mut AddDirEntryPlus<'_>,
+    ) -> io::Result<()> {
+        dir_ops::do_readdirplus_for_each(self, ctx, ino, handle, size, offset, add_entry)
+    }
+
+    fn fsyncdir(&self, ctx: Context, ino: u64, datasync: bool, handle: u64) -> io::Result<()> {
+        special::do_fsyncdir(self, ctx, ino, datasync, handle)
+    }
+
+    fn releasedir(&self, ctx: Context, ino: u64, flags: u32, handle: u64) -> io::Result<()> {
+        dir_ops::do_releasedir(self, ctx, ino, flags, handle)
+    }
+
+    fn access(&self, ctx: Context, ino: u64, mask: u32) -> io::Result<()> {
+        metadata::do_access(self, ctx, ino, mask)
+    }
+
+    fn lseek(
+        &self,
+        ctx: Context,
+        ino: u64,
+        handle: u64,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        special::do_lseek(self, ctx, ino, handle, offset, whence)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copyfilerange(
+        &self,
+        ctx: Context,
+        inode_in: u64,
+        handle_in: u64,
+        offset_in: u64,
+        inode_out: u64,
+        handle_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        special::do_copyfilerange(
+            self, ctx, inode_in, handle_in, offset_in, inode_out, handle_out, offset_out, len,
+            flags,
+        )
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Verify the xattr capability required by a strict mount's access mode.
+///
+/// A read-only mount only consumes existing stat overrides, so requiring a
+/// write would reject readable paths such as foreign-owned sticky directories.
+/// Writable mounts retain the stronger write probe because guest metadata
+/// changes must be persisted on every exposed inode, including the mount root.
+pub(crate) fn probe_strict_xattr_support(
+    cfg: &PassthroughConfig,
+    root_fd: RawFd,
+) -> io::Result<()> {
+    if !cfg.strict_enabled() || !cfg.xattr_enabled() {
+        return Ok(());
+    }
+
+    let (operation, supported) = if cfg.readonly() {
+        ("read", stat_override::probe_xattr_read_support(root_fd))
+    } else {
+        ("write", stat_override::probe_xattr_write_support(root_fd))
+    };
+    let supported = supported.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("strict stat virtualization {operation} probe failed: {error}"),
+        )
+    })?;
+
+    if !supported {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "strict stat virtualization requires xattr {operation} support on the mount root"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Open the mount root directory.
+///
+/// With `no_symlink_root` unset this opens `cfg.root_dir` directly, following
+/// symlinks — the legacy behavior where the caller vouches for the whole path.
+///
+/// With `no_symlink_root` set, the path is resolved from the real filesystem
+/// root following no symlink in any component and refusing `..`; a symlink
+/// anywhere (not just a tenant-created tail) fails the mount. On Linux this is a
+/// single `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+/// RESOLVE_NO_MAGICLINKS`; elsewhere it is a per-component `openat(O_NOFOLLOW)`
+/// walk with the same effect.
+pub(crate) fn open_root(cfg: &PassthroughConfig) -> io::Result<File> {
+    if cfg.no_symlink_root {
+        open_root_no_symlink(&cfg.root_dir)
+    } else {
+        open_dir_follow(&cfg.root_dir)
+    }
+}
+
+/// Open a directory by path, following symlinks (`O_DIRECTORY`).
+fn open_dir_follow(path: &Path) -> io::Result<File> {
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| platform::einval())?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(platform::linux_error(io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Resolve `root_dir` trusting no component, following no symlink.
+///
+/// Every path segment is opened without following symlinks, and `..` is refused
+/// so a caller-influenced segment cannot move the target laterally without ever
+/// crossing a symlink. An absolute path resolves from the real root `/`; a
+/// relative path resolves from the process working directory — in both cases the
+/// base is the only implicitly trusted object and is not attacker-controllable.
+/// A legitimately symlinked prefix must be canonicalized upstream.
+fn open_root_no_symlink(root_dir: &Path) -> io::Result<File> {
+    // Collect the real path segments, refusing `..` and any drive prefix.
+    let mut names = Vec::new();
+    for comp in root_dir.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => names.push(name),
+            Component::ParentDir | Component::Prefix(_) => return Err(platform::einval()),
+        }
+    }
+
+    // Base: the real root for absolute paths, the working directory otherwise.
+    // Neither is attacker-controllable and neither can be a symlink component we
+    // follow — resolution of the untrusted tail starts here.
+    let base = open_dir_follow(if root_dir.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    })?;
+    if names.is_empty() {
+        return Ok(base);
+    }
+
+    // Linux fast path: one openat2 from `/`, symlink resolution disabled.
+    //
+    // `open_beneath`'s internal fallback is an uncontained `openat`, so it is
+    // only safe to use when openat2 is genuinely present — probe explicitly and
+    // drop to the portable walk otherwise.
+    #[cfg(target_os = "linux")]
+    if platform::probe_openat2() {
+        let rel: PathBuf = names.iter().copied().collect();
+        let rel_c = CString::new(rel.as_os_str().as_bytes()).map_err(|_| platform::einval())?;
+        let fd = platform::open_beneath(
+            base.as_raw_fd(),
+            rel_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            true,
+        );
+        if fd < 0 {
+            return Err(platform::linux_error(io::Error::last_os_error()));
+        }
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+
+    // Portable fallback: walk one component at a time, each `openat` relative to
+    // the previously opened real directory fd, so a component swapped mid-walk
+    // cannot redirect resolution.
+    let mut dir = base;
+    for name in names {
+        let c = CString::new(name.as_bytes()).map_err(|_| platform::einval())?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(platform::linux_error(io::Error::last_os_error()));
+        }
+        dir = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(dir)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use builder::PassthroughFsBuilder;
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests;

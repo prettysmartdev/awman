@@ -25,9 +25,9 @@ command or flag.
   convention that can't be expressed as catalogue data (a flag's kind,
   default, `implies`/`conflicts_with`, or frontend visibility) doesn't
   belong in a frontend either; it belongs in a new catalogue field.
-- **Container isolation.** Every agentic operation runs inside a container
-  built from `Dockerfile.dev`. The host never executes agent code directly
-  — see `aspec/architecture/security.md`.
+- **Runtime isolation.** Every agentic operation runs inside an isolated
+  container or the builtin Linux microVM. The host never executes agent code
+  directly — see `aspec/architecture/security.md`.
 
 ## Naming and casing
 
@@ -150,3 +150,45 @@ belongs to rather than inventing a new code.
   then global config, then the catalogue's built-in default. A command
   never reads configuration through a path that skips a level of this
   order.
+
+## Runtime and image-source configuration
+
+The `runtime` setting selects `docker`, `apple-containers`,
+`docker-sbx-experimental`, or `builtin`; an unset value keeps the existing
+Docker default. The builtin block is stored in global or repository config and
+repo values merge over global values. Its supported keys are `stateDir`,
+`vcpus` (default 2), `memoryMib` (default 4096), `imageSource`, per-image
+`images`, and per-host `registries`. For example:
+
+```json
+{
+  "runtime": "builtin",
+  "builtin": {
+    "vcpus": 2,
+    "memoryMib": 4096,
+    "imageSource": { "type": "registry", "registry": "ghcr.io" },
+    "images": {
+      "awman-agent:latest": { "type": "archive", "path": "/images/agent.oci.tar" }
+    }
+  }
+}
+```
+
+Image source objects use one explicit `type`: `registry`, `docker-store`,
+`apple-store`, or `archive`. Registry settings may select anonymous, named
+environment variables, OS keychain, or Docker-config credentials and may
+declare per-host CA/insecure-registry settings. Docker-store settings may
+select a local or remote Engine endpoint and TLS files. Apple-store acquisition
+is currently reported as blocked until a supported export API exists; a user
+may explicitly export an archive and configure that archive source. `ready`
+imports existing images; image building remains an external step using the
+project Dockerfiles. The builtin backend does not build or silently choose
+another source.
+
+The internal `awman machine …` first-argument route is reserved for the
+same-executable microVM worker and is not a public command. Existing runtime
+selection commands and config editing follow the command catalogue; typed
+image-source maps are edited in config rather than guessed from Docker CLI
+flags. The builtin runtime rejects ambient `MSB_PATH`,
+`MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, or `MSB_BACKEND` overrides
+instead of loading an installed runtime.

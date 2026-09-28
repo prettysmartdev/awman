@@ -1,0 +1,266 @@
+//! Configuration and construction for the Windows passthrough backend.
+
+use super::*;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Stat virtualization policy for the Windows passthrough filesystem backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatVirtualization {
+    /// Require the Windows metadata store and fail the mount if it is unavailable.
+    Strict,
+
+    /// Use the Windows metadata store when available and tolerate an unavailable store.
+    Relaxed,
+
+    /// Do not apply virtual uid/gid/mode/rdev metadata.
+    Off,
+}
+
+/// Host permission propagation policy for the Windows passthrough filesystem backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPermissions {
+    /// Keep guest permission changes in the virtual metadata store only.
+    Private,
+
+    /// Mirror ordinary writability to the host readonly attribute where Windows supports it.
+    Mirror,
+}
+
+/// Configuration for the Windows passthrough filesystem backend.
+#[derive(Debug, Clone)]
+pub struct PassthroughConfig {
+    /// Path to the root directory on the host.
+    pub root_dir: PathBuf,
+
+    /// Resolve `root_dir` treating no component of the path as trusted.
+    ///
+    /// When `true`, `root_dir` is resolved from the volume root rejecting a
+    /// reparse point (symlink or junction) at *every* component and refusing
+    /// `..`, so neither a planted reparse point nor an injected `..` can move
+    /// the mount off its intended target. Because nothing is trusted, the caller
+    /// must pass an absolute path whose components are all real directories.
+    ///
+    /// `false` preserves the legacy behavior of resolving `root_dir` with
+    /// `canonicalize`, which follows reparse points, with the caller vouching
+    /// for the whole path.
+    pub no_symlink_root: bool,
+
+    /// Stat virtualization policy.
+    ///
+    /// Default: [`StatVirtualization::Strict`].
+    pub stat_virtualization: StatVirtualization,
+
+    /// Host permission propagation policy.
+    ///
+    /// Default: [`HostPermissions::Private`].
+    pub host_permissions: HostPermissions,
+
+    /// Whether mutating guest filesystem operations should be rejected.
+    pub readonly: bool,
+
+    /// FUSE entry cache timeout.
+    pub entry_timeout: Duration,
+
+    /// FUSE attribute cache timeout.
+    pub attr_timeout: Duration,
+
+    /// Whether to expose the synthetic `init.krun` entry at the mount root.
+    pub inject_init: bool,
+
+    /// Optional guest-write byte budget for this mount's subtree.
+    ///
+    /// `None` means unbounded. When set, guest-attributable growth past this
+    /// many bytes is rejected with `ENOSPC`.
+    pub quota_bytes: Option<u64>,
+
+    /// Optional quota accounting root when it differs from `root_dir`.
+    ///
+    /// Single-file mounts anchor pathname resolution at the parent directory,
+    /// while accounting only the selected file. `None` uses `root_dir`.
+    pub quota_root: Option<PathBuf>,
+
+    /// Guest `(uid, gid)` to present for host files that carry no per-file
+    /// override in the metadata store.
+    ///
+    /// Host-created files have no store entry, so without this they surface as
+    /// `0:0` (root). When set, such files are presented as this owner instead.
+    /// `None` keeps the legacy `0:0` fallback. Only consulted while stat
+    /// virtualization is enabled.
+    pub default_owner: Option<(u32, u32)>,
+
+    /// Explicit external-mount checkpoint policy and destination diagnostic report.
+    pub external_checkpoint: Option<super::super::ExternalCheckpointOptions>,
+
+    /// Sandbox-owned directory capture and private restore context.
+    pub owned_checkpoint: Option<super::super::OwnedDirectoryCheckpoint>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl PassthroughConfig {
+    /// Create a Windows passthrough configuration for `root_dir`.
+    pub fn new(root_dir: PathBuf) -> Self {
+        Self {
+            root_dir,
+            ..Default::default()
+        }
+    }
+
+    /// Whether the virtual stat metadata store is enabled.
+    pub(crate) fn stat_virtualization_enabled(&self) -> bool {
+        !matches!(self.stat_virtualization, StatVirtualization::Off)
+    }
+
+    /// Whether guest chmod/create permission bits should affect host metadata.
+    pub(crate) fn mirror_host_permissions(&self) -> bool {
+        matches!(self.host_permissions, HostPermissions::Mirror)
+    }
+}
+
+impl PassthroughFs {
+    /// Create a Windows passthrough filesystem rooted at `cfg.root_dir`.
+    pub fn new(cfg: PassthroughConfig) -> io::Result<Self> {
+        Self::new_with_stat_probe(cfg, None)
+    }
+
+    /// Create a passthrough backend whose read-only metadata probe targets one child.
+    pub(crate) fn new_with_stat_probe(
+        cfg: PassthroughConfig,
+        probe_name: Option<&CStr>,
+    ) -> io::Result<Self> {
+        if cfg.owned_checkpoint.is_some() && cfg.external_checkpoint.is_some() {
+            return Err(linux_error(LINUX_EINVAL));
+        }
+        // Reject contradictory metadata policy before resolving or probing the
+        // host root. Direct backend callers must receive the same guarantee as
+        // the SDK and runtime boundaries.
+        if cfg.default_owner.is_some() && matches!(cfg.stat_virtualization, StatVirtualization::Off)
+        {
+            return Err(linux_error(LINUX_EINVAL));
+        }
+
+        let root = if cfg.no_symlink_root {
+            // Resolve without following any reparse point; nothing in the path
+            // is trusted, so the escaping-symlink-root vector is closed.
+            resolve_root_no_reparse(&cfg.root_dir)?
+        } else {
+            let root = std::fs::canonicalize(&cfg.root_dir).map_err(host_error)?;
+            let metadata = std::fs::symlink_metadata(&root).map_err(host_error)?;
+            reject_reparse_metadata(&metadata)?;
+            if !metadata.file_type().is_dir() {
+                return Err(linux_error(LINUX_ENOTDIR));
+            }
+            root
+        };
+        let probe_path = probe_name
+            .map(|name| std::str::from_utf8(name.to_bytes()).map(|name| root.join(name)))
+            .transpose()
+            .map_err(|_| linux_error(LINUX_EINVAL))?;
+        let stat_store = StatStore::new(
+            &root,
+            probe_path.as_deref(),
+            cfg.stat_virtualization,
+            cfg.readonly,
+        )?;
+
+        let init_file = if cfg.inject_init {
+            let mut file = tempfile::tempfile().map_err(host_error)?;
+            file.write_all(agentd_bytes()).map_err(host_error)?;
+            file.sync_data().map_err(host_error)?;
+            Some(Mutex::new(file))
+        } else {
+            None
+        };
+
+        let quota = cfg.quota_bytes.map(|limit| {
+            super::super::quota::DirQuota::new(
+                cfg.quota_root.clone().unwrap_or_else(|| root.clone()),
+                limit,
+            )
+        });
+
+        Ok(Self {
+            cfg,
+            root,
+            inodes: RwLock::new(InodeTable::default()),
+            next_inode: AtomicU64::new(INIT_INODE + 1),
+            handles: RwLock::new(BTreeMap::new()),
+            dir_handles: RwLock::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+            init_file,
+            stat_store,
+            quota,
+            invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
+        })
+    }
+
+    pub(super) fn require_writable(&self) -> io::Result<()> {
+        if self.cfg.readonly {
+            Err(linux_error(LINUX_EROFS))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Seed guest-visible permission bits for an existing host path.
+    ///
+    /// This is used before the backend is mounted, for host files that need
+    /// Linux permission bits Windows cannot represent directly. The same
+    /// strict metadata store is used by the mounted backend, so failure here
+    /// matches a mount-time stat-virtualization failure.
+    pub fn set_path_virtual_permissions(
+        root_dir: &Path,
+        path: &Path,
+        uid: u32,
+        gid: u32,
+        permissions: u32,
+    ) -> io::Result<()> {
+        let root = std::fs::canonicalize(root_dir).map_err(host_error)?;
+        let root_metadata = std::fs::symlink_metadata(&root).map_err(host_error)?;
+        reject_reparse_metadata(&root_metadata)?;
+        if !root_metadata.file_type().is_dir() {
+            return Err(linux_error(LINUX_ENOTDIR));
+        }
+
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let path = std::fs::canonicalize(path).map_err(host_error)?;
+        let metadata = safe_metadata_under_root(&root, &path)?;
+        let mode = (mode_from_metadata(&metadata) & S_IFMT) | (permissions & 0o7777);
+        let store = StatStore::new(&root, None, StatVirtualization::Strict, false)?
+            .ok_or_else(|| linux_error(LINUX_EIO))?;
+        store.write(&path, uid, gid, mode, 0)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Default for PassthroughConfig {
+    fn default() -> Self {
+        Self {
+            root_dir: PathBuf::new(),
+            no_symlink_root: false,
+            stat_virtualization: StatVirtualization::Strict,
+            host_permissions: HostPermissions::Private,
+            readonly: false,
+            entry_timeout: Duration::from_secs(5),
+            attr_timeout: Duration::from_secs(5),
+            inject_init: true,
+            quota_bytes: None,
+            quota_root: None,
+            default_owner: None,
+            external_checkpoint: None,
+            owned_checkpoint: None,
+        }
+    }
+}

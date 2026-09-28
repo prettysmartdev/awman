@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! Layer 4 — the `awman` binary entrypoint.
 //!
 //! Per `aspec/architecture/2026-grand-architecture.md`, `main.rs`
@@ -18,8 +18,20 @@ use awman::engine::error::EngineError;
 use awman::frontend::cli;
 use awman::frontend::tui;
 
-#[tokio::main]
-async fn main() -> Result<ExitCode> {
+#[path = "engine/container/builtin/worker.rs"]
+mod builtin_worker;
+
+fn main() -> Result<ExitCode> {
+    if builtin_worker::dispatch(std::env::vars_os()) {
+        return Ok(ExitCode::SUCCESS);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(frontend_main())
+}
+
+async fn frontend_main() -> Result<ExitCode> {
     let removed_flag_startup = Startup::new(Vec::new());
     // Retired flags (e.g. `--mount-ssh`) are intercepted before clap renders
     // its generic "unexpected argument" message, so the user sees a migration

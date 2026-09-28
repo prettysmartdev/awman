@@ -1,0 +1,4 @@
+[env]
+MSB_EMBED_ARTIFACTS_ROOT = { value = "third_party/msb-payloads", relative = true }
+LIBCAPNG_LINK_TYPE = "static"
+LIBCAPNG_LIB_PATH = { value = "third_party/native/libcap-ng/lib", relative = true }

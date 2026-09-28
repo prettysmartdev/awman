@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
 
 jobs:
   fast:
@@ -99,3 +102,110 @@ jobs:
 
       - name: Hermetic tests
         run: make test-fast
+
+  builtin-build:
+    name: Builtin build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Only targets whose payload manifest status is `verified`; build.rs
+          # refuses the others. Add x86_64 Linux and Apple Silicon once verified.
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+            third_party/msb-payloads/${{ matrix.target }}
+          key: ${{ runner.os }}-builtin-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'third_party/msb-payloads/manifest.toml') }}
+      - name: Prepare checked inputs
+        run: |
+          bash tools/msb-payloads/fetch.sh ${{ matrix.target }}
+          if [ "${{ runner.os }}" = Linux ]; then bash third_party/native/libcap-ng/build.sh ${{ matrix.target }}; fi
+      - name: Build builtin runtime (2 jobs: each test binary links the whole VM stack)
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo build --locked --features builtin-runtime --target ${{ matrix.target }}
+      - name: Inspect dynamic dependencies
+        run: |
+          if [ "${{ runner.os }}" = macOS ]; then otool -L target/${{ matrix.target }}/debug/awman; else ldd target/${{ matrix.target }}/debug/awman; fi
+      - name: Builtin non-hardware tests (hosted runners have no KVM; builtin_hw tests SKIP)
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: make test-builtin
+
+  # Real guests on real hardware. Hosted runners have no KVM, so these run on
+  # self-hosted machines, on demand or nightly - never on push/PR. A missing
+  # prerequisite FAILS the job (AWMAN_TEST_BUILTIN_REQUIRE_HW): it is BLOCKED,
+  # never a pass and never a silent skip. The x86_64 Linux and Apple Silicon
+  # entries fail at the payload step until their kernel records in
+  # third_party/msb-payloads/manifest.toml are verified on native hardware.
+  builtin-hardware:
+    name: Builtin hardware (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-arm64, target: aarch64-unknown-linux-gnu, runs-on: [self-hosted, linux, arm64, kvm] }
+          - { name: linux-x86_64, target: x86_64-unknown-linux-gnu, runs-on: [self-hosted, linux, x64, kvm] }
+          - { name: macos-arm64, target: aarch64-apple-darwin, runs-on: [self-hosted, macOS, ARM64, hypervisor] }
+    env:
+      AWMAN_TEST_BUILTIN: "1"
+      AWMAN_TEST_BUILTIN_REQUIRE_HW: "1"
+      AWMAN_TEST_BUILTIN_REPORT: ${{ github.workspace }}/builtin-hw-report.tsv
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+      - name: Check hardware prerequisites (fails, never skips)
+        shell: bash
+        run: |
+          case "$(uname -s)" in
+            Linux)
+              if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+                echo "BLOCKED: /dev/kvm is not read/write accessible for $(id -un)"; ls -l /dev/kvm || true; exit 1
+              fi
+              ;;
+            Darwin)
+              [ "$(uname -m)" = arm64 ] || { echo "BLOCKED: Apple Silicon is required"; exit 1; }
+              [ "$(sysctl -n kern.hv_support)" = 1 ] || { echo "BLOCKED: Hypervisor.framework unsupported (kern.hv_support != 1)"; exit 1; }
+              command -v codesign >/dev/null || { echo "BLOCKED: codesign is required"; exit 1; }
+              ;;
+          esac
+      - name: Prepare checked inputs
+        shell: bash
+        run: |
+          bash tools/msb-payloads/fetch.sh "${{ matrix.target }}"
+          bash tools/msb-payloads/verify.sh "${{ matrix.target }}"
+          if [ "$(uname -s)" = Linux ]; then bash third_party/native/libcap-ng/build.sh "${{ matrix.target }}"; fi
+      - name: Produce the fixture base image (docker-save layout, uncompressed layers)
+        shell: bash
+        run: |
+          command -v skopeo >/dev/null || { echo "BLOCKED: skopeo is required to fetch the fixture base image"; exit 1; }
+          skopeo copy --override-os linux --format docker docker://docker.io/library/alpine:3.22 "docker-archive:$RUNNER_TEMP/base.tar"
+          echo "AWMAN_TEST_BUILTIN_BASE_TAR=$RUNNER_TEMP/base.tar" >> "$GITHUB_ENV"
+      - name: Build tests, awman and the guest driver
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test --locked --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --no-run
+      - name: Grant the hypervisor entitlement to the guest driver (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - --entitlements tools/oci-runtime-spike/strict-embed/hypervisor.plist target/debug/examples/builtin_hw_driver
+          codesign -d --entitlements :- target/debug/examples/builtin_hw_driver 2>&1 | grep -q com.apple.security.hypervisor || { echo "BLOCKED: com.apple.security.hypervisor missing from the guest driver"; exit 1; }
+      - name: Builtin tests including real guests
+        run: make test-builtin
+      - name: Report (SKIP/BLOCKED/RUN per hardware test)
+        if: always()
+        run: cat "$AWMAN_TEST_BUILTIN_REPORT" || true

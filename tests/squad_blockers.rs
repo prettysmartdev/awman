@@ -643,6 +643,8 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
             host_paths_visible: false,
             session_label_supported: false,
             has_image_store: false,
+            image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+            fractional_cpu: false,
         };
         &CAPS
     }
@@ -679,7 +681,7 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
         _working_dir: &str,
         _entrypoint: &[&str],
         _env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
         unimplemented!("never reached — require_container_tier refuses first")
     }
     fn attach(
@@ -694,7 +696,7 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
     ) -> Result<Vec<AgentHandle>, awman::engine::error::EngineError> {
         unimplemented!("never reached — require_container_tier refuses first")
     }
-    fn cli_binary(&self) -> &'static str {
-        "sbx"
+    fn host_cli(&self) -> Option<&'static str> {
+        Some("sbx")
     }
 }

@@ -245,3 +245,119 @@ impl OverlayEngine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod image_home_tests {
+    //! Settings destinations follow the image's HOME (what an importing runtime
+    //! reports), never `/root` or the host's own home.
+    use super::*;
+    use crate::data::fs::auth_paths::AuthPathResolver;
+    use crate::engine::agent::agent_matrix::{matrix_for, SUPPORTED_AGENTS};
+
+    fn host_with_settings() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("host-home");
+        for agent in SUPPORTED_AGENTS {
+            if let SettingsMount::Direct(relative) = matrix_for(agent).unwrap().settings_mount {
+                let dir = home.join(relative);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("settings.json"), b"{}").unwrap();
+            }
+            let paths = AuthPathResolver::at_home(&home).resolve(agent);
+            if let Some(dir) = paths.settings_dir {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("settings.json"), b"{}").unwrap();
+            }
+            if let Some(file) = paths.config_file {
+                std::fs::write(file, b"{}").unwrap();
+            }
+        }
+        (temp, home)
+    }
+
+    fn overlays(engine: &OverlayEngine, agent: &str, home: Option<&str>) -> Vec<OverlaySpec> {
+        engine
+            .agent_settings_overlays_with(
+                &AgentName::new(agent).unwrap(),
+                false,
+                Path::new("/nonexistent-repo"),
+                home,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn every_settings_destination_is_rooted_at_the_supplied_image_home() {
+        let (_temp, home) = host_with_settings();
+        let engine = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(&home));
+        for image_home in ["/home/probe", "/opt/agent home/u-1", "/var/lib/agent"] {
+            for agent in SUPPORTED_AGENTS {
+                for overlay in overlays(&engine, agent, Some(image_home)) {
+                    let destination = overlay.container_path.to_string_lossy().into_owned();
+                    assert!(
+                        destination.starts_with(&format!("{image_home}/")),
+                        "{agent}: {destination} is not under {image_home}"
+                    );
+                    assert!(!destination.starts_with("/root"), "{agent}: {destination}");
+                    assert_eq!(overlay.permission, OverlayPermission::ReadWrite);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_family_maps_to_its_documented_destination_and_source() {
+        let (_temp, home) = host_with_settings();
+        let engine = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(&home));
+        for agent in SUPPORTED_AGENTS {
+            let found = overlays(&engine, agent, Some("/home/probe"));
+            let destinations: Vec<String> = found
+                .iter()
+                .map(|o| o.container_path.to_string_lossy().into_owned())
+                .collect();
+            match matrix_for(agent).unwrap().settings_mount {
+                SettingsMount::None => assert!(found.is_empty(), "{agent}: {destinations:?}"),
+                SettingsMount::Direct(relative) => {
+                    assert_eq!(destinations, [format!("/home/probe/{relative}")], "{agent}");
+                    // The host directory itself is bound: live, not a copy.
+                    assert_eq!(found[0].host_path, home.join(relative), "{agent}");
+                }
+                SettingsMount::Claude => {
+                    let mut sorted = destinations.clone();
+                    sorted.sort();
+                    assert_eq!(sorted, ["/home/probe/.claude", "/home/probe/.claude.json"]);
+                    // Sanitized staging: never the raw host settings directory.
+                    let raw = AuthPathResolver::at_home(&home).resolve(agent);
+                    for overlay in &found {
+                        assert_ne!(Some(&overlay.host_path), raw.settings_dir.as_ref());
+                        assert_ne!(Some(&overlay.host_path), raw.config_file.as_ref());
+                    }
+                }
+                SettingsMount::Antigravity => {
+                    assert_eq!(destinations, ["/home/probe/.gemini"]);
+                    let raw = AuthPathResolver::at_home(&home).resolve(agent);
+                    assert_ne!(Some(&found[0].host_path), raw.settings_dir.as_ref());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_host_settings_only_claude_synthesizes_a_safe_overlay() {
+        let empty = tempfile::tempdir().unwrap();
+        let engine = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(empty.path()));
+        for agent in SUPPORTED_AGENTS {
+            let found = overlays(&engine, agent, Some("/home/probe"));
+            match matrix_for(agent).unwrap().settings_mount {
+                SettingsMount::Claude => {
+                    assert_eq!(found.len(), 2, "minimal .claude and .claude.json");
+                    assert!(found.iter().all(|o| o.host_path.exists()));
+                }
+                _ => assert!(
+                    found.is_empty(),
+                    "{agent}: nothing to mount without host settings"
+                ),
+            }
+        }
+    }
+}
