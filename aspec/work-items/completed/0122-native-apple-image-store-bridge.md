@@ -7,8 +7,14 @@ Current distribution policy (2026-09-28): signing and notarization are out of
 scope by user instruction. No signing identity, Apple distribution account,
 notarization credentials or explicit ad-hoc signing step is required. Native
 boot and final-artifact checks still apply; failures must be reported honestly.
-Status: Open — requires a resource-qualified Apple Silicon agent
-Parent: [WI 0121](0121-complete-builtin-runtime-and-native-verification.md), D-01/D-02/D-15; [WI 0119](0119-strict-embedded-microsandbox-runtime.md), acceptance criterion 5
+Status: Completed 2026-09-29. The in-process, version-gated adapter is
+implemented and natively validated on Apple Silicon against Apple Containers
+0.12.0, 1.4.1 and 1.5.0, with 1.3.1 refused. The evidence and its frozen code
+hash are in [native evidence notes](../../review-notes/0122-evidence/notes.md).
+The offline builtin run used a locally ad-hoc-signed artifact, because
+Hypervisor.framework requires the `com.apple.security.hypervisor` entitlement;
+reconciling that with the unsigned-distribution policy belongs to WI 0123.
+Parent: [WI 0121](../0121-complete-builtin-runtime-and-native-verification.md), D-01/D-02/D-15; [WI 0119](../0119-strict-embedded-microsandbox-runtime.md), acceptance criterion 5
 
 ## Summary:
 
@@ -69,18 +75,36 @@ manual source substitution or an installed Microsandbox runtime.
 
 ## Test Considerations:
 
-- [ ] Actual awman imports all required shipped-template images through the live
+- [x] Actual awman imports all required shipped-template images through the live
   supported Apple store on Apple Silicon; record fixture/source digests.
-- [ ] Version/platform/auth/service/error/cancellation/retry cases execute against
+  All nine agent templates and the project image:
+  [template-exports.log](../../review-notes/0122-evidence/final/template-exports.log).
+- [x] Version/platform/auth/service/error/cancellation/retry cases execute against
   disposable services; unknown protocol/version fails explicitly.
-- [ ] No helper CLI, extracted executable/firmware/DSO or private-store access in
-  an actual native execution trace.
-- [ ] Stop the store, remove source access and run the imported image using the
+  The native runs cover: disposable 1.5.0/1.4.1 (pass), 1.3.1 (refused), a
+  stopped service, mid-save cancellation, concurrent importers, and a helper
+  killed mid-save and then retried. Wrong-platform, malformed and peer-error
+  cases use scripted transports and the shared validator. The only
+  authorization is the helper's euid check; there are no credentials.
+- [x] No helper CLI, extracted executable/firmware/DSO or private-store access in
+  an actual native execution trace. This is kernel-enforced with
+  `sandbox-exec` (no fork, no exec other than itself, no private-store access,
+  with positive controls):
+  [sandboxed-export.log](../../review-notes/0122-evidence/final/sandboxed-export.log).
+  Actual-awman runs also trap `docker`/`container`/`sbx` on PATH.
+- [x] Stop the store, remove source access and run the imported image using the
   actual builtin runtime with denied egress and a minimal PATH.
-- [ ] Local changes pass `make pre-push`, feature Clippy and builtin tests; native
+  [guest-runs.log](../../review-notes/0122-evidence/final/guest-runs.log).
+- [x] Local changes pass `make pre-push`, feature Clippy and builtin tests; native
   required-hardware tests execute, with no opt-out counted as a pass.
-- [ ] Integrate with WI 0123's source/format/template and final-artifact matrix.
+  [hermetic.log](../../review-notes/0122-evidence/final/hermetic.log): the only
+  failures are two host `network_probe_*` tests that need GNU `timeout`,
+  identical on the base commit.
+- [x] Integrate with WI 0123's source/format/template and final-artifact matrix.
   Every mandatory Apple row has final linked evidence at the same revision.
+  The Apple-store source, format and template rows are linked from the WI 0121
+  register (D-01) to logs from one frozen tree. Optimized/distributed-artifact
+  rows remain WI 0123 scope and depend on its entitlement/signing decision.
 
 ## Codebase Integration:
 

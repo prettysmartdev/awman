@@ -8,8 +8,9 @@
 //!
 //! Sources never substitute for one another: a registry reference is only
 //! pulled from a registry, a Docker Engine reference is only exported from
-//! that engine, and an archive is only read from its path. The Apple
-//! Containers store is modelled but blocked (see [`apple_store`]).
+//! that engine, an Apple Containers reference is only exported by that
+//! service's own helper through the version-gated bridge ([`apple_store`]),
+//! and an archive is only read from its path.
 //!
 //! Every acquisition follows the same path:
 //!
@@ -228,6 +229,7 @@ pub struct CachingAcquirer {
     retry: RetryPolicy,
     cancel: CancelToken,
     sleep: Arc<retry::Sleeper<'static>>,
+    apple: Option<Arc<dyn apple_store::XpcTransport>>,
 }
 
 impl CachingAcquirer {
@@ -245,6 +247,7 @@ impl CachingAcquirer {
             retry: RetryPolicy::DEFAULT,
             cancel: CancelToken::new(),
             sleep: Arc::new(std::thread::sleep),
+            apple: apple_store::installed_transport(),
         }
     }
 
@@ -263,6 +266,15 @@ impl CachingAcquirer {
     /// Replace the backoff sleeper (tests).
     pub fn with_sleeper(mut self, sleep: Arc<retry::Sleeper<'static>>) -> Self {
         self.sleep = sleep;
+        self
+    }
+
+    /// Replace the Apple Containers transport (tests; `None` removes it).
+    pub fn with_apple_transport(
+        mut self,
+        transport: Option<Arc<dyn apple_store::XpcTransport>>,
+    ) -> Self {
+        self.apple = transport;
         self
     }
 
@@ -355,6 +367,7 @@ impl ImageAcquirer for CachingAcquirer {
                 cancel: &self.cancel,
                 deadline,
                 attempt: number,
+                apple: self.apple.as_deref(),
             };
             let fetch = |report: sources::Report<'_>| {
                 let fetched = resolved.fetch(&request.tag, &reference, &ctx, report)?;
@@ -621,14 +634,16 @@ mod tests {
     }
 
     #[test]
-    fn apple_store_is_blocked_without_running_anything() {
+    fn apple_store_without_a_bridge_is_blocked_without_running_anything() {
         let state = tempfile::tempdir().unwrap();
         let req = AcquireRequest {
             source: ImageSourceSpec::AppleStore { reference: None },
             ..request(Path::new("/unused"), AcquirePolicy::IfMissing)
         };
         assert!(matches!(
-            acquirer(state.path(), None).acquire(&req, &mut |_| {}),
+            acquirer(state.path(), None)
+                .with_apple_transport(None)
+                .acquire(&req, &mut |_| {}),
             Err(EngineError::ImageSourceBlocked {
                 source_kind: ImageSourceKind::AppleStore,
                 ..

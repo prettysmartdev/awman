@@ -15,11 +15,22 @@ missing implementation, native/service/distribution or Git-identity gates.
 The latest continuation adds cancellable production acquisition, explicit strict
 SNI enforcement, shared image-tag leases, genuine cross-driver transactions and
 registered guest/service/corpus scenarios. The user authorized follow-up items
-for work requiring unavailable resources: [WI 0122](0122-native-apple-image-store-bridge.md)
+for work requiring unavailable resources: [WI 0122](completed/0122-native-apple-image-store-bridge.md)
 owns the missing native Apple-store bridge; [WI 0123](0123-builtin-native-verification-and-release-closure.md)
 owns remaining native scenario implementation and full verification/release closure.
 These assignments await resource-qualified agents; creating them is not execution
 evidence and does not complete the original acceptance criteria below.
+
+Resolution scope (2026-09-29, user decision): this item is resolved when
+[WI 0123](0123-builtin-native-verification-and-release-closure.md) completes.
+WI 0123 ships the runtime as `builtin-experimental` on Apple Silicon macOS
+only, ad-hoc signed, and validates the Apple store, archive and normal-case
+registry sources. At that point each acceptance criterion below is either PASS
+for that scope, with linked evidence, or **Deferred (WI 0124, optional)**:
+Linux KVM targets, Docker Engine sources and registry edge cases. Deferred
+criteria do not keep this item open;
+[WI 0124](0124-builtin-linux-and-docker-gates.md) tracks them as optional
+future work.
 
 ## Summary:
 

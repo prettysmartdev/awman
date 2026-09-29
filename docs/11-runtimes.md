@@ -79,8 +79,20 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 The runtime is only present in awman builds compiled with it. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
 - **Release configuration:** `awman-linux-arm64` and a separate Apple Silicon job are configured to include the builtin runtime. Neither configuration establishes a published or boot-tested release. The ordinary Linux x86_64 and macOS matrix assets are configured without it.
-- **Building from source:** run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. `make install` includes the runtime automatically when the payloads for your host are verified and otherwise builds the existing runtimes only. Payloads for Linux x86_64 and macOS Apple Silicon are not yet verified, so a source build cannot include the runtime on those hosts yet.
+- **Building from source:** run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. `make install` includes the runtime automatically when the payloads for your host are verified and otherwise builds the existing runtimes only. Payloads for Linux arm64 and macOS Apple Silicon are verified. The Linux x86_64 payload is not yet verified, so a source build cannot include the runtime there yet.
 - **macOS distribution:** awman is not signed or notarized for the time being. Build and release jobs do not require signing credentials or perform explicit ad-hoc signing. Native guest boot must still succeed with the distributed binary; an OS permission failure remains a failed boot check, not a successful skip.
+- **Running a source build on macOS:** macOS only lets a program start a virtual machine when its code signature carries the `com.apple.security.hypervisor` entitlement, and a plain `cargo`/`make` build has none. Without it, starting an agent fails with `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …`. To use a build you compiled yourself, sign it locally with the entitlement:
+
+  ```sh
+  cat > hypervisor.plist <<'EOF'
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
+  EOF
+  codesign --force --sign - --entitlements hypervisor.plist /usr/local/bin/awman
+  ```
+
+  Sign again after every rebuild or reinstall.
 
 ### Setup
 
@@ -134,9 +146,19 @@ Every source is explicit. A source never falls back to another one, and the same
 | `registry` | `registry`, `reference` (at least one required) | Pulls the image for the host platform from an OCI registry. `reference` defaults to the awman image tag on `registry`; a `reference` naming a different registry than `registry` is refused. Docker Hub names are normalized (`library/`). Manifests and blobs are verified against their digests. |
 | `docker-store` | `host`, `tls`, `reference` (all optional) | Exports the image from a Docker Engine over its API (Engine API 1.41 or newer). `host` defaults to `$DOCKER_HOST`, then the platform default socket (`/var/run/docker.sock`; on macOS `~/.docker/run/docker.sock` is tried first). `host` must start with `unix://` or `tcp://`; plain `tcp://` is allowed only for loopback addresses. `ssh://` and `npipe://` are refused as unsupported. `tls` (`ca`, optional `cert` and `key`, `verify` default `true`) applies only to `tcp://` hosts; `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` are honored when the host comes from `DOCKER_HOST`. |
 | `archive` | `path` (absolute) | Reads a tar from disk: `docker save` output, an OCI image layout, or either one gzip-compressed. Re-imported automatically when the file changes. |
-| `apple-store` | `reference` | **Blocked.** Apple provides no supported export API, and awman will not run the `container` helper or read Apple's private store. Selecting it fails with `apple-store image source is blocked` and tells you to run `container image save <ref> -o <file>` yourself and use an `archive` source instead. That archive route is a workaround, not Apple-store support. |
+| `apple-store` | `reference` | macOS only. Exports the image from the Apple Containers image store (see [Apple Containers store](#apple-containers-store)). |
 
 `reference` defaults to the awman image tag (`awman-<project>-<agent>:latest`) when omitted.
+
+#### Apple Containers store
+
+With `{ "type": "apple-store" }`, `awman ready` asks the Apple Containers service to export the image. awman sends the request itself, from inside the `awman` process. It never runs the `container` CLI, never starts a helper program of its own, and never reads Apple's private store files.
+
+- **Supported releases.** Apple's image-store protocol has no version number, so awman checks the service's release and commit before it asks for any image. The supported releases are 0.12.0, 1.4.1 and 1.5.0. Any other release, including a newer one or a local build, fails with `apple-store image source is not supported: Apple Containers <version> … is not a release awman has verified`. Check your release with `container system version`.
+- **The service must be running.** If it isn't, `awman ready` fails with `the Apple Containers service is not running` and tells you to run `container system start`.
+- **Exactly one image.** The name must match exactly one image in the store. `docker.io/library/` and a missing `:latest` tag are normalized. If no image matches, or two different images match, the import fails instead of guessing.
+- **Same checks as every other source.** The export is written into awman's private staging area, then checked for platform (`linux/arm64`), digests, size limits and format before it is cached. A cancelled or failed export leaves nothing behind, and an image that was already imported stays usable.
+- **Works offline afterwards.** Once imported, the image runs from awman's cache. The Apple Containers service can be stopped and does not need to be running.
 
 **Per-image overrides.** `builtin.images` maps an awman image tag to its own source; it wins over `builtin.imageSource` for that tag:
 
@@ -277,7 +299,10 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 | `no image source is configured for '<tag>'` | Set `builtin.imageSource` or `builtin.images` (see [Getting an agent image](#getting-an-agent-image)). |
 | `image <tag> is not imported; run awman ready with an explicit image source`, or `… is not in the builtin image cache …` | Run `awman ready`. |
 | `image '<ref>' was not found in the Docker Engine at <endpoint>` | Build it first, or fix `reference`. |
-| `apple-store image source is blocked` | Use an `archive` source (see above). |
+| `apple-store image source is not supported: Apple Containers <version> … is not a release awman has verified` | Install a supported Apple Containers release (see [Apple Containers store](#apple-containers-store)), or use another source. |
+| `apple-store image source is blocked: the Apple Containers service is not running …` | Run `container system start`, then `awman ready`. |
+| `apple-store image source is blocked: Apple Containers exists only on macOS …` | Use a `registry`, `docker-store` or `archive` source. |
+| `image '<ref>' is not in the Apple Containers image store`, or `2 different Apple Containers images are named '<ref>'` | Build or pull it with Apple Containers, or remove the stale image. |
 | `digest mismatch …`, `platform mismatch … wanted linux/arm64, found …` | A corrupt transfer, or the image was built for another architecture. Rebuild for the host platform. |
 | `image archive <path> rejected: …` | The archive failed validation; the reason names the problem. |
 | `not enough disk space at <path> …` | Free space on the state directory's filesystem. |

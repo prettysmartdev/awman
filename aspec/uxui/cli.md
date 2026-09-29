@@ -184,8 +184,10 @@ Image source objects use one explicit `type`: `registry`, `docker-store`,
 environment variables, OS keychain, or Docker-config credentials and may
 declare per-host CA/insecure-registry settings. Docker-store settings may
 select a local or remote Engine endpoint and TLS files. Apple-store acquisition
-is currently reported as blocked until a supported export API exists; a user
-may explicitly export an archive and configure that archive source. `ready`
+(macOS) is an in-process, version-gated XPC bridge to the Apple Containers
+image helper: it refuses service releases outside the pinned list, never runs
+the `container` CLI or reads the private store, and validates the export like
+any other archive. Off macOS, or without the bridge, it is reported blocked. `ready`
 imports existing images; image building remains an external step using the
 project Dockerfiles. The builtin backend does not build or silently choose
 another source.

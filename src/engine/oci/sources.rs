@@ -39,6 +39,8 @@ pub(super) struct FetchContext<'a> {
     /// 1-based attempt number (for diagnostics only; the request is the
     /// same every time).
     pub attempt: u32,
+    /// The in-process Apple Containers bridge, when this process has one.
+    pub apple: Option<&'a dyn apple_store::XpcTransport>,
 }
 
 /// A staged, not yet validated archive.
@@ -189,7 +191,12 @@ impl Resolved {
             Self::DockerStore { endpoint } => {
                 docker_engine::export(endpoint, reference, ctx, report)
             }
-            Self::AppleStore => Err(apple_store::blocked(reference)),
+            Self::AppleStore => match ctx.apple {
+                Some(transport) => {
+                    apple_store::export(transport, awman_tag, reference, ctx, report)
+                }
+                None => Err(apple_store::no_transport()),
+            },
             Self::Archive { path } => {
                 let fingerprint = SourceFingerprint::of(path);
                 let meta = std::fs::metadata(path).map_err(|e| EngineError::io(path, e))?;
@@ -219,9 +226,13 @@ impl Resolved {
         }
     }
 
-    /// Whether this source does network I/O (and so must run off-runtime).
+    /// Whether this source waits on a network peer or service (and so must
+    /// run off-runtime).
     pub(super) fn is_network(&self) -> bool {
-        matches!(self, Self::Registry { .. } | Self::DockerStore { .. })
+        matches!(
+            self,
+            Self::Registry { .. } | Self::DockerStore { .. } | Self::AppleStore
+        )
     }
 
     /// Resolve transport credentials once, only after a cache miss. Retrying

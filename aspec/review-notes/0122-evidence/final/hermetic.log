@@ -1,0 +1,12 @@
+# code patch sha256 b077f376c4c70165915d7e0530fe4f208a984bdbc09e468f68429035ab8f0227 on base 105b5cbd7cb5506e16e22d9766e0905c0de72b65
+cargo fmt --check, clippy -D warnings (default and builtin-runtime): run before freeze, clean
+architecture-lint: OK — all imports respect the layering rules
+make pre-push exit=2 (stops at the first failing target)
+== default features, all targets, --no-fail-fast: 35 targets ok
+network_resources::network_probe_executes_fetch_and_rejects_missing_tools --- FAILED
+network_resources::network_probe_rejects_tls_tool_and_http_failures_as_denial --- FAILED
+test result: FAILED. 78 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+   (the two network_probe_* failures need GNU timeout on the host; identical on base 105b5cbd)
+== builtin-runtime feature, --lib --bins
+test result: ok. 3253 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.46s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

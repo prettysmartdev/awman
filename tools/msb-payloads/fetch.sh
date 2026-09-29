@@ -26,7 +26,7 @@ actual_archive_hash=$(hash_file "$download")
 [ "$actual_archive_hash" = "$archive_hash" ] || { echo "archive hash mismatch: $actual_archive_hash" >&2; exit 3; }
 tar xf "$download" -C "$dest" "$firmware"
 cc_bin=${CC:-cc}
-"$cc_bin" -Wall -Wextra -Werror "$root/tools/msb-payloads/extract-kernel.c" -o "$dest/extract-kernel" "${link_flags[@]}"
+"$cc_bin" -Wall -Wextra -Werror "$root/tools/msb-payloads/extract-kernel.c" -o "$dest/extract-kernel" ${link_flags[@]+"${link_flags[@]}"}
 "$dest/extract-kernel" "$dest/$firmware" "$dest/kernel.bin" > "$dest/kernel.meta"
 agent_path="$root/third_party/msb-payloads/$arch/agentd"
 if [ ! -f "$agent_path" ]; then

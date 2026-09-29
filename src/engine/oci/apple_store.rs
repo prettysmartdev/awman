@@ -1,271 +1,693 @@
-//! Apple Containers image store — an explicit, typed blocker for the strict
-//! builtin runtime.
+//! Apple Containers image store — the version-gated, in-process bridge.
 //!
-//! # What the pinned upstream sources say (evidence dated 2026-09-28)
+//! # The contract (evidence dated 2026-09-29)
 //!
-//! The `container` project (apple/container, release **1.4.1**, tag commit
-//! `9a8917ca2da5cd6ba059b9ba5ca5a74892e9bb7d`, published 2026-09-09) keeps
-//! its images in a content store owned by the launch agent helper
-//! `container-core-images`. The CLI's `container image save` does not read
-//! that store itself: it sends an XPC request to the helper and the helper
-//! writes an OCI image layout tar to a caller-supplied path
-//! (`Sources/Services/ContainerAPIService/Client/ClientImage.swift`,
-//! `ClientImage.save`, and `Sources/Services/ContainerImagesService/Server/ImagesService.swift`,
-//! `ImagesService.save`, which archives the store's OCI layout directory with
-//! a PAX tar writer). The wire contract is:
+//! `apple/container` keeps its images in a content store owned by the launch
+//! agent helper `container-core-images`. The CLI's `container image save`
+//! does not read that store itself: it sends an XPC request to the helper,
+//! which writes an OCI image-layout tar to a caller-supplied path. awman
+//! sends the same requests itself, in-process, through libxpc:
 //!
-//! | element | value in 1.4.1 |
-//! |---|---|
-//! | mach service | `com.apple.container.core.container-core-images` |
-//! | transport | `xpc_connection_create_mach_service` + `xpc_connection_send_message_with_reply` (libxpc, public C API) |
-//! | route key | `com.apple.container.xpc.route` = `imageSave` (Swift `ImagesServiceXPCRoute` raw value) |
-//! | request keys | `imageDescriptions` (JSON `[ImageDescription]`), `filePath` (output path), `ociPlatform` (JSON `Platform`) |
-//! | error key | `com.apple.container.xpc.error` (JSON `{code, message}`) |
-//! | protocol version | **none**: no version field, no negotiation; the apiserver only reports its release version through a separate `apiServerVersion` ping |
+//! | step | service | route | request keys | reply keys |
+//! |---|---|---|---|---|
+//! | release check | `com.apple.container.apiserver` | `ping` | — | `apiServerVersion`, `apiServerCommit`, `apiServerBuild` |
+//! | selection | `com.apple.container.core.container-core-images` | `imageList` | — | `imageDescriptions` (JSON `[ImageDescription]`) |
+//! | export | `com.apple.container.core.container-core-images` | `imageSave` | `imageDescriptions`, `filePath`, `ociPlatform` (JSON) | — |
 //!
-//! Source hashes recorded for this evidence (SHA-256 of the raw files at the
-//! tag): `ClientImage.swift` `97917ba5…61fc0`, `ImageServiceXPCRoutes.swift`
-//! `1b0710f2…b77c`, `ImageServiceXPCKeys.swift` `119b0fdd…a65f`,
-//! `ImagesService.swift` `4bf795bf…52ae`, `XPCMessage.swift` in
-//! `Sources/ContainerXPC`.
+//! The route travels under `com.apple.container.xpc.route`; a failed request
+//! replies with JSON `{code, message}` under `com.apple.container.xpc.error`.
+//! The helper only checks that the caller has its effective uid.
 //!
-//! # Why there is still no conforming adapter
+//! The schema carries **no protocol version**. The bridge therefore pins
+//! whole releases: before any image route it pings the API server and
+//! requires the exact release *and* full commit to be one of
+//! [`SUPPORTED_RELEASES`]. Each row was established from the tagged sources
+//! (the ping, list and save handlers, `ImageDescription`, the XPC key enums
+//! and `XPCMessage` framing are identical in the parts awman uses) and by
+//! native round trips against that release on Apple Silicon. Any other
+//! release — older, newer or a local build — is refused before an image
+//! route is sent (1.3.1 was confirmed refused natively).
 //!
-//! The strict runtime may only acquire images through a **versioned,
-//! in-process** API linked into `awman`. Against the evidence above:
+//! # What awman does and never does
 //!
-//! 1. The route and key names are raw values of Swift enums inside the
-//!    `ContainerImagesService` package. Apple documents the CLI and the
-//!    `container-apiserver` launch agent as the product interface; the XPC
-//!    message schema carries no protocol version and no compatibility
-//!    promise, so a Rust re-implementation of it would be pinned to a byte
-//!    layout that any release may change without notice.
-//! 2. The Swift client libraries are Swift Package Manager sources, not a
-//!    framework with a C ABI. Linking them in-process would require a Swift
-//!    toolchain in the awman build plus an FFI shim; speaking libxpc
-//!    directly from Rust requires `unsafe` FFI, which this crate forbids
-//!    (`#![forbid(unsafe_code)]`) and which has no native validation here.
-//! 3. The helper writes the export to a path it is handed. That is
-//!    acceptable for a bridge (the path would be awman's private staging
-//!    directory), but it makes the helper — not awman — the process that
-//!    reads the store, so the strict rules against scraping the private
-//!    store remain satisfied only if the XPC route is used, never the
-//!    on-disk layout under `~/Library/Application Support/com.apple.container`.
+//! The helper, not awman, reads the store; awman never opens anything under
+//! `~/Library/Application Support/com.apple.container`. The export lands in
+//! a fresh private directory inside the leased staging area of awman's own
+//! cache. awman then checks it is a single-link regular file it owns, moves
+//! it (same filesystem) into place, and hands it to the same limits,
+//! archive validator and atomic cache publication every other source uses.
+//! awman does not run the `container` CLI, ship or extract a helper
+//! executable or library, or fall back to another source.
 //!
-//! Executing the `container` CLI, shipping a separate bridge executable or
-//! dynamic library, or reading the store's private files are all excluded by
-//! `aspec/architecture/security.md`; none of them is an acceptable fallback.
-//!
-//! # What this module does instead
-//!
-//! It records the contract above as typed data ([`BridgeContract`],
-//! [`REQUIRED_SERVICE_VERSIONS`]), reports feasibility as a typed
-//! [`Feasibility`] value, and refuses every acquisition with
-//! `ImageSourceBlocked` and an actionable message. Any future bridge must
-//! (a) verify the helper's release version is one of
-//! [`REQUIRED_SERVICE_VERSIONS`] before sending `imageSave`, (b) validate the
-//! exported bytes with the same archive validator every other source uses,
-//! and (c) be proven on Apple Silicon against the real helper. Until then the
-//! WI 0119 acceptance row stays FAIL (adapter absent) with the native
-//! investigation BLOCKED.
+//! The unsafe libxpc calls live outside this library, in the binary's
+//! `apple_xpc` module, behind the safe [`XpcTransport`] trait; the library
+//! keeps `#![forbid(unsafe_code)]`. A build without that transport (any
+//! non-macOS target, or library tests) refuses the source with
+//! `ImageSourceBlocked`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::data::config::image_source::ImageSourceKind;
+use crate::data::oci_identity::{Digest, OciPlatform};
 use crate::engine::error::EngineError;
+use crate::engine::oci::sources::{FetchContext, Fetched, Report};
 
-/// The upstream release whose sources this contract was read from.
-pub const EVIDENCE_UPSTREAM_TAG: &str = "1.4.1";
-/// Commit the release tag resolves to.
-pub const EVIDENCE_UPSTREAM_COMMIT: &str = "9a8917ca2da5cd6ba059b9ba5ca5a74892e9bb7d";
-/// When the sources were read.
-pub const EVIDENCE_DATE: &str = "2026-09-28";
+/// When the sources and native service below were read.
+pub const EVIDENCE_DATE: &str = "2026-09-29";
 
-/// The only helper release versions a future bridge may speak to. A bridge
-/// must compare the helper's reported release version against this list
-/// *before* sending any image route, because the XPC schema has no version
-/// of its own.
-pub const REQUIRED_SERVICE_VERSIONS: &[&str] = &["1.4.1"];
+/// How a supported release was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseEvidence {
+    /// Native round trips against the installed service on Apple Silicon.
+    Native,
+    /// The tagged sources were compared with a natively validated release,
+    /// without a native run.
+    SourceVerified,
+}
 
-/// The XPC contract of the image helper as pinned in the upstream sources.
-/// Data only: nothing here opens a connection.
+/// One `apple/container` release the bridge may speak to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedRelease {
+    pub version: &'static str,
+    /// Full commit the release tag resolves to, as the API server reports it.
+    pub commit: &'static str,
+    pub evidence: ReleaseEvidence,
+}
+
+/// The only releases the bridge sends image routes to.
+pub const SUPPORTED_RELEASES: &[SupportedRelease] = &[
+    SupportedRelease {
+        version: "0.12.0",
+        commit: "651811cc090937457956643dd2c454df77eb141b",
+        evidence: ReleaseEvidence::Native,
+    },
+    SupportedRelease {
+        version: "1.4.1",
+        commit: "9a8917ca2da5cd6ba059b9ba5ca5a74892e9bb7d",
+        evidence: ReleaseEvidence::Native,
+    },
+    SupportedRelease {
+        version: "1.5.0",
+        commit: "d265d669ecae041bf338cb3b39c4118316d138f0",
+        evidence: ReleaseEvidence::Native,
+    },
+];
+
+/// The XPC contract shared by every supported release. Data only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgeContract {
-    /// Mach service name of the image helper.
-    pub mach_service: &'static str,
-    /// Dictionary key carrying the route name.
+    pub api_service: &'static str,
+    pub images_service: &'static str,
     pub route_key: &'static str,
-    /// Route that exports images to a path.
-    pub save_route: &'static str,
-    /// Route that lists images (needed to obtain `ImageDescription`s).
-    pub list_route: &'static str,
-    /// Request key: JSON-encoded `[ImageDescription]`.
-    pub descriptions_key: &'static str,
-    /// Request key: output file path written by the helper.
-    pub file_path_key: &'static str,
-    /// Request key: JSON-encoded platform selector.
-    pub platform_key: &'static str,
-    /// Reply key carrying a JSON `{code, message}` error.
     pub error_key: &'static str,
+    pub ping_route: &'static str,
+    pub list_route: &'static str,
+    pub save_route: &'static str,
+    pub version_key: &'static str,
+    pub commit_key: &'static str,
+    pub build_key: &'static str,
+    pub descriptions_key: &'static str,
+    pub file_path_key: &'static str,
+    pub platform_key: &'static str,
     /// Whether the protocol carries its own version (it does not).
     pub protocol_versioned: bool,
 }
 
-/// The contract as read from release [`EVIDENCE_UPSTREAM_TAG`].
 pub const CONTRACT: BridgeContract = BridgeContract {
-    mach_service: "com.apple.container.core.container-core-images",
+    api_service: "com.apple.container.apiserver",
+    images_service: "com.apple.container.core.container-core-images",
     route_key: "com.apple.container.xpc.route",
-    save_route: "imageSave",
+    error_key: "com.apple.container.xpc.error",
+    ping_route: "ping",
     list_route: "imageList",
+    save_route: "imageSave",
+    version_key: "apiServerVersion",
+    commit_key: "apiServerCommit",
+    build_key: "apiServerBuild",
     descriptions_key: "imageDescriptions",
     file_path_key: "filePath",
     platform_key: "ociPlatform",
-    error_key: "com.apple.container.xpc.error",
     protocol_versioned: false,
 };
 
-/// Why an in-process bridge is not shipped. Every variant is an exact,
-/// checkable statement; none is "not implemented yet".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Blocker {
-    /// The XPC message schema has no version field and no stability promise.
-    UnversionedProtocol,
-    /// The client is a Swift package, not a linkable C-ABI library.
-    NoLinkableCAbi,
-    /// Speaking libxpc from Rust needs `unsafe` FFI, which the crate forbids.
-    RequiresUnsafeFfi,
-    /// This build does not target macOS at all.
-    NotMacOs,
-    /// No Apple Silicon host with the helper installed has validated a bridge.
-    NoNativeValidation,
-}
+// ── Transport ──────────────────────────────────────────────────────────────
 
-impl Blocker {
-    /// One line a user or reviewer can act on.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::UnversionedProtocol => {
-                "the container-core-images XPC schema carries no protocol version or compatibility \
-                 promise (routes and keys are raw Swift enum values)"
-            }
-            Self::NoLinkableCAbi => {
-                "Apple ships the client as Swift Package Manager sources, not a framework with a C \
-                 ABI that awman could link"
-            }
-            Self::RequiresUnsafeFfi => {
-                "reaching the helper from Rust needs libxpc FFI, which awman forbids \
-                 (`#![forbid(unsafe_code)]`) without a reviewed, natively validated exception"
-            }
-            Self::NotMacOs => "Apple Containers exists only on macOS",
-            Self::NoNativeValidation => {
-                "no Apple Silicon host with a supported container-core-images release has \
-                 validated exported bytes, platform/config/layer identity or error handling"
-            }
-        }
-    }
-}
-
-/// The feasibility verdict for this build.
+/// A value in an XPC dictionary, as far as this contract uses them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Feasibility {
-    /// A conforming bridge could be linked and has been validated. Never
-    /// produced today; the variant exists so callers must handle it.
-    Available { service_version: String },
-    /// No conforming bridge; the blockers are listed most fundamental first.
-    Blocked(Vec<Blocker>),
+pub enum XpcValue {
+    String(String),
+    Data(Vec<u8>),
 }
 
-/// The verdict for the current target, from the recorded evidence.
-pub fn feasibility() -> Feasibility {
-    let mut blockers = vec![
-        Blocker::UnversionedProtocol,
-        Blocker::NoLinkableCAbi,
-        Blocker::RequiresUnsafeFfi,
-    ];
-    if !cfg!(target_os = "macos") {
-        blockers.push(Blocker::NotMacOs);
-    }
-    blockers.push(Blocker::NoNativeValidation);
-    Feasibility::Blocked(blockers)
+/// The type a reply key is read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpcKind {
+    String,
+    Data,
 }
 
-/// Why an Apple-store acquisition cannot proceed, with the supported route.
-pub(super) fn blocked(reference: &str) -> EngineError {
-    let blockers = match feasibility() {
-        Feasibility::Blocked(b) => b,
-        Feasibility::Available { .. } => Vec::new(),
-    };
-    let why = blockers
-        .iter()
-        .map(|b| b.describe())
-        .collect::<Vec<_>>()
-        .join("; ");
+/// The reply keys that were present with the requested type.
+pub type XpcReply = BTreeMap<String, XpcValue>;
+
+/// When a request must stop waiting.
+pub struct WaitControl<'a> {
+    pub deadline: Instant,
+    /// Polled while the request is outstanding; `true` abandons it.
+    pub stop: &'a (dyn Fn() -> bool + Sync),
+}
+
+/// Why a request produced no reply dictionary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XpcFailure {
+    /// The mach service is not registered (the service is not running).
+    Unavailable,
+    /// The peer went away mid-request (crash or restart).
+    Interrupted,
+    /// `stop` returned true; the connection was cancelled.
+    Stopped,
+    /// The deadline passed; the connection was cancelled.
+    TimedOut,
+    /// The reply was neither a dictionary nor a connection error.
+    UnexpectedReply,
+}
+
+/// Sends one request dictionary to a mach service and returns the reply.
+/// Implemented natively by the binary on macOS; faked in tests.
+pub trait XpcTransport: Send + Sync {
+    fn send(
+        &self,
+        service: &str,
+        request: &[(&str, XpcValue)],
+        reply_keys: &[(&str, XpcKind)],
+        wait: &WaitControl<'_>,
+    ) -> Result<XpcReply, XpcFailure>;
+}
+
+static NATIVE: OnceLock<Arc<dyn XpcTransport>> = OnceLock::new();
+
+/// Register the process's native transport. Called once by the binary at
+/// startup on macOS; later calls are ignored.
+pub fn install_transport(transport: Arc<dyn XpcTransport>) {
+    let _ = NATIVE.set(transport);
+}
+
+/// The registered native transport, if this process has one.
+pub fn installed_transport() -> Option<Arc<dyn XpcTransport>> {
+    NATIVE.get().cloned()
+}
+
+// ── Errors ─────────────────────────────────────────────────────────────────
+
+fn blocked(reason: String) -> EngineError {
     EngineError::ImageSourceBlocked {
         source_kind: ImageSourceKind::AppleStore,
-        reason: format!(
-            "awman's builtin runtime has no in-process bridge to the Apple Containers image \
-             store: {why}. awman does not run the `container` helper, ship a separate bridge, or \
-             read the store's private files (evidence: apple/container {EVIDENCE_UPSTREAM_TAG} \
-             sources, {EVIDENCE_DATE}). Export the image yourself with `container image save \
-             {reference} -o <file>` (an OCI layout tar) or build it with Docker, then set the \
-             image source to {{\"type\":\"archive\",\"path\":\"<file>\"}} and run `awman ready` \
-             again."
-        ),
+        reason,
     }
+}
+
+fn unsupported(reason: String) -> EngineError {
+    EngineError::UnsupportedImageSource {
+        source_kind: ImageSourceKind::AppleStore,
+        reason,
+    }
+}
+
+/// Why this process has no bridge at all.
+pub(super) fn no_transport() -> EngineError {
+    let why = if cfg!(target_os = "macos") {
+        "this awman process has no Apple Containers bridge registered"
+    } else {
+        "Apple Containers exists only on macOS"
+    };
+    blocked(format!(
+        "{why}. awman does not run the `container` CLI or read the store's private files; use a \
+         registry, Docker Engine or archive image source instead."
+    ))
+}
+
+/// Map a transport failure. Only an interrupted peer may be retried.
+fn transport_error(service: &str, route: &str, failure: XpcFailure) -> EngineError {
+    match failure {
+        XpcFailure::Unavailable => blocked(format!(
+            "the Apple Containers service is not running ({service} is not registered). Start it \
+             with `container system start` and run `awman ready` again."
+        )),
+        XpcFailure::Interrupted => EngineError::Network(format!(
+            "the Apple Containers service {service} went away during `{route}`"
+        )),
+        XpcFailure::Stopped => crate::engine::oci::retry::cancelled(),
+        XpcFailure::TimedOut => {
+            EngineError::Network("image acquisition exceeded its deadline".into())
+        }
+        XpcFailure::UnexpectedReply => unsupported(format!(
+            "{service} answered `{route}` with an object that is not a reply dictionary"
+        )),
+    }
+}
+
+/// Printable, bounded text from the peer: control characters dropped,
+/// private paths replaced, at most 300 characters.
+fn sanitize(text: &str, private: &[&Path]) -> String {
+    let mut out = text.to_string();
+    for p in private {
+        let s = p.display().to_string();
+        if !s.is_empty() {
+            out = out.replace(&s, "<staging>");
+        }
+    }
+    let cleaned: String = out
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut short: String = cleaned.chars().take(300).collect();
+    if cleaned.chars().count() > 300 {
+        short.push('…');
+    }
+    short
+}
+
+#[derive(serde::Deserialize)]
+struct PeerError {
+    code: String,
+    message: String,
+}
+
+/// Send one route and check the protocol-level error key.
+fn call(
+    transport: &dyn XpcTransport,
+    service: &str,
+    route: &str,
+    mut fields: Vec<(&str, XpcValue)>,
+    reply_keys: &[(&str, XpcKind)],
+    wait: &WaitControl<'_>,
+    private: &[&Path],
+) -> Result<XpcReply, EngineError> {
+    fields.insert(0, (CONTRACT.route_key, XpcValue::String(route.into())));
+    let mut keys = reply_keys.to_vec();
+    keys.push((CONTRACT.error_key, XpcKind::Data));
+    let reply = transport
+        .send(service, &fields, &keys, wait)
+        .map_err(|f| transport_error(service, route, f))?;
+    if let Some(XpcValue::Data(raw)) = reply.get(CONTRACT.error_key) {
+        let (code, message) = match serde_json::from_slice::<PeerError>(raw) {
+            Ok(e) => (e.code, e.message),
+            Err(_) => ("malformed".into(), "unreadable error payload".into()),
+        };
+        let code = sanitize(&code, &[]);
+        let message = sanitize(&message, private);
+        return Err(match code.as_str() {
+            "notFound" => {
+                EngineError::Config(format!("Apple Containers `{route}` failed: {message}"))
+            }
+            "interrupted" => EngineError::Network(format!(
+                "Apple Containers `{route}` was interrupted: {message}"
+            )),
+            _ => EngineError::Container(format!(
+                "Apple Containers `{route}` failed ({code}): {message}"
+            )),
+        });
+    }
+    Ok(reply)
+}
+
+// ── Release check ──────────────────────────────────────────────────────────
+
+/// The release the API server reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRelease {
+    pub version: String,
+    pub commit: String,
+    pub build: String,
+}
+
+/// `apiServerVersion` is `X.Y.Z` in 1.x and
+/// `container-apiserver version X.Y.Z (build: …, commit: …)` in 0.x.
+fn parse_version(raw: &str) -> Option<String> {
+    let token = match raw.split_once(" version ") {
+        Some((_, rest)) => rest.split_whitespace().next()?,
+        None => raw.trim(),
+    };
+    let ok = !token.is_empty()
+        && token.split('.').count() == 3
+        && token
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    ok.then(|| token.to_string())
+}
+
+/// Check the reported release against [`SUPPORTED_RELEASES`].
+pub fn check_release(reply: &XpcReply) -> Result<ServiceRelease, EngineError> {
+    let get = |key: &str| match reply.get(key) {
+        Some(XpcValue::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let (Some(raw), Some(commit), Some(build)) = (
+        get(CONTRACT.version_key),
+        get(CONTRACT.commit_key),
+        get(CONTRACT.build_key),
+    ) else {
+        return Err(unsupported(
+            "the Apple Containers API server did not report its release, commit and build; \
+             awman only talks to releases it has verified"
+                .into(),
+        ));
+    };
+    let version = parse_version(&raw).unwrap_or_else(|| sanitize(&raw, &[]));
+    let release = ServiceRelease {
+        version,
+        commit: sanitize(&commit, &[]),
+        build: sanitize(&build, &[]),
+    };
+    let known = SUPPORTED_RELEASES
+        .iter()
+        .any(|r| r.version == release.version && r.commit == release.commit);
+    if !known || release.build != "release" {
+        let supported = SUPPORTED_RELEASES
+            .iter()
+            .map(|r| r.version)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(unsupported(format!(
+            "Apple Containers {} ({} build, commit {}) is not a release awman has verified; \
+             supported releases: {supported}. The image-store protocol is unversioned, so awman \
+             refuses unknown releases instead of guessing.",
+            release.version, release.build, release.commit
+        )));
+    }
+    Ok(release)
+}
+
+// ── Selection ──────────────────────────────────────────────────────────────
+
+/// Fully qualify a reference the way the store does for Docker Hub names:
+/// `name` → `docker.io/library/name:latest`.
+pub fn normalize_reference(reference: &str) -> String {
+    let (domain, rest) = match reference.split_once('/') {
+        Some((first, rest))
+            if first.contains('.') || first.contains(':') || first == "localhost" =>
+        {
+            (first.to_string(), rest.to_string())
+        }
+        _ => ("docker.io".to_string(), reference.to_string()),
+    };
+    let rest = if domain == "docker.io" && !rest.contains('/') {
+        format!("library/{rest}")
+    } else {
+        rest
+    };
+    let last = rest.rsplit('/').next().unwrap_or("");
+    let rest = if last.contains(':') || last.contains('@') {
+        rest
+    } else {
+        format!("{rest}:latest")
+    };
+    format!("{domain}/{rest}")
+}
+
+/// The one store entry named `reference`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedImage {
+    /// The store's own reference string.
+    pub reference: String,
+    pub digest: String,
+    pub media_type: String,
+    /// The entry exactly as listed, re-sent to `imageSave`.
+    pub description: serde_json::Value,
+}
+
+/// Choose the single store image named `reference` from an `imageList`
+/// reply. Missing, malformed or ambiguous listings are refused.
+pub fn select_image(listing: &[u8], reference: &str) -> Result<SelectedImage, EngineError> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(listing).map_err(|_| {
+        unsupported("the Apple Containers image list is not a JSON array of images".into())
+    })?;
+    let wanted = normalize_reference(reference);
+    let mut found: Vec<SelectedImage> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.get("reference").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if normalize_reference(name) != wanted {
+            continue;
+        }
+        let descriptor = entry.get("descriptor");
+        let field = |k: &str| {
+            descriptor
+                .and_then(|d| d.get(k))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let (Some(digest), Some(media_type)) = (field("digest"), field("mediaType")) else {
+            return Err(unsupported(format!(
+                "the Apple Containers entry for {} has no descriptor digest or media type",
+                sanitize(name, &[])
+            )));
+        };
+        if Digest::parse(&digest).is_err() {
+            return Err(unsupported(format!(
+                "the Apple Containers entry for {} has an invalid digest",
+                sanitize(name, &[])
+            )));
+        }
+        if !found.iter().any(|f| f.digest == digest) {
+            found.push(SelectedImage {
+                reference: name.to_string(),
+                digest,
+                media_type,
+                description: entry,
+            });
+        }
+    }
+    match found.len() {
+        0 => Err(EngineError::Config(format!(
+            "image '{}' is not in the Apple Containers image store; build or pull it with \
+             Apple Containers first",
+            sanitize(reference, &[])
+        ))),
+        1 => Ok(found.pop().expect("one entry")),
+        n => Err(EngineError::Config(format!(
+            "{n} different Apple Containers images are named '{}'; remove the stale ones so the \
+             name is unambiguous",
+            sanitize(reference, &[])
+        ))),
+    }
+}
+
+/// A single-platform manifest descriptor vouches for the manifest digest
+/// the validator must find; an index does not.
+fn expected_manifest(selected: &SelectedImage) -> Option<Digest> {
+    const MANIFESTS: &[&str] = &[
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ];
+    MANIFESTS
+        .contains(&selected.media_type.as_str())
+        .then(|| Digest::parse(&selected.digest).ok())
+        .flatten()
+}
+
+/// The `ociPlatform` value: containerization's `Platform` uses the OCI key
+/// names.
+fn platform_json(platform: &OciPlatform) -> Vec<u8> {
+    let mut map = serde_json::Map::new();
+    map.insert("os".into(), platform.os.clone().into());
+    map.insert("architecture".into(), platform.architecture.clone().into());
+    if let Some(v) = &platform.variant {
+        map.insert("variant".into(), v.clone().into());
+    }
+    serde_json::Value::Object(map).to_string().into_bytes()
+}
+
+// ── Export ─────────────────────────────────────────────────────────────────
+
+/// Pings may wait for launchd to start the service, but not for long.
+const PING_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Export `reference` from the Apple store into `ctx.staging_dir`.
+pub(super) fn export(
+    transport: &dyn XpcTransport,
+    awman_tag: &str,
+    reference: &str,
+    ctx: &FetchContext<'_>,
+    _report: Report<'_>,
+) -> Result<Fetched, EngineError> {
+    let cancel = ctx.cancel.clone();
+    let stop = move || cancel.is_cancelled();
+    let deadline_in = |preferred: Option<Duration>| WaitControl {
+        deadline: Instant::now() + ctx.deadline.request_timeout(preferred),
+        stop: &stop,
+    };
+    ctx.deadline.check()?;
+    ctx.cancel.check()?;
+
+    // 1. Release check, before any image route.
+    let ping = call(
+        transport,
+        CONTRACT.api_service,
+        CONTRACT.ping_route,
+        Vec::new(),
+        &[
+            (CONTRACT.version_key, XpcKind::String),
+            (CONTRACT.commit_key, XpcKind::String),
+            (CONTRACT.build_key, XpcKind::String),
+        ],
+        &deadline_in(Some(PING_TIMEOUT)),
+        &[],
+    )?;
+    let release = check_release(&ping)?;
+    tracing::debug!(version = %release.version, "Apple Containers release verified");
+
+    // 2. Select exactly one image through the service.
+    let listed = call(
+        transport,
+        CONTRACT.images_service,
+        CONTRACT.list_route,
+        Vec::new(),
+        &[(CONTRACT.descriptions_key, XpcKind::Data)],
+        &deadline_in(Some(PING_TIMEOUT)),
+        &[],
+    )?;
+    let Some(XpcValue::Data(listing)) = listed.get(CONTRACT.descriptions_key) else {
+        return Err(unsupported(
+            "the Apple Containers image list reply has no image descriptions".into(),
+        ));
+    };
+    let selected = select_image(listing, reference)?;
+    ctx.cancel.check()?;
+
+    // 3. Export into a fresh private directory of the leased staging area.
+    crate::engine::oci::verify::ensure_space(
+        ctx.disk,
+        ctx.staging_dir,
+        0,
+        ctx.limits.min_free_bytes,
+    )?;
+    let export_dir = create_private_dir(&ctx.staging_dir.join("apple-export"))?;
+    let out = export_dir.join("image.tar");
+    let descriptions = serde_json::to_vec(&[&selected.description])
+        .map_err(|e| EngineError::Other(format!("encoding image description: {e}")))?;
+    call(
+        transport,
+        CONTRACT.images_service,
+        CONTRACT.save_route,
+        vec![
+            (CONTRACT.descriptions_key, XpcValue::Data(descriptions)),
+            (
+                CONTRACT.file_path_key,
+                XpcValue::String(out.display().to_string()),
+            ),
+            (
+                CONTRACT.platform_key,
+                XpcValue::Data(platform_json(ctx.platform)),
+            ),
+        ],
+        &[],
+        &deadline_in(None),
+        &[ctx.staging_dir],
+    )?;
+    ctx.cancel.check()?;
+    ctx.deadline.check()?;
+
+    // 4. Accept only what the helper was asked to produce.
+    let staged = ctx.staging_dir.join("archive.tar");
+    adopt_export(&export_dir, &out, &staged, ctx.limits.max_archive_bytes)?;
+    crate::engine::oci::verify::ensure_space(
+        ctx.disk,
+        ctx.staging_dir,
+        0,
+        ctx.limits.min_free_bytes,
+    )?;
+    Ok(Fetched {
+        path: staged,
+        wanted_refs: vec![selected.reference.clone(), awman_tag.to_string()],
+        expected_manifest: expected_manifest(&selected),
+        fingerprint: None,
+    })
+}
+
+/// Create `dir` (which must not exist) readable only by this user.
+fn create_private_dir(dir: &Path) -> Result<PathBuf, EngineError> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| EngineError::io(dir, e))?;
+    Ok(dir.to_path_buf())
+}
+
+fn rejected(reason: &str) -> EngineError {
+    EngineError::ImageArchiveRejected {
+        path: PathBuf::from("<apple-containers export>"),
+        reason: reason.into(),
+    }
+}
+
+/// Move the helper's output from `out` to `staged` after checking that the
+/// export directory is still the private directory awman made, and that the
+/// output is one regular, single-link, non-empty file owned by the same user
+/// within the byte cap. The file is re-checked by identity after the move,
+/// so a swapped path cannot be validated in its place.
+fn adopt_export(
+    export_dir: &Path,
+    out: &Path,
+    staged: &Path,
+    max_bytes: u64,
+) -> Result<(), EngineError> {
+    let dir_meta =
+        std::fs::symlink_metadata(export_dir).map_err(|e| EngineError::io(export_dir, e))?;
+    if !dir_meta.is_dir() {
+        return Err(rejected("the export directory was replaced"));
+    }
+    let meta = match std::fs::symlink_metadata(out) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(rejected(
+                "the Apple Containers service reported success but wrote no file",
+            ))
+        }
+        Err(e) => return Err(EngineError::io(out, e)),
+    };
+    if !meta.file_type().is_file() {
+        return Err(rejected("the export is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != dir_meta.uid() {
+            return Err(rejected("the export is owned by another user"));
+        }
+        if meta.nlink() != 1 {
+            return Err(rejected("the export has more than one link"));
+        }
+        if dir_meta.mode() & 0o077 != 0 {
+            return Err(rejected("the export directory is no longer private"));
+        }
+    }
+    if meta.len() == 0 {
+        return Err(rejected("the export is empty"));
+    }
+    if meta.len() > max_bytes {
+        return Err(rejected(&format!(
+            "the export is {} bytes, over the {max_bytes}-byte limit",
+            meta.len()
+        )));
+    }
+    std::fs::rename(out, staged).map_err(|e| EngineError::io(staged, e))?;
+    let moved = std::fs::symlink_metadata(staged).map_err(|e| EngineError::io(staged, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (moved.dev(), moved.ino()) != (meta.dev(), meta.ino()) || moved.len() != meta.len() {
+            return Err(rejected("the export changed while it was being adopted"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = moved;
+    let _ = std::fs::remove_dir(export_dir);
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blocked_error_names_the_supported_route_and_runs_nothing() {
-        match blocked("awman-x-claude:latest") {
-            EngineError::ImageSourceBlocked {
-                source_kind,
-                reason,
-            } => {
-                assert_eq!(source_kind, ImageSourceKind::AppleStore);
-                assert!(reason.contains("container image save awman-x-claude:latest -o <file>"));
-                assert!(reason.contains("\"type\":\"archive\""));
-                assert!(reason.contains("does not run the `container`"));
-                assert!(reason.contains(EVIDENCE_UPSTREAM_TAG));
-                assert!(reason.contains(EVIDENCE_DATE));
-            }
-            other => panic!("expected ImageSourceBlocked, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn feasibility_is_a_typed_blocker_list_never_available() {
-        match feasibility() {
-            Feasibility::Blocked(blockers) => {
-                assert_eq!(blockers[0], Blocker::UnversionedProtocol);
-                assert!(blockers.contains(&Blocker::RequiresUnsafeFfi));
-                assert!(blockers.contains(&Blocker::NoNativeValidation));
-                assert_eq!(
-                    blockers.contains(&Blocker::NotMacOs),
-                    !cfg!(target_os = "macos")
-                );
-                for b in blockers {
-                    assert!(!b.describe().is_empty());
-                }
-            }
-            Feasibility::Available { .. } => panic!("no bridge is available"),
-        }
-    }
-
-    #[test]
-    fn the_recorded_contract_is_unversioned_and_names_the_image_helper() {
-        let contract = CONTRACT;
-        assert!(!contract.protocol_versioned);
-        assert_eq!(
-            contract.mach_service,
-            "com.apple.container.core.container-core-images"
-        );
-        assert_eq!(contract.save_route, "imageSave");
-        assert_eq!(contract.route_key, "com.apple.container.xpc.route");
-        let versions: Vec<&str> = REQUIRED_SERVICE_VERSIONS.to_vec();
-        assert_eq!(versions, vec!["1.4.1"]);
-        let commit: String = EVIDENCE_UPSTREAM_COMMIT.to_string();
-        assert_eq!(commit.len(), 40);
-    }
-}
+mod tests;

@@ -222,10 +222,13 @@ fn descriptor_role(fd: i32, role: FdRole) -> bool {
         FdRole::Config => kind == libc::S_IFREG && stat.st_nlink == 0 && access != libc::O_WRONLY,
         FdRole::PipeRead => kind == libc::S_IFIFO && access == libc::O_RDONLY,
         FdRole::PipeWrite => kind == libc::S_IFIFO && access == libc::O_WRONLY,
+        // The SDK opens the lifecycle lock with the process umask (0644 by
+        // default). Only this user may be able to write it; read bits grant
+        // nothing, since `flock` needs no write access.
         FdRole::Lock => {
             kind == libc::S_IFREG
                 && stat.st_nlink == 1
-                && stat.st_mode & 0o077 == 0
+                && stat.st_mode & 0o022 == 0
                 && access == libc::O_RDWR
         }
     }
@@ -309,6 +312,13 @@ mod tests {
         assert!(!descriptor_role(write.as_raw_fd(), FdRole::PipeRead));
         assert!(!descriptor_role(lock_fd, FdRole::PipeRead));
         assert!(!descriptor_role(readonly.as_raw_fd(), FdRole::Lock));
+        // The SDK's real lock mode is accepted; group/other-writable is not.
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, ok) in [(0o644, true), (0o600, true), (0o664, false), (0o666, false)] {
+            std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(descriptor_role(lock_fd, FdRole::Lock), ok, "mode {mode:o}");
+        }
+        std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
         let valid = descriptors(
             Some(config.as_raw_fd()),
             Some(watch_read.as_raw_fd()),

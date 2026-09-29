@@ -1,0 +1,10 @@
+# code patch sha256 b077f376c4c70165915d7e0530fe4f208a984bdbc09e468f68429035ab8f0227 on base 105b5cbd7cb5506e16e22d9766e0905c0de72b65
+container-apiserver container-apiserver version 0.12.0 (build: release, commit: 651811c) release 651811cc090937457956643dd2c454df77eb141b
+...exported awman-amux:latest in 45.521792292s: manifest sha256:f71f3085a58636435dac403bc6aae504a1485162fa6db8dcc1cc2c43608f7d18 config sha256:b33ec0955cb2121fc7110b2a67cf2f8341e763ec8180ad07df8eb03661aaf464 platform linux/arm64 (497618944 bytes)
+..apple store lists 70 images
+.apple container release ServiceRelease { version: "0.12.0", commit: "651811cc090937457956643dd2c454df77eb141b", build: "release" }
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 112.30s
+== helper crash (kill container-core-images mid-save of awman-awman-codex)
+helper-crash calls: [("ping", None), ("imageList", None), ("imageSave", Some(Interrupted)), ("ping", None), ("imageList", None), ("imageSave", None)]
+helper crash retried: sha256:396bb5289edac9be2f9d6a9790cc8d1345b2b4c6f8d8e7c947b25ae52cdae4fa
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 67.75s

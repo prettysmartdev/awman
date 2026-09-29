@@ -1,0 +1,14 @@
+# code patch sha256 b077f376c4c70165915d7e0530fe4f208a984bdbc09e468f68429035ab8f0227 on base 105b5cbd7cb5506e16e22d9766e0905c0de72b65
+profile:
+(version 1)
+(allow default)
+(deny process-fork)
+(deny process-exec (require-not (literal "~/Workspaces/prettysmart/awman/target/debug/deps/awman-9be1c2bb644958ff")))
+(deny file-read* file-write* (subpath "~/Library/Application Support/com.apple.container"))
+control 1 (exec /bin/ls under profile):
+sandbox-exec: execvp() of '/bin/ls' failed: Operation not permitted
+control 2 (store read with exec allowed):
+ls: ~/Library/Application Support/com.apple.container: Operation not permitted
+bridge export under profile:
+exported awman-awman-claude:latest in 54.741684709s: manifest sha256:d1cf42e68a83b0886821408146d18acb64da79c99b124e210fb300bb7c6217f5 config sha256:0fcb2eac33333dd04f697255d85dc3d4e5d343c22c010ade24191c6e6ea85c8b platform linux/arm64 (615073792 bytes)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 54.74s

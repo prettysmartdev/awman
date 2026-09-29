@@ -1,0 +1,16 @@
+# code patch sha256 b077f376c4c70165915d7e0530fe4f208a984bdbc09e468f68429035ab8f0227 on base 105b5cbd7cb5506e16e22d9766e0905c0de72b65
+# artifact: target/debug/awman (builtin-runtime), copied and ad-hoc signed locally with com.apple.security.hypervisor; guest drivers signed the same way
+{"checkpoint_restore":false,"embedded_guest_agent":true,"embedded_kernel":true,"host_helpers":false,"kernel_sha256":"c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b","libkrun_commit":"2bd0f84ad0956f3032e0490d3b8512b6851eca12","msb_version":"0.7.2","reattach_after_owner_exit":false,"target_arch":"aarch64","target_os":"macos","worker_protocol":"0.7.2/18/awman-1"}
+
+== builtin_hw_actual_awman_cli_synthetic_agent_exit_37 (archive: fixture-oci.tar)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 1.68s
+
+== builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops (archive: fixture-oci.tar)
+PASS: builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops: awman-spike/fixture:latest imported from the Apple store ran offline
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 2.11s
+
+== builtin_hw_offline_cached_execution_under_denial (archive: apple-exported-fixture.tar)
+RUN: builtin_hw_offline_cached_execution_under_denial: prerequisites satisfied
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 4.88s
+

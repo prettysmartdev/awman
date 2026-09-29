@@ -188,7 +188,9 @@ ok() { n=$1; shift; if bounded "$@" >"$probe_output" 2>&1; then echo "PASS $n"; 
 refused() { n=$1; shift; bounded "$@" >"$probe_output" 2>&1; status=$?; case "$status" in 0) echo "FAIL $n unexpectedly succeeded";; 125|126|127) echo "FAIL $n probe could not execute ($status)";; *) if grep -Eiq 'unrecognized option|invalid option|applet not found|command not found|certificate|unknown ca|401 Unauthorized|403 Forbidden|404 Not Found' "$probe_output"; then echo "FAIL $n setup, TLS trust or HTTP failure is not a policy refusal"; else echo "PASS $n"; fi;; esac; }
 has() { n=$1; want=$2; shift 2; out=$(bounded "$@" 2>&1); status=$?; if [ "$status" != 0 ]; then echo "FAIL $n probe failed ($status)"; else case "$out" in *"$want"*) echo "PASS $n";; *) echo "FAIL $n got: $(printf %s "$out" | head -c 200 | tr '\n' ' ')";; esac; fi; }
 is() { n=$1; want=$2; shift 2; out=$(bounded "$@" 2>&1); status=$?; if [ "$status" = 0 ] && [ "$out" = "$want" ]; then echo "PASS $n"; else echo "FAIL $n got: $(printf %s "$out" | head -c 200 | tr '\n' ' ')"; fi; }
-only_lo() { got=$(ls /sys/class/net | tr '\n' ' '); if [ "$got" = "lo " ]; then echo "PASS $1"; else echo "FAIL $1 interfaces: $got"; fi; }
+# No interface besides lo may be up or addressed, and no route may exist; the
+# embedded kernel's inert, down dummy0 is not an egress path.
+only_lo() { usable=""; for i in $(ls /sys/class/net); do [ "$i" = lo ] && continue; if [ $(( $(cat "/sys/class/net/$i/flags") & 1 )) -ne 0 ] || grep -q " $i\$" /proc/net/if_inet6 2>/dev/null; then usable="$usable $i"; fi; done; routes=$(tail -n +2 /proc/net/route | wc -l | tr -d ' '); if [ -z "$usable" ] && [ "$routes" = 0 ]; then echo "PASS $1"; else echo "FAIL $1 usable:$usable routes:$routes"; fi; }
 probe_output=$(mktemp)
 trap 'rm -f "$probe_output"' EXIT
 "#;

@@ -31,15 +31,15 @@ agent = "agentd-x86_64"
 agent_sha256 = "4d2b2aac7c4f2c54362f81b083c19715032d4f15468332bc1fa86bea29afe249"
 
 [targets."aarch64-apple-darwin"]
-status = "unverified"
+status = "verified"
 architecture = "aarch64"
 kernel_alignment = 4096
 archive = "microsandbox-darwin-aarch64.tar.gz"
 archive_sha256 = "14a5910c6b395e9d50e001d81388cbe5366f18165c57ede4a5eda3e3315b7dbd"
 firmware = "libkrunfw.5.dylib"
-kernel_sha256 = ""
-size = 0
-guest_address = 0
-entry_address = 0
+kernel_sha256 = "c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b"
+size = 24576000
+guest_address = 2147483648
+entry_address = 2147483648
 agent = "agentd-aarch64"
 agent_sha256 = "ca6dde7a3000d8e93d5dca87fcebf77ebb36ce83377385bae2be70dbead9a5e1"

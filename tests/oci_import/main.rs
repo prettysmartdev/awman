@@ -246,9 +246,43 @@ fn wrong_platform_and_malformed_transfer_leave_no_visible_cache_state() {
 }
 
 #[test]
-fn apple_store_is_a_typed_blocker_with_dated_evidence() {
+fn apple_store_is_version_gated_and_blocked_without_a_bridge() {
     use awman::engine::error::EngineError;
-    use awman::engine::oci::apple_store::{feasibility, Blocker, Feasibility, CONTRACT};
+    use awman::engine::oci::apple_store::{
+        WaitControl, XpcFailure, XpcKind, XpcReply, XpcTransport, XpcValue, CONTRACT,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A service reporting an unsupported release; records every route.
+    struct Newer(Mutex<Vec<String>>);
+    impl XpcTransport for Newer {
+        fn send(
+            &self,
+            _service: &str,
+            request: &[(&str, XpcValue)],
+            _keys: &[(&str, XpcKind)],
+            _wait: &WaitControl<'_>,
+        ) -> Result<XpcReply, XpcFailure> {
+            if let Some((_, XpcValue::String(r))) =
+                request.iter().find(|(k, _)| *k == CONTRACT.route_key)
+            {
+                self.0.lock().unwrap().push(r.clone());
+            }
+            let mut reply = XpcReply::new();
+            for (k, v) in [
+                (CONTRACT.version_key, "9.0.0"),
+                (
+                    CONTRACT.commit_key,
+                    "0123456789012345678901234567890123456789",
+                ),
+                (CONTRACT.build_key, "release"),
+            ] {
+                reply.insert(k.into(), XpcValue::String(v.into()));
+            }
+            Ok(reply)
+        }
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let req = AcquireRequest {
         tag: "awman-fixture:latest".into(),
@@ -257,21 +291,26 @@ fn apple_store_is_a_typed_blocker_with_dated_evidence() {
         policy: AcquirePolicy::IfMissing,
         registries: Default::default(),
     };
+    // Test executables register no native bridge.
     match acquirer(&temp.path().join("s")).acquire(&req, &mut |_| {}) {
         Err(EngineError::ImageSourceBlocked { reason, .. }) => {
-            assert!(reason.contains("container image save awman-fixture:latest"));
-            assert!(reason.contains("apple/container 1.4.1"));
+            assert!(
+                reason.contains("does not run the `container` CLI"),
+                "{reason}"
+            );
         }
         other => panic!("expected a blocked source, got {other:?}"),
     }
-    match feasibility() {
-        Feasibility::Blocked(blockers) => {
-            assert!(blockers.contains(&Blocker::UnversionedProtocol));
-            assert!(blockers.contains(&Blocker::RequiresUnsafeFfi));
+    let newer = Arc::new(Newer(Mutex::new(Vec::new())));
+    match acquirer(&temp.path().join("s"))
+        .with_apple_transport(Some(newer.clone()))
+        .acquire(&req, &mut |_| {})
+    {
+        Err(EngineError::UnsupportedImageSource { reason, .. }) => {
+            assert!(reason.contains("9.0.0"), "{reason}");
         }
-        Feasibility::Available { .. } => panic!("no bridge exists"),
+        other => panic!("expected an unsupported release, got {other:?}"),
     }
-    let contract = CONTRACT;
-    assert!(!contract.protocol_versioned);
+    assert_eq!(*newer.0.lock().unwrap(), vec!["ping".to_string()]);
     assert_cache_empty(&temp.path().join("s"));
 }

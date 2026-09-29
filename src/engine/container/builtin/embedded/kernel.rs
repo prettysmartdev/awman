@@ -26,9 +26,9 @@ pub fn register() -> Result<(), String> {
         .map_err(|_| "embedded kernel registration raced with another provider".into())
 }
 
-/// aarch64 (and Windows x86_64) VMMs copy the kernel into guest RAM, so the
-/// immutable static can be handed over directly.
-#[cfg(not(target_arch = "x86_64"))]
+/// Linux aarch64 VMMs copy the kernel into guest RAM, so the immutable static
+/// can be handed over directly.
+#[cfg(not(any(target_arch = "x86_64", target_os = "macos")))]
 fn guest_kernel_bytes() -> &'static [u8] {
     &KERNEL.0
 }
@@ -37,14 +37,21 @@ fn guest_kernel_bytes() -> &'static [u8] {
 /// (`MmapRegion::build_raw`, no copy). The static lives in read-only
 /// `.rodata`, where every guest write into its own kernel image would fault.
 /// Hand the VMM a writable, aligned, process-lifetime copy instead.
-#[cfg(target_arch = "x86_64")]
+///
+/// On macOS the Mach-O linker caps section alignment below 64 KiB, so the
+/// static's `repr(align(65536))` is not honoured; the same aligned copy is
+/// used there.
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 fn guest_kernel_bytes() -> &'static [u8] {
     static COPY: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     COPY.get_or_init(|| writable_aligned_copy(&KERNEL.0))
 }
 
 /// Copy `source` into leaked heap memory starting at a `KERNEL_ALIGN` boundary.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_os = "macos")),
+    allow(dead_code)
+)]
 fn writable_aligned_copy(source: &[u8]) -> &'static [u8] {
     let buffer: &'static mut [u8] =
         Box::leak(vec![0u8; source.len() + KERNEL_ALIGN].into_boxed_slice());

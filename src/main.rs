@@ -21,10 +21,16 @@ use awman::frontend::tui;
 #[path = "engine/container/builtin/worker.rs"]
 mod builtin_worker;
 
+#[cfg(target_os = "macos")]
+#[path = "engine/oci/apple_xpc.rs"]
+mod apple_xpc;
+
 fn main() -> Result<ExitCode> {
     if builtin_worker::dispatch(std::env::vars_os()) {
         return Ok(ExitCode::SUCCESS);
     }
+    #[cfg(target_os = "macos")]
+    awman::engine::oci::apple_store::install_transport(std::sync::Arc::new(apple_xpc::NativeXpc));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

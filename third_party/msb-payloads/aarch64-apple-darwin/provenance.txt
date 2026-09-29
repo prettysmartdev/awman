@@ -1,0 +1,14 @@
+target=aarch64-apple-darwin
+architecture=aarch64
+host_os=Darwin
+host_arch=arm64
+archive=microsandbox-darwin-aarch64.tar.gz
+archive_sha256=14a5910c6b395e9d50e001d81388cbe5366f18165c57ede4a5eda3e3315b7dbd
+microsandbox_revision=60d4dc8a436fb9365491567ec21d073e924e3c6d
+libkrun_revision=2bd0f84ad0956f3032e0490d3b8512b6851eca12
+firmware=libkrunfw.5.dylib
+extractor_sha256=cf5d370345acf47d6c96867ab28327d871e6dab9d8ddeb5344ec7728278ee2f6
+native_cc=Apple clang version 21.0.0 (clang-2100.0.123.102)
+kernel_sha256=c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b
+agent=agentd-aarch64
+agent_sha256=ca6dde7a3000d8e93d5dca87fcebf77ebb36ce83377385bae2be70dbead9a5e1

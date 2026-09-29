@@ -424,12 +424,12 @@ The optional `builtin` object is read only when `runtime` is `builtin`. It can a
 | `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images and session VMs; mode `0700`, no symlinks, keep it short. `AWMAN_BUILTIN_STATE_DIR` overrides it |
 | `builtin.vcpus` | integer 1–255 | `2` | Whole vCPUs per session VM |
 | `builtin.memoryMib` | integer ≥ 128 | `4096` | Guest memory in MiB |
-| `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-store`, `archive`, or `apple-store` (blocked) |
+| `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-store`, `archive`, or `apple-store` (macOS) |
 | `builtin.images` | object (image tag → source) | `{}` | Per-image source; wins over `imageSource` for that tag |
 | `builtin.registries` | object (`host[:port]` → settings) | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
 | `builtin.network` | object | `{"mode":"public"}` | Guest network policy: `mode` (`public`/`allowlist`/`none`), `allow` (allowlist names), `hostPorts` (host loopback ports the guest may reach), `nameservers` and `trustHostCas` (global config only) — see [Runtimes: Network](11-runtimes.md#network) |
 
-Every source object, its fields, the registry settings, and the `apple-store` limitation are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to build and import an image instead of guessing.
+Every source object, its fields, the registry settings, and the supported `apple-store` releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to build and import an image instead of guessing.
 
 `builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 

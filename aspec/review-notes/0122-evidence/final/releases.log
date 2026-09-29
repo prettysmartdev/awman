@@ -1,0 +1,49 @@
+# code patch sha256 b077f376c4c70165915d7e0530fe4f208a984bdbc09e468f68429035ab8f0227 on base 105b5cbd7cb5506e16e22d9766e0905c0de72b65
+# Each release: Apple-signed+notarized pkg expanded to a private install root, started with a private app root, fixture loaded, native bridge suite run.
+######## 1.5.0 (Notarization: trusted by the Apple notary service)
+COMPONENT            VERSION  BUILD    COMMIT
+container            1.5.0    release  d265d669ecae041bf338cb3b39c4118316d138f0
+container-apiserver  1.5.0    release  d265d669ecae041bf338cb3b39c4118316d138f0
+awman-spike/fixture:latest
+..exported awman-spike/fixture:latest in 272.350208ms: manifest sha256:0ba7c7416d2fa14fa230b112e77d410da4bbd59aff6a3f8ea93e37a3cc678a5a config sha256:9a09625eb7ba87446e1c91aba8cb6fb9065c7b64ab401befabfabbcee6deb506 platform linux/arm64/v8 (8858624 bytes)
+..apple store lists 1 images
+.apple container release ServiceRelease { version: "1.5.0", commit: "d265d669ecae041bf338cb3b39c4118316d138f0", build: "release" }
+..
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 20.66s
+
+######## 1.4.1 (Notarization: trusted by the Apple notary service)
+COMPONENT            VERSION  BUILD    COMMIT
+container            1.4.1    release  9a8917ca2da5cd6ba059b9ba5ca5a74892e9bb7d
+container-apiserver  1.4.1    release  9a8917ca2da5cd6ba059b9ba5ca5a74892e9bb7d
+awman-spike/fixture:latest
+..exported awman-spike/fixture:latest in 268.790542ms: manifest sha256:0ba7c7416d2fa14fa230b112e77d410da4bbd59aff6a3f8ea93e37a3cc678a5a config sha256:9a09625eb7ba87446e1c91aba8cb6fb9065c7b64ab401befabfabbcee6deb506 platform linux/arm64/v8 (8858624 bytes)
+..apple store lists 1 images
+.apple container release ServiceRelease { version: "1.4.1", commit: "9a8917ca2da5cd6ba059b9ba5ca5a74892e9bb7d", build: "release" }
+..
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 20.65s
+
+######## 1.3.1 (Notarization: trusted by the Apple notary service)
+COMPONENT            VERSION                                                              BUILD    COMMIT
+container            1.3.1                                                                release  a9a62e28f6beb88940122a3d7b286f2d5ae8053a
+container-apiserver  container-apiserver version 1.3.1 (build: release, commit: a9a62e2)  release  a9a62e28f6beb88940122a3d7b286f2d5ae8053a
+awman-spike/fixture:latest
+thread 'apple_xpc::tests::apple_native_cancelled_export_leaves_nothing' (51118166) panicked at src/engine/oci/apple_xpc.rs:587:9:
+apple-store image source is not supported: Apple Containers 1.3.1 (release build, commit a9a62e28f6beb88940122a3d7b286f2d5ae8053a) is not a release awman has verified; supported releases: 0.12.0, 1.4.1, 1.5.0. The image-store protocol is unversioned, so awman refuses unknown releases instead of guessing.
+thread 'apple_xpc::tests::apple_native_concurrent_imports_share_one_commit' (51119865) panicked at src/engine/oci/apple_xpc.rs:624:41:
+called `Result::unwrap()` on an `Err` value: UnsupportedImageSource { source_kind: AppleStore, reason: "Apple Containers 1.3.1 (release build, commit a9a62e28f6beb88940122a3d7b286f2d5ae8053a) is not a release awman has verified; supported releases: 0.12.0, 1.4.1, 1.5.0. The image-store protocol is unversioned, so awman refuses u
+apple_xpc::tests::apple_native_concurrent_imports_share_one_commit --- FAILED
+
+thread 'apple_xpc::tests::apple_native_export_round_trip' (51119873) panicked at src/engine/oci/apple_xpc.rs:499:54:
+native export: UnsupportedImageSource { source_kind: AppleStore, reason: "Apple Containers 1.3.1 (release build, commit a9a62e28f6beb88940122a3d7b286f2d5ae8053a) is not a release awman has verified; supported releases: 0.12.0, 1.4.1, 1.5.0. The image-store protocol is unversioned, so awman refuses unknown releases instead of gue
+apple_xpc::tests::apple_native_export_round_trip --- FAILED
+.apple store lists 1 images
+.
+thread 'apple_xpc::tests::apple_native_ping_reports_a_supported_release' (51119879) panicked at src/engine/oci/apple_xpc.rs:406:45:
+installed release must be supported: UnsupportedImageSource { source_kind: AppleStore, reason: "Apple Containers 1.3.1 (release build, commit a9a62e28f6beb88940122a3d7b286f2d5ae8053a) is not a release awman has verified; supported releases: 0.12.0, 1.4.1, 1.5.0. The image-store protocol is unversioned, so awman refuses unknown r
+ 5/7
+apple_xpc::tests::apple_native_ping_reports_a_supported_release --- FAILED
+test result: FAILED. 3 passed; 4 failed; 0 ignored; 0 measured; 15 filtered out; finished in 120.02s
+
+######## restore installed 0.12.0
+Verifying apiserver is running...
+container-apiserver  container-apiserver version 0.12.0 (build: release, commit: 651811c)  release  651811cc090937457956643dd2c454df77eb141b

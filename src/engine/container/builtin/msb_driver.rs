@@ -247,7 +247,7 @@ impl SandboxDriver for MsbDriver {
             for mount in spec.mounts {
                 let owner = spec.mount_owner;
                 builder = builder.volume(mount.guest, |m| {
-                    let mut m = m.bind(mount.host);
+                    let mut m = m.bind(symlink_free_ancestors(&mount.host));
                     if mount.read_only {
                         m = m.readonly();
                     }
@@ -609,8 +609,42 @@ async fn pump(
     }
 }
 
+/// Resolve symlinks in `host`'s ancestors, keeping its final component as
+/// given. The SDK opens every bind root without following any symlink, so a
+/// path under a system symlink (macOS `/tmp`, `/var` → `/private/...`) would
+/// otherwise be refused; a symlinked final component still is.
+fn symlink_free_ancestors(host: &std::path::Path) -> std::path::PathBuf {
+    match (host.parent(), host.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|p| p.join(name))
+            .unwrap_or_else(|_| host.to_path_buf()),
+        _ => host.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn bind_sources_resolve_ancestor_symlinks_but_not_the_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(real.join("target")).unwrap();
+        std::os::unix::fs::symlink(&real, real.join("alias")).unwrap();
+        std::os::unix::fs::symlink(real.join("target"), real.join("leaf")).unwrap();
+        assert_eq!(
+            super::symlink_free_ancestors(&real.join("alias").join("target")),
+            real.join("target")
+        );
+        assert_eq!(
+            super::symlink_free_ancestors(&real.join("leaf")),
+            real.join("leaf")
+        );
+        let missing = std::path::Path::new("/nonexistent-awman/x");
+        assert_eq!(super::symlink_free_ancestors(missing), missing);
+    }
+
     use super::*;
 
     #[test]

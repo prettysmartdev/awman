@@ -14,10 +14,21 @@ tracks every outstanding deficiency from the
 This item remains incomplete until its failed/blocked acceptance criteria have
 the required evidence; creating the follow-up does not close them.
 The resource-qualified continuation is assigned to
-[WI 0122](0122-native-apple-image-store-bridge.md) for the Apple adapter and
+[WI 0122](completed/0122-native-apple-image-store-bridge.md) for the Apple adapter and
 [WI 0123](0123-builtin-native-verification-and-release-closure.md) for native
 scenario, service, build and distribution closure. No original box is satisfied
 by transferring work.
+
+Resolution scope (2026-09-29, user decision): this item is resolved when
+[WI 0123](0123-builtin-native-verification-and-release-closure.md) completes.
+WI 0123 ships the runtime as `builtin-experimental` on Apple Silicon macOS
+only, ad-hoc signed, and validates the Apple store, archive and normal-case
+registry sources. At that point each acceptance criterion below is either PASS
+for that scope, with linked evidence, or **Deferred (WI 0124, optional)**:
+Linux KVM targets, Docker Engine sources and registry edge cases. Deferred
+criteria do not keep this item open;
+[WI 0124](0124-builtin-linux-and-docker-gates.md) tracks them as optional
+future work.
 
 ## Summary:
 - Implement a builtin, container-class backend using Microsandbox, with its VM
