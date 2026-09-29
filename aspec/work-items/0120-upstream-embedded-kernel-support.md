@@ -3,6 +3,11 @@
 Title: Create an upstreamable embedded-kernel API for Microsandbox's libkrun
 Issue: n/a
 
+Current distribution policy (2026-09-28): signing and notarization are out of
+scope by user instruction. No signing identity, Apple distribution account,
+notarization credentials or explicit ad-hoc signing step is required. Native
+boot and final-artifact checks still apply; failures must be reported honestly.
+
 ## Summary:
 - Turn the strict-embedding proof and the local dependency patch from
   [WI 0119](0119-strict-embedded-microsandbox-runtime.md) into a small, reusable,
@@ -149,8 +154,9 @@ So I can: reduce divergence while retaining the validated strict runtime.
 
 ### WI 0119 downstream patch inventory and migration
 
-WI 0119 carries three patched published crates, plus awman-owned integration
-glue. Each item has a separate replacement gate; replacing one does not imply
+WI 0119 carries three patched published crates; WI 0121 adds the patched
+Microsandbox SDK, network and types crates, for six carried dependency patches. Awman also carries its own integration glue. Each item
+has a separate replacement gate; replacing one does not imply
 the others are removable.
 
 | Carried change | Exact current scope | Replacement | Removal gate |
@@ -158,13 +164,28 @@ the others are removable.
 | SQLx SQLite bound backport | `third_party/sqlx-sqlite-0.9.0/`: only the `libsqlite3-sys` upper bound changes from `<0.38.0` to `<0.39.0`, matching upstream SQLx commit `94aafe3a68884d923b0798a767c8d7f6cfda89d2`. This resolves the `rusqlite 0.40.2` / `libsqlite3-sys 0.38.2` native-links conflict. It is independent of embedded-kernel work. | A published compatible `sqlx-sqlite` release containing the same bound fix. | Update the dependency and lockfile, remove the `[patch.crates-io]` path and vendor tree, then pass the combined awman/msb link, exactly-one-bundled-SQLite check, awman store tests, msb migrations, cross-driver checks, and old/new catalog round trips on supported targets. Do not wait for or couple this to libkrun review. |
 | libkrun kernel-provider loader | `third_party/msb_krun-0.1.39/`: the typed, process-lifetime `EmbeddedKernel` registry and loader branch in `load_krunfw_library`; ordinary external firmware paths retain the published DSO behavior. It does not export a C getter or search process symbols. | An accepted and pinned libkrun API that accepts an owned/process-lifetime typed kernel provider with equivalent validation and lifetime. | Adapt awman's provider registration to the public API, update the pinned crate, then boot and run the strict fixture on Apple Silicon and Linux ARM64/x86_64 with KVM, plus external-firmware regressions and release artifact scans. Remove the vendored `msb_krun` patch/tree only after those gates pass. |
 | Microsandbox guest-agent artifact-root glue | `third_party/microsandbox-filesystem-0.7.2/`: only `build.rs` adds target-aware lookup at `MSB_EMBED_ARTIFACTS_ROOT/<target-arch>/agentd`; existing input paths remain. This supplies an embedded guest agent at build time, not an extracted host helper. | An equivalent upstream target-aware artifact-root/build-input API in the filesystem crate. | Pin the release/commit, remove the vendor patch and path override, and verify clean builds for all required targets plus guest-agent hash/architecture checks. |
-| Awman-side worker and provider integration (not a vendored dependency patch) | `src/engine/container/builtin/embedded/{kernel.rs,version.rs,mod.rs}`, `src/engine/container/builtin/worker.rs`, `src/engine/container/builtin/msb_driver.rs`, and the early route in `src/main.rs`: compile/register the selected kernel, embed worker protocol metadata, recognize the private same-executable `machine` invocation, and configure the SDK paths used to reach the local `msb_krun` provider. There is currently no patched `microsandbox` CLI/runtime crate. | Use libkrun's typed public provider directly. Remove the firmware-path transport and setter calls when the SDK/runtime can represent embedded origin directly. Keep awman's worker protocol and early dispatch only for as long as the SDK still launches the same executable through that protocol. If a separate Microsandbox runtime patch becomes necessary, scope it as its own upstream change and record its exact files/API here before carrying it. | Update and test worker launch/version compatibility first; then remove only the glue made redundant by the upstream API. Verify same-executable boot, external installed-runtime behavior, protocol compatibility, and no symbol/path workaround before deleting compatibility code. |
+| Awman-side worker and provider integration (not a vendored dependency patch) | `src/engine/container/builtin/embedded/{kernel.rs,version.rs,mod.rs}`, `src/engine/container/builtin/worker.rs`, `src/engine/container/builtin/msb_driver.rs`, and the early route in `src/main.rs`: compile/register the selected kernel, embed worker protocol metadata, recognize the private same-executable `machine` invocation, and configure the SDK paths used to reach the local `msb_krun` provider. The separate SDK builder patch is recorded below. | Use libkrun's typed public provider directly. Remove the firmware-path transport and setter calls when the SDK/runtime can represent embedded origin directly. Keep awman's worker protocol and early dispatch only for as long as the SDK still launches the same executable through that protocol. If a separate Microsandbox runtime patch becomes necessary, scope it as its own upstream change and record its exact files/API here before carrying it. | Update and test worker launch/version compatibility first; then remove only the glue made redundant by the upstream API. Verify same-executable boot, external installed-runtime behavior, protocol compatibility, and no symbol/path workaround before deleting compatibility code. |
+| Microsandbox isolated configuration builder (WI 0121 downstream patch) | `third_party/microsandbox-0.7.2/` vendors published `microsandbox 0.7.2` (crate SHA-256 `0fda3a76b3754d8eb10a5f9b6267a57517b9231eb2fe8254ab175df8a80fa8c8`, Apache-2.0, upstream revision `60d4dc8a436fb9365491567ec21d073e924e3c6d`). Its one-method [`upstream.diff`](../../third_party/microsandbox-0.7.2/upstream.diff) (SHA-256 `7cd71253c1d0c7d2b13e90e957019eec1c3c4aea0929f0a5a0c254bbd86d6cb4`) adds `LocalBackendBuilder::build_lazy_isolated(self) -> LocalBackend` using `build_lazy_from(GlobalConfig::default())`. `Cargo.toml` selects this tree through `[patch.crates-io]` and `Cargo.lock` records the path source. See [`PATCH.md`](../../third_party/microsandbox-0.7.2/PATCH.md) for provenance and the Apache license copy. | A pinned upstream SDK release with equivalent isolated-builder semantics. | Update the dependency and lockfile, remove the path patch/vendor tree, then rerun hostile installed-config tests, SDK runtime origin/path checks, native installed-runtime coexistence and guest boots on Apple Silicon and both Linux KVM targets. Do not claim native coexistence from a feature compile alone. |
+| Microsandbox visible-SNI network enforcement (WI 0121) | `third_party/microsandbox-network-0.7.2/`, published crate SHA-256 `be4f1c9d36c1957b35d674a993a59c5db1741f47c96c952b491b09d9674b92d7`, Apache-2.0, upstream revision `60d4dc8a436fb9365491567ec21d073e924e3c6d`. Six Rust files add default-off `strict_sni` to config/builder/poll/TCP proxy and tighten suffix policies to require the exact claimed name's DNS/IP binding. [`upstream.diff`](../../third_party/microsandbox-network-0.7.2/upstream.diff) SHA-256 `993d00b0d99e436e2cebc72a8a5ccbadcfb458b8ba1d9ad4cb242bafdcc2e100`; [provenance and boundary](../../third_party/microsandbox-network-0.7.2/PATCH.md). Ordinary strict opaque-TLS refusal stays unchanged unless explicitly opted in; suffix-binding tightening applies in every mode. | A pinned upstream release with explicit visible-SNI enforcement and exact DNS binding without TLS interception. | Remove alongside the types patch after actual SDK TLS positive/negative, missing/wrong/shared-IP/sibling-binding, config roundtrip and native non-root guest network tests pass on Apple Silicon and Linux ARM64/x86_64 KVM. Do not infer encrypted HTTP authority or ECH inner-name enforcement, or native packet routing, from host-side TLS tests. |
+| Microsandbox network option transport (WI 0121) | `third_party/microsandbox-types-0.7.2/`, published crate SHA-256 `8f705cfd6b163fc5b00987c6cf6143b5ceed311b097e68926822b2d6daa4cfee`, Apache-2.0, same upstream revision. Three Rust files add default-false `strict_sni` to local/cloud NetworkSpec and preserve both conversions, preventing the SDK builder from silently dropping the network option. [`upstream.diff`](../../third_party/microsandbox-types-0.7.2/upstream.diff) SHA-256 `30bf86e5a7e58acbe889d3d05eb898795b3078dedc608d0435b252196c6eed4f`; [provenance](../../third_party/microsandbox-types-0.7.2/PATCH.md). | The paired upstream networking release must transport the explicit option through all configuration conversions. | Remove with the network patch only after actual SandboxBuilder NetworkConfig→NetworkSpec→NetworkConfig roundtrip, backward-compatible defaults and SDK/native enforcement tests pass. No enforcement by an unpatched cloud server is claimed. |
+
+The completion follow-up also adds an explicit normal Rustls dependency for
+the shared API/squad TLS server's ring provider and a feature-gated direct
+`microsandbox-network =0.7.2` edge for tests of the SDK policy evaluator, plus
+feature-gated `sqlx =0.9.0` with SQLite/Tokio for genuine driver transaction
+tests. These versions were already in the dependency graph. These are awman manifest
+and integration changes. The paired network/types patches above separately
+raise the carried dependency inventory to six. Native network and distribution gates
+remain required.
 
 The currently carried dependency sources and their existing patch notes are
 enumerated in [`third_party/README.md`](../../third_party/README.md),
 `third_party/sqlx-sqlite-0.9.0/PATCH.md`,
 `third_party/msb_krun-0.1.39/PATCH.md`, and
-`third_party/microsandbox-filesystem-0.7.2/PATCH.md`. No patch acceptance or
+`third_party/microsandbox-filesystem-0.7.2/PATCH.md`, plus the WI 0121 SDK
+patch at `third_party/microsandbox-0.7.2/PATCH.md` and paired network/types
+patches at `third_party/microsandbox-network-0.7.2/PATCH.md` and
+`third_party/microsandbox-types-0.7.2/PATCH.md`. No patch acceptance or
 release is assumed by WI 0119. The historical spike under
 `tools/oci-runtime-spike/` remains evidence only and is not a production
 runtime dependency.
@@ -193,7 +214,7 @@ runtime dependency.
 - Payload owner dropped too early, accidental copying/moving of a borrowed
   backing buffer, teardown after startup failure, and shared immutable payloads
   across separate VM worker processes.
-- Optimization/LTO/dead-stripping, macOS signing, Linux target ABI and differing
+- Optimization/LTO/dead-stripping, Linux target ABI and differing
   host page sizes. Test the real payload layout, not only a toy byte slice.
 - Existing users explicitly selecting a firmware DSO, defaults that discover
   one, consumers using other boot modes, and older launch/config producers.

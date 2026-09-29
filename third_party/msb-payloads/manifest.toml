@@ -4,6 +4,8 @@ libkrun_revision = "2bd0f84ad0956f3032e0490d3b8512b6851eca12"
 
 [targets."aarch64-unknown-linux-gnu"]
 status = "verified"
+architecture = "aarch64"
+kernel_alignment = 4096
 archive = "microsandbox-linux-aarch64.tar.gz"
 archive_sha256 = "d4de7814147b835a4b99e51e236c8b333340091e5727a0b45d7eb847d56b022a"
 firmware = "libkrunfw.so.5.6.1"
@@ -16,6 +18,8 @@ agent_sha256 = "ca6dde7a3000d8e93d5dca87fcebf77ebb36ce83377385bae2be70dbead9a5e1
 
 [targets."x86_64-unknown-linux-gnu"]
 status = "unverified"
+architecture = "x86_64"
+kernel_alignment = 4096
 archive = "microsandbox-linux-x86_64.tar.gz"
 archive_sha256 = "47c223e3ef5298abf05f47ed9f87981106e400d99bb3f1d042d4d6881346b18b"
 firmware = "libkrunfw.so.5.6.1"
@@ -28,6 +32,8 @@ agent_sha256 = "4d2b2aac7c4f2c54362f81b083c19715032d4f15468332bc1fa86bea29afe249
 
 [targets."aarch64-apple-darwin"]
 status = "unverified"
+architecture = "aarch64"
+kernel_alignment = 4096
 archive = "microsandbox-darwin-aarch64.tar.gz"
 archive_sha256 = "14a5910c6b395e9d50e001d81388cbe5366f18165c57ede4a5eda3e3315b7dbd"
 firmware = "libkrunfw.5.dylib"

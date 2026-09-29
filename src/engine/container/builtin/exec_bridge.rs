@@ -33,6 +33,7 @@ const STDERR: u8 = 3;
 const EXIT: u8 = 4;
 const FAILED: u8 = 5;
 const MAX_FRAME: usize = 1024 * 1024;
+const ATTACH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 fn failed() -> EngineError {
     EngineError::Other("builtin exec stream closed or failed before reporting exit status".into())
 }
@@ -225,8 +226,15 @@ pub fn run(
                     });
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // A slow consumer missed output; the agent is still running.
-                    tracing::warn!(skipped, "builtin exec output lagged; frames dropped");
+                    // An ACP frontend must never see a truncated stream followed
+                    // by a plausible exit status. The guest may still be alive;
+                    // this is a transport failure, not its exit code.
+                    tracing::warn!(skipped, "builtin exec output lagged; stream failed");
+                    frontend
+                        .report_status(AgentStatus::Failed("builtin exec output lagged".into()));
+                    break Err(EngineError::Other(
+                        "builtin exec output lagged; reconnect or restart the agent".into(),
+                    ));
                 }
                 Ok(ExecEvent::Failed) | Err(_) => {
                     frontend
@@ -311,6 +319,21 @@ async fn write_frame(
     writer.write_u32_le(bytes.len() as u32).await?;
     writer.write_all(bytes).await
 }
+async fn write_frame_bounded(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    tag: u8,
+    bytes: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::time::timeout(timeout, write_frame(writer, tag, bytes))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "attach client write timed out",
+            )
+        })?
+}
 async fn read_frame(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> std::io::Result<(u8, Vec<u8>)> {
@@ -343,12 +366,15 @@ async fn serve_client(
                     _=>return,
                 } break;},
                 event=events.recv()=>{
-                    // A slow attach client skips frames it missed; the agent is
-                    // still running, so this is never reported as a failure.
-                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) { continue; }
+                    // The stream is no longer complete. Send an explicit
+                    // terminal failure, then disconnect this client only.
+                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) {
+                        let _ = write_frame_bounded(&mut writer, FAILED, &[], ATTACH_WRITE_TIMEOUT).await;
+                        return;
+                    }
                     let (tag,bytes,terminal)=match event {Ok(ExecEvent::Stdout(b))=>(STDOUT,b,false),Ok(ExecEvent::Stderr(b))=>(STDERR,b,false),Ok(ExecEvent::Exited(c))=>(EXIT,c.to_le_bytes().to_vec(),true),_=>(FAILED,Vec::new(),true)};
                     let mut error=false;
-                    if bytes.is_empty(){error=write_frame(&mut writer,tag,&[]).await.is_err();}else{for chunk in bytes.chunks(MAX_FRAME){if write_frame(&mut writer,tag,chunk).await.is_err(){error=true;break;}}}
+                    if bytes.is_empty(){error=write_frame_bounded(&mut writer,tag,&[],ATTACH_WRITE_TIMEOUT).await.is_err();}else{for chunk in bytes.chunks(MAX_FRAME){if write_frame_bounded(&mut writer,tag,chunk,ATTACH_WRITE_TIMEOUT).await.is_err(){error=true;break;}}}
                     if error||terminal{return;}
                 }
             }
@@ -374,8 +400,12 @@ impl AgentInstance for AttachInstance {
         frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
         let path = self.paths.attach(&self.handle.id, &self.owner);
-        let stream = std::os::unix::net::UnixStream::connect(&path)
-            .map_err(|e| EngineError::io(&path, e))?;
+        let stream = std::os::unix::net::UnixStream::connect(&path).map_err(|error| {
+            EngineError::Container(format!(
+                "cannot attach to {}: no live attach endpoint ({error}); the launching awman must remain alive, and reattachment after its exit is unsupported",
+                self.handle.name
+            ))
+        })?;
         stream
             .set_nonblocking(true)
             .map_err(|e| EngineError::io(&path, e))?;
@@ -532,38 +562,64 @@ mod tests {
         assert!(!path.exists());
     }
     #[tokio::test]
-    async fn lagging_attach_client_still_receives_the_real_exit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("attach.sock");
+    async fn lagging_attach_client_gets_failure_and_never_a_clean_exit() {
+        let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (broadcast, receiver) = tokio::sync::broadcast::channel(2);
+        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
+        // Fill a two-slot channel before the client task can read it. A
+        // terminal exit follows the lost protocol bytes deliberately.
+        for byte in 0..8u8 {
+            let _ = broadcast.send(ExecEvent::Stdout(vec![byte]));
+        }
+        let _ = broadcast.send(ExecEvent::Exited(0));
+        let task = tokio::spawn(serve_client(
+            server,
+            receiver,
+            Arc::new(RecordingControl(commands)),
+        ));
+        assert_eq!(read_frame(&mut peer).await.unwrap(), (FAILED, Vec::new()));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read_frame(&mut peer).await.is_err());
+    }
+    #[tokio::test]
+    async fn lagging_primary_frontend_reports_transport_failure_not_guest_exit() {
         let (broadcast, events) = tokio::sync::broadcast::channel(2);
         let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        let session = ExecSession {
-            events,
-            broadcast,
-            control: Arc::new(RecordingControl(commands)),
-        };
-        let server = serve(&path, &session).unwrap();
-        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
-        // Let the server subscribe before flooding the 2-slot channel.
-        while session.broadcast.receiver_count() < 2 {
-            tokio::task::yield_now().await;
-        }
         for byte in 0..8u8 {
-            let _ = session.broadcast.send(ExecEvent::Stdout(vec![byte]));
+            let _ = broadcast.send(ExecEvent::Stdout(vec![byte]));
         }
-        let _ = session.broadcast.send(ExecEvent::Exited(0));
-        let last = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let (tag, bytes) = read_frame(&mut stream).await.unwrap();
-                if tag != STDOUT {
-                    return (tag, bytes);
-                }
-            }
-        })
-        .await
+        let _ = broadcast.send(ExecEvent::Exited(0));
+        let (frontend, peer) = crate::engine::container::builtin::testing::frontend(None);
+        let mut execution = run(
+            AgentHandle {
+                id: "lagging".into(),
+                name: "lagging".into(),
+                image_tag: "test".into(),
+                started_at: chrono::Utc::now(),
+            },
+            ExecSession {
+                events,
+                broadcast,
+                control: Arc::new(RecordingControl(commands)),
+            },
+            frontend,
+            None,
+            None,
+            false,
+            RunInput {
+                seeded_prompt: None,
+                leases: Vec::new(),
+            },
+        )
         .unwrap();
-        assert_eq!(last, (EXIT, 0_i32.to_le_bytes().to_vec()));
-        server.finish();
+        let error = execution.wait().await.unwrap_err().to_string();
+        assert!(error.contains("lagged"), "{error}");
+        assert!(peer.statuses.lock().unwrap().iter().any(
+            |status| matches!(status, AgentStatus::Failed(message) if message.contains("lagged"))
+        ));
     }
     #[tokio::test]
     async fn attach_disconnect_never_signals_target() {
@@ -612,6 +668,15 @@ mod tests {
         writer.write_u8(STDOUT).await.unwrap();
         writer.write_u32_le((MAX_FRAME + 1) as u32).await.unwrap();
         assert!(read_frame(&mut reader).await.is_err());
+    }
+    #[tokio::test]
+    async fn full_attach_buffer_times_out_instead_of_hanging() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error =
+            write_frame_bounded(&mut writer, STDOUT, &[42; 1024], Duration::from_millis(20))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }
 

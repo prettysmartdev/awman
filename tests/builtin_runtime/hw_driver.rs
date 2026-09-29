@@ -344,6 +344,7 @@ mod driver {
         };
         std::fs::create_dir_all(&args.work).unwrap();
         let settings = BuiltinRuntimeSettings {
+            network: Default::default(),
             state_dir: args.state.clone(),
             vcpus: if args.scenario == "limits" { 1 } else { 2 },
             memory_mib: if args.scenario == "limits" { 512 } else { 1024 },

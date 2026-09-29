@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::data::config::builtin_network::BuiltinNetworkSettings;
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::config::env::test_isolation_active;
 use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
@@ -78,6 +79,10 @@ pub struct BuiltinRuntimeSettings {
     pub images: BTreeMap<String, ImageSourceSpec>,
     /// Registry host settings keyed by `host[:port]`.
     pub registries: BTreeMap<String, RegistryHostConfig>,
+    /// Guest network policy, already layered and validated
+    /// (`EffectiveConfig::builtin_network`). The backend compiles it into
+    /// every VM it creates; there is no per-launch override.
+    pub network: BuiltinNetworkSettings,
     /// The ambient `MSB_*` overrides present in the environment. Any entry
     /// makes the backend refuse to start (`AmbientRuntimeOverride`).
     pub ambient_overrides: Vec<&'static str>,
@@ -89,7 +94,8 @@ pub struct BuiltinRuntimeSettings {
 impl BuiltinRuntimeSettings {
     /// Resolve from the effective config (repo `builtin` block merged over the
     /// global one) and its environment snapshot. Invalid values — zero
-    /// resources, a meaningless image source — are a configuration error.
+    /// resources, a meaningless image source, a network block that
+    /// widens the global policy or contradicts itself — are a configuration error.
     pub fn resolve(config: &EffectiveConfig) -> Result<Self, EngineError> {
         let builtin = config.builtin_runtime();
         builtin.validate().map_err(EngineError::Config)?;
@@ -101,6 +107,7 @@ impl BuiltinRuntimeSettings {
             image_source: builtin.image_source,
             images: builtin.images,
             registries: builtin.registries,
+            network: config.builtin_network().map_err(EngineError::Config)?,
             ambient_overrides: env.ambient_msb_overrides(),
             test_isolation: test_isolation_active() && !env.test_builtin(),
         })
@@ -441,6 +448,15 @@ impl AgentRuntimeEngine for ContainerRuntime {
         self.backend.import_image(request, sink)
     }
 
+    fn import_image_cancellable(
+        &self,
+        request: &ImageImportRequest,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.backend.import_image_cancellable(request, sink, cancel)
+    }
+
     fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
         self.backend.image_identity(tag)
     }
@@ -570,6 +586,7 @@ mod tests {
         assert_eq!(settings.memory_mib, DEFAULT_MEMORY_MIB);
         assert_eq!(settings.ambient_overrides, vec![MSB_PATH]);
         assert!(settings.test_isolation, "unit tests are always isolated");
+        assert_eq!(settings.network, BuiltinNetworkSettings::default());
 
         let invalid = effective(BuiltinRuntimeConfig {
             vcpus: Some(0),
@@ -577,6 +594,53 @@ mod tests {
         });
         assert!(matches!(
             BuiltinRuntimeSettings::resolve(&invalid),
+            Err(EngineError::Config(_))
+        ));
+
+        // A repo network block may narrow the global policy but never widen
+        // it; a widening request is a configuration error, not a downgrade.
+        let layered = |global: &str, repo: &str| {
+            EffectiveConfig::new(
+                FlagConfig::default(),
+                env.clone(),
+                RepoConfig {
+                    builtin: Some(serde_json::from_str(repo).unwrap()),
+                    ..Default::default()
+                },
+                GlobalConfig {
+                    builtin: Some(serde_json::from_str(global).unwrap()),
+                    ..Default::default()
+                },
+            )
+        };
+        let narrowed = BuiltinRuntimeSettings::resolve(&layered(
+            r#"{"network":{"hostPorts":[8765]}}"#,
+            r#"{"network":{"mode":"allowlist","allow":["api.example.com"]}}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            narrowed.network.mode,
+            crate::data::config::NetworkMode::Allowlist
+        );
+        assert_eq!(narrowed.network.host_ports, vec![8765]);
+        for widen in [
+            (
+                r#"{"network":{"mode":"none"}}"#,
+                r#"{"network":{"mode":"public"}}"#,
+            ),
+            (r#"{}"#, r#"{"network":{"hostPorts":[8765]}}"#),
+        ] {
+            assert!(matches!(
+                BuiltinRuntimeSettings::resolve(&layered(widen.0, widen.1)),
+                Err(EngineError::Config(message)) if message.contains("builtin.network")
+            ));
+        }
+        let too_small = effective(BuiltinRuntimeConfig {
+            memory_mib: Some(64),
+            ..Default::default()
+        });
+        assert!(matches!(
+            BuiltinRuntimeSettings::resolve(&too_small),
             Err(EngineError::Config(_))
         ));
 

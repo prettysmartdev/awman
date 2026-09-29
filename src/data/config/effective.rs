@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::data::config::builtin_network::{BuiltinNetworkConfig, BuiltinNetworkSettings};
 use crate::data::config::builtin_runtime::{BuiltinRuntimeConfig, DEFAULT_STATE_SUBDIR};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
@@ -248,6 +249,19 @@ impl EffectiveConfig {
             Some(repo) => repo.merged_over(&global),
             None => global,
         }
+    }
+
+    /// Effective builtin network policy: the global `builtin.network` block is
+    /// the ceiling and the repo block may only narrow it (see
+    /// [`BuiltinNetworkConfig::resolve`]). Errors name the offending key.
+    pub fn builtin_network(&self) -> Result<BuiltinNetworkSettings, String> {
+        BuiltinNetworkConfig::resolve(
+            self.global
+                .builtin
+                .as_ref()
+                .and_then(|b| b.network.as_ref()),
+            self.repo.builtin.as_ref().and_then(|b| b.network.as_ref()),
+        )
     }
 
     /// Effective builtin-runtime state directory:

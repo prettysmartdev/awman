@@ -93,6 +93,25 @@ pub fn validate_archive(
     limits: &AcquireLimits,
     progress: &mut dyn FnMut(AcquireProgress),
 ) -> Result<ValidatedArchive, EngineError> {
+    validate_archive_controlled(
+        path,
+        platform,
+        wanted_refs,
+        limits,
+        progress,
+        &Default::default(),
+    )
+}
+
+pub(crate) fn validate_archive_controlled(
+    path: &Path,
+    platform: &OciPlatform,
+    wanted_refs: &[String],
+    limits: &AcquireLimits,
+    progress: &mut dyn FnMut(AcquireProgress),
+    control: &super::retry::OperationControl,
+) -> Result<ValidatedArchive, EngineError> {
+    control.check()?;
     let reject = |reason: String| EngineError::ImageArchiveRejected {
         path: path.to_path_buf(),
         reason,
@@ -107,7 +126,7 @@ pub fn validate_archive(
         )));
     }
 
-    let outer = scan_outer(path, limits)?;
+    let outer = scan_outer_controlled(path, limits, control)?;
     let selected = if outer.entries.contains_key("manifest.json") {
         select_docker_save(path, &outer, platform, wanted_refs)?
     } else if outer.entries.contains_key("oci-layout") && outer.entries.contains_key("index.json") {
@@ -136,10 +155,11 @@ pub fn validate_archive(
         )));
     }
 
-    scan_layers(path, &outer, &selected, limits)?;
+    scan_layers(path, &outer, &selected, limits, control)?;
     progress(AcquireProgress::Verifying {
         digest: selected.manifest_digest.clone(),
     });
+    control.check()?;
 
     Ok(ValidatedArchive {
         format: selected.format,
@@ -160,14 +180,25 @@ pub fn prepare_runtime_archive(
     tag: &str,
     limits: &AcquireLimits,
 ) -> Result<(tempfile::TempDir, std::path::PathBuf), EngineError> {
+    prepare_runtime_archive_controlled(acquired, tag, limits, &Default::default())
+}
+
+pub(crate) fn prepare_runtime_archive_controlled(
+    acquired: &crate::engine::oci::AcquiredImage,
+    tag: &str,
+    limits: &AcquireLimits,
+    control: &super::retry::OperationControl,
+) -> Result<(tempfile::TempDir, std::path::PathBuf), EngineError> {
+    control.check()?;
     let path = &acquired.archive;
     let refs = [tag.to_string(), acquired.identity.reference.clone()];
-    let validated = validate_archive(
+    let validated = validate_archive_controlled(
         path,
         &acquired.identity.platform,
         &refs,
         limits,
         &mut |_| {},
+        control,
     )?;
     if validated.manifest_digest != acquired.identity.manifest_digest
         || validated.config_digest != acquired.identity.config_digest
@@ -177,7 +208,7 @@ pub fn prepare_runtime_archive(
             reason: "runtime image selection differs from acquired identity".into(),
         });
     }
-    let outer = scan_outer(path, limits)?;
+    let outer = scan_outer_controlled(path, limits, control)?;
     let selected = match validated.format {
         ArchiveFormat::DockerSave => select_docker_save(path, &outer, &validated.platform, &refs)?,
         ArchiveFormat::OciLayout => select_oci_layout(path, &outer, &validated.platform, &refs)?,
@@ -249,7 +280,9 @@ pub fn prepare_runtime_archive(
         }
         // Seek back for aliases of a legacy docker-save layer. No blob-sized
         // allocation and no extraction through archive paths or symlinks.
-        for entry in open_archive(path)?.entries().map_err(&io_error)? {
+        let input = File::open(path).map_err(&io_error)?;
+        let mut input = tar::Archive::new(control.reader(BufReader::new(input)));
+        for entry in input.entries().map_err(&io_error)? {
             let mut entry = entry.map_err(&io_error)?;
             let Some(name) = normalize_outer_name(&entry.path_bytes()).map_err(|reason| {
                 EngineError::ImageArchiveRejected {
@@ -267,8 +300,13 @@ pub fn prepare_runtime_archive(
                     use std::io::{Seek, SeekFrom};
                     let mut input = File::open(path).map_err(&io_error)?;
                     input.seek(SeekFrom::Start(offset)).map_err(&io_error)?;
-                    append_runtime_member(&mut builder, &destination, size, input.take(size))
-                        .map_err(&io_error)?;
+                    append_runtime_member(
+                        &mut builder,
+                        &destination,
+                        size,
+                        control.reader(input.take(size)),
+                    )
+                    .map_err(&io_error)?;
                 }
                 std::io::copy(&mut entry, &mut std::io::sink()).map_err(&io_error)?;
             }
@@ -286,7 +324,9 @@ pub fn prepare_runtime_archive(
         return Err(error);
     }
     write_result?;
+    control.check()?;
     sink.finish()?;
+    control.check()?;
     Ok((dir, output))
 }
 
@@ -344,17 +384,22 @@ impl OuterScan {
     }
 }
 
-fn open_archive(path: &Path) -> Result<tar::Archive<BufReader<File>>, EngineError> {
-    let file = File::open(path).map_err(|e| EngineError::io(path, e))?;
-    Ok(tar::Archive::new(BufReader::new(file)))
+#[cfg(test)]
+fn scan_outer(path: &Path, limits: &AcquireLimits) -> Result<OuterScan, EngineError> {
+    scan_outer_controlled(path, limits, &Default::default())
 }
 
-fn scan_outer(path: &Path, limits: &AcquireLimits) -> Result<OuterScan, EngineError> {
+fn scan_outer_controlled(
+    path: &Path,
+    limits: &AcquireLimits,
+    control: &super::retry::OperationControl,
+) -> Result<OuterScan, EngineError> {
     let reject = |reason: String| EngineError::ImageArchiveRejected {
         path: path.to_path_buf(),
         reason,
     };
-    let mut archive = open_archive(path)?;
+    let file = File::open(path).map_err(|e| EngineError::io(path, e))?;
+    let mut archive = tar::Archive::new(control.reader(BufReader::new(file)));
     let mut entries = BTreeMap::new();
     let mut docs = HashMap::new();
     let mut doc_total = 0u64;
@@ -1048,28 +1093,9 @@ fn ref_names(annotations: &BTreeMap<String, String>) -> Vec<String> {
 }
 
 fn check_layer_media_type(path: &Path, media_type: &str) -> Result<(), EngineError> {
-    const OK: &[&str] = &[
-        "application/vnd.oci.image.layer.v1.tar",
-        "application/vnd.oci.image.layer.v1.tar+gzip",
-        "application/vnd.docker.image.rootfs.diff.tar.gzip",
-        "application/vnd.docker.image.rootfs.diff.tar",
-    ];
-    if OK.contains(&media_type) {
-        return Ok(());
-    }
-    let reason = if media_type.contains("zstd") {
-        format!(
-            "layer media type `{media_type}` (zstd) is not supported; re-export with gzip layers"
-        )
-    } else if media_type.contains("nondistributable") || media_type.contains("foreign") {
-        format!("non-distributable layer `{media_type}` is not supported")
-    } else {
-        format!("unknown layer media type `{media_type}`")
-    };
-    Err(EngineError::ImageArchiveRejected {
-        path: path.to_path_buf(),
-        reason,
-    })
+    crate::engine::oci::format::classify_layer_media_type(media_type)
+        .map(|_| ())
+        .map_err(|refusal| refusal.into_error(path))
 }
 
 /// Choose exactly one platform-matching image. More than one distinct
@@ -1148,6 +1174,7 @@ fn scan_layers(
     outer: &OuterScan,
     selected: &Selected,
     limits: &AcquireLimits,
+    control: &super::retry::OperationControl,
 ) -> Result<(), EngineError> {
     // Which real entries hold layers, and which diff_ids each must produce.
     let mut wanted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -1168,7 +1195,8 @@ fn scan_layers(
         path: path.to_path_buf(),
         reason,
     };
-    let mut archive = open_archive(path)?;
+    let file = File::open(path).map_err(|e| EngineError::io(path, e))?;
+    let mut archive = tar::Archive::new(control.reader(BufReader::new(file)));
     let iter = archive
         .entries()
         .map_err(|e| reject(format!("unreadable tar: {e}")))?;
@@ -1183,7 +1211,7 @@ fn scan_layers(
         let Some(diff_ids) = wanted.get(&name) else {
             continue;
         };
-        let (actual, ops) = scan_layer(path, &name, entry, limits.max_layer_bytes)?;
+        let (actual, ops) = scan_layer(path, &name, entry, limits.max_layer_bytes, control)?;
         summaries.insert(name.clone(), ops);
         // Several layers may share one blob, but one blob has one diff_id.
         if diff_ids.len() != 1 || !diff_ids.contains(&actual) {
@@ -1224,6 +1252,7 @@ fn scan_layer(
     name: &str,
     mut entry: impl Read,
     max_layer_bytes: u64,
+    control: &super::retry::OperationControl,
 ) -> Result<(String, Vec<PathOp>), EngineError> {
     let reject = |reason: String| EngineError::ImageArchiveRejected {
         path: path.to_path_buf(),
@@ -1240,16 +1269,15 @@ fn scan_layer(
     }
     let head = std::io::Cursor::new(magic[..got].to_vec());
     let chained = head.chain(entry);
-    let decompressed: Box<dyn Read> = if got >= 2 && magic[..2] == [0x1f, 0x8b] {
-        Box::new(flate2::read::MultiGzDecoder::new(chained))
-    } else if got == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        return Err(reject(
-            "zstd-compressed layers are not supported; re-export with gzip layers".into(),
-        ));
-    } else {
-        Box::new(chained)
+    use crate::engine::oci::format::{classify_layer_magic, LayerCompression};
+    let compression =
+        classify_layer_magic(&magic[..got]).map_err(|refusal| reject(refusal.reason()))?;
+    let decompressed: Box<dyn Read> = match compression {
+        LayerCompression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(chained)),
+        LayerCompression::None => Box::new(chained),
+        LayerCompression::Zstd => unreachable!("zstd is refused by classify_layer_magic"),
     };
-    let hashing = HashingReader::new(decompressed, max_layer_bytes);
+    let hashing = HashingReader::new(control.reader(decompressed), max_layer_bytes);
     let mut layer = tar::Archive::new(hashing);
     let ops = {
         let iter = layer
@@ -1517,19 +1545,27 @@ pub(super) fn stage_local_archive(
             reason: "not a regular file".into(),
         });
     }
-    let mut magic = [0u8; 2];
-    let n = file
-        .read(&mut magic)
-        .map_err(|e| EngineError::io(source, e))?;
+    use crate::engine::oci::format::{classify_archive_magic, ArchiveContainer};
+    let mut magic = [0u8; 6];
+    let mut n = 0;
+    while n < magic.len() {
+        match file.read(&mut magic[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(EngineError::io(source, e)),
+        }
+    }
+    let container =
+        classify_archive_magic(&magic[..n]).map_err(|refusal| refusal.into_error(source))?;
     let head = std::io::Cursor::new(magic[..n].to_vec());
     let chained = head.chain(file);
-    let mut reader: Box<dyn Read> = if n == 2 && magic == [0x1f, 0x8b] {
-        Box::new(HashingReader::new(
+    let mut reader: Box<dyn Read> = match container {
+        ArchiveContainer::GzipTar => Box::new(HashingReader::new(
             flate2::read::MultiGzDecoder::new(chained),
             max_bytes,
-        ))
-    } else {
-        Box::new(chained)
+        )),
+        _ => Box::new(chained),
     };
     sink.copy_from(&mut reader).map_err(|e| match e {
         EngineError::Network(msg) => EngineError::ImageArchiveRejected {

@@ -9,7 +9,7 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
-.PHONY: all build install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference
+.PHONY: all build install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
 
 all: build
 
@@ -24,6 +24,14 @@ build:
 payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 	@case "$$(uname -s)" in Linux) bash third_party/native/libcap-ng/build.sh "$$(rustc -vV | sed -n 's/^host: //p')";; esac
+
+# Explicit verification entrypoints; native hardware targets fail closed when
+# KVM/HVF or the fixture is absent. `TARGET` is a Rust target triple.
+reproducible-build-audit:
+	bash tools/reproducible-build-audit.sh "$(or $(OUTPUT),reproducible-build-audit)"
+
+native-builtin-ci:
+	bash tools/native-builtin-ci.sh "$(TARGET)"
 
 install: build
 	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
@@ -44,7 +52,7 @@ test:
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet
 
 test-fast:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet -- --skip docker --skip real_git --skip real_network --skip builtin_hw
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet -- --skip real_git --skip real_network --skip builtin_hw
 
 # Only the targets that exercise the builtin runtime: every test executable links the
 # whole embedded VM stack (hundreds of MB each in debug), so building all of them
@@ -52,6 +60,7 @@ test-fast:
 # `--examples` builds the real-guest driver used by the builtin_hw_* tests.
 test-builtin:
 	@AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --quiet
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/test-builtin-network.sh
 
 test-full:
 	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet

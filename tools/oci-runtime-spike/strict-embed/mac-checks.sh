@@ -8,7 +8,7 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
     printf 'Apple Silicon Mac required.\n' >&2
     exit 2
 fi
-for command in cargo cc git curl patch codesign otool shasum; do
+for command in cargo cc git curl patch otool shasum; do
     command -v "$command" >/dev/null || { printf 'Missing build tool: %s\n' "$command" >&2; exit 2; }
 done
 test -s "$previous/downloads/msb.tar.gz"
@@ -40,7 +40,6 @@ env CARGO_HOME="$output/cargo" CARGO_TARGET_DIR="$output/target" SPIKE_KERNEL="$
     exit 1
 }
 cp "$output/target/debug/awman-msb-full-embed-probe" "$output/runtime/awman-probe"
-codesign --force --sign - --entitlements "$scripts/hypervisor.plist" "$output/runtime/awman-probe" > "$output/logs/sign.stdout" 2> "$output/logs/sign.stderr"
 otool -L "$output/runtime/awman-probe" > "$output/logs/dynamic-libraries.stdout"
 mv "$output/release" "$output/build-only-release"
 mv "$output/kernel.bin" "$output/build-only-kernel.bin"

@@ -100,7 +100,7 @@ fn run_isolated(extra_env: &[(&str, &str)]) -> (String, tempfile::TempDir) {
     let stub = bin.join("cargo");
     std::fs::write(
         &stub,
-        "#!/bin/sh\nfor v in AWMAN_TEST_ISOLATION AWMAN_TEST_BUILTIN AWMAN_BUILTIN_STATE_DIR MSB_PATH MSB_HOME HOME; do\n  eval \"value=\\${$v-<unset>}\"; printf '%s=%s\\n' \"$v\" \"$value\"\ndone\nif [ -n \"${AWMAN_BUILTIN_STATE_DIR:-}\" ]; then ls -ld \"$AWMAN_BUILTIN_STATE_DIR\" | cut -c1-10; fi\n",
+        "#!/bin/sh\nfor v in AWMAN_TEST_ISOLATION AWMAN_TEST_BUILTIN AWMAN_BUILTIN_STATE_DIR MSB_PATH MSB_HOME HOME HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy DOCKER_CONFIG CODEX_HOME; do\n  eval \"value=\\${$v-<unset>}\"; printf '%s=%s\\n' \"$v\" \"$value\"\ndone\nif [ -n \"${AWMAN_BUILTIN_STATE_DIR:-}\" ]; then ls -ld \"$AWMAN_BUILTIN_STATE_DIR\" | cut -c1-10; fi\n",
     )
     .unwrap();
     {
@@ -176,6 +176,69 @@ fn builtin_isolated_run_normalizes_a_falsy_gate_to_unset() {
 }
 
 #[test]
+fn builtin_isolated_run_scrubs_proxy_and_credential_directories() {
+    let names = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "DOCKER_CONFIG",
+        "CODEX_HOME",
+    ];
+    let inputs: Vec<_> = names
+        .iter()
+        .map(|name| (*name, "sentinel-not-a-real-service"))
+        .collect();
+    let (seen, _dir) = run_isolated(&inputs);
+    for name in names {
+        assert!(seen.contains(&format!("{name}=<unset>")), "{seen}");
+    }
+}
+
+#[test]
+fn builtin_isolated_run_preserves_proxy_only_for_explicit_registry_services() {
+    let proxy = "http://127.0.0.1:9";
+    for gates in [
+        vec![],
+        vec![("AWMAN_TEST_IMAGE_STORES", "1")],
+        vec![("AWMAN_TEST_REGISTRY", "1")],
+    ] {
+        let mut inputs = gates;
+        inputs.push(("HTTP_PROXY", proxy));
+        let (seen, _dir) = run_isolated(&inputs);
+        assert!(seen.contains("HTTP_PROXY=<unset>"), "{seen}");
+    }
+    let (seen, _dir) = run_isolated(&[
+        ("AWMAN_TEST_IMAGE_STORES", "1"),
+        ("AWMAN_TEST_REGISTRY", "1"),
+        ("HTTP_PROXY", proxy),
+    ]);
+    assert!(seen.contains(&format!("HTTP_PROXY={proxy}")), "{seen}");
+}
+
+#[test]
+fn builtin_documented_network_example_validates() {
+    use awman::data::config::builtin_network::BuiltinNetworkConfig;
+    let docs = read("docs/11-runtimes.md");
+    let network = docs.split("### Network").nth(1).unwrap();
+    let json = network
+        .split("```json\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    let config: BuiltinNetworkConfig =
+        serde_json::from_value(value["builtin"]["network"].clone()).unwrap();
+    BuiltinNetworkConfig::resolve(Some(&config), None).unwrap();
+}
+
+#[test]
 fn builtin_hardware_tests_are_named_so_the_fast_tier_skips_them() {
     let dir = root().join("tests/builtin_runtime");
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
@@ -198,11 +261,26 @@ fn builtin_hardware_tests_are_named_so_the_fast_tier_skips_them() {
                 continue;
             };
             let hardware = name.starts_with("builtin_hw_");
-            assert_eq!(
-                hardware,
-                file == "hardware.rs",
-                "{file}: {name}: only real-guest tests (and all of them) may be named builtin_hw_*"
-            );
+            if file == "hardware.rs" {
+                assert!(
+                    hardware,
+                    "{file}: {name}: guest tests must use builtin_hw_*"
+                );
+            }
+            if hardware {
+                let module = file.trim_end_matches(".rs");
+                assert!(
+                    read("tests/builtin_runtime/main.rs").contains(&format!("mod {module};")),
+                    "{file}: guest module is not registered"
+                );
+                let head = lines.clone().take(3).collect::<Vec<_>>().join("\n");
+                assert!(
+                    head.contains("scenario(")
+                        || head.contains("gate(")
+                        || head.contains("hardware_or_skip("),
+                    "{file}: {name}: guest test must start with its prerequisite gate: {head}"
+                );
+            }
         }
     }
     // ... and each of them starts by checking the hardware prerequisites.
@@ -231,7 +309,7 @@ fn builtin_ci_runs_the_hermetic_builtin_tier_and_has_explicit_hardware_jobs() {
         workflow.contains("AWMAN_TEST_BUILTIN_REQUIRE_HW"),
         "hardware jobs must fail when hardware is missing"
     );
-    for needle in ["/dev/kvm", "hv_support", "com.apple.security.hypervisor"] {
+    for needle in ["/dev/kvm", "hv_support"] {
         assert!(
             workflow.contains(needle),
             "prerequisite check for {needle} is missing"

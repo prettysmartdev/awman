@@ -31,9 +31,17 @@ pub fn dispatch(
                     | "MSB_BACKEND"
                     | "MSB_CONFIG_PATH"
                     | "MSB_PROFILE"
+                    | "MSB_CACHE_DIR"
+                    | "MSB_SANDBOXES_DIR"
+                    | "MSB_VOLUMES_DIR"
+                    | "MSB_SNAPSHOTS_DIR"
+                    | "MSB_LOGS_DIR"
+                    | "MSB_SECRETS_DIR"
             )
         ) {
-            eprintln!("awman: ambient Microsandbox overrides are forbidden for the private embedded worker");
+            eprintln!(
+                "awman: ambient Microsandbox overrides are forbidden for the private embedded worker"
+            );
             std::process::exit(64);
         }
     }
@@ -86,8 +94,15 @@ fn enter() -> ! {
         lifecycle_lock: args.lifecycle_lock_fd,
         startup: args.startup_fd,
     };
-    if !descriptors.valid() || args.config_file.is_some() || args.restore {
-        eprintln!("awman: private worker requires distinct inherited descriptors; file transport and restore are disabled");
+    if !descriptors.valid()
+        || args.config_file.is_some()
+        || args.restore
+        || !descriptors.sdk_slots()
+        || !descriptors.open_with_expected_roles()
+    {
+        eprintln!(
+            "awman: invalid private worker descriptors (open inherited config, pipes and lock required)"
+        );
         std::process::exit(64);
     }
     if let Err(error) = kernel::register() {
@@ -141,6 +156,79 @@ impl WorkerDescriptors {
         fds.sort_unstable();
         fds.iter().all(|fd| *fd >= 3) && fds.windows(2).all(|pair| pair[0] != pair[1])
     }
+
+    /// SDK 0.7.2 maps these descriptors to fixed slots before exec. Checking
+    /// the slots prevents a caller from naming a different open host handle.
+    fn sdk_slots(&self) -> bool {
+        self.config == Some(96)
+            && self.parent_watch == Some(97)
+            && self.lifecycle_lock == Some(99)
+            && self.startup.is_none_or(|fd| fd == 98)
+    }
+
+    #[cfg(unix)]
+    fn open_with_expected_roles(&self) -> bool {
+        self.config
+            .is_some_and(|fd| descriptor_role(fd, FdRole::Config))
+            && self
+                .parent_watch
+                .is_some_and(|fd| descriptor_role(fd, FdRole::PipeRead))
+            && self
+                .lifecycle_lock
+                .is_some_and(|fd| descriptor_role(fd, FdRole::Lock))
+            && self
+                .startup
+                .is_none_or(|fd| descriptor_role(fd, FdRole::PipeWrite))
+    }
+}
+
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
+#[derive(Clone, Copy)]
+enum FdRole {
+    Config,
+    PipeRead,
+    PipeWrite,
+    Lock,
+}
+
+/// Probe raw inherited numbers without taking ownership. A safe `BorrowedFd`
+/// cannot be made from an unverified number: its constructor requires an open
+/// fd, precisely what this probe must establish. These libc calls neither
+/// close nor transfer the descriptor. No descriptor number enters a diagnostic.
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
+#[allow(unsafe_code)]
+fn descriptor_role(fd: i32, role: FdRole) -> bool {
+    if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return false;
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return false;
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: fstat returned success and initialized the complete stat struct.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_uid != nix::unistd::geteuid().as_raw() {
+        return false;
+    }
+    let kind = stat.st_mode & libc::S_IFMT;
+    let access = flags & libc::O_ACCMODE;
+    match role {
+        FdRole::Config => kind == libc::S_IFREG && stat.st_nlink == 0 && access != libc::O_WRONLY,
+        FdRole::PipeRead => kind == libc::S_IFIFO && access == libc::O_RDONLY,
+        FdRole::PipeWrite => kind == libc::S_IFIFO && access == libc::O_WRONLY,
+        FdRole::Lock => {
+            kind == libc::S_IFREG
+                && stat.st_nlink == 1
+                && stat.st_mode & 0o077 == 0
+                && access == libc::O_RDWR
+        }
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +279,55 @@ mod tests {
         assert!(!descriptors(Some(3), Some(3), Some(4), None).valid());
         assert!(!descriptors(Some(3), Some(5), Some(4), Some(5)).valid());
         assert!(!descriptors(Some(3), Some(5), Some(4), Some(0)).valid());
+    }
+
+    #[test]
+    fn sdk_slots_reject_swapped_or_arbitrary_descriptors() {
+        assert!(descriptors(Some(96), Some(97), Some(99), None).sdk_slots());
+        assert!(descriptors(Some(96), Some(97), Some(99), Some(98)).sdk_slots());
+        assert!(!descriptors(Some(97), Some(96), Some(99), None).sdk_slots());
+        assert!(!descriptors(Some(3), Some(4), Some(5), None).sdk_slots());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_fd_probe_checks_open_state_type_and_access() {
+        use std::os::fd::AsRawFd;
+        let (read, write) = nix::unistd::pipe().unwrap();
+        let (watch_read, _watch_write) = nix::unistd::pipe().unwrap();
+        let config = tempfile::tempfile().unwrap();
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let lock_fd = lock.as_file().as_raw_fd();
+        let readonly = std::fs::File::open(lock.path()).unwrap();
+        assert!(descriptor_role(config.as_raw_fd(), FdRole::Config));
+        assert!(!descriptor_role(lock_fd, FdRole::Config));
+        assert!(!descriptor_role(read.as_raw_fd(), FdRole::Config));
+        assert!(descriptor_role(read.as_raw_fd(), FdRole::PipeRead));
+        assert!(descriptor_role(write.as_raw_fd(), FdRole::PipeWrite));
+        assert!(descriptor_role(lock_fd, FdRole::Lock));
+        assert!(!descriptor_role(read.as_raw_fd(), FdRole::Lock));
+        assert!(!descriptor_role(write.as_raw_fd(), FdRole::PipeRead));
+        assert!(!descriptor_role(lock_fd, FdRole::PipeRead));
+        assert!(!descriptor_role(readonly.as_raw_fd(), FdRole::Lock));
+        let valid = descriptors(
+            Some(config.as_raw_fd()),
+            Some(watch_read.as_raw_fd()),
+            Some(lock_fd),
+            Some(write.as_raw_fd()),
+        );
+        assert!(valid.valid() && valid.open_with_expected_roles());
+        let wrong = descriptors(
+            Some(read.as_raw_fd()),
+            Some(watch_read.as_raw_fd()),
+            Some(lock_fd),
+            None,
+        );
+        assert!(!wrong.open_with_expected_roles());
+        let closed = read.as_raw_fd();
+        drop(read);
+        assert!(!descriptor_role(closed, FdRole::PipeRead));
+        let closed_set = descriptors(Some(config.as_raw_fd()), Some(closed), Some(lock_fd), None);
+        assert!(!closed_set.open_with_expected_roles());
     }
 
     #[test]

@@ -262,6 +262,18 @@ pub trait AgentRuntimeEngine: Send + Sync {
         })
     }
 
+    /// Import with a caller-owned cancellation signal. Build-only backends keep
+    /// their existing unsupported result; importing backends override this.
+    fn import_image_cancellable(
+        &self,
+        request: &ImageImportRequest,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        cancel.check()?;
+        self.import_image(request, sink)
+    }
+
     /// Content identity (digests, platform, source) of a cached image, when
     /// the runtime records one. `Ok(None)`: no identity is recorded, which
     /// is always the case for build runtimes.

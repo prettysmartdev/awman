@@ -1,5 +1,6 @@
 //! Transport boundary: runtime policy and frontend I/O never depend on SDK types.
 use crate::data::session::AgentHandle;
+use crate::engine::container::builtin::network::NetworkPlan;
 use crate::engine::{agent_runtime::execution::AgentStats, error::EngineError};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -12,6 +13,42 @@ pub struct SandboxSpec {
     pub mount_owner: Option<(u32, u32)>,
     pub vcpus: u8,
     pub memory_mib: u32,
+    /// Compiled network policy. The driver applies all of it or refuses to
+    /// create the VM; it never falls back to the SDK's defaults.
+    pub network: NetworkPlan,
+}
+impl SandboxSpec {
+    /// Refusals every driver applies before creating a VM. Each mount must be
+    /// a regular file or directory: a Unix socket (such as the Docker
+    /// socket), FIFO or device node shared into a guest is not a working or
+    /// sanctioned bridge, so it is refused rather than passed through.
+    pub fn check(&self) -> Result<(), EngineError> {
+        if self.vcpus == 0 {
+            return Err(EngineError::Config(
+                "builtin VM needs at least one vCPU".into(),
+            ));
+        }
+        if self.memory_mib < crate::data::config::builtin_runtime::MIN_MEMORY_MIB {
+            return Err(EngineError::Config(format!(
+                "builtin VM memory {} MiB is below the {} MiB minimum",
+                self.memory_mib,
+                crate::data::config::builtin_runtime::MIN_MEMORY_MIB
+            )));
+        }
+        for mount in &self.mounts {
+            let metadata =
+                std::fs::metadata(&mount.host).map_err(|e| EngineError::io(&mount.host, e))?;
+            if !metadata.is_file() && !metadata.is_dir() {
+                return Err(EngineError::Config(format!(
+                    "cannot share {} into the guest at {}: only regular files and directories can \
+                     be mounted; sockets such as the Docker socket are not bridged",
+                    mount.host.display(),
+                    mount.guest
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Clone)]
 pub struct MountSpec {
@@ -113,4 +150,78 @@ pub trait SandboxDriver: Send + Sync {
     fn image_config(&self, tag: &str) -> Result<Option<ImageConfigSummary>, EngineError>;
     fn import_archive(&self, path: PathBuf, tag: String) -> Result<(), EngineError>;
     fn remove_image(&self, tag: &str) -> Result<(), EngineError>;
+}
+
+#[cfg(all(test, unix))]
+mod spec_tests {
+    use super::*;
+
+    fn spec(mounts: Vec<MountSpec>) -> SandboxSpec {
+        SandboxSpec {
+            name: "awman-spec".into(),
+            image: "awman-x:latest".into(),
+            labels: BTreeMap::new(),
+            mounts,
+            mount_owner: None,
+            vcpus: 1,
+            memory_mib: 256,
+            network: NetworkPlan::default(),
+        }
+    }
+
+    #[test]
+    fn docker_socket_is_not_a_file_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let error = spec(vec![MountSpec {
+            host: socket,
+            guest: "/var/run/docker.sock".into(),
+            read_only: false,
+        }])
+        .check()
+        .unwrap_err();
+        assert!(
+            matches!(&error, EngineError::Config(m) if m.contains("not bridged")),
+            "{error:?}"
+        );
+        // A symlink to the socket is resolved and refused the same way.
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(dir.path().join("docker.sock"), &link).unwrap();
+        assert!(spec(vec![MountSpec {
+            host: link,
+            guest: "/var/run/docker.sock".into(),
+            read_only: true,
+        }])
+        .check()
+        .is_err());
+        // Files and directories are accepted.
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        spec(vec![
+            MountSpec {
+                host: dir.path().into(),
+                guest: "/workspace".into(),
+                read_only: false,
+            },
+            MountSpec {
+                host: file,
+                guest: "/workspace/f".into(),
+                read_only: true,
+            },
+        ])
+        .check()
+        .unwrap();
+    }
+
+    #[test]
+    fn spec_resources_below_the_floor_are_refused() {
+        let mut zero_cpu = spec(Vec::new());
+        zero_cpu.vcpus = 0;
+        assert!(zero_cpu.check().is_err());
+        let mut small = spec(Vec::new());
+        small.memory_mib = 127;
+        assert!(small.check().is_err());
+        assert!(spec(Vec::new()).check().is_ok());
+    }
 }

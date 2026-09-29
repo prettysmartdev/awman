@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::retry::OperationControl;
+use super::transport::{Response, Transport};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::image_source::{DockerTlsConfig, ImageSourceKind};
 use crate::data::oci_identity::OciPlatform;
@@ -31,6 +33,10 @@ const MIN_API: (u32, u32) = (1, 41);
 const PLATFORM_API: (u32, u32) = (1, 48);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+/// A running export that delivers no bytes for this long is treated as a
+/// disconnect (the caller may retry it; the acquisition deadline still bounds
+/// the whole transfer).
+const EXPORT_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Where the Engine listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +89,7 @@ pub fn resolve_endpoint(
         None if from_env && env.docker_tls_verify() => {
             let dir = env
                 .docker_cert_path()
-                .or_else(|| dirs::home_dir().map(|h| h.join(".docker")))
+                .or_else(|| env.get("HOME").map(|h| PathBuf::from(h).join(".docker")))
                 .ok_or_else(|| {
                     EngineError::Config(
                         "DOCKER_TLS_VERIFY is set but DOCKER_CERT_PATH is not, and there is no \
@@ -187,7 +193,10 @@ fn default_endpoint(env: &EnvSnapshot) -> Result<Endpoint, EngineError> {
     }
     let system = PathBuf::from("/var/run/docker.sock");
     if cfg!(target_os = "macos") {
-        if let Some(user) = dirs::home_dir().map(|h| h.join(".docker/run/docker.sock")) {
+        if let Some(user) = env
+            .get("HOME")
+            .map(|h| PathBuf::from(h).join(".docker/run/docker.sock"))
+        {
             if user.exists() || !system.exists() {
                 return Ok(Endpoint::Unix(user));
             }
@@ -220,16 +229,17 @@ pub(super) fn validate_reference(reference: &str) -> Result<(), EngineError> {
 }
 
 struct Client {
-    http: reqwest::blocking::Client,
+    http: reqwest::Client,
+    transport: Transport,
     base: String,
     endpoint: String,
 }
 
 impl Client {
-    fn new(endpoint: &Endpoint) -> Result<Self, EngineError> {
-        let mut builder = reqwest::blocking::Client::builder()
+    fn new(endpoint: &Endpoint, control: OperationControl) -> Result<Self, EngineError> {
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(None::<Duration>)
+            .read_timeout(EXPORT_STALL_TIMEOUT)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("awman/", env!("CARGO_PKG_VERSION")));
@@ -265,43 +275,48 @@ impl Client {
             .map_err(|e| EngineError::Network(format!("HTTP client setup failed: {e}")))?;
         Ok(Self {
             http,
+            transport: Transport::new(control)?,
             base,
             endpoint: endpoint.describe(),
         })
     }
 
-    fn get(
-        &self,
-        path: &str,
-        timeout: Option<Duration>,
-    ) -> Result<reqwest::blocking::Response, EngineError> {
-        let mut req = self.http.get(format!("{}{path}", self.base));
-        if let Some(t) = timeout {
-            req = req.timeout(t);
-        }
-        req.send().map_err(|e| {
-            EngineError::Network(format!(
-                "Docker Engine at {} is not reachable: {}",
-                self.endpoint,
-                e.without_url()
-            ))
+    fn get(&self, path: &str, timeout: Duration) -> Result<Response, EngineError> {
+        let req = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .timeout(timeout);
+        self.transport.send(req).map_err(|e| {
+            e.map_http(|e| {
+                EngineError::Network(format!(
+                    "Docker Engine at {} is not reachable: {}",
+                    self.endpoint,
+                    crate::engine::oci::retry::error_chain(&e.without_url())
+                ))
+            })
         })
     }
 
     fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
+        timeout: Duration,
     ) -> Result<(u16, Option<T>), EngineError> {
-        let resp = self.get(path, Some(METADATA_TIMEOUT))?;
+        let resp = self.get(path, timeout)?;
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
             return Ok((status, None));
         }
-        let parsed = resp.json::<T>().map_err(|e| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(resp, 1024 * 1024 + 1), &mut bytes)
+            .map_err(|e| EngineError::Network(format!("Docker metadata transfer failed: {e}")))?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(EngineError::Network("Docker metadata exceeds 1 MiB".into()));
+        }
+        let parsed = serde_json::from_slice::<T>(&bytes).map_err(|e| {
             EngineError::Network(format!(
                 "Docker Engine at {} returned an unreadable response for {path}: {}",
-                self.endpoint,
-                e.without_url()
+                self.endpoint, e
             ))
         })?;
         Ok((status, Some(parsed)))
@@ -309,9 +324,9 @@ impl Client {
 }
 
 fn apply_tls(
-    mut builder: reqwest::blocking::ClientBuilder,
+    mut builder: reqwest::ClientBuilder,
     tls: &DockerTlsConfig,
-) -> Result<reqwest::blocking::ClientBuilder, EngineError> {
+) -> Result<reqwest::ClientBuilder, EngineError> {
     let read = |p: &Path| std::fs::read(p).map_err(|e| EngineError::io(p, e));
     let ca = reqwest::Certificate::from_pem_bundle(&read(&tls.ca)?).map_err(|e| {
         EngineError::Config(format!(
@@ -378,9 +393,14 @@ pub(super) fn export(
     _report: Report<'_>,
 ) -> Result<Fetched, EngineError> {
     validate_reference(reference)?;
-    let client = Client::new(endpoint)?;
+    ctx.cancel.check()?;
+    let client = Client::new(
+        endpoint,
+        OperationControl::new(ctx.cancel.clone(), ctx.deadline),
+    )?;
+    let metadata = || ctx.deadline.request_timeout(Some(METADATA_TIMEOUT));
 
-    let ping = client.get("/_ping", Some(METADATA_TIMEOUT))?;
+    let ping = client.get("/_ping", metadata())?;
     if !ping.status().is_success() {
         return Err(EngineError::Network(format!(
             "Docker Engine at {} answered {} to /_ping",
@@ -388,7 +408,7 @@ pub(super) fn export(
             ping.status()
         )));
     }
-    let (_, version) = client.get_json::<VersionInfo>("/version")?;
+    let (_, version) = client.get_json::<VersionInfo>("/version", metadata())?;
     let api = version
         .as_ref()
         .and_then(|v| parse_api(&v.api_version))
@@ -411,8 +431,9 @@ pub(super) fn export(
     };
     let prefix = format!("/v{}.{}", use_api.0, use_api.1);
 
+    ctx.cancel.check()?;
     let (status, inspect) =
-        client.get_json::<Inspect>(&format!("{prefix}/images/{reference}/json"))?;
+        client.get_json::<Inspect>(&format!("{prefix}/images/{reference}/json"), metadata())?;
     let Some(inspect) = inspect else {
         return Err(if status == 404 {
             EngineError::Container(format!(
@@ -464,7 +485,14 @@ pub(super) fn export(
                 .unwrap_or_default();
         path = format!("{path}?{encoded}");
     }
-    let mut resp = client.get(&path, None)?;
+    ctx.cancel.check()?;
+    // The export body is bounded by the acquisition deadline; a stall longer
+    // than EXPORT_STALL_TIMEOUT within it is reported as a disconnect.
+    let export_timeout = ctx
+        .deadline
+        .request_timeout(None)
+        .max(Duration::from_millis(1));
+    let resp = client.get(&path, export_timeout)?;
     if !resp.status().is_success() {
         return Err(EngineError::Network(format!(
             "Docker Engine at {} answered {} when exporting '{reference}'",
@@ -479,12 +507,22 @@ pub(super) fn export(
         ctx.limits.max_archive_bytes,
         ctx.limits.min_free_bytes,
         ctx.disk,
-    )?;
-    sink.copy_from(&mut resp)?;
+    )?
+    .cancellable(ctx.cancel)
+    .with_deadline(ctx.deadline);
+    let mut body = resp;
+    sink.copy_from(&mut body).map_err(|e| match e {
+        EngineError::Network(message) => EngineError::Network(format!(
+            "Docker Engine at {} disconnected while exporting '{reference}': {message}",
+            client.endpoint
+        )),
+        other => other,
+    })?;
     if let Some(n) = declared {
         if n != sink.written() {
             return Err(EngineError::Network(format!(
-                "export of '{reference}' was truncated: {} of {n} bytes",
+                "export of '{reference}' from {} was truncated: {} of {n} bytes",
+                client.endpoint,
                 sink.written()
             )));
         }

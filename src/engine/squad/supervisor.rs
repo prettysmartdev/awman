@@ -634,6 +634,18 @@ mod tests {
     /// just spawned came up on a different port and was never used.
     #[test]
     fn a_dead_daemons_endpoint_is_discarded_rather_than_handed_out() {
+        // `endpoint_from_meta` calls `provision_key` unconditionally before
+        // checking the sidecar (see its doc comment), and this fixture's
+        // sidecar has no live PID behind it, so `daemon_auth_disabled` reports
+        // `false` and `provision_key` really mints a key and publishes it to
+        // the process-wide daemon overlay via `publish_key_to_process`. That
+        // overlay is one static shared by every test in this binary, so this
+        // must take the same lock every other overlay-touching test does.
+        let _lock = crate::data::config::env::DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = crate::data::config::env::daemon_overlay_snapshot();
+
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvSnapshot::with_overrides([(AWMAN_SQUAD_ROOT, tmp.path().to_str().unwrap())]);
         let supervisor = SquadSupervisor::from_env(&env).unwrap();
@@ -662,6 +674,8 @@ mod tests {
         assert!(supervisor.endpoint_from_meta().unwrap().is_none());
         // Idempotent: nothing to discard is not an error.
         supervisor.discard_stale_endpoint().unwrap();
+
+        crate::data::config::env::set_daemon_overlay(previous);
     }
 
     /// The daemon spawn must refuse to re-exec a test/bench harness, or

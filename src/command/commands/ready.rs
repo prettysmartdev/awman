@@ -255,7 +255,19 @@ impl Command for ReadyCommand {
         )
         .with_image_sources(sources);
         engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
-        let summary = match engine.run_to_completion(frontend.as_mut()).await {
+        let cancel = engine.cancel_token();
+        let result = {
+            let run = engine.run_to_completion(frontend.as_mut());
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result,
+                _ = tokio::signal::ctrl_c() => {
+                    cancel.cancel();
+                    run.await
+                }
+            }
+        };
+        let summary = match result {
             Ok(s) => s,
             Err(e) => {
                 let cmd_err = CommandError::from(e);

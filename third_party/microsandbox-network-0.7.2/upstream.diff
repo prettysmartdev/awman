@@ -1,0 +1,378 @@
+--- a/lib/engine/netstack/poll.rs
++++ b/lib/engine/netstack/poll.rs
+@@ -234,6 +234,7 @@
+     tls_state: Option<Arc<TlsState>>,
+     published_ports: Vec<PublishedPort>,
+     strict: bool,
++    strict_sni: bool,
+     max_tcp_connections: Option<NonZeroUsize>,
+     max_udp_connections: Option<ConnectionLimit>,
+     tokio_handle: tokio::runtime::Handle,
+@@ -622,7 +623,8 @@
+                 strict,
+                 conn.proxy_connect,
+                 connection_outbound_proxy,
+-            );
++            )
++            .with_strict_sni(strict_sni);
+             tokio_handle.spawn(proxy.run());
+         }
+ 
+--- a/lib/engine/network.rs
++++ b/lib/engine/network.rs
+@@ -366,6 +366,7 @@
+         let tls_state = self.tls_state.clone();
+         let published_ports = config.ports.clone();
+         let strict = config.strict;
++        let strict_sni = config.strict_sni;
+         let max_tcp_connections = config.max_tcp_connections.and_then(ConnectionLimit::cap);
+         let max_udp_connections = config.max_udp_connections;
+         let secrets = self.secrets.clone();
+@@ -388,6 +389,7 @@
+                         tls_state,
+                         published_ports,
+                         strict,
++                        strict_sni,
+                         max_tcp_connections,
+                         max_udp_connections,
+                         tokio_handle,
+--- a/lib/engine/tcp/proxy.rs
++++ b/lib/engine/tcp/proxy.rs
+@@ -78,6 +78,7 @@
+     secrets: Arc<SecretsConfig>,
+     tls_state: Option<Arc<TlsState>>,
+     strict: bool,
++    strict_sni: bool,
+     proxy_connect: Arc<ProxyConnectState>,
+     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+ }
+@@ -157,11 +158,17 @@
+             secrets,
+             tls_state,
+             strict,
++            strict_sni: false,
+             proxy_connect,
+             outbound_proxy,
+         }
+     }
+ 
++    pub(crate) fn with_strict_sni(mut self, enabled: bool) -> Self {
++        self.strict_sni = enabled;
++        self
++    }
++
+     /// Run the TCP proxy task to completion.
+     pub(crate) async fn run(self) {
+         let guest_dst = self.guest_dst;
+@@ -189,6 +196,7 @@
+             secrets,
+             tls_state,
+             strict,
++            strict_sni,
+             proxy_connect,
+             outbound_proxy,
+         } = self;
+@@ -221,14 +229,19 @@
+                 source,
+             ) {
+                 EgressEvaluation::Allow => {
+-                    if strict_hostname_allow_is_opaque(
+-                        strict,
+-                        &network_policy,
+-                        guest_dst,
+-                        &shared,
+-                        sni.as_deref(),
+-                        &initial_buf,
+-                    ) {
++                    // Policy has already checked SNI against the exact DNS
++                    // binding. The explicit opt-in admits end-to-end TLS; the
++                    // ordinary strict/interception behavior remains unchanged.
++                    if !(strict_sni && sni.is_some())
++                        && strict_hostname_allow_is_opaque(
++                            strict,
++                            &network_policy,
++                            guest_dst,
++                            &shared,
++                            sni.as_deref(),
++                            &initial_buf,
++                        )
++                    {
+                         tracing::debug!(
+                             sni = sni.as_deref(),
+                             dst = %guest_dst,
+@@ -2118,6 +2131,174 @@
+     }
+ 
+     #[tokio::test]
++    async fn strict_sni_end_to_end_tls_reaches_allowed_server_without_interception() {
++        use rustls::pki_types::PrivatePkcs8KeyDer;
++        let certified = rcgen::generate_simple_self_signed(vec!["allowed.example".into()]).unwrap();
++        let provider = Arc::new(rustls::crypto::ring::default_provider());
++        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
++            .with_safe_default_protocol_versions()
++            .unwrap()
++            .with_no_client_auth()
++            .with_single_cert(
++                vec![certified.cert.der().clone()],
++                PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
++            )
++            .unwrap();
++        let mut roots = rustls::RootCertStore::empty();
++        roots.add(certified.cert.der().clone()).unwrap();
++        let client = rustls::ClientConfig::builder_with_provider(provider)
++            .with_safe_default_protocol_versions()
++            .unwrap()
++            .with_root_certificates(roots)
++            .with_no_client_auth();
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let dst = listener.local_addr().unwrap();
++        let server_task = tokio::spawn(async move {
++            let (stream, _) = listener.accept().await.unwrap();
++            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server))
++                .accept(stream)
++                .await
++                .unwrap();
++            let mut request = [0; 4];
++            tls.read_exact(&mut request).await.unwrap();
++            assert_eq!(&request, b"ping");
++            tls.write_all(b"pong").await.unwrap();
++            tls.shutdown().await.unwrap();
++        });
++        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
++        let policy = Arc::new(NetworkPolicy {
++            default_egress: Action::Deny,
++            default_ingress: Action::Deny,
++            rules: vec![allow_tcp("allowed.example", dst.port())],
++        });
++        let (from_tx, from_rx) = mpsc::channel(8);
++        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(8);
++        let status = Arc::new(ProxyConnectState::new());
++        let proxy = TcpProxy::new(
++            dst,
++            UpstreamTcpTarget::direct(dst),
++            from_rx,
++            to_tx,
++            shared,
++            policy,
++            Arc::new(SecretsConfig::default()),
++            None,
++            true,
++            status.clone(),
++            None,
++        )
++        .with_strict_sni(true);
++        let proxy_task = tokio::spawn(proxy.try_run());
++        let (guest, channel) = tokio::io::duplex(16384);
++        let (mut read, mut write) = tokio::io::split(channel);
++        let outbound = tokio::spawn(async move {
++            let mut buf = [0; 8192];
++            while let Ok(n) = read.read(&mut buf).await {
++                if n == 0
++                    || from_tx
++                        .send(Bytes::copy_from_slice(&buf[..n]))
++                        .await
++                        .is_err()
++                {
++                    break;
++                }
++            }
++        });
++        let inbound = tokio::spawn(async move {
++            while let Some(bytes) = to_rx.recv().await {
++                if write.write_all(&bytes).await.is_err() {
++                    break;
++                }
++            }
++        });
++        tokio::time::timeout(Duration::from_secs(5), async {
++            let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
++                .connect("allowed.example".try_into().unwrap(), guest)
++                .await
++                .unwrap();
++            tls.write_all(b"ping").await.unwrap();
++            let mut response = [0; 4];
++            tls.read_exact(&mut response).await.unwrap();
++            assert_eq!(&response, b"pong");
++            tls.shutdown().await.unwrap();
++            server_task.await.unwrap();
++            proxy_task.await.unwrap().unwrap();
++        })
++        .await
++        .expect("allowed TLS handshake and exchange must finish");
++        assert_ne!(status.status(), ProxyConnectStatus::PolicyDenied);
++        outbound.abort();
++        inbound.abort();
++    }
++
++    #[tokio::test]
++    async fn strict_sni_denies_missing_wrong_unbound_and_sibling_names_before_dial() {
++        for (label, bytes, cached_name, suffix) in [
++            ("missing", vec![0x16, 0x03, 0x01], "allowed.example", false),
++            (
++                "wrong shared-IP name",
++                synthetic_client_hello("unlisted.example"),
++                "allowed.example",
++                false,
++            ),
++            (
++                "missing DNS binding",
++                synthetic_client_hello("allowed.example"),
++                "other.example",
++                false,
++            ),
++            (
++                "sibling DNS binding",
++                synthetic_client_hello("b.example"),
++                "a.example",
++                true,
++            ),
++        ] {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let dst = listener.local_addr().unwrap();
++            let shared = Arc::new(shared_with(cached_name, "127.0.0.1"));
++            let mut rule = allow_tcp("allowed.example", dst.port());
++            if suffix {
++                rule.destination = Destination::DomainSuffix(".example".parse().unwrap());
++            }
++            let policy = Arc::new(NetworkPolicy {
++                default_egress: Action::Deny,
++                default_ingress: Action::Deny,
++                rules: vec![rule],
++            });
++            let (from_tx, from_rx) = mpsc::channel(8);
++            let (to_tx, _to_rx) = mpsc::channel(8);
++            from_tx.send(Bytes::from(bytes)).await.unwrap();
++            drop(from_tx);
++            let status = Arc::new(ProxyConnectState::new());
++            TcpProxy::new(
++                dst,
++                UpstreamTcpTarget::direct(dst),
++                from_rx,
++                to_tx,
++                shared,
++                policy,
++                Arc::new(SecretsConfig::default()),
++                None,
++                true,
++                status.clone(),
++                None,
++            )
++            .with_strict_sni(true)
++            .try_run()
++            .await
++            .unwrap();
++            assert_eq!(status.status(), ProxyConnectStatus::PolicyDenied, "{label}");
++            assert!(
++                tokio::time::timeout(Duration::from_millis(20), listener.accept())
++                    .await
++                    .is_err(),
++                "{label}: denied connection must never dial upstream"
++            );
++        }
++    }
++
++    #[tokio::test]
+     async fn strict_mode_blocks_hostname_allowed_opaque_tls() {
+         let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
+         let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+--- a/lib/model/config/builder.rs
++++ b/lib/model/config/builder.rs
+@@ -222,6 +222,13 @@
+         self
+     }
+ 
++    /// Accept visible SNI and its DNS binding when strict mode is enabled.
++    /// This does not inspect encrypted HTTP authorities or disable strict mode.
++    pub fn strict_sni(mut self, enabled: bool) -> Self {
++        self.config.strict_sni = enabled;
++        self
++    }
++
+     /// Add a secret via a closure builder.
+     ///
+     /// ```ignore
+@@ -1013,6 +1020,20 @@
+     }
+ 
+     #[test]
++    fn strict_sni_is_explicit_and_survives_config_roundtrip() {
++        let old: NetworkConfig = serde_json::from_str("{}").unwrap();
++        assert!(!old.strict_sni);
++        let cfg = NetworkBuilder::new()
++            .strict(true)
++            .strict_sni(true)
++            .build()
++            .unwrap();
++        let wire = serde_json::to_vec(&cfg).unwrap();
++        let restored: NetworkConfig = serde_json::from_slice(&wire).unwrap();
++        assert!(restored.strict && restored.strict_sni);
++    }
++
++    #[test]
+     fn network_builder_sets_global_violation_action() {
+         let cfg = NetworkBuilder::new()
+             .secret_violation_action(SecretViolationAction::BlockAndTerminate)
+--- a/lib/model/config/types.rs
++++ b/lib/model/config/types.rs
+@@ -65,6 +65,12 @@
+     #[serde(default)]
+     pub strict: bool,
+ 
++    /// Permit visible TLS SNI plus an exact DNS binding as strict authority.
++    /// Opt-in for end-to-end TLS without interception. Encrypted HTTP authority
++    /// is outside this boundary; absent SNI (including ECH-only) is refused.
++    #[serde(default)]
++    pub strict_sni: bool,
++
+     /// Secret injection settings.
+     #[serde(default)]
+     pub secrets: SecretsConfig,
+@@ -277,6 +283,7 @@
+             dns: DnsConfig::default(),
+             tls: TlsConfig::default(),
+             strict: false,
++            strict_sni: false,
+             secrets: SecretsConfig::default(),
+             max_tcp_connections: None,
+             max_udp_connections: None,
+--- a/lib/model/policy/types.rs
++++ b/lib/model/policy/types.rs
+@@ -999,11 +999,8 @@
+         Destination::DomainSuffix(suffix) => match source {
+             HostnameSource::Sni(name) => {
+                 let name_matches = matches_suffix(name, suffix.as_str());
+-                let cache_matches = || {
+-                    shared.any_resolved_hostname(addr, |hostname| {
+-                        matches_suffix(hostname, suffix.as_str())
+-                    })
+-                };
++                let cache_matches =
++                    || shared.any_resolved_hostname(addr, |hostname| hostname == name);
+                 (name_matches && (action.is_deny() || cache_matches())).into()
+             }
+             HostnameSource::CacheOnly => shared
+@@ -2545,12 +2542,10 @@
+         assert_eq!(eval, EgressEvaluation::Deny);
+     }
+ 
+-    /// `Sni` against a `DomainSuffix` rule where the cache binds a
+-    /// sibling subdomain. The suffix-allow intent covers any name
+-    /// under the suffix, so an IP resolved as `other.pythonhosted.org`
+-    /// can serve a different subdomain via SNI. Real shared-CDN case.
++    /// A suffix allow still requires a DNS binding for the claimed SNI.
++    /// A sibling binding alone must not authorize an unresolved name.
+     #[test]
+-    fn hostname_source_sni_domain_suffix_allows_sibling_cache_binding() {
++    fn hostname_source_sni_domain_suffix_denies_sibling_cache_binding() {
+         let shared = shared_with_host("other.pythonhosted.org", FILES_V4);
+         let policy = allow_rule(Destination::DomainSuffix(name(".pythonhosted.org")));
+         let eval = policy.evaluate_egress_with_source(
+@@ -2559,7 +2554,7 @@
+             &shared,
+             HostnameSource::Sni("files.pythonhosted.org"),
+         );
+-        assert_eq!(eval, EgressEvaluation::Allow);
++        assert_eq!(eval, EgressEvaluation::Deny);
+     }
+ 
+     #[test]

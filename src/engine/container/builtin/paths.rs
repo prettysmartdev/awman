@@ -46,11 +46,42 @@ impl BuiltinPaths {
 
     /// Serialises image imports, which can take minutes, without blocking
     /// catalog readers such as `awman status`.
+    #[cfg(test)]
     pub fn import_lock(&self) -> Result<File, EngineError> {
         self.lock_named("awman-import.lock", IMPORT_LOCK_WAIT)
     }
 
+    pub fn import_lock_cancellable(
+        &self,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<File, EngineError> {
+        self.lock_controlled("awman-import.lock", IMPORT_LOCK_WAIT, false, cancel)
+    }
+
+    /// Protect the interval before the SDK publishes a sandbox's rootfs
+    /// reference. Afterwards its transactional ImageInUse check owns retention.
+    /// Mutations fail promptly rather than waiting for a planned launch.
+    pub fn image_lease(&self, image: &str, exclusive: bool) -> Result<File, EngineError> {
+        use sha2::{Digest, Sha256};
+        let digest: String = Sha256::digest(image.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let name = format!("image-{digest}.lock");
+        self.lock_controlled(&name, Duration::ZERO, !exclusive, &Default::default())
+    }
+
     fn lock_named(&self, name: &str, wait: Duration) -> Result<File, EngineError> {
+        self.lock_controlled(name, wait, false, &Default::default())
+    }
+
+    fn lock_controlled(
+        &self,
+        name: &str,
+        wait: Duration,
+        shared: bool,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<File, EngineError> {
         let path = self.home.join(name);
         let file = OpenOptions::new()
             .read(true)
@@ -69,7 +100,8 @@ impl BuiltinPaths {
         }
         let deadline = Instant::now() + wait;
         loop {
-            match file.try_lock() {
+            cancel.check()?;
+            match if shared { file.try_lock_shared() } else { file.try_lock() } {
                 Ok(()) => return Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(50));
@@ -208,6 +240,52 @@ pub fn secure_create(path: &Path) -> Result<(), EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_leases_exclude_mutation_across_processes_but_not_other_images() {
+        const CHILD: &str = "AWMAN_TEST_IMAGE_LEASE_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let paths = BuiltinPaths::resolve(Path::new(&root)).unwrap();
+            assert!(paths.image_lease("agent:1", true).is_err());
+            assert!(paths.image_lease("agent:1", false).is_ok());
+            assert!(paths.image_lease("other:1", true).is_ok());
+            return;
+        }
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = BuiltinPaths::resolve(&temp.path().join("s")).unwrap();
+        let lease = paths.image_lease("agent:1", false).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "engine::container::builtin::paths::tests::image_leases_exclude_mutation_across_processes_but_not_other_images", "--nocapture"])
+            .env(CHILD, &paths.home).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(lease);
+        assert!(paths.image_lease("agent:1", true).is_ok());
+    }
+
+    #[test]
+    fn import_lock_wait_observes_cancellation() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = BuiltinPaths::resolve(&temp.path().join("s")).unwrap();
+        let held = paths.import_lock().unwrap();
+        let token = crate::engine::oci::CancelToken::new();
+        let signal = token.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            signal.cancel();
+        });
+        let start = Instant::now();
+        let err = paths.import_lock_cancellable(&token).unwrap_err();
+        canceller.join().unwrap();
+        assert!(crate::engine::oci::retry::is_cancelled(&err));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(held);
+        assert!(paths.import_lock().is_ok());
+    }
+
     #[test]
     fn full_socket_budget_counts_utf8_bytes() {
         assert!(check_socket_budget(Path::new("/short")).is_ok());

@@ -501,6 +501,45 @@ impl Env {
         }
         EnvSnapshot { values }
     }
+
+    /// Capture only the source transport settings and explicitly named auth
+    /// variables needed for this acquisition. Absence is authoritative too.
+    pub fn for_image_acquisition(
+        registries: &std::collections::BTreeMap<
+            String,
+            crate::data::config::image_source::RegistryHostConfig,
+        >,
+    ) -> EnvSnapshot {
+        use crate::data::config::image_source::RegistryAuthSource;
+        let mut snapshot = Self::from_process();
+        let mut names = vec![
+            HOME,
+            "DOCKER_CONFIG",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ];
+        for registry in registries.values() {
+            if let Some(RegistryAuthSource::Env {
+                username_var,
+                password_var,
+            }) = &registry.auth
+            {
+                names.extend([username_var.as_str(), password_var.as_str()]);
+            }
+        }
+        for name in names {
+            if let Some(value) = host_var(name) {
+                snapshot.values.insert(name.into(), value);
+            }
+        }
+        snapshot
+    }
 }
 
 /// Whether this process must stay off per-user OS resources (see
@@ -568,6 +607,17 @@ pub fn host_var(name: &str) -> Option<String> {
     }
     drop(guard);
     std::env::var(name).ok()
+}
+
+/// Resolve an override without discarding non-UTF-8 process values.
+/// Presence checks for SDK paths must refuse these values as well.
+pub fn host_var_os(name: &str) -> Option<std::ffi::OsString> {
+    let guard = daemon_overlay().read().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = guard.get(name) {
+        return Some(value.into());
+    }
+    drop(guard);
+    std::env::var_os(name)
 }
 
 /// Install (replacing) the daemon's payload environment.
@@ -930,6 +980,26 @@ mod tests {
 
         std::env::remove_var(name);
         set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_var_os_preserves_non_utf8_and_overlay_precedence() {
+        use std::os::unix::ffi::OsStringExt;
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = daemon_overlay_snapshot();
+        let name = "AWMAN_TEST_NON_UTF8_OVERRIDE_0121";
+        let value = std::ffi::OsString::from_vec(vec![0xff]);
+        std::env::set_var(name, &value);
+        assert_eq!(host_var_os(name), Some(value));
+        update_daemon_overlay(|vars| {
+            vars.insert(name.into(), "overlay".into());
+        });
+        assert_eq!(host_var_os(name), Some("overlay".into()));
+        std::env::remove_var(name);
+        set_daemon_overlay(previous);
     }
 
     /// The overlay is checked first and wins over whatever the process

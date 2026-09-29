@@ -135,6 +135,18 @@ pub(super) trait ContainerBackend: Send + Sync {
         sink: &mut dyn UserMessageSink,
     ) -> Result<ImportedImage, EngineError>;
 
+    /// Import with a caller-owned cancellation signal. Build-only backends keep
+    /// their existing unsupported result; importing backends override this.
+    fn import_image_cancellable(
+        &self,
+        request: &ImageImportRequest,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        cancel.check()?;
+        self.import_image(request, sink)
+    }
+
     /// List dangling awman images eligible for cleanup.
     fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError>;
 

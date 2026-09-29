@@ -1,0 +1,6 @@
+
+architecture-lint: std::env::var above Layer 0; declare the variable in src/data/config/env.rs and read it through EnvSnapshot (or host_var):
+VIOLATION [env-var]: src/engine/container/builtin/embedded/mod.rs:23
+
+architecture-lint: 1 violation(s) found
+make: *** [Makefile:68: architecture-lint] Error 1

@@ -181,6 +181,8 @@ pub(super) struct StagingSink<'a> {
     min_free: u64,
     disk: &'a dyn DiskSpace,
     failure: Option<EngineError>,
+    cancel: Option<crate::engine::oci::retry::CancelToken>,
+    deadline: Option<super::retry::Deadline>,
 }
 
 impl<'a> StagingSink<'a> {
@@ -201,7 +203,32 @@ impl<'a> StagingSink<'a> {
             min_free,
             disk,
             failure: None,
+            cancel: None,
+            deadline: None,
         })
+    }
+
+    /// Stop accepting bytes once `token` is cancelled: the next chunk fails
+    /// with the cancellation error and the staged file is left for its
+    /// staging directory to remove.
+    pub(super) fn cancellable(mut self, token: &crate::engine::oci::retry::CancelToken) -> Self {
+        self.cancel = Some(token.clone());
+        self
+    }
+
+    pub(super) fn with_deadline(mut self, deadline: super::retry::Deadline) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    fn check(&self) -> Result<(), EngineError> {
+        if let Some(token) = &self.cancel {
+            token.check()?;
+        }
+        if let Some(deadline) = self.deadline {
+            deadline.check()?;
+        }
+        Ok(())
     }
 
     pub(super) fn written(&self) -> u64 {
@@ -210,6 +237,7 @@ impl<'a> StagingSink<'a> {
 
     /// Append `chunk`, enforcing the cap and the free-space floor.
     pub(super) fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), EngineError> {
+        self.check()?;
         let next = self.written + chunk.len() as u64;
         if next > self.max_bytes {
             return Err(EngineError::ImageArchiveRejected {
@@ -233,6 +261,7 @@ impl<'a> StagingSink<'a> {
             .write_all(chunk)
             .map_err(|e| EngineError::io(self.path.clone(), e))?;
         self.written = next;
+        self.check()?;
         Ok(())
     }
 
@@ -242,11 +271,22 @@ impl<'a> StagingSink<'a> {
         let mut buf = vec![0u8; CHUNK];
         let start = self.written;
         loop {
+            self.check()?;
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && self.cancel.is_none() => {
+                    continue
+                }
                 Err(e) => {
+                    // A cancelled acquisition reports cancellation, whatever
+                    // the transfer was doing when it noticed.
+                    if let Some(token) = &self.cancel {
+                        token.check()?;
+                    }
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
                     return Err(if is_limit_exceeded(&e) {
                         EngineError::ImageArchiveRejected {
                             path: self.path.clone(),
@@ -258,7 +298,7 @@ impl<'a> StagingSink<'a> {
                             self.path.display(),
                             self.written - start
                         ))
-                    })
+                    });
                 }
             };
             self.write_chunk(&buf[..n])?;
@@ -268,10 +308,12 @@ impl<'a> StagingSink<'a> {
 
     /// Flush and fsync, returning the finished file's path and size.
     pub(super) fn finish(mut self) -> Result<(PathBuf, u64), EngineError> {
+        self.check()?;
         self.file
             .flush()
             .and_then(|_| self.file.sync_all())
             .map_err(|e| EngineError::io(self.path.clone(), e))?;
+        self.check()?;
         Ok((self.path, self.written))
     }
 
@@ -342,9 +384,18 @@ pub(super) fn create_private_dir(dir: &Path) -> Result<(), EngineError> {
 }
 
 /// Hash a whole file: `(hex, size)`.
+#[cfg(test)]
 pub(super) fn hash_file(path: &Path) -> Result<(String, u64), EngineError> {
+    hash_file_controlled(path, &Default::default())
+}
+
+pub(super) fn hash_file_controlled(
+    path: &Path,
+    control: &super::retry::OperationControl,
+) -> Result<(String, u64), EngineError> {
+    control.check()?;
     let file = File::open(path).map_err(|e| EngineError::io(path, e))?;
-    HashingReader::new(file, u64::MAX)
+    HashingReader::new(control.reader(file), u64::MAX)
         .finish()
         .map_err(|e| EngineError::io(path, e))
 }
@@ -419,6 +470,25 @@ pub(super) mod tests {
         assert!(matches!(
             sink.write_chunk(&chunk),
             Err(EngineError::InsufficientDiskSpace { .. })
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_sink_refuses_the_next_chunk_and_keeps_what_it_had() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = FixedDisk(None);
+        let token = crate::engine::oci::retry::CancelToken::new();
+        let mut sink = StagingSink::create(dir.path().join("s"), u64::MAX, 0, &disk)
+            .unwrap()
+            .cancellable(&token);
+        sink.write_chunk(b"abcd").unwrap();
+        token.cancel();
+        let err = sink.write_chunk(b"e").unwrap_err();
+        assert!(crate::engine::oci::retry::is_cancelled(&err), "{err}");
+        assert_eq!(sink.written(), 4);
+        let mut reader: &[u8] = b"more";
+        assert!(crate::engine::oci::retry::is_cancelled(
+            &sink.copy_from(&mut reader).unwrap_err()
         ));
     }
 

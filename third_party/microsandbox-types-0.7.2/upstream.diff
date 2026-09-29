@@ -1,0 +1,60 @@
+--- a/lib/domain.rs
++++ b/lib/domain.rs
+@@ -609,6 +609,10 @@
+     /// Require hostname-based policy allows to use inspectable application authority.
+     pub strict: bool,
+ 
++    /// Explicit visible-SNI plus exact DNS-binding enforcement without interception.
++    #[serde(default)]
++    pub strict_sni: bool,
++
+     /// Secret substitution subdocument.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     #[config_patch(nested)]
+@@ -1795,6 +1799,7 @@
+             dns: None,
+             tls: None,
+             strict: false,
++            strict_sni: false,
+             secrets: None,
+             max_tcp_connections: None,
+             max_udp_connections: None,
+--- a/lib/cloud/specs.rs
++++ b/lib/cloud/specs.rs
+@@ -694,6 +694,10 @@
+     /// Require hostname-based policy allows to use inspectable application authority.
+     pub strict: bool,
+ 
++    /// Explicit visible-SNI plus exact DNS-binding enforcement without interception.
++    #[serde(default)]
++    pub strict_sni: bool,
++
+     /// Max concurrent TCP connections.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     // Keep outbound requests compatible with existing cloud servers.
+@@ -712,6 +716,7 @@
+             policy: None,
+             secrets: None,
+             strict: false,
++            strict_sni: false,
+             max_tcp_connections: None,
+             max_udp_connections: None,
+         }
+--- a/lib/cloud/mod.rs
++++ b/lib/cloud/mod.rs
+@@ -490,6 +490,7 @@
+             dns: None,
+             tls: None,
+             strict: self.network.strict,
++            strict_sni: self.network.strict_sni,
+             secrets: self.network.secrets.map(Into::into),
+             max_tcp_connections: self.network.max_tcp_connections,
+             max_udp_connections: self.network.max_udp_connections,
+@@ -559,6 +560,7 @@
+                 policy: spec.network.policy,
+                 secrets: spec.network.secrets.map(Into::into),
+                 strict: spec.network.strict,
++                strict_sni: spec.network.strict_sni,
+                 max_tcp_connections: spec.network.max_tcp_connections,
+                 max_udp_connections: spec.network.max_udp_connections,
+             },

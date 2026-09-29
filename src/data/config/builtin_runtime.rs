@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::data::config::builtin_network::BuiltinNetworkConfig;
 use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
 
 /// Whole vCPUs per agent VM when none are configured.
@@ -16,6 +17,10 @@ pub const DEFAULT_VCPUS: u8 = 2;
 
 /// Guest memory per agent VM, in MiB, when none is configured.
 pub const DEFAULT_MEMORY_MIB: u32 = 4096;
+
+/// Smallest guest memory, in MiB, the runtime accepts. The same floor applies
+/// to config values and to per-launch memory limits.
+pub const MIN_MEMORY_MIB: u32 = 128;
 
 /// Subdirectory of the awman data home that holds the builtin runtime's
 /// private state when `stateDir` is not configured.
@@ -34,7 +39,8 @@ pub struct BuiltinRuntimeConfig {
     /// requests are rejected, never rounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus: Option<u8>,
-    /// Guest memory in MiB. Default [`DEFAULT_MEMORY_MIB`].
+    /// Guest memory in MiB. Default [`DEFAULT_MEMORY_MIB`], at least
+    /// [`MIN_MEMORY_MIB`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
     /// Where `awman ready` acquires images that are not cached yet. No
@@ -49,6 +55,12 @@ pub struct BuiltinRuntimeConfig {
     /// Registry host settings keyed by `host[:port]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub registries: BTreeMap<String, RegistryHostConfig>,
+    /// Guest network policy. Global and repo blocks do not merge per field
+    /// like the rest of this struct: see
+    /// [`crate::data::config::builtin_network`] and
+    /// `EffectiveConfig::builtin_network`, which the engine enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<BuiltinNetworkConfig>,
 }
 
 impl BuiltinRuntimeConfig {
@@ -69,6 +81,8 @@ impl BuiltinRuntimeConfig {
                 .or_else(|| base.image_source.clone()),
             images,
             registries,
+            // Informational only; enforcement resolves both layers.
+            network: self.network.clone().or_else(|| base.network.clone()),
         }
     }
 
@@ -88,14 +102,22 @@ impl BuiltinRuntimeConfig {
         self.images.get(awman_tag).or(self.image_source.as_ref())
     }
 
-    /// Reject values that cannot be honoured: zero vCPUs, zero memory, or an
-    /// image source that fails [`ImageSourceSpec::validate`].
+    /// Reject values that cannot be honoured: zero vCPUs, memory below
+    /// [`MIN_MEMORY_MIB`], an image source that fails
+    /// [`ImageSourceSpec::validate`], or a contradictory network block.
     pub fn validate(&self) -> Result<(), String> {
         if self.vcpus == Some(0) {
             return Err("builtin.vcpus must be at least 1".into());
         }
-        if self.memory_mib == Some(0) {
-            return Err("builtin.memoryMib must be at least 1".into());
+        if self.memory_mib.is_some_and(|m| m < MIN_MEMORY_MIB) {
+            return Err(format!(
+                "builtin.memoryMib must be at least {MIN_MEMORY_MIB}"
+            ));
+        }
+        if let Some(network) = &self.network {
+            network
+                .validate()
+                .map_err(|e| format!("builtin.network: {e}"))?;
         }
         if let Some(source) = &self.image_source {
             source

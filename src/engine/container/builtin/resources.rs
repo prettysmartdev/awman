@@ -1,5 +1,17 @@
+//! Per-launch CPU and memory for a session VM.
+//!
+//! A vCPU count is a whole number of virtual CPUs the guest sees, not a share
+//! of host CPU time: the runtime has no fractional quota, so fractional,
+//! non-finite and out-of-range requests are refused rather than rounded.
+//! Guest memory is a hard ceiling enforced by the VMM: exceeding it triggers
+//! the guest kernel's OOM killer inside the VM, never host memory pressure
+//! beyond the configured size.
+use crate::data::config::builtin_runtime::MIN_MEMORY_MIB;
 use crate::engine::container::options::{CpuLimit, MemoryLimit};
 use crate::engine::error::EngineError;
+
+/// Resolve a launch's `(vcpus, memory MiB)` from its optional limits and the
+/// configured defaults.
 pub fn resolve(
     cpu: Option<CpuLimit>,
     memory: Option<MemoryLimit>,
@@ -18,11 +30,11 @@ pub fn resolve(
     let memory = memory.map(|m| m.0).unwrap_or(u64::from(defaults.1));
     let memory = u32::try_from(memory)
         .ok()
-        .filter(|m| *m >= 128)
+        .filter(|m| *m >= MIN_MEMORY_MIB)
         .ok_or_else(|| EngineError::UnsupportedResourceRequest {
             runtime: "builtin",
             request: "memory limit".into(),
-            reason: "requires 128..=4294967295 MiB".into(),
+            reason: format!("requires {MIN_MEMORY_MIB}..={} MiB", u32::MAX),
         })?;
     Ok((cpus as u8, memory))
 }

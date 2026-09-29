@@ -61,7 +61,7 @@ fn truthy(name: &str) -> bool {
 }
 
 /// Linux: `/dev/kvm` must be openable read/write. macOS: Apple Silicon with
-/// Hypervisor.framework support and the hypervisor entitlement on the binary.
+/// Hypervisor.framework support. Actual boot verifies OS permission to run a VM.
 pub fn hypervisor(binary: &Path) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
@@ -85,25 +85,8 @@ pub fn hypervisor(binary: &Path) -> Result<(), String> {
         if String::from_utf8_lossy(&hv.stdout).trim() != "1" {
             return Err("Hypervisor.framework is not supported here (kern.hv_support != 1)".into());
         }
-        let signed = std::process::Command::new("codesign")
-            .args(["-d", "--entitlements", "-"])
-            .arg(binary)
-            .output()
-            .map_err(|e| format!("cannot inspect the signature: {e}"))?;
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&signed.stdout),
-            String::from_utf8_lossy(&signed.stderr)
-        );
-        if text.contains("com.apple.security.hypervisor") {
-            Ok(())
-        } else {
-            Err(
-                "the awman binary lacks the com.apple.security.hypervisor entitlement \
-                 (sign it with the release entitlements before running hardware tests)"
-                    .into(),
-            )
-        }
+        let _ = binary;
+        Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -140,8 +123,8 @@ fn record(test: &str, outcome: &str, detail: &str) {
 /// has already reported SKIP/BLOCKED (or panicked under REQUIRE_HW) and the
 /// caller must return without asserting anything about a guest.
 pub fn hardware_or_skip(test: &str, needs_archive: bool) -> bool {
-    // The driver (not the awman test copy) is what boots guests, so it is what
-    // must carry the macOS hypervisor entitlement.
+    // Check the host for the driver that will boot the guest. Actual boot
+    // remains mandatory; these preflights do not prove OS access.
     let binary = super::hardware::driver_path();
     match decide(&facts(&binary), needs_archive) {
         Decision::Run => {

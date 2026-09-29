@@ -55,7 +55,23 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 case "${AWMAN_TEST_DOCKER:-}" in
     1 | true | yes | on) export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}" ;;
+    *) unset DOCKER_CONFIG DOCKER_HOST DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY ;;
 esac
+
+# Ordinary tests must never contact an inherited proxy. Preserve caller-supplied
+# transport only when both disposable-registry gates are explicitly enabled.
+registry_proxy_opt_in=0
+case "${AWMAN_TEST_IMAGE_STORES:-}" in
+    1 | true | yes | on)
+        case "${AWMAN_TEST_REGISTRY:-}" in
+            1 | true | yes | on) registry_proxy_opt_in=1 ;;
+        esac
+        ;;
+esac
+if [ "$registry_proxy_opt_in" != 1 ]; then
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
+fi
+unset CODEX_HOME
 
 test_home="$run_dir/home"
 mkdir -p "$test_home"

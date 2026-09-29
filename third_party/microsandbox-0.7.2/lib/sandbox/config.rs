@@ -1,0 +1,2204 @@
+//! Sandbox configuration.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZero;
+use std::path::PathBuf;
+
+#[cfg(feature = "local")]
+use microsandbox_runtime::launch::{CheckpointRestoreConfig, RootfsUpperLayerConfig};
+use microsandbox_types::SandboxLogLevel as LogLevel;
+use microsandbox_types::{
+    EnvVar, SandboxLogLevel, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
+    TransparentHugePagePolicy,
+};
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "local")]
+use microsandbox_image::ImageConfig;
+use microsandbox_protocol::{HANDOFF_INIT_AUTO, HANDOFF_INIT_IMAGE_ENTRYPOINT_CANDIDATES};
+use microsandbox_types::RegistryAuth;
+use typed_path::Utf8UnixPath;
+
+#[cfg(feature = "local")]
+use super::types::RootfsSource;
+use super::types::{MountOptions, RootDisk, VolumeMount};
+use crate::snapshot::SnapshotReference;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+const DEFAULT_OCI_TMPFS_PATH: &str = "/tmp";
+const DEFAULT_OCI_TMPFS_MAX_SIZE_MIB: u32 = 512;
+const DEFAULT_OCI_TMPFS_MEMORY_DIVISOR: u32 = 4;
+pub(crate) const DEFAULT_OCI_UPPER_SIZE_MIB: u32 = 4 * 1024;
+
+/// Default guest-write budget for a bind mount, in MiB.
+///
+/// Bounds how much the guest may add beyond a bind-mounted host directory's
+/// existing contents, so a sandbox cannot fill the host disk through a mount.
+/// Anchored to [`DEFAULT_OCI_UPPER_SIZE_MIB`] for a consistent mental model;
+/// overridable per mount via [`MountBuilder::quota`](crate::sandbox::MountBuilder::quota).
+pub(crate) const DEFAULT_BIND_QUOTA_MIB: u32 = DEFAULT_OCI_UPPER_SIZE_MIB;
+
+/// Default timeout given to the existing sandbox during a `.replace()`
+/// create before it is force-killed.
+///
+/// Distinct from [`SandboxHandle::stop_with_timeout`]'s explicit deadline: this applies
+/// to the builder's override-an-existing-sandbox flow, not the
+/// user-facing stop. Ordinary `stop()` waits without an implicit deadline or force-kill.
+///
+/// [`SandboxHandle::stop_with_timeout`]: super::SandboxHandle::stop_with_timeout
+pub const DEFAULT_REPLACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// Compile-time defaults for `SandboxConfig` serde. Serde's `#[serde(default
+// = "fn")]` attribute can't take parameters, so these can't consult a
+// `LocalBackend`. They intentionally mirror `GlobalConfig::default()` /
+// `SandboxDefaults::default()` for the same fields, so DB-row
+// deserialization (and `sandbox_config_from_cloud`) are side-effect-free.
+// A `LocalBackend` with non-default sandbox defaults applies them through
+// `SandboxBuilder` at create time, not via serde.
+
+fn default_cpus() -> u8 {
+    microsandbox_types::DEFAULT_SANDBOX_CPUS
+}
+
+fn default_memory_mib() -> u32 {
+    microsandbox_types::DEFAULT_SANDBOX_MEMORY_MIB
+}
+
+fn default_log_level() -> Option<SandboxLogLevel> {
+    None
+}
+
+fn default_metrics_sample_interval_ms() -> Option<NonZero<u64>> {
+    NonZero::new(microsandbox_types::DEFAULT_METRICS_SAMPLE_INTERVAL_MS)
+}
+
+fn default_disable_metrics_sample() -> bool {
+    false
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Transient intent for the initial process requested by a CLI operation.
+///
+/// Foreground commands remain separate from the durable OCI command because an attached
+/// `msb run` is one-shot. Background commands use `runtime.cmd` so the resolved startup shape is
+/// visible through inspect and preserved with the sandbox configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum LaunchIntent {
+    /// Boot the sandbox without starting an initial workload.
+    #[default]
+    None,
+
+    /// Run the resolved OCI command through the foreground attach/exec path.
+    Foreground {
+        /// Optional one-shot CMD override supplied after `--`.
+        command: Option<Vec<String>>,
+    },
+
+    /// Run the resolved OCI command in the background after the guest agent is ready.
+    Background,
+}
+
+/// Materialization selected when a checkpoint snapshot is used as a sandbox source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SnapshotRestoreMode {
+    /// Restore disk, memory, execution, and device state.
+    #[default]
+    Full,
+
+    /// Use only the checkpoint's disk closure and perform an ordinary cold boot.
+    DiskOnly,
+}
+
+/// Explicit resource choices that must not be silently replaced during deferred archive restore.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RestoreOverrideIntent {
+    pub(crate) cpus: bool,
+    pub(crate) max_cpus: bool,
+    pub(crate) memory: bool,
+    pub(crate) max_memory: bool,
+}
+
+/// Configuration for a sandbox.
+///
+/// The durable task description lives in [`SandboxSpec`]. This type keeps
+/// local SDK/runtime operation state beside that shared contract, such as
+/// registry credentials, replacement flags, and resolved snapshot metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Operation-local observer; never persisted or retained as a stream owner.
+    #[cfg(feature = "local")]
+    #[serde(skip)]
+    pub(crate) creation_progress: Option<tokio::sync::mpsc::WeakSender<crate::CreationProgress>>,
+    /// Backend-neutral sandbox task description shared across SDKs and services.
+    #[serde(flatten)]
+    pub spec: SandboxSpec,
+
+    /// Registry authentication for private OCI registries.
+    ///
+    /// Redacted (set to `None`) before serialization to database — credentials
+    /// are only needed during the pull.
+    #[serde(default, skip_serializing)]
+    pub registry_auth: Option<RegistryAuth>,
+
+    /// Access the registry over plain HTTP (SDK override).
+    #[serde(skip)]
+    pub(crate) insecure: bool,
+
+    /// Additional PEM-encoded CA certs (SDK override).
+    #[serde(skip)]
+    pub(crate) ca_certs: Vec<Vec<u8>>,
+
+    /// Replace an existing sandbox with the same name during create.
+    ///
+    /// If the existing sandbox is still active, microsandbox stops it and
+    /// waits for it to exit before recreating it.
+    ///
+    /// This is an operation flag, not persisted sandbox state.
+    #[serde(skip)]
+    pub replace_existing: bool,
+
+    /// How long to wait after SIGTERM for the existing sandbox process to
+    /// exit gracefully before escalating to SIGKILL during a replace.
+    ///
+    /// Only consulted when `replace_existing` is true. A zero duration
+    /// skips SIGTERM entirely and goes straight to SIGKILL. Default is
+    /// `DEFAULT_REPLACE_TIMEOUT`, which gives the exit observer plenty
+    /// of headroom to flush logs and clean up the agent socket on a
+    /// healthy sandbox before we escalate.
+    ///
+    /// This is an operation flag, not persisted sandbox state.
+    #[serde(skip)]
+    pub replace_with_timeout: std::time::Duration,
+
+    /// Requested globally-unique slug for the sandbox (cloud backends only).
+    ///
+    /// When unset, the cloud assigns one. Create fails when the slug is
+    /// already taken.
+    ///
+    /// This is a create-time option, not persisted sandbox state.
+    #[serde(skip)]
+    pub slug: Option<String>,
+
+    /// Manifest digest for the resolved OCI image.
+    ///
+    /// Set at create time. Used by spawn to derive VMDK and fsmeta paths
+    /// from the global cache. `None` for non-OCI rootfs sources.
+    #[serde(default)]
+    pub(crate) manifest_digest: Option<String>,
+
+    /// Path to a file snapshot's writable root disk to copy into the new
+    /// sandbox at create time, replacing fresh root-disk provisioning.
+    ///
+    /// Transient: populated during snapshot preparation and consumed when creating
+    /// the sandbox's root disk. Never persisted.
+    #[serde(skip)]
+    pub(crate) snapshot_upper_source: Option<PathBuf>,
+
+    /// Original backend-neutral reference supplied to `Sandbox::restore_ref`.
+    ///
+    /// The selected backend resolves this into its restore configuration. It
+    /// is operation-only and is never persisted.
+    #[serde(skip)]
+    pub(crate) snapshot_reference: Option<SnapshotReference>,
+
+    /// Immutable installed-snapshot layers to materialize into child-owned root storage.
+    ///
+    /// Transient: paths remain read-only sources until local create copies or links them and adds
+    /// a private writable qcow2 head.
+    #[serde(skip)]
+    #[cfg(feature = "local")]
+    pub(crate) snapshot_root_layer_sources: Vec<RootfsUpperLayerConfig>,
+
+    /// Installed file snapshot's required owned payloads, consumed into child storage.
+    #[serde(skip)]
+    #[cfg(feature = "local")]
+    pub(crate) snapshot_owned_source: Option<(
+        PathBuf,
+        Vec<microsandbox_image::snapshot::OwnedVolumeCapture>,
+    )>,
+
+    /// Guest-visible capacity of `snapshot_root_layer_sources`.
+    #[serde(skip)]
+    pub(crate) snapshot_root_virtual_size: Option<u64>,
+
+    /// Archive to materialize directly into child staging during create.
+    ///
+    /// Transient and never persisted.
+    #[serde(skip)]
+    pub(crate) snapshot_archive_source: Option<PathBuf>,
+    /// Explicit base dependency used only while constructing a child from a delta archive.
+    #[serde(skip)]
+    pub(crate) snapshot_base: Option<String>,
+
+    /// Snapshot from which this sandbox derives. Later captures retain their own local cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_parent: Option<String>,
+
+    /// Child-owned checkpoint closure for an unfinished restore construction.
+    ///
+    /// The builder initially points this at an installed snapshot. The local create path copies
+    /// the closure into child staging and rewrites the path before spawning the runtime. Local
+    /// creation persists this intent until activation succeeds; an interrupted restore must not
+    /// subsequently be interpreted as an ordinary cold boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(feature = "local")]
+    pub(crate) checkpoint_restore: Option<CheckpointRestoreConfig>,
+
+    /// Source name for a one-shot direct local branch, consumed under child reservation.
+    #[serde(skip)]
+    #[cfg(feature = "local")]
+    pub(crate) branch_source: Option<super::identity::BranchSource>,
+    /// Transient ownership passed to a Linux child; never stored in launch JSON or the database.
+    #[serde(skip)]
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) branch_memory:
+        Option<std::sync::Arc<microsandbox_runtime::checkpoint::LocalMemoryPin>>,
+
+    /// Restore captured RAM through private CoW mappings; never a cold-boot policy.
+    #[serde(skip)]
+    pub(crate) forked: bool,
+
+    /// Transient checkpoint materialization policy selected by the caller.
+    #[serde(skip)]
+    pub(crate) snapshot_restore_mode: SnapshotRestoreMode,
+
+    /// Explicit failure policy for external resources during full execution restore.
+    #[serde(default)]
+    pub(crate) external_mount_policy: microsandbox_types::ExternalMountRestorePolicy,
+
+    /// Resource choices apply to this restore/branch only, never later starts or branches.
+    #[serde(skip)]
+    pub(crate) restore_resources: super::restore_resources::RestoreResources,
+
+    /// Whether this create operation resumed execution from a full snapshot.
+    #[serde(skip)]
+    pub(crate) resumed_from_full_snapshot: bool,
+
+    /// Child-owned oldest-to-head root-disk chain prepared for checkpoint restore.
+    #[serde(skip)]
+    #[cfg(feature = "local")]
+    pub(crate) snapshot_upper_layers: Vec<RootfsUpperLayerConfig>,
+
+    /// Explicit builder choices retained until a deferred archive descriptor is available.
+    #[serde(skip)]
+    pub(crate) restore_overrides: RestoreOverrideIntent,
+
+    /// Destination boot settings that require scope admission before snapshot materialization.
+    /// Captured execution does not rerun guest bootstrap; explicit choices cannot be ignored.
+    #[serde(skip)]
+    pub(crate) restore_boot_overrides: super::restore_builder::RestoreBootOverrides,
+
+    /// Transient process-launch intent for the current create operation.
+    #[serde(skip)]
+    pub(crate) launch_intent: LaunchIntent,
+
+    /// Durable CMD before a detached one-shot command temporarily replaced it.
+    #[serde(skip)]
+    pub(crate) launch_cmd_before_override: Option<Option<Vec<String>>>,
+
+    /// Whether image-init routing consumed the requested boot workload.
+    #[serde(skip)]
+    pub(crate) init_owns_workload: bool,
+
+    /// Number of transient workload arguments appended to the init specification.
+    #[serde(skip)]
+    pub(crate) init_workload_arg_count: usize,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl SandboxConfig {
+    /// Resolve the effective metrics sampling interval, accounting for the disable override.
+    pub fn effective_metrics_interval(&self) -> Option<NonZero<u64>> {
+        if self.spec.runtime.disable_metrics_sample {
+            None
+        } else {
+            self.spec
+                .runtime
+                .metrics_sample_interval_ms
+                .and_then(NonZero::new)
+        }
+    }
+
+    /// Return the config shape that should be persisted for future starts.
+    ///
+    /// CLI `run` commands are one-shot launch intent. Their durable CMD template is retained, while
+    /// transient launch markers and any workload argv routed through an inherited init are removed.
+    pub(crate) fn clone_for_persistence(&self) -> Self {
+        let mut config = self.clone();
+        #[cfg(feature = "local")]
+        {
+            config.checkpoint_restore = None;
+            config.branch_source = None;
+            #[cfg(target_os = "linux")]
+            {
+                config.branch_memory = None;
+            }
+            config.forked = false;
+        }
+        config.snapshot_restore_mode = SnapshotRestoreMode::Full;
+        config.restore_resources = Default::default();
+        config.resumed_from_full_snapshot = false;
+        #[cfg(feature = "local")]
+        {
+            config.snapshot_root_layer_sources.clear();
+            config.snapshot_owned_source = None;
+        }
+        config.snapshot_root_virtual_size = None;
+        #[cfg(feature = "local")]
+        {
+            config.snapshot_upper_layers.clear();
+        }
+        config.restore_overrides = RestoreOverrideIntent::default();
+        config.restore_boot_overrides = Default::default();
+        config.launch_intent = LaunchIntent::None;
+        config.launch_cmd_before_override = None;
+        config.init_owns_workload = false;
+        if config.init_workload_arg_count > 0 {
+            if let Some(init) = config.spec.init.as_mut() {
+                let durable_len = init
+                    .args
+                    .len()
+                    .saturating_sub(config.init_workload_arg_count);
+                init.args.truncate(durable_len);
+            }
+            config.init_workload_arg_count = 0;
+        }
+        for mount in &mut config.spec.mounts {
+            if let VolumeMount::Named { create, .. } = mount {
+                *create = None;
+            }
+        }
+        config
+    }
+
+    /// Select the foreground launch path for attached `msb run`.
+    pub(crate) fn set_foreground_command(&mut self, command: Vec<String>) {
+        self.launch_intent = LaunchIntent::Foreground {
+            command: (!command.is_empty()).then_some(command),
+        };
+    }
+
+    /// Select the background launch path for detached `msb run -d`.
+    ///
+    /// A non-empty command replaces the image CMD while preserving the effective entrypoint. An
+    /// empty command intentionally keeps the image CMD so detached and attached runs resolve the
+    /// same OCI process.
+    pub(crate) fn set_background_command(&mut self, command: Vec<String>) {
+        if !command.is_empty() {
+            if self.launch_cmd_before_override.is_none() {
+                self.launch_cmd_before_override = Some(self.spec.runtime.cmd.clone());
+            }
+            self.spec.runtime.cmd = Some(command);
+        }
+        self.launch_intent = LaunchIntent::Background;
+    }
+
+    /// Return whether this create operation should launch the resolved command in the background.
+    pub(crate) fn should_launch_background_command(&self) -> bool {
+        self.launch_intent == LaunchIntent::Background
+    }
+
+    /// Clear process-launch intent after another mechanism takes ownership of the command.
+    pub(crate) fn clear_launch_intent(&mut self) {
+        self.launch_intent = LaunchIntent::None;
+        self.launch_cmd_before_override = None;
+    }
+
+    /// Discard a requested startup command because restored execution already owns the workload.
+    pub(crate) fn suppress_launch_for_full_restore(&mut self) {
+        if let Some(previous) = self.launch_cmd_before_override.take() {
+            self.spec.runtime.cmd = previous;
+        }
+        self.launch_intent = LaunchIntent::None;
+        self.resumed_from_full_snapshot = true;
+    }
+
+    /// Return whether inherited image init routing owns this create operation's boot workload.
+    #[doc(hidden)]
+    pub fn init_owns_boot_workload(&self) -> bool {
+        self.init_owns_workload
+    }
+
+    /// Return whether this create operation resumed execution from a full snapshot.
+    #[doc(hidden)]
+    pub fn resumed_from_full_snapshot(&self) -> bool {
+        self.resumed_from_full_snapshot
+    }
+
+    /// Apply OCI image config as defaults. User-provided values take precedence.
+    ///
+    /// - `env`: image env vars form the base; user env vars override by key, otherwise append.
+    /// - `labels`: image labels form the base; user labels override by key.
+    /// - `cmd`, `entrypoint`, `workdir`, `user`: image value used only if user did not set one.
+    /// - `init`: an `auto` init may resolve from a known init at the start of the image entrypoint and inherit the effective entrypoint env.
+    #[cfg(feature = "local")]
+    pub fn merge_image_defaults(&mut self, image: &ImageConfig) {
+        self.spec.env = merge_env(&image.env, &self.spec.env);
+        self.spec.labels = merge_image_labels(&image.labels, &self.spec.labels);
+
+        let inherit_entrypoint = self.spec.runtime.entrypoint.is_none();
+
+        if self.spec.runtime.cmd.is_none() {
+            self.spec.runtime.cmd = image.cmd.clone();
+        }
+        if self.spec.runtime.entrypoint.is_none() {
+            self.spec.runtime.entrypoint = image.entrypoint.clone();
+        }
+        if self.spec.runtime.workdir.is_none() {
+            self.spec.runtime.workdir = image
+                .working_dir
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+        }
+        if self.spec.runtime.user.is_none() {
+            self.spec.runtime.user = image
+                .user
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+        }
+
+        self.resolve_auto_init_from_image_entrypoint(
+            image.entrypoint.as_deref(),
+            inherit_entrypoint,
+        );
+    }
+
+    /// Resolve `init = "auto"` from a known init path declared as the
+    /// image entrypoint.
+    ///
+    /// Docker starts containers by appending CMD to the image ENTRYPOINT. Init selection always
+    /// removes a recognized inherited init token from the durable workload template. Only an
+    /// explicit boot-workload intent may transfer the already-resolved argv to PID 1.
+    fn resolve_auto_init_from_image_entrypoint(
+        &mut self,
+        image_entrypoint: Option<&[String]>,
+        inherited_entrypoint: bool,
+    ) {
+        let Some(init) = self.spec.init.as_ref() else {
+            return;
+        };
+        if init.cmd != HANDOFF_INIT_AUTO {
+            return;
+        }
+        let Some(entrypoint) = image_entrypoint else {
+            return;
+        };
+        let Some(init_path) = entrypoint
+            .first()
+            .map(String::as_str)
+            .filter(|path| is_image_entrypoint_init(path))
+        else {
+            return;
+        };
+
+        if !inherited_entrypoint {
+            let init = self
+                .spec
+                .init
+                .as_mut()
+                .expect("init was present at start of auto resolution");
+            init.cmd = init_path.to_string();
+            init.env = merge_init_env(&self.spec.env, &init.env);
+            return;
+        }
+
+        let Some(entrypoint) = self.spec.runtime.entrypoint.take() else {
+            return;
+        };
+        let mut workload_entrypoint = entrypoint.clone();
+        if workload_entrypoint
+            .first()
+            .is_some_and(|first| first.as_str() == init_path)
+        {
+            workload_entrypoint.remove(0);
+        }
+
+        let init = self
+            .spec
+            .init
+            .as_mut()
+            .expect("init was present at start of auto resolution");
+        init.cmd = init_path.to_string();
+        init.env = merge_init_env(&self.spec.env, &init.env);
+
+        self.spec.runtime.entrypoint =
+            (!workload_entrypoint.is_empty()).then_some(workload_entrypoint.clone());
+
+        let cmd_override = match &self.launch_intent {
+            LaunchIntent::Foreground { command } => command.as_deref(),
+            LaunchIntent::Background => None,
+            LaunchIntent::None => return,
+        };
+        let is_container_init_contract = init_path == "/init" || !workload_entrypoint.is_empty();
+        if !is_container_init_contract {
+            return;
+        }
+
+        let Ok(command) = microsandbox_types::resolve_default_command(
+            Some(entrypoint.as_slice()),
+            self.spec.runtime.cmd.as_deref(),
+            cmd_override,
+        ) else {
+            return;
+        };
+        if command.program != init_path {
+            return;
+        }
+
+        self.init_workload_arg_count = command.args.len();
+        self.spec
+            .init
+            .as_mut()
+            .expect("init remains configured")
+            .args
+            .extend(command.args);
+        self.init_owns_workload = true;
+
+        // The startup command is now part of PID 1's argv. Clearing launch intent prevents the
+        // direct runtime from issuing a duplicate agent exec for a detached invocation.
+        self.clear_launch_intent();
+    }
+
+    /// Materialize rootfs defaults that should be persisted with the sandbox.
+    ///
+    /// The backend default may select the complete root-disk shape. The deprecated upper-size
+    /// setting remains managed-disk size sugar and cannot be combined with `root_disk`. An absent
+    /// root disk resolves to managed; a sizeless tmpfs resolves to half the sandbox memory.
+    #[cfg(feature = "local")]
+    pub(crate) fn apply_rootfs_defaults(
+        &mut self,
+        defaults: &crate::config::OciSandboxDefaults,
+    ) -> crate::MicrosandboxResult<()> {
+        if defaults.upper_size_mib.is_some() && defaults.root_disk.is_some() {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "sandbox_defaults.oci.root_disk and deprecated sandbox_defaults.oci.upper_size_mib are mutually exclusive".into(),
+            ));
+        }
+        if matches!(defaults.root_disk, Some(RootDisk::DiskImage { .. })) {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "sandbox_defaults.oci.root_disk cannot be a shared disk-image; specify user-owned disk images per sandbox".into(),
+            ));
+        }
+
+        if self.snapshot_reference.is_some()
+            || self.snapshot_upper_source.is_some()
+            || !self.snapshot_root_layer_sources.is_empty()
+            || self.snapshot_archive_source.is_some()
+            || self.checkpoint_restore.is_some()
+        {
+            return Ok(());
+        }
+
+        let default_size_mib = defaults.upper_size_mib;
+        let memory_mib = self.spec.resources.memory_mib;
+        if let RootfsSource::Oci(oci) = &mut self.spec.image {
+            if oci.root_disk.is_none() {
+                oci.root_disk = defaults.root_disk.clone();
+            }
+
+            match &mut oci.root_disk {
+                None => {
+                    oci.root_disk = Some(RootDisk::Managed {
+                        size_mib: Some(default_size_mib.unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB)),
+                    });
+                }
+                Some(RootDisk::Managed { size_mib }) if size_mib.is_none() => {
+                    *size_mib = Some(default_size_mib.unwrap_or(DEFAULT_OCI_UPPER_SIZE_MIB));
+                }
+                Some(RootDisk::Tmpfs { size_mib }) if size_mib.is_none() => {
+                    *size_mib = Some((memory_mib / 2).max(1));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep disk-backed OCI temporary files on the writable disk. Only a
+    /// deliberately RAM-backed root receives the historical bounded tmpfs.
+    /// Explicit mounts, including tmpfs stored by older versions, are retained.
+    pub(crate) fn apply_runtime_defaults(&mut self) {
+        if !matches!(
+            self.spec.image.oci_root_disk(),
+            Some(RootDisk::Tmpfs { .. })
+        ) {
+            return;
+        }
+
+        if self
+            .spec
+            .mounts
+            .iter()
+            .any(|mount| guest_mount_is(mount, DEFAULT_OCI_TMPFS_PATH))
+        {
+            return;
+        }
+
+        self.spec.mounts.push(VolumeMount::Tmpfs {
+            guest: DEFAULT_OCI_TMPFS_PATH.to_string(),
+            size_mib: Some(default_oci_tmpfs_size_mib(self.spec.resources.memory_mib)),
+            options: MountOptions::default(),
+        });
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Merge two sets of env-var pairs. Base entries are kept unless overridden by
+/// key, then all override entries are appended.
+pub(crate) fn merge_env_pairs(base: &[EnvVar], overrides: &[EnvVar]) -> Vec<EnvVar> {
+    let override_keys: HashSet<&str> = overrides.iter().map(|var| var.key.as_str()).collect();
+
+    let mut merged: Vec<EnvVar> = base
+        .iter()
+        .filter(|var| !override_keys.contains(var.key.as_str()))
+        .cloned()
+        .collect();
+
+    merged.extend(overrides.iter().cloned());
+    merged
+}
+
+fn merge_init_env(base: &[EnvVar], overrides: &[(String, String)]) -> Vec<(String, String)> {
+    let overrides = overrides
+        .iter()
+        .cloned()
+        .map(EnvVar::from)
+        .collect::<Vec<_>>();
+
+    merge_env_pairs(base, &overrides)
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Merge image env vars (OCI `KEY=VALUE` strings) with user env var pairs.
+fn merge_env(image_env: &[String], user_env: &[EnvVar]) -> Vec<EnvVar> {
+    let base: Vec<EnvVar> = image_env
+        .iter()
+        .filter_map(|entry| match entry.split_once('=') {
+            Some((key, value)) => Some(EnvVar::new(key, value)),
+            None => {
+                tracing::warn!(entry = %entry, "skipping malformed image env var (expected KEY=VALUE)");
+                None
+            }
+        })
+        .collect();
+
+    merge_env_pairs(&base, user_env)
+}
+
+/// Merge OCI image labels (base) with user labels (override on key collision).
+///
+/// Image labels carrying a reserved prefix or an empty key are skipped: they
+/// cannot become metric attributes and would otherwise bypass user-label
+/// validation (which already ran before the image was pulled).
+fn merge_image_labels(
+    image_labels: &HashMap<String, String>,
+    user_labels: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged: BTreeMap<String, String> = image_labels
+        .iter()
+        .filter(|(key, _)| !key.is_empty() && super::reserved_label_prefix(key).is_none())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    // User labels win on collision.
+    for (key, value) in user_labels {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
+fn is_image_entrypoint_init(path: &str) -> bool {
+    HANDOFF_INIT_IMAGE_ENTRYPOINT_CANDIDATES.contains(&path)
+}
+
+fn default_oci_tmpfs_size_mib(memory_mib: u32) -> u32 {
+    (memory_mib / DEFAULT_OCI_TMPFS_MEMORY_DIVISOR).clamp(1, DEFAULT_OCI_TMPFS_MAX_SIZE_MIB)
+}
+
+fn guest_mount_is(mount: &VolumeMount, path: &str) -> bool {
+    match mount {
+        VolumeMount::Bind { guest, .. }
+        | VolumeMount::Named { guest, .. }
+        | VolumeMount::Owned { guest, .. }
+        | VolumeMount::Tmpfs { guest, .. }
+        | VolumeMount::DiskImage { guest, .. } => {
+            Utf8UnixPath::new(guest).normalize() == Utf8UnixPath::new(path).normalize()
+        }
+    }
+}
+
+pub(crate) fn sandbox_log_level_from_runtime(level: LogLevel) -> SandboxLogLevel {
+    match level {
+        LogLevel::Error => SandboxLogLevel::Error,
+        LogLevel::Warn => SandboxLogLevel::Warn,
+        LogLevel::Info => SandboxLogLevel::Info,
+        LogLevel::Debug => SandboxLogLevel::Debug,
+        LogLevel::Trace => SandboxLogLevel::Trace,
+    }
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn network_spec_from_config(
+    config: &microsandbox_network::config::NetworkConfig,
+) -> crate::MicrosandboxResult<microsandbox_types::NetworkSpec> {
+    Ok(serde_json::from_value(serde_json::to_value(config)?)?)
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn network_config_from_spec(
+    spec: &microsandbox_types::NetworkSpec,
+) -> crate::MicrosandboxResult<microsandbox_network::config::NetworkConfig> {
+    Ok(serde_json::from_value(serde_json::to_value(spec)?)?)
+}
+
+#[cfg(feature = "net")]
+impl SandboxConfig {
+    pub(crate) fn local_network_config(
+        &self,
+    ) -> crate::MicrosandboxResult<microsandbox_network::config::NetworkConfig> {
+        network_config_from_spec(&self.spec.network)
+    }
+
+    pub(crate) fn set_local_network_config(
+        &mut self,
+        config: microsandbox_network::config::NetworkConfig,
+    ) -> crate::MicrosandboxResult<()> {
+        self.spec.network = network_spec_from_config(&config)?;
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl From<SandboxSpec> for SandboxConfig {
+    /// Build a config from a full durable spec, defaulting all local
+    /// operational state (registry auth, replace flags, snapshot metadata).
+    fn from(spec: SandboxSpec) -> Self {
+        Self {
+            spec,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            spec: SandboxSpec {
+                resources: SandboxResources {
+                    cpus: default_cpus(),
+                    memory_mib: default_memory_mib(),
+                    max_cpus: default_cpus(),
+                    max_memory_mib: default_memory_mib(),
+                    cpu_placement: Default::default(),
+                    placement_profile: None,
+                    thp: TransparentHugePagePolicy::Madvise,
+                },
+                runtime: SandboxRuntimeOptions {
+                    log_level: default_log_level(),
+                    metrics_sample_interval_ms: default_metrics_sample_interval_ms()
+                        .map(NonZero::get),
+                    disable_metrics_sample: default_disable_metrics_sample(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            registry_auth: None,
+            #[cfg(feature = "local")]
+            creation_progress: None,
+            insecure: false,
+            ca_certs: Vec::new(),
+            replace_existing: false,
+            replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
+            slug: None,
+            manifest_digest: None,
+            snapshot_reference: None,
+            snapshot_upper_source: None,
+            #[cfg(feature = "local")]
+            snapshot_root_layer_sources: Vec::new(),
+            #[cfg(feature = "local")]
+            snapshot_owned_source: None,
+            snapshot_root_virtual_size: None,
+            snapshot_archive_source: None,
+            snapshot_parent: None,
+            snapshot_base: None,
+            #[cfg(feature = "local")]
+            checkpoint_restore: None,
+            #[cfg(feature = "local")]
+            branch_source: None,
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            branch_memory: None,
+            forked: false,
+            snapshot_restore_mode: SnapshotRestoreMode::Full,
+            external_mount_policy: microsandbox_types::ExternalMountRestorePolicy::Strict,
+            restore_resources: Default::default(),
+            resumed_from_full_snapshot: false,
+            #[cfg(feature = "local")]
+            snapshot_upper_layers: Vec::new(),
+            restore_overrides: RestoreOverrideIntent::default(),
+            restore_boot_overrides: Default::default(),
+            launch_intent: LaunchIntent::None,
+            launch_cmd_before_override: None,
+            init_owns_workload: false,
+            init_workload_arg_count: 0,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "local"))]
+mod tests {
+    use std::path::PathBuf;
+
+    use microsandbox_runtime::launch::CheckpointRestoreConfig;
+
+    use super::{SandboxConfig, SnapshotRestoreMode, merge_env};
+    use crate::sandbox::{
+        HandoffInit, MountOptions, NamedVolumeMode, RootDisk, RootfsSource, StatVirtualization,
+        VolumeMount,
+    };
+    use crate::snapshot::SnapshotReference;
+    use microsandbox_image::ImageConfig;
+    use microsandbox_types::{
+        EnvVar, NamedVolumeCreate, SandboxLogLevel, SandboxPolicy, SandboxResources,
+        SandboxRuntimeOptions, SandboxSpec, SecurityProfile, TransparentHugePagePolicy, VolumeKind,
+    };
+
+    #[test]
+    fn test_merge_env_image_base_with_user_override() {
+        let image_env = vec![
+            "PATH=/usr/local/bin:/usr/bin".to_string(),
+            "PYTHON_VERSION=3.14".to_string(),
+        ];
+        let user_env = vec![
+            EnvVar::new("PATH", "/custom/bin"),
+            EnvVar::new("MY_VAR", "hello"),
+        ];
+
+        let merged = merge_env(&image_env, &user_env);
+
+        assert_eq!(
+            merged,
+            vec![
+                EnvVar::new("PYTHON_VERSION", "3.14"),
+                EnvVar::new("PATH", "/custom/bin"),
+                EnvVar::new("MY_VAR", "hello"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_env_empty_user_inherits_image() {
+        let image_env = vec!["PATH=/usr/bin".to_string(), "LANG=C.UTF-8".to_string()];
+        let user_env = Vec::new();
+
+        let merged = merge_env(&image_env, &user_env);
+
+        assert_eq!(
+            merged,
+            vec![
+                EnvVar::new("PATH", "/usr/bin"),
+                EnvVar::new("LANG", "C.UTF-8"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_env_empty_image_keeps_user() {
+        let image_env = vec![];
+        let user_env = vec![EnvVar::new("MY_VAR", "val")];
+
+        let merged = merge_env(&image_env, &user_env);
+
+        assert_eq!(merged, vec![EnvVar::new("MY_VAR", "val")]);
+    }
+
+    #[test]
+    fn test_merge_image_defaults_replace_fields() {
+        let image = ImageConfig {
+            cmd: Some(vec!["python3".to_string()]),
+            entrypoint: Some(vec!["/entrypoint.sh".to_string()]),
+            working_dir: Some("/app".to_string()),
+            user: Some("appuser".to_string()),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig::default();
+        config.merge_image_defaults(&image);
+
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["python3".to_string()]));
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/entrypoint.sh".to_string()])
+        );
+        assert_eq!(config.spec.runtime.workdir, Some("/app".to_string()));
+        assert_eq!(config.spec.runtime.user, Some("appuser".to_string()));
+    }
+
+    #[test]
+    fn test_merge_image_defaults_user_overrides_take_precedence() {
+        let image = ImageConfig {
+            cmd: Some(vec!["python3".to_string()]),
+            entrypoint: Some(vec!["/entrypoint.sh".to_string()]),
+            working_dir: Some("/app".to_string()),
+            user: Some("appuser".to_string()),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                runtime: SandboxRuntimeOptions {
+                    cmd: Some(vec!["bash".to_string()]),
+                    workdir: Some("/workspace".to_string()),
+                    user: Some("root".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.merge_image_defaults(&image);
+
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["bash".to_string()]));
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/entrypoint.sh".to_string()])
+        );
+        assert_eq!(config.spec.runtime.workdir, Some("/workspace".to_string()));
+        assert_eq!(config.spec.runtime.user, Some("root".to_string()));
+    }
+
+    #[test]
+    fn full_restore_suppresses_transient_background_command() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                runtime: SandboxRuntimeOptions {
+                    cmd: Some(vec!["durable".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.set_background_command(vec!["ignored".to_string()]);
+        config.suppress_launch_for_full_restore();
+
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["durable".to_string()]));
+        assert!(!config.should_launch_background_command());
+        assert!(config.resumed_from_full_snapshot());
+    }
+
+    #[test]
+    fn test_merge_image_defaults_selects_init_without_launching_default_workload() {
+        let image = ImageConfig {
+            entrypoint: Some(vec![
+                "/init".to_string(),
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.merge_image_defaults(&image);
+
+        let init = config
+            .spec
+            .init
+            .as_ref()
+            .expect("init should remain configured");
+        assert_eq!(init.cmd, "/init");
+        assert!(init.args.is_empty());
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/opt/hermes/docker/main-wrapper.sh".to_string()])
+        );
+        assert!(!config.init_owns_boot_workload());
+    }
+
+    #[test]
+    fn test_merge_image_defaults_routes_attached_command_through_init_entrypoint() {
+        let image = ImageConfig {
+            entrypoint: Some(vec![
+                "/init".to_string(),
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.set_foreground_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.merge_image_defaults(&image);
+
+        let init = config
+            .spec
+            .init
+            .as_ref()
+            .expect("init should remain configured");
+        assert_eq!(init.cmd, "/init");
+        assert_eq!(
+            init.args,
+            vec![
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+                "gateway".to_string(),
+                "run".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/opt/hermes/docker/main-wrapper.sh".to_string()])
+        );
+        assert!(config.init_owns_boot_workload());
+    }
+
+    #[test]
+    fn test_merge_image_defaults_passes_effective_env_to_init_entrypoint() {
+        let image = ImageConfig {
+            entrypoint: Some(vec![
+                "/init".to_string(),
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+            ]),
+            env: vec![
+                "PATH=/image/bin:/usr/bin:/bin".to_string(),
+                "IMAGE_ONLY=1".to_string(),
+                "OVERRIDE=image".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: vec![
+                        ("PATH".to_string(), "/init/bin:/usr/bin:/bin".to_string()),
+                        ("INIT_ONLY".to_string(), "1".to_string()),
+                    ],
+                }),
+                env: vec![
+                    EnvVar::new("HERMES_DASHBOARD", "1"),
+                    EnvVar::new("OVERRIDE", "user"),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.set_foreground_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.merge_image_defaults(&image);
+
+        let init = config
+            .spec
+            .init
+            .as_ref()
+            .expect("init should remain configured");
+        assert_eq!(
+            init.env,
+            vec![
+                ("IMAGE_ONLY".to_string(), "1".to_string()),
+                ("HERMES_DASHBOARD".to_string(), "1".to_string()),
+                ("OVERRIDE".to_string(), "user".to_string()),
+                ("PATH".to_string(), "/init/bin:/usr/bin:/bin".to_string()),
+                ("INIT_ONLY".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_image_defaults_passes_detached_startup_cmd_to_init_args() {
+        let image = ImageConfig {
+            entrypoint: Some(vec![
+                "/init".to_string(),
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.set_background_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.merge_image_defaults(&image);
+
+        let init = config.spec.init.as_ref().expect("runtime init");
+        assert_eq!(init.cmd, "/init");
+        assert_eq!(
+            init.args,
+            vec![
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+                "gateway".to_string(),
+                "run".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/opt/hermes/docker/main-wrapper.sh".to_string()])
+        );
+        assert_eq!(
+            config.spec.runtime.cmd,
+            Some(vec!["gateway".to_string(), "run".to_string()])
+        );
+        assert!(!config.should_launch_background_command());
+        assert!(config.init_owns_boot_workload());
+
+        let persisted = config.clone_for_persistence();
+        assert!(
+            persisted
+                .spec
+                .init
+                .as_ref()
+                .expect("persisted init")
+                .args
+                .is_empty()
+        );
+        assert!(!persisted.init_owns_boot_workload());
+    }
+
+    #[test]
+    fn test_background_command_sets_runtime_cmd() {
+        let mut config = SandboxConfig::default();
+
+        config.set_background_command(vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "echo detached".to_string(),
+        ]);
+
+        assert_eq!(
+            config.spec.runtime.cmd,
+            Some(vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "echo detached".to_string(),
+            ])
+        );
+        assert!(config.should_launch_background_command());
+    }
+
+    #[test]
+    fn test_empty_background_command_keeps_runtime_cmd() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                runtime: SandboxRuntimeOptions {
+                    cmd: Some(vec!["python3".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.set_background_command(Vec::new());
+
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["python3".to_string()]));
+        assert!(config.should_launch_background_command());
+    }
+
+    #[test]
+    fn test_empty_background_command_uses_merged_image_cmd() {
+        let image = ImageConfig {
+            cmd: Some(vec!["bash".to_string()]),
+            ..Default::default()
+        };
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                runtime: SandboxRuntimeOptions {
+                    entrypoint: Some(vec!["start-desktop".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.set_background_command(Vec::new());
+        config.merge_image_defaults(&image);
+
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["start-desktop".to_string()])
+        );
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["bash".to_string()]));
+        assert!(config.should_launch_background_command());
+    }
+
+    #[test]
+    fn test_restore_boot_intent_is_operation_local() {
+        let config = SandboxConfig {
+            restore_boot_overrides: super::super::restore_builder::RestoreBootOverrides {
+                security: true,
+            },
+            ..Default::default()
+        };
+
+        // A later ordinary start must not replay the previous restore's admission decision.
+        assert!(config.restore_boot_overrides.security);
+        assert!(
+            !config
+                .clone_for_persistence()
+                .restore_boot_overrides
+                .security
+        );
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert!(encoded.get("restore_boot_overrides").is_none());
+        let decoded: SandboxConfig = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.restore_boot_overrides.security);
+    }
+
+    #[test]
+    fn test_clone_for_persistence_keeps_user_init_args() {
+        let config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "/lib/systemd/systemd".to_string(),
+                    args: vec!["--unit=multi-user.target".to_string()],
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let persisted = config.clone_for_persistence();
+
+        let persisted_init = persisted.spec.init.as_ref().expect("persisted init");
+        assert_eq!(
+            persisted_init.args,
+            vec!["--unit=multi-user.target".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_clone_for_persistence_strips_named_volume_create_intent() {
+        let config = SandboxConfig {
+            spec: SandboxSpec {
+                mounts: vec![VolumeMount::Named {
+                    name: "cache".to_string(),
+                    guest: "/cache".to_string(),
+                    create: Some(NamedVolumeCreate {
+                        mode: NamedVolumeMode::Create,
+                        name: "cache".to_string(),
+                        kind: VolumeKind::Directory,
+                        quota_mib: Some(512),
+                        capacity_mib: None,
+                        labels: Vec::new(),
+                    }),
+                    options: MountOptions::default(),
+                    stat_virtualization: StatVirtualization::Strict,
+                    host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let persisted = config.clone_for_persistence();
+
+        match &persisted.spec.mounts[0] {
+            VolumeMount::Named { name, create, .. } => {
+                assert_eq!(name, "cache");
+                assert!(create.is_none());
+            }
+            other => panic!("expected named mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_image_defaults_passes_image_cmd_to_init_args() {
+        let image = ImageConfig {
+            entrypoint: Some(vec!["/init".to_string()]),
+            cmd: Some(vec!["/app/server".to_string(), "--serve".to_string()]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.set_foreground_command(Vec::new());
+        config.merge_image_defaults(&image);
+
+        let init = config
+            .spec
+            .init
+            .as_ref()
+            .expect("init should remain configured");
+        assert_eq!(init.cmd, "/init");
+        assert_eq!(
+            init.args,
+            vec!["/app/server".to_string(), "--serve".to_string()]
+        );
+        assert_eq!(config.spec.runtime.entrypoint, None);
+        assert_eq!(
+            config.spec.runtime.cmd,
+            Some(vec!["/app/server".to_string(), "--serve".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_image_defaults_resolves_bare_systemd_init_entrypoint() {
+        let image = ImageConfig {
+            entrypoint: Some(vec!["/lib/systemd/systemd".to_string()]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.set_foreground_command(vec!["bash".to_string()]);
+        config.merge_image_defaults(&image);
+
+        let init = config
+            .spec
+            .init
+            .as_ref()
+            .expect("init should remain configured");
+        assert_eq!(init.cmd, "/lib/systemd/systemd");
+        assert!(init.args.is_empty());
+        assert_eq!(config.spec.runtime.entrypoint, None);
+        assert!(!config.init_owns_boot_workload());
+    }
+
+    #[test]
+    fn test_merge_image_defaults_keeps_user_entrypoint_when_resolving_auto_init() {
+        let image = ImageConfig {
+            entrypoint: Some(vec![
+                "/init".to_string(),
+                "/opt/hermes/docker/main-wrapper.sh".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                runtime: SandboxRuntimeOptions {
+                    entrypoint: Some(vec!["/bin/sh".to_string()]),
+                    ..Default::default()
+                },
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.set_foreground_command(vec!["gateway".to_string(), "run".to_string()]);
+        config.merge_image_defaults(&image);
+
+        let init = config
+            .spec
+            .init
+            .as_ref()
+            .expect("init should remain configured");
+        assert_eq!(init.cmd, "/init");
+        assert!(init.args.is_empty());
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/bin/sh".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_image_defaults_leaves_auto_init_for_unknown_entrypoint() {
+        let image = ImageConfig {
+            entrypoint: Some(vec!["/entrypoint.sh".to_string()]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                init: Some(HandoffInit {
+                    cmd: "auto".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.merge_image_defaults(&image);
+
+        assert_eq!(
+            config.spec.init.expect("init should remain configured").cmd,
+            "auto"
+        );
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["/entrypoint.sh".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_image_defaults_imports_labels() {
+        use std::collections::HashMap;
+
+        let image = ImageConfig {
+            labels: HashMap::from([
+                (
+                    "org.opencontainers.image.source".to_string(),
+                    "https://example.com/repo".to_string(),
+                ),
+                ("vendor".to_string(), "image-vendor".to_string()),
+                // Reserved prefix and empty key must be skipped.
+                ("sandbox.id".to_string(), "spoofed".to_string()),
+                (String::new(), "x".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                labels: [
+                    ("user.id".to_string(), "alice".to_string()),
+                    // Collides with an image label; the user value must win.
+                    ("vendor".to_string(), "user-vendor".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.merge_image_defaults(&image);
+
+        assert_eq!(
+            config
+                .spec
+                .labels
+                .get("org.opencontainers.image.source")
+                .map(String::as_str),
+            Some("https://example.com/repo")
+        );
+        assert_eq!(
+            config.spec.labels.get("user.id").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            config.spec.labels.get("vendor").map(String::as_str),
+            Some("user-vendor")
+        );
+        assert!(!config.spec.labels.contains_key("sandbox.id"));
+        assert!(!config.spec.labels.contains_key(""));
+    }
+
+    #[test]
+    fn test_merge_image_defaults_empty_strings_treated_as_none() {
+        let image = ImageConfig {
+            working_dir: Some(String::new()),
+            user: Some(String::new()),
+            ..Default::default()
+        };
+
+        let mut config = SandboxConfig::default();
+        config.merge_image_defaults(&image);
+
+        assert!(
+            config.spec.runtime.workdir.is_none(),
+            "empty working_dir should not propagate"
+        );
+        assert!(
+            config.spec.runtime.user.is_none(),
+            "empty user should not propagate"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_config_serializes_manifest_digest_but_redacts_registry_auth() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                name: "persisted".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.replace_existing = true;
+        config.manifest_digest = Some("sha256:abc123".into());
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("registry_auth"));
+        assert!(!json.contains("replace_existing"));
+        assert!(json.contains("manifest_digest"));
+        assert!(json.contains("sha256:abc123"));
+
+        let decoded: SandboxConfig = serde_json::from_str(&json).unwrap();
+        assert!(decoded.registry_auth.is_none());
+        assert!(!decoded.replace_existing);
+        assert_eq!(decoded.manifest_digest, config.manifest_digest);
+    }
+
+    #[test]
+    fn test_sandbox_config_embeds_shared_spec() {
+        let spec = microsandbox_types::SandboxSpec {
+            name: "spec-test".into(),
+            image: RootfsSource::oci("python:3.12"),
+            resources: SandboxResources {
+                cpus: 2,
+                memory_mib: 1024,
+                max_cpus: 2,
+                max_memory_mib: 1024,
+                cpu_placement: Default::default(),
+                placement_profile: None,
+                thp: TransparentHugePagePolicy::Madvise,
+            },
+            runtime: SandboxRuntimeOptions {
+                workdir: Some("/app".into()),
+                shell: Some("/bin/bash".into()),
+                scripts: [("setup".to_string(), "echo hi".to_string())]
+                    .into_iter()
+                    .collect(),
+                entrypoint: Some(vec!["python".into(), "-u".into()]),
+                cmd: Some(vec!["worker.py".into()]),
+                hostname: Some("worker".into()),
+                user: Some("appuser".into()),
+                log_level: Some(SandboxLogLevel::Trace),
+                metrics_sample_interval_ms: Some(750),
+                disable_metrics_sample: true,
+            },
+            env: vec![EnvVar::new("A", "B")],
+            labels: [("team".to_string(), "infra".to_string())]
+                .into_iter()
+                .collect(),
+            rlimits: vec![microsandbox_types::Rlimit {
+                resource: microsandbox_types::RlimitResource::Nofile,
+                soft: 1024,
+                hard: 2048,
+            }],
+            security_profile: SecurityProfile::Restricted,
+            lifecycle: SandboxPolicy {
+                ephemeral: false,
+                max_duration_secs: Some(3600),
+                idle_timeout_secs: Some(120),
+            },
+            ..Default::default()
+        };
+
+        let config = SandboxConfig {
+            spec,
+            ..Default::default()
+        };
+
+        assert_eq!(config.spec.name, "spec-test");
+        assert!(
+            matches!(config.spec.image, RootfsSource::Oci(ref oci) if oci.reference == "python:3.12")
+        );
+        assert_eq!(config.spec.resources.cpus, 2);
+        assert_eq!(config.spec.resources.memory_mib, 1024);
+        assert_eq!(config.spec.runtime.log_level, Some(SandboxLogLevel::Trace));
+        assert_eq!(config.spec.runtime.metrics_sample_interval_ms, Some(750));
+        assert!(config.spec.runtime.disable_metrics_sample);
+        assert_eq!(config.spec.runtime.workdir.as_deref(), Some("/app"));
+        assert_eq!(config.spec.runtime.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(
+            config.spec.runtime.scripts.get("setup"),
+            Some(&"echo hi".into())
+        );
+        assert_eq!(config.spec.env, vec![EnvVar::new("A", "B")]);
+        assert_eq!(config.spec.labels.get("team"), Some(&"infra".into()));
+        assert_eq!(config.spec.rlimits.len(), 1);
+        assert_eq!(
+            config.spec.runtime.entrypoint,
+            Some(vec!["python".to_string(), "-u".to_string()])
+        );
+        assert_eq!(config.spec.runtime.cmd, Some(vec!["worker.py".to_string()]));
+        assert_eq!(config.spec.runtime.hostname.as_deref(), Some("worker"));
+        assert_eq!(config.spec.runtime.user.as_deref(), Some("appuser"));
+        assert_eq!(config.spec.security_profile, SecurityProfile::Restricted);
+        assert_eq!(config.spec.lifecycle.max_duration_secs, Some(3600));
+        assert_eq!(config.spec.lifecycle.idle_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn test_apply_runtime_defaults_adds_tmpfs_for_ram_backed_oci_tmp() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                resources: SandboxResources {
+                    memory_mib: 2048,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        if let RootfsSource::Oci(oci) = &mut config.spec.image {
+            oci.root_disk = Some(RootDisk::tmpfs(1024));
+        }
+        config.apply_runtime_defaults();
+
+        assert_eq!(config.spec.mounts.len(), 1);
+        match &config.spec.mounts[0] {
+            VolumeMount::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => {
+                assert_eq!(guest, "/tmp");
+                assert_eq!(*size_mib, Some(512));
+                assert_eq!(*options, MountOptions::default());
+            }
+            mount => panic!("expected tmpfs mount, got {mount:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_backed_tmp_uses_root_disk_and_explicit_tmpfs_survives_restart() {
+        for root_disk in [
+            None,
+            Some(RootDisk::managed(16384)),
+            Some(RootDisk::flat(16384)),
+        ] {
+            let mut config = SandboxConfig::default();
+            config.spec.image = RootfsSource::oci("node:22");
+            if let RootfsSource::Oci(oci) = &mut config.spec.image {
+                oci.root_disk = root_disk;
+            }
+            config.apply_runtime_defaults();
+            assert!(config.spec.mounts.is_empty());
+            config.spec.mounts.push(VolumeMount::Tmpfs {
+                guest: "/tmp".into(),
+                size_mib: Some(128),
+                options: MountOptions::default(),
+            });
+            // Persisted mounts from older versions remain explicit on restart.
+            let mut restarted: SandboxConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            restarted.apply_runtime_defaults();
+            assert_eq!(restarted.spec.mounts.len(), 1);
+            assert!(matches!(
+                restarted.spec.mounts[0],
+                VolumeMount::Tmpfs {
+                    size_mib: Some(128),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_sets_managed_root_disk() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults::default())
+            .unwrap();
+
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&RootDisk::managed(4096))
+        );
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_sizes_tmpfs_from_memory() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::Oci(microsandbox_types::OciRootfsSource {
+                    reference: "python:3.12".into(),
+                    root_disk: Some(RootDisk::Tmpfs { size_mib: None }),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.spec.resources.memory_mib = 2048;
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults::default())
+            .unwrap();
+
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&RootDisk::tmpfs(1024))
+        );
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_uses_backend_oci_upper_size() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: Some(8192),
+                root_disk: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&RootDisk::managed(8192))
+        );
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_uses_flat_backend_default() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let expected = RootDisk::Flat {
+            size_mib: Some(8192),
+            fstype: Some("ext4".into()),
+            clone: microsandbox_types::FlatClone::Copy,
+        };
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: None,
+                root_disk: Some(expected.clone()),
+            })
+            .unwrap();
+
+        assert_eq!(config.spec.image.oci_root_disk(), Some(&expected));
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_rejects_conflicting_config_fields() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: Some(8192),
+                root_disk: Some(RootDisk::Flat {
+                    size_mib: None,
+                    fstype: None,
+                    clone: microsandbox_types::FlatClone::Auto,
+                }),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_skips_snapshot_reference() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                ..Default::default()
+            },
+            snapshot_reference: Some(SnapshotReference::path("/tmp/snapshot")),
+            ..Default::default()
+        };
+
+        config
+            .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                upper_size_mib: Some(8192),
+                root_disk: None,
+            })
+            .unwrap();
+
+        assert!(config.spec.image.oci_root_disk().is_none());
+    }
+
+    #[test]
+    fn test_apply_rootfs_defaults_skips_installed_checkpoint_restore() {
+        for restore_mode in [SnapshotRestoreMode::Full, SnapshotRestoreMode::DiskOnly] {
+            let mut config = SandboxConfig {
+                spec: SandboxSpec {
+                    image: RootfsSource::oci("python:3.12"),
+                    ..Default::default()
+                },
+                snapshot_restore_mode: restore_mode,
+                checkpoint_restore: Some(CheckpointRestoreConfig {
+                    memory_descriptor: false,
+                    network_gateway_mac: None,
+                    external_mount_policy: Default::default(),
+                    external_mounts: Vec::new(),
+                    unavailable_disks: Default::default(),
+                    local_branch: false,
+                    forked: false,
+                    closure: PathBuf::from("/tmp/checkpoint"),
+                    checkpoint_root:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                    checkpoint_id: "checkpoint_test".into(),
+                }),
+                ..Default::default()
+            };
+
+            config
+                .apply_rootfs_defaults(&crate::config::OciSandboxDefaults {
+                    upper_size_mib: Some(8192),
+                    root_disk: None,
+                })
+                .unwrap();
+
+            assert!(
+                config.spec.image.oci_root_disk().is_none(),
+                "{restore_mode:?} restore inherited an ordinary root-disk default"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_runtime_defaults_preserves_explicit_tmp_mount() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                mounts: vec![VolumeMount::Bind {
+                    host: "/host/tmp".into(),
+                    guest: "/tmp/".into(),
+                    options: MountOptions::default(),
+                    stat_virtualization: crate::sandbox::StatVirtualization::Strict,
+                    host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
+                    quota_mib: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_runtime_defaults();
+
+        assert_eq!(config.spec.mounts.len(), 1);
+        match &config.spec.mounts[0] {
+            VolumeMount::Bind { guest, .. } => assert_eq!(guest, "/tmp/"),
+            mount => panic!("expected bind mount, got {mount:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_runtime_defaults_preserves_canonical_tmp_alias() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                mounts: vec![VolumeMount::Bind {
+                    host: "/host/tmp".into(),
+                    guest: "/tmp/.".into(),
+                    options: MountOptions::default(),
+                    stat_virtualization: crate::sandbox::StatVirtualization::Strict,
+                    host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
+                    quota_mib: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_runtime_defaults();
+
+        assert_eq!(config.spec.mounts.len(), 1);
+        assert_eq!(config.spec.mounts[0].guest(), "/tmp/.");
+    }
+
+    #[test]
+    fn test_apply_runtime_defaults_skips_non_oci_roots() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::Bind {
+                    path: "/tmp/rootfs".into(),
+                    follow_root_symlinks: false,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_runtime_defaults();
+
+        assert!(config.spec.mounts.is_empty());
+    }
+
+    #[test]
+    fn test_apply_runtime_defaults_skips_disk_image_roots() {
+        // Disk-image rootfses bring their own /tmp (it's part of the
+        // shipped filesystem), so we don't synthesise an implicit tmpfs
+        // for them. This test pins the policy so a future change has to
+        // be deliberate.
+        use crate::sandbox::DiskImageFormat;
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::DiskImage {
+                    path: "/tmp/disk.qcow2".into(),
+                    format: DiskImageFormat::Qcow2,
+                    fstype: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_runtime_defaults();
+
+        assert!(config.spec.mounts.is_empty());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn unspecified_network_policy_uses_engine_public_default() {
+        use microsandbox_network::policy::{NetworkPolicy, NetworkProfile};
+
+        let config = SandboxConfig::default();
+        assert!(config.spec.network.policy.is_none());
+
+        let actual = config.local_network_config().unwrap().policy;
+        let expected = NetworkPolicy::from_profiles([NetworkProfile::Public]);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Tests: Secret source references (create path + spawn resolution)
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(feature = "net")]
+    const SECRET_SENTINEL: &str = "sentinel-secret-value";
+
+    /// Build a network-enabled config carrying one secret. When `source_var`
+    /// is `Some`, the entry is a reference (the create path) resolved from that
+    /// host variable; when `None`, it is a legacy inlined value.
+    #[cfg(feature = "net")]
+    fn config_with_source_secret(source_var: Option<&str>) -> SandboxConfig {
+        use microsandbox_network::secrets::config::{
+            HostPattern, SecretEntry, SecretSource, SecretSubstitution,
+        };
+
+        let mut config = SandboxConfig::default();
+        config.spec.network.enabled = true;
+        let mut network = config.local_network_config().unwrap();
+        network.secrets.secrets.push(SecretEntry {
+            env_var: "API_KEY".into(),
+            value: if source_var.is_some() {
+                zeroize::Zeroizing::new(String::new())
+            } else {
+                zeroize::Zeroizing::new(SECRET_SENTINEL.into())
+            },
+            source: source_var.map(|var| SecretSource::Env {
+                var: var.to_string(),
+            }),
+            placeholder: "$MSB_API_KEY".into(),
+            allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+            substitution: SecretSubstitution::default(),
+            passthrough_hosts: Vec::new(),
+            violation_action: None,
+            require_tls_identity: true,
+        });
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    #[cfg(feature = "net")]
+    fn config_with_socks5_password_source() -> SandboxConfig {
+        use microsandbox_network::{OutboundProxyBuilder, OutboundProxyConfig};
+        use microsandbox_types::SecretSource;
+
+        let mut config = SandboxConfig::default();
+        config.spec.network.enabled = true;
+        let mut network = config.local_network_config().unwrap();
+        network.outbound_proxy = Some(
+            OutboundProxyBuilder::new()
+                .socks5("127.0.0.1:1080")
+                .credentials("sandbox", SecretSource::env("MSB_TEST_SOCKS5_PASSWORD"))
+                .build()
+                .unwrap(),
+        );
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn socks5_password_uses_resolved_network_launch_type() {
+        let _env_guard = crate::test_support::lock_env();
+        let config = config_with_socks5_password_source();
+        let durable_json = serde_json::to_string(&config).unwrap();
+        assert!(durable_json.contains("MSB_TEST_SOCKS5_PASSWORD"));
+        assert!(!durable_json.contains(SECRET_SENTINEL));
+
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_TEST_SOCKS5_PASSWORD", SECRET_SENTINEL) };
+        let resolved = config
+            .local_network_config()
+            .unwrap()
+            .resolve(&microsandbox_network::config::EnvNetworkSecretResolver)
+            .unwrap();
+        let launch_json = serde_json::to_string(&resolved).unwrap();
+        assert!(launch_json.contains(SECRET_SENTINEL));
+
+        let persisted_json = serde_json::to_string(&config.clone_for_persistence()).unwrap();
+        assert!(persisted_json.contains("MSB_TEST_SOCKS5_PASSWORD"));
+        assert!(!persisted_json.contains(SECRET_SENTINEL));
+        unsafe { std::env::remove_var("MSB_TEST_SOCKS5_PASSWORD") };
+    }
+
+    /// The create path persists a source reference, never the resolved value:
+    /// the durable config JSON and the active_config snapshot carry the
+    /// `{kind: env, var: ...}` reference and zero occurrences of the value.
+    #[cfg(feature = "net")]
+    #[test]
+    fn create_path_persists_reference_not_value() {
+        // No host env is touched: the reference is persisted without ever
+        // reading the value at create time.
+        let config = config_with_source_secret(Some("MSB_TEST_CREATE_SOURCE"));
+        let persisted = serde_json::to_string(&config).unwrap();
+        assert!(
+            !persisted.contains(SECRET_SENTINEL),
+            "persisted config must not contain the secret value"
+        );
+        assert!(persisted.contains("\"var\":\"MSB_TEST_CREATE_SOURCE\""));
+
+        // The active_config snapshot is written from the same config shape at
+        // start, so it inherits the reference and stays value-free.
+        let active = config.clone_for_persistence();
+        let active_json = serde_json::to_string(&active).unwrap();
+        assert!(!active_json.contains(SECRET_SENTINEL));
+        assert!(active_json.contains("\"var\":\"MSB_TEST_CREATE_SOURCE\""));
+    }
+
+    /// The spawn resolver reads the source from the host environment and yields
+    /// a config whose entry carries the value; the durable input is unchanged.
+    #[cfg(feature = "net")]
+    #[test]
+    fn spawn_resolver_reads_source_from_host_env() {
+        let _env_guard = crate::test_support::lock_env();
+        // SAFETY: every environment-mutating SDK unit test holds the shared lock.
+        unsafe { std::env::set_var("MSB_TEST_RESOLVE_SOURCE", SECRET_SENTINEL) };
+
+        let config = config_with_source_secret(Some("MSB_TEST_RESOLVE_SOURCE"));
+        let resolved = config
+            .local_network_config()
+            .unwrap()
+            .resolve(&microsandbox_network::config::EnvNetworkSecretResolver)
+            .unwrap();
+        assert_eq!(
+            resolved.config().secrets.secrets[0].value.as_str(),
+            SECRET_SENTINEL
+        );
+        // The durable input still stores only the reference.
+        let durable = config.local_network_config().unwrap();
+        assert!(durable.secrets.secrets[0].value.is_empty());
+
+        unsafe { std::env::remove_var("MSB_TEST_RESOLVE_SOURCE") };
+    }
+
+    /// Back-compat: a legacy config that inlined the value (no `source`) still
+    /// spawns. The resolver leaves the present non-empty value in the
+    /// declarative launch config and has no separate value to apply.
+    #[cfg(feature = "net")]
+    #[test]
+    fn spawn_resolver_preserves_legacy_inlined_value() {
+        let config = config_with_source_secret(None);
+        let resolved = config
+            .local_network_config()
+            .unwrap()
+            .resolve(&microsandbox_network::config::EnvNetworkSecretResolver)
+            .unwrap();
+        assert_eq!(
+            resolved.config().secrets.secrets[0].value.as_str(),
+            SECRET_SENTINEL
+        );
+    }
+    #[test]
+    fn test_sandbox_config_deserializes_legacy_readonly_mounts() {
+        let json = r#"{"name":"legacy","mounts":[{"type":"Tmpfs","guest":"/tmp","size_mib":512,"readonly":false}]}"#;
+
+        let decoded: SandboxConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(decoded.spec.mounts.len(), 1);
+        match &decoded.spec.mounts[0] {
+            VolumeMount::Tmpfs {
+                guest,
+                size_mib,
+                options,
+            } => {
+                assert_eq!(guest, "/tmp");
+                assert_eq!(*size_mib, Some(512));
+                assert_eq!(*options, MountOptions::default());
+            }
+            mount => panic!("expected tmpfs mount, got {mount:?}"),
+        }
+    }
+}

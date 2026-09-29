@@ -7,27 +7,44 @@ use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::runtime::BuiltinRuntimeSettings;
 use crate::engine::error::EngineError;
 
-#[cfg(awman_builtin)]
+// Gating follows the actual runtime boundary. Only the modules that call the
+// Microsandbox SDK or embed the verified payload (`embedded`, `msb_driver`)
+// need `awman_builtin`. Planning, paths, naming, resources, network policy,
+// the catalog marker, attach framing and the fake-driver lifecycle are plain
+// Unix code, so their tests run in the default hermetic tier without payloads
+// or the VM SDK. A default build has no production caller for them.
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod backend;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod catalog;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod driver;
 #[cfg(awman_builtin)]
 mod embedded;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod exec_bridge;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod instance;
 #[cfg(awman_builtin)]
 mod msb_driver;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod naming;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
+mod network;
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod paths;
-#[cfg(awman_builtin)]
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod resources;
-#[cfg(all(test, awman_builtin))]
+#[cfg(all(test, unix))]
 mod testing;
 
 /// `(target_os, target_arch)` pairs the builtin runtime supports.
@@ -112,6 +129,7 @@ mod tests {
             registries: BTreeMap::new(),
             ambient_overrides: ambient,
             test_isolation: true,
+            network: Default::default(),
         }
     }
 

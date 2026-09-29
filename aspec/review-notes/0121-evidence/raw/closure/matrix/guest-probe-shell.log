@@ -1,0 +1,9 @@
+    Blocking waiting for file lock on artifact directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.79s
+     Running tests/builtin_runtime/main.rs (target/debug/deps/builtin_runtime-f9ada9ba7c874b91)
+
+running 1 test
+test guest_compat::synthetic_strategy_probes_parse_as_shell_without_running_on_host ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 0.04s
+

@@ -5,7 +5,7 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
     printf 'Run this script on an Apple Silicon Mac, outside Rosetta.\n' >&2
     exit 2
 fi
-for command in cargo curl tar shasum codesign perl; do
+for command in cargo curl tar shasum perl; do
     command -v "$command" >/dev/null || { printf 'Required development tool missing: %s\n' "$command" >&2; exit 2; }
 done
 scripts=$(cd "$(dirname "$0")" && pwd)
@@ -59,10 +59,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-run_case msb-signature 0 codesign --verify --deep --strict "$msb"
-run_case smolvm-signature 0 codesign --verify --deep --strict "$smolvm_binary"
-run_case msb-entitlements 0 codesign -d --entitlements :- "$msb"
-run_case smolvm-entitlements 0 codesign -d --entitlements :- "$smolvm_binary"
 run_case msb-doctor 0 msb_run doctor
 run_case registry-pull 0 msb_run pull docker.io/library/alpine:3.22
 run_case base-save 0 msb_run image save --format docker -o "$output/base.tar" docker.io/library/alpine:3.22

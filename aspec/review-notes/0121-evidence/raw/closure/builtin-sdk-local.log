@@ -1,0 +1,355 @@
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:196:67
+    |
+196 |     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
+    |                                                                   ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated tuple variant `time::format_description::Component::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:199:52
+    |
+199 |     const YEAR: BorrowedFormatItem<'_> = Component(Year({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:200:35
+    |
+200 |         let mut value = modifier::Year::default();
+    |                                   ^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::YearRepr::Full`: used only in the deprecated `Year` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:42
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |                                          ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:208:53
+    |
+208 |     const MONTH: BorrowedFormatItem<'_> = Component(Month({
+    |                                                     ^^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:209:35
+    |
+209 |         let mut value = modifier::Month::default();
+    |                                   ^^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::MonthRepr::Numerical`: used only in the deprecated `Month` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:43
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |                                           ^^^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:222:52
+    |
+222 |     const HOUR: BorrowedFormatItem<'_> = Component(Hour({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:223:35
+    |
+223 |         let mut value = modifier::Hour::default();
+    |                                   ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:263:13
+    |
+263 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:265:13
+    |
+265 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:267:23
+    |
+267 |             Optional(&Literal(b" ")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:268:23
+    |
+268 |             Optional(&Literal(b"T")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:270:13
+    |
+270 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:272:23
+    |
+272 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:274:23
+    |
+274 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:277:23
+    |
+277 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:285:13
+    |
+285 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:287:13
+    |
+287 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:289:13
+    |
+289 |             Literal(b" "),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:291:13
+    |
+291 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:293:23
+    |
+293 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:295:23
+    |
+295 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:297:23
+    |
+297 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:304:13
+    |
+304 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:306:13
+    |
+306 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:308:13
+    |
+308 |             Literal(b"T"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:310:13
+    |
+310 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:312:23
+    |
+312 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:314:23
+    |
+314 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:316:23
+    |
+316 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::padding`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:201:9
+    |
+201 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::repr`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:9
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::iso_week_based`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:203:9
+    |
+203 |         value.iso_week_based = false;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::sign_is_mandatory`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:204:9
+    |
+204 |         value.sign_is_mandatory = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::padding`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:210:9
+    |
+210 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::repr`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:9
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::case_sensitive`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:212:9
+    |
+212 |         value.case_sensitive = true;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::padding`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:224:9
+    |
+224 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::is_12_hour_clock`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:225:9
+    |
+225 |         value.is_12_hour_clock = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `sqlx-sqlite` (lib) generated 40 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (target/debug/deps/awman-2166b00a3c3d7408)
+
+running 105 tests
+test engine::container::builtin::backend::compat_tests::numeric_image_user_sets_guest_mount_owner ... ok
+test engine::container::builtin::backend::compat_tests::named_image_user_resolves_from_the_image_account_database ... ok
+test engine::container::builtin::backend::compat_tests::maps_single_file_without_mounting_its_parent_and_rejects_socket ... ok
+test engine::container::builtin::backend::compat_tests::maps_agent_flags_without_splitting_values_and_preserves_acp_argv ... ok
+test engine::container::builtin::backend::lifecycle_tests::a_corrupt_identity_catalog_is_an_error_not_an_empty_catalog ... ok
+test engine::container::builtin::backend::lifecycle_tests::a_worker_protocol_mismatch_is_refused_everywhere ... ok
+test engine::container::builtin::backend::lifecycle_tests::a_failed_stream_is_an_error_never_exit_zero ... ok
+test engine::container::builtin::backend::lifecycle_tests::acp_keeps_persistent_binary_clean_framing ... ok
+test engine::container::builtin::backend::lifecycle_tests::attach_refuses_stopped_sandboxes ... ok
+test engine::container::builtin::backend::lifecycle_tests::attach_after_the_owner_finished_is_an_error ... ok
+test engine::container::builtin::backend::lifecycle_tests::capabilities_describe_an_importing_hostless_runtime ... ok
+test engine::container::builtin::backend::lifecycle_tests::a_background_exec_that_fails_is_an_error_not_a_zero_exit ... ok
+test engine::container::builtin::backend::lifecycle_tests::cleanup_never_touches_another_sessions_sandboxes ... ok
+test engine::container::builtin::backend::lifecycle_tests::exec_start_failure_removes_the_created_sandbox ... ok
+test engine::container::builtin::backend::lifecycle_tests::concurrent_starts_get_distinct_sandboxes_and_owners ... ok
+test engine::container::builtin::backend::lifecycle_tests::discovery_filters_by_full_name_prefix_and_state ... ok
+test engine::container::builtin::backend::lifecycle_tests::a_newer_awman_with_the_same_protocol_attaches_to_an_older_owners_sandbox ... ok
+test engine::container::builtin::backend::lifecycle_tests::guest_oom_exit_137_is_preserved_and_cleanup_still_runs ... ok
+test engine::container::builtin::backend::lifecycle_tests::explicit_stop_works_across_sessions_but_not_for_a_reused_name ... ok
+test engine::container::builtin::backend::lifecycle_tests::background_sandbox_env_lives_in_memory_and_exec_runs_as_the_image_user ... ok
+test engine::container::builtin::backend::lifecycle_tests::hypervisor_and_test_isolation_gate_every_launch_path ... ok
+test engine::container::builtin::backend::lifecycle_tests::keep_preserves_the_stopped_sandbox_for_explicit_removal ... ok
+test engine::container::builtin::backend::lifecycle_tests::lifecycle_create_exec_exit_and_remove ... ok
+test engine::container::builtin::backend::lifecycle_tests::owner_exit_without_an_attach_endpoint_never_starts_a_replacement_shell ... ok
+test engine::container::builtin::backend::lifecycle_tests::image_identity_catalog_round_trips_and_only_tracked_images_are_removed ... ok
+test engine::container::builtin::backend::lifecycle_tests::racing_starts_of_one_name_leave_the_winner_untouched ... ok
+test engine::container::builtin::backend::lifecycle_tests::resource_limits_are_rejected_before_anything_is_created ... ok
+test engine::container::builtin::backend::lifecycle_tests::remove_agent_deletes_only_its_own_stale_attach_socket ... ok
+test engine::container::builtin::backend::lifecycle_tests::secrets_never_reach_argv_labels_names_or_mounts ... ok
+test engine::container::builtin::backend::lifecycle_tests::unsupported_requests_fail_closed_without_side_effects ... ok
+test engine::container::builtin::backend::lifecycle_tests::pty_size_resize_and_ctrl_c_bytes_reach_the_guest_verbatim ... ok
+test engine::container::builtin::backend::matrix_tests::acp_launch_keeps_the_agent_entrypoint_and_is_persistent ... ok
+test engine::container::builtin::backend::lifecycle_tests::noninteractive_seeded_prompt_is_queued_then_stdin_closes ... ok
+test engine::container::builtin::backend::matrix_tests::a_missing_image_home_is_refused_instead_of_guessing_root ... ok
+test engine::container::builtin::backend::matrix_tests::every_settings_family_and_prompt_mode_belongs_to_some_agent ... ok
+test engine::container::builtin::backend::lifecycle_tests::reattach_streams_to_a_second_client_and_detach_never_kills ... ok
+test engine::container::builtin::backend::matrix_tests::environment_overlay_keeps_boundaries_and_literal_precedence ... ok
+test engine::container::builtin::backend::matrix_tests::named_and_all_skill_overlays_reach_the_builtin_plan ... ok
+test engine::container::builtin::catalog::hardening_tests::a_symlinked_version_marker_is_never_followed ... ok
+test engine::container::builtin::backend::matrix_tests::the_same_options_yield_the_same_mounts_for_the_same_image ... ok
+test engine::container::builtin::backend::matrix_tests::every_agent_plans_every_overlay_settings_and_prompt_variant ... ok
+test engine::container::builtin::catalog::tests::incompatible_catalog_is_preserved_without_migration ... ok
+test engine::container::builtin::catalog::hardening_tests::an_old_protocol_marker_names_both_versions_and_changes_nothing ... ok
+test engine::container::builtin::driver::spec_tests::docker_socket_is_not_a_file_bridge ... ok
+test engine::container::builtin::driver::spec_tests::spec_resources_below_the_floor_are_refused ... ok
+test engine::container::builtin::catalog::tests::unversioned_catalog_is_not_adopted ... ok
+test engine::container::builtin::embedded::tests::detects_a_replaced_executable ... ok
+test engine::container::builtin::catalog::tests::matching_catalog_reopens_and_released_locks_are_reusable ... ok
+test engine::container::builtin::catalog::hardening_tests::concurrent_first_starts_agree_on_one_marker ... ok
+test engine::container::builtin::backend::matrix_tests::claude_credentials_are_leased_per_execution_and_refresh_atomically_for_every_consumer ... ok
+test engine::container::builtin::exec_bridge::bridge_tests::keep_is_honoured_when_a_cancel_has_to_kill ... ok
+test engine::container::builtin::exec_bridge::bridge_tests::cancel_without_ownership_only_interrupts ... ok
+test engine::container::builtin::exec_bridge::bridge_tests::an_agent_that_ignores_interrupt_is_killed_and_removed_after_the_grace ... ok
+test engine::container::builtin::exec_bridge::tests::attach_routes_binary_streams_resize_and_real_exit ... ok
+test engine::container::builtin::exec_bridge::tests::frames_preserve_binary_stderr_and_exit ... ok
+test engine::container::builtin::exec_bridge::tests::lagging_attach_client_gets_failure_and_never_a_clean_exit ... ok
+test engine::container::builtin::exec_bridge::tests::lagging_primary_frontend_reports_transport_failure_not_guest_exit ... ok
+test engine::container::builtin::exec_bridge::tests::oversized_frames_are_rejected_before_allocation ... ok
+test engine::container::builtin::backend::lifecycle_tests::cancel_interrupts_and_does_not_kill_an_agent_that_exits_within_grace ... ok
+test engine::container::builtin::exec_bridge::tests::full_attach_buffer_times_out_instead_of_hanging ... ok
+test engine::container::builtin::msb_driver::tests::image_accounts_are_bounded_and_an_invalid_upper_file_never_falls_back ... ok
+test engine::container::builtin::msb_driver::tests::numeric_user_without_gid_requires_the_image_account_database ... ok
+test engine::container::builtin::msb_driver::tests::sdk_hostname_dns_binding_cannot_authorize_udp_or_quic ... ok
+test engine::container::builtin::msb_driver::tests::sdk_isolated_config_ignores_installed_msb_config ... ok
+test engine::container::builtin::exec_bridge::tests::attach_disconnect_never_signals_target ... ok
+test engine::container::builtin::naming::hardening_tests::a_missing_owner_label_is_not_an_owner ... ok
+test engine::container::builtin::naming::hardening_tests::every_reserved_label_is_refused_and_caller_labels_survive ... ok
+test engine::container::builtin::msb_driver::tests::sdk_accepts_every_compiled_network_policy ... ok
+test engine::container::builtin::naming::hardening_tests::no_label_value_carries_environment_or_secret_material ... ok
+test engine::container::builtin::naming::hardening_tests::sandbox_names_are_stable_short_ascii_and_distinct_per_awman_name ... ok
+test engine::container::builtin::naming::tests::names_are_fixed_and_labels_cannot_spoof_ownership ... ok
+test engine::container::builtin::naming::tests::reused_pid_does_not_authorize_a_new_owner ... ok
+test engine::container::builtin::network::tests::allowlist_with_host_ports_resolves_only_the_host_alias ... ok
+test engine::container::builtin::network::tests::allowlist_resolves_and_reaches_only_listed_names ... ok
+test engine::container::builtin::network::tests::host_ports_are_the_only_host_access_and_come_first ... ok
+test engine::container::builtin::network::tests::host_side_settings_pass_through ... ok
+test engine::container::builtin::network::tests::none_disables_the_device_and_denies_everything ... ok
+test engine::container::builtin::network::tests::public_default_is_dns_plus_public_internet_and_no_host ... ok
+test engine::container::builtin::paths::hardening_tests::a_short_state_root_used_by_the_test_harness_fits ... ok
+test engine::container::builtin::paths::hardening_tests::an_overlong_root_fails_before_anything_is_created ... ok
+test engine::container::builtin::paths::hardening_tests::every_state_subdirectory_is_private ... ok
+test engine::container::builtin::paths::hardening_tests::a_stale_lock_file_from_a_crashed_process_is_reusable ... ok
+test engine::container::builtin::paths::hardening_tests::hostile_ids_cannot_escape_the_attach_directory ... ok
+test engine::container::builtin::paths::hardening_tests::relative_and_parent_relative_roots_are_refused ... ok
+test engine::container::builtin::paths::hardening_tests::the_budget_is_measured_in_bytes_at_the_exact_boundary ... ok
+test engine::container::builtin::paths::hardening_tests::hostile_lock_files_are_refused ... ok
+test engine::container::builtin::paths::hardening_tests::the_socket_limit_is_the_macos_bound_minus_the_terminator ... ok
+test engine::container::builtin::paths::tests::concurrent_creation_is_safe ... ok
+test engine::container::builtin::exec_bridge::tests::partial_attach_frames_survive_simultaneous_output_and_input ... ok
+test engine::container::builtin::paths::tests::full_socket_budget_counts_utf8_bytes ... ok
+test engine::container::builtin::paths::tests::image_leases_exclude_mutation_across_processes_but_not_other_images ... ok
+test engine::container::builtin::paths::tests::refuses_symlinks_and_public_roots ... ok
+test engine::container::builtin::paths::tests::socket_budget_includes_the_longest_sdk_compatibility_endpoint ... ok
+test engine::container::builtin::paths::tests::symlinked_parent_is_resolved_but_symlinked_leaf_is_refused ... ok
+test engine::container::builtin::resources::boundary_tests::a_fractional_request_is_rejected_not_rounded ... ok
+test engine::container::builtin::resources::boundary_tests::integer_vcpus_and_memory_are_accepted_exactly_at_their_bounds ... ok
+test engine::container::builtin::resources::tests::rejects_fractional_nonfinite_and_overflowing_resources ... ok
+test engine::container::builtin::tests::ambient_override_is_refused_first ... ok
+test engine::container::builtin::tests::supported_targets ... ok
+test engine::container::builtin::tests::unavailable_build_or_test_isolation_reports_a_precise_reason ... ok
+test engine::container::builtin::paths::hardening_tests::concurrent_lockers_serialise_and_the_loser_reports_busy ... ok
+test engine::container::builtin::paths::tests::busy_lock_times_out_with_a_clear_error ... ok
+test engine::container::builtin::paths::tests::import_lock_wait_observes_cancellation ... ok
+test engine::container::builtin::exec_bridge::bridge_tests::a_delayed_cancel_from_a_previous_launch_cannot_stop_the_replacement ... ok
+test engine::container::builtin::exec_bridge::bridge_tests::no_kill_when_the_exit_path_finishes_inside_the_grace ... ok
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 3135 filtered out; finished in 0.97s
+

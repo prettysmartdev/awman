@@ -1,0 +1,5 @@
+PASS: .github/workflows/release.yml: YAML, job dependency references, shell syntax and no explicit signing operations
+
+thread 'main' (198042) panicked at /awman/context/workflow/0121/unsigned-policy/yaml-check.rs:6:57:
+called `Result::unwrap()` on an `Err` value: Error { kind: SCANNER, problem: "mapping values are not allowed in this context", problem_mark: Mark { line: 132, column: 44 } }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

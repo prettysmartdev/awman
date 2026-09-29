@@ -6,6 +6,7 @@
 #[path = "../helpers/mod.rs"]
 mod helpers;
 
+mod builtin_network;
 mod config_session_roundtrip;
 mod daemon_primitives;
 mod db_migration;

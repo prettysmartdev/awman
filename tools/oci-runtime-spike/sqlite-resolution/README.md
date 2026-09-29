@@ -38,7 +38,15 @@ also explains the single-native-library constraint and default static bundling.
 Retain the distinct embedded-kernel patch until its own upstream replacement is
 ready; these patches have independent lifecycles.
 
-## What was actually tested
+## Historical reported results (not current acceptance evidence)
+
+The original report below is retained for provenance. Its temporary probe/results
+artifacts are unavailable in the current workspace, so these historical PASS
+labels do not establish WI 0121 acceptance. The current
+[evidence register](../../../aspec/review-notes/0121-evidence-register.md)
+records the witnessed replacement tests and open native/old-new catalog gates.
+
+### Original report
 
 Host: Linux ARM64, Rust/Cargo 1.94.0. Awman baseline
 `8765a9b95db1f0b2444ee999e3b5908ac59b78ee`, including the current working tree;
@@ -119,7 +127,7 @@ bash tools/oci-runtime-spike/sqlite-resolution/checks.sh \
 ```
 
 The Mac form is provided for the outstanding platform check, not represented
-as already run. It requires the same Rust/compiler/signing prerequisites as
+as already run. It requires the same Rust/compiler prerequisites as
 the strict probe. On Linux the script additionally needs the strict spike's
 `static-lib/libcap-ng.a`, or `SQLITE_SPIKE_NATIVE_LIB_DIR` pointing to a directory
 with that archive. `CARGO_TARGET_DIR` may reuse the prior target cache. The

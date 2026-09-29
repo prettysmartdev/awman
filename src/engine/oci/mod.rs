@@ -24,6 +24,14 @@
 //! Nothing is visible in the cache until step 4, so a wrong-platform,
 //! malformed, oversized, tampered or truncated image — or a full disk —
 //! leaves no partial state behind.
+//!
+//! Steps 2–3 are repeated for transient transport failures under a bounded
+//! [`RetryPolicy`] ([`retry`]): the same source, endpoint, reference and
+//! credentials every time, a fresh staging directory per attempt, never a
+//! retry of an authentication, certificate, platform, digest or format
+//! failure. A [`CancelToken`] stops an acquisition between attempts and
+//! inside a transfer. The formats accepted at step 3 are the contract in
+//! [`format`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,14 +46,18 @@ pub mod apple_store;
 pub mod archive;
 pub mod cache;
 pub mod docker_engine;
+pub mod format;
 pub mod registry;
 pub mod resolve;
+pub mod retry;
 pub mod sources;
+mod transport;
 pub mod verify;
 
 pub use archive::{validate_archive, ImageConfigSummary, ValidatedArchive};
 pub use cache::{CacheRecord, OciCache, PruneReport};
 pub use resolve::{external_build_hint, resolve_source, BuildHint, ImageSources};
+pub use retry::{CancelToken, RetryPolicy};
 pub use verify::DiskSpace;
 
 /// Acquires images from explicit sources into awman's verified archive cache.
@@ -59,7 +71,7 @@ pub trait ImageAcquirer: Send + Sync {
         &self,
         request: &AcquireRequest,
         progress: &mut dyn FnMut(AcquireProgress),
-    ) -> Result<AcquiredImage, EngineError>;
+    ) -> Result<LeasedImage, EngineError>;
 }
 
 /// One acquisition.
@@ -97,6 +109,28 @@ pub struct AcquiredImage {
     /// Archive size in bytes.
     pub bytes: u64,
 }
+
+/// A verified acquisition whose archive cannot be pruned until the last
+/// consumer drops it. Cloning preserves the lease, not just the pathname.
+#[derive(Debug, Clone)]
+pub struct LeasedImage {
+    image: AcquiredImage,
+    _lease: Arc<cache::ArchiveLease>,
+}
+
+impl std::ops::Deref for LeasedImage {
+    type Target = AcquiredImage;
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
+
+impl PartialEq for LeasedImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.image == other.image
+    }
+}
+impl Eq for LeasedImage {}
 
 /// Layout of an archive on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,13 +193,13 @@ pub fn default_acquirer(
     state_dir: &Path,
     limits: AcquireLimits,
     env: &EnvSnapshot,
-) -> Box<dyn ImageAcquirer> {
-    Box::new(CachingAcquirer::new(
+) -> CachingAcquirer {
+    CachingAcquirer::new(
         state_dir,
         limits,
         env.clone(),
         Arc::new(verify::HostDiskSpace),
-    ))
+    )
 }
 
 /// The non-secret image defaults recorded when `archive` (an
@@ -183,13 +217,17 @@ pub fn prune_cache(state_dir: &Path, keep: &[Digest]) -> Result<PruneReport, Eng
     OciCache::open(state_dir)?.prune(keep)
 }
 
-/// The cache-backed acquirer. The disk probe is injectable so the
-/// insufficient-space path is testable.
+/// The cache-backed acquirer. The disk probe, retry policy, cancellation
+/// token and sleeper are injectable so the insufficient-space, retry and
+/// cancellation paths are testable without a real disk or real waiting.
 pub struct CachingAcquirer {
     state_dir: PathBuf,
     limits: AcquireLimits,
     env: EnvSnapshot,
     disk: Arc<dyn DiskSpace>,
+    retry: RetryPolicy,
+    cancel: CancelToken,
+    sleep: Arc<retry::Sleeper<'static>>,
 }
 
 impl CachingAcquirer {
@@ -204,7 +242,33 @@ impl CachingAcquirer {
             limits,
             env,
             disk,
+            retry: RetryPolicy::DEFAULT,
+            cancel: CancelToken::new(),
+            sleep: Arc::new(std::thread::sleep),
         }
+    }
+
+    /// Bound the attempts, deadline and backoff of every acquisition.
+    pub fn with_retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// Stop acquisitions when `token` is cancelled.
+    pub fn with_cancel(mut self, token: CancelToken) -> Self {
+        self.cancel = token;
+        self
+    }
+
+    /// Replace the backoff sleeper (tests).
+    pub fn with_sleeper(mut self, sleep: Arc<retry::Sleeper<'static>>) -> Self {
+        self.sleep = sleep;
+        self
+    }
+
+    /// The token this acquirer watches.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 }
 
@@ -213,10 +277,13 @@ impl ImageAcquirer for CachingAcquirer {
         &self,
         request: &AcquireRequest,
         progress: &mut dyn FnMut(AcquireProgress),
-    ) -> Result<AcquiredImage, EngineError> {
+    ) -> Result<LeasedImage, EngineError> {
+        let deadline = retry::Deadline::start(self.retry.deadline);
+        let control = retry::OperationControl::new(self.cancel.clone(), deadline);
+        control.check()?;
         let kind = request.source.kind();
         let reference = request.source.reference_or(&request.tag);
-        let resolved = sources::Resolved::resolve(
+        let mut resolved = sources::Resolved::resolve(
             &request.source,
             &reference,
             &request.registries,
@@ -228,9 +295,9 @@ impl ImageAcquirer for CachingAcquirer {
             reference: reference.clone(),
         });
 
-        let cache = OciCache::open(&self.state_dir)?;
+        let cache = OciCache::open(&self.state_dir)?.controlled(control.clone());
         if request.policy != AcquirePolicy::Refresh {
-            if let Some(hit) = cache.lookup(&key)? {
+            if let Some((hit, lease)) = cache.lookup_leased(&key)? {
                 let archive_changed = match (&resolved, &hit.record.source_fingerprint) {
                     // An archive re-exported at the same path is re-imported
                     // (only when the source is allowed to be read at all).
@@ -245,7 +312,11 @@ impl ImageAcquirer for CachingAcquirer {
                     progress(AcquireProgress::Cached {
                         identity: hit.image.identity.clone(),
                     });
-                    return Ok(hit.image);
+                    control.check()?;
+                    return Ok(LeasedImage {
+                        image: hit.image,
+                        _lease: Arc::new(lease),
+                    });
                 }
             }
             if request.policy == AcquirePolicy::CachedOnly {
@@ -258,46 +329,69 @@ impl ImageAcquirer for CachingAcquirer {
                 )));
             }
         }
+        self.cancel.check()?;
 
-        let staging = cache.staging()?;
-        verify::ensure_space(
-            self.disk.as_ref(),
-            staging.path(),
-            0,
-            self.limits.min_free_bytes,
-        )?;
-        let ctx = sources::FetchContext {
-            staging_dir: staging.path(),
-            limits: self.limits,
-            disk: self.disk.as_ref(),
-            platform: &request.platform,
-        };
-        let fetch = |report: sources::Report<'_>| {
-            let fetched = resolved.fetch(&request.tag, &reference, &ctx, report)?;
-            let validated = archive::validate_archive(
-                &fetched.path,
-                &request.platform,
-                &fetched.wanted_refs,
-                &self.limits,
-                &mut |p| report(p),
+        resolved.prepare_credentials(&self.env)?;
+
+        // Every attempt is the same request against the same resolved source
+        // and endpoint, staged into a fresh private directory. A failed or
+        // cancelled attempt drops its staging directory with it.
+        let attempt = |number: u32| -> Result<
+            (cache::Staging, sources::Fetched, ValidatedArchive),
+            EngineError,
+        > {
+            let staging = cache.staging_leased()?;
+            verify::ensure_space(
+                self.disk.as_ref(),
+                staging.path(),
+                0,
+                self.limits.min_free_bytes,
             )?;
-            Ok::<_, EngineError>((fetched, validated))
-        };
-        let (fetched, validated) = if resolved.is_network() {
-            sources::run_isolated(progress, fetch)?
-        } else {
-            let events = std::sync::Mutex::new(Vec::new());
-            let out = fetch(&|p| {
-                if let Ok(mut e) = events.lock() {
-                    e.push(p)
+            let ctx = sources::FetchContext {
+                staging_dir: staging.path(),
+                limits: self.limits,
+                disk: self.disk.as_ref(),
+                platform: &request.platform,
+                cancel: &self.cancel,
+                deadline,
+                attempt: number,
+            };
+            let fetch = |report: sources::Report<'_>| {
+                let fetched = resolved.fetch(&request.tag, &reference, &ctx, report)?;
+                self.cancel.check()?;
+                let validated = archive::validate_archive_controlled(
+                    &fetched.path,
+                    &request.platform,
+                    &fetched.wanted_refs,
+                    &self.limits,
+                    &mut |p| report(p),
+                    &control,
+                )?;
+                Ok::<_, EngineError>((fetched, validated))
+            };
+            let (fetched, validated) = if resolved.is_network() {
+                sources::run_isolated(&mut *progress, fetch)?
+            } else {
+                let events = std::sync::Mutex::new(Vec::new());
+                let out = fetch(&|p| {
+                    if let Ok(mut e) = events.lock() {
+                        e.push(p)
+                    }
+                });
+                for p in events.into_inner().unwrap_or_default() {
+                    progress(p);
                 }
-            });
-            for p in events.into_inner().unwrap_or_default() {
-                progress(p);
-            }
-            out?
+                out?
+            };
+            Ok((staging, fetched, validated))
         };
-
+        let (staging, fetched, validated) = retry::run_bounded(
+            self.retry,
+            deadline,
+            &self.cancel,
+            self.sleep.as_ref(),
+            attempt,
+        )?;
         if let Some(expected) = &fetched.expected_manifest {
             if *expected != validated.manifest_digest {
                 return Err(EngineError::ImageDigestMismatch {
@@ -314,7 +408,8 @@ impl ImageAcquirer for CachingAcquirer {
             platform: validated.platform.clone(),
             source: kind,
         };
-        let committed = cache.commit(
+        control.check()?;
+        let (committed, lease) = cache.commit_leased(
             &fetched.path,
             &key,
             identity,
@@ -326,7 +421,10 @@ impl ImageAcquirer for CachingAcquirer {
         progress(AcquireProgress::Cached {
             identity: committed.image.identity.clone(),
         });
-        Ok(committed.image)
+        Ok(LeasedImage {
+            image: committed.image,
+            _lease: Arc::new(lease),
+        })
     }
 }
 
@@ -367,6 +465,38 @@ mod tests {
         std::fs::read_dir(state.join(cache::CACHE_DIR).join("images"))
             .map(|d| d.count())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn expired_validation_progress_never_publishes_a_reference() {
+        let state = tempfile::tempdir().unwrap();
+        let src = state.path().join("export.tar");
+        std::fs::write(&src, oci_archive(&arm64(), &[layer()]).0).unwrap();
+        let acq = acquirer(state.path(), None).with_retry(RetryPolicy {
+            deadline: std::time::Duration::from_millis(100),
+            ..RetryPolicy::NONE
+        });
+        let err = acq
+            .acquire(&request(&src, AcquirePolicy::IfMissing), &mut |event| {
+                if matches!(event, AcquireProgress::Verifying { .. }) {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err}");
+        assert_eq!(cache_entries(state.path()), 0);
+        assert_eq!(
+            std::fs::read_dir(state.path().join(cache::CACHE_DIR).join("refs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(state.path().join(cache::CACHE_DIR).join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -507,9 +637,8 @@ mod tests {
     }
 
     mod engine_store {
-        //! Docker Engine source tests. Kept out of any module or function named
-        //! `docker` so `make test-fast` (which skips `docker` tests, meaning "needs
-        //! a real daemon") still runs these hermetic ones.
+        //! Hermetic Docker Engine protocol tests. These execute in the fast
+        //! tier; real-service tests require their separate explicit opt-ins.
         use std::path::PathBuf;
 
         use crate::data::config::env::EnvSnapshot;
@@ -752,7 +881,7 @@ mod tests {
             fn acquire(
                 state: &Path,
                 req: &AcquireRequest,
-            ) -> Result<crate::engine::oci::AcquiredImage, EngineError> {
+            ) -> Result<crate::engine::oci::LeasedImage, EngineError> {
                 CachingAcquirer::new(
                     state,
                     limits(),

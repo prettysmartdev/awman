@@ -17,6 +17,7 @@ pub struct LaunchPlan {
     pub persistent_stdin: bool,
     pub seeded_prompt: Option<String>,
     pub leases: Vec<crate::engine::credential_refresh::CredentialLease>,
+    pub image_lease: std::fs::File,
 }
 pub struct Instance {
     pub driver: Arc<dyn SandboxDriver>,
@@ -38,6 +39,7 @@ impl AgentInstance for Instance {
     ) -> Result<AgentExecution, EngineError> {
         frontend.report_status(crate::engine::agent_runtime::frontend::AgentStatus::Starting);
         let id = self.plan.spec.name.clone();
+        let _image_lease = self.plan.image_lease;
         self.driver.create(self.plan.spec)?;
         let mut request = self.plan.command;
         // Read I/O only once; this adapter gives the bridge the captured channels.

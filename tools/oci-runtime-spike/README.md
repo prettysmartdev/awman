@@ -123,7 +123,7 @@ Smolvm ships `crane` 0.19.0 in the examined guest rootfs. Running that exact hel
 | Main attraction for awman | Closest mount/image contract to Docker/Apple | Embedding/reexec architecture, persistent machine management, snapshots/packs |
 | Main integration cost | Database graph, worker packaging, full awman adapter and hardware validation | Same baseline plus file sharing, archive-format normalization and whiteout repair |
 
-Both necessarily include a Linux kernel and nontrivial virtualization machinery. “No external runtime install” is realistic; “no operating-system prerequisites or auxiliary bytes” is not. On Mac, do not assume an embedded worker inherits valid entitlements after copying/re-signing: test the exact distributed artifact. Neither runtime makes an ordinary cloud/container host with no KVM capable of running its VMs.
+Both necessarily include a Linux kernel and nontrivial virtualization machinery. “No external runtime install” is realistic; “no operating-system prerequisites or auxiliary bytes” is not. On Mac, do not assume an embedded worker inherits valid entitlements after copying: test the exact distributed artifact. Neither runtime makes an ordinary cloud/container host with no KVM capable of running its VMs.
 
 Microsandbox's embedding logic is visible in [SDK build.rs](https://github.com/superradcompany/microsandbox/blob/60d4dc8a436fb9365491567ec21d073e924e3c6d/sdk/rust/build.rs). Smolvm explicitly exposes self-reexec boot support in [its Rust library](https://github.com/smol-machines/smolvm/blob/c890ec3dae904ca9d47e64b084a23cfbf2230849/src/lib.rs#L90); its [platform notes](https://github.com/smol-machines/smolvm/blob/c890ec3dae904ca9d47e64b084a23cfbf2230849/README.md#L317) document signing requirements. These capabilities make single-awman-entrypoint designs plausible, not already integrated.
 
@@ -185,7 +185,7 @@ The supplied mount probe tests synthetic forms of all four overlay categories, a
 
 ## Implementation options after hardware validation
 
-1. **Bundled Microsandbox worker — recommended first path.** Awman owns a pinned runtime/firmware bundle, private state and transport; users install neither msb nor Docker/Apple for execution. Preserve current container option/config resolution and implement a full new backend adapter. Resolve the Linux `libcap-ng` packaging issue, macOS signing, secret transport and importer strategy before calling it dependency-free. Pros: shortest path to required mount/image behavior; subprocess contains global runtime state and avoids SQLite collision. Cons: asset extraction/update/signing and process supervision; not a literal one-executable process tree.
+1. **Bundled Microsandbox worker — recommended first path.** Awman owns a pinned runtime/firmware bundle, private state and transport; users install neither msb nor Docker/Apple for execution. Preserve current container option/config resolution and implement a full new backend adapter. Resolve the Linux `libcap-ng` packaging issue, secret transport and importer strategy before calling it dependency-free. Pros: shortest path to required mount/image behavior; subprocess contains global runtime state and avoids SQLite collision. Cons: asset extraction/update and process supervision; not a literal one-executable process tree.
 2. **In-process/reexec Microsandbox integration.** Align SQLite dependencies or extract narrower crates, and make awman the worker entrypoint. Pros: tighter APIs, possible one executable plus firmware assets. Cons: more upstream coupling, larger native build/release burden, and no demonstrated advantage for the user's actual compatibility needs yet.
 3. **Patched smolvm integration.** Add safe live single-file sharing, support/normalize OCI archives, preserve local-archive runtime defaults, resolve default commands, fix the flattener, then align the SQLite graph or bundle a worker. Pros: good reexec architecture and machine lifecycle features. Cons: more prerequisite work, especially security-sensitive filesystem work; current release fails hard requirements before awman integration starts. Revisit if these capabilities land upstream.
 
@@ -193,7 +193,7 @@ For either choice, refactor the CLI assumptions in `src/engine/container/backend
 
 ## Go/no-go gates before a work item is finalized
 
-- Corrected Mac baseline obtained. Repeat native Linux ARM64 and x86_64 with accessible KVM. Validate exact signed release artifacts, not only development builds.
+- Corrected Mac baseline obtained. Repeat native Linux ARM64 and x86_64 with accessible KVM. Validate exact release artifacts, not only development builds.
 - Complete actual local Apple and local/remote Docker-store import round trips, plus authenticated/local registries and offline relaunch. Settle whether an optional source CLI is acceptable or a bundled source bridge is mandatory.
 - Pass file/dir ro/rw, nested mounts, non-root ownership, atomic token refresh and host-sibling/parent escape checks. A single missing overlay/config strategy is not full compatibility.
 - Add and run PTY/resize/reattach, stdin/ACP framing, lifecycle/recovery, squad concurrency, resource enforcement, networking/proxy/CA and realistic repository workloads.

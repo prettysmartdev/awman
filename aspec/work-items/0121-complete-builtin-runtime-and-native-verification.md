@@ -3,6 +3,24 @@
 Title: Complete the builtin Microsandbox runtime and close all WI 0119 verification gaps
 Issue: n/a
 
+Current distribution policy (2026-09-28): signing and notarization are out of
+scope by user instruction. No signing identity, Apple distribution account,
+notarization credentials or explicit ad-hoc signing step is required. Native
+boot and final-artifact checks still apply; failures must be reported honestly.
+
+Final verification (2026-09-28): **NOT ACCEPTED**. All acceptance boxes remain
+unchecked. The [final evidence register](../review-notes/0121-evidence-register.md)
+is authoritative for current verdicts; local hermetic passes do not close the
+missing implementation, native/service/distribution or Git-identity gates.
+The latest continuation adds cancellable production acquisition, explicit strict
+SNI enforcement, shared image-tag leases, genuine cross-driver transactions and
+registered guest/service/corpus scenarios. The user authorized follow-up items
+for work requiring unavailable resources: [WI 0122](0122-native-apple-image-store-bridge.md)
+owns the missing native Apple-store bridge; [WI 0123](0123-builtin-native-verification-and-release-closure.md)
+owns remaining native scenario implementation and full verification/release closure.
+These assignments await resource-qualified agents; creating them is not execution
+evidence and does not complete the original acceptance criteria below.
+
 ## Summary:
 
 - Close all outstanding implementation, compatibility, security, build and
@@ -77,7 +95,7 @@ different steps; descriptions and this register's D-IDs disambiguate them.
 | D-10 | Pure builtin tests require verified payload/full SDK; test links have exhausted RAM/disk (B-26/B-51/B-53) | G: SDK-independent fast tests and reliable bounded feature/native test tiers |
 | D-11 | Full Git diff, tracked build inputs and clean checkout unverified (B-11/B-16/B-67) | B/H: restored base/head audit, tracked `.cargo/config.toml`/lockfile/patches, native clean-checkout and unsupported-target regressions |
 | D-12 | Historical SQLite cross-driver and genuine old/new catalog checks absent (B-14 deps-foundation/B-54) | H: reproducible fixtures/probes and actual SQLx/rusqlite bidirectional checks on supported targets |
-| D-13 | Final LTO/stripped/signed/notarized boot and executable/firmware tracing absent (B-05/B-20/B-57/B-58) | I: exact distributed artifacts boot and satisfy dependency, helper, entitlement and distribution checks |
+| D-13 | Final LTO/stripped boot and executable/firmware tracing absent (B-05/B-20/B-57/B-58) | I: exact distributed artifacts boot and satisfy dependency, helper and distribution checks |
 | D-14 | Optimized size/performance/workload evidence and distribution obligations unresolved (B-07/B-12/B-55) | I: measurements, matching Linux ABI, source/notices/relink materials and recorded distribution review |
 | D-15 | Real-image compatibility and documented restrictions need closure; prior risk notes contain stale statements (B-22/B-25/B-27/B-28/B-42) | A/C/J: validate shipped templates, source/format policy, onboarding and every remaining bounded difference; reconcile the ledger against final code |
 
@@ -136,7 +154,7 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
 4. Provision and run the existing native CI jobs with accessible KVM or HVF and
    entitlements. Hardware-required jobs must fail missing prerequisites; local
    missing hardware remains SKIP/BLOCKED and contributes zero execution passes.
-   Enable release targets only after their payload, build, boot and signing gates.
+   Enable release targets only after their payload, build and boot gates.
 5. Build/test existing backends on Windows and Intel Mac with builtin disabled;
    selecting builtin must give a precise unsupported-backend error. Retain the
    existing default runtime and independent Docker/Apple selections.
@@ -217,7 +235,7 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
 3. Retain early worker dispatch before normal Tokio/TUI startup, private config
    transport, lifecycle locks/watchdogs and secrets outside argv/logs. Review the
    narrow version-section unsafe-attribute exception and prove retention under
-   optimization/stripping/signing. No host pointers in worker messages.
+   optimization/stripping. No host pointers in worker messages.
 
 ### G. Close cache/concurrency and test-infrastructure gaps
 
@@ -259,10 +277,9 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
 
 ### I. Validate distribution artifacts and costs
 
-1. Build final release/LTO/stripped awman artifacts on each required target. On
-   Mac sign the actual awman executable with release hardened-runtime settings
-   and hypervisor entitlement, validate notarization/distribution behavior, then
-   boot that artifact. Signing only the fixture driver or old probe is insufficient.
+1. Build final release/LTO/stripped awman artifacts on each required target.
+   Distribute without signing or notarization and boot the exact artifact.
+   A fixture driver or old probe does not establish final-artifact boot.
 2. Inspect `ldd`/`otool -L`, embedded version/provider retention and helper scans;
    trace executable and firmware access throughout boot and realistic sessions.
    Provision `strace`/allowed tracing on native runners and a suitable Mac trace.
@@ -298,7 +315,7 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
    results. Keep orchestration in commands and runtime policy in the engine.
 3. Re-run final adversarial review against the complete diff. A fixture-only run,
    hardcoded capability declaration or CI job that never ran is not evidence.
-   Keep missing hardware/signing/services as BLOCKED and missing required code
+   Keep missing hardware/services as BLOCKED and missing required code
    as FAIL. Neither status satisfies a mandatory checkbox.
 
 ## Acceptance criteria
@@ -325,8 +342,7 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
   bidirectional driver transactions and old/new catalog checks pass on every
   supported native target; no database-contract change or SQLite DSO.
 - [ ] D-13/D-14: the final optimized/stripped/distributed artifacts boot, retain
-  the provider, pass native access/dependency/helper scans and Mac release signing/
-  distribution checks; ABI, licensing materials and measurements are recorded.
+  the provider, pass native access/dependency/helper scans and Mac release distribution checks; ABI, licensing materials and measurements are recorded.
 - [ ] D-11/D-15: Windows/Intel Mac existing builds and real Docker/Apple backend
   regressions pass; onboarding, image-format policy and bounded parity limits are
   implemented or explicitly tested/documented within WI 0119's allowed scope.
@@ -365,7 +381,7 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
 - Re-run the original SQLite spike and preserved final-review regressions.
   Fresh implementation tests must exercise failures as well as success, including
   fragmented streams, repeated/concurrent refresh, ENOSPC and interrupted commit.
-- Native host access, KVM/HVF, fixture images, signing/distribution credentials
+- Native host access, KVM/HVF, fixture images, distribution artifacts
   and disposable stores are prerequisites. Arrange them early; if unavailable,
   report the exact block and leave the affected criteria open.
 

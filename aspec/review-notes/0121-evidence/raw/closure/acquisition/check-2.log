@@ -1,0 +1,65 @@
+    Updating crates.io index
+     Locking 1 package to latest compatible version
+      Adding microsandbox-network v0.7.2 (/workspace/third_party/microsandbox-network-0.7.2)
+    Checking awman v0.12.0 (/workspace)
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>>: LowerHex` is not satisfied
+  --> src/engine/container/builtin/paths.rs:65:47
+   |
+65 |         let name = format!("image-{:x}.lock", Sha256::digest(image.as_bytes()));
+   |                                   ----        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<..., ...>, ...>, ...>, ...>, ...>>`
+   |                                   |
+   |                                   required by this formatting parameter
+   |
+   = help: the following other types implement trait `LowerHex`:
+             &T
+             &mut T
+             AccessFlags
+             AtFlags
+             Braced
+             BytesMut
+             FallocateFlags
+             FdFlag
+           and 188 others
+   = note: the full name for the type has been written to '/workspace/target/debug/deps/awman-1507a85d5974102a.long-type-9741959425367944595.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+   = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0499]: cannot borrow `*frontend` as mutable more than once at a time
+   --> src/command/commands/ready.rs:272:17
+    |
+259 |         let run = engine.run_to_completion(frontend.as_mut());
+    |                                            -------- first mutable borrow occurs here
+...
+272 |                 frontend.write_message(UserMessage {
+    |                 ^^^^^^^^ second mutable borrow occurs here
+...
+297 |     }
+    |     - first borrow might be used here, when `run` is dropped and runs the destructor for type `impl futures_util::Future<Output = Result<ReadySummary, engine::error::EngineError>>`
+
+error[E0499]: cannot borrow `*frontend` as mutable more than once at a time
+   --> src/command/commands/ready.rs:279:9
+    |
+259 |         let run = engine.run_to_completion(frontend.as_mut());
+    |                                            -------- first mutable borrow occurs here
+...
+279 |         frontend.replay_queued();
+    |         ^^^^^^^^ second mutable borrow occurs here
+...
+297 |     }
+    |     - first borrow might be used here, when `run` is dropped and runs the destructor for type `impl futures_util::Future<Output = Result<ReadySummary, engine::error::EngineError>>`
+
+error[E0499]: cannot borrow `*frontend` as mutable more than once at a time
+   --> src/command/commands/ready.rs:284:9
+    |
+259 |         let run = engine.run_to_completion(frontend.as_mut());
+    |                                            -------- first mutable borrow occurs here
+...
+284 |         frontend.write_message(UserMessage {
+    |         ^^^^^^^^ second mutable borrow occurs here
+...
+297 |     }
+    |     - first borrow might be used here, when `run` is dropped and runs the destructor for type `impl futures_util::Future<Output = Result<ReadySummary, engine::error::EngineError>>`
+
+Some errors have detailed explanations: E0277, E0499.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `awman` (lib) due to 4 previous errors

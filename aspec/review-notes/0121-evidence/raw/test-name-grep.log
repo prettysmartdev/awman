@@ -1,0 +1,83 @@
+FOUND apple_store_is_a_typed_blocker_with_dated_evidence
+tests/oci_import/main.rs:248:fn apple_store_is_a_typed_blocker_with_dated_evidence() {
+FOUND store_registry_real_ca_proxy_auth_roundtrip
+tests/oci_import/real_stores.rs:155:fn store_registry_real_ca_proxy_auth_roundtrip() {
+tests/oci_import/real_stores.rs:156:    const TEST: &str = "store_registry_real_ca_proxy_auth_roundtrip";
+FOUND native_keychain_disposable_registry_entry
+tests/oci_import/real_stores.rs:312:fn native_keychain_disposable_registry_entry() {
+tests/oci_import/real_stores.rs:313:    const TEST: &str = "native_keychain_disposable_registry_entry";
+FOUND builtin_hw_cached_execution_after_sources_stop
+tests/builtin_runtime/acquisition.rs:107:fn builtin_hw_cached_execution_after_sources_stop() {
+tests/builtin_runtime/acquisition.rs:108:    const TEST: &str = "builtin_hw_cached_execution_after_sources_stop";
+FOUND builtin_hw_actual_awman_cli_synthetic_agent_exit_37
+tests/builtin_runtime/lifecycle.rs:85:fn builtin_hw_actual_awman_cli_synthetic_agent_exit_37() {
+tests/builtin_runtime/lifecycle.rs:86:    const TEST: &str = "builtin_hw_actual_awman_cli_synthetic_agent_exit_37";
+FOUND builtin_hw_image_defaults_hold_and_the_guest_is_not_root
+tests/builtin_runtime/hardware.rs:172:fn builtin_hw_image_defaults_hold_and_the_guest_is_not_root() {
+FOUND builtin_hw_network_dns_auth_ca_proxy_mcp
+tests/builtin_runtime/network_resources.rs:322:fn builtin_hw_network_dns_auth_ca_proxy_mcp() {
+tests/builtin_runtime/network_resources.rs:323:    let test = "builtin_hw_network_dns_auth_ca_proxy_mcp";
+FOUND builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass
+tests/builtin_runtime/network_resources.rs:383:fn builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass() {
+tests/builtin_runtime/network_resources.rs:384:    let test = "builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass";
+FOUND builtin_hw_memory_oom_preserves_host_and_peer
+tests/builtin_runtime/network_resources.rs:494:fn builtin_hw_memory_oom_preserves_host_and_peer() {
+tests/builtin_runtime/network_resources.rs:495:    let test = "builtin_hw_memory_oom_preserves_host_and_peer";
+FOUND builtin_hw_vcpu_load_and_cleanup
+tests/builtin_runtime/network_resources.rs:544:fn builtin_hw_vcpu_load_and_cleanup() {
+tests/builtin_runtime/network_resources.rs:545:    let test = "builtin_hw_vcpu_load_and_cleanup";
+FOUND sdk_isolated_config_ignores_installed_msb_config
+src/engine/container/builtin/msb_driver.rs:676:    fn sdk_isolated_config_ignores_installed_msb_config() {
+src/engine/container/builtin/msb_driver.rs:721:            .arg("engine::container::builtin::msb_driver::tests::sdk_isolated_config_ignores_installed_msb_config")
+FOUND inherited_fd_probe_checks_open_state_type_and_access
+src/engine/container/builtin/worker.rs:294:    fn inherited_fd_probe_checks_open_state_type_and_access() {
+FOUND sdk_slots_reject_swapped_or_arbitrary_descriptors
+src/engine/container/builtin/worker.rs:285:    fn sdk_slots_reject_swapped_or_arbitrary_descriptors() {
+FOUND builtin_final_artifact_retains_worker_provider
+tests/builtin_runtime/binary.rs:660:fn builtin_final_artifact_retains_worker_provider() {
+FOUND partial_attach_frames_survive_simultaneous_output_and_input
+src/engine/container/builtin/exec_bridge.rs:476:    async fn partial_attach_frames_survive_simultaneous_output_and_input() {
+FOUND lagging_attach_client_gets_failure_and_never_a_clean_exit
+src/engine/container/builtin/exec_bridge.rs:565:    async fn lagging_attach_client_gets_failure_and_never_a_clean_exit() {
+FOUND prune_waits_for_publication_of_an_in_flight_archive
+src/engine/oci/cache.rs:933:    fn prune_waits_for_publication_of_an_in_flight_archive() {
+FOUND builtin_sqlite_exactly_one_native_binding_in_the_dependency_graph
+tests/builtin_runtime/sqlite.rs:49:fn builtin_sqlite_exactly_one_native_binding_in_the_dependency_graph() {
+FOUND builtin_version_output_is_unchanged
+tests/builtin_runtime/binary.rs:158:fn builtin_version_output_is_unchanged() {
+FOUND archive_real_corpus_preserves_identity_and_links
+tests/oci_import/corpus.rs:188:fn archive_real_corpus_preserves_identity_and_links() {
+FOUND real_corpus_every_shipped_template_archive_validates_and_projects
+tests/oci_import/corpus.rs:406:fn real_corpus_every_shipped_template_archive_validates_and_projects() {
+FOUND import_runtime_rechecks_changed_locators_with_the_same_kind_and_reference
+src/engine/ready/mod.rs:1838:    async fn import_runtime_rechecks_changed_locators_with_the_same_kind_and_reference() {
+FOUND import_runtime_preserves_the_concrete_availability_error
+src/engine/ready/mod.rs:1756:    async fn import_runtime_preserves_the_concrete_availability_error() {
+FOUND import_runtime_provisions_the_dockerfile_its_build_hint_names
+src/engine/ready/mod.rs:1935:    async fn import_runtime_provisions_the_dockerfile_its_build_hint_names() {
+FOUND import_runtime_without_a_source_explains_the_external_build
+src/engine/ready/mod.rs:1896:    async fn import_runtime_without_a_source_explains_the_external_build() {
+FOUND legacy_save_identity_depends_on_content_not_entry_names
+src/engine/oci/archive.rs:1992:    fn legacy_save_identity_depends_on_content_not_entry_names() {
+FOUND modern_save_manifest_digest_must_match_config_and_layers
+src/engine/oci/archive.rs:2012:    fn modern_save_manifest_digest_must_match_config_and_layers() {
+FOUND shared_archive_keeps_each_references_identity_config_and_fingerprint
+src/engine/oci/cache.rs:984:    fn shared_archive_keeps_each_references_identity_config_and_fingerprint() {
+FOUND a_same_length_corruption_is_a_miss_not_a_hit
+src/engine/oci/cache.rs:1039:    fn a_same_length_corruption_is_a_miss_not_a_hit() {
+FOUND image_accounts_are_bounded_and_an_invalid_upper_file_never_falls_back
+src/engine/container/builtin/msb_driver.rs:738:    fn image_accounts_are_bounded_and_an_invalid_upper_file_never_falls_back() {
+FOUND noninteractive_seeded_prompt_is_queued_then_stdin_closes
+src/engine/container/builtin/backend/lifecycle_tests.rs:233:async fn noninteractive_seeded_prompt_is_queued_then_stdin_closes() {
+FOUND foreign_token_realm_never_receives_credentials
+src/engine/oci/registry.rs:1704:        async fn foreign_token_realm_never_receives_credentials() {
+FOUND store_docker_unix_roundtrip_then_cached_use_after_the_daemon_is_gone
+tests/oci_import/docker_store.rs:60:fn store_docker_unix_roundtrip_then_cached_use_after_the_daemon_is_gone() {
+FOUND store_docker_tls_roundtrip_with_a_private_ca
+tests/oci_import/docker_store.rs:487:fn store_docker_tls_roundtrip_with_a_private_ca() {
+FOUND writable_copy_is_aligned_and_identical
+src/engine/container/builtin/embedded/kernel.rs:62:    fn writable_copy_is_aligned_and_identical() {
+FOUND blocked_error_names_the_supported_route_and_runs_nothing
+src/engine/oci/apple_store.rs:220:    fn blocked_error_names_the_supported_route_and_runs_nothing() {
+FOUND docker_socket_is_not_a_file_bridge
+src/engine/container/builtin/driver.rs:173:    fn docker_socket_is_not_a_file_bridge() {

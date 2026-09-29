@@ -1,0 +1,360 @@
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:196:67
+    |
+196 |     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
+    |                                                                   ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated tuple variant `time::format_description::Component::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:199:52
+    |
+199 |     const YEAR: BorrowedFormatItem<'_> = Component(Year({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:200:35
+    |
+200 |         let mut value = modifier::Year::default();
+    |                                   ^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::YearRepr::Full`: used only in the deprecated `Year` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:42
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |                                          ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:208:53
+    |
+208 |     const MONTH: BorrowedFormatItem<'_> = Component(Month({
+    |                                                     ^^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:209:35
+    |
+209 |         let mut value = modifier::Month::default();
+    |                                   ^^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::MonthRepr::Numerical`: used only in the deprecated `Month` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:43
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |                                           ^^^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:222:52
+    |
+222 |     const HOUR: BorrowedFormatItem<'_> = Component(Hour({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:223:35
+    |
+223 |         let mut value = modifier::Hour::default();
+    |                                   ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:263:13
+    |
+263 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:265:13
+    |
+265 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:267:23
+    |
+267 |             Optional(&Literal(b" ")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:268:23
+    |
+268 |             Optional(&Literal(b"T")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:270:13
+    |
+270 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:272:23
+    |
+272 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:274:23
+    |
+274 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:277:23
+    |
+277 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:285:13
+    |
+285 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:287:13
+    |
+287 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:289:13
+    |
+289 |             Literal(b" "),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:291:13
+    |
+291 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:293:23
+    |
+293 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:295:23
+    |
+295 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:297:23
+    |
+297 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:304:13
+    |
+304 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:306:13
+    |
+306 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:308:13
+    |
+308 |             Literal(b"T"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:310:13
+    |
+310 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:312:23
+    |
+312 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:314:23
+    |
+314 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:316:23
+    |
+316 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::padding`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:201:9
+    |
+201 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::repr`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:9
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::iso_week_based`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:203:9
+    |
+203 |         value.iso_week_based = false;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::sign_is_mandatory`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:204:9
+    |
+204 |         value.sign_is_mandatory = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::padding`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:210:9
+    |
+210 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::repr`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:9
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::case_sensitive`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:212:9
+    |
+212 |         value.case_sensitive = true;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::padding`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:224:9
+    |
+224 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::is_12_hour_clock`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:225:9
+    |
+225 |         value.is_12_hour_clock = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `sqlx-sqlite` (lib) generated 40 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.55s
+     Running unittests src/lib.rs (target/debug/deps/awman-eb8fe9812c42df4d)
+
+running 110 tests
+test engine::oci::apple_store::tests::the_recorded_contract_is_unversioned_and_names_the_image_helper ... ok
+test engine::oci::apple_store::tests::feasibility_is_a_typed_blocker_list_never_available ... ok
+test engine::oci::apple_store::tests::blocked_error_names_the_supported_route_and_runs_nothing ... ok
+test engine::container::builtin::msb_driver::tests::sdk_hostname_dns_binding_cannot_authorize_udp_or_quic ... ok
+test engine::oci::archive::tests::duplicate_outer_entries_are_rejected ... ok
+test engine::oci::archive::tests::gzip_wrapped_archives_are_staged_as_plain_tar ... ok
+test engine::oci::archive::tests::ambiguous_multi_image_archive_is_narrowed_by_reference_or_rejected ... ok
+test engine::oci::archive::tests::diff_id_mismatch_is_rejected ... ok
+test engine::oci::archive::tests::legacy_save_archive_symlinked_layers_are_followed ... ok
+test engine::oci::archive::tests::legacy_save_identity_depends_on_content_not_entry_names ... ok
+test engine::oci::archive::tests::oci_layout_is_validated_and_identified ... ok
+test engine::oci::archive::tests::outer_traversal_and_escaping_symlinks_are_rejected ... ok
+test engine::oci::archive::tests::a_lower_layer_symlink_cannot_be_written_through ... ok
+test engine::oci::archive::tests::modern_save_manifest_digest_must_match_config_and_layers ... ok
+test engine::oci::archive::tests::layer_attacks_are_rejected ... ok
+test engine::oci::archive::tests::oversized_archive_and_too_many_layers_are_rejected ... ok
+test engine::oci::archive::tests::save_archive_is_validated_and_identified ... ok
+test engine::oci::archive::tests::tampered_blob_is_a_digest_mismatch ... ok
+test engine::oci::archive::tests::truncated_archive_is_rejected ... ok
+test engine::oci::archive::tests::zstd_layers_are_rejected_with_a_reason ... ok
+test engine::oci::archive::tests::wrong_platform_is_a_platform_mismatch ... ok
+test engine::oci::cache::tests::a_same_length_corruption_is_a_miss_not_a_hit ... ok
+test engine::oci::cache::tests::a_damaged_archive_is_a_miss_not_a_hit ... ok
+test engine::oci::cache::tests::a_lease_by_path_only_covers_intact_cache_entries ... ok
+test engine::oci::cache::tests::a_leased_archive_survives_prune_until_the_lease_is_dropped ... ok
+test engine::oci::cache::tests::a_substituted_cache_directory_is_refused_at_open ... ok
+test engine::oci::cache::tests::cancelled_reference_write_keeps_previous_reference ... ok
+test engine::oci::cache::tests::an_interrupted_commit_of_shared_bytes_keeps_the_other_reference ... ok
+test engine::oci::cache::tests::cache_files_are_owner_only ... ok
+test engine::oci::cache::tests::commit_leased_publishes_and_holds_the_archive ... ok
+test engine::oci::cache::tests::commit_then_lookup_round_trips ... ok
+test engine::oci::cache::tests::enospc_after_the_archive_rename_leaves_no_partial_entry ... ok
+test engine::oci::cache::tests::prune_recovers_what_a_crashed_commit_and_acquisition_left_behind ... ok
+test engine::oci::cache::tests::prune_keeps_referenced_digests_only ... ok
+test engine::oci::cache::tests::substituted_locks_and_leases_are_refused_not_followed ... ok
+test engine::oci::cache::tests::shared_archive_keeps_each_references_identity_config_and_fingerprint ... ok
+test engine::oci::cache::tests::two_leases_share_an_archive_and_both_must_go ... ok
+test engine::oci::format::tests::magic_bytes_classify_layers_and_archives ... ok
+test engine::oci::format::tests::refusals_become_archive_rejections ... ok
+test engine::oci::format::tests::supported_media_types_classify_by_compression ... ok
+test engine::oci::format::tests::zstd_nondistributable_and_unknown_are_refused_with_actionable_reasons ... ok
+test engine::oci::registry::tests::a_reference_cannot_redirect_to_another_registry ... ok
+test engine::oci::registry::tests::challenges_parse ... ok
+test engine::oci::registry::tests::env_credentials_are_read_by_name_and_never_rendered ... ok
+test engine::oci::registry::tests::inline_config_auth_is_used_and_helpers_are_never_run ... ok
+test engine::oci::registry::tests::malformed_references_are_rejected ... ok
+test engine::oci::registry::tests::proxies_come_only_from_the_supplied_lookup ... ok
+test engine::oci::registry::tests::references_parse_with_hub_normalisation ... ok
+test engine::oci::registry::tests::token_realms_receive_credentials_only_on_the_registry_origin ... ok
+test engine::oci::cache::tests::acquisition_budget_expires_while_waiting_for_cache_lock ... ok
+test engine::oci::cache::tests::symlinked_or_oversized_entries_are_misses ... ok
+test engine::oci::registry::tests::wire::index_without_the_native_platform_is_a_platform_mismatch ... ok
+test engine::oci::registry::tests::wire::foreign_token_realm_never_receives_credentials ... ok
+test engine::oci::registry::tests::wire::pull_authenticates_selects_platform_verifies_and_caches ... ok
+test engine::oci::resolve::tests::configured_reference_is_used_verbatim ... ok
+test engine::oci::resolve::tests::invalid_spec_is_a_config_error ... ok
+test engine::oci::resolve::tests::no_source_explains_the_external_build ... ok
+test engine::oci::resolve::tests::per_tag_source_wins_over_the_default ... ok
+test engine::oci::retry::tests::an_exhausted_deadline_stops_retrying ... ok
+test engine::oci::retry::tests::backoff_doubles_and_caps ... ok
+test engine::oci::retry::tests::cancellation_wins_before_and_between_attempts ... ok
+test engine::oci::archive::tests::decompression_bomb_is_capped ... ok
+test engine::oci::registry::tests::wire::tampered_layer_is_a_digest_mismatch_and_caches_nothing ... ok
+test engine::oci::retry::tests::only_transport_failures_are_retryable ... ok
+test engine::oci::retry::tests::redaction_replaces_known_secrets_only ... ok
+test engine::oci::retry::tests::run_bounded_retries_transport_failures_up_to_the_cap ... ok
+test engine::oci::retry::tests::run_bounded_stops_at_the_first_final_failure ... ok
+test engine::oci::retry::tests::run_bounded_succeeds_on_a_later_attempt ... ok
+test engine::oci::sources::tests::registry_without_registry_or_reference_is_refused ... ok
+test engine::oci::sources::tests::relative_archive_paths_are_refused ... ok
+test engine::oci::sources::tests::run_isolated_forwards_progress_and_returns ... ok
+test engine::oci::sources::tests::same_name_from_different_kinds_never_shares_a_key ... ok
+test engine::oci::registry::tests::wire::wrong_credentials_are_an_auth_error_without_the_secret ... ok
+test engine::oci::tests::apple_store_is_blocked_without_running_anything ... ok
+test engine::oci::tests::a_re_exported_archive_is_re_imported ... ok
+test engine::oci::tests::cached_only_miss_never_reads_the_source ... ok
+test engine::oci::tests::engine_store::default_socket_is_off_limits_under_test_isolation ... ok
+test engine::oci::tests::engine_store::engine_host_and_tls_env_are_honoured ... ok
+test engine::oci::tests::engine_store::explicit_hosts_resolve ... ok
+test engine::oci::tests::archive_source_is_imported_then_served_from_cache ... ok
+test engine::oci::retry::tests::controlled_reader_rejects_bytes_returned_after_expiry ... ok
+test engine::oci::retry::tests::late_success_and_cancelled_success_are_rejected ... ok
+test engine::oci::cache::tests::prune_waits_for_publication_of_an_in_flight_archive ... ok
+test engine::oci::tests::engine_store::fake_daemon::missing_image_names_the_engine ... ok
+test engine::oci::tests::engine_store::fake_daemon::export_is_validated_cached_and_reused_without_the_daemon ... ok
+test engine::oci::tests::engine_store::fake_daemon::a_default_variant_mismatch_still_exports_the_native_platform ... ok
+test engine::oci::tests::engine_store::references_that_could_escape_the_api_path_are_refused ... ok
+test engine::oci::tests::engine_store::remote_plain_tcp_ssh_npipe_and_userinfo_are_refused ... ok
+test engine::oci::tests::engine_store::fake_daemon::new_engines_are_asked_for_the_native_platform ... ok
+test engine::oci::tests::insufficient_disk_space_is_reported_before_staging ... ok
+test engine::oci::tests::rejected_archives_leave_no_cache_state ... ok
+test engine::oci::verify::tests::a_cancelled_sink_refuses_the_next_chunk_and_keeps_what_it_had ... ok
+test engine::oci::verify::tests::a_symlinked_cache_directory_is_refused_not_followed ... ok
+test engine::oci::verify::tests::a_write_crossing_the_reserved_window_checks_disk_before_writing ... ok
+test engine::oci::tests::engine_store::fake_daemon::wrong_platform_is_refused_before_export ... ok
+test engine::oci::archive::tests::runtime_projection_excludes_unselected_images_and_preserves_selected_blobs ... ok
+test engine::oci::verify::tests::ensure_space_reports_needed_including_the_floor ... ok
+test engine::oci::verify::tests::background_reader_notices_cancellation_while_the_source_is_silent ... ok
+test engine::oci::verify::tests::hashing_reader_counts_hashes_and_caps ... ok
+test engine::oci::verify::tests::private_files_and_dirs_are_owner_only ... ok
+test engine::oci::verify::tests::sha256_of_empty_input_is_the_well_known_value ... ok
+test engine::oci::verify::tests::staging_file_cannot_be_preplanted ... ok
+test engine::oci::verify::tests::staging_sink_rejects_growth_past_the_cap ... ok
+test engine::oci::verify::tests::staging_sink_stops_when_the_disk_fills ... ok
+test engine::oci::verify::tests::the_free_space_floor_is_enforced_for_small_writes ... ok
+test engine::oci::tests::expired_validation_progress_never_publishes_a_reference ... ok
+test engine::oci::verify::tests::background_reader_passes_bytes_through_and_detects_a_stall ... ok
+test frontend::api::serve::tls_tests::production_https_server_handshakes_with_both_crypto_providers ... ok
+test engine::oci::tests::engine_store::fake_daemon::unreachable_engine_is_a_network_error ... ok
+test engine::oci::tests::engine_store::fake_daemon::truncated_export_leaves_no_cache_state ... ok
+
+test result: ok. 110 passed; 0 failed; 0 ignored; 0 measured; 3127 filtered out; finished in 3.31s
+

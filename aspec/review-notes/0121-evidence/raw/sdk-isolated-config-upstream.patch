@@ -1,0 +1,18 @@
+--- a/lib/backend/local/mod.rs
++++ b/lib/backend/local/mod.rs
+@@ -455,6 +455,15 @@ impl LocalBackendBuilder {
+         Ok(self.build_lazy_from(load_persisted_config_or_default()?))
+     }
+ 
++    /// Build a lazy local backend from independent defaults and builder values.
++    ///
++    /// This constructor never loads a persisted Microsandbox configuration or
++    /// resolves `MSB_CONFIG_PATH`, HOME or XDG paths. Embedders that own every
++    /// runtime path can coexist with an installed Microsandbox configuration.
++    pub fn build_lazy_isolated(self) -> LocalBackend {
++        self.build_lazy_from(GlobalConfig::default())
++    }
++
+     /// Finish lazy construction from an already resolved persisted config.
+     fn build_lazy_from(self, persisted: GlobalConfig) -> LocalBackend {
+         let config = self.merge_into(persisted);

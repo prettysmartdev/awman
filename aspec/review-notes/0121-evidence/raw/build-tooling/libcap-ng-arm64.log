@@ -1,0 +1,218 @@
+/workspace/third_party/native/libcap-ng/libcap-ng-0.8.3.tar.gz: OK
+Configuring libcap-ng
+checking build system type... aarch64-unknown-linux-gnu
+checking host system type... aarch64-unknown-linux-gnu
+checking target system type... aarch64-unknown-linux-gnu
+checking for a BSD-compatible install... /usr/bin/install -c
+checking whether build environment is sane... yes
+checking for a thread-safe mkdir -p... /usr/bin/mkdir -p
+checking for gawk... no
+checking for mawk... mawk
+checking whether make sets $(MAKE)... yes
+checking whether make supports nested variables... yes
+checking how to print strings... printf
+checking whether make supports the include directive... yes (GNU style)
+checking for gcc... gcc
+checking whether the C compiler works... yes
+checking for C compiler default output file name... a.out
+checking for suffix of executables... 
+checking whether we are cross compiling... no
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether gcc accepts -g... yes
+checking for gcc option to accept ISO C89... none needed
+checking whether gcc understands -c and -o together... yes
+checking dependency style of gcc... gcc3
+checking for a sed that does not truncate output... /usr/bin/sed
+checking for grep that handles long lines and -e... /usr/bin/grep
+checking for egrep... /usr/bin/grep -E
+checking for fgrep... /usr/bin/grep -F
+checking for ld used by gcc... /usr/bin/ld
+checking if the linker (/usr/bin/ld) is GNU ld... yes
+checking for BSD- or MS-compatible name lister (nm)... /usr/bin/nm -B
+checking the name lister (/usr/bin/nm -B) interface... BSD nm
+checking whether ln -s works... yes
+checking the maximum length of command line arguments... 1572864
+checking how to convert aarch64-unknown-linux-gnu file names to aarch64-unknown-linux-gnu format... func_convert_file_noop
+checking how to convert aarch64-unknown-linux-gnu file names to toolchain format... func_convert_file_noop
+checking for /usr/bin/ld option to reload object files... -r
+checking for objdump... objdump
+checking how to recognize dependent libraries... pass_all
+checking for dlltool... no
+checking how to associate runtime and link libraries... printf %s\n
+checking for ar... ar
+checking for archiver @FILE support... @
+checking for strip... strip
+checking for ranlib... ranlib
+checking command to parse /usr/bin/nm -B output from gcc object... ok
+checking for sysroot... no
+checking for a working dd... /usr/bin/dd
+checking how to truncate binary pipes... /usr/bin/dd bs=4096 count=1
+checking for mt... no
+checking if : is a manifest tool... no
+checking how to run the C preprocessor... gcc -E
+checking for ANSI C header files... yes
+checking for sys/types.h... yes
+checking for sys/stat.h... yes
+checking for stdlib.h... yes
+checking for string.h... yes
+checking for memory.h... yes
+checking for strings.h... yes
+checking for inttypes.h... yes
+checking for stdint.h... yes
+checking for unistd.h... yes
+checking for dlfcn.h... yes
+checking for objdir... .libs
+checking if gcc supports -fno-rtti -fno-exceptions... no
+checking for gcc option to produce PIC... -fPIC -DPIC
+checking if gcc PIC flag -fPIC -DPIC works... yes
+checking if gcc static flag -static works... yes
+checking if gcc supports -c -o file.o... yes
+checking if gcc supports -c -o file.o... (cached) yes
+checking whether the gcc linker (/usr/bin/ld) supports shared libraries... yes
+checking dynamic linker characteristics... GNU/Linux ld.so
+checking how to hardcode library paths into programs... immediate
+checking whether stripping libraries is possible... yes
+checking if libtool supports shared libraries... yes
+checking whether to build shared libraries... no
+checking whether to build static libraries... yes
+.
+Checking for programs
+checking for gcc... (cached) gcc
+checking whether we are using the GNU C compiler... (cached) yes
+checking whether gcc accepts -g... (cached) yes
+checking for gcc option to accept ISO C89... (cached) none needed
+checking whether gcc understands -c and -o together... (cached) yes
+checking dependency style of gcc... (cached) gcc3
+checking for gawk... (cached) mawk
+.
+Checking for header files
+checking for ANSI C header files... (cached) yes
+checking linux/capability.h usability... yes
+checking linux/capability.h presence... yes
+checking for linux/capability.h... yes
+checking sys/xattr.h usability... yes
+checking sys/xattr.h presence... yes
+checking for sys/xattr.h... yes
+checking linux/securebits.h usability... yes
+checking linux/securebits.h presence... yes
+checking for linux/securebits.h... yes
+checking pthread.h usability... yes
+checking pthread.h presence... yes
+checking for pthread.h... yes
+checking for library containing pthread_atfork... none required
+checking sys/vfs.h usability... yes
+checking sys/vfs.h presence... yes
+checking for sys/vfs.h... yes
+checking linux/magic.h usability... yes
+checking linux/magic.h presence... yes
+checking for linux/magic.h... yes
+configure: WARNING: linux/magic.h is required in order to verify procfs.
+checking __attr_access support... yes
+checking for -Wformat-truncation... yes
+checking sys/syscall.h usability... yes
+checking sys/syscall.h presence... yes
+checking for sys/syscall.h... yes
+checking whether PR_CAP_AMBIENT is declared... yes
+checking whether VFS_CAP_REVISION_2 is declared... yes
+checking whether VFS_CAP_REVISION_3 is declared... yes
+checking whether CAP_EPOLLWAKEUP is declared... no
+checking whether CAP_WAKE_ALARM is declared... yes
+checking whether CAP_BLOCK_SUSPEND is declared... yes
+checking whether CAP_AUDIT_READ is declared... yes
+checking whether CAP_PERFMON is declared... yes
+checking whether CAP_BPF is declared... yes
+checking whether CAP_CHECKPOINT_RESTORE is declared... yes
+checking for swig... no
+configure: WARNING: "Swig not found - python bindings will not be made"
+checking whether to create python bindings... no
+checking whether to create python3 bindings... investigating
+checking for python3-config... no
+./configure: line 13816: test: =: unary operator expected
+Python3 bindings will NOT be built
+checking that generated files are newer than configure... done
+configure: creating ./config.status
+config.status: creating Makefile
+config.status: creating src/Makefile
+config.status: creating src/libcap-ng.pc
+config.status: creating src/test/Makefile
+config.status: creating bindings/Makefile
+config.status: creating bindings/python/Makefile
+config.status: creating bindings/python3/Makefile
+config.status: creating bindings/src/Makefile
+config.status: creating bindings/python/test/Makefile
+config.status: creating utils/Makefile
+config.status: creating m4/Makefile
+config.status: creating docs/Makefile
+config.status: creating config.h
+config.status: executing depfiles commands
+config.status: executing libtool commands
+.
+
+
+  libcap-ng Version:      0.8.3
+  Target:                 aarch64-unknown-linux-gnu
+  Installation prefix:    /usr/local
+  Compiler:               gcc
+  Compiler flags:
+                          -g -O2
+  __attr_access support:  yes
+
+make  all-recursive
+make[1]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3'
+Making all in src
+make[2]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src'
+Making all in test
+make[3]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src/test'
+make[3]: Nothing to be done for 'all'.
+make[3]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src/test'
+make[3]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src'
+/bin/bash ../libtool  --tag=CC   --mode=compile gcc -DHAVE_CONFIG_H -I. -I..  -I. -I..  -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -MT cap-ng.lo -MD -MP -MF .deps/cap-ng.Tpo -c -o cap-ng.lo cap-ng.c
+/bin/bash ../libtool  --tag=CC   --mode=compile gcc -DHAVE_CONFIG_H -I. -I..  -I. -I..  -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -MT lookup_table.lo -MD -MP -MF .deps/lookup_table.Tpo -c -o lookup_table.lo lookup_table.c
+libtool: compile:  gcc -DHAVE_CONFIG_H -I. -I.. -I. -I.. -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -MT cap-ng.lo -MD -MP -MF .deps/cap-ng.Tpo -c cap-ng.c -o cap-ng.o
+libtool: compile:  gcc -DHAVE_CONFIG_H -I. -I.. -I. -I.. -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -MT lookup_table.lo -MD -MP -MF .deps/lookup_table.Tpo -c lookup_table.c -o lookup_table.o
+mv -f .deps/lookup_table.Tpo .deps/lookup_table.Plo
+/bin/bash ../libtool  --tag=CC   --mode=compile gcc -DHAVE_CONFIG_H -I. -I..  -I. -I..  -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -MT libdrop_ambient.lo -MD -MP -MF .deps/libdrop_ambient.Tpo -c -o libdrop_ambient.lo libdrop_ambient.c
+libtool: compile:  gcc -DHAVE_CONFIG_H -I. -I.. -I. -I.. -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -MT libdrop_ambient.lo -MD -MP -MF .deps/libdrop_ambient.Tpo -c libdrop_ambient.c -o libdrop_ambient.o
+mv -f .deps/libdrop_ambient.Tpo .deps/libdrop_ambient.Plo
+/bin/bash ../libtool  --tag=CC   --mode=link gcc -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2   -o libdrop_ambient.la -rpath /usr/local/lib libdrop_ambient.lo  
+libtool: link: ar cru .libs/libdrop_ambient.a  libdrop_ambient.o
+ar: `u' modifier ignored since `D' is the default (see `U')
+libtool: link: ranlib .libs/libdrop_ambient.a
+libtool: link: ( cd ".libs" && rm -f "libdrop_ambient.la" && ln -s "../libdrop_ambient.la" "libdrop_ambient.la" )
+mv -f .deps/cap-ng.Tpo .deps/cap-ng.Plo
+/bin/bash ../libtool  --tag=CC   --mode=link gcc -fPIC -DPIC -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -Wl,-z,relro  -o libcap-ng.la -rpath /usr/local/lib cap-ng.lo lookup_table.lo  
+libtool: link: ar cru .libs/libcap-ng.a  cap-ng.o lookup_table.o
+ar: `u' modifier ignored since `D' is the default (see `U')
+libtool: link: ranlib .libs/libcap-ng.a
+libtool: link: ( cd ".libs" && rm -f "libcap-ng.la" && ln -s "../libcap-ng.la" "libcap-ng.la" )
+make[3]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src'
+make[2]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src'
+Making all in utils
+make[2]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/utils'
+gcc -DHAVE_CONFIG_H -I. -I..  -I.. -I../src  -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -c -o pscap.o pscap.c
+gcc -DHAVE_CONFIG_H -I. -I..  -I.. -I../src  -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -c -o netcap.o netcap.c
+gcc -DHAVE_CONFIG_H -I. -I..  -I.. -I../src  -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -c -o proc-llist.o proc-llist.c
+gcc -DHAVE_CONFIG_H -I. -I..  -I.. -I../src  -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -c -o filecap.o filecap.c
+gcc -DHAVE_CONFIG_H -I. -I..  -I.. -I../src  -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -c -o captest.o captest.c
+/bin/bash ../libtool  --tag=CC   --mode=link gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2   -o pscap pscap.o  -L../src -lcap-ng
+/bin/bash ../libtool  --tag=CC   --mode=link gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2   -o netcap netcap.o proc-llist.o  -L../src -lcap-ng
+libtool: link: gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -o pscap pscap.o  -L../src /workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src/.libs/libcap-ng.a
+libtool: link: gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -o netcap netcap.o proc-llist.o  -L../src /workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src/.libs/libcap-ng.a
+/bin/bash ../libtool  --tag=CC   --mode=link gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2   -o filecap filecap.o  -L../src -lcap-ng
+/bin/bash ../libtool  --tag=CC   --mode=link gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2   -o captest captest.o  -L../src -lcap-ng
+libtool: link: gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -o filecap filecap.o  -L../src /workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src/.libs/libcap-ng.a
+libtool: link: gcc -W -Wall -Wshadow -Wno-format-truncation -Wundef -D_GNU_SOURCE -g -O2 -o captest captest.o  -L../src /workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/src/.libs/libcap-ng.a
+make[2]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/utils'
+Making all in m4
+make[2]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/m4'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/m4'
+Making all in docs
+make[2]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/docs'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3/docs'
+make[2]: Entering directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3'
+make[2]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3'
+make[1]: Leaving directory '/workspace/third_party/native/libcap-ng/build.bkjdXP/libcap-ng-0.8.3'
+f063ed4c3589f7b596e9df27d177e8c4d2bb3d31eb8aee8efac1595557b09557  /workspace/third_party/native/libcap-ng/aarch64-unknown-linux-gnu/libcap-ng.a

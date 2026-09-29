@@ -23,6 +23,7 @@ fn settings(state: &std::path::Path) -> BuiltinRuntimeSettings {
         image_source: None,
         images: BTreeMap::new(),
         registries: BTreeMap::new(),
+        network: Default::default(),
         ambient_overrides: Vec::new(),
         test_isolation: true,
     }

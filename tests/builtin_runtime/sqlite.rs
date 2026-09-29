@@ -51,7 +51,7 @@ fn builtin_sqlite_exactly_one_native_binding_in_the_dependency_graph() {
     // Two `links = "sqlite3"` crates cannot link into one executable; a second
     // libsqlite3-sys (or a system libsqlite3 binding) means the patch regressed.
     let native = only(&packages, "libsqlite3-sys");
-    assert!(native.version.starts_with("0.38."), "{}", native.version);
+    assert_eq!(native.version, "0.38.2", "{}", native.version);
     assert!(
         packages
             .iter()
@@ -62,7 +62,7 @@ fn builtin_sqlite_exactly_one_native_binding_in_the_dependency_graph() {
     );
     let rusqlite = only(&packages, "rusqlite");
     assert!(
-        rusqlite.version.starts_with("0.40."),
+        rusqlite.version == "0.40.2",
         "awman's rusqlite must stay unchanged: {}",
         rusqlite.version
     );
@@ -218,7 +218,7 @@ fn applied_migrations(db: &Path) -> i64 {
 }
 
 #[test]
-fn builtin_sqlite_sdk_catalog_migrates_twice_and_survives_cross_driver_writes_and_a_crash() {
+fn builtin_sqlite_sdk_catalog_migrates_twice_and_preserves_rusqlite_writes_after_a_crash() {
     if !has_builtin_runtime() {
         eprintln!(
             "SKIP: builtin_sqlite catalog round trip: awman was built without the builtin runtime"
@@ -247,7 +247,10 @@ fn builtin_sqlite_sdk_catalog_migrates_twice_and_survives_cross_driver_writes_an
     let first_tables = tables(&db);
     assert!(first_tables.len() > 5, "{first_tables:?}");
     let migrations = applied_migrations(&db);
-    assert!(migrations >= 1, "migrations must have been recorded");
+    assert_eq!(
+        migrations, 27,
+        "the supported SDK catalog has 27 migrations"
+    );
 
     // rusqlite (awman's stack, same native library) commits a cross-driver transaction.
     {
@@ -290,6 +293,128 @@ fn builtin_sqlite_sdk_catalog_migrates_twice_and_survives_cross_driver_writes_an
         .query_row("pragma integrity_check", [], |r| r.get(0))
         .unwrap();
     assert_eq!(integrity, "ok");
+}
+
+#[cfg(awman_builtin)]
+#[test]
+fn builtin_sqlite_genuine_bidirectional_transactions_and_locking() {
+    use sqlx::Connection as _;
+    let state = short_state();
+    let state_dir = state.path().join("s");
+    let scratch = Scratch::new();
+    config_home(&scratch);
+    status_until_listed(&scratch, &state_dir).unwrap();
+    let db = state_dir.join("db/msb.db");
+    assert_eq!(applied_migrations(&db), 27);
+    let mut native = rusqlite::Connection::open(&db).unwrap();
+    native.busy_timeout(Duration::from_millis(100)).unwrap();
+    native.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE awman_driver_transactions (id INTEGER PRIMARY KEY, value BLOB NOT NULL);").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut other = sqlx::SqliteConnection::connect_with(
+                &sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_millis(100)),
+            )
+            .await
+            .unwrap();
+            let source: String = sqlx::query_scalar("SELECT sqlite_source_id()")
+                .fetch_one(&mut other)
+                .await
+                .unwrap();
+            let native_source: String = native
+                .query_row("SELECT sqlite_source_id()", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(source, native_source);
+            let bytes = vec![0u8, 1, 127, 255];
+            let tx = native
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "INSERT INTO awman_driver_transactions VALUES (1, ?1)",
+                [&bytes],
+            )
+            .unwrap();
+            let invisible: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM awman_driver_transactions")
+                    .fetch_one(&mut other)
+                    .await
+                    .unwrap();
+            assert_eq!(invisible, 0);
+            let busy = sqlx::query("INSERT INTO awman_driver_transactions VALUES (2, X'02')")
+                .execute(&mut other)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                busy.as_database_error().and_then(|e| e.code()).as_deref(),
+                Some("5")
+            );
+            tx.rollback().unwrap();
+            let tx = native.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO awman_driver_transactions VALUES (3, ?1)",
+                [&bytes],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            let read: Vec<u8> =
+                sqlx::query_scalar("SELECT value FROM awman_driver_transactions WHERE id=3")
+                    .fetch_one(&mut other)
+                    .await
+                    .unwrap();
+            assert_eq!(read, bytes);
+            let mut tx = other.begin().await.unwrap();
+            sqlx::query("INSERT INTO awman_driver_transactions VALUES (4, ?)")
+                .bind(&bytes)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let visible: i64 = native
+                .query_row("SELECT count(*) FROM awman_driver_transactions", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(visible, 1);
+            tx.rollback().await.unwrap();
+            let mut tx = other.begin().await.unwrap();
+            sqlx::query("INSERT INTO awman_driver_transactions VALUES (5, ?)")
+                .bind(&bytes)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let read: Vec<u8> = native
+                .query_row(
+                    "SELECT value FROM awman_driver_transactions WHERE id=5",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(read, bytes);
+            other.close().await.unwrap();
+        });
+    drop(native);
+    status_until_listed(&scratch, &state_dir).unwrap();
+    let native = rusqlite::Connection::open(&db).unwrap();
+    let ids: Vec<i64> = native
+        .prepare("SELECT id FROM awman_driver_transactions ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids, [3, 5]);
+    assert_eq!(
+        native
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(applied_migrations(&db), 27);
 }
 
 #[test]

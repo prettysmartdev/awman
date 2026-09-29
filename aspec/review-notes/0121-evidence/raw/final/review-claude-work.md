@@ -1,0 +1,113 @@
+# WI 0121 adversarial review — Claude-owned areas
+
+Verdict: **changes require fixes; WI 0121 remains open.** Review date: 2026-09-28, Linux aarch64. No repository source, test, configuration, or documentation file was edited. Review artifacts are beside this report.
+
+I read ownership.md, baseline.md/README handoff information, acquisition/network/docs notes and shared-edit requests, then inspected the scoped current source and its consumers. The guest-compat and cache-testinfra notes/handoffs are absent. `git diff --stat` and the scoped `git diff` both fail because `.git` points to the unmounted `/Users/cohix-studio/Workspaces/prettysmart/awman/.git/worktrees/0121`. See `review-claude-git-diff.log`. I compared the preserved baseline hashes (`review-claude-baseline-changes.log`) to identify changed existing files and examined new files directly. **This is not a complete base/head diff review or tracking audit.** That gate remains BLOCKED; baseline hashes cannot establish additions/deletions or commit identity.
+
+Verification performed:
+
+| Check | Actual result | Raw evidence |
+|---|---|---|
+| `make test-fast`, with `/usr/local/cargo/bin` added to PATH | **FAIL**, make exit 2. Lib: 3132 passed, 1 ignored, 91 filtered; subsequent builtin target: 48 passed, 1 failed, 12 filtered. Cargo stops there, so later targets did not run in this command. | `review-claude-test-fast.log` |
+| `cargo clippy --all-targets -- -D warnings`, same PATH | **FAIL**, exit 101, unused `Run::facts_for` | `review-claude-clippy.log` |
+| Isolated `cargo test --locked --test oci_import -- --nocapture` | Harness says 36 passed; **32 executed hermetic checks, 4 skip paths** (real Docker, real registry, native keychain, real corpus). No real-store execution pass. | `review-claude-oci-tests.log` |
+| OCI inventory with/without the exact fast-tier filters | 36 versus 22 tests; all 13 `docker_store::` checks disappear | `review-claude-oci-list.log`, `review-claude-oci-fast-list.log` |
+| Registry hermetic test with synthetic ambient proxy `http://127.0.0.1:9` and empty NO_PROXY | **FAIL**, tried the ambient proxy; only loopback contacted | `review-claude-ambient-proxy.log` |
+| Extracted network guest prelude with a successful shell-only fetch stand-in | Positive test fails; negative test falsely reports PASS | `review-claude-prelude.sh`, `review-claude-prelude.log` |
+| Public retry API, linked against the current awman rlib, 10 ms budget / 50 ms successful attempt | **FAIL**, returns `Ok(37)` after 50.43 ms | `review-claude-deadline.rs`, `review-claude-deadline-build.log`, `review-claude-deadline.log` |
+| Native guest / real store / distribution execution | **NOT RUN / BLOCKED**: no `/dev/kvm`, no native Mac/x86 hosts, no supplied disposable stores or final signed artifacts | No execution pass claimed |
+
+The network analysis below uses the exact published `microsandbox-network 0.7.2` crate, downloaded into `review-sdk/` from https://static.crates.io/crates/microsandbox-network/microsandbox-network-0.7.2.crate . Its SHA-256 is `be4f1c9d36c1957b35d674a993a59c5db1741f47c96c952b491b09d9674b92d7`, matching Cargo.lock. These are source-level findings against the pinned enforcement implementation, not claimed guest executions.
+
+## Findings
+
+1. **MAJOR — allowlist mode blocks its own allowed HTTPS APIs.**
+   **Location:** `src/engine/container/builtin/network.rs:246`; consumer `src/engine/container/builtin/msb_driver.rs:224` and `:230`; advertised behavior `docs/11-runtimes.md:232`.
+   The compiler sets `strict=true` for allowlist, and the SDK adapter disables TLS interception. In the pinned SDK, `lib/engine/tcp/proxy.rs:224` calls `strict_hostname_allow_is_opaque`; at `:553` that function returns true for a hostname-allowed TLS connection even when it presents the correct SNI. The SDK even contains `strict_mode_blocks_hostname_allowed_opaque_tls` at `:2121`. Thus resolving and connecting to an allowed `api.anthropic.com:443` is refused before upstream dialing. Strict means inspectable application authority here, not merely the SNI check described by awman. The JSON equality tests cannot detect this.
+   **Required fix:** implement/review an enforcement path that meets the agreed end-to-end TLS/SNI contract without enabling TLS interception or silently relaxing policy. Add a pinned-SDK positive allowed-HTTPS test and negative shared-IP/unlisted-authority tests, then native execution evidence. Correct the docs/spec assertions until that contract is actually implemented.
+
+2. **BLOCKER — hostname allow rules admit UDP/QUIC without hostname enforcement.**
+   **Location:** `src/engine/container/builtin/network.rs:234`; security promise `aspec/architecture/security.md:32` (the “Builtin guest network policy” bullet) and `docs/11-runtimes.md:232`.
+   Domain allows have empty protocol and port filters, permitting every protocol. SDK `lib/engine/netstack/poll.rs:770` evaluates UDP using `evaluate_egress`, which uses `HostnameSource::CacheOnly` (`lib/model/policy/types.rs`, `evaluate_egress`). There is no strict/SNI check on this path. QUIC is blocked only when TLS interception is active, which awman explicitly disables. A guest can resolve an allowed hostname, then send UDP/443 to its shared CDN address with an unlisted QUIC hostname; the policy admits it on the cached allowed-name binding. DNS answers alone therefore *can* authorize encrypted traffic to an unlisted co-host, contrary to the documented boundary. The new negative tests cover wget/TCP, not this path.
+   **Required fix:** deny protocols that cannot enforce the promised hostname boundary (including UDP/QUIC for name-based allows), or implement and test equivalent enforcement. Add a controlled shared-IP UDP/QUIC bypass regression at the SDK enforcement boundary and on a guest. Do not describe `strict` as enforcing protocols it does not inspect.
+
+3. **MAJOR — the acquisition-to-import lease handoff still has a prune window.**
+   **Location:** `src/engine/oci/mod.rs:274`, `:312`, `:381`; `src/engine/oci/cache.rs:433`; consumer `src/engine/container/builtin/backend.rs:540`.
+   Acquisition uses `lookup`, `staging`, and `commit`, rather than the new leased variants, and returns an `AcquiredImage` containing only a path. A second process can prune immediately after lookup/publication releases its lock and before backend `lease_archive` runs. `ready` then fails with “verified image archive was pruned before import; retry awman ready”; a cache-only caller can receive a nonexistent archive. The backend lease does protect projection/import *after it is acquired*, so this finding does not claim that already-leased imports are unprotected. The source itself says `commit_leased` is only used by tests. New lease unit tests do not prove the production handoff.
+   **Required fix:** carry an archive lease from atomic lookup/publication through projection and SDK import, and use leased staging. Complete the shared API integration with the backend owner. Add a barrier-controlled cross-process prune test over the real acquirer/import handoff, preserving the existing publication-window and per-reference metadata fixes.
+
+4. **MAJOR — the advertised overall acquisition deadline does not bound successful validation/publication.**
+   **Location:** `src/engine/oci/retry.rs:223`; `src/engine/oci/mod.rs:332` and `:381`.
+   `run_bounded` immediately accepts an `Ok` attempt without rechecking elapsed time. Archive staging/validation and cache hashing/commit do not receive the deadline. A local archive or a downloaded archive with expensive layer validation can run past the configured budget and still publish successfully. The attached public-API reproducer returns `Ok(37)` after 50.43 ms with a 10 ms budget. The existing stalled-export test only covers a reqwest timeout, not the claimed whole-operation bound.
+   **Required fix:** thread deadline checks through local copy, validation/decompression/hash loops and publication, and refuse an expired success before committing. Add injected-clock/slow-reader tests that expire in each phase and assert no published ref.
+
+5. **MAJOR — cancellation is not wired to production callers and can wait an hour before response headers.**
+   **Location:** `src/engine/oci/mod.rs:169` (default acquirer factory), `:235` (concrete-only cancellation setter); `src/engine/oci/docker_engine.rs:482`; `src/engine/oci/registry.rs:614`.
+   Production receives `Box<dyn ImageAcquirer>` with no cancellation method/token in the trait or request. Only test callers use the concrete cancellation API; the default token is never cancelled by the ready/runtime caller. Even a caller that supplies a token cannot interrupt blocking `req.send()` before headers arrive: Docker's export request uses the remaining one-hour deadline, and `BackgroundReader` starts only after `send()` returns. The cancellation test starts cancellation during a response body, missing this case.
+   **Required fix:** pass the engine's cancellation signal through the public acquisition boundary and make connection/header waits as well as transfer, validation and commit cooperatively abortable with a stated bound. Add a server that accepts a request but withholds headers, plus an actual-awman cancellation scenario. Coordinate caller changes with their owner; do not count a concrete test-only token as completed lifecycle integration.
+
+6. **MAJOR — injected environments are not hermetic; ordinary registry tests can use the developer's proxy/config.**
+   **Location:** `src/engine/oci/sources.rs:172`; `tests/oci_import/registry_store.rs:97`; `tools/isolated-test.sh:64`.
+   Missing snapshot keys fall back to `host_var`, and missing DOCKER_CONFIG falls back to ambient home discovery. The isolated runner does not scrub HTTP(S)/ALL_PROXY, NO_PROXY, their lowercase variants, or an inherited DOCKER_CONFIG. With only synthetic loopback proxy variables set, the otherwise passing same-origin registry test fails after trying that proxy (attached log). On a developer host this can send ordinary test traffic through a real proxy; DockerConfig tests/callers can read an inherited real credential directory. Retrying also re-resolves these ambient credentials rather than freezing the original request environment.
+   **Required fix:** make an injected snapshot authoritative, including explicit absence, and capture production environment values once at the boundary. Give tests explicit proxy/config/home inputs and scrub inherited source/credential settings in the ordinary runner. Preserve separately explicit real-store opt-ins. Add sentinel tests for both uppercase/lowercase proxies and inherited DOCKER_CONFIG.
+
+7. **MAJOR — required acquisition/network guest tests are unreachable from every Cargo test tier.**
+   **Location:** `tests/builtin_runtime/main.rs:21`; example registry in `Cargo.toml`.
+   The registry ends at `mod state_dir` and never declares `acquisition`, `network_resources`, or the lifecycle module supplied by the other area. The network driver file also has no `builtin_net_driver` Cargo example entry. `autotests=false` means creating these files provides zero executable coverage. Even `AWMAN_TEST_BUILTIN_REQUIRE_HW=1 make test-builtin` cannot discover the new denied-egress/OOM/cached-source-stop tests, regardless of runner hardware. This is missing integration (FAIL), not just unavailable hardware (BLOCKED).
+   **Required fix:** register the existing modules and driver with the owning agents, compile both default and feature targets, and archive the test inventory proving each required assertion is discoverable. Then execute native tests; registration itself is not an execution pass.
+
+8. **MAJOR — the fast filter silently removes the hermetic Docker-source adapter suite.**
+   **Location:** `Makefile:55`; `tests/oci_import/main.rs:26`.
+   `--skip docker` applies to fully qualified test names, so every `docker_store::...` test is excluded, including `acquire_retry_is_bounded_and_source_stable`, cancellation and deadline tests that do not contact Docker. The attached inventories shrink from 36 to 22 tests; all 13 hermetic Docker adapter tests vanish. This directly violates G.3 and leaves new transport/security behavior outside the routine fast gate.
+   **Required fix:** replace the broad substring skip with explicit external-service gating/naming that retains hermetic source adapters. Add a tier inventory assertion over Cargo's actual discovered names, not just comments or module presence.
+
+9. **MAJOR — the required fast test gate is already red on the delivered files.**
+   **Location:** `tests/builtin_runtime/gates.rs:201`.
+   The gate asserts `hardware == (file == "hardware.rs")` while scanning all `.rs` files, including unregistered ones. `make test-fast` fails on `acquisition.rs::builtin_hw_cached_execution_after_sources_stop` before later integration targets run. The handoff had already identified this incompatibility; it remains unresolved.
+   **Required fix:** validate opt-in gating for hardware tests across all registered modules, keeping the hardware prerequisite and fast-tier exclusions, and rerun the full requested command to completion. Do not simply exclude these new files from the audit.
+
+10. **MAJOR — all-targets Clippy fails on the guest-test change.**
+    **Location:** `tests/builtin_runtime/hardware.rs:96`.
+    `Run::facts_for` has no caller anywhere in the test tree. The requested `cargo clippy --all-targets -- -D warnings` exits 101 on dead code, so `make pre-push` cannot pass either.
+    **Required fix:** remove the unused accessor or exercise it in an actual registered test that needs it; rerun Clippy without weakening `-D warnings`.
+
+11. **MAJOR — guest network probes can report refusal without attempting any connection.**
+    **Location:** `tests/builtin_runtime/network_resources.rs:185`–`:190`, uses at `:335`–`:344` and `:397`–`:409`.
+    The wrappers execute `timeout 20 "$@"`, but callers pass `fetch`, a shell function. `timeout` execs a program; it cannot invoke that function in the parent `/bin/sh`. The attached extracted-prelude reproduction reports `FAIL positive-control ... fetch: No such file or directory` and `PASS false-policy-pass` even when `fetch()` merely prints success. Consequently allowed HTTPS/host probes always fail and denied HTTP probes can falsely PASS. More generally `refused` accepts command-not-found, missing CA/tools and unreachable endpoints as policy denial; `10.0.0.1` has no controlled positive endpoint.
+    **Required fix:** invoke real executables or a correctly scoped child shell, distinguish setup/tool/TLS failures from policy refusal, and use controlled reachable endpoints with positive controls and server-side connection observations. Run the exact shell harness hermetically before spending native hardware time on it.
+
+12. **BLOCKER — section C's expanded guest strategy matrix is absent, not merely unexecuted.**
+    **Location:** `src/engine/container/builtin/backend/matrix_tests.rs:288`; `tests/builtin_runtime/hardware.rs:236`; `tests/builtin_runtime/hw_driver.rs:255`.
+    The every-agent test inspects fake-driver plans for each agent's existing pairing. The hardware driver manually constructs the promoted fixture mounts; there is no `guest_compat` module/scenario implementing the required agent × SettingsMount × SystemPromptMode strategy coverage through actual awman. Baseline hashes show the matrix, fixture inventory, driver, overlay/agent/options and template implementations unchanged; hardware.rs mainly exposes helpers and adds the unused accessor. The existing two-consumer fixture is useful but is not the required expanded non-root watcher/writeback/strategy matrix. Missing hardware explains no live results; it does not explain missing test implementations. No guest/cache notes were left to account for these gaps.
+    **Required fix:** implement and register the missing synthetic-guest matrix and actual-awman init/ready/workflow onboarding cases, using effective image HOME and every mandatory variant rather than per-agent pairings. Separate missing code (FAIL) from native execution (BLOCKED), supply the section C handoff, and leave D-04/D-15 open until all required runs exist. Preserve bounded account reads, primary-GID lookup, sanitized staging and the HostAgentPinger authorization boundary.
+
+13. **BLOCKER — Apple-store acquisition still has no implementation.**
+    **Location:** `src/engine/oci/apple_store.rs:177` and `:201`; `src/engine/oci/sources.rs:207`.
+    Every target produces `Feasibility::Blocked`; acquisition unconditionally returns `ImageSourceBlocked`. A supported Apple Silicon store cannot be imported in-process. The source inspection and refusal regression are useful and honest, but add no bridge or real store round trip. This is an acknowledged mandatory acceptance blocker, not a demand to bypass the security constraints with a helper or private-storage scraper.
+    **Required fix:** keep D-01/AC5 and WI 0121 open. Complete native feasibility and a versioned linked bridge with exported-byte/platform/config/layer/error validation if feasible; otherwise retain an explicit blocker. Manual export must remain a workaround, never a completion claim.
+
+14. **MAJOR — real-store/corpus gates can pass without the required service/format matrix.**
+    **Location:** `tests/oci_import/real_stores.rs:100`, `:155`; `tests/oci_import/corpus.rs:455`; `tests/oci_import/corpus/build-corpus.sh:57`.
+    The real Engine test exercises one caller-selected endpoint, not Unix plus TLS plus client-certificate-required mTLS or the real disconnect/expiry/version cases. The registry test accepts omitted auth/CA inputs, so its name can report a CA/proxy/auth round trip using only an anonymous registry. The hermetic client-cert test loads a client identity against a server that does not require it. Corpus coverage tracks only template names; one Docker-save entry per template satisfies it while buildx and Apple exporters silently skip when absent. There is no format × template coverage requirement. Here all four external paths skipped, and none of these mandatory real cases executed.
+    **Required fix:** split scenarios into explicit required matrices with disposable provisioning, prerequisite enforcement, per-scenario authentication/CA/proxy/mTLS assertions and failures/retries. Require the appropriate export formats for each target in the corpus manifest/inventory. Missing services/hosts remain BLOCKED; missing scenarios remain FAIL. Do not promote synthetic archives or one anonymous endpoint to D-02/D-15 completion.
+
+15. **MAJOR — the durable real-store report writes PASS before the test finishes.**
+    **Location:** `tests/oci_import/real_stores.rs:130` (and registry PASS emission before its cached-use assertion).
+    The Docker row is appended to `AWMAN_TEST_STORES_REPORT` immediately after initial export, before cached reuse and missing-image/finality assertions. If either later assertion panics, the durable report still contains PASS for the entire named test. Registry cached-use failure has the same problem. A downstream evidence collector can report a passing round trip despite a red test.
+    **Required fix:** emit the whole-scenario PASS only after every assertion succeeds, or write separate assertion-level rows and an explicit final outcome. Add a failing later-stage fixture proving the report cannot retain a whole-test PASS.
+
+16. **MINOR — the new copyable network configuration is rejected by its own validator.**
+    **Location:** `docs/11-runtimes.md:214`–`:215`.
+    The JSON example combines `"mode": "public"` with a nonempty `allow`. `BuiltinNetworkConfig::parsed` explicitly rejects any `allow` field outside allowlist mode, so copying the main setup example prevents runtime initialization instead of producing the documented network. The adjacent schema prose does not make invalid JSON a usable example.
+    **Required fix:** use `"mode": "allowlist"` for that example or remove `allow` from a public example; validate copyable examples through the real config parser. Also reconcile `docs/11-runtimes.md:81`, which still says macOS release assets are configured without builtin even though `release-macos-builtin-signed` now builds/uploads the arm64 builtin asset. Preserve the distinction between configured and successfully built/distributed.
+
+## Verified sound (within the stated limits)
+
+- The executed hermetic OCI suite preserves wrong-platform/digest/archive rejection, selected-image projection, distinct source keys, per-reference cache identity, corruption/migration misses, and stopped-source cache lookup. I found no evidence requiring reopening R1/R2/O1; foreign token realms are not sent the configured registry credential. These tests are not SDK/guest materialization proof.
+- Existing archive/link/whiteout/space validation remains in the acquisition path; the new format contract explicitly refuses zstd and foreign/non-distributable layers rather than silently handing unsupported bytes to the SDK.
+- Pure builtin modules are now reachable in the default Unix build without verified payloads/full SDK. The default lib run completed successfully, including current planning/network/resource/path/catalog/framing tests. The broader fast target still fails as recorded above.
+- The global/repo network config ceiling and explicit fractional/invalid resource refusals are implemented in data/engine layers. Network-plan propagation is present in both backend startup paths and the SDK adapter; its actual enforcement semantics require findings 1–2 to be fixed.
+- The backend's existing late archive lease is retained throughout projection/import, and new cache locks/leases use private-file/no-follow checks. These are useful protections despite the earlier handoff window in finding 3.
+- The named socket/FIFO/device mount check rejects non-file/non-directory mount roots. No new host agent execution, helper extraction, parent-directory widening, or alternate-source fallback was found in the reviewed changes. This is source inspection, not executable/firmware tracing.
+- Preview/native-verification caveats remain in the user docs. The durable evidence register's overall NOT ACCEPTED disposition and explicit Apple blocker are honest. No guest, real-service, signed-artifact or complete-diff pass was inferred from CI declarations or skipped tests.
+- I did not reopen R3 or propose redundant lifecycle maintenance: no finding assumes SDK get/list lack reconciliation. Partial-frame retention, bounded account reads, numeric primary-GID behavior, and build-input corrections were left intact.

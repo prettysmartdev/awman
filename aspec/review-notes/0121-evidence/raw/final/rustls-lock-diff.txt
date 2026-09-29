@@ -1,0 +1,10 @@
+--- /awman/context/workflow/0121/final-lock-before-rustls	2026-09-28 18:14:20.315403349 +0000
++++ Cargo.lock	2026-09-28 18:14:21.273833578 +0000
+@@ -506,6 +506,7 @@
+  "reqwest",
+  "ring",
+  "rusqlite",
++ "rustls",
+  "serde",
+  "serde_json",
+  "serde_yaml_ng",

@@ -1,0 +1,17 @@
+pre-push	0
+feature-clippy	0
+test-builtin	0
+focused-local	0
+focused-oci	0
+hermetic-builtin	0
+hardware-required	101
+services-required	101
+corpus-required	101
+distribution-required	101
+native-arm	2
+native-x86	2
+native-apple	2
+pre-push-stable	0
+test-fast-stable	0
+builtin-sdk-local	0
+builtin-inventory	0

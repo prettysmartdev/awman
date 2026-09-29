@@ -78,9 +78,9 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 
 The runtime is only present in awman builds compiled with it. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
-- **Release configuration:** only `awman-linux-arm64` is configured to include the builtin runtime. This does not establish that a published or boot-tested release exists. The Linux x86_64 and macOS assets are configured without it.
+- **Release configuration:** `awman-linux-arm64` and a separate Apple Silicon job are configured to include the builtin runtime. Neither configuration establishes a published or boot-tested release. The ordinary Linux x86_64 and macOS matrix assets are configured without it.
 - **Building from source:** run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. `make install` includes the runtime automatically when the payloads for your host are verified and otherwise builds the existing runtimes only. Payloads for Linux x86_64 and macOS Apple Silicon are not yet verified, so a source build cannot include the runtime on those hosts yet.
-- **macOS entitlement:** a macOS binary that includes the runtime must be code-signed with the `com.apple.security.hypervisor` entitlement, or the VM cannot start (`embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …`). Signed macOS builds that include the runtime are not yet distributed.
+- **macOS distribution:** awman is not signed or notarized for the time being. Build and release jobs do not require signing credentials or perform explicit ad-hoc signing. Native guest boot must still succeed with the distributed binary; an OS permission failure remains a failed boot check, not a successful skip.
 
 ### Setup
 
@@ -182,9 +182,10 @@ Every source is explicit. A source never falls back to another one, and the same
 - `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged.
 - If a Dockerfile changed after you built, `ready` warns you to rebuild externally and re-run `awman ready --build`.
 - Older acquisition-cache references without per-source metadata must be acquired again once. Installed images remain runnable without their source.
+- A transient failure while importing (a dropped connection, a stalled transfer, a 5xx from the registry or daemon) is retried automatically, up to a bounded number of attempts and an overall time limit. Errors that won't be fixed by retrying — bad credentials, a digest or platform mismatch, a rejected archive, an unsupported or blocked source — are reported immediately instead. Ctrl-C cancels acquisition and waits for cleanup. If the final runtime import has already begun, cancellation waits for that commit and may leave a complete cached image. Local filesystem or keychain calls may delay the response.
 - Workflow setup/teardown steps use the imported agent image of the repo's configured agent (default `claude`) unless the workflow or config sets an explicit `baseImage`, which must already be imported. A workflow whose agent image is not imported stops at pre-flight with the build instructions instead of offering to build.
 
-Importing enforces safety limits: a total archive of up to 32 GiB, up to 8 GiB per layer after decompression, up to 256 layers, and at least 1 GiB of free disk space. Archive metadata and the selected image's layers are validated before import: digests must match, the image must be for the host's Linux platform, and selected images with path traversal, writes through symlinks, device nodes, unsafe hard links, or malformed whiteouts are rejected (`image archive … rejected: <reason>`). Only the selected image and requested tag reach the runtime importer; unselected images and unrelated tags are excluded, while selected config and layer bytes are preserved. zstd-compressed and non-distributable layers are not supported. Launching a session never pulls or reads any source: it uses only the already-imported image.
+Importing enforces safety limits: a total archive of up to 32 GiB, up to 8 GiB per layer after decompression, up to 256 layers, and at least 1 GiB of free disk space. Archive metadata and the selected image's layers are validated before import: digests must match, the image must be for the host's Linux platform, and selected images with path traversal, writes through symlinks, device nodes, unsafe hard links, or malformed whiteouts are rejected (`image archive … rejected: <reason>`). Only the selected image and requested tag reach the runtime importer; unselected images and unrelated tags are excluded, while selected config and layer bytes are preserved. Plain and gzip-wrapped tars are supported; zstd-, xz-, or bzip2-wrapped archives, zstd-compressed layers, and non-distributable/foreign layers are refused with a reason naming the problem and, for zstd, the gzip re-export that works instead. Launching a session never pulls or reads any source: it uses only the already-imported image.
 
 ### Configuration
 
@@ -198,14 +199,52 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 | `builtin.imageSource` | unset | Default image source (see above). |
 | `builtin.images` | `{}` | Per-image-tag sources. |
 | `builtin.registries` | `{}` | Per-registry settings. |
+| `builtin.network` | `{"mode":"public"}` | Guest network policy — see [Network](#network) below. |
 
-`vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The three object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin`, and an invalid one is an error naming the bad key.
+`vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The four object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin`, and an invalid one is an error naming the bad key.
+
+### Network
+
+Every session VM gets its own network stack running in the host-side worker process. Allowed HTTPS passes host-side stack tests with end-to-end TLS. Hostname allow rules are limited to TCP; UDP/QUIC is denied because the stack cannot inspect its hostname boundary for those protocols. Enforcement inside real guests remains unverified. Configure it under `builtin.network`, global and/or per repo:
+
+```json
+{
+  "builtin": {
+    "network": {
+      "mode": "allowlist",
+      "allow": ["api.anthropic.com", "*.github.com"],
+      "hostPorts": [8765],
+      "nameservers": ["1.1.1.1", "[2606:4700::1111]:53"],
+      "trustHostCas": false
+    }
+  }
+}
+```
+
+| `mode` | Guest network device | Reachable |
+|---|---|---|
+| `public` (default) | yes | the public internet, plus any authorized `hostPorts` |
+| `allowlist` | yes | only the names in `allow` (exact or `*.suffix`), plus any authorized `hostPorts` |
+| `none` | no | nothing — a cached, already-imported image still runs offline |
+
+In every mode: inbound connections are refused (awman never publishes a guest port); private/LAN (RFC1918/ULA/CGN), loopback, link-local and cloud-metadata (`169.254.169.254`) destinations are refused; TLS is never intercepted; and the host's own `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` are **not** applied to guest traffic — a proxy the guest is configured to use is just another destination, subject to the same policy.
+
+**DNS and HTTPS.** The host-side stack intercepts DNS. For HTTPS authorized by a hostname rule, the visible TLS ClientHello server name (SNI) must be allowed and that exact name must have a DNS binding to the destination IP. An allowed sibling name or a shared IP alone does not authorize the connection. Missing or unlisted visible SNI is refused. The connection remains encrypted end to end: awman cannot inspect encrypted HTTP `Host`/`:authority`, domain fronting behind an allowed server, or the hidden inner name of Encrypted ClientHello (ECH). An allowed ECH outer name proves only that outer name. Use services you trust within this boundary; it is not a guarantee about every logical destination carried inside an allowed encrypted connection. A DNS answer does not authorize UDP/QUIC. Upstream resolvers default to the host's own resolver configuration, or set `nameservers` (global only; IP or `IP:PORT`, never a host name, so resolving a resolver never depends on one). Native guest tests remain required.
+
+**Host-local services**, such as an MCP server listening on your host's own loopback address, are reached through `hostPorts`, not through the guest's own `127.0.0.1` — inside the VM, `127.0.0.1` / `::1` / `localhost` is always the guest's own loopback, never the host's. List the TCP port in `hostPorts`; the guest then dials `host.microsandbox.internal:<port>` and the host-side stack connects that to the host's own loopback on the same port. Every other host port stays refused (including port `53`, which is reserved for guest DNS).
+
+**Layering.** The global `builtin.network` block is a ceiling a repo config cannot raise, since repo config is part of the checkout and may be untrusted: a repo may pick a stricter `mode`, a subset of the global `allow` list, and a subset of the global `hostPorts`, but never something wider — asking for more is a config error, not a silent downgrade. `nameservers` and `trustHostCas` are read from the global config only.
+
+**CAs.** By default the guest trusts only the image's own CA bundle. Set `trustHostCas: true` (global only) to also install the host's trusted root CAs in the guest at boot — useful behind a corporate TLS-inspecting proxy. awman never installs an interception CA of its own.
+
+> Hermetic tests validate configuration and serialization, not the enforcement promises above. The known allowlist defects remain unresolved, and guest enforcement, host-port access, and isolation between concurrently running VMs remain unverified on KVM and Apple Silicon.
 
 ### Session lifecycle
 
 - Each agent session, and each workflow setup/teardown environment, is its own microVM, removed when the session ends.
 - Ctrl-C sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed.
-- **The awman process that launched a session must keep running.** If it exits, the session's VM stops. Detaching and reattaching works while that process is alive; reattaching after it has exited is not supported. Checkpoint restore is not supported.
+- **The awman process that launched a session must keep running.** If it exits, the session's VM stops. Detaching and reattaching works while that process is alive: another client, including a newer compatible awman process, can attach to the same live session and see the same output; detaching only ends that one client's connection, and the guest keeps running. Reattaching after the launching process has exited is not supported. Checkpoint restore is not supported.
+- **A client is never left believing it saw the whole session when it didn't.** If a client reading attached output falls too far behind the live stream, awman ends that connection with an explicit failure — never a later clean exit that would make missed output look like it was delivered. Reconnect (or restart the agent) after seeing this. An attach starts at the current output; it does not replay what was written before the connection was accepted.
 - `awman status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.
 - If you replace the awman binary while a session is running, new operations report `awman was replaced on disk while this session was running; restart awman to use the builtin runtime`. An awman with a different internal protocol version refuses to adopt sandboxes created by another version (`builtin runtime worker protocol mismatch … stop running agents started by an older awman and retry`): stop those agents with the awman that started them first.
 
@@ -218,7 +257,8 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 | Resource limit enforcement | Container-level limits | VM allocation; enforcement is not yet verified in a real guest |
 | `--allow-docker` | Mounts the host Docker socket (Docker only) | **Rejected.** No socket is ever mounted and there is no host daemon bridge |
 | Reattach after the launching awman exits | Docker: yes. Apple: no | No |
-| Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; services on the host's loopback are not reachable that way. Guest networking is not yet verified |
+| Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; a host loopback service is reachable only if its port is listed in `builtin.network.hostPorts` (see [Network](#network)). Enforcement on real guest hardware is not yet verified |
+| Egress control | None built in (Docker); per-container network (Apple) | `builtin.network.mode`: `public` (default), `allowlist`, or `none`. HTTPS checks visible SNI plus its exact DNS/IP binding; encrypted HTTP authority and ECH inner names are not inspected. Hostname rules deny UDP/QUIC; native enforcement remains unverified |
 | Tool allow/deny lists for an agent with no matching flag | See [Agent Sessions](03-agent-sessions.md) | Rejected with an error instead of being silently discarded |
 | Named image `USER` (like `awman` in the templates) | Handled by the container engine | Resolved to a numeric id from the imported image's `/etc/passwd` and `/etc/group`; an unresolvable user is refused. Reading a staged credential file as that user inside a guest is not yet verified |
 | Image `HOME` | From the image | From the imported image; a missing or non-absolute `HOME` is refused |
@@ -243,6 +283,9 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 | `not enough disk space at <path> …` | Free space on the state directory's filesystem. |
 | `the builtin runtime cannot honour <request>: …` | Fractional CPU, out-of-range memory, or an unsupported agent option. |
 | `Docker socket bridge is not supported on the builtin runtime` | You passed `--allow-docker`. Drop the flag; it is not available under `builtin`. |
+| `cannot share <path> into the guest at <path>: only regular files and directories can be mounted; sockets such as the Docker socket are not bridged` | An overlay or mount points at a Unix socket, FIFO, or device node. Only regular files and directories can be shared into the VM. |
+| `builtin exec output lagged; reconnect or restart the agent` | Your attached connection fell too far behind the live output and was closed rather than risk showing a false clean exit. Reconnect, or restart the agent if it isn't responding. |
+| `cannot attach to <name>: no live attach endpoint (...); the launching awman must remain alive, and reattachment after its exit is unsupported` | The awman process that started this session has exited. Start a new session; reattaching to one whose launcher is gone is not supported. |
 | `builtin runtime is busy: another awman process held …` | Retry shortly; another awman is importing an image or updating its catalog. |
 
 See [Cleaning Up](13-cleaning-up.md#builtin-runtime-state) for reclaiming disk space.

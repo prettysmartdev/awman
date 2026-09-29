@@ -1,0 +1,2 @@
+BLOCKED: writable /dev/kvm is required
+ls: cannot access '/dev/kvm': No such file or directory

@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running tests/builtin_runtime/main.rs (target/debug/deps/builtin_runtime-8b1a605f9619ce6f)
+
+running 1 test
+test sqlite::builtin_sqlite_exactly_one_native_binding_in_the_dependency_graph ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.03s
+

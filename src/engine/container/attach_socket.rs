@@ -33,6 +33,7 @@
 //! Symmetric length-prefixed frames: `tag: u8, len: u32 LE, payload: [u8; len]`.
 //!
 //! - server → client: [`OUTPUT_FRAME`] — raw PTY output bytes.
+//!   [`LAGGED_FRAME`] — this client's output is incomplete; detach with error.
 //! - client → server: [`STDIN_FRAME`] — raw stdin bytes for the agent;
 //!   [`RESIZE_FRAME`] — 4-byte payload `cols: u16 LE, rows: u16 LE`.
 
@@ -48,6 +49,9 @@ pub(crate) const OUTPUT_FRAME: u8 = 0;
 pub(crate) const STDIN_FRAME: u8 = 1;
 /// Client → server: `cols: u16 LE, rows: u16 LE`.
 pub(crate) const RESIZE_FRAME: u8 = 2;
+/// Server → client: the output channel overran this client. No later output
+/// or successful exit may be presented as a complete stream.
+pub(crate) const LAGGED_FRAME: u8 = 3;
 /// Upper bound on a single frame's payload; anything larger is a protocol
 /// violation and closes the connection.
 const MAX_FRAME_LEN: u32 = 1 << 20;
@@ -95,8 +99,8 @@ pub(crate) fn attach_socket_path(container_name: &str) -> Option<PathBuf> {
 
 /// What the socket server needs from the owning PTY bridge.
 pub(crate) struct AttachHooks {
-    /// Live PTY output. Each client subscribes; a lagging client drops chunks
-    /// rather than backpressuring the bridge.
+    /// Live PTY output. Each client subscribes; a lagging client is told that
+    /// its stream is incomplete and disconnected.
     pub output: Arc<tokio::sync::broadcast::Sender<Vec<u8>>>,
     /// The bridge's stdin injector — client keystrokes merge with whatever
     /// the launching frontend itself sends, exactly as concurrent
@@ -249,7 +253,10 @@ mod unix_impl {
                         break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = write_half.write_all(&encode_frame(LAGGED_FRAME, &[])).await;
+                    break;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -385,19 +392,30 @@ mod unix_impl {
             let activity: crate::engine::container::io_bridge::SharedActivity =
                 Arc::new(Mutex::new(None));
             let first_byte = Arc::new(AtomicBool::new(false));
-            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<(), EngineError>>();
+            let cancelled = Arc::new(AtomicBool::new(false));
             let stdout_tx = io.stdout;
             let tail = Arc::clone(&output_tail);
             let act = Arc::clone(&activity);
             let fb = Arc::clone(&first_byte);
             tokio::spawn(async move {
+                let mut outcome = Err(EngineError::Container(
+                    "attach endpoint closed without an exit status; reconnect if the launcher is still alive".into(),
+                ));
                 loop {
                     let mut header = [0u8; 5];
                     if read_half.read_exact(&mut header).await.is_err() {
                         break;
                     }
                     let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+                    if header[0] == LAGGED_FRAME && len == 0 {
+                        outcome = Err(EngineError::Container(
+                            "attach output lagged; reconnect to the live agent".into(),
+                        ));
+                        break;
+                    }
                     if header[0] != OUTPUT_FRAME || len > MAX_FRAME_LEN {
+                        outcome = Err(EngineError::Container("invalid attach output frame".into()));
                         break;
                     }
                     let mut payload = vec![0u8; len as usize];
@@ -411,7 +429,7 @@ mod unix_impl {
                     tail.push_bytes(&payload);
                     let _ = stdout_tx.send(payload);
                 }
-                let _ = exit_tx.send(());
+                let _ = exit_tx.send(outcome);
             });
 
             let stuck_tx = crate::engine::container::io_bridge::spawn_stuck_detector(
@@ -429,6 +447,7 @@ mod unix_impl {
                 shutdown_for_handle,
                 stdin_injector,
                 started_at,
+                cancelled,
             };
             Ok(AgentExecution::new(
                 handle,
@@ -453,18 +472,24 @@ mod unix_impl {
     /// local socket down — never the target container, which belongs to the
     /// serving process.
     struct SocketAttachExecution {
-        exit_rx: std::sync::mpsc::Receiver<()>,
+        exit_rx: std::sync::mpsc::Receiver<Result<(), EngineError>>,
         shutdown: std::os::unix::net::UnixStream,
         shutdown_for_handle: std::os::unix::net::UnixStream,
         stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         started_at: chrono::DateTime<chrono::Utc>,
+        cancelled: Arc<AtomicBool>,
     }
 
     impl ExecutionBackend for SocketAttachExecution {
         fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
             // Resolves when the reader task ends: server gone (container exit,
             // launcher teardown) or this session's own shutdown.
-            let _ = self.exit_rx.recv();
+            let outcome = self.exit_rx.recv().map_err(|_| {
+                EngineError::Container("attach reader stopped without a result".into())
+            })?;
+            if !self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                outcome?;
+            }
             Ok(AgentExitInfo {
                 exit_code: 0,
                 signal: None,
@@ -481,6 +506,8 @@ mod unix_impl {
         }
 
         fn cancel(&self) -> Result<(), EngineError> {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
             let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
             Ok(())
         }
@@ -490,7 +517,9 @@ mod unix_impl {
                 Ok(stream) => stream,
                 Err(_) => return None,
             };
+            let cancelled = Arc::clone(&self.cancelled);
             Some(CancelHandle::new(move || {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 Ok(())
             }))
@@ -745,11 +774,33 @@ mod tests {
         // and removes the socket file.
         let path = server.path.clone();
         drop(server.guard);
-        tokio::time::timeout(Duration::from_secs(5), execution2.wait())
+        let ended = tokio::time::timeout(Duration::from_secs(5), execution2.wait())
             .await
             .expect("wait must resolve when the server goes away")
-            .expect("wait result");
+            .unwrap_err();
+        assert!(ended.to_string().contains("without an exit status"));
         wait_until(|| !path.exists(), "socket file removal").await;
+    }
+
+    #[tokio::test]
+    async fn lagging_socket_attach_reports_incomplete_output() {
+        let server = start_server();
+        let captured = Captured::default();
+        let mut execution = instance(&server.path)
+            .run_with_frontend(Box::new(TestFrontend {
+                captured: captured.clone(),
+            }))
+            .unwrap();
+        wait_until(|| server.output.receiver_count() > 0, "attach subscription").await;
+        // This test uses the current-thread executor. Sending a full ring
+        // without awaiting forces the server's receiver to overrun.
+        for byte in 0..256 {
+            server.output.send(vec![byte as u8]).unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), execution.wait())
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("lagged"));
     }
 
     /// No serving process → a clear, attributable error instead of a doomed

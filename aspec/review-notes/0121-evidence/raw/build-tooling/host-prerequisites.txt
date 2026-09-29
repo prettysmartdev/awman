@@ -1,0 +1,8 @@
+Linux awman-7042-412910000 6.18.15 #1 SMP Tue Mar 17 01:36:53 UTC 2026 aarch64 GNU/Linux
+arch=aarch64
+kvm=missing-or-inaccessible
+strace=unavailable
+codesign=unavailable
+notarytool=unavailable
+fs_usage=unavailable
+dtruss=unavailable

@@ -1,0 +1,521 @@
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:196:67
+    |
+196 |     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
+    |                                                                   ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated tuple variant `time::format_description::Component::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:199:52
+    |
+199 |     const YEAR: BorrowedFormatItem<'_> = Component(Year({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:200:35
+    |
+200 |         let mut value = modifier::Year::default();
+    |                                   ^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::YearRepr::Full`: used only in the deprecated `Year` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:42
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |                                          ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:208:53
+    |
+208 |     const MONTH: BorrowedFormatItem<'_> = Component(Month({
+    |                                                     ^^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:209:35
+    |
+209 |         let mut value = modifier::Month::default();
+    |                                   ^^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::MonthRepr::Numerical`: used only in the deprecated `Month` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:43
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |                                           ^^^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:222:52
+    |
+222 |     const HOUR: BorrowedFormatItem<'_> = Component(Hour({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:223:35
+    |
+223 |         let mut value = modifier::Hour::default();
+    |                                   ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:263:13
+    |
+263 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:265:13
+    |
+265 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:267:23
+    |
+267 |             Optional(&Literal(b" ")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:268:23
+    |
+268 |             Optional(&Literal(b"T")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:270:13
+    |
+270 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:272:23
+    |
+272 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:274:23
+    |
+274 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:277:23
+    |
+277 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:285:13
+    |
+285 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:287:13
+    |
+287 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:289:13
+    |
+289 |             Literal(b" "),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:291:13
+    |
+291 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:293:23
+    |
+293 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:295:23
+    |
+295 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:297:23
+    |
+297 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:304:13
+    |
+304 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:306:13
+    |
+306 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:308:13
+    |
+308 |             Literal(b"T"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:310:13
+    |
+310 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:312:23
+    |
+312 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:314:23
+    |
+314 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:316:23
+    |
+316 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::padding`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:201:9
+    |
+201 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::repr`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:9
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::iso_week_based`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:203:9
+    |
+203 |         value.iso_week_based = false;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::sign_is_mandatory`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:204:9
+    |
+204 |         value.sign_is_mandatory = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::padding`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:210:9
+    |
+210 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::repr`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:9
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::case_sensitive`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:212:9
+    |
+212 |         value.case_sensitive = true;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::padding`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:224:9
+    |
+224 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::is_12_hour_clock`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:225:9
+    |
+225 |         value.is_12_hour_clock = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+
+running 3230 tests
+....................................................................................... 87/3230
+....................................................................................... 174/3230
+....................................................................................... 261/3230
+....................................................................................... 348/3230
+....................................................................................... 435/3230
+.........................i............................................................. 522/3230
+....................................................................................... 609/3230
+....................................................................................... 696/3230
+....................................................................................... 783/3230
+....................................................................................... 870/3230
+....................................................................................... 957/3230
+....................................................................................... 1044/3230
+....................................................................................... 1131/3230
+....................................................................................... 1218/3230
+....................................................................................... 1305/3230
+....................................................................................... 1392/3230
+....................................................................................... 1479/3230
+....................................................................................... 1566/3230
+....................................................................................... 1653/3230
+....................................................................................... 1740/3230
+....................................................................................... 1827/3230
+....................................................................................... 1914/3230
+....................................................................................... 2001/3230
+....................................................................................... 2088/3230
+..............................................Initialized empty Git repository in /var/tmp/test-fixtures/test-run.qavK46/.tmpPGAXZt/.git/
+[main (root-commit) caac133] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+..Initialized empty Git repository in /var/tmp/test-fixtures/test-run.qavK46/.tmpKc0jIU/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.qavK46/.tmpzSu24l/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.qavK46/.tmpg8r8nn/.git/
+[main (root-commit) caac133] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+[main (root-commit) caac133] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+[main (root-commit) caac133] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+....................................... 2175/3230
+....................................................................................... 2262/3230
+....................................................................................... 2349/3230
+....[1;22r[24;1H7[24;1H[2K[7m [2 agents running | showing: a | Ctrl-S: switch] [0m8..awman warning: .2 agents are launching in parallel, but output merging is not supported in non-interactive mode; step output will interleave without chrome.
+....[r[24;1H[2K........................................................................... 2436/3230
+...................................................awman: .immediate
+.awman: immediate again
+awman: .queued message
+.awman warning: .another
+.awman: .immediate
+.awman: .msg
+........................... 2523/3230
+....................................................................................... 2610/3230
+....................................................................................... 2697/3230
+....................................................................................... 2784/3230
+....................................................................................... 2871/3230
+....................................................................................... 2958/3230
+....................................................................................... 3045/3230
+....................................................................................... 3132/3230
+....................................................................................... 3219/3230
+...........
+test result: ok. 3229 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.36s
+
+
+running 14 tests
+..............
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 77 tests
+.............................................................................
+test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+
+running 113 tests
+....................................................................................... 87/113
+..........................
+test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 36 tests
+........... 11/36
+docker_store::docker_tls_defaults_come_from_the_injected_environment_not_the_real_home --- FAILED
+. 13/36
+docker_store::store_docker_tls_client_certificate_material_is_read_and_validated --- FAILED
+docker_store::store_docker_tls_roundtrip_with_a_private_ca --- FAILED
+docker_store::store_docker_tls_verify_false_accepts_an_unknown_certificate --- FAILED
+.......... 26/36
+registry_store::registry_untrusted_realm_and_redirect_redact_sentinels --- FAILED
+. 28/36
+registry_store::store_registry_anonymous_access_needs_no_credentials_and_helpers_never_run --- FAILED
+registry_store::store_registry_ca_and_same_origin_token_realm_roundtrip --- FAILED
+. 31/36
+registry_store::store_registry_proxy_is_used_and_no_proxy_bypasses_it --- FAILED
+registry_store::store_registry_wrong_ca_is_final_and_leaks_nothing --- FAILED
+registry_store::store_registry_wrong_password_is_an_auth_error_without_the_secret --- FAILED
+..
+failures:
+
+---- docker_store::docker_tls_defaults_come_from_the_injected_environment_not_the_real_home stdout ----
+
+thread 'tokio-rt-worker' (39780) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tokio-rt-worker' (39778) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(4), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'docker_store::docker_tls_defaults_come_from_the_injected_environment_not_the_real_home' (39777) panicked at tests/oci_import/docker_store.rs:708:10:
+called `Result::unwrap()` on an `Err` value: Network("Docker Engine at tcp+tls://127.0.0.1:43249 is not reachable: error sending request: client error (Connect): Connection reset by peer (os error 104)")
+
+---- docker_store::store_docker_tls_client_certificate_material_is_read_and_validated stdout ----
+
+thread 'tokio-rt-worker' (39818) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39817) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(54), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'docker_store::store_docker_tls_client_certificate_material_is_read_and_validated' (39811) panicked at tests/oci_import/docker_store.rs:631:10:
+called `Result::unwrap()` on an `Err` value: Network("Docker Engine at tcp+tls://127.0.0.1:38013 is not reachable: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111)")
+
+---- docker_store::store_docker_tls_roundtrip_with_a_private_ca stdout ----
+
+thread 'tokio-rt-worker' (39824) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39823) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(59), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'docker_store::store_docker_tls_roundtrip_with_a_private_ca' (39821) panicked at tests/oci_import/docker_store.rs:506:10:
+called `Result::unwrap()` on an `Err` value: Network("Docker Engine at tcp+tls://127.0.0.1:34913 is not reachable: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111)")
+
+---- docker_store::store_docker_tls_verify_false_accepts_an_unknown_certificate stdout ----
+
+thread 'tokio-rt-worker' (39832) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39831) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(71), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'docker_store::store_docker_tls_verify_false_accepts_an_unknown_certificate' (39827) panicked at tests/oci_import/docker_store.rs:604:10:
+called `Result::unwrap()` on an `Err` value: Network("Docker Engine at tcp+tls://127.0.0.1:38415 is not reachable: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111)")
+
+---- registry_store::registry_untrusted_realm_and_redirect_redact_sentinels stdout ----
+
+thread 'tokio-rt-worker' (39895) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39894) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(140), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'tokio-rt-worker' (39898) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39897) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(144), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'registry_store::registry_untrusted_realm_and_redirect_redact_sentinels' (39892) panicked at tests/oci_import/registry_store.rs:198:5:
+Network("registry 127.0.0.1:41493: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111) (after 3 of 3 attempts against the same source)")
+
+---- registry_store::store_registry_anonymous_access_needs_no_credentials_and_helpers_never_run stdout ----
+
+thread 'tokio-rt-worker' (39920) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39919) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(167), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'registry_store::store_registry_anonymous_access_needs_no_credentials_and_helpers_never_run' (39917) panicked at tests/oci_import/registry_store.rs:255:10:
+called `Result::unwrap()` on an `Err` value: Network("registry 127.0.0.1:36111: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111) (after 3 of 3 attempts against the same source)")
+
+---- registry_store::store_registry_ca_and_same_origin_token_realm_roundtrip stdout ----
+
+thread 'tokio-rt-worker' (39933) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39932) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(177), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'registry_store::store_registry_ca_and_same_origin_token_realm_roundtrip' (39925) panicked at tests/oci_import/registry_store.rs:107:10:
+called `Result::unwrap()` on an `Err` value: Network("registry 127.0.0.1:45855: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111) (after 3 of 3 attempts against the same source)")
+
+---- registry_store::store_registry_proxy_is_used_and_no_proxy_bypasses_it stdout ----
+
+thread 'tokio-rt-worker' (39940) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39941) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(183), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'registry_store::store_registry_proxy_is_used_and_no_proxy_bypasses_it' (39938) panicked at tests/oci_import/registry_store.rs:312:6:
+called `Result::unwrap()` on an `Err` value: Network("registry 127.0.0.1:43219: error sending request: client error (Connect): tunnel error: unsuccessful (after 3 of 3 attempts against the same source)")
+
+---- registry_store::store_registry_wrong_ca_is_final_and_leaks_nothing stdout ----
+
+thread 'tokio-rt-worker' (39956) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39954) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(201), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'registry_store::store_registry_wrong_ca_is_final_and_leaks_nothing' (39953) panicked at tests/oci_import/registry_store.rs:154:5:
+certificate failures are not retried: network error: registry 127.0.0.1:41657: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111) (after 3 of 3 attempts against the same source)
+
+---- registry_store::store_registry_wrong_password_is_an_auth_error_without_the_secret stdout ----
+
+thread 'tokio-rt-worker' (39965) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustls-0.23.45/src/crypto/mod.rs:249:14:
+
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+See the documentation of the CryptoProvider type for more information.
+            
+
+thread 'tokio-rt-worker' (39966) panicked at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-server-0.8.0/src/tls_rustls/mod.rs:216:14:
+called `Result::unwrap()` on an `Err` value: JoinError::Panic(Id(209), "\nCould not automatically determine the process-level CryptoProvider from Rustls crate features.\nCall CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.\nSee the documentation of the CryptoProvider type for more information.\n            ", ...)
+
+thread 'registry_store::store_registry_wrong_password_is_an_auth_error_without_the_secret' (39963) panicked at tests/oci_import/registry_store.rs:233:5:
+Network("registry 127.0.0.1:34633: error sending request: client error (Connect): tcp connect error: Connection refused (os error 111) (after 3 of 3 attempts against the same source)")
+
+
+failures:
+    docker_store::docker_tls_defaults_come_from_the_injected_environment_not_the_real_home
+    docker_store::store_docker_tls_client_certificate_material_is_read_and_validated
+    docker_store::store_docker_tls_roundtrip_with_a_private_ca
+    docker_store::store_docker_tls_verify_false_accepts_an_unknown_certificate
+    registry_store::registry_untrusted_realm_and_redirect_redact_sentinels
+    registry_store::store_registry_anonymous_access_needs_no_credentials_and_helpers_never_run
+    registry_store::store_registry_ca_and_same_origin_token_realm_roundtrip
+    registry_store::store_registry_proxy_is_used_and_no_proxy_bypasses_it
+    registry_store::store_registry_wrong_ca_is_final_and_leaks_nothing
+    registry_store::store_registry_wrong_password_is_an_auth_error_without_the_secret
+
+test result: FAILED. 26 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+
+error: test failed, to rerun pass `--test oci_import`
+make: *** [Makefile:62: test-builtin] Error 101

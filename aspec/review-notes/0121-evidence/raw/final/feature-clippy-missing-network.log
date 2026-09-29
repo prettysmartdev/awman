@@ -1,0 +1,472 @@
+ Downloading crates ...
+  Downloaded ahash v0.8.12
+  Downloaded ciborium-io v0.2.2
+  Downloaded async-stream-impl v0.3.6
+  Downloaded const-random v0.1.18
+  Downloaded crunchy v0.2.4
+  Downloaded microsandbox-agent-client v0.7.2
+  Downloaded aliasable v0.1.3
+  Downloaded inotify-sys v0.1.8
+  Downloaded crc-catalog v2.5.0
+  Downloaded cmov v0.5.4
+  Downloaded msb_krun_smbios v0.1.39
+  Downloaded managed v0.8.0
+  Downloaded konst_macro_rules v0.2.19
+  Downloaded getset v0.1.7
+  Downloaded maybe-owned v0.3.4
+  Downloaded ambient-authority v0.0.2
+  Downloaded crc v3.4.0
+  Downloaded ciborium-ll v0.2.2
+  Downloaded darling_macro v0.20.11
+  Downloaded capng v0.2.3
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded microsandbox-types-macros v0.7.2
+  Downloaded hash32 v0.3.1
+  Downloaded msb_krun_kernel v0.1.39
+  Downloaded defmt-parser v1.0.0
+  Downloaded md-5 v0.11.0
+  Downloaded bincode_derive v2.0.1
+  Downloaded compression-core v0.4.33
+  Downloaded async-stream v0.3.6
+  Downloaded docker_credential v1.4.0
+  Downloaded const-random-macro v0.1.16
+  Downloaded heck v0.4.1
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded arraydeque v0.5.1
+  Downloaded darling_core v0.20.11
+  Downloaded msb_krun_polly v0.1.39
+  Downloaded olpc-cjson v0.1.4
+  Downloaded io-lifetimes v3.0.1
+  Downloaded unit-prefix v0.5.2
+  Downloaded untrusted v0.7.1
+  Downloaded unicode-xid v0.2.6
+  Downloaded sea-bae v0.2.2
+  Downloaded sea-orm-arrow v2.0.0-rc.4
+  Downloaded dotenvy v0.15.7
+  Downloaded crossbeam-queue v0.3.14
+  Downloaded defmt-macros v1.1.1
+  Downloaded sea-schema-derive v0.3.0
+  Downloaded ouroboros v0.18.5
+  Downloaded atoi v2.0.0
+  Downloaded hashlink v0.11.1
+  Downloaded compression-codecs v0.4.43
+  Downloaded caps v0.5.6
+  Downloaded fs-set-times v0.20.3
+  Downloaded inotify v0.11.5
+  Downloaded lexical-core v1.0.6
+  Downloaded encoding_rs_io v0.1.8
+  Downloaded proc-macro-crate v3.5.0
+  Downloaded derive_builder_core v0.20.2
+  Downloaded httlib-huffman v0.3.4
+  Downloaded glob v0.3.4
+  Downloaded crossbeam-deque v0.8.8
+  Downloaded signature v2.2.0
+  Downloaded rand_chacha v0.3.1
+  Downloaded byteorder v1.5.0
+  Downloaded hmac v0.13.0
+  Downloaded http-auth v0.1.10
+  Downloaded darling v0.20.11
+  Downloaded event-listener v5.4.2
+  Downloaded arrow-data v58.4.0
+  Downloaded defmt v1.1.1
+  Downloaded crossbeam-epoch v0.9.21
+  Downloaded borsh-derive v1.8.1
+  Downloaded parking v2.2.1
+  Downloaded crossbeam-utils v0.8.23
+  Downloaded console v0.16.6
+  Downloaded page_size v0.6.0
+  Downloaded cap-std v4.0.3
+  Downloaded constant_time_eq v0.4.2
+  Downloaded rtoolbox v0.0.6
+  Downloaded proc-macro2-diagnostics v0.10.1
+  Downloaded arrow-string v58.4.0
+  Downloaded ciborium v0.2.2
+  Downloaded io-extras v0.19.0
+  Downloaded ctutils v0.4.2
+  Downloaded ipnetwork v0.21.1
+  Downloaded io-lifetimes v2.0.4
+  Downloaded unicode-properties v0.1.4
+  Downloaded derive_builder v0.20.2
+  Downloaded derive-where v1.7.0
+  Downloaded astral-tokio-tar v0.6.4
+  Downloaded zstd-safe v8.0.0
+  Downloaded cap-primitives v4.0.3
+  Downloaded virtue v0.0.18
+  Downloaded strum v0.27.2
+  Downloaded annotate-snippets v0.12.16
+  Downloaded arrow-row v58.4.0
+  Downloaded clap_complete v4.6.11
+  Downloaded arrow-arith v58.4.0
+  Downloaded jsonwebtoken v10.4.0
+  Downloaded same-file v1.0.6
+  Downloaded whoami v2.1.3
+  Downloaded arrow-schema v58.4.0
+  Downloaded zstd v0.14.0
+  Downloaded vm-fdt v0.3.0
+  Downloaded vmm-sys-util v0.15.0
+  Downloaded indicatif v0.18.6
+  Downloaded bincode v2.0.1
+  Downloaded flume v0.12.0
+  Downloaded sha1 v0.11.0
+  Downloaded konst v0.2.20
+  Downloaded serde_bytes v0.11.19
+  Downloaded futures-intrusive v0.5.0
+  Downloaded unty v0.0.4
+  Downloaded multiversion_no_op v1.0.0
+  Downloaded arrow-ord v58.4.0
+  Downloaded borsh v1.8.1
+  Downloaded crossbeam-channel v0.5.17
+  Downloaded const_format v0.2.36
+  Downloaded msb_krun_utils v0.1.39
+  Downloaded yansi v1.0.1
+  Downloaded kvm-ioctls v0.25.0
+  Downloaded microsandbox-protocol-client v0.7.2
+  Downloaded arrow v58.4.0
+  Downloaded notify-types v2.1.0
+  Downloaded async-compression v0.4.48
+  Downloaded arrow-select v58.4.0
+  Downloaded msb_krun_arch v0.1.39
+  Downloaded lexical-util v1.0.7
+  Downloaded kvm-bindings v0.14.1
+  Downloaded arrow-buffer v58.4.0
+  Downloaded bigdecimal v0.4.10
+  Downloaded heapless v0.9.3
+  Downloaded num-complex v0.4.6
+  Downloaded hickory-net v0.26.3
+  Downloaded arrow-cast v58.4.0
+  Downloaded microsandbox-vsock v0.7.2
+  Downloaded zeroize_derive v1.5.0
+  Downloaded msb_krun_arch_gen v0.1.39
+  Downloaded hkdf v0.13.0
+  Downloaded blake3 v1.8.7
+  Downloaded reflink-copy v0.1.30
+  Downloaded rand_chacha v0.9.0
+  Downloaded unicase v2.9.0
+  Downloaded stringprep v0.1.5
+  Downloaded lexical-parse-float v1.0.6
+  Downloaded granit-parser v1.3.0
+  Downloaded simdutf8 v0.1.5
+  Downloaded rand_core v0.9.5
+  Downloaded tokio-socks v0.5.3
+  Downloaded tiny-keccak v2.0.2
+  Downloaded rpassword v7.5.4
+  Downloaded resolv-conf v0.7.6
+  Downloaded rustix-linux-procfs v0.1.1
+  Downloaded pem v3.0.6
+  Downloaded virtio-bindings v0.2.7
+  Downloaded arrow-array v58.4.0
+  Downloaded sqlx-macros v0.9.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded pluralizer v0.5.0
+  Downloaded ouroboros_macro v0.18.5
+  Downloaded hickory-proto v0.26.3
+  Downloaded sea-query-derive v1.0.0
+  Downloaded sea-query-sqlx v0.9.1
+  Downloaded memmap2 v0.9.11
+  Downloaded microsandbox-db v0.7.2
+  Downloaded lexical-parse-integer v1.0.6
+  Downloaded microsandbox-utils v0.7.2
+  Downloaded encoding_rs v0.8.42
+  Downloaded notify v8.2.0
+  Downloaded microsandbox-control-client v0.7.2
+  Downloaded libloading v0.8.9
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded strum_macros v0.27.2
+  Downloaded sea-orm-migration v2.0.3
+  Downloaded spin v0.9.9
+  Downloaded microsandbox-migration v0.7.2
+  Downloaded microsandbox-metrics v0.7.2
+  Downloaded walkdir v2.5.0
+  Downloaded lexical-write-integer v1.0.6
+  Downloaded pgvector v0.4.2
+  Downloaded sea-orm-cli v2.0.3
+  Downloaded sqlx-macros-core v0.9.0
+  Downloaded microsandbox-protocol v0.7.2
+  Downloaded rayon-core v1.13.0
+  Downloaded unicode-bidi v0.3.18
+  Downloaded sqlx-mysql v0.9.0
+  Downloaded sea-orm-macros v2.0.3
+  Downloaded toml_edit v0.25.15+spec-1.1.0
+  Downloaded microsandbox-types v0.7.2
+  Downloaded oci-spec v0.9.0
+  Downloaded oci-spec v0.10.0
+  Downloaded msb-vm-memory v0.18.0-msb.2
+  Downloaded lexical-write-float v1.0.6
+  Downloaded rand v0.9.5
+  Downloaded typed-path v0.12.3
+  Downloaded msb-imago v0.1.7
+  Downloaded unicode-normalization v0.1.25
+  Downloaded sqlx-postgres v0.9.0
+  Downloaded sqlx-core v0.9.0
+  Downloaded microsandbox-image v0.7.2
+  Downloaded rayon v1.12.0
+  Downloaded rust_decimal v1.43.0
+  Downloaded httlib-hpack v0.1.3
+  Downloaded webpki-roots v1.0.9
+  Downloaded sqlx v0.9.0
+  Downloaded microsandbox-cli v0.7.2
+  Downloaded microsandbox-network v0.7.2
+  Downloaded sea-query v1.0.2
+  Downloaded nix v0.30.1
+  Downloaded microsandbox-runtime v0.7.2
+  Downloaded smoltcp v0.14.0
+  Downloaded object v0.37.3
+  Downloaded serde-saphyr v1.3.0
+  Downloaded msb_krun_devices v0.1.39
+  Downloaded msb_krun_vmm v0.1.39
+  Downloaded oci-client v0.17.0
+  Downloaded sea-schema v0.18.1
+  Downloaded sea-orm v2.0.3
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:196:67
+    |
+196 |     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
+    |                                                                   ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated tuple variant `time::format_description::Component::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:199:52
+    |
+199 |     const YEAR: BorrowedFormatItem<'_> = Component(Year({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:200:35
+    |
+200 |         let mut value = modifier::Year::default();
+    |                                   ^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::YearRepr::Full`: used only in the deprecated `Year` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:42
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |                                          ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:208:53
+    |
+208 |     const MONTH: BorrowedFormatItem<'_> = Component(Month({
+    |                                                     ^^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:209:35
+    |
+209 |         let mut value = modifier::Month::default();
+    |                                   ^^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::MonthRepr::Numerical`: used only in the deprecated `Month` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:43
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |                                           ^^^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:222:52
+    |
+222 |     const HOUR: BorrowedFormatItem<'_> = Component(Hour({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:223:35
+    |
+223 |         let mut value = modifier::Hour::default();
+    |                                   ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:263:13
+    |
+263 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:265:13
+    |
+265 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:267:23
+    |
+267 |             Optional(&Literal(b" ")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:268:23
+    |
+268 |             Optional(&Literal(b"T")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:270:13
+    |
+270 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:272:23
+    |
+272 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:274:23
+    |
+274 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:277:23
+    |
+277 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:285:13
+    |
+285 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:287:13
+    |
+287 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:289:13
+    |
+289 |             Literal(b" "),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:291:13
+    |
+291 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:293:23
+    |
+293 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:295:23
+    |
+295 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:297:23
+    |
+297 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:304:13
+    |
+304 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:306:13
+    |
+306 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:308:13
+    |
+308 |             Literal(b"T"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:310:13
+    |
+310 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:312:23
+    |
+312 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:314:23
+    |
+314 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:316:23
+    |
+316 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::padding`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:201:9
+    |
+201 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::repr`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:9
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::iso_week_based`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:203:9
+    |
+203 |         value.iso_week_based = false;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::sign_is_mandatory`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:204:9
+    |
+204 |         value.sign_is_mandatory = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::padding`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:210:9
+    |
+210 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::repr`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:9
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::case_sensitive`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:212:9
+    |
+212 |         value.case_sensitive = true;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::padding`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:224:9
+    |
+224 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::is_12_hour_clock`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:225:9
+    |
+225 |         value.is_12_hour_clock = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `sqlx-sqlite` (lib) generated 40 warnings
+   Compiling awman v0.12.0 (/workspace)
+error[E0063]: missing field `network` in initializer of `awman::engine::container::runtime::BuiltinRuntimeSettings`
+   --> tests/builtin_runtime/hw_driver.rs:346:24
+    |
+346 |         let settings = BuiltinRuntimeSettings {
+    |                        ^^^^^^^^^^^^^^^^^^^^^^ missing `network`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `awman` (example "builtin_hw_driver") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

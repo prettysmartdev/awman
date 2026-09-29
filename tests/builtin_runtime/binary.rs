@@ -299,6 +299,41 @@ fn builtin_worker_rejects_bad_descriptor_shapes_without_echoing_argv() {
 }
 
 #[test]
+fn worker_unopened_fd_is_sanitized_error_not_abort() {
+    if skip_without_runtime("unopened inherited descriptors") {
+        return;
+    }
+    let scratch = Scratch::new();
+    let (output, elapsed) = run_limited(
+        {
+            let mut command = scratch.command(&awman(), Some(PATHS));
+            command.args([
+                "machine",
+                "--config-fd",
+                "96",
+                "--parent-watch-fd",
+                "97",
+                "--lifecycle-lock-fd",
+                "99",
+                "--sandbox-id",
+                "1",
+                "--name",
+                "SECRET-NAME",
+            ]);
+            command
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(output.status.code(), Some(64), "{}", text(&output));
+    assert!(elapsed < Duration::from_secs(5));
+    assert!(output.stdout.is_empty());
+    let diagnostic = text(&output);
+    assert!(diagnostic.contains("invalid private worker descriptors"));
+    assert!(!diagnostic.contains("SECRET-NAME"));
+    assert!(!diagnostic.contains("IO safety"));
+}
+
+#[test]
 fn builtin_worker_never_leaks_secrets_from_its_environment() {
     let scratch = Scratch::new();
     let (output, _) = run_limited(
@@ -324,6 +359,12 @@ fn builtin_ambient_msb_overrides_are_refused_at_the_worker_boundary() {
         "MSB_BACKEND",
         "MSB_CONFIG_PATH",
         "MSB_PROFILE",
+        "MSB_CACHE_DIR",
+        "MSB_SANDBOXES_DIR",
+        "MSB_VOLUMES_DIR",
+        "MSB_SNAPSHOTS_DIR",
+        "MSB_LOGS_DIR",
+        "MSB_SECRETS_DIR",
     ];
     for route in [
         vec![
@@ -604,6 +645,59 @@ fn builtin_binary_carries_the_msb_version_section_the_sdk_reads_without_executin
         bytes.windows(8).any(|w| w == b"__msbver"),
         "{} has no __TEXT,__msbver section",
         binary.display()
+    );
+    #[cfg(awman_builtin)]
+    assert_eq!(
+        microsandbox::setup::resolve_runtime_version(&binary)
+            .unwrap()
+            .map(|version| version.to_string())
+            .as_deref(),
+        Some("0.7.2"),
+        "SDK could not read the version section in {}",
+        binary.display()
+    );
+}
+
+#[test]
+fn builtin_final_artifact_retains_worker_provider() {
+    if !matches!(
+        std::env::var("AWMAN_TEST_DISTRIBUTION").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    ) {
+        eprintln!("SKIP: final optimized artifact requires AWMAN_TEST_DISTRIBUTION=1");
+        return;
+    }
+    let path = std::env::var_os("AWMAN_TEST_BUILTIN_ARTIFACT")
+        .map(PathBuf::from)
+        .expect("AWMAN_TEST_BUILTIN_ARTIFACT must name the final optimized/stripped artifact");
+    assert!(path.is_file(), "final artifact must exist");
+    let output = Command::new(&path)
+        .arg("__awman-builtin-info")
+        .env_clear()
+        .output()
+        .expect("run exact final artifact");
+    assert!(
+        output.status.success(),
+        "final artifact private info failed"
+    );
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["embedded_kernel"], true);
+    assert_eq!(info["host_helpers"], false);
+    let bytes = std::fs::read(&path).unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        elf_section(&bytes, ".msbver").as_deref(),
+        Some(&b"0.7.2"[..])
+    );
+    #[cfg(target_os = "macos")]
+    assert!(bytes.windows(8).any(|w| w == b"__msbver"));
+    #[cfg(awman_builtin)]
+    assert_eq!(
+        microsandbox::setup::resolve_runtime_version(&path)
+            .unwrap()
+            .map(|version| version.to_string())
+            .as_deref(),
+        Some("0.7.2")
     );
 }
 

@@ -154,6 +154,52 @@ silently switch sources or substitute Docker, Apple containers, SBX, an
 installed Microsandbox runtime, a host agent, or a downloaded/extracted helper
 when an operation is unavailable.
 
+Acquisition is bounded and idempotent: each attempt resolves the same source
+spec to the same endpoint/reference/credentials, stages into a fresh private
+directory, and either commits a fully validated archive or nothing. Only
+transport-shaped failures (connection reset, disconnect, truncation, stall,
+5xx) are retried, up to a fixed attempt cap and an overall deadline that also
+bounds each request; auth, config, certificate, digest/platform mismatch,
+rejected-archive and missing-image errors are final on first occurrence.
+Local copy, validation/decompression reads, cache hashing and lock waits now
+check the same cooperative deadline. A successful attempt is checked again
+before publication, and a reference is not renamed after an observed expiry.
+Ready passes a caller cancellation token to a blocking import worker; dropping
+the ready future also cancels that operation. HTTP connect, headers, token and
+body waits poll the same control through an asynchronous transport and drop
+the request on cancellation. Progress uses a bounded channel. Filesystem
+syscalls and the platform DNS resolver cannot be preempted; executor shutdown
+waits at most 100 ms for resolver work. Projection and import-lock waits check
+cancellation. Once the SDK mutating import begins, it completes the import and
+identity publication before reporting cancellation, avoiding orphaned writes
+from a dropped extraction future. Native cancellation/crash scenarios remain
+mandatory in WI 0123; these safe points do not prove a hard wall-clock bound
+for SDK extraction or filesystem calls.
+
+Archive leases cover cache lookup/publication, projection and SDK import.
+Per-image shared leases cover launch planning until the SDK creates its rootfs
+reference; imports and removals require an exclusive lease. The SDK catalog's
+transactional image-in-use check then protects referenced images. A competing
+mutation fails explicitly instead of changing a planned image underneath a
+consumer. Cross-process lock tests do not replace native multi-VM validation.
+
+### Builtin network policy
+
+The builtin backend's guest network is a data-owned, engine-compiled policy,
+not a host firewall or helper process. `BuiltinNetworkConfig`
+(`src/data/config/builtin_network.rs`) is the persisted global/repo config —
+mode (`none`/`allowlist`/`public`), allowed names, authorized host loopback
+ports, and global-only nameservers/CA trust — validated and layered so a
+repository config can only narrow the global ceiling, never widen it. The
+engine compiles that into a `NetworkPlan`
+(`src/engine/container/builtin/network.rs`), a pure function with no SDK or
+VM dependency, so its rules are covered by hermetic tests independent of
+hardware. The driver applies the compiled plan (never the SDK's own defaults)
+to every session VM — foreground and background alike — at the SDK/VMM
+boundary; enforcement happens in the SDK's user-space network stack inside the
+host-side worker, which is the only place a guest packet is ever seen or
+decided on.
+
 ## Key Components
 
 ### Session Management

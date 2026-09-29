@@ -1,0 +1,325 @@
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:196:67
+    |
+196 |     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
+    |                                                                   ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated tuple variant `time::format_description::Component::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:199:52
+    |
+199 |     const YEAR: BorrowedFormatItem<'_> = Component(Year({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:200:35
+    |
+200 |         let mut value = modifier::Year::default();
+    |                                   ^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::YearRepr::Full`: used only in the deprecated `Year` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:42
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |                                          ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:208:53
+    |
+208 |     const MONTH: BorrowedFormatItem<'_> = Component(Month({
+    |                                                     ^^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:209:35
+    |
+209 |         let mut value = modifier::Month::default();
+    |                                   ^^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::MonthRepr::Numerical`: used only in the deprecated `Month` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:43
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |                                           ^^^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:222:52
+    |
+222 |     const HOUR: BorrowedFormatItem<'_> = Component(Hour({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:223:35
+    |
+223 |         let mut value = modifier::Hour::default();
+    |                                   ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:263:13
+    |
+263 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:265:13
+    |
+265 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:267:23
+    |
+267 |             Optional(&Literal(b" ")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:268:23
+    |
+268 |             Optional(&Literal(b"T")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:270:13
+    |
+270 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:272:23
+    |
+272 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:274:23
+    |
+274 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:277:23
+    |
+277 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:285:13
+    |
+285 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:287:13
+    |
+287 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:289:13
+    |
+289 |             Literal(b" "),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:291:13
+    |
+291 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:293:23
+    |
+293 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:295:23
+    |
+295 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:297:23
+    |
+297 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:304:13
+    |
+304 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:306:13
+    |
+306 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:308:13
+    |
+308 |             Literal(b"T"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:310:13
+    |
+310 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:312:23
+    |
+312 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:314:23
+    |
+314 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:316:23
+    |
+316 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::padding`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:201:9
+    |
+201 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::repr`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:9
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::iso_week_based`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:203:9
+    |
+203 |         value.iso_week_based = false;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::sign_is_mandatory`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:204:9
+    |
+204 |         value.sign_is_mandatory = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::padding`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:210:9
+    |
+210 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::repr`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:9
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::case_sensitive`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:212:9
+    |
+212 |         value.case_sensitive = true;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::padding`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:224:9
+    |
+224 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::is_12_hour_clock`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:225:9
+    |
+225 |         value.is_12_hour_clock = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `sqlx-sqlite` (lib) generated 40 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
+     Running tests/builtin_runtime/main.rs (target/debug/deps/builtin_runtime-839abebbe89f4bee)
+acquisition::builtin_hw_cached_execution_after_sources_stop: test
+binary::builtin_ambient_msb_overrides_are_refused_at_the_worker_boundary: test
+binary::builtin_binary_carries_the_msb_version_section_the_sdk_reads_without_executing_it: test
+binary::builtin_dependency_listing_has_no_sqlite_firmware_or_helper_libraries: test
+binary::builtin_final_artifact_retains_worker_provider: test
+binary::builtin_info_reports_the_strict_embedded_contract: test
+binary::builtin_info_works_with_an_empty_path_and_offline: test
+binary::builtin_loader_trace_maps_only_system_libraries_and_no_firmware: test
+binary::builtin_no_helper_is_extracted_by_the_binary_before_any_guest_starts: test
+binary::builtin_non_utf8_ambient_overrides_are_still_refused: test
+binary::builtin_private_info_route_without_the_runtime_refuses_cleanly: test
+binary::builtin_trace_shows_no_external_executable_or_firmware_access: test
+binary::builtin_version_output_is_unchanged: test
+binary::builtin_worker_dispatch_precedes_clap_config_and_runtime_startup: test
+binary::builtin_worker_never_leaks_secrets_from_its_environment: test
+binary::builtin_worker_rejects_bad_descriptor_shapes_without_echoing_argv: test
+binary::builtin_worker_route_is_hidden_from_humans: test
+binary::worker_unopened_fd_is_sanitized_error_not_abort: test
+fixture_inventory::builtin_every_guest_assertion_is_classified_and_every_dimension_is_covered: test
+fixture_inventory::builtin_fixture_has_exactly_the_nine_image_assertions: test
+fixture_inventory::builtin_fixture_has_exactly_the_thirty_two_mount_and_config_assertions: test
+fixture_inventory::builtin_fixture_pins_a_non_root_image_user_with_explicit_overrides_available: test
+fixture_inventory::builtin_image_transcript_requires_the_completion_marker_too: test
+fixture_inventory::builtin_transcript_parser_accepts_only_a_complete_clean_pass: test
+fixture_inventory::builtin_transcript_parser_rejects_every_kind_of_non_pass: test
+gate::tests::a_binary_without_the_runtime_or_a_missing_archive_is_blocked: test
+gate::tests::a_missing_guest_driver_is_blocked: test
+gate::tests::gate_off_is_a_skip_even_on_capable_hardware: test
+gate::tests::gate_on_without_hypervisor_is_blocked_never_run: test
+gate::tests::only_a_fully_capable_host_runs: test
+gates::builtin_ci_runs_the_hermetic_builtin_tier_and_has_explicit_hardware_jobs: test
+gates::builtin_documented_network_example_validates: test
+gates::builtin_hardware_tests_are_named_so_the_fast_tier_skips_them: test
+gates::builtin_isolated_run_leaves_the_builtin_runtime_unavailable_by_default: test
+gates::builtin_isolated_run_normalizes_a_falsy_gate_to_unset: test
+gates::builtin_isolated_run_preserves_proxy_only_for_explicit_registry_services: test
+gates::builtin_isolated_run_scrubs_proxy_and_credential_directories: test
+gates::builtin_isolated_run_with_the_gate_gets_a_short_private_state_root_and_cleans_it_up: test
+gates::builtin_isolated_script_documents_and_conditions_the_gate: test
+gates::builtin_makefile_gate_is_opt_in_only_through_test_builtin: test
+hardware::builtin_hw_a_second_client_can_reattach_while_the_launcher_lives: test
+hardware::builtin_hw_acp_frames_are_binary_clean_end_to_end: test
+hardware::builtin_hw_cancel_stops_within_the_grace_and_removes_the_vm: test
+hardware::builtin_hw_concurrent_vms_are_independent: test
+hardware::builtin_hw_credential_refresh_reaches_every_consumer_atomically: test
+hardware::builtin_hw_every_overlay_settings_and_prompt_variant_is_visible_in_the_guest: test
+hardware::builtin_hw_exit_code_and_stream_separation: test
+hardware::builtin_hw_image_defaults_hold_and_the_guest_is_not_root: test
+hardware::builtin_hw_pty_reports_the_initial_size_and_follows_resizes: test
+hardware::builtin_hw_resource_limits_are_enforced_in_the_guest: test
+hardware::builtin_hw_runtime_overrides_win_over_image_defaults_but_never_root: test
+lifecycle::builtin_hw_actual_awman_cli_synthetic_agent_exit_37: test
+measure::builtin_measure_size_startup_rss_and_disk_growth: test
+network_resources::builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass: test
+network_resources::builtin_hw_memory_oom_preserves_host_and_peer: test
+network_resources::builtin_hw_network_dns_auth_ca_proxy_mcp: test
+network_resources::builtin_hw_network_policy_isolated_between_vms: test
+network_resources::builtin_hw_offline_cached_execution_under_denial: test
+network_resources::builtin_hw_vcpu_load_and_cleanup: test
+network_resources::network_probe_executes_fetch_and_rejects_missing_tools: test
+network_resources::tests::a_host_that_cannot_boot_is_blocked_whatever_the_opt_ins: test
+network_resources::tests::a_missing_or_failed_guest_check_is_a_problem: test
+network_resources::tests::guest_scripts_bound_every_probe_and_keep_the_prelude: test
+network_resources::tests::network_and_pressure_tests_need_their_own_opt_in: test
+network_resources::tests::the_host_service_checks_the_bearer_token: test
+runtime_refusal::builtin_ambient_msb_variables_reach_the_settings_and_block_detection: test
+runtime_refusal::builtin_ambient_override_is_refused_before_anything_else: test
+runtime_refusal::builtin_is_unavailable_under_test_isolation_and_creates_nothing: test
+runtime_refusal::builtin_never_falls_back_to_docker_and_a_typo_is_fatal: test
+runtime_refusal::builtin_selection_parses_and_round_trips: test
+runtime_refusal::builtin_test_gate_is_off_by_default_in_resolved_settings: test
+sqlite::builtin_sqlite_an_unversioned_foreign_catalog_is_refused_not_adopted_or_migrated: test
+sqlite::builtin_sqlite_bundled_library_version_is_what_rusqlite_reports: test
+sqlite::builtin_sqlite_exactly_one_native_binding_in_the_dependency_graph: test
+sqlite::builtin_sqlite_sdk_catalog_migrates_twice_and_survives_cross_driver_writes_and_a_crash: test
+sqlite::builtin_sqlite_sqlx_is_the_vendored_patched_crate_and_the_patch_is_documented: test
+state_dir::builtin_state_dir_that_is_a_symlink_or_public_is_refused: test
+state_dir::builtin_state_dir_too_long_for_sockets_is_refused_with_the_limit_and_creates_nothing: test
+
+78 tests, 0 benchmarks

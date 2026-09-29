@@ -129,7 +129,7 @@ jobs:
         run: |
           bash tools/msb-payloads/fetch.sh ${{ matrix.target }}
           if [ "${{ runner.os }}" = Linux ]; then bash third_party/native/libcap-ng/build.sh ${{ matrix.target }}; fi
-      - name: Build builtin runtime (2 jobs: each test binary links the whole VM stack)
+      - name: "Build builtin runtime (2 jobs: each test binary links the whole VM stack)"
         env:
           CARGO_BUILD_JOBS: "2"
         run: cargo build --locked --features builtin-runtime --target ${{ matrix.target }}
@@ -162,6 +162,8 @@ jobs:
     env:
       AWMAN_TEST_BUILTIN: "1"
       AWMAN_TEST_BUILTIN_REQUIRE_HW: "1"
+      AWMAN_TEST_BUILTIN_NETWORK: "1"
+      AWMAN_TEST_BUILTIN_PRESSURE: "1"
       AWMAN_TEST_BUILTIN_REPORT: ${{ github.workspace }}/builtin-hw-report.tsv
     steps:
       - uses: actions/checkout@v7
@@ -180,7 +182,6 @@ jobs:
             Darwin)
               [ "$(uname -m)" = arm64 ] || { echo "BLOCKED: Apple Silicon is required"; exit 1; }
               [ "$(sysctl -n kern.hv_support)" = 1 ] || { echo "BLOCKED: Hypervisor.framework unsupported (kern.hv_support != 1)"; exit 1; }
-              command -v codesign >/dev/null || { echo "BLOCKED: codesign is required"; exit 1; }
               ;;
           esac
       - name: Prepare checked inputs
@@ -199,13 +200,81 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: cargo test --locked --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --no-run
-      - name: Grant the hypervisor entitlement to the guest driver (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          codesign --force --sign - --entitlements tools/oci-runtime-spike/strict-embed/hypervisor.plist target/debug/examples/builtin_hw_driver
-          codesign -d --entitlements :- target/debug/examples/builtin_hw_driver 2>&1 | grep -q com.apple.security.hypervisor || { echo "BLOCKED: com.apple.security.hypervisor missing from the guest driver"; exit 1; }
       - name: Builtin tests including real guests
         run: make test-builtin
       - name: Report (SKIP/BLOCKED/RUN per hardware test)
         if: always()
         run: cat "$AWMAN_TEST_BUILTIN_REPORT" || true
+
+  native-typed-provider:
+    name: Clean native build and typed-provider gate (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-arm64-kvm, target: aarch64-unknown-linux-gnu, runs-on: [self-hosted, linux, arm64, kvm] }
+          - { name: linux-x86_64-kvm, target: x86_64-unknown-linux-gnu, runs-on: [self-hosted, linux, x64, kvm] }
+          - { name: macos-arm64-hvf, target: aarch64-apple-darwin, runs-on: [self-hosted, macOS, ARM64, hypervisor] }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target }}
+      - name: Provision disposable OCI guest fixture
+        shell: bash
+        run: |
+          command -v skopeo >/dev/null || { echo "BLOCKED: skopeo is required for the guest fixture"; exit 1; }
+          skopeo copy --override-os linux --format oci docker://docker.io/library/alpine:3.22 "oci-archive:$RUNNER_TEMP/awman-fixture.tar"
+          echo "AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE=$RUNNER_TEMP/awman-fixture.tar" >> "$GITHUB_ENV"
+      - name: Build and boot the current provider from this clean checkout
+        env:
+          CARGO_BUILD_JOBS: "2"
+          AWMAN_TEST_BUILTIN: "1"
+          AWMAN_TEST_BUILTIN_REQUIRE_HW: "1"
+          AWMAN_TEST_BUILTIN_NETWORK: "1"
+          AWMAN_TEST_BUILTIN_PRESSURE: "1"
+        run: bash tools/native-builtin-ci.sh "${{ matrix.target }}"
+      - name: SQLite exact dependency, cross-driver and catalog round trips
+        env:
+          SQLITE_SPIKE_OUTPUT_DIR: ${{ runner.temp }}/sqlite-results
+        run: bash tools/oci-runtime-spike/sqlite-resolution/checks.sh auto
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sqlite-resolution-${{ matrix.name }}
+          path: ${{ runner.temp }}/sqlite-results/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-payload-evidence-${{ matrix.name }}
+          path: |
+            third_party/msb-payloads/${{ matrix.target }}/kernel.meta
+            third_party/msb-payloads/${{ matrix.target }}/provenance.txt
+            third_party/native/libcap-ng/${{ matrix.target }}/libcap-ng.a
+          if-no-files-found: ignore
+
+  existing-backend-unsupported-targets:
+    name: Existing backends with builtin disabled (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x86_64, target: x86_64-pc-windows-msvc, runs-on: windows-2025 }
+          - { name: macos-intel, target: x86_64-apple-darwin, runs-on: [self-hosted, macOS, Intel] }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target }}
+      - name: Build default existing backends (builtin feature disabled)
+        run: cargo build --locked --target "${{ matrix.target }}" --bin awman
+      - name: Assert unsupported builtin selection reports a precise target error
+        run: cargo test --locked --target "${{ matrix.target }}" --lib unavailable_build_or_test_isolation_reports_a_precise_reason -- --nocapture

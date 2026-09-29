@@ -1,0 +1,39 @@
+    Checking awman v0.12.0 (/workspace)
+error[E0308]: mismatched types
+   --> src/engine/oci/mod.rs:849:17
+    |
+848 |               ) -> Result<crate::engine::oci::AcquiredImage, EngineError> {
+    |                    ------------------------------------------------------ expected `Result<AcquiredImage, engine::error::EngineError>` because of return type
+849 | /                 CachingAcquirer::new(
+850 | |                     state,
+851 | |                     limits(),
+852 | |                     EnvSnapshot::empty(),
+...   |
+855 | |                 .acquire(req, &mut |_| {})
+    | |__________________________________________^ expected `Result<AcquiredImage, EngineError>`, found `Result<LeasedImage, EngineError>`
+    |
+    = note: expected enum `Result<AcquiredImage, _>`
+               found enum `Result<LeasedImage, _>`
+
+warning: method `commit` is never used
+   --> src/engine/oci/cache.rs:420:19
+    |
+190 | impl OciCache {
+    | ------------- method in this implementation
+...
+420 |     pub(super) fn commit(
+    |                   ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `awman` (lib) generated 1 warning
+error[E0308]: mismatched types
+   --> tests/oci_import/corpus.rs:178:13
+    |
+178 |     (state, got)
+    |             ^^^ expected `AcquiredImage`, found `LeasedImage`
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `awman` (test "oci_import") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `awman` (lib test) due to 1 previous error

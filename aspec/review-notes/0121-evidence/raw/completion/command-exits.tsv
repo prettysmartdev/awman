@@ -1,0 +1,9 @@
+pre-push-reviewed	0
+feature-clippy-reviewed	0
+test-builtin-reviewed	0
+focused-oci	0
+focused-fixes	0
+hardware-required	101
+services-required	101
+corpus-required	101
+distribution-required	101

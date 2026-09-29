@@ -1,0 +1,60 @@
+architecture-lint: OK — all imports respect the layering rules
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+   Compiling awman v0.12.0 (/workspace)
+error: unused import: `awman::data::config::env::EnvSnapshot`
+  --> tests/oci_import/real_stores.rs:18:5
+   |
+18 | use awman::data::config::env::EnvSnapshot;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error[E0283]: type annotations needed
+   --> tests/oci_import/registry_store.rs:212:9
+    |
+212 |         EnvSnapshot::with_overrides([("DOCKER_CONFIG".into(), temp.path().display().to_string())]);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot infer type of the type parameter `I` declared on the associated function `with_overrides`
+    |
+    = note: cannot satisfy `_: std::convert::Into<std::string::String>`
+note: required by a bound in `awman::data::config::EnvSnapshot::with_overrides`
+   --> src/data/config/env.rs:237:12
+    |
+234 |     pub fn with_overrides<I, K, V>(entries: I) -> Self
+    |            -------------- required by a bound in this associated function
+...
+237 |         K: Into<String>,
+    |            ^^^^^^^^^^^^ required by this bound in `EnvSnapshot::with_overrides`
+help: consider specifying the generic arguments
+    |
+212 |         EnvSnapshot::with_overrides::<[(T, std::string::String); 1], K, std::string::String>([("DOCKER_CONFIG".into(), temp.path().display().to_string())]);
+    |                                    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0283]: type annotations needed
+   --> tests/oci_import/registry_store.rs:212:9
+    |
+212 |         EnvSnapshot::with_overrides([("DOCKER_CONFIG".into(), temp.path().display().to_string())]);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^                   ---- type must be known at this point
+    |         |
+    |         cannot infer type of the type parameter `I` declared on the associated function `with_overrides`
+    |
+    = note: multiple `impl`s satisfying `_: std::convert::From<&str>` found in the following crates: `axum_core`, `bytes`, `clap_builder`, `reqwest`:
+            - impl std::convert::From<&'static str> for axum::body::Body;
+            - impl std::convert::From<&'static str> for axum::body::Bytes;
+            - impl std::convert::From<&'static str> for clap_builder::builder::os_str::OsStr;
+            - impl std::convert::From<&'static str> for clap_builder::builder::str::Str;
+            - impl std::convert::From<&'static str> for clap_builder::builder::styled_str::StyledStr;
+            - impl std::convert::From<&'static str> for clap_builder::util::id::Id;
+            - impl std::convert::From<&'static str> for reqwest::async_impl::body::Body;
+            - impl std::convert::From<&'static str> for reqwest::blocking::body::Body;
+    = note: required for `&str` to implement `std::convert::Into<_>`
+help: consider specifying the generic arguments
+    |
+212 |         EnvSnapshot::with_overrides::<[(T, std::string::String); 1], K, std::string::String>([("DOCKER_CONFIG".into(), temp.path().display().to_string())]);
+    |                                    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+For more information about this error, try `rustc --explain E0283`.
+error: could not compile `awman` (test "oci_import") due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...
+make: *** [Makefile:87: pre-push] Error 101

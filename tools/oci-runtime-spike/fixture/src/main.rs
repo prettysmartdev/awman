@@ -38,8 +38,107 @@ fn directory(builder: &mut Builder<Vec<u8>>, name: &str, mode: u32) -> Result<()
     Ok(())
 }
 
+fn sqlite_fixture(output: &Path) -> Result<()> {
+    // Small deterministic, real Docker-save + OCI image archives for catalog
+    // compatibility tests. The old CLI imports these bytes; no catalog is
+    // fabricated or renamed. This image is intentionally metadata-only and is
+    // never used as a guest boot fixture.
+    let architecture = std::env::var("AWMAN_SQLITE_FIXTURE_ARCH").unwrap_or_else(|_| {
+        if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "amd64"
+        }
+        .to_owned()
+    });
+    let mut layer_builder = Builder::new(Vec::new());
+    append(
+        &mut layer_builder,
+        "etc/awman-sqlite-fixture",
+        b"catalog fixture v1\n",
+        0o644,
+    )?;
+    let layer = layer_builder.into_inner()?;
+    let layer_hash = digest(&layer);
+    let config = json!({
+        "architecture": architecture.clone(),
+        "os": "linux",
+        "config": {"User": "0:0", "WorkingDir": "/", "Env": ["PATH=/usr/bin:/bin"]},
+        "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{layer_hash}")]},
+        "history": [{"created_by": "awman deterministic SQLite catalog fixture"}]
+    });
+    let config_bytes = serde_json::to_vec(&config)?;
+    let config_hash = digest(&config_bytes);
+    let mut docker = Builder::new(Vec::new());
+    append(
+        &mut docker,
+        &format!("{config_hash}.json"),
+        &config_bytes,
+        0o644,
+    )?;
+    append(&mut docker, "layer-0/layer.tar", &layer, 0o644)?;
+    let docker_manifest = json!([{"Config": format!("{config_hash}.json"), "RepoTags": ["awman-spike/sqlite-fixture:latest"], "Layers": ["layer-0/layer.tar"]}]);
+    append(
+        &mut docker,
+        "manifest.json",
+        &serde_json::to_vec(&docker_manifest)?,
+        0o644,
+    )?;
+    fs::write(output.join("fixture-docker.tar"), docker.into_inner()?)?;
+
+    let oci_manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": format!("sha256:{config_hash}"), "size": config_bytes.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": format!("sha256:{layer_hash}"), "size": layer.len()}]
+    });
+    let manifest_bytes = serde_json::to_vec(&oci_manifest)?;
+    let manifest_hash = digest(&manifest_bytes);
+    let index = json!({"schemaVersion": 2, "manifests": [{
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": format!("sha256:{manifest_hash}"), "size": manifest_bytes.len(),
+        "platform": {"os": "linux", "architecture": architecture},
+        "annotations": {"org.opencontainers.image.ref.name": "awman-spike/sqlite-fixture:latest"}
+    }]});
+    let mut oci = Builder::new(Vec::new());
+    append(
+        &mut oci,
+        "oci-layout",
+        b"{\"imageLayoutVersion\":\"1.0.0\"}",
+        0o644,
+    )?;
+    append(&mut oci, "index.json", &serde_json::to_vec(&index)?, 0o644)?;
+    append(
+        &mut oci,
+        &format!("blobs/sha256/{manifest_hash}"),
+        &manifest_bytes,
+        0o644,
+    )?;
+    append(
+        &mut oci,
+        &format!("blobs/sha256/{config_hash}"),
+        &config_bytes,
+        0o644,
+    )?;
+    append(
+        &mut oci,
+        &format!("blobs/sha256/{layer_hash}"),
+        &layer,
+        0o644,
+    )?;
+    fs::write(output.join("fixture-oci.tar"), oci.into_inner()?)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--sqlite-minimal" {
+        let output = Path::new(&args[2]);
+        fs::create_dir_all(output)?;
+        sqlite_fixture(output)?;
+        println!("generated deterministic metadata-only SQLite Docker-save/OCI fixtures");
+        return Ok(());
+    }
     if args.len() != 3 {
         return Err("usage: awman-oci-spike-fixture BASE_DOCKER_TAR OUTPUT_DIRECTORY".into());
     }

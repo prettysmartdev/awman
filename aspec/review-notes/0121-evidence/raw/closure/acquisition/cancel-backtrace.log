@@ -1,0 +1,73 @@
+
+running 1 test
+
+thread '<unnamed>' (154574) panicked at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic_display
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/panicking.rs:259:5
+   3: tokio::runtime::scheduler::Handle::current
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/runtime/scheduler/mod.rs:95:27
+   4: tokio::time::sleep::Sleep::new_timeout
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/time/sleep.rs:254:22
+   5: tokio::time::sleep::sleep
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.53.1/src/time/sleep.rs:127:27
+   6: core::ops::function::FnOnce::call_once
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5
+   7: core::option::Option<T>::map
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/option.rs:1165:29
+   8: reqwest::async_impl::client::Client::execute_request
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/reqwest-0.13.5/src/async_impl/client.rs:2675:14
+   9: reqwest::async_impl::request::RequestBuilder::send
+             at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/reqwest-0.13.5/src/async_impl/request.rs:523:36
+  10: awman::engine::oci::transport::Transport::send
+             at ./src/engine/oci/transport.rs:80:38
+  11: awman::engine::oci::docker_engine::Client::get
+             at ./src/engine/oci/docker_engine.rs:289:24
+  12: awman::engine::oci::docker_engine::export
+             at ./src/engine/oci/docker_engine.rs:403:23
+  13: awman::engine::oci::sources::Resolved::fetch
+             at ./src/engine/oci/sources.rs:190:17
+  14: <awman::engine::oci::CachingAcquirer as awman::engine::oci::ImageAcquirer>::acquire::{{closure}}::{{closure}}
+             at ./src/engine/oci/mod.rs:360:40
+  15: core::ops::function::FnOnce::call_once
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5
+  16: awman::engine::oci::sources::run_isolated::{{closure}}::{{closure}}
+             at ./src/engine/oci/sources.rs:273:13
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker' (154571) panicked at tests/oci_import/cancellation.rs:140:53:
+called `Result::unwrap()` on an `Err` value: Timeout
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/result.rs:1867:5
+   3: core::result::Result<T,E>::unwrap
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/result.rs:1233:23
+   4: oci_import::cancellation::exercise
+             at ./tests/oci_import/cancellation.rs:140:53
+   5: oci_import::cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker
+             at ./tests/oci_import/cancellation.rs:169:5
+   6: oci_import::cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker::{{closure}}
+             at ./tests/oci_import/cancellation.rs:168:69
+   7: core::ops::function::FnOnce::call_once
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5
+   8: core::ops::function::FnOnce::call_once
+             at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker ... FAILED
+
+failures:
+
+failures:
+    cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 2.03s
+

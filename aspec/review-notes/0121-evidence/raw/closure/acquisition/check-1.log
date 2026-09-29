@@ -1,0 +1,22 @@
+    Checking hyper-rustls v0.27.10
+    Checking axum-server v0.8.0
+    Checking reqwest v0.13.5
+    Checking awman v0.12.0 (/workspace)
+warning: struct `BackgroundReader` is never constructed
+   --> src/engine/oci/verify.rs:356:19
+    |
+356 | pub(super) struct BackgroundReader {
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `spawn` is never used
+   --> src/engine/oci/verify.rs:366:19
+    |
+365 | impl BackgroundReader {
+    | --------------------- associated function in this implementation
+366 |     pub(super) fn spawn(
+    |                   ^^^^^
+
+warning: `awman` (lib) generated 2 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.87s

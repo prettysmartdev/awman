@@ -1,0 +1,46 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling awman v0.12.0 (/workspace)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 26s
+     Running tests/oci_import/main.rs (target/debug/deps/oci_import-a4dd508ae0c82521)
+
+running 3 tests
+test cancellation::cancel_closes_registry_and_auth_header_and_body_waits ... FAILED
+test cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker ... FAILED
+test cancellation::deadline_closes_withheld_headers_and_leaves_no_cache_reference ... FAILED
+
+failures:
+
+---- cancellation::cancel_closes_registry_and_auth_header_and_body_waits stdout ----
+
+thread '<unnamed>' (152489) panicked at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'cancellation::cancel_closes_registry_and_auth_header_and_body_waits' (152483) panicked at tests/oci_import/cancellation.rs:140:53:
+called `Result::unwrap()` on an `Err` value: Timeout
+
+---- cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker stdout ----
+
+thread '<unnamed>' (152488) panicked at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+
+thread 'cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker' (152482) panicked at tests/oci_import/cancellation.rs:140:53:
+called `Result::unwrap()` on an `Err` value: Timeout
+
+---- cancellation::deadline_closes_withheld_headers_and_leaves_no_cache_reference stdout ----
+
+thread '<unnamed>' (152526) panicked at /rustc/4a4ef493e3a1488c6e321570238084b38948f6db/library/core/src/ops/function.rs:250:5:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+
+thread 'cancellation::deadline_closes_withheld_headers_and_leaves_no_cache_reference' (152523) panicked at tests/oci_import/cancellation.rs:140:53:
+called `Result::unwrap()` on an `Err` value: Timeout
+
+
+failures:
+    cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker
+    cancellation::cancel_closes_registry_and_auth_header_and_body_waits
+    cancellation::deadline_closes_withheld_headers_and_leaves_no_cache_reference
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 43 filtered out; finished in 4.02s
+
+error: test failed, to rerun pass `--test oci_import`

@@ -3,7 +3,7 @@ use super::{
     driver::*,
     exec_bridge::AttachInstance,
     instance::{Instance, LaunchPlan},
-    naming,
+    naming, network,
     paths::BuiltinPaths,
     resources,
 };
@@ -226,6 +226,7 @@ impl BuiltinBackend {
             .ok_or_else(|| EngineError::Config("builtin launch needs an image".into()))?
             .0
             .clone();
+        let image_lease = self.paths.image_lease(&image, false)?;
         let config = self.driver.image_config(&image)?.ok_or_else(|| {
             EngineError::Config(format!(
                 "image {image} is not imported; run awman ready with an explicit image source"
@@ -276,6 +277,7 @@ impl BuiltinBackend {
             mount_owner: image_owner(user.as_deref(), &config.accounts)?,
             vcpus,
             memory_mib,
+            network: network::compile(&self.settings.network),
         };
         let argv = agent_argv(
             options
@@ -313,6 +315,7 @@ impl BuiltinBackend {
             ..Default::default()
         };
         Ok(LaunchPlan {
+            image_lease,
             spec,
             command,
             name,
@@ -506,8 +509,22 @@ impl ContainerBackend for BuiltinBackend {
     fn import_image(
         &self,
         request: &ImageImportRequest,
-        _sink: &mut dyn UserMessageSink,
+        sink: &mut dyn UserMessageSink,
     ) -> Result<ImportedImage, EngineError> {
+        self.import_image_cancellable(request, sink, &crate::engine::oci::CancelToken::new())
+    }
+    fn import_image_cancellable(
+        &self,
+        request: &ImageImportRequest,
+        _sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        use crate::engine::oci::ImageAcquirer;
+        cancel.check()?;
+        let control = crate::engine::oci::retry::OperationControl::new(
+            cancel.clone(),
+            crate::engine::oci::retry::Deadline::start(std::time::Duration::from_secs(3600)),
+        );
         let acquirer = default_acquirer(
             &self.paths.home,
             AcquireLimits {
@@ -516,8 +533,9 @@ impl ContainerBackend for BuiltinBackend {
                 max_layers: 256,
                 min_free_bytes: 1024 * 1024 * 1024,
             },
-            &Env::from_process(),
-        );
+            &Env::for_image_acquisition(&self.settings.registries),
+        )
+        .with_cancel(cancel.clone());
         let acquired = acquirer.acquire(
             &AcquireRequest {
                 tag: request.tag.clone(),
@@ -532,23 +550,33 @@ impl ContainerBackend for BuiltinBackend {
             },
             &mut |_| {},
         )?;
+        // `acquired` carries the lease taken atomically with lookup/publication,
+        // through projection, SDK import and identity publication below.
         // Imports serialise on their own lock; the catalog lock is only held
         // for the short identity read-modify-write so status/list never wait
         // on a long import.
-        let _import = self.paths.import_lock()?;
+        let _import = self.paths.import_lock_cancellable(cancel)?;
+        let _image_lease = self.paths.image_lease(&request.tag, true)?;
+        control.check()?;
         if self.image_identity(&request.tag)?.as_ref() != Some(&acquired.identity)
             || !self.image_exists(&request.tag)?
         {
-            let (_staging, archive) = crate::engine::oci::archive::prepare_runtime_archive(
-                &acquired,
-                &request.tag,
-                &AcquireLimits {
-                    max_archive_bytes: 32 << 30,
-                    max_layer_bytes: 8 << 30,
-                    max_layers: 256,
-                    min_free_bytes: 1 << 30,
-                },
-            )?;
+            let (_staging, archive) =
+                crate::engine::oci::archive::prepare_runtime_archive_controlled(
+                    &acquired,
+                    &request.tag,
+                    &AcquireLimits {
+                        max_archive_bytes: 32 << 30,
+                        max_layer_bytes: 8 << 30,
+                        max_layers: 256,
+                        min_free_bytes: 1 << 30,
+                    },
+                    &control,
+                )?;
+            control.check()?;
+            // Once the SDK mutating transaction starts, finish it and record
+            // the identity before observing cancellation again. Dropping this
+            // future mid-extraction could leave untracked SDK writes.
             self.driver.import_archive(archive, request.tag.clone())?;
         }
         let config = self.driver.image_config(&request.tag)?.unwrap_or_default();
@@ -558,9 +586,10 @@ impl ContainerBackend for BuiltinBackend {
             identities.insert(request.tag.clone(), acquired.identity.clone());
             self.save_identities(&identities)?;
         }
+        cancel.check()?;
         Ok(ImportedImage {
             tag: request.tag.clone(),
-            identity: acquired.identity,
+            identity: acquired.identity.clone(),
             home_dir: config.home,
             user: config.user,
         })
@@ -571,6 +600,7 @@ impl ContainerBackend for BuiltinBackend {
         Ok(Vec::new())
     }
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
+        let _image_lease = self.paths.image_lease(id, true)?;
         let _lock = self.paths.lock()?;
         let mut identities = self.identities()?;
         if !identities.contains_key(id) {
@@ -604,6 +634,7 @@ impl ContainerBackend for BuiltinBackend {
                 },
             );
         }
+        let _image_lease = self.paths.image_lease(image, false)?;
         let config = self.driver.image_config(image)?.ok_or_else(|| {
             EngineError::Config(format!(
                 "image {image} is not imported; run awman ready with an explicit image source"
@@ -621,6 +652,7 @@ impl ContainerBackend for BuiltinBackend {
             mount_owner: image_owner(config.user.as_deref(), &config.accounts)?,
             vcpus: self.settings.vcpus,
             memory_mib: self.settings.memory_mib,
+            network: network::compile(&self.settings.network),
         })?;
         self.background_env
             .lock()

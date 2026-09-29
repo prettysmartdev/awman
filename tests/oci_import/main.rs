@@ -1,7 +1,30 @@
-//! Public-contract tests for OCI import and the verified image cache.
+//! Public-contract tests for OCI image acquisition and the verified image
+//! cache.
 //!
-//! The fixture is assembled in memory for each test. These tests never invoke
-//! Docker, read user credentials, or use a per-user cache.
+//! Every fixture is assembled in memory or served by a loopback double built
+//! in this process; nothing invokes Docker, reads user credentials, or uses a
+//! per-user cache. The opt-in real-service tier is `real_stores`, gated by
+//! `AWMAN_TEST_IMAGE_STORES=1` plus the specific service gates it documents.
+//!
+//! Modules:
+//! * `support` — fixture builders, Docker Engine / registry / proxy doubles,
+//!   TLS material;
+//! * `docker_store` — Docker Engine export over Unix and TLS, API versions,
+//!   missing images, disconnects, bounded retry, cancellation;
+//! * `registry_store` — registry pulls over TLS with a private CA, token
+//!   realms, native credentials, proxy/no-proxy and secret redaction;
+//! * `corpus` — docker-save / OCI / Apple-shaped archives, layer preservation,
+//!   the zstd / non-distributable format policy, real corpus (gated);
+//! * `cache_invariants` — cached-execution invariants of the archive cache;
+//! * `real_stores` — disposable real services (gated).
+
+mod cache_invariants;
+mod cancellation;
+mod corpus;
+mod docker_store;
+mod real_stores;
+mod registry_store;
+mod support;
 
 use std::io::Write;
 use std::path::Path;
@@ -220,4 +243,35 @@ fn wrong_platform_and_malformed_transfer_leave_no_visible_cache_state() {
         )
         .is_err());
     assert_cache_empty(&state);
+}
+
+#[test]
+fn apple_store_is_a_typed_blocker_with_dated_evidence() {
+    use awman::engine::error::EngineError;
+    use awman::engine::oci::apple_store::{feasibility, Blocker, Feasibility, CONTRACT};
+    let temp = tempfile::tempdir().unwrap();
+    let req = AcquireRequest {
+        tag: "awman-fixture:latest".into(),
+        source: ImageSourceSpec::AppleStore { reference: None },
+        platform: OciPlatform::host_linux(),
+        policy: AcquirePolicy::IfMissing,
+        registries: Default::default(),
+    };
+    match acquirer(&temp.path().join("s")).acquire(&req, &mut |_| {}) {
+        Err(EngineError::ImageSourceBlocked { reason, .. }) => {
+            assert!(reason.contains("container image save awman-fixture:latest"));
+            assert!(reason.contains("apple/container 1.4.1"));
+        }
+        other => panic!("expected a blocked source, got {other:?}"),
+    }
+    match feasibility() {
+        Feasibility::Blocked(blockers) => {
+            assert!(blockers.contains(&Blocker::UnversionedProtocol));
+            assert!(blockers.contains(&Blocker::RequiresUnsafeFfi));
+        }
+        Feasibility::Available { .. } => panic!("no bridge exists"),
+    }
+    let contract = CONTRACT;
+    assert!(!contract.protocol_versioned);
+    assert_cache_empty(&temp.path().join("s"));
 }

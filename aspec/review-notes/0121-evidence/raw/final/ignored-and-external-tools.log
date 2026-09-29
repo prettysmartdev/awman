@@ -1,0 +1,11 @@
+Explicit ignored test declarations (not native evidence):
+src/command/dispatch/projections/markdown.rs:217:    #[ignore = "regenerates docs/14-command-reference.md from the catalogue; run explicitly"]
+src/command/commands/exec_workflow/tests.rs:2387:// Seven `#[ignore]`-ed `todo!()` stubs stood here until WI 0114 F-52. None
+tests/helpers/fake_awman.rs:38:#[ignore = "runs only as the body of a FakeAwmanProcess"]
+External executable availability:
+BLOCKED: docker not installed
+BLOCKED: container not installed
+BLOCKED: codesign not installed
+BLOCKED: xcrun not installed
+BLOCKED: strace not installed
+No disposable service endpoints/credentials or final distribution artifact supplied.

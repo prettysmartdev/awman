@@ -1,0 +1,24 @@
+COMMAND: git rev-parse --verify HEAD
+fatal: not a git repository: /Users/cohix-studio/Workspaces/prettysmart/awman/.git/worktrees/0121
+EXIT: 128
+COMMAND: git status --short
+fatal: not a git repository: /Users/cohix-studio/Workspaces/prettysmart/awman/.git/worktrees/0121
+EXIT: 128
+COMMAND: git diff --stat
+fatal: not a git repository: /Users/cohix-studio/Workspaces/prettysmart/awman/.git/worktrees/0121
+EXIT: 128
+BASE: baseline.md records UNKNOWN; no base commit available
+HOST:
+Linux awman-7042-917644000 6.18.15 #1 SMP Tue Mar 17 01:36:53 UTC 2026 aarch64 GNU/Linux
+rustc 1.94.0 (4a4ef493e 2026-03-02)
+binary: rustc
+commit-hash: 4a4ef493e3a1488c6e321570238084b38948f6db
+commit-date: 2026-03-02
+host: aarch64-unknown-linux-gnu
+release: 1.94.0
+LLVM version: 21.1.8
+ls: cannot access '/dev/kvm': No such file or directory
+ls: cannot access '/var/run/docker.sock': No such file or directory
+ls: cannot access '/Users': No such file or directory
+ls: cannot access '/awman/context/workflow/0121/review-codex-work.md': No such file or directory
+ls: cannot access '/awman/context/workflow/0121/fixes-claude-area.md': No such file or directory

@@ -1,0 +1,94 @@
+/awman/context/workflow/0121/completion/focused-oci.log:SKIP: real_corpus: AWMAN_TEST_IMAGE_CORPUS does not name a directory with manifest.json (build one with tests/oci_import/corpus/build-corpus.sh)
+/awman/context/workflow/0121/completion/focused-oci.log:SKIP: native_keychain_disposable_registry_entry: AWMAN_TEST_NATIVE_KEYCHAIN=1 is not set (native credential opt-in)
+/awman/context/workflow/0121/completion/focused-oci.log:SKIP: store_docker_real_engine_unix_or_tls_roundtrip: AWMAN_TEST_IMAGE_STORES=1 is not set (real-store opt-in)
+/awman/context/workflow/0121/completion/focused-oci.log:SKIP: store_registry_real_ca_proxy_auth_roundtrip: AWMAN_TEST_IMAGE_STORES=1 is not set (real-store opt-in)
+/awman/context/workflow/0121/completion/focused-oci.log:test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+/awman/context/workflow/0121/completion/focused-fixes.log:test result: ok. 110 passed; 0 failed; 0 ignored; 0 measured; 3127 filtered out; finished in 3.31s
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_cached_execution_after_sources_stop: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: 
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'acquisition::builtin_hw_cached_execution_after_sources_stop' (142293) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_cached_execution_after_sources_stop: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_reattach: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_a_second_client_can_reattach_while_the_launcher_lives' (142294) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_reattach: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_cancel: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_cancel_stops_within_the_grace_and_removes_the_vm' (142296) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_cancel: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_multi_vm: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_concurrent_vms_are_independent' (142297) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_multi_vm: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_acp: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_acp_frames_are_binary_clean_end_to_end' (142295) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_acp: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_refresh_multi: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_credential_refresh_reaches_every_consumer_atomically' (142298) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_refresh_multi: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: test hardware::builtin_hw_concurrent_vms_are_independent ... FAILEDbuiltin_hw_mounts: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_every_overlay_settings_and_prompt_variant_is_visible_in_the_guest' (142300) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_mounts: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: 
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_exit_code: test acquisition::builtin_hw_cached_execution_after_sources_stop ... FAILED/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_exit_code_and_stream_separation' (142301) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_exit_code: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: test hardware::builtin_hw_credential_refresh_reaches_every_consumer_atomically ... FAILEDbuiltin_hw_image_defaults: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_image_defaults_hold_and_the_guest_is_not_root' (142302) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_image_defaults: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: 
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_pty: test hardware::builtin_hw_exit_code_and_stream_separation ... FAILED/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_pty_reports_the_initial_size_and_follows_resizes' (142303) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_pty: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: test hardware::builtin_hw_image_defaults_hold_and_the_guest_is_not_root ... FAILEDbuiltin_hw_limits: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_resource_limits_are_enforced_in_the_guest' (142304) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_limits: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: 
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_overrides: test hardware::builtin_hw_resource_limits_are_enforced_in_the_guest ... FAILED/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'hardware::builtin_hw_runtime_overrides_win_over_image_defaults_but_never_root' (142305) panicked at tests/builtin_runtime/gate.rs:166:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_overrides: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_actual_awman_cli_synthetic_agent_exit_37test hardware::builtin_hw_runtime_overrides_win_over_image_defaults_but_never_root ... FAILED: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'lifecycle::builtin_hw_actual_awman_cli_synthetic_agent_exit_37' (142306) panicked at tests/builtin_runtime/lifecycle.rs:19:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_actual_awman_cli_synthetic_agent_exit_37: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: 
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'network_resources::builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass' (142307) panicked at tests/builtin_runtime/network_resources.rs:125:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'network_resources::builtin_hw_memory_oom_preserves_host_and_peer' (142308) panicked at tests/builtin_runtime/network_resources.rs:125:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_memory_oom_preserves_host_and_peer: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'network_resources::builtin_hw_network_dns_auth_ca_proxy_mcp' (142309) panicked at tests/builtin_runtime/network_resources.rs:125:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_network_dns_auth_ca_proxy_mcp: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: test network_resources::builtin_hw_network_dns_auth_ca_proxy_mcp ... FAILEDbuiltin_hw_network_policy_isolated_between_vms: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'network_resources::builtin_hw_network_policy_isolated_between_vms' (142310) panicked at tests/builtin_runtime/network_resources.rs:125:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_network_policy_isolated_between_vms: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: test network_resources::builtin_hw_network_policy_isolated_between_vms ... FAILEDbuiltin_hw_offline_cached_execution_under_denial: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'network_resources::builtin_hw_offline_cached_execution_under_denial' (142311) panicked at tests/builtin_runtime/network_resources.rs:125:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_offline_cached_execution_under_denial: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:BLOCKED: test network_resources::builtin_hw_offline_cached_execution_under_denial ... FAILEDbuiltin_hw_vcpu_load_and_cleanup: 
+/awman/context/workflow/0121/completion/hardware-required.log:/dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:thread 'network_resources::builtin_hw_vcpu_load_and_cleanup' (142312) panicked at tests/builtin_runtime/network_resources.rs:125:9:
+/awman/context/workflow/0121/completion/hardware-required.log:builtin_hw_vcpu_load_and_cleanup: hardware is required (AWMAN_TEST_BUILTIN_REQUIRE_HW=1) but: /dev/kvm is not usable (No such file or directory (os error 2)); KVM access is required
+/awman/context/workflow/0121/completion/hardware-required.log:test result: FAILED. 0 passed; 19 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.25s
+/awman/context/workflow/0121/completion/services-required.log:SKIP: native_keychain_disposable_registry_entry: AWMAN_TEST_NATIVE_KEYCHAIN=1 is not set (native credential opt-in)
+/awman/context/workflow/0121/completion/services-required.log:SKIP: store_registry_real_ca_proxy_auth_roundtrip: 
+/awman/context/workflow/0121/completion/services-required.log:thread 'real_stores::native_keychain_disposable_registry_entry' (142327) panicked at tests/oci_import/real_stores.rs:37:9:
+/awman/context/workflow/0121/completion/services-required.log:native_keychain_disposable_registry_entry: an external service is required (AWMAN_TEST_REQUIRE_EXTERNAL=1) but: AWMAN_TEST_NATIVE_KEYCHAIN=1 is not set (native credential opt-in)
+/awman/context/workflow/0121/completion/services-required.log:AWMAN_TEST_IMAGE_STORES=1 is not set (real-store opt-in)
+/awman/context/workflow/0121/completion/services-required.log:thread 'real_stores::store_registry_real_ca_proxy_auth_roundtrip' (142329) panicked at tests/oci_import/real_stores.rs:37:9:
+/awman/context/workflow/0121/completion/services-required.log:store_registry_real_ca_proxy_auth_roundtrip: an external service is required (AWMAN_TEST_REQUIRE_EXTERNAL=1) but: AWMAN_TEST_IMAGE_STORES=1 is not set (real-store opt-in)
+/awman/context/workflow/0121/completion/services-required.log:SKIP: store_docker_real_engine_unix_or_tls_roundtrip: AWMAN_TEST_IMAGE_STORES=1 is not set (real-store opt-in)
+/awman/context/workflow/0121/completion/services-required.log:thread 'real_stores::store_docker_real_engine_unix_or_tls_roundtrip' (142328) panicked at tests/oci_import/real_stores.rs:37:9:
+/awman/context/workflow/0121/completion/services-required.log:store_docker_real_engine_unix_or_tls_roundtrip: an external service is required (AWMAN_TEST_REQUIRE_EXTERNAL=1) but: AWMAN_TEST_IMAGE_STORES=1 is not set (real-store opt-in)
+/awman/context/workflow/0121/completion/services-required.log:test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.01s
+/awman/context/workflow/0121/completion/corpus-required.log:SKIP: real_corpus: AWMAN_TEST_IMAGE_CORPUS does not name a directory with manifest.json (build one with tests/oci_import/corpus/build-corpus.sh)
+/awman/context/workflow/0121/completion/corpus-required.log:thread 'corpus::real_corpus_every_shipped_template_archive_validates_and_projects' (142344) panicked at tests/oci_import/corpus.rs:398:17:
+/awman/context/workflow/0121/completion/corpus-required.log:real corpus is required (AWMAN_TEST_REQUIRE_EXTERNAL=1) but: AWMAN_TEST_IMAGE_CORPUS does not name a directory with manifest.json (build one with tests/oci_import/corpus/build-corpus.sh)
+/awman/context/workflow/0121/completion/corpus-required.log:test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.00s
+/awman/context/workflow/0121/completion/distribution-required.log:thread 'binary::builtin_final_artifact_retains_worker_provider' (142359) panicked at tests/builtin_runtime/binary.rs:672:10:
+/awman/context/workflow/0121/completion/distribution-required.log:AWMAN_TEST_BUILTIN_ARTIFACT must name the final optimized/stripped artifact
+/awman/context/workflow/0121/completion/distribution-required.log:test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 77 filtered out; finished in 0.00s

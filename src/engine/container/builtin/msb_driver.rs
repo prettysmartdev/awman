@@ -66,33 +66,15 @@ impl MsbDriver {
     pub fn open(paths: BuiltinPaths) -> Result<Arc<Self>, EngineError> {
         let executable = super::embedded::resolve()?;
         super::catalog::check(&paths)?;
-        // SDK 0.7.2 loads this file BEFORE applying .home(). It has no setter
-        // to disable that merge. Fail closed rather than inherit agentd paths.
-        let ambient = microsandbox::config::config_path();
-        if ambient.exists() {
-            return Err(EngineError::BuiltinRuntimeUnavailable {
-                reason: format!(
-                    "a Microsandbox configuration exists at {}; awman's builtin runtime cannot run while it is present because it could change the embedded runtime. Move it aside (for example, rename it) and retry, or use runtime docker",
-                    ambient.display()
-                ),
-            });
-        }
-        let local = LocalBackend::builder()
-            .home(&paths.home)
-            .cache_dir(paths.home.join("cache"))
-            .sandboxes_dir(paths.home.join("sandboxes"))
-            .logs_dir(paths.home.join("logs"))
-            .volumes_dir(paths.home.join("volumes"))
-            .snapshots_dir(paths.home.join("snapshots"))
-            .secrets_dir(paths.home.join("secrets"))
-            .registry_hosts(Default::default())
-            .ca_certs(None)
-            .try_build_lazy()
-            .map_err(|_| failure("configuration"))?;
+        // This pinned SDK entrypoint starts with GlobalConfig::default() and
+        // never loads installed msb config or resolves paths from HOME/XDG.
+        // All state roots below are owned by awman and remain explicit.
+        let local = isolated_backend(&paths);
         let resolved = microsandbox::setup::resolve_runtime(local.config())
             .map_err(|_| failure("embedded resolution"))?;
         if resolved.msb_path != executable
             || resolved.libkrunfw_path != executable
+            || resolved.origin != microsandbox::setup::RuntimeOrigin::SdkPackage
             || local.config().paths.agentd.is_some()
         {
             return Err(EngineError::BuiltinRuntimeUnavailable {
@@ -148,6 +130,20 @@ impl MsbDriver {
         self.local.clone()
     }
 }
+
+fn isolated_backend(paths: &BuiltinPaths) -> LocalBackend {
+    LocalBackend::builder()
+        .home(&paths.home)
+        .cache_dir(paths.home.join("cache"))
+        .sandboxes_dir(paths.home.join("sandboxes"))
+        .logs_dir(paths.home.join("logs"))
+        .volumes_dir(paths.home.join("volumes"))
+        .snapshots_dir(paths.home.join("snapshots"))
+        .secrets_dir(paths.home.join("secrets"))
+        .registry_hosts(Default::default())
+        .ca_certs(None)
+        .build_lazy_isolated()
+}
 fn summary(handle: &microsandbox::sandbox::SandboxHandle) -> Result<SandboxSummary, EngineError> {
     let config = handle.config().map_err(|_| failure("catalog read"))?;
     let labels = config.spec.labels.clone();
@@ -200,6 +196,10 @@ impl ExecControl for ControlSender {
 }
 impl SandboxDriver for MsbDriver {
     fn create(&self, spec: SandboxSpec) -> Result<(), EngineError> {
+        spec.check()?;
+        let plan = spec.network.clone();
+        let policy: microsandbox::sandbox::NetworkPolicy =
+            serde_json::from_value(plan.policy_json()).map_err(|_| failure("network policy"))?;
         let backend = self.backend();
         let active = self.active.clone();
         self.call(async move {
@@ -217,6 +217,33 @@ impl SandboxDriver for MsbDriver {
                 .pull_policy(microsandbox::sandbox::PullPolicy::Never)
                 .labels(spec.labels)
                 .quiet_logs();
+            builder = if plan.enabled {
+                builder.network(|network| {
+                    network
+                        .policy(policy)
+                        .strict(plan.strict)
+                        .strict_sni(plan.strict)
+                        .trust_host_cas(plan.trust_host_cas)
+                        .dns(|dns| {
+                            dns.rebind_protection(true)
+                                .nameservers(plan.nameservers.clone())
+                        })
+                        .tls(|tls| tls.enabled(false))
+                })
+            } else {
+                builder.disable_network().network(|network| {
+                    network
+                        .policy(policy)
+                        .strict(plan.strict)
+                        .strict_sni(plan.strict)
+                        .trust_host_cas(plan.trust_host_cas)
+                        .dns(|dns| {
+                            dns.rebind_protection(true)
+                                .nameservers(plan.nameservers.clone())
+                        })
+                        .tls(|tls| tls.enabled(false))
+                })
+            };
             for mount in spec.mounts {
                 let owner = spec.mount_owner;
                 builder = builder.volume(mount.guest, |m| {
@@ -585,6 +612,195 @@ async fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdk_hostname_dns_binding_cannot_authorize_udp_or_quic() {
+        use crate::data::config::builtin_network::{
+            BuiltinNetworkSettings, NetworkAllowEntry, NetworkMode,
+        };
+        use microsandbox_network::{
+            policy::{Action, DomainName, Protocol},
+            shared::{ResolvedHostnameFamily, SharedState},
+        };
+        let settings = BuiltinNetworkSettings {
+            mode: NetworkMode::Allowlist,
+            allow: vec![NetworkAllowEntry::Domain("allowed.example".into())],
+            ..Default::default()
+        };
+        let plan = crate::engine::container::builtin::network::compile(&settings);
+        let policy: microsandbox::sandbox::NetworkPolicy =
+            serde_json::from_value(plan.policy_json()).unwrap();
+        let state = SharedState::new(16);
+        let destination: std::net::SocketAddr = "93.184.216.34:443".parse().unwrap();
+        state.cache_resolved_hostname(
+            "allowed.example",
+            ResolvedHostnameFamily::Ipv4,
+            vec![destination.ip()],
+            std::time::Duration::from_secs(60),
+        );
+        // Use the exact pinned SDK evaluator called by the UDP netstack.
+        assert_eq!(
+            policy.evaluate_egress(destination, Protocol::Udp, &state),
+            Action::Deny
+        );
+        assert_eq!(
+            policy.evaluate_egress(destination, Protocol::Tcp, &state),
+            Action::Allow
+        );
+        assert_eq!(
+            policy.evaluate_egress("93.184.216.35:443".parse().unwrap(), Protocol::Tcp, &state),
+            Action::Deny
+        );
+        assert_eq!(
+            policy.evaluate_dns_query(
+                &"allowed.example".parse::<DomainName>().unwrap(),
+                Protocol::Udp,
+                53
+            ),
+            Action::Allow
+        );
+        assert_eq!(
+            policy.evaluate_dns_query(
+                &"unlisted.example".parse::<DomainName>().unwrap(),
+                Protocol::Udp,
+                53
+            ),
+            Action::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_accepts_every_compiled_network_policy() {
+        use crate::data::config::builtin_network::{
+            BuiltinNetworkSettings, NetworkAllowEntry, NetworkMode,
+        };
+        use crate::engine::container::builtin::network;
+
+        let none = BuiltinNetworkSettings {
+            mode: NetworkMode::None,
+            ..Default::default()
+        };
+        let public = BuiltinNetworkSettings::default();
+        let allowlist = BuiltinNetworkSettings {
+            mode: NetworkMode::Allowlist,
+            allow: vec![
+                NetworkAllowEntry::Domain("api.example.test".into()),
+                NetworkAllowEntry::Suffix("example.org".into()),
+            ],
+            host_ports: vec![8765],
+            ..Default::default()
+        };
+        for settings in [none, public, allowlist] {
+            let plan = network::compile(&settings);
+            let policy: microsandbox::sandbox::NetworkPolicy =
+                serde_json::from_value(plan.policy_json()).unwrap();
+            assert_eq!(serde_json::to_value(&policy).unwrap(), plan.policy_json());
+            let builder =
+                Sandbox::builder("network-policy-test").image("example.com/fixture:latest");
+            let builder = if plan.enabled {
+                builder.network(|net| {
+                    net.policy(policy)
+                        .strict(plan.strict)
+                        .strict_sni(plan.strict)
+                        .trust_host_cas(plan.trust_host_cas)
+                        .dns(|dns| {
+                            dns.rebind_protection(true)
+                                .nameservers(plan.nameservers.clone())
+                        })
+                        .tls(|tls| tls.enabled(false))
+                })
+            } else {
+                builder.disable_network().network(|net| {
+                    net.policy(policy)
+                        .strict(plan.strict)
+                        .strict_sni(plan.strict)
+                        .trust_host_cas(plan.trust_host_cas)
+                        .dns(|dns| {
+                            dns.rebind_protection(true)
+                                .nameservers(plan.nameservers.clone())
+                        })
+                        .tls(|tls| tls.enabled(false))
+                })
+            };
+            let config = builder.build().await.unwrap();
+            let net = &config.spec.network;
+            assert_eq!(net.enabled, plan.enabled);
+            assert_eq!(net.strict, plan.strict);
+            assert_eq!(net.strict_sni, plan.strict);
+            let restored: microsandbox_network::config::NetworkConfig =
+                serde_json::from_value(serde_json::to_value(net).unwrap()).unwrap();
+            assert_eq!(restored.strict_sni, plan.strict);
+            assert_eq!(
+                serde_json::to_value(net.policy.as_ref().unwrap()).unwrap(),
+                plan.policy_json()
+            );
+            assert!(!net.tls.as_ref().unwrap().enabled);
+            assert!(net.ports.is_empty());
+            assert!(net.outbound_proxy.is_none());
+        }
+    }
+
+    #[test]
+    fn sdk_isolated_config_ignores_installed_msb_config() {
+        const CHILD: &str = "AWMAN_SDK_ISOLATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let home = std::env::var_os("HOME").unwrap();
+            let home = PathBuf::from(home);
+            let ambient = microsandbox::config::config_path();
+            let real_home = home.canonicalize().unwrap();
+            assert!(
+                ambient.starts_with(&home) || ambient.starts_with(&real_home),
+                "test config must stay in temp HOME"
+            );
+            std::fs::create_dir_all(ambient.parent().unwrap()).unwrap();
+            std::fs::write(
+                &ambient,
+                br#"{"home":"/tmp/hostile-msb-home","paths":{"msb":"/tmp/hostile-msb","libkrunfw":"/tmp/hostile-lib","agentd":"/tmp/hostile-agentd","cache":"/tmp/hostile-cache"}}"#,
+            )
+            .unwrap();
+            let paths = BuiltinPaths {
+                home: home.join("awman-state"),
+            };
+            let local = isolated_backend(&paths);
+            let config = local.config();
+            assert_eq!(config.home(), paths.home);
+            assert_eq!(config.cache_dir(), paths.home.join("cache"));
+            assert_eq!(config.sandboxes_dir(), paths.home.join("sandboxes"));
+            assert_eq!(config.volumes_dir(), paths.home.join("volumes"));
+            assert_eq!(config.snapshots_dir(), paths.home.join("snapshots"));
+            assert_eq!(config.logs_dir(), paths.home.join("logs"));
+            assert_eq!(config.secrets_dir(), paths.home.join("secrets"));
+            assert!(config.paths.agentd.is_none());
+            assert!(config.paths.msb.is_none());
+            assert!(config.paths.libkrunfw.is_none());
+            // A malformed installed document must not stop this constructor
+            // either; the ambient SDK constructor would fail here.
+            std::fs::write(&ambient, b"{ hostile config").unwrap();
+            let again = isolated_backend(&paths);
+            assert_eq!(again.config().home(), paths.home);
+            assert!(again.config().paths.agentd.is_none());
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("engine::container::builtin::msb_driver::tests::sdk_isolated_config_ignores_installed_msb_config")
+            .arg("--nocapture")
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    }
 
     #[test]
     fn image_accounts_are_bounded_and_an_invalid_upper_file_never_falls_back() {

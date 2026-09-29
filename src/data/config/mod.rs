@@ -1,6 +1,7 @@
 //! Configuration concerns for awman: per-repo config, global config, env-var
 //! reads, typed flag values, and the merged effective view.
 
+pub mod builtin_network;
 pub mod builtin_runtime;
 pub mod config_json;
 pub mod effective;
@@ -14,6 +15,9 @@ pub mod overlays;
 pub mod repo;
 pub mod runtime_selection;
 
+pub use builtin_network::{
+    BuiltinNetworkConfig, BuiltinNetworkSettings, NetworkAllowEntry, NetworkMode,
+};
 pub use builtin_runtime::BuiltinRuntimeConfig;
 pub use effective::EffectiveConfig;
 pub use env::{Env, EnvSnapshot};

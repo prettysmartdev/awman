@@ -1,0 +1,11 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling awman v0.12.0 (/workspace)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 52s
+     Running tests/builtin_runtime/main.rs (target/debug/deps/builtin_runtime-f9ada9ba7c874b91)
+
+running 2 tests
+test network_resources::network_probe_executes_fetch_and_rejects_missing_tools ... ok
+test network_resources::network_probe_rejects_tls_tool_and_http_failures_as_denial ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 0.08s
+

@@ -1,4 +1,4 @@
-use crate::{data::config::env::host_var, engine::error::EngineError};
+use crate::{data::config::env::host_var_os, engine::error::EngineError};
 
 pub fn resolve() -> Result<std::path::PathBuf, EngineError> {
     // The builder also reads SDK config/profile and path overrides not captured
@@ -18,7 +18,7 @@ pub fn resolve() -> Result<std::path::PathBuf, EngineError> {
         "MSB_LOGS_DIR",
         "MSB_SECRETS_DIR",
     ] {
-        if host_var(variable).is_some() {
+        if host_var_os(variable).is_some() {
             return Err(EngineError::AmbientRuntimeOverride {
                 variable: variable.into(),
             });

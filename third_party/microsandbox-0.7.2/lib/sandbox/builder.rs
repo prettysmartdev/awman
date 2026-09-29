@@ -1,0 +1,3793 @@
+//! Fluent builder for [`SandboxConfig`].
+
+use std::collections::{BTreeMap, HashSet};
+#[cfg(feature = "net")]
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[cfg(feature = "local")]
+use microsandbox_image::{PullProgressHandle, snapshot::SnapshotRootDisk};
+#[cfg(feature = "net")]
+use microsandbox_network::builder::{NetworkBuilder, SecretBuilder};
+#[cfg(feature = "net")]
+use microsandbox_network::policy::Rule;
+#[cfg(feature = "net")]
+use microsandbox_network::{OutboundProxyBuilder, OutboundProxyConfig};
+use microsandbox_types::{
+    CpuPlacement, EnvVar, PullPolicy, RegistryAuth, SandboxConfigPatch, VsockRouteSpec,
+    VsockSocketType,
+};
+#[cfg(feature = "net")]
+use microsandbox_types::{PortProtocol, PublishedPortSpec};
+
+use super::{
+    SandboxSpec,
+    config::{
+        RestoreOverrideIntent, SandboxConfig, SnapshotRestoreMode, sandbox_log_level_from_runtime,
+    },
+    exec::{Rlimit, RlimitResource},
+    init::{HandoffInit, InitOptionsBuilder},
+    types::{
+        DeploymentProfile, ImageBuilder, IntoImage, MountBuilder, Patch, PatchBuilder,
+        RootDiskBuilder, RootfsSource, SecurityProfile, VolumeMount,
+    },
+};
+#[cfg(any(feature = "local", windows))]
+use crate::Operation;
+#[cfg(feature = "local")]
+use crate::UnsupportedReason;
+#[cfg(feature = "local")]
+use crate::config::GlobalConfig;
+use crate::snapshot::SnapshotReference;
+use crate::{LogLevel, MicrosandboxError, MicrosandboxResult, size::Mebibytes};
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Builder for constructing a [`SandboxConfig`] with a fluent API.
+pub struct SandboxBuilder {
+    pub(crate) config: SandboxConfig,
+    detached: bool,
+    pub(crate) build_error: Option<crate::MicrosandboxError>,
+    cpus_explicit: bool,
+    memory_explicit: bool,
+    max_cpus_explicit: bool,
+    max_memory_explicit: bool,
+    /// Raw script snippets supplied through construction patches. They are materialized only when
+    /// building so later shell overrides determine their shebang.
+    config_scripts: BTreeMap<String, String>,
+    /// Pending backend-scoped snapshot reference, resolved during async `build()`.
+    pending_snapshot: Option<SnapshotReference>,
+    /// Distinguishes a sparse-patch snapshot, which later builder calls may override, from an
+    /// explicit restore call that retains the established mutual-exclusion validation.
+    pending_snapshot_from_config: bool,
+}
+
+/// Sub-builder for registry connection settings.
+#[derive(Default)]
+pub struct RegistryConfigBuilder {
+    pub(crate) auth: Option<RegistryAuth>,
+    pub(crate) insecure: bool,
+    pub(crate) ca_certs: Vec<Vec<u8>>,
+}
+
+impl RegistryConfigBuilder {
+    /// Set authentication credentials.
+    pub fn auth(mut self, auth: RegistryAuth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Access the registry over plain HTTP instead of HTTPS.
+    pub fn insecure(mut self) -> Self {
+        self.insecure = true;
+        self
+    }
+
+    /// Add PEM-encoded CA root certificates to trust.
+    pub fn ca_certs(mut self, pem_data: Vec<u8>) -> Self {
+        self.ca_certs.push(pem_data);
+        self
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl SandboxBuilder {
+    /// Select validation of authorized external filesystem mappings and captured handles.
+    /// Strict is the default; relaxed accepts supported mismatches with warnings.
+    /// Neither policy grants host access or waives full restore's required-resource checks.
+    pub(crate) fn external_mount_policy(
+        mut self,
+        policy: super::ExternalMountRestorePolicy,
+    ) -> Self {
+        self.config.external_mount_policy = policy;
+        self
+    }
+    /// Start building a sandbox configuration.
+    ///
+    /// The name must be unique among existing sandboxes (unless
+    /// [`replace`](Self::replace) is set) and no longer than 128 UTF-8 bytes.
+    /// Built-in defaults are applied first, followed by the active global `config.json`.
+    pub fn new(name: impl Into<String>) -> Self {
+        // Start with the hardcoded sandbox defaults.
+        let mut config = SandboxConfig::default();
+        config.spec.name = name.into();
+
+        let builder = Self {
+            config,
+            detached: false,
+            build_error: None,
+            cpus_explicit: false,
+            memory_explicit: false,
+            max_cpus_explicit: false,
+            max_memory_explicit: false,
+            config_scripts: BTreeMap::new(),
+            pending_snapshot: None,
+            pending_snapshot_from_config: false,
+        };
+
+        // Overlay the global `config.json` defaults on the hardcoded defaults.
+        builder.apply_global_config()
+    }
+
+    /// Overlay sparse sandbox configuration on the hardcoded and global defaults.
+    pub fn overlay(mut self, patch: SandboxConfigPatch) -> Self {
+        // Full restore may inherit omitted geometry, but must reject explicit mismatches.
+        // Preserve field presence before applying the patch; comparing resulting values with
+        // defaults would lose explicit requests that happen to equal those defaults.
+        let patch = patch.modify_resources(|resources| {
+            self.cpus_explicit |= resources.has_cpus();
+            self.memory_explicit |= resources.has_memory_mib();
+            self.max_cpus_explicit |= resources.has_max_cpus();
+            self.max_memory_explicit |= resources.has_max_memory_mib();
+            resources
+        });
+        patch.apply_to(&mut self.config.spec);
+        self
+    }
+
+    /// Apply the selected backend's defaults without requiring local support in cloud-only builds.
+    fn apply_global_config(self) -> Self {
+        #[cfg(feature = "local")]
+        {
+            let backend = crate::backend::default_backend();
+            if let Some(local) = backend.as_local() {
+                return self.with_local_defaults(local.config());
+            }
+        }
+        self
+    }
+
+    /// Apply host-owned defaults before caller-supplied configuration and builder methods.
+    #[cfg(feature = "local")]
+    pub(crate) fn with_local_defaults(mut self, config: &GlobalConfig) -> Self {
+        if let Err(error) = config.validate_sandbox_defaults() {
+            self.build_error = Some(error);
+            return self;
+        }
+
+        let defaults = &config.sandbox_defaults;
+        self.config.spec.resources.cpus = defaults.cpus;
+        self.config.spec.resources.max_cpus = defaults.cpus;
+        self.config.spec.resources.memory_mib = defaults.memory_mib;
+        self.config.spec.resources.max_memory_mib = defaults.memory_mib;
+        self.config.spec.resources.cpu_placement = defaults.cpu_placement;
+        self.config.spec.resources.placement_profile = defaults.placement_profile.clone();
+        self.config.spec.resources.thp = defaults.thp;
+        self.config.spec.runtime.shell = Some(defaults.shell.clone());
+        self.config.spec.runtime.workdir = defaults.workdir.clone();
+        self.config.spec.runtime.metrics_sample_interval_ms = defaults
+            .metrics_sample_interval_ms
+            .map(std::num::NonZero::get);
+        self.config.spec.runtime.disable_metrics_sample = defaults.disable_metrics_sample;
+        self.config.spec.runtime.log_level = config.log_level.map(sandbox_log_level_from_runtime);
+        self
+    }
+
+    /// Seed a builder from a full [`SandboxSpec`] JSON.
+    ///
+    /// Options chained afterwards override individual fields (last-wins), just as
+    /// on a builder from [`new`](Self::new). This is the Rust entry the FFI
+    /// `create_from_spec` path calls into, so both share one implementation.
+    pub fn from_spec_json(json: &str) -> MicrosandboxResult<Self> {
+        let spec: SandboxSpec = serde_json::from_str(json)
+            .map_err(|e| MicrosandboxError::InvalidConfig(e.to_string()))?;
+        Ok(Self::from(SandboxConfig::from(spec)))
+    }
+
+    /// Set the root filesystem image source.
+    ///
+    /// - **`&str` / `String`**: Paths starting with `/`, `./`, or `../` are treated as local
+    ///   paths. Everything else is treated as an OCI image reference. Disk image extensions
+    ///   (`.qcow2`, `.raw`, `.vmdk`) resolve to virtio-blk block device rootfs.
+    /// - **`PathBuf`**: Always treated as a local path.
+    ///
+    /// For explicit disk image configuration, see [`image_with`](Self::image_with).
+    ///
+    /// ```ignore
+    /// .image("python:3.12")       // OCI image
+    /// .image("./rootfs")          // local directory (bind mount)
+    /// .image("./ubuntu.qcow2")   // disk image (auto-detect fs)
+    /// ```
+    pub fn image(mut self, image: impl IntoImage) -> Self {
+        if self.pending_snapshot_from_config {
+            self.pending_snapshot = None;
+            self.pending_snapshot_from_config = false;
+        }
+        match image.into_rootfs_source() {
+            Ok(rootfs) => self.config.spec.image = rootfs,
+            Err(e) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(e);
+                }
+            }
+        }
+        self
+    }
+
+    /// Set the root filesystem image using a builder closure.
+    ///
+    /// ```ignore
+    /// .image_with(|i| i.oci("python:3.12").root_disk(8.gib()))
+    /// .image_with(|i| i.disk("./ubuntu.qcow2").fstype("ext4"))
+    /// ```
+    pub fn image_with(mut self, f: impl FnOnce(ImageBuilder) -> ImageBuilder) -> Self {
+        if self.pending_snapshot_from_config {
+            self.pending_snapshot = None;
+            self.pending_snapshot_from_config = false;
+        }
+        match f(ImageBuilder::new()).build() {
+            Ok(rootfs) => self.config.spec.image = rootfs,
+            Err(e) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(e);
+                }
+            }
+        }
+        self
+    }
+
+    /// Apply a CLI-selected image after discarding a lower-precedence configured snapshot.
+    #[doc(hidden)]
+    pub fn override_image(mut self, image: impl IntoImage) -> Self {
+        self.pending_snapshot = None;
+        self.pending_snapshot_from_config = false;
+        self.image(image)
+    }
+
+    /// Apply a CLI-selected image builder after discarding a configured snapshot.
+    #[doc(hidden)]
+    pub fn override_image_with(
+        mut self,
+        configure: impl FnOnce(ImageBuilder) -> ImageBuilder,
+    ) -> Self {
+        self.pending_snapshot = None;
+        self.pending_snapshot_from_config = false;
+        self.image_with(configure)
+    }
+
+    /// Apply a CLI-selected snapshot after discarding a lower-precedence configured image.
+    #[doc(hidden)]
+    pub fn override_snapshot(mut self, snapshot: impl Into<String>) -> Self {
+        self.config.spec.image = RootfsSource::oci("");
+        self.pending_snapshot = Some(SnapshotReference::auto(snapshot));
+        self.pending_snapshot_from_config = false;
+        self
+    }
+
+    /// Record a deferred configuration error, surfaced at `build()`. Keeps the
+    /// first error so the earliest misconfiguration wins.
+    pub(super) fn config_error(mut self, message: impl Into<String>) -> Self {
+        if self.build_error.is_none() {
+            self.build_error = Some(MicrosandboxError::InvalidConfig(message.into()));
+        }
+        self
+    }
+
+    /// Set a managed root disk of the given size for an OCI rootfs.
+    ///
+    /// Sugar for `root_disk_with(|d| d.size(size))`.
+    pub fn root_disk(self, size: impl Into<Mebibytes>) -> Self {
+        let size = size.into();
+        self.root_disk_with(|d| d.size(size))
+    }
+
+    /// Configure the writable rootfs layer (root disk) for an OCI rootfs.
+    ///
+    /// The root disk is a property of the OCI rootfs source, so this is sugar
+    /// over [`image_with`](Self::image_with) and requires an OCI image to be
+    /// set first. Prefer `image_with` when configuring the image and root disk
+    /// together; this method exists for call sites, such as CLIs, where the
+    /// image reference and its options are parsed separately.
+    ///
+    /// ```ignore
+    /// .image("python").root_disk_with(|d| d.tmpfs().size(2.gib()))
+    /// .image("python").root_disk_with(|d| d.disk_image("./scratch.img"))
+    /// ```
+    pub fn root_disk_with(
+        mut self,
+        configure: impl FnOnce(RootDiskBuilder) -> RootDiskBuilder,
+    ) -> Self {
+        let root_disk = match configure(RootDiskBuilder::default()).build() {
+            Ok(root_disk) => root_disk,
+            Err(e) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(e);
+                }
+                return self;
+            }
+        };
+        match &mut self.config.spec.image {
+            RootfsSource::Oci(oci) if !oci.reference.is_empty() => {
+                oci.root_disk = Some(root_disk);
+            }
+            RootfsSource::Oci(_) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(crate::MicrosandboxError::InvalidConfig(
+                        "root_disk() requires an OCI image to be set first".into(),
+                    ));
+                }
+            }
+            _ => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(crate::MicrosandboxError::InvalidConfig(
+                        "root_disk() is only valid for OCI images".into(),
+                    ));
+                }
+            }
+        }
+        self
+    }
+
+    /// Set the writable overlay upper size for an OCI rootfs.
+    #[deprecated(since = "0.6.0", note = "use `root_disk` instead")]
+    pub fn oci_upper_size(self, size: impl Into<Mebibytes>) -> Self {
+        self.root_disk(size)
+    }
+
+    /// Allocate virtual CPUs for this sandbox (default: 1).
+    pub fn cpus(mut self, count: u8) -> Self {
+        self.config.spec.resources.cpus = count;
+        self.cpus_explicit = true;
+        if !self.max_cpus_explicit || self.config.spec.resources.max_cpus < count {
+            self.config.spec.resources.max_cpus = count;
+        }
+        self
+    }
+
+    /// Set the boot-time maximum possible virtual CPUs.
+    ///
+    /// This reserves the CPU hotplug capacity the sandbox may use after live
+    /// resize support lands. It does not increase the effective vCPU count by
+    /// itself; use [`cpus`](Self::cpus) for the initial effective count.
+    pub fn max_cpus(mut self, count: u8) -> Self {
+        self.config.spec.resources.max_cpus = count;
+        self.max_cpus_explicit = true;
+        self
+    }
+
+    /// Select how vCPU threads are placed on host processors.
+    pub fn cpu_placement(mut self, policy: CpuPlacement) -> Self {
+        self.config.spec.resources.cpu_placement = policy;
+        self
+    }
+
+    /// Select a host-defined placement profile by name.
+    pub fn placement_profile(mut self, profile: impl Into<String>) -> Self {
+        self.config.spec.resources.placement_profile = Some(profile.into());
+        self
+    }
+
+    /// Set guest memory size.
+    ///
+    /// Accepts bare `u32` (interpreted as MiB) or a [`SizeExt`](crate::size::SizeExt) helper:
+    /// ```ignore
+    /// .memory(512)         // 512 MiB
+    /// .memory(512.mib())   // 512 MiB (explicit)
+    /// .memory(1.gib())     // 1 GiB = 1024 MiB
+    /// ```
+    pub fn memory(mut self, size: impl Into<Mebibytes>) -> Self {
+        let memory_mib = size.into().as_u32();
+        self.config.spec.resources.memory_mib = memory_mib;
+        self.memory_explicit = true;
+        if !self.max_memory_explicit || self.config.spec.resources.max_memory_mib < memory_mib {
+            self.config.spec.resources.max_memory_mib = memory_mib;
+        }
+        self
+    }
+
+    /// Set the boot-time maximum hotpluggable guest memory.
+    ///
+    /// This reserves memory hotplug capacity for future live resize support.
+    /// It does not increase the effective guest memory by itself; use
+    /// [`memory`](Self::memory) for the initial effective memory.
+    pub fn max_memory(mut self, size: impl Into<Mebibytes>) -> Self {
+        self.config.spec.resources.max_memory_mib = size.into().as_u32();
+        self.max_memory_explicit = true;
+        self
+    }
+
+    /// Select the guest transparent huge-page policy applied at boot.
+    ///
+    /// `Madvise` is the default and uses huge pages only for mappings that
+    /// request them. `Always` can improve large anonymous-memory workloads at
+    /// the cost of coarser memory allocation, while `Never` disables THP.
+    pub fn thp(mut self, policy: super::TransparentHugePagePolicy) -> Self {
+        self.config.spec.resources.thp = policy;
+        self
+    }
+
+    /// Restore a full snapshot using private copy-on-write memory.
+    ///
+    /// Clean pages can be shared by children; writes remain private. This requires
+    /// a full snapshot and cannot be combined with a fresh boot or disk-only restore.
+    pub(crate) fn forked(mut self) -> Self {
+        self.config.forked = true;
+        self
+    }
+
+    /// Set the runtime log level for the sandbox process.
+    ///
+    /// This controls the verbosity of the `msb machine` process.
+    pub fn log_level(mut self, level: LogLevel) -> Self {
+        self.config.spec.runtime.log_level = Some(sandbox_log_level_from_runtime(level));
+        self
+    }
+
+    /// Disable runtime logs for this sandbox, even if a global default exists.
+    pub fn quiet_logs(mut self) -> Self {
+        self.config.spec.runtime.log_level = None;
+        self
+    }
+
+    /// Configure whether the sandbox process is created in detached/background mode.
+    ///
+    /// Detached sandboxes survive the creating process. Defaults to `false`.
+    pub fn detached(mut self, detached: bool) -> Self {
+        self.detached = detached;
+        self
+    }
+
+    /// Force-disable metrics sampling regardless of `metrics_sample_interval`.
+    pub fn disable_metrics_sample(mut self) -> Self {
+        self.config.spec.runtime.disable_metrics_sample = true;
+        self
+    }
+
+    /// Override the metrics sampling interval; pass `Duration::ZERO` to disable.
+    pub fn metrics_sample_interval(mut self, interval: Duration) -> Self {
+        let ms = interval.as_millis();
+        if ms > u128::from(u64::MAX) {
+            if self.build_error.is_none() {
+                self.build_error = Some(MicrosandboxError::InvalidConfig(format!(
+                    "metrics sample interval {interval:?} overflows u64 milliseconds"
+                )));
+            }
+            return self;
+        }
+        self.config.spec.runtime.metrics_sample_interval_ms =
+            std::num::NonZero::new(ms as u64).map(std::num::NonZero::get);
+        self
+    }
+
+    /// Default working directory for commands executed in this sandbox
+    /// (e.g., `/app`). Used by [`exec`](super::Sandbox::exec),
+    /// [`shell`](super::Sandbox::shell), and [`attach`](super::Sandbox::attach)
+    /// unless overridden per-command.
+    pub fn workdir(mut self, path: impl Into<String>) -> Self {
+        self.config.spec.runtime.workdir = Some(path.into());
+        self
+    }
+
+    /// Shell used by [`shell()`](super::Sandbox::shell) to interpret
+    /// commands (default: `/bin/sh`).
+    pub fn shell(mut self, shell: impl Into<String>) -> Self {
+        self.config.spec.runtime.shell = Some(shell.into());
+        self
+    }
+
+    /// Configure registry connection settings (auth, TLS, insecure).
+    ///
+    /// ```rust,ignore
+    /// use microsandbox::{RegistryAuth, sandbox::Sandbox};
+    ///
+    /// let sb = Sandbox::builder("worker")
+    ///     .image("localhost:5050/my-app:latest")
+    ///     .registry(|r| r
+    ///         .auth(RegistryAuth::Basic {
+    ///             username: "user".into(),
+    ///             password: "pass".into(),
+    ///         })
+    ///         .insecure()
+    ///     )
+    ///     .create()
+    ///     .await
+    ///     .unwrap();
+    /// ```
+    pub fn registry(
+        mut self,
+        f: impl FnOnce(RegistryConfigBuilder) -> RegistryConfigBuilder,
+    ) -> Self {
+        let builder = f(RegistryConfigBuilder::default());
+        if let Some(auth) = builder.auth {
+            self.config.registry_auth = Some(auth);
+        }
+        self.config.insecure = builder.insecure;
+        self.config.ca_certs = builder.ca_certs;
+        self
+    }
+
+    /// Request a globally-unique slug for the sandbox (cloud backends only).
+    ///
+    /// Lowercase letters, digits, and single hyphens. When unset, the cloud
+    /// assigns one; create fails when the slug is already taken. The local
+    /// backend has no slugs and ignores this with a warning.
+    pub fn slug(mut self, slug: impl Into<String>) -> Self {
+        self.config.slug = Some(slug.into());
+        self
+    }
+
+    /// Replace an existing sandbox with the same name during create.
+    ///
+    /// If a sandbox with this name is already active, microsandbox stops
+    /// the prior instance before recreating it: SIGTERM, wait up to ten
+    /// seconds for a graceful exit, then SIGKILL. When the prior sandbox
+    /// is owned by an in-process `Sandbox` handle, the handle's
+    /// underlying child is signalled and reaped directly.
+    ///
+    /// To override the ten-second timeout, use [`replace_with_timeout`];
+    /// pass `Duration::ZERO` to skip SIGTERM and SIGKILL immediately.
+    ///
+    /// [`replace_with_timeout`]: Self::replace_with_timeout
+    pub fn replace(mut self) -> Self {
+        self.config.replace_existing = true;
+        self
+    }
+
+    /// Replace an existing sandbox, overriding the SIGTERM-to-SIGKILL
+    /// timeout. Implies [`replace`](Self::replace) — calling this alone
+    /// is enough.
+    ///
+    /// - `timeout > 0`: SIGTERM, wait up to `timeout`, then SIGKILL.
+    /// - `timeout == Duration::ZERO`: SIGKILL immediately (skip SIGTERM).
+    ///
+    /// The default timeout used by [`replace`](Self::replace) is ten
+    /// seconds. An expired timeout does not surface an error — the
+    /// existing sandbox is force-killed and `create()` proceeds.
+    pub fn replace_with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.replace_existing = true;
+        self.config.replace_with_timeout = timeout;
+        self
+    }
+
+    /// Override the OCI image entrypoint.
+    pub fn entrypoint(mut self, cmd: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.config.spec.runtime.entrypoint = Some(cmd.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Override the OCI image command used by default-workload execution.
+    ///
+    /// An empty array clears the image CMD. This describes durable configuration and does not
+    /// execute the command during sandbox creation.
+    pub fn cmd(mut self, cmd: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.config.spec.runtime.cmd = Some(cmd.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Select the foreground command for attached CLI `run`.
+    #[doc(hidden)]
+    pub fn foreground_command(
+        mut self,
+        command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config
+            .set_foreground_command(command.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Select the background command for detached CLI `run`.
+    ///
+    /// An empty command uses the image's default CMD. A non-empty command replaces CMD while
+    /// preserving the effective OCI entrypoint.
+    #[doc(hidden)]
+    pub fn background_command(
+        mut self,
+        command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.config
+            .set_background_command(command.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Hand off PID 1 to a guest init binary after agentd's setup.
+    ///
+    /// `cmd` is either an absolute path inside the guest rootfs or
+    /// the literal `"auto"`. Auto first honors a known init path at
+    /// the start of the image ENTRYPOINT, preserving attached
+    /// init-entrypoint commands when needed, then falls back to
+    /// guest-side probing of common distro init paths.
+    ///
+    /// ```ignore
+    /// .init("auto")
+    /// .init("/lib/systemd/systemd")
+    /// ```
+    ///
+    /// For init binaries that take argv or extra env (rare in
+    /// practice), use [`init_with`](Self::init_with).
+    ///
+    /// `init` and `entrypoint` are orthogonal: `init` is the guest's
+    /// PID 1; `entrypoint` is the user workload that agentd exec's
+    /// per request. They can be combined freely.
+    pub fn init(mut self, cmd: impl Into<String>) -> Self {
+        self.config.spec.init = Some(HandoffInit {
+            cmd: cmd.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+        });
+        self
+    }
+
+    /// Hand off PID 1 with a closure-builder for argv and env. Use this
+    /// when the init binary takes flags (e.g. systemd's
+    /// `--unit=multi-user.target`) or needs extra env vars.
+    ///
+    /// ```ignore
+    /// .init_with("/lib/systemd/systemd", |i| {
+    ///     i.args(["--unit=multi-user.target"])
+    ///      .env("container", "microsandbox")
+    /// })
+    /// ```
+    ///
+    /// Calling `.init` or `.init_with` more than once overwrites
+    /// (different from `.env`, which appends). The init is
+    /// pre-boot and one-shot.
+    pub fn init_with(
+        mut self,
+        cmd: impl Into<String>,
+        f: impl FnOnce(InitOptionsBuilder) -> InitOptionsBuilder,
+    ) -> Self {
+        let (args, env) = f(InitOptionsBuilder::default()).build();
+        self.config.spec.init = Some(HandoffInit {
+            cmd: cmd.into(),
+            args,
+            env,
+        });
+        self
+    }
+
+    /// Set the guest hostname. Limited to 64 UTF-8 bytes (the Linux UTS
+    /// limit). Defaults to a sandbox-name-derived form when unset.
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.config.spec.runtime.hostname = Some(hostname.into());
+        self
+    }
+
+    /// Set the user identity inside the sandbox (e.g., `"1000"`, `"appuser"`, `"1000:1000"`).
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.config.spec.runtime.user = Some(user.into());
+        self
+    }
+
+    /// Set the pull policy for OCI images.
+    pub fn pull_policy(mut self, policy: PullPolicy) -> Self {
+        self.config.spec.pull_policy = policy;
+        self
+    }
+
+    /// Disable all network access for this sandbox.
+    ///
+    /// Disables the network device entirely and sets the policy to
+    /// [`NetworkPolicy::none()`](microsandbox_network::policy::NetworkPolicy::none)
+    /// so the serialized config also reflects that networking is off.
+    ///
+    /// ```ignore
+    /// .disable_network()
+    /// ```
+    #[cfg(feature = "net")]
+    pub fn disable_network(mut self) -> Self {
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.enabled = false;
+                network.policy = microsandbox_network::policy::NetworkPolicy::none();
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
+        }
+        self
+    }
+
+    /// Configure networking via a closure.
+    ///
+    /// ```ignore
+    /// .network(|n| n
+    ///     .port(8080, 80)
+    ///     .policy(NetworkPolicy::default())
+    ///     .tls(|t| t.bypass("*.internal.com"))
+    /// )
+    /// ```
+    #[cfg(feature = "net")]
+    pub fn network(mut self, f: impl FnOnce(NetworkBuilder) -> NetworkBuilder) -> Self {
+        let network = match self.config.local_network_config() {
+            Ok(network) => network,
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+                return self;
+            }
+        };
+        match f(NetworkBuilder::from_config(network)).build() {
+            Ok(net) => {
+                if let Err(err) = self.config.set_local_network_config(net)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err.into());
+                }
+            }
+        }
+        self
+    }
+
+    /// Configure the single proxy used for outbound sandbox connections.
+    ///
+    /// Supports SOCKS4 for TCP and SOCKS5 for TCP and non-DNS UDP. The
+    /// proxy applies uniformly to TLS-intercepted and bypassed/plain TCP.
+    #[cfg(feature = "net")]
+    pub fn proxy<P>(mut self, configure: impl FnOnce(OutboundProxyBuilder) -> P) -> Self
+    where
+        P: OutboundProxyConfig,
+    {
+        use microsandbox_network::policy::BuildError::InvalidOutboundProxy;
+
+        let proxy = match configure(OutboundProxyBuilder::new()).build() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::from(InvalidOutboundProxy {
+                        reason: error.to_string(),
+                    }));
+                }
+                return self;
+            }
+        };
+
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.outbound_proxy = Some(proxy);
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
+        }
+        self
+    }
+
+    /// Prepend explicit rules while preserving a configured policy's defaults and existing rules.
+    #[cfg(feature = "net")]
+    #[doc(hidden)]
+    pub fn prepend_network_policy_rules(mut self, mut rules: Vec<Rule>) -> Self {
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                rules.append(&mut network.policy.rules);
+                network.policy.rules = rules;
+                if let Err(error) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(error);
+                }
+            }
+            Err(error) if self.build_error.is_none() => self.build_error = Some(error),
+            Err(_) => {}
+        }
+        self
+    }
+
+    /// Publish a TCP port directly on the sandbox builder.
+    ///
+    /// Repeatable: call multiple times to expose multiple ports.
+    ///
+    /// ```ignore
+    /// .port(8080, 80)
+    /// .port(3000, 3000)
+    /// ```
+    #[cfg(feature = "net")]
+    pub fn port(mut self, host_port: u16, guest_port: u16) -> Self {
+        self.push_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port,
+            guest_port,
+            PortProtocol::Tcp,
+        );
+        self
+    }
+
+    /// Publish a TCP port on a specific host bind address.
+    ///
+    /// ```ignore
+    /// .port_bind("0.0.0.0".parse().unwrap(), 8080, 80)
+    /// ```
+    #[cfg(feature = "net")]
+    pub fn port_bind(mut self, host_bind: IpAddr, host_port: u16, guest_port: u16) -> Self {
+        self.push_port(host_bind, host_port, guest_port, PortProtocol::Tcp);
+        self
+    }
+
+    #[cfg(feature = "net")]
+    fn push_port(
+        &mut self,
+        host_bind: IpAddr,
+        host_port: u16,
+        guest_port: u16,
+        protocol: PortProtocol,
+    ) {
+        self.config.spec.network.ports.push(PublishedPortSpec {
+            host_port,
+            guest_port,
+            protocol,
+            host_bind: host_bind.to_string(),
+        });
+    }
+
+    /// Publish a UDP port directly on the sandbox builder.
+    ///
+    /// Repeatable: call multiple times to expose multiple ports.
+    ///
+    /// ```ignore
+    /// .port_udp(5353, 53)
+    /// .port_udp(8125, 8125)
+    /// ```
+    #[cfg(feature = "net")]
+    pub fn port_udp(mut self, host_port: u16, guest_port: u16) -> Self {
+        self.push_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host_port,
+            guest_port,
+            PortProtocol::Udp,
+        );
+        self
+    }
+
+    /// Publish a UDP port on a specific host bind address.
+    #[cfg(feature = "net")]
+    pub fn port_udp_bind(mut self, host_bind: IpAddr, host_port: u16, guest_port: u16) -> Self {
+        self.push_port(host_bind, host_port, guest_port, PortProtocol::Udp);
+        self
+    }
+
+    /// Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port.
+    ///
+    /// Guest applications connect directly to host CID 2 and `port`. No
+    /// in-guest proxy or agentd integration is required.
+    pub fn vsock(mut self, host_path: impl AsRef<Path>, port: u32) -> Self {
+        self.config.spec.vsock.routes.push(VsockRouteSpec {
+            host_socket: host_path.as_ref().to_path_buf(),
+            port,
+            socket_type: VsockSocketType::Stream,
+        });
+        self
+    }
+
+    /// Expose a host Unix datagram socket on a guest-to-host vsock port.
+    ///
+    /// Datagram boundaries are preserved end to end. Delivery remains
+    /// best-effort, matching Unix and vsock datagram semantics. Windows does
+    /// not support datagram routes.
+    pub fn vsock_dgram(mut self, host_path: impl AsRef<Path>, port: u32) -> Self {
+        self.config.spec.vsock.routes.push(VsockRouteSpec {
+            host_socket: host_path.as_ref().to_path_buf(),
+            port,
+            socket_type: VsockSocketType::Dgram,
+        });
+        self
+    }
+
+    /// Add a fully specified guest-to-host vsock route.
+    pub fn vsock_route(mut self, route: VsockRouteSpec) -> Self {
+        self.config.spec.vsock.routes.push(route);
+        self
+    }
+
+    /// Add a secret with placeholder-based protection via a closure.
+    ///
+    /// The sandbox receives a placeholder; the real value is substituted
+    /// by the TLS proxy only for allowed hosts.
+    ///
+    /// ```ignore
+    /// .secret(|s| s
+    ///     .env("OPENAI_API_KEY")
+    ///     .value(api_key)
+    ///     .allow("api.openai.com")
+    /// )
+    /// ```
+    ///
+    /// Automatically enables TLS interception if not already enabled.
+    #[cfg(feature = "net")]
+    pub fn secret(self, f: impl FnOnce(SecretBuilder) -> SecretBuilder) -> Self {
+        self.secret_entry(f(SecretBuilder::new()).build())
+    }
+
+    /// Add a materialized secret entry.
+    #[cfg(feature = "net")]
+    pub fn secret_entry(
+        mut self,
+        entry: microsandbox_network::secrets::config::SecretEntry,
+    ) -> Self {
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.secrets.secrets.push(entry);
+                if !network.tls.enabled {
+                    network.tls.enabled = true;
+                }
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
+        }
+        self
+    }
+
+    /// Set the default action for blocked secret placeholders.
+    #[cfg(feature = "net")]
+    pub fn secret_violation_action(
+        mut self,
+        action: microsandbox_types::SecretViolationAction,
+    ) -> Self {
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.secrets.violation_action = action;
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) if self.build_error.is_none() => self.build_error = Some(err),
+            Err(_) => {}
+        }
+        self
+    }
+
+    /// Shorthand: add a secret with env var, value, and allowed host.
+    ///
+    /// Placeholder is auto-generated as `$MSB_<env_var>`.
+    /// Automatically enables TLS interception.
+    ///
+    /// ```ignore
+    /// .secret_env("OPENAI_API_KEY", api_key, "api.openai.com")
+    /// ```
+    ///
+    /// **Plaintext at rest.** The value is persisted verbatim in the durable
+    /// sandbox config and stays there until a later `modify` rotate with a
+    /// source reference migrates the entry. This path exists for embedders
+    /// who hold only a value (e.g. from their own vault); prefer
+    /// `.secret(|s| s.source(..))` when the value can be referenced instead.
+    /// Downstream behavior is identical either way: the guest sees only the
+    /// placeholder, the proxy injects the value for allowed hosts, and
+    /// in-memory copies are zeroized. When a host-side secret store lands,
+    /// this method will import the value and store a reference — same
+    /// signature, no more raw value at rest.
+    #[cfg(feature = "net")]
+    pub fn secret_env(
+        self,
+        env_var: impl Into<String>,
+        value: impl Into<String>,
+        allowed_host: impl Into<String>,
+    ) -> Self {
+        let env_var = env_var.into();
+        let value = value.into();
+        let allowed_host = allowed_host.into();
+        self.secret(|s| s.env(&env_var).value(value).allow(allowed_host))
+    }
+
+    /// Set an environment variable visible to all commands in this sandbox.
+    /// Can be called multiple times. Per-command env vars (on exec/shell)
+    /// are merged on top.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let key = key.into();
+        if key.starts_with("MSB_") {
+            if self.build_error.is_none() {
+                self.build_error = Some(crate::MicrosandboxError::InvalidConfig(format!(
+                    "environment variable {key:?} uses the reserved MSB_ prefix"
+                )));
+            }
+            return self;
+        }
+        self.config.spec.env.push(EnvVar::new(key, value));
+        self
+    }
+
+    /// Set multiple environment variables at once. See [`env`](Self::env).
+    pub fn envs(
+        mut self,
+        vars: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        for (k, v) in vars {
+            self = self.env(k, v);
+        }
+        self
+    }
+
+    /// Attach a label (`key`/`value`) to the sandbox for attribution.
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.spec.labels.insert(key.into(), value.into());
+        self
+    }
+
+    /// Attach multiple labels at once. See [`label`](Self::label).
+    pub fn labels(
+        mut self,
+        labels: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        for (k, v) in labels {
+            self.config.spec.labels.insert(k.into(), v.into());
+        }
+        self
+    }
+
+    /// Set a sandbox-wide resource limit inherited by all guest processes.
+    ///
+    /// This is applied during agentd PID 1 startup, so bootstrap scripts and
+    /// long-lived daemons inherit the raised baseline without needing explicit
+    /// per-exec rlimits.
+    pub fn rlimit(mut self, resource: RlimitResource, limit: u64) -> Self {
+        self.config.spec.rlimits.push(Rlimit {
+            resource,
+            soft: limit,
+            hard: limit,
+        });
+        self
+    }
+
+    /// Set a sandbox-wide resource limit with different soft/hard values.
+    pub fn rlimit_range(mut self, resource: RlimitResource, soft: u64, hard: u64) -> Self {
+        self.config.spec.rlimits.push(Rlimit {
+            resource,
+            soft,
+            hard,
+        });
+        self
+    }
+
+    /// Register a script that will be mounted at `/.msb/scripts/<name>` in
+    /// the guest. Scripts are added to `PATH` so they can be invoked by name
+    /// via [`exec`](super::Sandbox::exec).
+    pub fn script(mut self, name: impl Into<String>, content: impl Into<String>) -> Self {
+        let name = name.into();
+        self.config_scripts.remove(&name);
+        self.config
+            .spec
+            .runtime
+            .scripts
+            .insert(name, content.into());
+        self
+    }
+
+    /// Register multiple scripts at once. See [`script`](Self::script).
+    pub fn scripts(
+        mut self,
+        scripts: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        for (name, content) in scripts {
+            let name = name.into();
+            self.config_scripts.remove(&name);
+            self.config
+                .spec
+                .runtime
+                .scripts
+                .insert(name, content.into());
+        }
+        self
+    }
+
+    /// Mark the sandbox as ephemeral (or persistent).
+    ///
+    /// Ephemeral sandboxes are one-off: the host runtime that owns the
+    /// process removes the persisted DB row and on-disk state once the VM
+    /// reaches a terminal status, and other host runtimes opportunistically
+    /// clean up leftovers from runtimes that died first. This sets policy
+    /// intent only; enforcement is runtime-owned, never an SDK/CLI reaper.
+    /// Defaults to persistent (`false`).
+    ///
+    /// Note: removing an ephemeral sandbox also drops its logs and captured
+    /// output, since those live under the sandbox directory.
+    pub fn ephemeral(mut self, ephemeral: bool) -> Self {
+        self.config.spec.lifecycle.ephemeral = ephemeral;
+        self
+    }
+
+    /// Set a maximum sandbox lifetime in seconds.
+    pub fn max_duration(mut self, secs: u64) -> Self {
+        self.config.spec.lifecycle.max_duration_secs = Some(secs);
+        self
+    }
+
+    /// Auto-stop the sandbox after this many seconds of inactivity.
+    /// Inactivity is detected via agentd heartbeat. Omit to disable (default).
+    pub fn idle_timeout(mut self, secs: u64) -> Self {
+        self.config.spec.lifecycle.idle_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the in-guest security profile.
+    pub fn security(mut self, profile: SecurityProfile) -> Self {
+        self.config.spec.security_profile = profile;
+        self
+    }
+
+    /// Set the host-runtime deployment profile.
+    ///
+    /// Managed backends may replace this request with a platform-owned profile
+    /// before launch. The cloud create wire does not transmit this value.
+    pub fn deployment_profile(mut self, profile: DeploymentProfile) -> Self {
+        self.config.spec.deployment_profile = profile;
+        self
+    }
+
+    /// Add a volume mount using a closure-based builder.
+    ///
+    /// ```ignore
+    /// .volume("/data", |m| m.bind("/host/data"))
+    /// .volume("/config", |m| m.bind("/host/config").readonly())
+    /// .volume("/cache", |m| m.named("my-cache"))
+    /// .volume("/tmp", |m| m.tmpfs().size(100))
+    /// ```
+    pub fn volume(
+        mut self,
+        guest_path: impl Into<String>,
+        f: impl FnOnce(MountBuilder) -> MountBuilder,
+    ) -> Self {
+        match f(MountBuilder::new(guest_path)).build() {
+            Ok(mount) => self.config.spec.mounts.push(mount),
+            Err(e) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(e);
+                }
+            }
+        }
+        self
+    }
+
+    /// Apply rootfs patches using a builder closure.
+    ///
+    /// Patches are applied before VM start. Managed OCI roots bake patches into their writable
+    /// upper, flat OCI roots bake them into the private complete root disk, and bind roots patch
+    /// the host directory directly. User-owned disk-image roots and tmpfs roots reject patches.
+    ///
+    /// ```ignore
+    /// .patch(|p| p
+    ///     .text("/etc/app.conf", config_str, None, false)
+    ///     .copy_file("./cert.pem", "/etc/ssl/cert.pem", None, false)
+    ///     .mkdir("/var/cache/app", None)
+    /// )
+    /// ```
+    pub fn patch(mut self, f: impl FnOnce(PatchBuilder) -> PatchBuilder) -> Self {
+        self.config
+            .spec
+            .patches
+            .extend(f(PatchBuilder::new()).build());
+        self
+    }
+
+    /// Add a single patch directly.
+    pub fn add_patch(mut self, patch: Patch) -> Self {
+        self.config.spec.patches.push(patch);
+        self
+    }
+
+    /// Add one already-materialized volume mount.
+    #[doc(hidden)]
+    pub fn add_volume_mount(mut self, mount: VolumeMount) -> Self {
+        self.config.spec.mounts.push(mount);
+        self
+    }
+
+    /// Cold-boot only the disk state carried by a full snapshot.
+    ///
+    /// This is a restore policy, not a different artifact kind. It must be combined with
+    /// [`with_snapshot_reference`](Self::with_snapshot_reference), and the selected artifact must contain checkpoint
+    /// state. Memory, execution, and device state are deliberately ignored.
+    pub(crate) fn disk_only(mut self) -> Self {
+        self.config.snapshot_restore_mode = SnapshotRestoreMode::DiskOnly;
+        self
+    }
+
+    /// Supply the base snapshot or standalone archive for omitted disk layers and RAM objects.
+    pub(crate) fn snapshot_base(mut self, base: impl Into<String>) -> Self {
+        self.config.snapshot_base = Some(base.into());
+        self
+    }
+
+    /// Defer snapshot resolution to the selected backend.
+    ///
+    /// References returned by [`crate::snapshot::Snapshot::reference`] and
+    /// [`SnapshotHandle::reference`](crate::snapshot::SnapshotHandle::reference)
+    /// preserve whether the selected backend resolves the value as an
+    /// identifier or a path.
+    pub(crate) fn with_snapshot_reference(
+        mut self,
+        reference: impl Into<SnapshotReference>,
+    ) -> Self {
+        self.pending_snapshot = Some(reference.into());
+        self.pending_snapshot_from_config = false;
+        self
+    }
+
+    /// Record an already-resolved local snapshot artifact.
+    ///
+    /// This compatibility helper derives the artifact directory from
+    /// `upper_source`; creation still validates that directory's snapshot descriptor.
+    /// A loose disk file without a descriptor is not a snapshot and is rejected before
+    /// the destination is changed. New code should prefer [`Sandbox::restore_ref`](super::Sandbox::restore_ref),
+    /// which lets the selected backend resolve the snapshot without requiring
+    /// callers to inspect its storage layout.
+    pub fn snapshot_resolved(
+        mut self,
+        image_manifest_digest: impl Into<String>,
+        upper_source: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let upper_source = upper_source.into();
+        self.config.manifest_digest = Some(image_manifest_digest.into());
+        if let Some(artifact_dir) = upper_source.parent() {
+            self.config.snapshot_reference = Some(SnapshotReference::path(
+                artifact_dir.to_string_lossy().into_owned(),
+            ));
+        } else {
+            self =
+                self.config_error("snapshot upper source must have an artifact parent directory");
+        }
+        self
+    }
+
+    /// Build the configuration without creating the sandbox.
+    ///
+    /// Snapshot restoration uses [`Sandbox::restore`](super::Sandbox::restore)
+    /// instead of the public creation builder.
+    /// Backend-owned defaults were seeded before explicit builder methods were applied.
+    pub async fn build(mut self) -> MicrosandboxResult<SandboxConfig> {
+        self.materialize_config_scripts();
+        self.resolve_pending().await?;
+        self.validate()?;
+        let restore_overrides = self.restore_override_intent();
+        self.config.restore_overrides = restore_overrides;
+        Ok(self.config)
+    }
+
+    /// Apply raw scripts loaded from configuration after the final shell is known.
+    #[doc(hidden)]
+    pub fn config_scripts(mut self, scripts: BTreeMap<String, String>) -> Self {
+        self.config_scripts.extend(scripts);
+        self
+    }
+
+    fn materialize_config_scripts(&mut self) {
+        let shell = self.config.spec.runtime.shell.as_deref();
+        for (name, body) in std::mem::take(&mut self.config_scripts) {
+            if let Err(message) = validate_config_script_name(&name) {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::InvalidConfig(message));
+                }
+                continue;
+            }
+            self.config
+                .spec
+                .runtime
+                .scripts
+                .insert(name, wrap_config_script(shell, &body));
+        }
+    }
+
+    /// Resolve a restore source through the selected backend before any destination mutation.
+    async fn resolve_pending(&mut self) -> MicrosandboxResult<()> {
+        let Some(snapshot_ref) = self.pending_snapshot.take() else {
+            return Ok(());
+        };
+        self.pending_snapshot_from_config = false;
+        if self.has_explicit_rootfs_source() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "from_snapshot is mutually exclusive with explicit rootfs configuration".into(),
+            ));
+        }
+        if !self.config.spec.patches.is_empty() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "patches cannot be combined with from_snapshot".into(),
+            ));
+        }
+        // Capture explicit intent before backend dispatch: a direct archive resolves later,
+        // while an installed full snapshot checks geometry during this call.
+        self.config.restore_overrides = self.restore_override_intent();
+        let backend = crate::backend::default_backend();
+        backend
+            .snapshots()
+            .prepare_restore(backend.clone(), &mut self.config, snapshot_ref)
+            .await
+    }
+
+    fn restore_override_intent(&self) -> RestoreOverrideIntent {
+        RestoreOverrideIntent {
+            cpus: self.cpus_explicit,
+            max_cpus: self.max_cpus_explicit,
+            memory: self.memory_explicit,
+            max_memory: self.max_memory_explicit,
+        }
+    }
+
+    fn has_explicit_rootfs_source(&self) -> bool {
+        match &self.config.spec.image {
+            RootfsSource::Oci(oci) => !oci.reference.is_empty() || oci.root_disk.is_some(),
+            RootfsSource::Bind { path, .. } => !path.as_os_str().is_empty(),
+            RootfsSource::DiskImage { .. } => true,
+        }
+    }
+
+    /// Create the sandbox. Boots the VM with agentd ready.
+    pub async fn create(self) -> MicrosandboxResult<super::Sandbox> {
+        if self.detached {
+            return self.create_detached().await;
+        }
+        let config = self.build().await?;
+        super::Sandbox::create(config).await
+    }
+
+    /// Connect to the persisted sandbox with this name, or create it.
+    ///
+    /// Existing sandboxes keep their persisted configuration: running ones
+    /// are connected and stopped ones are started. Builder configuration is
+    /// used only when this call creates the sandbox. A concurrent creator is
+    /// handled by connecting to and converging on the winner.
+    pub async fn connect_or_create(self) -> MicrosandboxResult<super::Sandbox> {
+        if self.config.replace_existing {
+            return Err(MicrosandboxError::InvalidConfig(
+                "connect_or_create cannot be combined with replace_existing".to_string(),
+            ));
+        }
+
+        let name = self.config.spec.name.clone();
+        let detached = self.detached;
+        match super::Sandbox::get(&name).await {
+            Ok(handle) => return handle.connect_or_start_with_mode(detached).await,
+            Err(MicrosandboxError::SandboxNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        match self.create().await {
+            Ok(sandbox) => Ok(sandbox),
+            Err(MicrosandboxError::SandboxAlreadyExists(_)) => {
+                super::Sandbox::get(&name)
+                    .await?
+                    .connect_or_start_with_mode(detached)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Create the sandbox for detached/background use.
+    pub async fn create_detached(self) -> MicrosandboxResult<super::Sandbox> {
+        let config = self.build().await?;
+        super::Sandbox::create_detached(config).await
+    }
+
+    /// Create with image-pull, snapshot-preparation, and activation progress.
+    ///
+    /// Events are best-effort and never block creation. Await the task for the authoritative
+    /// result; dropping the progress receiver does not cancel it. Abort the task to cancel.
+    #[cfg(feature = "local")]
+    pub fn create_with_progress(
+        mut self,
+    ) -> crate::MicrosandboxResult<(
+        crate::CreationProgressHandle,
+        tokio::task::JoinHandle<crate::MicrosandboxResult<super::Sandbox>>,
+    )> {
+        let (handle, sender) = crate::progress::channel();
+        self.config.creation_progress = Some(sender.downgrade());
+        let task = tokio::spawn(async move {
+            if self.pending_snapshot.is_some() {
+                let _ = sender.try_send(crate::CreationProgress::Startup(
+                    crate::StartupProgress::phase(crate::StartupPhase::PreparingSnapshot),
+                ));
+            }
+            let (mut pull, pull_sender) = microsandbox_image::progress_channel();
+            let create = async {
+                let requested_detached = self.detached;
+                let config = self.build().await?;
+                let detached = requested_detached || config.resumed_from_full_snapshot();
+                let backend = crate::backend::default_backend();
+                match backend.kind() {
+                    crate::backend::BackendKind::Local => {
+                        let mode = if detached {
+                            crate::runtime::SpawnMode::Detached
+                        } else {
+                            crate::runtime::SpawnMode::Attached
+                        };
+                        let local = backend.as_local().ok_or_else(|| {
+                            MicrosandboxError::local_only(Operation::SandboxCreate)
+                        })?;
+                        local
+                            .create_sandbox(backend.clone(), config, mode, Some(pull_sender))
+                            .await
+                    }
+                    crate::backend::BackendKind::Cloud => {
+                        drop(pull_sender);
+                        if detached {
+                            backend
+                                .sandboxes()
+                                .create_detached(backend.clone(), config)
+                                .await
+                        } else {
+                            backend
+                                .sandboxes()
+                                .create(backend.clone(), config, true)
+                                .await
+                        }
+                    }
+                }
+            };
+            let forward = async {
+                while let Some(event) = pull.recv().await {
+                    let _ = sender.try_send(crate::CreationProgress::Pull(event));
+                }
+            };
+            // No detached forwarding task: cancellation drops both futures together.
+            let (result, ()) = tokio::join!(create, forward);
+            result
+        });
+        Ok((handle, task))
+    }
+
+    /// Create a detached sandbox with the same creation-progress stream.
+    #[cfg(feature = "local")]
+    pub fn create_detached_with_progress(
+        self,
+    ) -> crate::MicrosandboxResult<(
+        crate::CreationProgressHandle,
+        tokio::task::JoinHandle<crate::MicrosandboxResult<super::Sandbox>>,
+    )> {
+        self.detached(true).create_with_progress()
+    }
+
+    /// Create the sandbox with pull progress reporting.
+    ///
+    /// Returns a progress handle for per-layer pull events and a task handle
+    /// for the sandbox creation result. Useful for CLI commands that want to
+    /// display per-layer download/materialization progress during sandbox creation.
+    ///
+    /// Snapshot restoration has its own `RestoreBuilder::restore_with_progress`
+    /// terminal; both operations spawn work without blocking the caller.
+    #[cfg(feature = "local")]
+    pub fn create_with_pull_progress(
+        self,
+    ) -> crate::MicrosandboxResult<(
+        PullProgressHandle,
+        tokio::task::JoinHandle<crate::MicrosandboxResult<super::Sandbox>>,
+    )> {
+        let (handle, sender) = microsandbox_image::progress_channel();
+        let task = tokio::spawn(async move {
+            let requested_detached = self.detached;
+            let config = self.build().await?;
+            // Resumed execution is not a new foreground command owned by this caller. Its runtime
+            // must be detached before spawn; disarming an attached parent watchdog after startup
+            // races the creator's exit and leaves Windows in a kill-on-close job.
+            let detached = requested_detached || config.resumed_from_full_snapshot();
+            let backend = crate::backend::default_backend();
+            match backend.kind() {
+                crate::backend::BackendKind::Local => {
+                    let mode = if detached {
+                        crate::runtime::SpawnMode::Detached
+                    } else {
+                        crate::runtime::SpawnMode::Attached
+                    };
+                    // Pull progress is a local-only extension that is not part of
+                    // SandboxBackend::create, so dispatch to the local backend's
+                    // canonical create entry point explicitly.
+                    let local = backend
+                        .as_local()
+                        .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxCreate))?;
+                    local
+                        .create_sandbox(backend.clone(), config, mode, Some(sender))
+                        .await
+                }
+                crate::backend::BackendKind::Cloud => {
+                    drop(sender);
+                    if detached {
+                        backend
+                            .sandboxes()
+                            .create_detached(backend.clone(), config)
+                            .await
+                    } else {
+                        backend
+                            .sandboxes()
+                            .create(backend.clone(), config, true)
+                            .await
+                    }
+                }
+            }
+        });
+        Ok((handle, task))
+    }
+
+    /// Like `create_with_pull_progress` but spawns the sandbox process in detached
+    /// mode so the sandbox survives after the creating process exits.
+    #[cfg(feature = "local")]
+    pub fn create_detached_with_pull_progress(
+        self,
+    ) -> crate::MicrosandboxResult<(
+        PullProgressHandle,
+        tokio::task::JoinHandle<crate::MicrosandboxResult<super::Sandbox>>,
+    )> {
+        let (handle, sender) = microsandbox_image::progress_channel();
+        let task = tokio::spawn(async move {
+            let config = self.build().await?;
+            let backend = crate::backend::default_backend();
+            match backend.kind() {
+                crate::backend::BackendKind::Local => {
+                    let local = backend
+                        .as_local()
+                        .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxCreate))?;
+                    local
+                        .create_sandbox(
+                            backend.clone(),
+                            config,
+                            crate::runtime::SpawnMode::Detached,
+                            Some(sender),
+                        )
+                        .await
+                }
+                crate::backend::BackendKind::Cloud => {
+                    drop(sender);
+                    backend
+                        .sandboxes()
+                        .create_detached(backend.clone(), config)
+                        .await
+                }
+            }
+        });
+        Ok((handle, task))
+    }
+}
+
+impl SandboxBuilder {
+    /// Validate the configuration before building.
+    fn validate(&mut self) -> MicrosandboxResult<()> {
+        if let Some(err) = self.build_error.take() {
+            return Err(err);
+        }
+
+        if self.config.spec.name.is_empty() {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "sandbox name is required".into(),
+            ));
+        }
+        super::validate_sandbox_name(&self.config.spec.name)?;
+        super::validate_hostname(self.config.spec.runtime.hostname.as_deref())?;
+        if self.config.spec.resources.cpus == 0 {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "cpus must be greater than 0".into(),
+            ));
+        }
+        if self.config.spec.resources.memory_mib == 0 {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "memory must be greater than 0".into(),
+            ));
+        }
+        if self.config.spec.resources.max_cpus == 0 {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "max_cpus must be greater than 0".into(),
+            ));
+        }
+        if self.config.spec.resources.max_memory_mib == 0 {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "max_memory must be greater than 0".into(),
+            ));
+        }
+        if self.config.spec.resources.max_cpus < self.config.spec.resources.cpus {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "max_cpus {} must be greater than or equal to cpus {}",
+                self.config.spec.resources.max_cpus, self.config.spec.resources.cpus
+            )));
+        }
+        if self.config.spec.resources.max_memory_mib < self.config.spec.resources.memory_mib {
+            return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                "max_memory {} MiB must be greater than or equal to memory {} MiB",
+                self.config.spec.resources.max_memory_mib, self.config.spec.resources.memory_mib
+            )));
+        }
+
+        // Check that image is set (non-empty OCI string or Bind path). A direct
+        // archive restore resolves its pinned image while the local backend
+        // authenticates and streams the archive into child-owned staging. Keep
+        // that path single-pass instead of scanning the archive once here and
+        // then reading the payload again during creation.
+        match &self.config.spec.image {
+            RootfsSource::Oci(oci)
+                if oci.reference.is_empty() && self.config.snapshot_archive_source.is_some() =>
+            {
+                // The archive source is transient and cloud conversion rejects
+                // it explicitly, so only the local backend may defer this field.
+            }
+            RootfsSource::Oci(oci)
+                if oci.reference.is_empty() && self.config.snapshot_reference.is_none() =>
+            {
+                return Err(crate::MicrosandboxError::InvalidConfig(
+                    "image source is required".into(),
+                ));
+            }
+            RootfsSource::Oci(oci) => {
+                self.validate_root_disk(oci.root_disk.as_ref())?;
+            }
+            RootfsSource::DiskImage { .. } if !self.config.spec.patches.is_empty() => {
+                return Err(crate::MicrosandboxError::InvalidConfig(
+                    "patches are not compatible with disk image rootfs".into(),
+                ));
+            }
+            _ => {}
+        }
+        #[cfg(feature = "local")]
+        if self.config.snapshot_restore_mode == SnapshotRestoreMode::DiskOnly
+            && self.config.snapshot_archive_source.is_none()
+            && self.config.checkpoint_restore.is_none()
+        {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "disk_only must be combined with from_snapshot".into(),
+            ));
+        }
+        #[cfg(feature = "local")]
+        if self.config.forked
+            && (self.config.snapshot_restore_mode == SnapshotRestoreMode::DiskOnly
+                || (self.config.checkpoint_restore.is_none()
+                    && self.config.snapshot_archive_source.is_none()))
+        {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "forked requires a full snapshot restore and cannot be combined with disk_only"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "local")]
+        if self.config.checkpoint_restore.is_some() && !self.config.spec.patches.is_empty() {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "patches cannot be combined with full snapshot restore".into(),
+            ));
+        }
+        if self.config.snapshot_base.is_some() && self.config.snapshot_archive_source.is_none() {
+            return Err(crate::MicrosandboxError::InvalidConfig(
+                "snapshot_base requires from_snapshot with an archive path".into(),
+            ));
+        }
+
+        for rlimit in &self.config.spec.rlimits {
+            if rlimit.soft > rlimit.hard {
+                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    "rlimit {}: soft ({}) must not exceed hard ({})",
+                    rlimit.resource.as_str(),
+                    rlimit.soft,
+                    rlimit.hard
+                )));
+            }
+        }
+
+        super::types::validate_volume_mounts(&mut self.config.spec.mounts)?;
+        super::validate_env(&self.config.spec.env)?;
+        super::validate_labels(&self.config.spec.labels)?;
+        self.validate_vsock_routes()?;
+
+        if let Err(error) = microsandbox_types::resolve_default_command(
+            self.config.spec.runtime.entrypoint.as_deref(),
+            self.config.spec.runtime.cmd.as_deref(),
+            None,
+        ) && !matches!(
+            error,
+            microsandbox_types::CommandResolutionError::NoDefaultCommand
+        ) {
+            return Err(error.into());
+        }
+
+        if let Some(spec) = &self.config.spec.init {
+            super::init::validate(spec)?;
+        }
+
+        #[cfg(feature = "net")]
+        self.config
+            .local_network_config()?
+            .secrets
+            .validate()
+            .map_err(|err| {
+                crate::MicrosandboxError::InvalidConfig(format!("invalid network secrets: {err}"))
+            })?;
+
+        // Reject any two DiskImage mounts pointing at the same host file.
+        // Each virtio-blk device caches independently on the host, so any
+        // mix of writable+writable, writable+read-only, or even two
+        // read-only mounts of the same image will diverge from the
+        // kernel's view (RW invalidates the RO cache; RO+RO doubles the
+        // page-cache footprint with no benefit). Compare against the
+        // canonical path so symlinks and `./` prefixes don't bypass the
+        // check.
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for mount in &self.config.spec.mounts {
+            if let VolumeMount::DiskImage { host, .. } = mount {
+                let canonical = std::fs::canonicalize(host).map_err(|e| {
+                    crate::MicrosandboxError::InvalidConfig(format!(
+                        "disk image host path does not exist: {} ({e})",
+                        host.display()
+                    ))
+                })?;
+                if seen.contains(&canonical) {
+                    return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                        "disk-image volumes cannot share the same host path: {}",
+                        canonical.display()
+                    )));
+                }
+                seen.push(canonical);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate the stable route key and the host resources it references.
+    pub(crate) fn validate_vsock_routes(&self) -> MicrosandboxResult<()> {
+        if self.config.spec.deployment_profile == DeploymentProfile::MultiTenant
+            && !self.config.spec.vsock.is_empty()
+        {
+            return Err(MicrosandboxError::InvalidConfig(
+                "host vsock routes are disabled for multi-tenant deployments".into(),
+            ));
+        }
+
+        let mut routes = HashSet::new();
+
+        for route in &self.config.spec.vsock.routes {
+            #[cfg(unix)]
+            if !route.host_socket.is_absolute() {
+                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    "vsock host path must be absolute: {}",
+                    route.host_socket.display()
+                )));
+            }
+            #[cfg(windows)]
+            {
+                let path = route.host_socket.as_os_str().to_string_lossy();
+                let prefix = r"\\.\pipe\";
+                let local = path
+                    .get(..prefix.len())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix));
+                let name = path.get(prefix.len()..).unwrap_or_default();
+                if !local
+                    || name.is_empty()
+                    || name
+                        .split(['\\', '/'])
+                        .any(|part| part.is_empty() || part == "." || part == "..")
+                {
+                    return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                        "vsock host path must be a local Windows named pipe such as \\\\.\\pipe\\api: {}",
+                        route.host_socket.display()
+                    )));
+                }
+                if route.socket_type == VsockSocketType::Dgram {
+                    return Err(MicrosandboxError::unsupported(
+                        Operation::SandboxCreate,
+                        crate::UnsupportedReason::RequiresUnixHost,
+                    ));
+                }
+            }
+            if route.port == 0 || route.port == u32::MAX {
+                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    "vsock port {} must be between 1 and {}",
+                    route.port,
+                    u32::MAX - 1
+                )));
+            }
+            // libkrun uses datagram port 123 for host-to-guest clock updates
+            // on macOS. Reserving it everywhere keeps configurations portable.
+            if route.socket_type == VsockSocketType::Dgram && route.port == 123 {
+                return Err(crate::MicrosandboxError::InvalidConfig(
+                    "vsock datagram port 123 is reserved for guest clock synchronization".into(),
+                ));
+            }
+            if !routes.insert((route.socket_type, route.port)) {
+                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    "duplicate vsock {:?} route for port {}",
+                    route.socket_type, route.port
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Kind-specific root disk guards for an OCI rootfs.
+    fn validate_root_disk(
+        &self,
+        root_disk: Option<&super::types::RootDisk>,
+    ) -> MicrosandboxResult<()> {
+        use super::types::RootDisk;
+
+        match root_disk {
+            None | Some(RootDisk::Managed { size_mib: None }) => Ok(()),
+            Some(RootDisk::Managed { size_mib: Some(0) }) => {
+                Err(crate::MicrosandboxError::InvalidConfig(
+                    "root disk size must be greater than 0".into(),
+                ))
+            }
+            Some(RootDisk::Managed { .. }) => Ok(()),
+            Some(RootDisk::Tmpfs { size_mib }) => {
+                if *size_mib == Some(0) {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "root disk size must be greater than 0".into(),
+                    ));
+                }
+                // tmpfs pages come from guest RAM and the guest has no swap:
+                // writes past memory are an OOM kill, not ENOSPC.
+                if let Some(size) = size_mib
+                    && *size > self.config.spec.resources.memory_mib
+                {
+                    return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                        "tmpfs root disk size ({size} MiB) must not exceed sandbox memory ({} MiB)",
+                        self.config.spec.resources.memory_mib
+                    )));
+                }
+                if !self.config.spec.patches.is_empty() {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "patches require a managed or flat sandbox-owned root disk".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Some(RootDisk::DiskImage { path, .. }) => {
+                if path.as_os_str().is_empty() {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "disk-image root disk path must not be empty".into(),
+                    ));
+                }
+                if !self.config.spec.patches.is_empty() {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "patches require a managed or flat sandbox-owned root disk".into(),
+                    ));
+                }
+                if self.config.snapshot_upper_source.is_some()
+                    || self.config.snapshot_archive_source.is_some()
+                {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "from_snapshot requires a managed root disk".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Some(RootDisk::Flat {
+                size_mib, fstype, ..
+            }) => {
+                if *size_mib == Some(0) {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "flat root disk size must be greater than 0".into(),
+                    ));
+                }
+                if fstype.as_deref().unwrap_or("ext4") != "ext4" {
+                    return Err(crate::MicrosandboxError::InvalidConfig(
+                        "flat root disks currently support only fstype=ext4".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Populate local restore inputs without changing capture semantics during backend dispatch.
+#[cfg(feature = "local")]
+pub(crate) fn prepare_local_snapshot_restore(
+    config: &mut SandboxConfig,
+    snap: &crate::snapshot::Snapshot,
+) -> MicrosandboxResult<()> {
+    // A security profile is a boot-time guest policy, not a host-side restore override.
+    // Validate the caller's explicit intent before preparing any snapshot resources.
+    config
+        .restore_boot_overrides
+        .validate_scope(snap.manifest().scope, config.snapshot_restore_mode)?;
+    if config.spec.runtime.user.is_none() {
+        config.spec.runtime.user = snap.manifest().restore_defaults()?.user;
+    }
+    config.snapshot_parent = Some(snap.id().to_string());
+    let unsupported = snap.manifest().unsupported_requires();
+    if !unsupported.is_empty() {
+        return Err(crate::MicrosandboxError::unsupported(
+            Operation::SnapshotOps,
+            UnsupportedReason::NotAvailable(format!(
+                "snapshot requires unsupported runtime capabilities: {}",
+                unsupported.join(", ")
+            )),
+        ));
+    }
+    let snap_ref = snap.manifest().image.reference.clone();
+    config.spec.image = RootfsSource::oci(snap_ref);
+    config.manifest_digest = Some(snap.manifest().image.manifest_digest.clone());
+    apply_snapshot_root_layout(config, &snap.manifest().root_disk)?;
+
+    let file_state = match &snap.manifest().state {
+        crate::snapshot::SnapshotState::File(state) => state,
+        crate::snapshot::SnapshotState::Checkpoint(state) => {
+            if snap.manifest().scope != crate::snapshot::SnapshotScope::Full {
+                return Err(crate::MicrosandboxError::SnapshotIntegrity(
+                    "checkpoint state must use full snapshot scope".into(),
+                ));
+            }
+            let expected = microsandbox_image::checkpoint::ObjectId::new(&state.checkpoint_root)
+                .map_err(|error| crate::MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
+            let closure = snap.path()?.join(crate::snapshot::CHECKPOINT_DIRECTORY);
+            let opened = microsandbox_image::checkpoint::CheckpointClosure::inspect_manifest(
+                &closure,
+                Some(&expected),
+            )
+            .map_err(|error| crate::MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
+            if opened.checkpoint_id != state.checkpoint_id {
+                return Err(crate::MicrosandboxError::SnapshotIntegrity(
+                    "snapshot and checkpoint closure identities differ".into(),
+                ));
+            }
+            crate::snapshot::validate_checkpoint_owned_inventory(snap.manifest(), &opened)?;
+            if config.snapshot_restore_mode == SnapshotRestoreMode::Full {
+                if opened.architecture != std::env::consts::ARCH {
+                    return Err(crate::MicrosandboxError::SnapshotIntegrity(
+                        "checkpoint architecture cannot restore on this host".into(),
+                    ));
+                }
+                let restore_overrides = config.restore_overrides;
+                apply_checkpoint_restore_constraints(config, state, &opened, restore_overrides)?;
+                config.suppress_launch_for_full_restore();
+            }
+            config.checkpoint_restore =
+                Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+                    memory_descriptor: false,
+                    network_gateway_mac: if config.snapshot_restore_mode
+                        == SnapshotRestoreMode::Full
+                    {
+                        microsandbox_runtime::checkpoint::captured_gateway_mac(&opened.resources)
+                            .map_err(crate::MicrosandboxError::SnapshotIntegrity)?
+                    } else {
+                        None
+                    },
+                    external_mount_policy: config.external_mount_policy,
+                    external_mounts: Vec::new(),
+                    unavailable_disks: Default::default(),
+                    local_branch: false,
+                    forked: false,
+                    closure,
+                    checkpoint_root: state.checkpoint_root.clone(),
+                    checkpoint_id: state.checkpoint_id.clone(),
+                });
+            return Ok(());
+        }
+    };
+    if config.snapshot_restore_mode == SnapshotRestoreMode::DiskOnly {
+        return Err(crate::MicrosandboxError::InvalidConfig(
+            "disk_only requires a full snapshot with checkpoint state".into(),
+        ));
+    }
+    if snap.manifest().scope != crate::snapshot::SnapshotScope::Disk {
+        return Err(crate::MicrosandboxError::SnapshotIntegrity(
+            "file state must use disk snapshot scope".into(),
+        ));
+    }
+    if file_state.filesystem != "ext4" {
+        return Err(crate::MicrosandboxError::unsupported(
+            Operation::SnapshotOps,
+            UnsupportedReason::NotAvailable(format!(
+                "snapshot file state {:?}/{} is not qualified for restore",
+                file_state.disk_format, file_state.filesystem
+            )),
+        ));
+    }
+    config.snapshot_root_layer_sources = file_state
+        .layers
+        .iter()
+        .map(|layer| {
+            Ok(microsandbox_runtime::launch::RootfsUpperLayerConfig {
+                path: snap.layer_path(layer)?,
+                format: match layer.format {
+                    crate::snapshot::SnapshotFormat::Raw => "raw",
+                    crate::snapshot::SnapshotFormat::Qcow2 => "qcow2",
+                }
+                .into(),
+            })
+        })
+        .collect::<MicrosandboxResult<Vec<_>>>()?;
+    config.snapshot_root_virtual_size = Some(file_state.virtual_size);
+    let owned = snap.manifest().owned_volumes()?;
+    if !owned.is_empty() {
+        config.snapshot_owned_source = Some((snap.path()?.to_path_buf(), owned));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "local")]
+pub(crate) fn apply_snapshot_root_layout(
+    config: &mut SandboxConfig,
+    layout: &SnapshotRootDisk,
+) -> MicrosandboxResult<()> {
+    let RootfsSource::Oci(oci) = &mut config.spec.image else {
+        return Err(MicrosandboxError::SnapshotIntegrity(
+            "snapshot image did not resolve to an OCI rootfs".into(),
+        ));
+    };
+    oci.root_disk = Some(match layout {
+        SnapshotRootDisk::Managed => microsandbox_types::RootDisk::Managed { size_mib: None },
+        SnapshotRootDisk::Flat => microsandbox_types::RootDisk::Flat {
+            size_mib: None,
+            fstype: Some("ext4".into()),
+            clone: microsandbox_types::FlatClone::Auto,
+        },
+        SnapshotRootDisk::Tmpfs { size_mib } => microsandbox_types::RootDisk::Tmpfs {
+            size_mib: *size_mib,
+        },
+    });
+    Ok(())
+}
+
+fn validate_config_script_name(name: &str) -> Result<(), String> {
+    let path = std::path::Path::new(name);
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.as_bytes().contains(&0)
+        || name.contains(['/', '\\'])
+        || path.file_name().and_then(|part| part.to_str()) != Some(name)
+    {
+        return Err(format!(
+            "script name {name:?} must be a single non-empty filename"
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the immutable VM geometry and effective guest network identity carried by a checkpoint.
+///
+/// Installed snapshots call this while resolving the builder. Archive restores call it after the
+/// descriptor and closure have streamed into child staging.
+#[cfg(feature = "local")]
+pub(crate) fn apply_checkpoint_restore_constraints(
+    config: &mut SandboxConfig,
+    state: &crate::snapshot::CheckpointSnapshotState,
+    checkpoint: &microsandbox_image::checkpoint::CheckpointManifest,
+    overrides: RestoreOverrideIntent,
+) -> MicrosandboxResult<()> {
+    // Keep this guard at the shared boundary as well: archive descriptors are resolved later
+    // than installed snapshots, and must not silently discard a requested boot policy.
+    config.restore_boot_overrides.validate_scope(
+        crate::snapshot::SnapshotScope::Full,
+        config.snapshot_restore_mode,
+    )?;
+    // The summary is for inspection, not an independent source of VM layout.
+    // Reject disagreement before applying configuration or preparing child disks.
+    let geometry = checkpoint.geometry;
+    for (key, expected) in [
+        ("vcpus", u64::from(geometry.vcpus)),
+        ("max_vcpus", u64::from(geometry.max_vcpus)),
+        ("memory_mib", u64::from(geometry.memory_mib)),
+        ("max_memory_mib", u64::from(geometry.max_memory_mib)),
+    ] {
+        if checkpoint_requirement_u64(state, key)? != expected {
+            return Err(MicrosandboxError::SnapshotIntegrity(format!(
+                "checkpoint restore summary disagrees with captured geometry for {key}"
+            )));
+        }
+    }
+    apply_checkpoint_resources(config, state, overrides)?;
+    apply_capture_network(config, &checkpoint.resources)
+}
+
+#[cfg(feature = "local")]
+pub(crate) fn apply_capture_network(
+    config: &mut SandboxConfig,
+    captured_resources: &[microsandbox_image::checkpoint::ResourceDescriptor],
+) -> MicrosandboxResult<()> {
+    // Reject missing gateway identity before creating child-owned disk state.
+    microsandbox_runtime::checkpoint::captured_gateway_mac(captured_resources)
+        .map_err(MicrosandboxError::SnapshotIntegrity)?;
+    let mut resources = captured_resources
+        .iter()
+        .filter(|resource| resource.kind == "network");
+    let Some(resource) = resources.next() else {
+        if !config.spec.network.ports.is_empty() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "a checkpoint without a network device cannot restore published ports".into(),
+            ));
+        }
+        config.spec.network.enabled = false;
+        config.spec.network.interface = None;
+        return Ok(());
+    };
+    if resources.next().is_some() {
+        return Err(MicrosandboxError::SnapshotIntegrity(
+            "checkpoint contains more than one guest network resource".into(),
+        ));
+    }
+    if !config.spec.network.enabled {
+        return Err(MicrosandboxError::InvalidConfig(
+            "a checkpoint with a network device cannot restore with networking disabled".into(),
+        ));
+    }
+    let encoded = resource.binding.get("guest_network").ok_or_else(|| {
+        MicrosandboxError::SnapshotIntegrity(
+            "checkpoint network resource has no effective guest binding".into(),
+        )
+    })?;
+    let network: microsandbox_protocol::bootstrap::BootstrapNetwork = serde_json::from_str(encoded)
+        .map_err(|error| {
+            MicrosandboxError::SnapshotIntegrity(format!(
+                "checkpoint guest network binding is invalid: {error}"
+            ))
+        })?;
+    if network.interface != "eth0" {
+        return Err(MicrosandboxError::SnapshotIntegrity(format!(
+            "checkpoint guest network interface {:?} is unsupported",
+            network.interface
+        )));
+    }
+    let interface = microsandbox_types::InterfaceOverrides {
+        mac: Some(network.mac),
+        mtu: Some(network.mtu),
+        ipv4_address: network.ipv4.map(|ipv4| ipv4.address),
+        ipv4_pool: None,
+        ipv6_address: network.ipv6.map(|ipv6| ipv6.address),
+        ipv6_pool: None,
+    };
+    if config
+        .spec
+        .network
+        .interface
+        .as_ref()
+        .is_some_and(|requested| checkpoint_network_override_conflicts(requested, &interface))
+    {
+        return Err(MicrosandboxError::InvalidConfig(
+            "full snapshot restore cannot change the captured guest network identity".into(),
+        ));
+    }
+    config.spec.network.interface = Some(interface);
+    Ok(())
+}
+
+/// Return whether an explicitly populated guest-interface field conflicts with the captured
+/// effective identity. An empty `InterfaceOverrides` is the normal result of round-tripping local
+/// network defaults through the shared spec and must not be mistaken for an explicit override.
+#[cfg(feature = "local")]
+fn checkpoint_network_override_conflicts(
+    requested: &microsandbox_types::InterfaceOverrides,
+    captured: &microsandbox_types::InterfaceOverrides,
+) -> bool {
+    requested.mac.is_some_and(|value| Some(value) != captured.mac)
+        || requested
+            .mtu
+            .is_some_and(|value| Some(value) != captured.mtu)
+        || requested
+            .ipv4_address
+            .is_some_and(|value| Some(value) != captured.ipv4_address)
+        || requested
+            .ipv6_address
+            .is_some_and(|value| Some(value) != captured.ipv6_address)
+        // Pools derive an identity from the destination slot, which cannot be substituted for the
+        // effective address already present in the restored guest and device state.
+        || requested.ipv4_pool.is_some()
+        || requested.ipv6_pool.is_some()
+}
+
+#[cfg(feature = "local")]
+fn apply_checkpoint_resources(
+    config: &mut SandboxConfig,
+    state: &crate::snapshot::CheckpointSnapshotState,
+    overrides: RestoreOverrideIntent,
+) -> MicrosandboxResult<()> {
+    let vcpus = u8::try_from(checkpoint_requirement_u64(state, "vcpus")?).map_err(|_| {
+        MicrosandboxError::SnapshotIntegrity("checkpoint vCPU count exceeds u8".into())
+    })?;
+    let max_vcpus =
+        u8::try_from(checkpoint_requirement_u64(state, "max_vcpus")?).map_err(|_| {
+            MicrosandboxError::SnapshotIntegrity("checkpoint maximum vCPU count exceeds u8".into())
+        })?;
+    let memory_mib =
+        u32::try_from(checkpoint_requirement_u64(state, "memory_mib")?).map_err(|_| {
+            MicrosandboxError::SnapshotIntegrity("checkpoint memory exceeds u32 MiB".into())
+        })?;
+    let max_memory_mib = u32::try_from(checkpoint_requirement_u64(state, "max_memory_mib")?)
+        .map_err(|_| {
+            MicrosandboxError::SnapshotIntegrity("checkpoint maximum memory exceeds u32 MiB".into())
+        })?;
+    if (overrides.cpus && config.spec.resources.cpus != vcpus)
+        || (overrides.max_cpus && config.spec.resources.max_cpus != max_vcpus)
+        || (overrides.memory && config.spec.resources.memory_mib != memory_mib)
+        || (overrides.max_memory && config.spec.resources.max_memory_mib != max_memory_mib)
+    {
+        return Err(MicrosandboxError::InvalidConfig(
+            "a full snapshot must restore with its captured CPU and memory geometry".into(),
+        ));
+    }
+    config.spec.resources.cpus = vcpus;
+    config.spec.resources.max_cpus = max_vcpus;
+    config.spec.resources.memory_mib = memory_mib;
+    config.spec.resources.max_memory_mib = max_memory_mib;
+    Ok(())
+}
+
+#[cfg(feature = "local")]
+fn checkpoint_requirement_u64(
+    state: &crate::snapshot::CheckpointSnapshotState,
+    key: &str,
+) -> MicrosandboxResult<u64> {
+    state
+        .requirements_summary
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            MicrosandboxError::SnapshotIntegrity(format!(
+                "checkpoint snapshot is missing numeric restore requirement {key:?}"
+            ))
+        })
+}
+
+fn wrap_config_script(shell: Option<&str>, body: &str) -> String {
+    let shell = shell.unwrap_or("/bin/sh");
+    let mut script = if shell.contains('/') {
+        format!("#!{shell}")
+    } else {
+        format!("#!/usr/bin/env {shell}")
+    };
+    script.push('\n');
+    script.push_str(body);
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+    script
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl From<SandboxConfig> for SandboxBuilder {
+    fn from(config: SandboxConfig) -> Self {
+        Self {
+            config,
+            detached: false,
+            build_error: None,
+            cpus_explicit: true,
+            memory_explicit: true,
+            max_cpus_explicit: true,
+            max_memory_explicit: true,
+            config_scripts: BTreeMap::new(),
+            pending_snapshot: None,
+            pending_snapshot_from_config: false,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "local"))]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        SandboxBuilder, apply_checkpoint_resources, checkpoint_network_override_conflicts,
+    };
+    use crate::LogLevel;
+    use crate::sandbox::config::RestoreOverrideIntent;
+    use crate::sandbox::{MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RlimitResource};
+    #[cfg(feature = "net")]
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[cfg(feature = "net")]
+    use microsandbox_network::config::ConnectionLimit;
+    #[cfg(feature = "net")]
+    use microsandbox_network::secrets::config::{HostPattern, SecretEntry, SecretSubstitution};
+    use microsandbox_types::{
+        CpuPlacement, DeploymentProfile, SandboxConfigPatch, SandboxLogLevel,
+        SandboxResourcesPatch, TransparentHugePagePolicy, VolumeMount, VsockSocketType,
+    };
+    #[cfg(feature = "net")]
+    use microsandbox_types::{PortProtocol, SecretSource};
+
+    #[cfg(feature = "cloud")]
+    use crate::backend::{CloudBackend, with_backend};
+    use crate::snapshot::SnapshotReference;
+
+    fn checkpoint_state_with_geometry(
+        vcpus: u8,
+        max_vcpus: u8,
+        memory_mib: u32,
+        max_memory_mib: u32,
+    ) -> crate::snapshot::CheckpointSnapshotState {
+        crate::snapshot::CheckpointSnapshotState {
+            checkpoint_id: "checkpoint_test".into(),
+            checkpoint_root:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            restore_intents: vec!["clone".into()],
+            requirements_summary: BTreeMap::from([
+                ("vcpus".into(), serde_json::Value::from(vcpus)),
+                ("max_vcpus".into(), serde_json::Value::from(max_vcpus)),
+                ("memory_mib".into(), serde_json::Value::from(memory_mib)),
+                (
+                    "max_memory_mib".into(),
+                    serde_json::Value::from(max_memory_mib),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn deployment_profile_sets_sandbox_spec() {
+        let builder =
+            SandboxBuilder::new("profile-test").deployment_profile(DeploymentProfile::MultiTenant);
+
+        assert_eq!(
+            builder.config.spec.deployment_profile,
+            DeploymentProfile::MultiTenant
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_sets_runtime_log_level() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .log_level(LogLevel::Debug)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.runtime.log_level, Some(SandboxLogLevel::Debug));
+    }
+
+    #[tokio::test]
+    async fn test_builder_builds_config_with_shared_spec() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .cpus(2)
+            .max_cpus(4)
+            .cpu_placement(CpuPlacement::Spread)
+            .memory(1024)
+            .max_memory(4096)
+            .thp(TransparentHugePagePolicy::Always)
+            .log_level(LogLevel::Info)
+            .env("A", "B")
+            .script("setup", "echo hi")
+            .max_duration(60)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.name, "test");
+        assert_eq!(config.spec.resources.cpus, 2);
+        assert_eq!(config.spec.resources.max_cpus, 4);
+        assert_eq!(config.spec.resources.cpu_placement, CpuPlacement::Spread);
+        assert_eq!(config.spec.resources.memory_mib, 1024);
+        assert_eq!(config.spec.resources.max_memory_mib, 4096);
+        assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+        assert_eq!(config.spec.runtime.log_level, Some(SandboxLogLevel::Info));
+        assert_eq!(config.spec.env.len(), 1);
+        assert_eq!(
+            config.spec.runtime.scripts.get("setup"),
+            Some(&"echo hi".into())
+        );
+        assert_eq!(config.spec.lifecycle.max_duration_secs, Some(60));
+    }
+
+    #[tokio::test]
+    async fn test_builder_preserves_cmd_override_and_explicit_clears() {
+        let configured = SandboxBuilder::new("test")
+            .image("alpine")
+            .cmd(["worker.py", "--once"])
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            configured.spec.runtime.cmd,
+            Some(vec!["worker.py".to_string(), "--once".to_string()])
+        );
+
+        let cleared = SandboxBuilder::new("test")
+            .image("alpine")
+            .entrypoint(Vec::<String>::new())
+            .cmd(Vec::<String>::new())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(cleared.spec.runtime.entrypoint, Some(Vec::new()));
+        assert_eq!(cleared.spec.runtime.cmd, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn test_builder_accepts_128_byte_sandbox_name() {
+        let name = "x".repeat(MAX_SANDBOX_NAME_BYTES);
+        let config = SandboxBuilder::new(name.clone())
+            .image("alpine")
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.name, name);
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_over_128_byte_sandbox_name() {
+        let name = "x".repeat(MAX_SANDBOX_NAME_BYTES + 1);
+        let err = SandboxBuilder::new(name)
+            .image("alpine")
+            .build()
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid config: sandbox name must be at most 128 characters: got 129"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_zero_cpus() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .cpus(0)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cpus must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_zero_memory() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .memory(0)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("memory must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_max_cpus_below_effective_cpus() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .cpus(4)
+            .max_cpus(2)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("max_cpus 2 must be greater than or equal to cpus 4")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_max_memory_below_effective_memory() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .memory(2048)
+            .max_memory(1024)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("max_memory 1024 MiB must be greater than or equal to memory 2048 MiB")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_accepts_64_byte_hostname() {
+        let hostname = "y".repeat(MAX_HOSTNAME_BYTES);
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .hostname(hostname.clone())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.spec.runtime.hostname.as_deref(),
+            Some(hostname.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_over_64_byte_hostname() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .hostname("y".repeat(MAX_HOSTNAME_BYTES + 1))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid config: hostname is too long: 65 bytes (max 64)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_empty_hostname() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .hostname("")
+            .build()
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid config: hostname must not be empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_image_with_root_disk() {
+        let config = SandboxBuilder::new("test")
+            .image_with(|i| i.oci("alpine").root_disk(8192u32))
+            .build()
+            .await
+            .unwrap();
+
+        match &config.spec.image {
+            super::RootfsSource::Oci(oci) => {
+                assert_eq!(oci.reference, "alpine");
+                assert_eq!(oci.root_disk, Some(crate::sandbox::RootDisk::managed(8192)));
+            }
+            other => panic!("expected Oci, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_leaves_backend_root_disk_default_unmaterialized() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.spec.image.oci_root_disk().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_builder_root_disk_rejects_bind_rootfs() {
+        let err = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .root_disk(8192u32)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("only valid for OCI images"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_root_disk_rejects_disk_image_rootfs() {
+        let err = SandboxBuilder::new("test")
+            .image_with(|i| i.disk("./rootfs.qcow2"))
+            .root_disk(8192u32)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("only valid for OCI images"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_tmpfs_root_disk_rejects_size_over_memory() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .memory(1024u32)
+            .root_disk_with(|d| d.tmpfs().size(2048u32))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("must not exceed sandbox memory"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_tmpfs_root_disk_rejects_patches() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .root_disk_with(|d| d.tmpfs())
+            .patch(|p| p.text("/etc/motd", "hello", None, true))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("sandbox-owned root disk"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_accepts_flat_root_disk() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .root_disk_with(|disk| {
+                disk.flat()
+                    .size(8192u32)
+                    .clone_strategy(crate::sandbox::FlatClone::Copy)
+            })
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&crate::sandbox::RootDisk::Flat {
+                size_mib: Some(8192),
+                fstype: None,
+                clone: crate::sandbox::FlatClone::Copy,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_flat_root_disk_accepts_patches() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .root_disk_with(|disk| disk.flat())
+            .patch(|patch| patch.text("/etc/motd", "hello", None, true))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            config.spec.image.oci_root_disk(),
+            Some(crate::sandbox::RootDisk::Flat { .. })
+        ));
+        assert_eq!(config.spec.patches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_builder_deprecated_oci_upper_size_alias() {
+        #[allow(deprecated)]
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .oci_upper_size(8192u32)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.spec.image.oci_root_disk(),
+            Some(&crate::sandbox::RootDisk::managed(8192))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_snapshot_rejects_explicit_oci_image() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .with_snapshot_reference(SnapshotReference::auto("/tmp/missing-snapshot"))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("from_snapshot is mutually exclusive")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_snapshot_rejects_explicit_root_disk() {
+        let err = SandboxBuilder::new("test")
+            .image_with(|i| i.oci("").root_disk(8192u32))
+            .with_snapshot_reference(SnapshotReference::auto("/tmp/missing-snapshot"))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("from_snapshot is mutually exclusive")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_snapshot_rejects_explicit_disk_image() {
+        let err = SandboxBuilder::new("test")
+            .image_with(|i| i.disk("./rootfs.raw"))
+            .with_snapshot_reference(SnapshotReference::auto("/tmp/missing-snapshot"))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("from_snapshot is mutually exclusive")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_snapshot_rejects_explicit_bind_rootfs() {
+        let err = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .with_snapshot_reference(SnapshotReference::auto("/tmp/missing-snapshot"))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("from_snapshot is mutually exclusive")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_disk_only_requires_snapshot() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .disk_only()
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("disk_only must be combined"));
+    }
+
+    #[cfg(feature = "cloud")]
+    #[tokio::test]
+    async fn test_restore_defers_typed_reference_to_cloud_backend() {
+        let cloud = CloudBackend::new("https://api.example.test", "test-key").unwrap();
+        for reference in [
+            SnapshotReference::auto("00000000-0000-0000-0000-000000000003"),
+            SnapshotReference::id("00000000-0000-0000-0000-000000000003"),
+            SnapshotReference::path("snapshots/ready"),
+        ] {
+            let config = with_backend(cloud.clone(), async {
+                crate::Sandbox::restore_ref(reference.clone())
+                    .name("test")
+                    .inner
+                    .build()
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert_eq!(config.snapshot_reference, Some(reference));
+            // Reference routing must not smuggle creation defaults into host bindings.
+            assert!(config.spec.mounts.is_empty());
+            assert!(config.spec.network.ports.is_empty());
+            assert!(config.spec.vsock.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_rejects_patches_before_backend_resolution() {
+        let err = SandboxBuilder::new("test")
+            .with_snapshot_reference(SnapshotReference::auto("post-setup"))
+            .patch(|patch| patch.text("/etc/motd", "hello", None, true))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("patches cannot be combined"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_accepts_archive_as_deferred_image_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("snapshot.tar.zst");
+        std::fs::write(&archive, b"validated by the local backend").unwrap();
+
+        let config = SandboxBuilder::new("test")
+            .with_snapshot_reference(SnapshotReference::path(archive.to_string_lossy()))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.snapshot_archive_source.as_deref(),
+            Some(archive.as_path())
+        );
+        assert!(matches!(
+            config.spec.image,
+            crate::sandbox::RootfsSource::Oci(ref image) if image.reference.is_empty()
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restore_adopts_captured_vm_geometry() {
+        let mut builder = SandboxBuilder::new("restore");
+        let state = checkpoint_state_with_geometry(4, 8, 2048, 4096);
+
+        apply_checkpoint_resources(
+            &mut builder.config,
+            &state,
+            RestoreOverrideIntent::default(),
+        )
+        .unwrap();
+
+        assert_eq!(builder.config.spec.resources.cpus, 4);
+        assert_eq!(builder.config.spec.resources.max_cpus, 8);
+        assert_eq!(builder.config.spec.resources.memory_mib, 2048);
+        assert_eq!(builder.config.spec.resources.max_memory_mib, 4096);
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_conflicting_explicit_geometry() {
+        let mut builder = SandboxBuilder::new("restore").cpus(2);
+        let state = checkpoint_state_with_geometry(4, 8, 2048, 4096);
+
+        let error = apply_checkpoint_resources(
+            &mut builder.config,
+            &state,
+            RestoreOverrideIntent {
+                cpus: true,
+                ..RestoreOverrideIntent::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("captured CPU and memory geometry")
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_checks_each_explicit_patch_resource() {
+        let state = checkpoint_state_with_geometry(4, 8, 2048, 4096);
+        let cases = [
+            ("cpus", SandboxResourcesPatch::new().cpus(4), false),
+            ("cpus", SandboxResourcesPatch::new().cpus(2), true),
+            ("max_cpus", SandboxResourcesPatch::new().max_cpus(8), false),
+            ("max_cpus", SandboxResourcesPatch::new().max_cpus(4), true),
+            (
+                "memory",
+                SandboxResourcesPatch::new().memory_mib(2048),
+                false,
+            ),
+            ("memory", SandboxResourcesPatch::new().memory_mib(512), true),
+            (
+                "max_memory",
+                SandboxResourcesPatch::new().max_memory_mib(4096),
+                false,
+            ),
+            (
+                "max_memory",
+                SandboxResourcesPatch::new().max_memory_mib(2048),
+                true,
+            ),
+        ];
+
+        for (field, patch, conflicting) in cases {
+            let mut builder =
+                SandboxBuilder::new("restore").overlay(SandboxConfigPatch::new().resources(patch));
+            let intent = builder.restore_override_intent();
+            assert_eq!(intent.cpus, field == "cpus");
+            assert_eq!(intent.max_cpus, field == "max_cpus");
+            assert_eq!(intent.memory, field == "memory");
+            assert_eq!(intent.max_memory, field == "max_memory");
+            let result = apply_checkpoint_resources(&mut builder.config, &state, intent);
+            if conflicting {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("captured CPU and memory geometry"),
+                    "{field}"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(builder.config.spec.resources.cpus, 4);
+                assert_eq!(builder.config.spec.resources.max_cpus, 8);
+                assert_eq!(builder.config.spec.resources.memory_mib, 2048);
+                assert_eq!(builder.config.spec.resources.max_memory_mib, 4096);
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_patch_preserves_omission_and_prior_intent() {
+        // Clearing a patch field means omission, not resetting a previous builder request.
+        let absent = SandboxConfigPatch::new().resources(
+            SandboxResourcesPatch::new()
+                .cpus(2)
+                .clear_cpus()
+                .memory_mib(512)
+                .clear_memory_mib(),
+        );
+        let mut omitted = SandboxBuilder::new("restore").overlay(absent.clone());
+        let intent = omitted.restore_override_intent();
+        assert!(!intent.cpus && !intent.max_cpus && !intent.memory && !intent.max_memory);
+        apply_checkpoint_resources(
+            &mut omitted.config,
+            &checkpoint_state_with_geometry(4, 8, 2048, 4096),
+            intent,
+        )
+        .unwrap();
+
+        let explicit = SandboxBuilder::new("restore")
+            .cpus(4)
+            .max_cpus(8)
+            .memory(2048)
+            .max_memory(4096)
+            .overlay(absent)
+            .overlay(SandboxConfigPatch::new());
+        let intent = explicit.restore_override_intent();
+        assert!(intent.cpus && intent.max_cpus && intent.memory && intent.max_memory);
+        assert_eq!(explicit.config.spec.resources.memory_mib, 2048);
+    }
+
+    #[test]
+    fn checkpoint_restore_patch_tracks_requests_equal_to_defaults() {
+        let mut builder = SandboxBuilder::new("restore");
+        let default_memory = builder.config.spec.resources.memory_mib;
+        builder = builder.overlay(
+            SandboxConfigPatch::new()
+                .resources(SandboxResourcesPatch::new().memory_mib(default_memory)),
+        );
+        let intent = builder.restore_override_intent();
+        assert!(intent.memory);
+        let state =
+            checkpoint_state_with_geometry(4, 8, default_memory + 512, default_memory + 1024);
+        assert!(apply_checkpoint_resources(&mut builder.config, &state, intent).is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_archive_build_retains_patch_resource_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("saved.msb");
+        std::fs::write(&archive, b"archive validation is deferred to the backend").unwrap();
+        let config = SandboxBuilder::new("restore")
+            .with_snapshot_reference(SnapshotReference::path(archive.to_string_lossy()))
+            .overlay(
+                SandboxConfigPatch::new().resources(
+                    SandboxResourcesPatch::new()
+                        .cpus(2)
+                        .max_cpus(4)
+                        .memory_mib(512)
+                        .max_memory_mib(1024),
+                ),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        // Direct archives cross the builder/backend boundary before geometry is checked.
+        // Both routes must carry the same intent into that later validation.
+        assert_eq!(
+            config.snapshot_archive_source.as_deref(),
+            Some(archive.as_path())
+        );
+        let intent = config.restore_overrides;
+        assert!(intent.cpus && intent.max_cpus && intent.memory && intent.max_memory);
+    }
+
+    #[test]
+    fn checkpoint_restore_accepts_default_and_matching_network_fields() {
+        let captured = microsandbox_types::InterfaceOverrides {
+            mac: Some([0x02, 0x4d, 0x53, 0x42, 0x00, 0x01]),
+            mtu: Some(1500),
+            ..Default::default()
+        };
+
+        assert!(!checkpoint_network_override_conflicts(
+            &microsandbox_types::InterfaceOverrides::default(),
+            &captured,
+        ));
+        assert!(!checkpoint_network_override_conflicts(
+            &microsandbox_types::InterfaceOverrides {
+                mtu: Some(1500),
+                ..Default::default()
+            },
+            &captured,
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_conflicting_network_fields() {
+        let captured = microsandbox_types::InterfaceOverrides {
+            mac: Some([0x02, 0x4d, 0x53, 0x42, 0x00, 0x01]),
+            mtu: Some(1500),
+            ..Default::default()
+        };
+        let requested = microsandbox_types::InterfaceOverrides {
+            mtu: Some(1400),
+            ..Default::default()
+        };
+
+        assert!(checkpoint_network_override_conflicts(&requested, &captured,));
+    }
+
+    #[tokio::test]
+    async fn test_builder_quiet_logs_clears_runtime_log_level() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .log_level(LogLevel::Trace)
+            .quiet_logs()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.runtime.log_level, None);
+    }
+
+    #[tokio::test]
+    async fn test_builder_metrics_sample_interval_sets_ms() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .metrics_sample_interval(std::time::Duration::from_millis(750))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.runtime.metrics_sample_interval_ms, Some(750));
+    }
+
+    #[tokio::test]
+    async fn test_builder_metrics_sample_interval_zero_is_disabled() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .metrics_sample_interval(std::time::Duration::ZERO)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.spec.runtime.metrics_sample_interval_ms.is_none());
+        assert!(config.effective_metrics_interval().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_builder_disable_metrics_sample_overrides_interval() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .metrics_sample_interval(std::time::Duration::from_millis(5000))
+            .disable_metrics_sample()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.spec.runtime.disable_metrics_sample);
+        assert_eq!(config.spec.runtime.metrics_sample_interval_ms, Some(5000));
+        assert!(config.effective_metrics_interval().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_builder_replace_sets_replace_existing() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .replace()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.replace_existing);
+    }
+
+    #[tokio::test]
+    async fn connect_or_create_rejects_replace_semantics() {
+        let result = SandboxBuilder::new("connect-or-replace")
+            .replace()
+            .connect_or_create()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::MicrosandboxError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_builder_defaults_to_persistent() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .build()
+            .await
+            .unwrap();
+
+        assert!(!config.spec.lifecycle.ephemeral);
+    }
+
+    #[tokio::test]
+    async fn test_builder_ephemeral_sets_policy() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .ephemeral(true)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.spec.lifecycle.ephemeral);
+    }
+
+    #[tokio::test]
+    async fn test_builder_rlimit_sets_sandbox_wide_limit() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .rlimit(RlimitResource::Nofile, 65_535)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.rlimits.len(), 1);
+        assert_eq!(config.spec.rlimits[0].resource, RlimitResource::Nofile);
+        assert_eq!(config.spec.rlimits[0].soft, 65_535);
+        assert_eq!(config.spec.rlimits[0].hard, 65_535);
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_ports_are_repeatable() {
+        let bind = "0.0.0.0".parse().unwrap();
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .port(8080, 80)
+            .port(3000, 3000)
+            .port_udp(5353, 53)
+            .port_bind(bind, 8081, 81)
+            .port_udp_bind(bind, 5354, 54)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.network.ports.len(), 5);
+        assert_eq!(config.spec.network.ports[0].host_port, 8080);
+        assert_eq!(config.spec.network.ports[0].guest_port, 80);
+        assert_eq!(config.spec.network.ports[0].protocol, PortProtocol::Tcp);
+        assert_eq!(
+            config.spec.network.ports[0].host_bind,
+            IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()
+        );
+        assert_eq!(config.spec.network.ports[1].host_port, 3000);
+        assert_eq!(config.spec.network.ports[1].guest_port, 3000);
+        assert_eq!(config.spec.network.ports[1].protocol, PortProtocol::Tcp);
+        assert_eq!(config.spec.network.ports[2].host_port, 5353);
+        assert_eq!(config.spec.network.ports[2].guest_port, 53);
+        assert_eq!(config.spec.network.ports[2].protocol, PortProtocol::Udp);
+        assert_eq!(config.spec.network.ports[3].host_bind, bind.to_string());
+        assert_eq!(config.spec.network.ports[3].host_port, 8081);
+        assert_eq!(config.spec.network.ports[3].guest_port, 81);
+        assert_eq!(config.spec.network.ports[3].protocol, PortProtocol::Tcp);
+        assert_eq!(config.spec.network.ports[4].host_bind, bind.to_string());
+        assert_eq!(config.spec.network.ports[4].host_port, 5354);
+        assert_eq!(config.spec.network.ports[4].guest_port, 54);
+        assert_eq!(config.spec.network.ports[4].protocol, PortProtocol::Udp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_builder_vsock_routes_preserve_socket_type() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock("/run/host-api.sock", 5000)
+            // Stream and datagram namespaces are independent.
+            .vsock_dgram("/run/events.sock", 5000)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.vsock.routes.len(), 2);
+        assert_eq!(
+            config.spec.vsock.routes[0].socket_type,
+            VsockSocketType::Stream
+        );
+        assert_eq!(
+            config.spec.vsock.routes[1].socket_type,
+            VsockSocketType::Dgram
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_builder_rejects_duplicate_vsock_route_key() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock("/run/one.sock", 5000)
+            .vsock("/run/two.sock", 5000)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate vsock Stream route"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_builder_rejects_reserved_timesync_datagram_port() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock_dgram("/run/events.sock", 123)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("reserved for guest clock"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_vsock_for_multi_tenant_deployments() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .deployment_profile(DeploymentProfile::MultiTenant)
+            .vsock("/run/host-api.sock", 5000)
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("multi-tenant"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_builder_accepts_local_named_pipe_stream_route() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock(r"\\.\pipe\host-api", 5000)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.vsock.routes.len(), 1);
+        assert_eq!(
+            config.spec.vsock.routes[0].socket_type,
+            VsockSocketType::Stream
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_builder_rejects_remote_named_pipe_and_datagram() {
+        let remote = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock(r"\\server\pipe\host-api", 5000)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(remote.to_string().contains("local Windows named pipe"));
+
+        let datagram = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock_dgram(r"\\.\pipe\events", 5001)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            datagram,
+            crate::MicrosandboxError::Unsupported {
+                op: crate::Operation::SandboxCreate,
+                reason: crate::UnsupportedReason::RequiresUnixHost,
+            }
+        ));
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_disable_network_denies_all() {
+        use microsandbox_network::policy::Action;
+
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .disable_network()
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert!(!network.enabled);
+        // `disable_network()` uses `NetworkPolicy::none()` which is deny-all
+        // in both directions with no rules.
+        assert_eq!(network.policy.default_egress, Action::Deny);
+        assert_eq!(network.policy.default_ingress, Action::Deny);
+        assert!(network.policy.rules.is_empty());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_network_preserves_explicit_unlimited() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .network(|n| n.max_tcp_connections(0))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.spec.network.max_tcp_connections, Some(0));
+        assert_eq!(
+            config.local_network_config().unwrap().max_tcp_connections,
+            Some(ConnectionLimit::Unlimited)
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_network_preserves_explicit_unlimited_udp() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .network(|n| n.max_udp_connections(0))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.spec.network.max_udp_connections, Some(0));
+        assert_eq!(
+            config.local_network_config().unwrap().max_udp_connections,
+            Some(ConnectionLimit::Unlimited)
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_network_preserves_top_level_settings() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .port(8080, 80)
+            .secret_env("OPENAI_API_KEY", "secret", "api.openai.com")
+            .network(|n| n.max_tcp_connections(128).strict(true))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.network.ports.len(), 1);
+        assert_eq!(config.spec.network.ports[0].host_port, 8080);
+        assert_eq!(config.spec.network.ports[0].guest_port, 80);
+        assert_eq!(config.spec.network.ports[0].protocol, PortProtocol::Tcp);
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert_eq!(
+            network.max_tcp_connections,
+            Some(ConnectionLimit::from(128))
+        );
+        assert!(network.strict);
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_sets_outbound_proxy() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| p.socks5("127.0.0.1:1080"))
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert_eq!(
+            network.outbound_proxy,
+            Some(microsandbox_network::OutboundProxy::Socks5 {
+                address: "127.0.0.1:1080".parse().unwrap(),
+                credentials: None,
+            })
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_network_rate_limiters_land_in_the_spec() {
+        use std::time::Duration;
+
+        use microsandbox_utils::size::SizeExt;
+
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .network(|n| {
+                n.rate_limiter(|r| {
+                    r.egress(|r| {
+                        r.bandwidth(1.mib(), Duration::from_secs(1))
+                            .bandwidth_burst(512.kib())
+                            .ops(1_000, Duration::from_secs(1))
+                            .ops_burst(500)
+                    })
+                })
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let rate_limiter = config
+            .spec
+            .network
+            .rate_limiter
+            .as_ref()
+            .expect("network rate limiter persisted");
+        let egress = rate_limiter
+            .egress
+            .as_ref()
+            .expect("egress limiter persisted");
+        let bandwidth = egress.bandwidth.as_ref().unwrap();
+        assert_eq!(bandwidth.size, 1024 * 1024);
+        assert_eq!(bandwidth.refill_time_ms, 1000);
+        assert_eq!(bandwidth.one_time_burst, 512 * 1024);
+        assert_eq!(egress.ops.as_ref().unwrap().one_time_burst, 500);
+        assert!(rate_limiter.ingress.is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_sets_socks5_credentials() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| {
+                p.socks5("127.0.0.1:1080").credentials(
+                    "sandbox",
+                    SecretSource::Env {
+                        var: "SOCKS5_PASSWORD".into(),
+                    },
+                )
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        let json = serde_json::to_value(network.outbound_proxy).unwrap();
+        assert_eq!(json["credentials"]["username"], "sandbox");
+        assert_eq!(json["credentials"]["password"]["kind"], "env");
+        assert_eq!(json["credentials"]["password"]["var"], "SOCKS5_PASSWORD");
+        assert!(json["credentials"].get("value").is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_sets_socks4_outbound_proxy_with_user_id() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| p.socks4("127.0.0.1:1080").user_id("sandbox"))
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert_eq!(
+            network.outbound_proxy,
+            Some(microsandbox_network::OutboundProxy::Socks4 {
+                address: "127.0.0.1:1080".parse().unwrap(),
+                user_id: Some("sandbox".to_string()),
+            })
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_outbound_proxy() {
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| p.socks5("not-an-address"))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid SOCKS5 proxy address"));
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_rate_limiter() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .network(|n| n.rate_limiter(|r| r.ingress(|r| r)))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("rate limiter must configure at least one of bandwidth or ops"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_secret_config() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .secret_entry(SecretEntry {
+                env_var: "API\0KEY".into(),
+                value: zeroize::Zeroizing::new("secret".into()),
+                source: None,
+                placeholder: "$MSB_API_KEY".into(),
+                allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
+                substitution: SecretSubstitution::default(),
+                passthrough_hosts: Vec::new(),
+                violation_action: None,
+                require_tls_identity: true,
+            })
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("env_var must not contain NUL"));
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // DiskImage host-path validation
+    //----------------------------------------------------------------------------------------------
+
+    /// Helper: stage two files in a tempdir, return absolute paths.
+    fn two_disk_files() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.qcow2");
+        let b = dir.path().join("b.qcow2");
+        std::fs::write(&a, []).unwrap();
+        std::fs::write(&b, []).unwrap();
+        (dir, a, b)
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_two_writable_same_host() {
+        let (_dir, a, _) = two_disk_files();
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/x", |v| v.disk(a.clone()))
+            .volume("/y", |v| v.disk(a.clone()))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disk-image volumes cannot share the same host path")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_writable_plus_readonly_same_host() {
+        // Mixed writable+readonly still corrupts because the writable side's
+        // host page cache invalidates the readonly side's view.
+        let (_dir, a, _) = two_disk_files();
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/x", |v| v.disk(a.clone()))
+            .volume("/y", |v| v.disk(a.clone()).readonly())
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disk-image volumes cannot share the same host path")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_two_readonly_same_host() {
+        let (_dir, a, _) = two_disk_files();
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/x", |v| v.disk(a.clone()).readonly())
+            .volume("/y", |v| v.disk(a.clone()).readonly())
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disk-image volumes cannot share the same host path")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_accepts_two_writable_different_hosts() {
+        let (_dir, a, b) = two_disk_files();
+        SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/x", |v| v.disk(a))
+            .volume("/y", |v| v.disk(b))
+            .build()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_builder_canonicalizes_host_paths() {
+        // /foo/./bar resolves to the same canonical as /foo/bar; the check
+        // must catch this even though the byte strings differ.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.qcow2");
+        std::fs::write(&a, []).unwrap();
+        let parent = a.parent().unwrap();
+        let dotted = parent.join(".").join("a.qcow2");
+
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/x", |v| v.disk(a))
+            .volume("/y", |v| v.disk(dotted))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disk-image volumes cannot share the same host path")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_missing_disk_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("nope.qcow2");
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/x", |v| v.disk(nonexistent))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disk image host path does not exist")
+        );
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Sandbox name validation
+    //----------------------------------------------------------------------------------------------
+
+    #[test]
+    fn sandbox_name_accepts_typical() {
+        for name in [
+            "foo",
+            "foo-bar",
+            "foo.bar",
+            "foo_bar",
+            "FooBar",
+            "abc123",
+            "a",
+            "0",
+            "agent-1",
+            "my.app_2026",
+        ] {
+            assert!(
+                crate::sandbox::validate_sandbox_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_name_rejects_empty() {
+        assert!(crate::sandbox::validate_sandbox_name("").is_err());
+    }
+
+    #[test]
+    fn sandbox_name_rejects_too_long() {
+        let long = "a".repeat(MAX_SANDBOX_NAME_BYTES + 1);
+        assert!(crate::sandbox::validate_sandbox_name(&long).is_err());
+    }
+
+    #[test]
+    fn sandbox_name_accepts_at_max_length() {
+        let max = "a".repeat(MAX_SANDBOX_NAME_BYTES);
+        assert!(crate::sandbox::validate_sandbox_name(&max).is_ok());
+    }
+
+    #[test]
+    fn sandbox_name_rejects_disallowed_chars() {
+        for name in [
+            "foo bar", "foo/bar", "foo:bar", "foo!", "foo@bar", "foo#1", "✨",
+        ] {
+            assert!(
+                crate::sandbox::validate_sandbox_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_name_rejects_non_alphanumeric_start() {
+        for name in [".foo", "-foo", "_foo"] {
+            assert!(
+                crate::sandbox::validate_sandbox_name(name).is_err(),
+                "expected {name:?} to be rejected (non-alphanumeric start)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_validate_rejects_bad_name() {
+        let err = SandboxBuilder::new("bad name!")
+            .image("alpine")
+            .build()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("alphanumeric"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn builder_orders_nested_mounts_parent_first() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/workspace/persist", |mount| mount.tmpfs())
+            .volume("/workspace", |mount| mount.tmpfs())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config
+                .spec
+                .mounts
+                .iter()
+                .map(VolumeMount::guest)
+                .collect::<Vec<_>>(),
+            vec!["/workspace", "/workspace/persist"]
+        );
+    }
+    #[tokio::test]
+    async fn forked_rejects_fresh_boot() {
+        let error = SandboxBuilder::new("forked-boot")
+            .image("alpine")
+            .forked()
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("forked requires a full snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn forked_restore_is_transient_and_requires_execution() {
+        let mut builder = SandboxBuilder::new("forked-child").image("alpine").forked();
+        builder.config.checkpoint_restore =
+            Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+                memory_descriptor: false,
+                network_gateway_mac: None,
+                external_mount_policy: Default::default(),
+                external_mounts: Vec::new(),
+                unavailable_disks: Default::default(),
+                local_branch: false,
+                forked: false,
+                closure: "/owned/checkpoint".into(),
+                checkpoint_root: "blake3:captured-root".into(),
+                checkpoint_id: "captured".into(),
+            });
+        builder.validate().unwrap();
+        let config = builder.config.clone();
+        assert!(config.forked);
+        assert!(!config.clone_for_persistence().forked);
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("forked")
+                .is_none()
+        );
+        builder.config.snapshot_restore_mode =
+            crate::sandbox::config::SnapshotRestoreMode::DiskOnly;
+        assert!(
+            builder
+                .build()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("forked")
+        );
+    }
+}

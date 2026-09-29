@@ -157,8 +157,13 @@ The `runtime` setting selects `docker`, `apple-containers`,
 `docker-sbx-experimental`, or `builtin`; an unset value keeps the existing
 Docker default. The builtin block is stored in global or repository config and
 repo values merge over global values. Its supported keys are `stateDir`,
-`vcpus` (default 2), `memoryMib` (default 4096), `imageSource`, per-image
-`images`, and per-host `registries`. For example:
+`vcpus` (default 2), `memoryMib` (default 4096, minimum 128), `imageSource`,
+per-image `images`, per-host `registries`, and `network` (guest network
+policy: `mode` `public`/`allowlist`/`none`, default `public`; `allow`;
+`hostPorts`; global-only `nameservers`/`trustHostCas`). A repo `network`
+block may only narrow the global one — a stricter mode, a subset of the
+global `allow` list, a subset of the global `hostPorts` — never widen it, since
+repo config ships with the checkout and may be untrusted. For example:
 
 ```json
 {

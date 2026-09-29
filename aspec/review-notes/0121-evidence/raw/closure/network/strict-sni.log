@@ -1,0 +1,92 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+   Compiling portable-atomic v1.15.0
+   Compiling crossbeam-utils v0.8.23
+   Compiling once_cell v1.21.4
+   Compiling log v0.4.34
+   Compiling zeroize v1.9.0
+   Compiling mio v1.2.3
+   Compiling kvm-bindings v0.14.1
+   Compiling tokio v1.53.1
+   Compiling smallvec v1.16.1
+   Compiling time-macros v0.2.32
+   Compiling crossbeam-channel v0.5.17
+   Compiling tracing-core v0.1.36
+   Compiling time v0.3.55
+   Compiling tracing v0.1.44
+   Compiling msb_krun_utils v0.1.39
+   Compiling rustls-pki-types v1.15.1
+   Compiling futures-sink v0.3.34
+   Compiling futures-core v0.3.34
+   Compiling icu_normalizer v2.3.0
+   Compiling futures-channel v0.3.34
+   Compiling slab v0.4.12
+   Compiling futures-util v0.3.34
+   Compiling idna_adapter v1.2.2
+   Compiling crc32fast v1.5.2
+   Compiling asn1-rs v0.7.2
+   Compiling aws-lc-rs v1.18.1
+   Compiling kvm-ioctls v0.25.0
+   Compiling miniz_oxide v0.8.9
+   Compiling rustix v1.1.5
+   Compiling serde_json v1.0.151
+   Compiling simd-adler32 v0.3.10
+   Compiling form_urlencoded v1.2.2
+   Compiling miniz_oxide v0.9.1
+   Compiling msb_krun_arch v0.1.39
+   Compiling bincode v2.0.1
+   Compiling rustls v0.23.45
+   Compiling msb-imago v0.1.7
+   Compiling rustls-webpki v0.103.15
+   Compiling idna v1.1.0
+   Compiling msb_krun_polly v0.1.39
+   Compiling linux-raw-sys v0.12.1
+   Compiling subtle v2.6.1
+   Compiling chrono v0.4.45
+   Compiling msb_krun_devices v0.1.39
+   Compiling rand v0.10.3
+   Compiling url v2.5.8
+   Compiling flate2 v1.1.10
+   Compiling der-parser v10.0.0
+   Compiling oid-registry v0.8.1
+   Compiling msb_krun_kernel v0.1.39
+   Compiling ipnetwork v0.21.1
+   Compiling ipnet v2.12.2
+   Compiling base64 v0.23.1
+   Compiling pem v4.0.0
+   Compiling hickory-proto v0.26.3
+   Compiling microsandbox-types v0.7.2
+   Compiling hashbrown v0.17.1
+   Compiling x509-parser v0.18.1
+   Compiling msb_krun_vmm v0.1.39
+   Compiling reflink-copy v0.1.30
+   Compiling parking_lot_core v0.9.12
+   Compiling ciborium v0.2.2
+   Compiling tokio-rustls v0.26.5
+   Compiling futures-executor v0.3.34
+   Compiling yasna v0.6.0
+   Compiling serde_bytes v0.11.19
+   Compiling either v1.18.0
+   Compiling rustls-native-certs v0.8.4
+   Compiling rcgen v0.14.10
+   Compiling tokio-socks v0.5.3
+   Compiling microsandbox-protocol v0.7.2
+   Compiling futures v0.3.34
+   Compiling hickory-net v0.26.3
+   Compiling parking_lot v0.12.5
+   Compiling microsandbox-utils v0.7.2
+   Compiling msb_krun v0.1.39 (/workspace/third_party/msb_krun-0.1.39)
+   Compiling lru v0.18.5
+   Compiling crossbeam-queue v0.3.14
+   Compiling microsandbox-network v0.7.2 (/workspace/third_party/microsandbox-network-0.7.2)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.78s
+     Running unittests lib/lib.rs (target/debug/deps/microsandbox_network-01b81dec1750cee6)
+
+running 3 tests
+test model::config::builder::tests::strict_sni_is_explicit_and_survives_config_roundtrip ... ok
+test engine::tcp::proxy::tests::strict_sni_end_to_end_tls_reaches_allowed_server_without_interception ... ok
+test engine::tcp::proxy::tests::strict_sni_denies_missing_wrong_unbound_and_sibling_names_before_dial ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 559 filtered out; finished in 0.09s
+

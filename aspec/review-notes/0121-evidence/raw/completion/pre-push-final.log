@@ -1,0 +1,291 @@
+architecture-lint: OK — all imports respect the layering rules
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+   Compiling awman v0.12.0 (/workspace)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.96s
+make --no-print-directory test
+
+running 3231 tests
+....................................................................................... 87/3231
+....................................................................................... 174/3231
+....................................................................................... 261/3231
+....................................................................................... 348/3231
+....................................................................................... 435/3231
+........................i.............................................................. 522/3231
+....................................................................................... 609/3231
+....................................................................................... 696/3231
+....................................................................................... 783/3231
+....................................................................................... 870/3231
+....................................................................................... 957/3231
+....................................................................................... 1044/3231
+....................................................................................... 1131/3231
+....................................................................................... 1218/3231
+....................................................................................... 1305/3231
+....................................................................................... 1392/3231
+....................................................................................... 1479/3231
+....................................................................................... 1566/3231
+....................................................................................... 1653/3231
+....................................................................................... 1740/3231
+....................................................................................... 1827/3231
+....................................................................................... 1914/3231
+....................................................................................... 2001/3231
+....................................................................................... 2088/3231
+..............................................Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpXFkvGh/.git/
+[main (root-commit) f0e0dfe] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+..Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmphkwA5e/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpmn5ixQ/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpe8xnoJ/.git/
+[main (root-commit) f0e0dfe] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+[main (root-commit) f0e0dfe] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+[main (root-commit) f0e0dfe] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+....................................... 2175/3231
+....................................................................................... 2262/3231
+....................................................................................... 2349/3231
+.......awman warning: 2 agents are launching in parallel, but output merging is not supported in non-interactive mode; step output will interleave without chrome
+...............................................................[1;22r[24;1H................. 2436/3231
+................................7[24;1H[2K[7m [2 agents running | showing: a | Ctrl-S: switch] [0m8...................awman: immediate
+awman: immediate again
+awman:. msg
+awman: .queued message
+.awman warning: another
+.awman: .immediate
+....................[r[24;1H[2K........... 2523/3231
+....................................................................................... 2610/3231
+....................................................................................... 2697/3231
+....................................................................................... 2784/3231
+....................................................................................... 2871/3231
+....................................................................................... 2958/3231
+....................................................................................... 3045/3231
+....................................................................................... 3132/3231
+....................................................................................... 3219/3231
+............
+test result: ok. 3230 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.39s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 176 tests
+....................................................................................... 87/176
+....................................................................................... 174/176
+..
+test result: ok. 176 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+
+running 72 tests
+........................................................................
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+
+
+running 78 tests
+..............................................................................
+test result: ok. 78 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+
+running 23 tests
+.......................
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 39 tests
+...................................awman: Pulled 'superpowers' into /var/tmp/test-fixtures/test-run.twYCW0/.tmpDzKKVj/skills/.library/superpowers (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'superpowers' into /var/tmp/test-fixtures/test-run.twYCW0/.tmpDzKKVj/skills/.library/superpowers (2 skill(s) found under skills/): brainstorming, refreshed
+.awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.twYCW0/.tmpwWr3SA/skills/.library/alpha (1 skill(s) found under custom-skills/): brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.twYCW0/.tmpwWr3SA/skills/.library/beta (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.twYCW0/.tmpwWr3SA/skills/.library/alpha (1 skill(s) found under custom-skills/): brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.twYCW0/.tmpwWr3SA/skills/.library/beta (1 skill(s) found under skills/): brainstorming
+awman: Skill library refresh complete: 2 succeeded, 0 failed.
+.awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.twYCW0/.tmp4VbtOB/skills/.library/alpha (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.twYCW0/.tmp4VbtOB/skills/.library/beta (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.twYCW0/.tmp4VbtOB/skills/.library/alpha (2 skill(s) found under skills/): alpha-refresh, brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.twYCW0/.tmp4VbtOB/skills/.library/beta (2 skill(s) found under skills/): beta-refresh, brainstorming
+awman: Skill library refresh complete: 2 succeeded, 0 failed.
+.awman: Pulled 'custom-library' into /var/tmp/test-fixtures/test-run.twYCW0/.tmp4iN60h/skills/.library/custom-library (1 skill(s) found under custom-skills/): brainstorming
+.
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+
+running 113 tests
+....................................................................................... 87/113
+..........................
+test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 133 tests
+...................................
+running 1 test
+
+running 1 test
+test credential_refresh_integration::integration_monitor_failed_host_refresh_warns_and_keeps_last_known_good ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.01s
+
+..
+running 1 test
+
+running 1 test
+test credential_refresh_integration::integration_monitor_rewrites_only_live_leases_and_skips_dropped ... ok
+test credential_refresh_integration::integration_monitor_refreshes_near_expiry_and_advances_expiry ... 
+test result: ok
+ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out
+test result: ; finished in 0.00s
+
+ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.03s
+
+....
+running 1 test
+
+running 1 test
+...test credential_refresh_integration::integration_workflow_auth_non_auth_failure_does_not_refresh_or_retry ... ok
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.13s
+
+..Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpSD64Np/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpA91wzB/repo/.git/
+.[main (root-commit) a290455] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpnFvIzh/repo/.git/
+..test credential_refresh_integration::integration_workflow_auth_401_refreshes_and_retries_exactly_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.25s
+
+.Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpmIAV04/repo/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmp9q4beW/.git/
+.Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpQHJlQb/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.twYCW0/.tmpSUSdaw/.git/
+................................... 87/133
+..................................[main (root-commit) a290455] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) a290455] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+........[main (root-commit) a290455] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+..[awman/work-item-0042 b400c6d] branch work
+ 1 file changed, 1 insertion(+)
+ create mode 100644 change.txt
+.test credential_refresh_integration::integration_spawn_choke_holds_lease_before_pty_piped_and_acp_on_docker_and_apple ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.97s
+
+.
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+
+running 39 tests
+.......................................
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 13 tests
+.i...........
+test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.56s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+i......
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+
+running 5 tests
+i....
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.62s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

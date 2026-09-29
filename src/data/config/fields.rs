@@ -168,6 +168,14 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         sensitive: false,
         hint: Some("edit registry settings in config JSON"),
     },
+    ConfigFieldSpec {
+        name: "builtin.network",
+        scope: FieldScope::Both,
+        kind: ConfigFieldKind::String,
+        read_only: true,
+        sensitive: false,
+        hint: Some("edit the network policy object in config JSON"),
+    },
     f(
         "default_agent",
         FieldScope::GlobalOnly,

@@ -3,11 +3,21 @@
 Title: Builtin OCI agent runtime using strictly embedded Microsandbox
 Issue: n/a
 
+Current distribution policy (2026-09-28): signing and notarization are out of
+scope by user instruction. No signing identity, Apple distribution account,
+notarization credentials or explicit ad-hoc signing step is required. Native
+boot and final-artifact checks still apply; failures must be reported honestly.
+
 Follow-up: [WI 0121 — completion and native verification](0121-complete-builtin-runtime-and-native-verification.md)
 tracks every outstanding deficiency from the
 [final adversarial review](../review-notes/0119-final-adversarial-verification.md).
 This item remains incomplete until its failed/blocked acceptance criteria have
 the required evidence; creating the follow-up does not close them.
+The resource-qualified continuation is assigned to
+[WI 0122](0122-native-apple-image-store-bridge.md) for the Apple adapter and
+[WI 0123](0123-builtin-native-verification-and-release-closure.md) for native
+scenario, service, build and distribution closure. No original box is satisfied
+by transferring work.
 
 ## Summary:
 - Implement a builtin, container-class backend using Microsandbox, with its VM
@@ -294,20 +304,19 @@ an unbounded permanent fork.
   workflow/squad integration coverage is absent. Guest-level ownership,
   credential visibility, PTY/ACP, lifecycle and resource verification are
   separately **BLOCKED** on hardware (B-18, B-21, B-29, B-30, B-33, B-55).
-- [ ] Final optimized/LTO and signed artifacts preserve the embedded provider,
+- [ ] Final optimized/LTO artifacts preserve the embedded provider,
   boot successfully, and pass the relevant distribution/security checks.
-  **BLOCKED (B-05, B-12, B-18, B-31):** optimized artifact, signing, notarizing,
-  and provider boot checks require unavailable native hosts and credentials.
-- [x] Documentation/spec changes describe the builtin backend accurately;
+  **BLOCKED (B-05, B-12, B-18, B-31):** optimized artifact
+  and provider boot checks require unavailable native hosts and test artifacts.
+- [ ] Documentation/spec changes describe the builtin backend accurately;
   existing Docker/Apple behavior is regression-tested; no SBX model is adopted.
-  Documentation was updated in this run. Existing backend unit/regression
-  tests and feature-graph checks passed; real Docker/Apple round trips remain
-  **SKIP (B-16)** and are not claimed here.
-- [x] WI 0120 has a precise patch inventory and replacement/removal path;
+  **BLOCKED:** current hermetic checks do not establish real Docker/Apple
+  regressions. See the [WI 0121 evidence register](../review-notes/0121-evidence-register.md).
+- [ ] WI 0120 has a precise patch inventory and replacement/removal path;
   upstream acceptance is not a completion dependency for this item.
-  The inventory was added in this run, covering the SQLx backport,
-  `msb_krun` loader, target-aware guest-agent build input, and awman-side worker
-  glue, each with an independent replacement/removal gate.
+  The inventory includes SQLx, `msb_krun`, guest-agent build inputs, the isolated
+  SDK builder, and awman-side glue. **BLOCKED:** tracking and complete-diff
+  verification require the unavailable Git metadata; no current acceptance pass.
 
 ## Edge Case Considerations:
 - Reject wrong-platform images/payloads, malformed or oversized archives,

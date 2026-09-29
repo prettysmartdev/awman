@@ -24,7 +24,7 @@ use crate::fixture_inventory::{
 };
 use crate::gate::hardware_or_skip;
 
-const TAG: &str = "awman-hw/fixture:latest";
+pub(crate) const TAG: &str = "awman-hw/fixture:latest";
 
 pub fn driver_path() -> PathBuf {
     // Cargo puts examples next to the binaries: target/<profile>/examples/.
@@ -69,23 +69,25 @@ pub fn fixture_archive() -> Option<PathBuf> {
         .clone()
 }
 
-struct Run {
+/// Shared by every `builtin_hw_*` test module (`hardware.rs` plus later
+/// modules such as `guest_compat.rs`): one call into the real guest driver.
+pub(crate) struct Run {
     /// Scratch directory holding `<scenario>.stdout` / `.stderr` from the guest.
     work: tempfile::TempDir,
     /// `KEY -> values` from the driver's own stdout.
     facts: BTreeMap<String, Vec<String>>,
-    code: i32,
-    raw: String,
+    pub(crate) code: i32,
+    pub(crate) raw: String,
 }
 
 impl Run {
-    fn guest_stdout(&self, name: &str) -> String {
+    pub(crate) fn guest_stdout(&self, name: &str) -> String {
         std::fs::read_to_string(self.work.path().join(format!("{name}.stdout"))).unwrap_or_default()
     }
-    fn guest_stderr(&self, name: &str) -> String {
+    pub(crate) fn guest_stderr(&self, name: &str) -> String {
         std::fs::read_to_string(self.work.path().join(format!("{name}.stderr"))).unwrap_or_default()
     }
-    fn fact(&self, key: &str) -> Option<&str> {
+    pub(crate) fn fact(&self, key: &str) -> Option<&str> {
         self.facts
             .get(key)
             .and_then(|v| v.first())
@@ -95,7 +97,7 @@ impl Run {
 
 /// Run one driver scenario with an empty environment and a short private state
 /// dir. Returns `None` after reporting SKIP/BLOCKED when the host cannot run it.
-fn scenario(test: &str, name: &str) -> Option<Run> {
+pub(crate) fn scenario(test: &str, name: &str) -> Option<Run> {
     if !hardware_or_skip(test, true) {
         return None;
     }
@@ -155,7 +157,7 @@ fn scenario(test: &str, name: &str) -> Option<Run> {
     })
 }
 
-fn expect_clean(problems: Vec<String>, run: &Run) {
+pub(crate) fn expect_clean(problems: Vec<String>, run: &Run) {
     assert!(
         problems.is_empty(),
         "{problems:#?}\n--- driver ---\n{}",

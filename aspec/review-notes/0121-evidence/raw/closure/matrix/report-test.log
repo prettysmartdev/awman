@@ -1,0 +1,27 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling awman v0.12.0 (/workspace)
+error[E0373]: closure may outlive the current function, but it borrows `template`, which is owned by the current function
+   --> tests/oci_import/corpus.rs:397:39
+    |
+397 |             formats.iter().filter_map(|format| {
+    |                                       ^^^^^^^^ may outlive borrowed value `template`
+398 |                 (!covered.contains(&(template.clone(), (*format).to_string())))
+399 |                     .then(|| format!("{template}/{format}"))
+    |                                        -------- `template` is borrowed here
+    |
+note: closure is returned here
+   --> tests/oci_import/corpus.rs:397:13
+    |
+397 | /             formats.iter().filter_map(|format| {
+398 | |                 (!covered.contains(&(template.clone(), (*format).to_string())))
+399 | |                     .then(|| format!("{template}/{format}"))
+400 | |             })
+    | |______________^
+help: to force the closure to take ownership of `template` (and any other referenced variables), use the `move` keyword
+    |
+397 |             formats.iter().filter_map(move |format| {
+    |                                       ++++
+
+For more information about this error, try `rustc --explain E0373`.
+error: could not compile `awman` (test "oci_import") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

@@ -1,0 +1,55 @@
+use strict; use warnings;
+sub edit {my($p,$fn)=@_;open my $f,'<',$p or die $!;local $/;my $s=<$f>;close $f;$fn->(\$s);open $f,'>',$p or die $!;print $f $s;close $f;}
+for my $p(glob('aspec/work-items/0119-*.md'),glob('aspec/work-items/0120-*.md'),glob('aspec/work-items/0121-*.md'),glob('aspec/work-items/0122-*.md'),glob('aspec/work-items/0123-*.md')) {
+ edit($p,sub{my $s=shift;
+ $$s =~ s/(Issue: n\/a\n)/$1\nCurrent distribution policy (2026-09-28): signing and notarization are out of\nscope by user instruction. No signing identity, Apple distribution account,\nnotarization credentials or explicit ad-hoc signing step is required. Native\nboot and final-artifact checks still apply; failures must be reported honestly.\n/;
+ $$s =~ s/Final optimized\/LTO and signed artifacts/Final optimized\/LTO artifacts/;
+ $$s =~ s/optimized artifact, signing, notarizing,\n  and provider boot checks require unavailable native hosts and credentials/optimized artifact\n  and provider boot checks require unavailable native hosts and test artifacts/;
+ $$s =~ s/Optimization\/LTO\/dead-stripping, macOS signing, Linux target ABI/Optimization\/LTO\/dead-stripping, Linux target ABI/;
+ $$s =~ s/Final LTO\/stripped\/signed\/notarized boot/Final LTO\/stripped boot/;
+ $$s =~ s/dependency, helper, entitlement and distribution checks/dependency, helper and distribution checks/;
+ $$s =~ s/payload, build, boot and signing gates/payload, build and boot gates/;
+ $$s =~ s/optimization\/stripping\/signing/optimization\/stripping/;
+ $$s =~ s/1\. Build final release\/LTO\/stripped awman artifacts on each required target\. On\n   Mac sign the actual awman executable with release hardened-runtime settings\n   and hypervisor entitlement, validate notarization\/distribution behavior, then\n   boot that artifact\. Signing only the fixture driver or old probe is insufficient\./1. Build final release\/LTO\/stripped awman artifacts on each required target.\n   Distribute without signing or notarization and boot the exact artifact.\n   A fixture driver or old probe does not establish final-artifact boot./;
+ $$s =~ s/missing hardware\/signing\/services/missing hardware\/services/;
+ $$s =~ s/Mac release signing\/\n  distribution checks/Mac release distribution checks/;
+ $$s =~ s/fixture images, signing\/distribution credentials/fixture images, distribution artifacts/;
+ $$s =~ s/Swift\/Xcode and signing tools/Swift\/Xcode tools/;
+ $$s =~ s/signed-artifact matrix/final-artifact matrix/;
+ $$s =~ s/remote runner connection or signing account/remote runner connection/;
+ $$s =~ s/; signing\/notarization identities and distribution account//;
+ $$s =~ s/9\. Build optimized\/LTO\/stripped artifacts, then sign\/notarize\/package the actual\n   Mac awman executable\. Boot the exact distributed artifacts; trace executable\//9. Build optimized\/LTO\/stripped artifacts and prepare the actual Mac awman\n   executable for distribution without signing or notarization. Boot the exact\n   distributed artifacts; trace executable\//;
+ $$s =~ s/ Signing only an example driver does not qualify\./ An example driver does not qualify./;
+ $$s =~ s/native\/service\/signing logs/native\/service\/distribution logs/;
+ $$s =~ s/native scans\/Mac signing\/distribution/native scans\/Mac distribution/;
+ });
+}
+edit('docs/11-runtimes.md',sub{my $s=shift;
+ $$s =~ s/a separate signed Apple Silicon job/a separate Apple Silicon job/;
+ $$s =~ s/^- \*\*macOS entitlement:\*\*.*$/- **macOS distribution:** awman is not signed or notarized for the time being. Build and release jobs do not require signing credentials or perform explicit ad-hoc signing. Native guest boot must still succeed with the distributed binary; an OS permission failure remains a failed boot check, not a successful skip./m;
+});
+edit('tools/oci-runtime-spike/sqlite-resolution/README.md',sub{my $s=shift;$$s =~ s/Rust\/compiler\/signing prerequisites/Rust\/compiler prerequisites/;});
+edit('tools/oci-runtime-spike/strict-embed/README.md',sub{my $s=shift;
+ $$s =~ s/release-signing or security-review/final-artifact or security-review/;
+ $$s =~ s/6\. \*\*Mac distribution\.\*\*.*$/6. **Mac distribution.** The historical ad-hoc-signed probe is not evidence for the current distribution policy. Signing and notarization are out of scope; test the final optimized awman artifact without explicit signing steps and report any native boot failure./m;
+ $$s =~ s/extra signing\/artifact checks/extra artifact checks/;
+ $$s =~ s/unified build\/signing surface/unified build surface/;
+});
+edit('tools/oci-runtime-spike/README.md',sub{my $s=shift;
+ $$s =~ s/after copying\/re-signing/after copying/;
+ $$s =~ s/packaging issue, macOS signing, secret transport/packaging issue, secret transport/;
+ $$s =~ s/asset extraction\/update\/signing/asset extraction\/update/;
+ $$s =~ s/exact signed release artifacts/exact release artifacts/;
+});
+edit('tests/builtin_runtime/main.rs',sub{my $s=shift;$$s =~ s/the hypervisor\n\/\/!   entitlement \(macOS\)/Hypervisor.framework\n\/\/!   support (macOS)/;});
+edit('aspec/review-notes/0121-evidence-register.md',sub{my $s=shift;
+ # Amend current requirements, retain historical command transcripts below.
+ my($current,$history)=split /(?=## Final adversarial verification — initial snapshot)/,$$s,2;
+ $current =~ s/Mac signing\/notarization\/package/Mac distribution artifact/;
+ $current =~ s/final artifact, signing identity, workload trace/final artifact, workload trace/;
+ $current =~ s/optimized\/signed section retention/optimized section retention/;
+ $current =~ s/signed\/notarized Mac package\. CI now signs actual awman as well as examples, but no job executed\./Mac distribution artifact. No native release job executed./;
+ $current =~ s/optimized\/signed\/distributed artifact/optimized\/distributed artifact/;
+ $$s=$current.$history;
+ $$s =~ s/(# WI 0121 evidence register \(sections J\.1 and J\.3\)\n)/$1\n**Scope amendment (2026-09-28):** the user removed all signing and notarization\nrequirements. This includes release credentials and explicit ad-hoc signing\nsteps. Earlier reports\/logs retain their historical wording; those requirements\nare superseded, not outstanding blockers. Native boot, distribution artifact,\ntracing, dependency and measurement requirements remain.\n/;
+});

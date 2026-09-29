@@ -1,0 +1,11 @@
+    Checking awman v0.12.0 (/workspace)
+warning: function `hash_file` is never used
+   --> src/engine/oci/verify.rs:500:15
+    |
+500 | pub(super) fn hash_file(path: &Path) -> Result<(String, u64), EngineError> {
+    |               ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `awman` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.68s

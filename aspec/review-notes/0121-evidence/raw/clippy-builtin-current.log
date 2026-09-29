@@ -1,0 +1,881 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded atoi v2.0.0
+  Downloaded anstream v1.0.0
+  Downloaded approx v0.5.1
+  Downloaded atomic v0.6.1
+  Downloaded bit-set v0.5.3
+  Downloaded aliasable v0.1.3
+  Downloaded darling_macro v0.20.11
+  Downloaded crypto-common v0.1.7
+  Downloaded crunchy v0.2.4
+  Downloaded block-buffer v0.12.1
+  Downloaded crc v3.4.0
+  Downloaded darling_macro v0.24.1
+  Downloaded byteorder-lite v0.1.0
+  Downloaded asn1-rs-impl v0.2.0
+  Downloaded defmt-parser v1.0.0
+  Downloaded cpufeatures v0.3.1
+  Downloaded ambient-authority v0.0.2
+  Downloaded bincode_derive v2.0.1
+  Downloaded crypto-common v0.2.2
+  Downloaded dirs v7.0.0
+  Downloaded async-stream v0.3.6
+  Downloaded futures-core v0.3.34
+  Downloaded by_address v1.2.1
+  Downloaded castaway v0.2.4
+  Downloaded atomic-waker v1.1.2
+  Downloaded block-buffer v0.10.4
+  Downloaded equivalent v1.0.2
+  Downloaded either v1.18.0
+  Downloaded digest v0.11.3
+  Downloaded futures-task v0.3.34
+  Downloaded deadpool-runtime v0.1.4
+  Downloaded dirs-sys v0.5.0
+  Downloaded dunce v1.0.5
+  Downloaded cfg_aliases v0.1.1
+  Downloaded cfg-if v1.0.5
+  Downloaded capng v0.2.3
+  Downloaded ciborium-io v0.2.2
+  Downloaded colorchoice v1.0.5
+  Downloaded compression-core v0.4.33
+  Downloaded downcast-rs v1.2.1
+  Downloaded assert-json-diff v2.0.2
+  Downloaded filedescriptor v0.8.3
+  Downloaded futures-sink v0.3.34
+  Downloaded hash32 v0.3.1
+  Downloaded fallible-streaming-iterator v0.1.9
+  Downloaded fs-set-times v0.20.3
+  Downloaded getset v0.1.7
+  Downloaded fixedbitset v0.4.2
+  Downloaded generic-array v0.14.7
+  Downloaded fnv v1.0.7
+  Downloaded heck v0.4.1
+  Downloaded docker_credential v1.4.0
+  Downloaded futures-io v0.3.34
+  Downloaded derive_builder_macro v0.20.2
+  Downloaded hex v0.4.3
+  Downloaded caps v0.5.6
+  Downloaded autocfg v1.5.1
+  Downloaded async-trait v0.1.92
+  Downloaded asn1-rs-derive v0.6.0
+  Downloaded arraydeque v0.5.1
+  Downloaded arc-swap v1.9.2
+  Downloaded anstyle-query v1.1.5
+  Downloaded cmov v0.5.4
+  Downloaded gethostname v1.1.0
+  Downloaded anstyle-parse v1.0.0
+  Downloaded adler2 v2.0.1
+  Downloaded cpufeatures v0.2.17
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded convert_case v0.10.0
+  Downloaded constant_time_eq v0.4.2
+  Downloaded const-random-macro v0.1.16
+  Downloaded const-random v0.1.18
+  Downloaded cmake v0.1.58
+  Downloaded heck v0.5.0
+  Downloaded clap_lex v1.1.1
+  Downloaded ciborium-ll v0.2.2
+  Downloaded cfg_aliases v0.2.2
+  Downloaded byteorder v1.5.0
+  Downloaded bit-vec v0.9.1
+  Downloaded compression-codecs v0.4.43
+  Downloaded bit-vec v0.6.3
+  Downloaded axum-core v0.5.6
+  Downloaded async-stream-impl v0.3.6
+  Downloaded anstyle v1.0.14
+  Downloaded annotate-snippets v0.12.16
+  Downloaded fallible-iterator v0.3.0
+  Downloaded bitflags v1.3.2
+  Downloaded data-encoding v2.11.1
+  Downloaded csscolorparser v0.6.2
+  Downloaded der-parser v10.0.0
+  Downloaded dotenvy v0.15.7
+  Downloaded document-features v0.2.12
+  Downloaded crossbeam-queue v0.3.14
+  Downloaded critical-section v1.2.0
+  Downloaded anyhow v1.0.104
+  Downloaded glob v0.3.4
+  Downloaded ahash v0.8.12
+  Downloaded digest v0.10.7
+  Downloaded arrayvec v0.7.8
+  Downloaded deranged v0.5.8
+  Downloaded derive_builder_core v0.20.2
+  Downloaded defmt-macros v1.1.1
+  Downloaded clap_derive v4.6.7
+  Downloaded axum-server v0.8.0
+  Downloaded fdeflate v0.3.7
+  Downloaded errno v0.3.14
+  Downloaded encoding_rs_io v0.1.8
+  Downloaded find-msvc-tools v0.1.13
+  Downloaded crc-catalog v2.5.0
+  Downloaded arrow-string v58.4.0
+  Downloaded futures-macro v0.3.34
+  Downloaded fs_extra v1.3.0
+  Downloaded displaydoc v0.2.7
+  Downloaded httpdate v1.0.3
+  Downloaded http-body v1.1.0
+  Downloaded console v0.16.6
+  Downloaded chacha20 v0.10.2
+  Downloaded borsh-derive v1.8.1
+  Downloaded bytemuck v1.25.2
+  Downloaded bitflags v2.13.2
+  Downloaded arrow-row v58.4.0
+  Downloaded arrow-arith v58.4.0
+  Downloaded foldhash v0.2.0
+  Downloaded crossbeam-deque v0.8.8
+  Downloaded ciborium v0.2.2
+  Downloaded form_urlencoded v1.2.2
+  Downloaded fs-err v3.3.1
+  Downloaded filetime v0.2.29
+  Downloaded futures-executor v0.3.34
+  Downloaded fastrand v2.5.0
+  Downloaded arboard v3.6.1
+  Downloaded cap-std v4.0.3
+  Downloaded clap_complete v4.6.11
+  Downloaded hashlink v0.11.1
+  Downloaded inotify-sys v0.1.8
+  Downloaded darling v0.20.11
+  Downloaded instability v0.3.14
+  Downloaded hmac v0.13.0
+  Downloaded crc32fast v1.5.2
+  Downloaded arrow-data v58.4.0
+  Downloaded bincode v2.0.1
+  Downloaded http-body-util v0.1.5
+  Downloaded clap v4.6.7
+  Downloaded ident_case v1.0.1
+  Downloaded idna_adapter v1.2.2
+  Downloaded hyper-rustls v0.27.10
+  Downloaded const-oid v0.10.2
+  Downloaded allocator-api2 v0.2.21
+  Downloaded bytes v1.12.1
+  Downloaded itoa v1.0.18
+  Downloaded ctutils v0.4.2
+  Downloaded indoc v2.0.7
+  Downloaded io-lifetimes v3.0.1
+  Downloaded ipnet v2.12.2
+  Downloaded crossbeam-epoch v0.9.21
+  Downloaded arrow-ord v58.4.0
+  Downloaded base64 v0.23.1
+  Downloaded astral-tokio-tar v0.6.4
+  Downloaded fax v0.2.7
+  Downloaded hashlink v0.12.2
+  Downloaded derive_builder v0.20.2
+  Downloaded cap-primitives v4.0.3
+  Downloaded futures-channel v0.3.34
+  Downloaded base64 v0.22.1
+  Downloaded event-listener v5.4.2
+  Downloaded maybe-owned v0.3.4
+  Downloaded mac_address v1.1.8
+  Downloaded matchers v0.2.0
+  Downloaded lazy_static v1.5.0
+  Downloaded deadpool v0.12.3
+  Downloaded darling v0.24.1
+  Downloaded lru-slab v0.1.3
+  Downloaded getrandom v0.3.4
+  Downloaded crossbeam-utils v0.8.23
+  Downloaded compact_str v0.9.1
+  Downloaded const_format v0.2.36
+  Downloaded managed v0.8.0
+  Downloaded io-lifetimes v2.0.4
+  Downloaded memoffset v0.9.1
+  Downloaded io-extras v0.19.0
+  Downloaded httparse v1.10.1
+  Downloaded arrow-schema v58.4.0
+  Downloaded borsh v1.8.1
+  Downloaded async-compression v0.4.48
+  Downloaded asn1-rs v0.7.2
+  Downloaded arrow v58.4.0
+  Downloaded libloading v0.8.9
+  Downloaded lru v0.18.5
+  Downloaded md-5 v0.11.0
+  Downloaded line-clipping v0.3.8
+  Downloaded multiversion_no_op v1.0.0
+  Downloaded msb_krun_polly v0.1.39
+  Downloaded cc v1.4.7
+  Downloaded arrow-buffer v58.4.0
+  Downloaded memmem v0.1.1
+  Downloaded arrow-select v58.4.0
+  Downloaded konst_macro_rules v0.2.19
+  Downloaded num-conv v0.2.2
+  Downloaded lock_api v0.4.14
+  Downloaded litemap v0.8.3
+  Downloaded lexical-parse-integer v1.0.6
+  Downloaded memmap2 v0.9.11
+  Downloaded matchit v0.8.4
+  Downloaded microsandbox-agent-client v0.7.2
+  Downloaded icu_provider v2.3.1
+  Downloaded aho-corasick v1.1.5
+  Downloaded openssl-probe v0.2.1
+  Downloaded httlib-huffman v0.3.4
+  Downloaded microsandbox-db v0.7.2
+  Downloaded notify-types v2.1.0
+  Downloaded microsandbox-vsock v0.7.2
+  Downloaded microsandbox-control-client v0.7.2
+  Downloaded http-auth v0.1.10
+  Downloaded bigdecimal v0.4.10
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded ouroboros v0.18.5
+  Downloaded option-ext v0.2.0
+  Downloaded icu_collections v2.3.0
+  Downloaded inotify v0.11.5
+  Downloaded log v0.4.34
+  Downloaded litrs v1.0.0
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded ipnetwork v0.21.1
+  Downloaded parking v2.2.1
+  Downloaded percent-encoding v2.3.2
+  Downloaded microsandbox-types-macros v0.7.2
+  Downloaded oid-registry v0.8.1
+  Downloaded notify v8.2.0
+  Downloaded hybrid-array v0.4.15
+  Downloaded getrandom v0.4.3
+  Downloaded arrow-cast v58.4.0
+  Downloaded defmt v1.1.1
+  Downloaded getrandom v0.2.17
+  Downloaded quick-error v2.0.1
+  Downloaded lexical-write-integer v1.0.6
+  Downloaded half v2.7.1
+  Downloaded palette_derive v0.7.7
+  Downloaded mime v0.3.17
+  Downloaded pgvector v0.4.2
+  Downloaded flume v0.12.0
+  Downloaded pest_derive v2.9.2
+  Downloaded jobserver v0.1.35
+  Downloaded once_cell v1.21.4
+  Downloaded msb_krun_kernel v0.1.39
+  Downloaded msb_krun_smbios v0.1.39
+  Downloaded microsandbox-protocol v0.7.2
+  Downloaded phf_macros v0.11.3
+  Downloaded ouroboros_macro v0.18.5
+  Downloaded lab v0.11.0
+  Downloaded portable-pty v0.9.0
+  Downloaded lexical-core v1.0.6
+  Downloaded rand_chacha v0.3.1
+  Downloaded hyper-util v0.1.20
+  Downloaded num-derive v0.4.2
+  Downloaded num_cpus v1.17.0
+  Downloaded icu_properties v2.3.0
+  Downloaded iana-time-zone v0.1.65
+  Downloaded miniz_oxide v0.9.1
+  Downloaded pest_meta v2.9.2
+  Downloaded parking_lot_core v0.9.12
+  Downloaded parking_lot v0.12.5
+  Downloaded phf v0.11.3
+  Downloaded ratatui-macros v0.7.2
+  Downloaded quote v1.0.47
+  Downloaded quinn-udp v0.5.15
+  Downloaded microsandbox-protocol-client v0.7.2
+  Downloaded axum v0.8.9
+  Downloaded num_threads v0.1.7
+  Downloaded clap_builder v4.6.7
+  Downloaded page_size v0.6.0
+  Downloaded minimal-lexical v0.2.1
+  Downloaded rand_chacha v0.9.0
+  Downloaded ratatui-crossterm v0.1.2
+  Downloaded hickory-net v0.26.3
+  Downloaded derive-where v1.7.0
+  Downloaded darling_core v0.20.11
+  Downloaded ratatui-termina v0.1.0
+  Downloaded flate2 v1.1.10
+  Downloaded rand_pcg v0.10.2
+  Downloaded memchr v2.8.3
+  Downloaded futures v0.3.34
+  Downloaded palette_math v0.7.7
+  Downloaded rtoolbox v0.0.6
+  Downloaded rustc_version v0.4.1
+  Downloaded ratatui-termwiz v0.1.2
+  Downloaded msb_krun_arch_gen v0.1.39
+  Downloaded rand_core v0.6.4
+  Downloaded rusticata-macros v4.1.0
+  Downloaded msb_krun_arch v0.1.39
+  Downloaded phf_generator v0.11.3
+  Downloaded scopeguard v1.2.0
+  Downloaded phf_shared v0.11.3
+  Downloaded sea-bae v0.2.2
+  Downloaded proc-macro2 v1.0.107
+  Downloaded lexical-write-float v1.0.6
+  Downloaded lexical-util v1.0.7
+  Downloaded kasuari v0.4.12
+  Downloaded reflink-copy v0.1.30
+  Downloaded sea-orm-arrow v2.0.0-rc.4
+  Downloaded rand_core v0.9.5
+  Downloaded num-complex v0.4.6
+  Downloaded proc-macro-crate v3.5.0
+  Downloaded potential_utf v0.1.6
+  Downloaded oci-spec v0.9.0
+  Downloaded powerfmt v0.2.0
+  Downloaded hkdf v0.13.0
+  Downloaded proc-macro2-diagnostics v0.10.1
+  Downloaded rustc-hash v2.1.3
+  Downloaded rpassword v7.5.4
+  Downloaded sea-schema-derive v0.3.0
+  Downloaded pin-project-lite v0.2.17
+  Downloaded rustix-linux-procfs v0.1.1
+  Downloaded rand_core v0.10.1
+  Downloaded rustversion v1.0.23
+  Downloaded rustls-native-certs v0.8.4
+  Downloaded serde_bytes v0.11.19
+  Downloaded microsandbox-metrics v0.7.2
+  Downloaded microsandbox-utils v0.7.2
+  Downloaded olpc-cjson v0.1.4
+  Downloaded same-file v1.0.6
+  Downloaded resolv-conf v0.7.6
+  Downloaded euclid v0.22.14
+  Downloaded darling_core v0.24.1
+  Downloaded ordered-float v4.6.0
+  Downloaded derive_more v2.1.1
+  Downloaded fancy-regex v0.11.0
+  Downloaded futures-intrusive v0.5.0
+  Downloaded shell-words v1.1.1
+  Downloaded finl_unicode v1.5.0
+  Downloaded pem v3.0.6
+  Downloaded sea-query-derive v1.0.0
+  Downloaded nom v7.1.3
+  Downloaded sha1 v0.11.0
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded pest_generator v2.9.2
+  Downloaded crossbeam-channel v0.5.17
+  Downloaded phf_codegen v0.11.3
+  Downloaded pem v4.0.0
+  Downloaded siphasher v1.0.3
+  Downloaded pkg-config v0.3.34
+  Downloaded serde_spanned v1.1.1
+  Downloaded jsonwebtoken v10.4.0
+  Downloaded ratatui v0.30.2
+  Downloaded msb_krun_utils v0.1.39
+  Downloaded pluralizer v0.5.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded num-integer v0.1.47
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded serde_path_to_error v0.1.20
+  Downloaded icu_locale_core v2.3.0
+  Downloaded sea-orm-cli v2.0.3
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded indicatif v0.18.6
+  Downloaded strip-ansi-escapes v0.2.1
+  Downloaded blake3 v1.8.7
+  Downloaded microsandbox-migration v0.7.2
+  Downloaded rayon-core v1.13.0
+  Downloaded signal-hook-mio v0.2.5
+  Downloaded signature v2.2.0
+  Downloaded simd-adler32 v0.3.10
+  Downloaded strum v0.27.2
+  Downloaded smallvec v1.16.1
+  Downloaded sync_wrapper v1.0.2
+  Downloaded simdutf8 v0.1.5
+  Downloaded rcgen v0.14.10
+  Downloaded icu_properties_data v2.3.0
+  Downloaded derive_more-impl v2.1.1
+  Downloaded strsim v0.11.1
+  Downloaded sea-query-sqlx v0.9.1
+  Downloaded serial2 v0.2.38
+  Downloaded rand v0.8.8
+  Downloaded strum v0.28.0
+  Downloaded subtle v2.6.1
+  Downloaded konst v0.2.20
+  Downloaded kvm-ioctls v0.25.0
+  Downloaded sha2 v0.11.0
+  Downloaded sha2 v0.10.9
+  Downloaded static_assertions v1.1.0
+  Downloaded time-core v0.1.9
+  Downloaded icu_normalizer_data v2.3.0
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded shlex v2.0.1
+  Downloaded num-traits v0.2.19
+  Downloaded serde_core v1.0.229
+  Downloaded strum_macros v0.28.0
+  Downloaded thread_local v1.1.10
+  Downloaded slab v0.4.12
+  Downloaded libm v0.2.16
+  Downloaded tokio-macros v2.7.2
+  Downloaded quinn v0.11.12
+  Downloaded sqlx-macros v0.9.0
+  Downloaded spin v0.9.9
+  Downloaded sea-orm-migration v2.0.3
+  Downloaded thiserror v1.0.69
+  Downloaded stringprep v0.1.5
+  Downloaded synstructure v0.14.0
+  Downloaded semver v1.0.28
+  Downloaded serde_yaml_ng v0.10.0
+  Downloaded tower-layer v0.3.3
+  Downloaded try-lock v0.2.5
+  Downloaded tracing-serde v0.2.0
+  Downloaded thiserror v2.0.20
+  Downloaded tower-service v0.3.3
+  Downloaded thiserror-impl v1.0.69
+  Downloaded kvm-bindings v0.14.1
+  Downloaded png v0.18.1
+  Downloaded strum_macros v0.27.2
+  Downloaded signal-hook v0.3.18
+  Downloaded rand v0.10.3
+  Downloaded synstructure v0.13.2
+  Downloaded thiserror-impl v2.0.20
+  Downloaded termios v0.3.3
+  Downloaded socket2 v0.6.5
+  Downloaded tinystr v0.8.4
+  Downloaded unit-prefix v0.5.2
+  Downloaded unicode-xid v0.2.6
+  Downloaded untrusted v0.9.0
+  Downloaded utf8parse v0.2.2
+  Downloaded lexical-parse-float v1.0.6
+  Downloaded http v1.5.0
+  Downloaded microsandbox-types v0.7.2
+  Downloaded chrono v0.4.45
+  Downloaded rustls-platform-verifier v0.7.0
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded tiny-keccak v2.0.2
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded tokio-rustls v0.26.5
+  Downloaded unty v0.0.4
+  Downloaded untrusted v0.7.1
+  Downloaded utf8_iter v1.0.4
+  Downloaded rand v0.9.5
+  Downloaded sqlx-macros-core v0.9.0
+  Downloaded ryu v1.0.23
+  Downloaded miniz_oxide v0.8.9
+  Downloaded terminfo v0.9.0
+  Downloaded pest v2.9.2
+  Downloaded heapless v0.9.3
+  Downloaded serde v1.0.229
+  Downloaded vte_generate_state_changes v0.1.2
+  Downloaded version_check v0.9.5
+  Downloaded serde_derive v1.0.229
+  Downloaded vtparse v0.6.2
+  Downloaded want v0.3.1
+  Downloaded rustls-webpki v0.103.15
+  Downloaded wezterm-color-types v0.3.0
+  Downloaded wezterm-dynamic v0.2.1
+  Downloaded wezterm-dynamic-derive v0.1.1
+  Downloaded tokio-socks v0.5.3
+  Downloaded tokio-stream v0.1.19
+  Downloaded sharded-slab v0.1.7
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded tempfile v3.27.0
+  Downloaded unicode-truncate v2.0.1
+  Downloaded wezterm-blob-leases v0.1.1
+  Downloaded xattr v1.6.1
+  Downloaded yoke-derive v0.8.3
+  Downloaded aws-lc-rs v1.18.1
+  Downloaded sqlx-mysql v0.9.0
+  Downloaded arrow-array v58.4.0
+  Downloaded oci-spec v0.10.0
+  Downloaded time-macros v0.2.32
+  Downloaded ucd-trie v0.1.7
+  Downloaded unicase v2.9.0
+  Downloaded unicode-ident v1.0.26
+  Downloaded sea-orm-macros v2.0.3
+  Downloaded tinyvec v1.13.3
+  Downloaded walkdir v2.5.0
+  Downloaded zeroize_derive v1.5.0
+  Downloaded moxcms v0.8.1
+  Downloaded hashbrown v0.17.1
+  Downloaded crossterm v0.29.0
+  Downloaded tar v0.4.46
+  Downloaded tracing-attributes v0.1.31
+  Downloaded toml v1.1.6+spec-1.1.0
+  Downloaded tracing-log v0.2.0
+  Downloaded zerofrom-derive v0.1.8
+  Downloaded zerofrom v0.1.8
+  Downloaded unicode-properties v0.1.4
+  Downloaded whoami v2.1.3
+  Downloaded writeable v0.6.4
+  Downloaded unicode-bidi v0.3.18
+  Downloaded virtue v0.0.18
+  Downloaded hashbrown v0.16.1
+  Downloaded toml_edit v0.25.15+spec-1.1.0
+  Downloaded mio v1.2.3
+  Downloaded weezl v0.1.12
+  Downloaded msb-vm-memory v0.18.0-msb.2
+  Downloaded vt100-ctt v0.17.1
+  Downloaded zstd-safe v8.0.0
+  Downloaded zeroize v1.9.0
+  Downloaded zerovec-derive v0.11.6
+  Downloaded wezterm-input-types v0.1.0
+  Downloaded num-bigint v0.4.8
+  Downloaded indexmap v2.14.2
+  Downloaded vmm-sys-util v0.15.0
+  Downloaded which v8.0.6
+  Downloaded zmij v1.0.23
+  Downloaded zune-core v0.5.3
+  Downloaded h2 v0.4.19
+  Downloaded yoke v0.8.3
+  Downloaded vte v0.14.1
+  Downloaded msb-imago v0.1.7
+  Downloaded yasna v0.6.0
+  Downloaded tracing-core v0.1.36
+  Downloaded uuid v1.26.1
+  Downloaded reqwest v0.13.5
+  Downloaded tiff v0.11.3
+  Downloaded portable-atomic v1.15.0
+  Downloaded unsafe-libyaml v0.2.11
+  Downloaded vte v0.13.1
+  Downloaded vm-fdt v0.3.0
+  Downloaded itertools v0.14.0
+  Downloaded hyper v1.11.1
+  Downloaded idna v1.1.0
+  Downloaded zstd v0.14.0
+  Downloaded ratatui-core v0.1.2
+  Downloaded wezterm-bidi v0.2.3
+  Downloaded regex v1.13.1
+  Downloaded futures-util v0.3.34
+  Downloaded rust_decimal v1.43.0
+  Downloaded wiremock v0.6.5
+  Downloaded url v2.5.8
+  Downloaded hickory-proto v0.26.3
+  Downloaded rusqlite v0.40.2
+  Downloaded termina v0.3.3
+  Downloaded typed-path v0.12.3
+  Downloaded yansi v1.0.1
+  Downloaded sqlx-core v0.9.0
+  Downloaded granit-parser v1.3.0
+  Downloaded typenum v1.20.1
+  Downloaded zune-jpeg v0.5.15
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded tokio-util v0.7.19
+  Downloaded zerotrie v0.2.5
+  Downloaded tower v0.5.3
+  Downloaded x509-parser v0.18.1
+  Downloaded microsandbox-cli v0.7.2
+  Downloaded zerocopy-derive v0.8.57
+  Downloaded ratatui-widgets v0.3.2
+  Downloaded serde_json v1.0.151
+  Downloaded nix v0.29.0
+  Downloaded nix v0.28.0
+  Downloaded unicode-normalization v0.1.25
+  Downloaded quinn-proto v0.11.18
+  Downloaded rayon v1.12.0
+  Downloaded zerovec v0.11.8
+  Downloaded nix v0.31.3
+  Downloaded sqlx-postgres v0.9.0
+  Downloaded tower-http v0.6.11
+  Downloaded nix v0.30.1
+  Downloaded object v0.37.3
+  Downloaded microsandbox-image v0.7.2
+  Downloaded tower-http v0.7.1
+  Downloaded webpki-roots v1.0.9
+  Downloaded winnow v1.0.4
+  Downloaded sqlx v0.9.0
+  Downloaded image v0.25.10
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded palette v0.7.7
+  Downloaded syn v1.0.109
+  Downloaded time v0.3.55
+  Downloaded virtio-bindings v0.2.7
+  Downloaded x11rb v0.13.2
+  Downloaded microsandbox-network v0.7.2
+  Downloaded regex-syntax v0.8.11
+  Downloaded vcpkg v0.2.15
+  Downloaded unicode-width v0.2.2
+  Downloaded zlib-rs v0.6.8
+  Downloaded syn v3.0.6
+  Downloaded syn v2.0.119
+  Downloaded rustls v0.23.45
+  Downloaded zerocopy v0.8.57
+  Downloaded icu_normalizer v2.3.0
+  Downloaded smoltcp v0.14.0
+  Downloaded sea-query v1.0.2
+  Downloaded termwiz v0.23.3
+  Downloaded microsandbox-runtime v0.7.2
+  Downloaded rustix v1.1.5
+  Downloaded regex-automata v0.4.18
+  Downloaded tracing v0.1.44
+  Downloaded encoding_rs v0.8.42
+  Downloaded libc v0.2.189
+  Downloaded x11rb-protocol v0.13.2
+  Downloaded pxfm v0.1.30
+  Downloaded msb_krun_devices v0.1.39
+  Downloaded serde-saphyr v1.3.0
+  Downloaded microsandbox v0.7.2
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded msb_krun_vmm v0.1.39
+  Downloaded tokio v1.53.1
+  Downloaded ring v0.17.14
+  Downloaded deltae v0.3.2
+  Downloaded oci-client v0.17.0
+  Downloaded sea-orm v2.0.3
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded sea-schema v0.18.1
+  Downloaded httlib-hpack v0.1.3
+  Downloaded libsqlite3-sys v0.38.2
+  Downloaded aws-lc-sys v0.45.0
+    Checking hyper v1.11.1
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:196:67
+    |
+196 |     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
+    |                                                                   ^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated tuple variant `time::format_description::Component::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:199:52
+    |
+199 |     const YEAR: BorrowedFormatItem<'_> = Component(Year({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Year`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:200:35
+    |
+200 |         let mut value = modifier::Year::default();
+    |                                   ^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::YearRepr::Full`: used only in the deprecated `Year` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:42
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |                                          ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:208:53
+    |
+208 |     const MONTH: BorrowedFormatItem<'_> = Component(Month({
+    |                                                     ^^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Month`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:209:35
+    |
+209 |         let mut value = modifier::Month::default();
+    |                                   ^^^^^
+
+warning: use of deprecated unit variant `time::format_description::modifier::MonthRepr::Numerical`: used only in the deprecated `Month` component
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:43
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |                                           ^^^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::Component::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:222:52
+    |
+222 |     const HOUR: BorrowedFormatItem<'_> = Component(Hour({
+    |                                                    ^^^^
+
+warning: use of deprecated struct `time::format_description::modifier::Hour`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:223:35
+    |
+223 |         let mut value = modifier::Hour::default();
+    |                                   ^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:263:13
+    |
+263 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:265:13
+    |
+265 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:267:23
+    |
+267 |             Optional(&Literal(b" ")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:268:23
+    |
+268 |             Optional(&Literal(b"T")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:270:13
+    |
+270 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:272:23
+    |
+272 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:274:23
+    |
+274 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:277:23
+    |
+277 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:285:13
+    |
+285 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:287:13
+    |
+287 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:289:13
+    |
+289 |             Literal(b" "),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:291:13
+    |
+291 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:293:23
+    |
+293 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:295:23
+    |
+295 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:297:23
+    |
+297 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:304:13
+    |
+304 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:306:13
+    |
+306 |             Literal(b"-"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:308:13
+    |
+308 |             Literal(b"T"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:310:13
+    |
+310 |             Literal(b":"),
+    |             ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:312:23
+    |
+312 |             Optional(&Literal(b":")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:314:23
+    |
+314 |             Optional(&Literal(b".")),
+    |                       ^^^^^^^
+
+warning: use of deprecated tuple variant `time::format_description::BorrowedFormatItem::Literal`: use `StringLiteral` instead; raw bytes are not recommended
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:316:23
+    |
+316 |             Optional(&Literal(b"Z")),
+    |                       ^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::padding`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:201:9
+    |
+201 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::repr`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:202:9
+    |
+202 |         value.repr = modifier::YearRepr::Full;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::iso_week_based`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:203:9
+    |
+203 |         value.iso_week_based = false;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Year::sign_is_mandatory`: use one of the various `Year*` components instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:204:9
+    |
+204 |         value.sign_is_mandatory = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::padding`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:210:9
+    |
+210 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::repr`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:211:9
+    |
+211 |         value.repr = modifier::MonthRepr::Numerical;
+    |         ^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Month::case_sensitive`: use `MonthShort`, `MonthLong`, or `MonthNumeric` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:212:9
+    |
+212 |         value.case_sensitive = true;
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::padding`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:224:9
+    |
+224 |         value.padding = modifier::Padding::Zero;
+    |         ^^^^^^^^^^^^^
+
+warning: use of deprecated field `time::format_description::modifier::Hour::is_12_hour_clock`: use `Hour12` or `Hour24` instead
+   --> third_party/sqlx-sqlite-0.9.0/src/types/time.rs:225:9
+    |
+225 |         value.is_12_hour_clock = false;
+    |         ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `sqlx-sqlite` (lib) generated 40 warnings
+   Compiling awman v0.12.0 (/workspace)
+    Checking hyper-util v0.1.20
+    Checking deadpool v0.12.3
+    Checking hyper-rustls v0.27.10
+    Checking axum-server v0.8.0
+    Checking reqwest v0.13.5
+    Checking axum v0.8.9
+    Checking oci-client v0.17.0
+    Checking microsandbox-image v0.7.2
+    Checking assert-json-diff v2.0.2
+    Checking wiremock v0.6.5
+    Checking microsandbox-runtime v0.7.2
+    Checking microsandbox v0.7.2
+    Checking microsandbox-cli v0.7.2
+error[E0599]: no method named `build_lazy_isolated` found for struct `microsandbox::LocalBackendBuilder` in the current scope
+   --> src/engine/container/builtin/msb_driver.rs:145:10
+    |
+135 | /     LocalBackend::builder()
+136 | |         .home(&paths.home)
+137 | |         .cache_dir(paths.home.join("cache"))
+138 | |         .sandboxes_dir(paths.home.join("sandboxes"))
+...   |
+144 | |         .ca_certs(None)
+145 | |         .build_lazy_isolated()
+    | |_________-^^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `build_lazy` with a similar name
+    |
+145 -         .build_lazy_isolated()
+145 +         .build_lazy()
+    |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `awman` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `awman` (lib test) due to 1 previous error

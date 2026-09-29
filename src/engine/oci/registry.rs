@@ -34,6 +34,7 @@ use crate::data::config::image_source::{RegistryAuthSource, RegistryHostConfig};
 use crate::data::oci_identity::{Digest, OciPlatform};
 use crate::engine::auth::credential::SecretString;
 use crate::engine::error::EngineError;
+use crate::engine::oci::retry::{redact, CancelToken, Deadline};
 use crate::engine::oci::sources::{FetchContext, Fetched, Report};
 use crate::engine::oci::verify::{
     digest_hex, ensure_space, is_limit_exceeded, sha256_digest, HashingReader, StagingSink,
@@ -48,6 +49,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Metadata requests (manifests, tokens) — blobs have no total timeout.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(120);
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// A blob transfer that delivers no bytes for this long is a disconnect.
+const BLOB_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -460,10 +463,27 @@ impl ProxySettings {
         }
     }
 
+    /// Credentials embedded in proxy URLs (`http://user:pw@proxy`), so they
+    /// can be redacted from transport errors.
+    fn secrets(&self) -> Vec<String> {
+        [&self.https, &self.http]
+            .into_iter()
+            .flatten()
+            .filter_map(|url| reqwest::Url::parse(url).ok())
+            .flat_map(|url| {
+                let mut out = Vec::new();
+                if let Some(pw) = url.password() {
+                    out.push(pw.to_string());
+                }
+                out
+            })
+            .collect()
+    }
+
     fn apply(
         &self,
-        mut builder: reqwest::blocking::ClientBuilder,
-    ) -> Result<reqwest::blocking::ClientBuilder, EngineError> {
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, EngineError> {
         // Never let the HTTP library consult the process environment itself.
         builder = builder.no_proxy();
         let no_proxy = self
@@ -489,14 +509,25 @@ impl ProxySettings {
     }
 }
 
+use super::retry::OperationControl;
+use super::transport::{Response, Transport};
+
 struct Session<'a> {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
+    transport: Transport,
     base: String,
     reference: &'a ImageReference,
     credentials: Option<Credentials>,
     insecure: bool,
     token: Option<SecretString>,
     basic: bool,
+    /// Every request is bounded by what is left of the acquisition deadline.
+    deadline: Deadline,
+    cancel: CancelToken,
+    /// Values that must never appear in an error: the password, the bearer
+    /// token and any proxy credential. Transport errors are redacted
+    /// against this list before they leave the session.
+    secrets: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -513,11 +544,17 @@ impl<'a> Session<'a> {
         host: Option<&RegistryHostConfig>,
         credentials: Option<Credentials>,
         proxy: &ProxySettings,
+        deadline: Deadline,
+        cancel: &CancelToken,
     ) -> Result<Self, EngineError> {
         let insecure = host.is_some_and(|h| h.insecure);
-        let mut builder = reqwest::blocking::Client::builder()
+        let mut secrets: Vec<String> = proxy.secrets();
+        if let Some(c) = &credentials {
+            secrets.push(c.password.expose().to_string());
+        }
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(None::<Duration>)
+            .read_timeout(BLOB_STALL_TIMEOUT)
             .user_agent(concat!("awman/", env!("CARGO_PKG_VERSION")));
         builder = proxy.apply(builder)?;
         if let Some(ca) = host.and_then(|h| h.ca_cert.as_ref()) {
@@ -535,6 +572,7 @@ impl<'a> Session<'a> {
         let scheme = if insecure { "http" } else { "https" };
         Ok(Self {
             client,
+            transport: Transport::new(OperationControl::new(cancel.clone(), deadline))?,
             base: format!(
                 "{scheme}://{}/v2/{}",
                 reference.api_host(),
@@ -545,6 +583,9 @@ impl<'a> Session<'a> {
             insecure,
             token: None,
             basic: false,
+            deadline,
+            cancel: cancel.clone(),
+            secrets,
         })
     }
 
@@ -555,21 +596,25 @@ impl<'a> Session<'a> {
         url: &str,
         accept: Option<&str>,
         timeout: Option<Duration>,
-    ) -> Result<reqwest::blocking::Response, EngineError> {
+    ) -> Result<Response, EngineError> {
         for attempt in 0..2 {
-            let mut req = self.client.get(url);
+            self.cancel.check()?;
+            let mut req = self
+                .client
+                .get(url)
+                .timeout(self.deadline.request_timeout(timeout));
             if let Some(a) = accept {
                 req = req.header(reqwest::header::ACCEPT, a);
-            }
-            if let Some(t) = timeout {
-                req = req.timeout(t);
             }
             if let Some(token) = &self.token {
                 req = req.bearer_auth(token.expose());
             } else if let (true, Some(c)) = (self.basic, &self.credentials) {
                 req = req.basic_auth(&c.username, Some(c.password.expose()));
             }
-            let resp = req.send().map_err(|e| self.network_error(e))?;
+            let resp = self
+                .transport
+                .send(req)
+                .map_err(|e| e.map_http(|e| self.network_error(e)))?;
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
                 if attempt == 0 {
                     let challenge = resp
@@ -606,11 +651,17 @@ impl<'a> Session<'a> {
     }
 
     fn network_error(&self, e: reqwest::Error) -> EngineError {
-        // `reqwest::Error` renders the URL, never request headers.
-        EngineError::Network(format!(
-            "registry {}: {}",
-            self.reference.registry,
-            e.without_url()
+        // `reqwest::Error` renders the URL, never request headers; the text
+        // is still redacted against every secret this session holds (a proxy
+        // URL with credentials can surface in a connect error).
+        let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        EngineError::Network(redact(
+            &format!(
+                "registry {}: {}",
+                self.reference.registry,
+                crate::engine::oci::retry::error_chain(&e.without_url())
+            ),
+            &secrets,
         ))
     }
 
@@ -662,11 +713,17 @@ impl<'a> Session<'a> {
                     });
                     q.append_pair("scope", &scope);
                 }
-                let mut req = self.client.get(url).timeout(METADATA_TIMEOUT);
+                let mut req = self
+                    .client
+                    .get(url)
+                    .timeout(self.deadline.request_timeout(Some(METADATA_TIMEOUT)));
                 if let (true, Some(c)) = (trusted, &self.credentials) {
                     req = req.basic_auth(&c.username, Some(c.password.expose()));
                 }
-                let resp = req.send().map_err(|e| self.network_error(e))?;
+                let resp = self
+                    .transport
+                    .send(req)
+                    .map_err(|e| e.map_http(|e| self.network_error(e)))?;
                 if !resp.status().is_success() {
                     return Err(self.rejected());
                 }
@@ -687,6 +744,7 @@ impl<'a> Session<'a> {
                     .or(parsed.access_token)
                     .filter(|t| !t.is_empty())
                     .ok_or_else(|| self.rejected())?;
+                self.secrets.push(token.clone());
                 self.token = Some(SecretString::new(token));
                 Ok(())
             }
@@ -800,14 +858,19 @@ impl<'a> Session<'a> {
         }
         let mut file = crate::engine::oci::verify::create_private_file(path)?;
         // Allow one extra byte so an over-long body is detected, not cut.
-        let mut reader = HashingReader::new(resp, size + 1);
+        let body = resp;
+        let mut reader = HashingReader::new(body, size + 1);
         let mut buf = vec![0u8; crate::engine::oci::verify::CHUNK];
         let mut last = 0u64;
         loop {
+            self.cancel.check()?;
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    self.cancel.check()?;
+                    continue;
+                }
                 Err(e) if is_limit_exceeded(&e) => {
                     return Err(EngineError::ImageDigestMismatch {
                         reference: self.reference.to_string(),
@@ -816,10 +879,16 @@ impl<'a> Session<'a> {
                     })
                 }
                 Err(e) => {
-                    return Err(EngineError::Network(format!(
-                        "blob {digest} transfer failed after {} of {size} bytes: {e}",
-                        reader.count()
-                    )))
+                    let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+                    return Err(EngineError::Network(redact(
+                        &format!(
+                            "registry {}: blob {digest} transfer failed after {} of {size} \
+                             bytes: {e}",
+                            self.reference.registry,
+                            reader.count()
+                        ),
+                        &secrets,
+                    )));
                 }
             };
             std::io::Write::write_all(&mut file, &buf[..n])
@@ -857,7 +926,7 @@ impl<'a> Session<'a> {
     }
 }
 
-fn read_capped(resp: reqwest::blocking::Response, cap: u64) -> Result<Vec<u8>, String> {
+fn read_capped(resp: Response, cap: u64) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     resp.take(cap + 1)
         .read_to_end(&mut body)
@@ -959,7 +1028,14 @@ pub(super) fn pull(
     ctx: &FetchContext<'_>,
     report: Report<'_>,
 ) -> Result<Fetched, EngineError> {
-    let mut session = Session::new(reference, inputs.host, inputs.credentials, &inputs.proxy)?;
+    let mut session = Session::new(
+        reference,
+        inputs.host,
+        inputs.credentials,
+        &inputs.proxy,
+        ctx.deadline,
+        ctx.cancel,
+    )?;
     let shown = reference.to_string();
 
     let (mut bytes, mut media_type, mut digest) = session.manifest(&reference.manifest_ref())?;
@@ -1083,6 +1159,7 @@ pub(super) fn pull(
     )?;
     let mut layer_digests = Vec::new();
     for layer in &manifest.layers {
+        ctx.cancel.check()?;
         let d = Digest::parse(&layer.digest)
             .map_err(|e| EngineError::Network(format!("manifest of {shown}: {e}")))?;
         let path = blobs_dir.join(digest_hex(&d));
@@ -1117,7 +1194,9 @@ pub(super) fn pull(
         ctx.limits.max_archive_bytes,
         ctx.limits.min_free_bytes,
         ctx.disk,
-    )?;
+    )?
+    .cancellable(ctx.cancel)
+    .with_deadline(ctx.deadline);
     let written = (|| -> std::io::Result<()> {
         let mut builder = tar::Builder::new(&mut sink);
         append_bytes(

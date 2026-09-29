@@ -1,0 +1,21 @@
+
+running 16 tests
+test engine::ready::tests::awaiting_dockerfile_decision_false_leads_to_failed_phase ... ok
+test engine::ready::tests::creating_dockerfile_phase_writes_file ... ok
+test engine::ready::tests::each_phase_reachable_via_step_calls ... ok
+test engine::ready::tests::import_runtime_imports_the_agent_image_and_never_builds ... ok
+test engine::ready::tests::import_runtime_checks_the_source_cache_unless_refresh_is_requested ... ok
+test engine::ready::tests::import_runtime_keeps_an_installed_image_when_no_source_is_configured ... ok
+test engine::ready::tests::import_runtime_preserves_the_concrete_availability_error ... ok
+test engine::ready::tests::import_runtime_rechecks_changed_locators_with_the_same_kind_and_reference ... ok
+test engine::ready::tests::import_runtime_reimports_an_image_cached_from_another_source_kind ... ok
+test engine::ready::tests::import_runtime_without_a_source_explains_the_external_build ... ok
+test engine::ready::tests::import_runtime_provisions_the_dockerfile_its_build_hint_names ... ok
+test engine::ready::tests::ready_caller_token_cancels_an_in_flight_import ... ok
+test engine::ready::tests::ready_on_a_kit_declarative_runtime_applies_the_kit_and_skips_image_phases ... ok
+test engine::ready::tests::ready_with_configured_dockerfile_reports_configured_path_when_missing ... ok
+test engine::ready::tests::ready_with_configured_dockerfile_skips_decision_when_present ... ok
+test engine::ready::tests::ready_import_timeout_cancels_worker_on_a_current_thread_runtime ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 3218 filtered out; finished in 0.17s
+

@@ -1,0 +1,12 @@
+builtin-inventory	0
+builtin-hermetic	0
+sdk-and-builtin-lib	0
+hardware-required	101
+oci-current	0
+services-required	101
+corpus-required	101
+distribution-required	101
+final-feature-clippy	0
+final-pre-push	0
+final-test-fast	0
+fast-oci-inventory	0

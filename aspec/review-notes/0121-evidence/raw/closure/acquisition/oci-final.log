@@ -1,0 +1,55 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling awman v0.12.0 (/workspace)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 19s
+     Running tests/oci_import/main.rs (target/debug/deps/oci_import-a4dd508ae0c82521)
+
+running 46 tests
+test apple_store_is_a_typed_blocker_with_dated_evidence ... ok
+test archive_import_persists_identity_and_cached_only_reuse_needs_no_source ... ok
+test cache_invariants::a_corrupted_cached_archive_is_a_miss_and_is_reacquired_once ... ok
+test cache_invariants::a_pre_metadata_cache_record_is_migrated_by_one_reacquisition ... ok
+test cache_invariants::acquisition_holds_lease_before_publication_callback_and_through_cloned_handoff ... ok
+test cache_invariants::changed_path_reference_endpoint_or_platform_is_never_served_from_another_entry ... ok
+test cache_invariants::unselected_images_and_tags_never_reach_the_runtime_projection ... ok
+test cache_invariants::source_deletion_replacement_and_shared_bytes_keep_per_reference_identity ... ok
+test cancellation::cancel_closes_docker_headers_and_body_without_a_transfer_worker ... ok
+test cancellation::cancel_closes_registry_and_auth_header_and_body_waits ... ok
+test corpus::archive_real_corpus_preserves_identity_and_links ... ok
+test corpus::archive_zstd_and_nondistributable_policy ... ok
+test corpus::corpus_inventory_requires_every_template_format_pair ... ok
+test corpus::real_corpus_every_shipped_template_archive_validates_and_projects ... ok
+test corpus::restrictive_symlink_rules_hold_against_realistic_layers ... ok
+test docker_store::a_daemon_that_drops_the_connection_is_retried_and_5xx_is_transient ... ok
+test docker_store::acquire_cancel_removes_partial_transfer ... ok
+test cancellation::deadline_closes_withheld_headers_and_leaves_no_cache_reference ... ok
+test docker_store::docker_tls_defaults_come_from_the_injected_environment_not_the_real_home ... ok
+test docker_store::acquire_retry_is_bounded_and_source_stable ... ok
+test docker_store::store_docker_missing_image_names_the_endpoint_and_is_not_retried ... ok
+test docker_store::store_docker_multi_platform_store_exports_the_requested_platform ... ok
+test docker_store::store_docker_old_supported_api_exports_without_platform_and_older_is_refused ... ok
+test docker_store::store_docker_tls_client_certificate_material_is_read_and_validated ... ok
+test docker_store::store_docker_tls_roundtrip_with_a_private_ca ... ok
+test docker_store::store_docker_tls_wrong_ca_expired_and_mismatched_certificates_are_final ... ok
+test docker_store::store_docker_tls_verify_false_accepts_an_unknown_certificate ... ok
+test docker_store::store_docker_unix_roundtrip_then_cached_use_after_the_daemon_is_gone ... ok
+test real_stores::late_stage_failure_never_writes_whole_scenario_pass ... ok
+test real_stores::native_keychain_disposable_registry_entry ... ok
+test real_stores::store_docker_real_engine_required_mtls_roundtrip ... ok
+test real_stores::store_docker_real_engine_tls_roundtrip ... ok
+test real_stores::store_docker_real_engine_unix_roundtrip ... ok
+test real_stores::store_registry_real_ca_proxy_auth_roundtrip ... ok
+test registry_store::a_proxy_that_is_unreachable_never_exposes_its_credentials ... ok
+test registry_store::injected_environment_ignores_ambient_credentials_and_proxies ... ok
+test registry_store::registry_untrusted_realm_and_redirect_redact_sentinels ... ok
+test registry_store::retry_uses_credentials_captured_before_the_first_request ... ok
+test registry_store::store_registry_anonymous_access_needs_no_credentials_and_helpers_never_run ... ok
+test registry_store::store_registry_ca_and_same_origin_token_realm_roundtrip ... ok
+test registry_store::store_registry_local_insecure_registry_with_basic_auth ... ok
+test docker_store::the_acquisition_deadline_bounds_a_stalled_export ... ok
+test registry_store::store_registry_wrong_ca_is_final_and_leaks_nothing ... ok
+test registry_store::store_registry_wrong_password_is_an_auth_error_without_the_secret ... ok
+test wrong_platform_and_malformed_transfer_leave_no_visible_cache_state ... ok
+test registry_store::store_registry_proxy_is_used_and_no_proxy_bypasses_it ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.15s
+

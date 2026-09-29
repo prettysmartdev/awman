@@ -17,6 +17,7 @@ use crate::engine::overlay::OverlayEngine;
 
 pub mod frontend;
 pub mod host_agent;
+mod import;
 
 pub use crate::data::ready_phase::{ReadyFailure, ReadyPhase};
 // Re-exported at the module root so the many call sites that name the ping
@@ -61,6 +62,7 @@ pub struct ReadyEngine {
     /// importing runtime then reports `ImageSourceUnconfigured` with the
     /// external-build hint.
     image_sources: ImageSources,
+    cancel: crate::engine::oci::CancelToken,
 }
 
 impl ReadyEngine {
@@ -85,6 +87,7 @@ impl ReadyEngine {
             pre_audit_dockerfile_hash: None,
             host_agent: HostAgentPinger::new(),
             image_sources: ImageSources::default(),
+            cancel: crate::engine::oci::CancelToken::new(),
         }
     }
 
@@ -93,6 +96,12 @@ impl ReadyEngine {
     pub fn with_image_sources(mut self, sources: ImageSources) -> Self {
         self.image_sources = sources;
         self
+    }
+
+    /// Cancellation handle for an in-flight ready import. Dropping an import
+    /// future also cancels it, so async deadlines work on a current-thread runtime.
+    pub fn cancel_token(&self) -> crate::engine::oci::CancelToken {
+        self.cancel.clone()
     }
 
     /// Whether the runtime imports prepared images instead of building them.
@@ -135,6 +144,7 @@ impl ReadyEngine {
         use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
         use crate::data::templates;
 
+        self.cancel.check()?;
         frontend.report_phase(&self.phase);
         let git_root = self.session.git_root().to_path_buf();
         let _ = &self.git_engine;
@@ -867,7 +877,7 @@ impl ReadyEngine {
             platform,
             refresh,
         };
-        match self.runtime.import_image(&request, frontend) {
+        match import::run(self.runtime.clone(), request, self.cancel.clone(), frontend).await {
             Ok(imported) => {
                 self.summary.agent_image = StepStatus::Done;
                 self.summary.image_source = Some(StepStatus::Done);
@@ -885,7 +895,9 @@ impl ReadyEngine {
                 let text = e.to_string();
                 // A missing source image is the common case; say how to
                 // produce it rather than only that it is missing.
-                if matches!(e, EngineError::Container(_)) {
+                if matches!(e, EngineError::Container(_))
+                    && !crate::engine::oci::retry::is_cancelled(&e)
+                {
                     self.provision_agent_dockerfile(frontend, git_root, &hint.agent_dockerfile)
                         .await;
                     frontend.write_message(UserMessage {
@@ -937,6 +949,7 @@ impl ReadyEngine {
     ) -> Result<ReadySummary, EngineError> {
         loop {
             let next = self.step(frontend).await?;
+            self.cancel.check()?;
             if matches!(next, ReadyPhase::Complete | ReadyPhase::Failed(_)) {
                 break;
             }
@@ -1522,6 +1535,8 @@ mod tests {
         cached_source: crate::data::config::image_source::ImageSourceKind,
         imports: std::sync::Mutex<Vec<crate::engine::agent_runtime::ImageImportRequest>>,
         builds: std::sync::Mutex<usize>,
+        wait_for_cancel: bool,
+        cancel_observed: std::sync::atomic::AtomicBool,
     }
 
     impl FakeImportRuntime {
@@ -1538,6 +1553,8 @@ mod tests {
                 cached_source: crate::data::config::image_source::ImageSourceKind::Archive,
                 imports: std::sync::Mutex::new(Vec::new()),
                 builds: std::sync::Mutex::new(0),
+                wait_for_cancel: false,
+                cancel_observed: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -1656,6 +1673,27 @@ mod tests {
                 operation: "image build",
             })
         }
+        fn import_image_cancellable(
+            &self,
+            request: &crate::engine::agent_runtime::ImageImportRequest,
+            sink: &mut dyn crate::data::message::UserMessageSink,
+            cancel: &crate::engine::oci::CancelToken,
+        ) -> Result<crate::engine::agent_runtime::ImportedImage, EngineError> {
+            if self.wait_for_cancel {
+                self.imports.lock().unwrap().push(request.clone());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while !cancel.is_cancelled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                self.cancel_observed
+                    .store(cancel.is_cancelled(), std::sync::atomic::Ordering::SeqCst);
+                cancel.check()?;
+                return Err(EngineError::Other(
+                    "ready caller did not cancel import".into(),
+                ));
+            }
+            self.import_image(request, sink)
+        }
         fn import_image(
             &self,
             request: &crate::engine::agent_runtime::ImageImportRequest,
@@ -1750,6 +1788,57 @@ mod tests {
             ),
             images: Default::default(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_import_timeout_cancels_worker_on_a_current_thread_runtime() {
+        let mut fake = FakeImportRuntime::new(false);
+        fake.wait_for_cancel = true;
+        let runtime = Arc::new(fake);
+        let (mut engine, mut frontend, tmp) =
+            import_engine(runtime.clone(), true, archive_sources());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.import_agent_image(&mut frontend, tmp.path()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "blocking import must not prevent the async timeout"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !runtime
+                .cancel_observed
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropped ready future must cancel its production worker");
+        assert_eq!(runtime.imports.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_caller_token_cancels_an_in_flight_import() {
+        let mut fake = FakeImportRuntime::new(false);
+        fake.wait_for_cancel = true;
+        let runtime = Arc::new(fake);
+        let (mut engine, mut frontend, tmp) =
+            import_engine(runtime.clone(), true, archive_sources());
+        let cancel = engine.cancel_token();
+        let signal = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        engine.import_agent_image(&mut frontend, tmp.path()).await;
+        signal.await.unwrap();
+        assert!(runtime
+            .cancel_observed
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            matches!(engine.summary().agent_image, StepStatus::Failed(message) if message.contains("cancelled"))
+        );
     }
 
     #[tokio::test]

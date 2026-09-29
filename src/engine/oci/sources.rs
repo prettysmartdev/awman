@@ -15,6 +15,7 @@ use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
 use crate::data::oci_identity::{Digest, OciPlatform};
 use crate::engine::error::EngineError;
 use crate::engine::oci::cache::SourceFingerprint;
+use crate::engine::oci::retry::{CancelToken, Deadline};
 use crate::engine::oci::verify::{DiskSpace, StagingSink};
 use crate::engine::oci::{apple_store, archive, docker_engine, registry};
 use crate::engine::oci::{AcquireLimits, AcquireProgress};
@@ -29,6 +30,15 @@ pub(super) struct FetchContext<'a> {
     pub limits: AcquireLimits,
     pub disk: &'a dyn DiskSpace,
     pub platform: &'a OciPlatform,
+    /// Cancellation requested by the caller; adapters check it in every
+    /// transfer loop.
+    pub cancel: &'a CancelToken,
+    /// The whole acquisition's deadline; every request is bounded by what
+    /// is left of it.
+    pub deadline: Deadline,
+    /// 1-based attempt number (for diagnostics only; the request is the
+    /// same every time).
+    pub attempt: u32,
 }
 
 /// A staged, not yet validated archive.
@@ -48,6 +58,7 @@ pub(super) enum Resolved {
     Registry {
         reference: registry::ImageReference,
         host: Option<RegistryHostConfig>,
+        transport: Box<RegistryTransport>,
     },
     DockerStore {
         endpoint: docker_engine::Endpoint,
@@ -56,6 +67,12 @@ pub(super) enum Resolved {
     Archive {
         path: PathBuf,
     },
+}
+
+#[derive(Default)]
+pub(super) struct RegistryTransport {
+    credentials: Option<registry::Credentials>,
+    proxy: registry::ProxySettings,
 }
 
 impl Resolved {
@@ -85,6 +102,7 @@ impl Resolved {
                 Self::Registry {
                     reference: parsed,
                     host,
+                    transport: Box::default(),
                 }
             }
             ImageSourceSpec::DockerStore { host, tls, .. } => Self::DockerStore {
@@ -108,7 +126,9 @@ impl Resolved {
     /// Non-secret description of the source.
     pub(super) fn locator(&self) -> String {
         match self {
-            Self::Registry { reference, host } => {
+            Self::Registry {
+                reference, host, ..
+            } => {
                 let scheme = if host.as_ref().is_some_and(|h| h.insecure) {
                     "http"
                 } else {
@@ -145,38 +165,27 @@ impl Resolved {
         ctx: &FetchContext<'_>,
         report: Report<'_>,
     ) -> Result<Fetched, EngineError> {
+        tracing::debug!(
+            attempt = ctx.attempt,
+            locator = %self.locator(),
+            "staging image archive"
+        );
         match self {
             Self::Registry {
                 reference: parsed,
                 host,
-            } => {
-                let lookup = |name: &str| crate::data::config::env::host_var(name);
-                let docker_config = || {
-                    let dir = lookup("DOCKER_CONFIG")
-                        .map(PathBuf::from)
-                        .or_else(|| dirs::home_dir().map(|h| h.join(".docker")))?;
-                    let path = dir.join("config.json");
-                    let bytes = std::fs::read(&path).ok()?;
-                    Some((path, bytes))
-                };
-                let credentials = registry::resolve_credentials(
-                    &parsed.registry,
-                    host.as_ref().and_then(|h| h.auth.as_ref()),
-                    &lookup,
-                    &docker_config,
-                )?;
-                registry::pull(
-                    parsed,
-                    awman_tag,
-                    registry::PullInputs {
-                        host: host.as_ref(),
-                        credentials,
-                        proxy: registry::ProxySettings::from_lookup(&lookup),
-                    },
-                    ctx,
-                    report,
-                )
-            }
+                transport,
+            } => registry::pull(
+                parsed,
+                awman_tag,
+                registry::PullInputs {
+                    host: host.as_ref(),
+                    credentials: transport.credentials.clone(),
+                    proxy: transport.proxy.clone(),
+                },
+                ctx,
+                report,
+            ),
             Self::DockerStore { endpoint } => {
                 docker_engine::export(endpoint, reference, ctx, report)
             }
@@ -195,7 +204,9 @@ impl Resolved {
                     ctx.limits.max_archive_bytes,
                     ctx.limits.min_free_bytes,
                     ctx.disk,
-                )?;
+                )?
+                .cancellable(ctx.cancel)
+                .with_deadline(ctx.deadline);
                 archive::stage_local_archive(path, &mut sink, ctx.limits.max_archive_bytes)?;
                 let (staged, _) = sink.finish()?;
                 Ok(Fetched {
@@ -212,16 +223,45 @@ impl Resolved {
     pub(super) fn is_network(&self) -> bool {
         matches!(self, Self::Registry { .. } | Self::DockerStore { .. })
     }
+
+    /// Resolve transport credentials once, only after a cache miss. Retrying
+    /// must not reread an edited credential file, keychain or host environment.
+    pub(super) fn prepare_credentials(&mut self, env: &EnvSnapshot) -> Result<(), EngineError> {
+        if let Self::Registry {
+            reference,
+            host,
+            transport,
+        } = self
+        {
+            let lookup = |name: &str| env.get(name).map(str::to_owned);
+            let docker_config = || {
+                let dir = lookup("DOCKER_CONFIG")
+                    .map(PathBuf::from)
+                    .or_else(|| lookup("HOME").map(|h| PathBuf::from(h).join(".docker")))?;
+                let path = dir.join("config.json");
+                let bytes = std::fs::read(&path).ok()?;
+                Some((path, bytes))
+            };
+            transport.credentials = registry::resolve_credentials(
+                &reference.registry,
+                host.as_ref().and_then(|h| h.auth.as_ref()),
+                &lookup,
+                &docker_config,
+            )?;
+            transport.proxy = registry::ProxySettings::from_lookup(&lookup);
+        }
+        Ok(())
+    }
 }
 
 /// Run `work` on a dedicated OS thread, forwarding its progress events to
-/// `progress` on this thread. Blocking HTTP clients must not run inside an
-/// async runtime's worker, and `import_image` may be called from one.
+/// `progress` on this thread. The synchronous HTTP facade owns its own async
+/// executor, which must not be nested inside a caller's Tokio worker.
 pub(super) fn run_isolated<T: Send>(
     progress: &mut dyn FnMut(AcquireProgress),
     work: impl FnOnce(Report<'_>) -> T + Send,
 ) -> T {
-    let (tx, rx) = std::sync::mpsc::channel::<AcquireProgress>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<AcquireProgress>(64);
     std::thread::scope(|scope| {
         let handle = scope.spawn(move || {
             let tx = std::sync::Mutex::new(tx);

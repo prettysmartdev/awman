@@ -1,0 +1,676 @@
+architecture-lint: OK — all imports respect the layering rules
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded approx v0.5.1
+  Downloaded futures-task v0.3.34
+  Downloaded anstyle-query v1.1.5
+  Downloaded adler2 v2.0.1
+  Downloaded futures-macro v0.3.34
+  Downloaded bit-set v0.5.3
+  Downloaded assert-json-diff v2.0.2
+  Downloaded cfg_aliases v0.1.1
+  Downloaded futures v0.3.34
+  Downloaded clap_lex v1.1.1
+  Downloaded by_address v1.2.1
+  Downloaded asn1-rs-impl v0.2.0
+  Downloaded asn1-rs-derive v0.6.0
+  Downloaded futures-sink v0.3.34
+  Downloaded futures-io v0.3.34
+  Downloaded cfg_aliases v0.2.2
+  Downloaded castaway v0.2.4
+  Downloaded anstyle v1.0.14
+  Downloaded cfg-if v1.0.5
+  Downloaded heck v0.5.0
+  Downloaded futures-core v0.3.34
+  Downloaded form_urlencoded v1.2.2
+  Downloaded fixedbitset v0.4.2
+  Downloaded futures-executor v0.3.34
+  Downloaded cpufeatures v0.2.17
+  Downloaded hex v0.4.3
+  Downloaded dirs-sys v0.5.0
+  Downloaded httpdate v1.0.3
+  Downloaded http-body v1.1.0
+  Downloaded ident_case v1.0.1
+  Downloaded idna_adapter v1.2.2
+  Downloaded generic-array v0.14.7
+  Downloaded gethostname v1.1.0
+  Downloaded instability v0.3.14
+  Downloaded fallible-streaming-iterator v0.1.9
+  Downloaded block-buffer v0.10.4
+  Downloaded anstream v1.0.0
+  Downloaded bit-vec v0.9.1
+  Downloaded bit-vec v0.6.3
+  Downloaded autocfg v1.5.1
+  Downloaded atomic v0.6.1
+  Downloaded cmake v0.1.58
+  Downloaded errno v0.3.14
+  Downloaded equivalent v1.0.2
+  Downloaded dunce v1.0.5
+  Downloaded document-features v0.2.12
+  Downloaded dirs v7.0.0
+  Downloaded deadpool-runtime v0.1.4
+  Downloaded percent-encoding v2.3.2
+  Downloaded option-ext v0.2.0
+  Downloaded openssl-probe v0.2.1
+  Downloaded num_threads v0.1.7
+  Downloaded num_cpus v1.17.0
+  Downloaded num-derive v0.4.2
+  Downloaded num-conv v0.2.2
+  Downloaded memoffset v0.9.1
+  Downloaded memmem v0.1.1
+  Downloaded matchers v0.2.0
+  Downloaded lru-slab v0.1.3
+  Downloaded lab v0.11.0
+  Downloaded itoa v1.0.18
+  Downloaded axum-core v0.5.6
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded darling_macro v0.24.1
+  Downloaded crypto-common v0.2.2
+  Downloaded cpufeatures v0.3.1
+  Downloaded byteorder-lite v0.1.0
+  Downloaded async-trait v0.1.92
+  Downloaded anyhow v1.0.104
+  Downloaded crypto-common v0.1.7
+  Downloaded fnv v1.0.7
+  Downloaded colorchoice v1.0.5
+  Downloaded block-buffer v0.12.1
+  Downloaded mime v0.3.17
+  Downloaded fs_extra v1.3.0
+  Downloaded fs-err v3.3.1
+  Downloaded mac_address v1.1.8
+  Downloaded phf_codegen v0.11.3
+  Downloaded phf_generator v0.11.3
+  Downloaded anstyle-parse v1.0.0
+  Downloaded lazy_static v1.5.0
+  Downloaded atomic-waker v1.1.2
+  Downloaded quick-error v2.0.1
+  Downloaded digest v0.10.7
+  Downloaded fallible-iterator v0.3.0
+  Downloaded deranged v0.5.8
+  Downloaded csscolorparser v0.6.2
+  Downloaded ipnet v2.12.2
+  Downloaded http-body-util v0.1.5
+  Downloaded fdeflate v0.3.7
+  Downloaded fastrand v2.5.0
+  Downloaded foldhash v0.2.0
+  Downloaded bitflags v1.3.2
+  Downloaded either v1.18.0
+  Downloaded phf_shared v0.11.3
+  Downloaded find-msvc-tools v0.1.13
+  Downloaded filetime v0.2.29
+  Downloaded fax v0.2.7
+  Downloaded digest v0.11.3
+  Downloaded critical-section v1.2.0
+  Downloaded convert_case v0.10.0
+  Downloaded oid-registry v0.8.1
+  Downloaded palette_derive v0.7.7
+  Downloaded jobserver v0.1.35
+  Downloaded indoc v2.0.7
+  Downloaded kasuari v0.4.12
+  Downloaded line-clipping v0.3.8
+  Downloaded palette_math v0.7.7
+  Downloaded num-integer v0.1.47
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded potential_utf v0.1.6
+  Downloaded arboard v3.6.1
+  Downloaded downcast-rs v1.2.1
+  Downloaded data-encoding v2.11.1
+  Downloaded allocator-api2 v0.2.21
+  Downloaded pest_generator v2.9.2
+  Downloaded pest_derive v2.9.2
+  Downloaded pem v4.0.0
+  Downloaded filedescriptor v0.8.3
+  Downloaded displaydoc v0.2.7
+  Downloaded deadpool v0.12.3
+  Downloaded clap_derive v4.6.7
+  Downloaded chacha20 v0.10.2
+  Downloaded axum-server v0.8.0
+  Downloaded ordered-float v4.6.0
+  Downloaded futures-channel v0.3.34
+  Downloaded lock_api v0.4.14
+  Downloaded ratatui-macros v0.7.2
+  Downloaded arrayvec v0.7.8
+  Downloaded rand_pcg v0.10.2
+  Downloaded powerfmt v0.2.0
+  Downloaded pin-project-lite v0.2.17
+  Downloaded phf_macros v0.11.3
+  Downloaded crc32fast v1.5.2
+  Downloaded portable-pty v0.9.0
+  Downloaded bytemuck v1.25.2
+  Downloaded arc-swap v1.9.2
+  Downloaded const-oid v0.10.2
+  Downloaded phf v0.11.3
+  Downloaded httparse v1.10.1
+  Downloaded hashlink v0.12.2
+  Downloaded parking_lot_core v0.9.12
+  Downloaded lru v0.18.5
+  Downloaded darling v0.24.1
+  Downloaded litemap v0.8.3
+  Downloaded clap v4.6.7
+  Downloaded bitflags v2.13.2
+  Downloaded pkg-config v0.3.34
+  Downloaded once_cell v1.21.4
+  Downloaded matchit v0.8.4
+  Downloaded hyper-rustls v0.27.10
+  Downloaded parking_lot v0.12.5
+  Downloaded der-parser v10.0.0
+  Downloaded getrandom v0.4.3
+  Downloaded iana-time-zone v0.1.65
+  Downloaded quote v1.0.47
+  Downloaded base64 v0.22.1
+  Downloaded quinn-udp v0.5.15
+  Downloaded ratatui-termina v0.1.0
+  Downloaded scopeguard v1.2.0
+  Downloaded rusticata-macros v4.1.0
+  Downloaded rustc-hash v2.1.3
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded serde_spanned v1.1.1
+  Downloaded rustc_version v0.4.1
+  Downloaded siphasher v1.0.3
+  Downloaded shell-words v1.1.1
+  Downloaded strsim v0.11.1
+  Downloaded fancy-regex v0.11.0
+  Downloaded rand_core v0.6.4
+  Downloaded bytes v1.12.1
+  Downloaded ratatui-crossterm v0.1.2
+  Downloaded rand_core v0.10.1
+  Downloaded half v2.7.1
+  Downloaded flate2 v1.1.10
+  Downloaded derive_more v2.1.1
+  Downloaded finl_unicode v1.5.0
+  Downloaded darling_core v0.24.1
+  Downloaded compact_str v0.9.1
+  Downloaded getrandom v0.3.4
+  Downloaded signal-hook-mio v0.2.5
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded hybrid-array v0.4.15
+  Downloaded getrandom v0.2.17
+  Downloaded strip-ansi-escapes v0.2.1
+  Downloaded subtle v2.6.1
+  Downloaded cc v1.4.7
+  Downloaded base64 v0.23.1
+  Downloaded asn1-rs v0.7.2
+  Downloaded litrs v1.0.0
+  Downloaded num-traits v0.2.19
+  Downloaded ratatui-termwiz v0.1.2
+  Downloaded strum v0.28.0
+  Downloaded proc-macro2 v1.0.107
+  Downloaded sync_wrapper v1.0.2
+  Downloaded icu_provider v2.3.1
+  Downloaded rustls-native-certs v0.8.4
+  Downloaded sha2 v0.10.9
+  Downloaded log v0.4.34
+  Downloaded shlex v2.0.1
+  Downloaded euclid v0.22.14
+  Downloaded thread_local v1.1.10
+  Downloaded time-core v0.1.9
+  Downloaded pest_meta v2.9.2
+  Downloaded tokio-macros v2.7.2
+  Downloaded synstructure v0.14.0
+  Downloaded tower-service v0.3.3
+  Downloaded serde_path_to_error v0.1.20
+  Downloaded tower-layer v0.3.3
+  Downloaded strum_macros v0.28.0
+  Downloaded slab v0.4.12
+  Downloaded simd-adler32 v0.3.10
+  Downloaded smallvec v1.16.1
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded thiserror-impl v1.0.69
+  Downloaded thiserror v2.0.20
+  Downloaded try-lock v0.2.5
+  Downloaded tracing-serde v0.2.0
+  Downloaded thiserror v1.0.69
+  Downloaded static_assertions v1.1.0
+  Downloaded sha2 v0.11.0
+  Downloaded derive_more-impl v2.1.1
+  Downloaded synstructure v0.13.2
+  Downloaded rustls-pki-types v1.15.1
+  Downloaded untrusted v0.9.0
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded miniz_oxide v0.8.9
+  Downloaded icu_normalizer_data v2.3.0
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded tokio-rustls v0.26.5
+  Downloaded rustls-platform-verifier v0.7.0
+  Downloaded thiserror-impl v2.0.20
+  Downloaded tempfile v3.27.0
+  Downloaded terminfo v0.9.0
+  Downloaded utf8parse v0.2.2
+  Downloaded termios v0.3.3
+  Downloaded wezterm-blob-leases v0.1.1
+  Downloaded vte_generate_state_changes v0.1.2
+  Downloaded sharded-slab v0.1.7
+  Downloaded quinn v0.11.12
+  Downloaded socket2 v0.6.5
+  Downloaded signal-hook v0.3.18
+  Downloaded semver v1.0.28
+  Downloaded serial2 v0.2.38
+  Downloaded rustversion v1.0.23
+  Downloaded wezterm-dynamic-derive v0.1.1
+  Downloaded tinystr v0.8.4
+  Downloaded unicode-truncate v2.0.1
+  Downloaded tracing-log v0.2.0
+  Downloaded want v0.3.1
+  Downloaded wezterm-color-types v0.3.0
+  Downloaded wezterm-dynamic v0.2.1
+  Downloaded version_check v0.9.5
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded icu_locale_core v2.3.0
+  Downloaded zerofrom-derive v0.1.8
+  Downloaded wezterm-input-types v0.1.0
+  Downloaded miniz_oxide v0.9.1
+  Downloaded crossterm v0.29.0
+  Downloaded rcgen v0.14.10
+  Downloaded icu_collections v2.3.0
+  Downloaded xattr v1.6.1
+  Downloaded zerofrom v0.1.8
+  Downloaded yoke-derive v0.8.3
+  Downloaded toml v1.1.6+spec-1.1.0
+  Downloaded utf8_iter v1.0.4
+  Downloaded pest v2.9.2
+  Downloaded tar v0.4.46
+  Downloaded tokio-stream v0.1.19
+  Downloaded vt100-ctt v0.17.1
+  Downloaded serde_derive v1.0.229
+  Downloaded ryu v1.0.23
+  Downloaded zeroize v1.9.0
+  Downloaded zune-core v0.5.3
+  Downloaded time-macros v0.2.32
+  Downloaded vtparse v0.6.2
+  Downloaded which v8.0.6
+  Downloaded ratatui v0.30.2
+  Downloaded indexmap v2.14.2
+  Downloaded tracing-attributes v0.1.31
+  Downloaded rand v0.10.3
+  Downloaded unsafe-libyaml v0.2.11
+  Downloaded mio v1.2.3
+  Downloaded minimal-lexical v0.2.1
+  Downloaded writeable v0.6.4
+  Downloaded num-bigint v0.4.8
+  Downloaded memchr v2.8.3
+  Downloaded yoke v0.8.3
+  Downloaded rand v0.8.8
+  Downloaded vte v0.13.1
+  Downloaded termina v0.3.3
+  Downloaded http v1.5.0
+  Downloaded ucd-trie v0.1.7
+  Downloaded zerovec-derive v0.11.6
+  Downloaded clap_builder v4.6.7
+  Downloaded aho-corasick v1.1.5
+  Downloaded axum v0.8.9
+  Downloaded serde_core v1.0.229
+  Downloaded serde_yaml_ng v0.10.0
+  Downloaded tinyvec v1.13.3
+  Downloaded tracing-core v0.1.36
+  Downloaded icu_properties v2.3.0
+  Downloaded hyper-util v0.1.20
+  Downloaded nom v7.1.3
+  Downloaded yasna v0.6.0
+  Downloaded unicode-ident v1.0.26
+  Downloaded zmij v1.0.23
+  Downloaded vte v0.14.1
+  Downloaded serde v1.0.229
+  Downloaded typenum v1.20.1
+  Downloaded rustls-webpki v0.103.15
+  Downloaded url v2.5.8
+  Downloaded weezl v0.1.12
+  Downloaded wiremock v0.6.5
+  Downloaded tower v0.5.3
+  Downloaded regex v1.13.1
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded uuid v1.26.1
+  Downloaded png v0.18.1
+  Downloaded wezterm-bidi v0.2.3
+  Downloaded rusqlite v0.40.2
+  Downloaded reqwest v0.13.5
+  Downloaded hashbrown v0.16.1
+  Downloaded x509-parser v0.18.1
+  Downloaded zerotrie v0.2.5
+  Downloaded tiff v0.11.3
+  Downloaded zerocopy-derive v0.8.57
+  Downloaded hashbrown v0.17.1
+  Downloaded itertools v0.14.0
+  Downloaded zerovec v0.11.8
+  Downloaded tokio-util v0.7.19
+  Downloaded chrono v0.4.45
+  Downloaded zune-jpeg v0.5.15
+  Downloaded tower-http v0.6.11
+  Downloaded idna v1.1.0
+  Downloaded icu_properties_data v2.3.0
+  Downloaded libm v0.2.16
+  Downloaded h2 v0.4.19
+  Downloaded tower-http v0.7.1
+  Downloaded futures-util v0.3.34
+  Downloaded aws-lc-rs v1.18.1
+  Downloaded hyper v1.11.1
+  Downloaded moxcms v0.8.1
+  Downloaded quinn-proto v0.11.18
+  Downloaded winnow v1.0.4
+  Downloaded syn v1.0.109
+  Downloaded serde_json v1.0.151
+  Downloaded ratatui-core v0.1.2
+  Downloaded portable-atomic v1.15.0
+  Downloaded ratatui-widgets v0.3.2
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded x11rb v0.13.2
+  Downloaded unicode-width v0.2.2
+  Downloaded zerocopy v0.8.57
+  Downloaded rustls v0.23.45
+  Downloaded regex-syntax v0.8.11
+  Downloaded termwiz v0.23.3
+  Downloaded nix v0.29.0
+  Downloaded rustix v1.1.5
+  Downloaded vcpkg v0.2.15
+  Downloaded zlib-rs v0.6.8
+  Downloaded palette v0.7.7
+  Downloaded image v0.25.10
+  Downloaded nix v0.28.0
+  Downloaded tracing v0.1.44
+  Downloaded time v0.3.55
+  Downloaded nix v0.31.3
+  Downloaded syn v2.0.119
+  Downloaded syn v3.0.6
+  Downloaded regex-automata v0.4.18
+  Downloaded icu_normalizer v2.3.0
+  Downloaded x11rb-protocol v0.13.2
+  Downloaded libc v0.2.189
+  Downloaded ring v0.17.14
+  Downloaded pxfm v0.1.30
+  Downloaded tokio v1.53.1
+  Downloaded deltae v0.3.2
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded libsqlite3-sys v0.38.2
+  Downloaded aws-lc-sys v0.45.0
+   Compiling awman v0.12.0 (/workspace)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.24s
+make --no-print-directory test
+
+running 3225 tests
+....................................................................................... 87/3225
+....................................................................................... 174/3225
+....................................................................................... 261/3225
+....................................................................................... 348/3225
+....................................................................................... 435/3225
+........................i.............................................................. 522/3225
+....................................................................................... 609/3225
+....................................................................................... 696/3225
+....................................................................................... 783/3225
+....................................................................................... 870/3225
+....................................................................................... 957/3225
+....................................................................................... 1044/3225
+....................................................................................... 1131/3225
+....................................................................................... 1218/3225
+....................................................................................... 1305/3225
+....................................................................................... 1392/3225
+....................................................................................... 1479/3225
+....................................................................................... 1566/3225
+....................................................................................... 1653/3225
+....................................................................................... 1740/3225
+....................................................................................... 1827/3225
+....................................................................................... 1914/3225
+....................................................................................... 2001/3225
+....................................................................................... 2088/3225
+.........................................Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmp43q8QK/.git/
+[main (root-commit) 74d5028] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+..Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpgrMYsk/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpfEIJLa/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpE7ViU3/.git/
+[main (root-commit) 74d5028] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+[main (root-commit) 74d5028] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+[main (root-commit) 74d5028] init
+ 1 file changed, 1 insertion(+)
+ create mode 100644 f.txt
+............................................ 2175/3225
+....................................................................................... 2262/3225
+......................................................................................[1;22r[24;1H7[24;1H[2K[7m [2 agents running | showing: a | Ctrl-S: switch] [0m8. 2349/3225
+.awman warning: 2 agents are launching in parallel, but output merging is not supported in non-interactive mode; step output will interleave without chrome.
+.............[r[24;1H[2K........................................................................ 2436/3225
+.............................................awman: .immediate
+.awman: .immediate again
+.awman: .queued message
+.awman warning: .another
+.awman: .immediate
+.awman: .msg
+............................... 2523/3225
+....................................................................................... 2610/3225
+....................................................................................... 2697/3225
+....................................................................................... 2784/3225
+....................................................................................... 2871/3225
+....................................................................................... 2958/3225
+....................................................................................... 3045/3225
+....................................................................................... 3132/3225
+....................................................................................... 3219/3225
+......
+test result: ok. 3224 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.05s
+
+
+running 12 tests
+............
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 176 tests
+....................................................................................... 87/176
+....................................................................................... 174/176
+..
+test result: ok. 176 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+
+running 72 tests
+........................................................................
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.74s
+
+
+running 74 tests
+..........................................................................
+test result: ok. 74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+
+running 23 tests
+.......................
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 39 tests
+...................................awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpOEWMOU/skills/.library/alpha (1 skill(s) found under custom-skills/): brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpOEWMOU/skills/.library/beta (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpOEWMOU/skills/.library/alpha (1 skill(s) found under custom-skills/): brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpOEWMOU/skills/.library/beta (1 skill(s) found under skills/): brainstorming
+awman: Skill library refresh complete: 2 succeeded, 0 failed.
+.awman: Pulled 'superpowers' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpHeM809/skills/.library/superpowers (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'superpowers' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpHeM809/skills/.library/superpowers (2 skill(s) found under skills/): brainstorming, refreshed
+.awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpuPUYE3/skills/.library/alpha (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpuPUYE3/skills/.library/beta (1 skill(s) found under skills/): brainstorming
+awman: Pulled 'alpha' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpuPUYE3/skills/.library/alpha (2 skill(s) found under skills/): alpha-refresh, brainstorming
+awman: Pulled 'beta' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpuPUYE3/skills/.library/beta (2 skill(s) found under skills/): beta-refresh, brainstorming
+awman: Skill library refresh complete: 2 succeeded, 0 failed.
+.awman: Pulled 'custom-library' into /var/tmp/test-fixtures/test-run.ANYifK/.tmpbxtukd/skills/.library/custom-library (1 skill(s) found under custom-skills/): brainstorming
+.
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+
+running 113 tests
+....................................................................................... 87/113
+..........................
+test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 133 tests
+...................................
+running 1 test
+
+running 1 test
+test credential_refresh_integration::integration_monitor_failed_host_refresh_warns_and_keeps_last_known_good ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.01s
+
+..
+running 1 test
+
+running 1 test
+test credential_refresh_integration::integration_monitor_refreshes_near_expiry_and_advances_expiry ... ok
+test credential_refresh_integration::integration_monitor_rewrites_only_live_leases_and_skips_dropped ... ok
+test result: 
+
+ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered outtest result: ok; finished in 0.02s
+
+. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+
+..
+running 1 test
+
+running 1 test
+...test credential_refresh_integration::integration_workflow_auth_non_auth_failure_does_not_refresh_or_retry ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.11s
+
+.....Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpMMUsY6/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpfWvKCN/repo/.git/
+.Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpUtBE9V/repo/.git/
+[main (root-commit) b3f024b] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+....Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpAL1oBn/repo/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpVYNCah/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmpdwdaqh/.git/
+Initialized empty Git repository in /var/tmp/test-fixtures/test-run.ANYifK/.tmp1jzOAr/.git/
+................................... 87/133
+.................................test credential_refresh_integration::integration_workflow_auth_401_refreshes_and_retries_exactly_once ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.22s
+
+.[main (root-commit) b3f024b] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+[main (root-commit) b3f024b] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+.[main (root-commit) b3f024b] initial
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+.........[awman/work-item-0042 4155f8c] branch work
+ 1 file changed, 1 insertion(+)
+ create mode 100644 change.txt
+.test credential_refresh_integration::integration_spawn_choke_holds_lease_before_pty_piped_and_acp_on_docker_and_apple ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 1.01s
+
+.
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+
+running 36 tests
+....................................
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 11 tests
+...........
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+
+running 9 tests
+.........
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 13 tests
+.i...........
+test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+
+running 19 tests
+...................
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s
+
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+i......
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+
+running 5 tests
+i....
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+
+running 6 tests
+......
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+...
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+
+running 5 tests
+.....
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+..
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 7 tests
+.......
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+
+running 4 tests
+....
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 13 tests
+.............
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.62s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+tools/isolated-test.sh: line 97: es: command not found
+make[1]: *** [Makefile:52: test] Error 127
+make: *** [Makefile:88: pre-push] Error 2

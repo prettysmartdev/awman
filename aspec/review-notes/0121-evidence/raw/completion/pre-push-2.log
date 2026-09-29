@@ -1,0 +1,15 @@
+architecture-lint: OK — all imports respect the layering rules
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+    Checking awman v0.12.0 (/workspace)
+error: unused import: `awman::data::config::env::EnvSnapshot`
+  --> tests/oci_import/real_stores.rs:18:5
+   |
+18 | use awman::data::config::env::EnvSnapshot;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: could not compile `awman` (test "oci_import") due to 1 previous error
+make: *** [Makefile:87: pre-push] Error 101

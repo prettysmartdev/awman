@@ -24,6 +24,7 @@ pub(super) fn settings(state_dir: &std::path::Path) -> BuiltinRuntimeSettings {
         image_source: None,
         images: BTreeMap::new(),
         registries: BTreeMap::new(),
+        network: Default::default(),
         ambient_overrides: Vec::new(),
         test_isolation: false,
     }
@@ -92,6 +93,7 @@ fn new_spec(name: &str, owner: &str) -> SandboxSpec {
         mount_owner: None,
         vcpus: 1,
         memory_mib: 256,
+        network: Default::default(),
     }
 }
 
@@ -128,6 +130,10 @@ async fn lifecycle_create_exec_exit_and_remove() {
 
     let spec = rig.driver.spec(&preview.id);
     assert_eq!(spec.image, "agent:latest");
+    assert_eq!(
+        spec.network.policy_json(),
+        network::compile(&rig.backend.settings.network).policy_json()
+    );
     assert_eq!((spec.vcpus, spec.memory_mib), (2, 4096));
     assert_eq!(spec.labels[naming::LABEL_NAME], "awman-t1");
     assert_eq!(spec.labels[naming::LABEL_PROTOCOL], naming::PROTOCOL);
@@ -163,6 +169,21 @@ async fn lifecycle_create_exec_exit_and_remove() {
         container_name: "awman-t1".into()
     }));
     assert!(statuses.contains(&AgentStatus::Exited(37)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_oom_exit_137_is_preserved_and_cleanup_still_runs() {
+    let rig = Rig::new("session-a");
+    let (id, mut execution, peer) = launch(&rig, &rig.backend, "awman-oom").await;
+    rig.driver.emit(&id, ExecEvent::Exited(137));
+    assert_eq!(execution.wait().await.unwrap().exit_code, 137);
+    assert!(rig.driver.names().is_empty());
+    assert_eq!(rig.driver.finished().len(), 1);
+    assert!(peer
+        .statuses
+        .lock()
+        .unwrap()
+        .contains(&AgentStatus::Exited(137)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -701,6 +722,10 @@ fn background_sandbox_env_lives_in_memory_and_exec_runs_as_the_image_user() {
         .unwrap();
 
     let spec = rig.driver.spec(&id);
+    assert_eq!(
+        spec.network.policy_json(),
+        network::compile(&rig.backend.settings.network).policy_json()
+    );
     let guest_work = work.path().to_str().unwrap();
     assert_eq!(spec.mounts[0].guest, guest_work, "workdir mounts first, rw");
     assert!(!spec.mounts[0].read_only);
@@ -867,6 +892,13 @@ fn image_identity_catalog_round_trips_and_only_tracked_images_are_removed() {
 
     assert!(rig.backend.remove_image("untracked:latest").is_err());
     assert!(rig.driver.state.lock().unwrap().removed_images.is_empty());
+    // Planning reads image defaults before the SDK has a rootfs reference.
+    // Keep the tag stable throughout that gap, including another backend.
+    let pending = rig.backend.build(options("awman-planned")).unwrap();
+    let competing = rig.second_session("session-b");
+    assert!(competing.remove_image("agent:latest").is_err());
+    assert!(rig.driver.state.lock().unwrap().removed_images.is_empty());
+    drop(pending);
     rig.backend.remove_image("agent:latest").unwrap();
     assert_eq!(rig.backend.image_identity("agent:latest").unwrap(), None);
     assert_eq!(
@@ -947,6 +979,26 @@ async fn attach_after_the_owner_finished_is_an_error() {
         attach.run_with_frontend(fe).is_err(),
         "no launcher, no endpoint: reattach after owner exit is unsupported and says so"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_exit_without_an_attach_endpoint_never_starts_a_replacement_shell() {
+    let rig = Rig::new("session-a");
+    let (id, mut launcher, _peer) = launch(&rig, &rig.backend, "awman-owner-gone").await;
+    let handle = rig.backend.list_running_all().unwrap().remove(0);
+    let attach = rig.backend.attach(&handle).unwrap();
+    let token = token_of(&rig.driver, &id);
+    let path = rig.backend.paths.attach(&id, &token);
+    std::fs::remove_file(&path).unwrap();
+    let (frontend, _) = frontend(None);
+    let error = match attach.run_with_frontend(frontend) {
+        Ok(_) => panic!("attach must not substitute a new shell"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("no live attach endpoint"), "{error}");
+    assert_eq!(rig.driver.execs(&id).len(), 1, "no sibling exec started");
+    rig.driver.emit(&id, ExecEvent::Exited(0));
+    launcher.wait().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

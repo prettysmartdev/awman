@@ -853,7 +853,7 @@ The [builtin microVM runtime](11-runtimes.md#builtin-microvm) resolves overlays 
 - Nested destinations are mounted parent-first, so a mount inside another mount works.
 - `env()` overlays are set in the environment of the agent process.
 - Agent settings (the sanitized Claude, Antigravity, and other staged directories) and system-prompt files or directories are delivered the same way, through these mounts; their guest location comes from the imported image's `HOME`. A missing or non-absolute `HOME` in the image is refused.
-- A Unix socket can never be an overlay source, and `--allow-docker` is rejected.
+- A Unix socket, FIFO, or device node can never be an overlay source — only regular files and directories can be mounted — and `--allow-docker` is rejected.
 
 Mounts appear in the VM owned by the image's `USER`. If the image declares a named user (as the awman templates do), awman resolves it to a numeric id from the image's own `/etc/passwd` and `/etc/group`, and refuses to launch if it can't. The mounts, ownership, and live credential refresh in a real guest have not yet been verified on real hardware; see [Parity limits](11-runtimes.md#parity-limits-versus-docker-and-apple-containers).
 

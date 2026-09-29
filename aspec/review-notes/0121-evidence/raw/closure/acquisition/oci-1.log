@@ -1,0 +1,43 @@
+    Blocking waiting for file lock on package cache
+   Compiling awman v0.12.0 (/workspace)
+warning: struct `BackgroundReader` is never constructed
+   --> src/engine/oci/verify.rs:355:19
+    |
+355 | pub(super) struct BackgroundReader {
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `spawn` is never used
+   --> src/engine/oci/verify.rs:365:19
+    |
+364 | impl BackgroundReader {
+    | --------------------- associated function in this implementation
+365 |     pub(super) fn spawn(
+    |                   ^^^^^
+
+warning: `awman` (lib) generated 2 warnings
+error[E0599]: no function or associated item named `from_pairs` found for struct `EnvSnapshot` in the current scope
+   --> tests/oci_import/real_stores.rs:293:28
+    |
+293 |     let env = EnvSnapshot::from_pairs([
+    |                            ^^^^^^^^^^ function or associated item not found in `EnvSnapshot`
+    |
+note: if you're trying to build a new `EnvSnapshot` consider using one of the following associated functions:
+      EnvSnapshot::empty
+      EnvSnapshot::with_overrides
+   --> src/data/config/env.rs:227:5
+    |
+227 |       pub fn empty() -> Self {
+    |       ^^^^^^^^^^^^^^^^^^^^^^
+...
+234 | /     pub fn with_overrides<I, K, V>(entries: I) -> Self
+235 | |     where
+236 | |         I: IntoIterator<Item = (K, V)>,
+237 | |         K: Into<String>,
+238 | |         V: Into<String>,
+    | |________________________^
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `awman` (test "oci_import") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

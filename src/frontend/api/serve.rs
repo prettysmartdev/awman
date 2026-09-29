@@ -147,12 +147,7 @@ where
     });
 
     let serve_result = if let Some(tls) = tls {
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-            tls.cert_pem.into_bytes(),
-            tls.key_pem.into_bytes(),
-        )
-        .await
-        .map_err(|e| CommandError::Other(format!("TLS setup: {e}")))?;
+        let rustls_config = tls_config(tls)?;
         axum_server::from_tcp_rustls(listener, rustls_config)
             .map_err(|e| CommandError::Other(format!("Server setup: {e}")))?
             .handle(server_handle.clone())
@@ -169,6 +164,35 @@ where
     serve_result.map_err(|e| CommandError::Other(format!("Server error: {e}")))?;
 
     Ok(())
+}
+
+fn tls_config(tls: TlsMaterial) -> Result<axum_server::tls_rustls::RustlsConfig, CommandError> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let invalid = || CommandError::Other("TLS setup: invalid certificate or private key".into());
+    let certificates = CertificateDer::pem_slice_iter(tls.cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    let mut keys = PrivateKeyDer::pem_slice_iter(tls.key_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    if keys.len() != 1 {
+        return Err(invalid());
+    }
+    // The embedded SDK and HTTP server enable different Rustls providers.
+    // Select per server; never depend on or mutate the process-wide default.
+    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| invalid())?
+    .with_no_client_auth()
+    .with_single_cert(certificates, keys.remove(0))
+    .map_err(|_| invalid())?;
+    // Preserve axum-server's from_pem protocol negotiation.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(config),
+    ))
 }
 
 fn bind_error(addr: SocketAddr, error: std::io::Error) -> CommandError {
@@ -192,4 +216,57 @@ fn bind_error(addr: SocketAddr, error: std::io::Error) -> CommandError {
         ));
     }
     CommandError::Other(format!("Server error: {error}"))
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn production_https_server_handshakes_with_both_crypto_providers() {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let material = TlsMaterial {
+            cert_pem: cert.pem(),
+            key_pem: signing_key.serialize_pem(),
+            fingerprint_sha256_hex: String::new(),
+        };
+        let root = reqwest::Certificate::from_pem(material.cert_pem.as_bytes()).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(serve_router_with_bound(
+            Router::new().route("/probe", axum::routing::get(|| async { "tls-ok" })),
+            ServeOptions {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: Some(material),
+                shutdown_grace: Duration::from_secs(1),
+            },
+            move |addr| {
+                let _ = tx.send(addr);
+                Ok(())
+            },
+        ));
+        let addr = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let url = format!("https://localhost:{}/probe", addr.port());
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(root)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().text().await.unwrap(),
+            "tls-ok"
+        );
+        let untrusted = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert!(untrusted.get(&url).send().await.unwrap_err().is_connect());
+        task.abort();
+        let _ = task.await;
+    }
 }

@@ -11,6 +11,7 @@ fn sandbox(driver: &Arc<FakeDriver>, name: &str, token: &str) -> String {
         mount_owner: None,
         vcpus: 1,
         memory_mib: 256,
+        network: Default::default(),
     };
     let id = spec.name.clone();
     driver.create(spec).unwrap();

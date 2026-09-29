@@ -444,7 +444,10 @@ impl SessionSetup {
             container_runtime,
             Arc::clone(&self.engines.agent_engine),
             ready_options,
-        );
+        )
+        .with_image_sources(crate::engine::oci::ImageSources::from_config(
+            &session_guard.effective_config().builtin_runtime(),
+        ));
         drop(session_guard);
 
         let mut setup_frontend = presenter.ready_frontend();

@@ -410,6 +410,10 @@ The optional `builtin` object is read only when `runtime` is `builtin`. It can a
         "caCert": "/etc/ssl/corp-ca.pem",
         "auth": { "type": "env", "usernameVar": "REG_USER", "passwordVar": "REG_PASS" }
       }
+    },
+    "network": {
+      "mode": "public",
+      "hostPorts": [8765]
     }
   }
 }
@@ -423,10 +427,13 @@ The optional `builtin` object is read only when `runtime` is `builtin`. It can a
 | `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-store`, `archive`, or `apple-store` (blocked) |
 | `builtin.images` | object (image tag → source) | `{}` | Per-image source; wins over `imageSource` for that tag |
 | `builtin.registries` | object (`host[:port]` → settings) | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
+| `builtin.network` | object | `{"mode":"public"}` | Guest network policy: `mode` (`public`/`allowlist`/`none`), `allow` (allowlist names), `hostPorts` (host loopback ports the guest may reach), `nameservers` and `trustHostCas` (global config only) — see [Runtimes: Network](11-runtimes.md#network) |
 
 Every source object, its fields, the registry settings, and the `apple-store` limitation are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to build and import an image instead of guessing.
 
-`builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The three object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
+`builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
+
+`builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
 
 ---
 
@@ -523,7 +530,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `builtin.stateDir` | repo or global |
 | `builtin.vcpus` | repo or global |
 | `builtin.memoryMib` | repo or global |
-| `builtin.imageSource`, `builtin.images`, `builtin.registries` | repo or global; shown read-only, edit the JSON |
+| `builtin.imageSource`, `builtin.images`, `builtin.registries`, `builtin.network` | repo or global; shown read-only, edit the JSON |
 | `default_agent` | global only |
 | `api` | global only |
 | `remote` | global only in practice (see note) |
