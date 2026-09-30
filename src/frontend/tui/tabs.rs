@@ -38,6 +38,21 @@ pub enum ExecutionPhase {
 }
 
 impl ExecutionPhase {
+    /// The command this phase is about, or `""` when idle.
+    ///
+    /// Every non-idle variant carries it: by the time a tab polls the
+    /// command's result, `refresh_from_session` has usually already moved the
+    /// phase from `Running` to `Done`/`Error`, so reading only `Running`
+    /// loses the name.
+    pub fn command_name(&self) -> &str {
+        match self {
+            Self::Idle => "",
+            Self::Running { command }
+            | Self::Done { command, .. }
+            | Self::Error { command, .. } => command,
+        }
+    }
+
     /// How a session's recorded command reads in the tab bar and the
     /// execution window.
     ///

@@ -57,7 +57,8 @@ impl ReadyFrontend for TuiCommandFrontend {
             .any(|(_, s)| matches!(s, crate::data::step_status::StepStatus::Warn(_)));
         if has_missing {
             self.messages.info(
-                "Tip: run \"ready --build\" to build all available agent images.".to_string(),
+                "Tip: run \"ready --build\" to build or import all available agent images."
+                    .to_string(),
             );
         }
 

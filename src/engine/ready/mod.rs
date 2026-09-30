@@ -760,7 +760,12 @@ impl ReadyEngine {
                 ReadyPhase::ImportingAgentImage
             }
             ReadyPhase::ImportingAgentImage => {
-                self.import_agent_image(frontend, &git_root).await;
+                self.import_default_agent_image(frontend, &git_root).await;
+                // The import counterpart of ENG-1: `--build` also acquires
+                // every other agent's image.
+                if self.options.build && self.runtime.availability().is_ok() {
+                    self.import_other_agent_images(frontend, &git_root).await;
+                }
                 ReadyPhase::CheckingNonDefaultAgents
             }
             ReadyPhase::Complete | ReadyPhase::Failed(_) => self.phase.clone(),
@@ -772,32 +777,50 @@ impl ReadyEngine {
         Ok(next)
     }
 
-    /// `ImportingAgentImage`: make the default agent's image available to an
-    /// importing runtime. Records the outcome in the summary; a failure is a
-    /// summary row, not an abort, exactly like a failed build.
-    async fn import_agent_image(
+    /// `ImportingAgentImage`: import the default agent's image and record the
+    /// outcome in the summary.
+    async fn import_default_agent_image(
         &mut self,
         frontend: &mut dyn ReadyFrontend,
         git_root: &std::path::Path,
     ) {
+        let agent = self.options.agent.as_str().to_string();
+        match self.import_agent_image(frontend, git_root, &agent).await {
+            Ok(()) => {
+                self.summary.agent_image = StepStatus::Done;
+                self.summary.image_source = Some(StepStatus::Done);
+            }
+            Err(msg) => self.record_import_failure(msg),
+        }
+    }
+
+    /// Make `agent`'s image available to an importing runtime. `Err` carries
+    /// the failure for the caller's row; a failure is a row, not an abort,
+    /// exactly like a failed build.
+    async fn import_agent_image(
+        &mut self,
+        frontend: &mut dyn ReadyFrontend,
+        git_root: &std::path::Path,
+        agent: &str,
+    ) -> Result<(), String> {
         use crate::data::image_tags::{agent_image_tag, project_image_tag};
         use crate::data::message::{MessageLevel, UserMessage};
         use crate::data::oci_identity::OciPlatform;
         use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 
-        let agent = self.options.agent.as_str().to_string();
-        let tag = agent_image_tag(git_root, &agent);
+        let tag = agent_image_tag(git_root, agent);
         // Import mode keeps the runtime's concrete reason (e.g. /dev/kvm
         // permission, test isolation) instead of a bare "not available".
         if let Err(error) = self.runtime.availability() {
-            let msg = format!("{} is not available: {error}", self.runtime.display_name());
-            self.record_import_failure(msg);
-            return;
+            return Err(format!(
+                "{} is not available: {error}",
+                self.runtime.display_name()
+            ));
         }
 
         let paths = RepoDockerfilePaths::new(git_root);
         let hint = BuildHint {
-            agent_dockerfile: paths.agent_dockerfile(&agent),
+            agent_dockerfile: paths.agent_dockerfile(agent),
             project: Some((
                 self.session
                     .repo_config()
@@ -823,8 +846,6 @@ impl ReadyEngine {
             // Nothing configured to compare against: keep the image.
             let current = matches!(resolved, Err(EngineError::ImageSourceUnconfigured { .. }));
             if current {
-                self.summary.agent_image = StepStatus::Done;
-                self.summary.image_source = Some(StepStatus::Done);
                 if let Some(identity) = identity {
                     frontend.report_step_status(
                         &SetupStep::output(format!(
@@ -834,7 +855,7 @@ impl ReadyEngine {
                         StepStatus::Done,
                     );
                 }
-                return;
+                return Ok(());
             }
             if let (Ok((source, reference)), Some(id)) = (&resolved, &identity) {
                 let step = SetupStep::output(format!(
@@ -854,15 +875,14 @@ impl ReadyEngine {
             Err(e) => {
                 // The error carries the external build instruction; make
                 // sure the Dockerfile it names exists.
-                self.provision_agent_dockerfile(frontend, git_root, &hint.agent_dockerfile)
+                self.provision_agent_dockerfile(frontend, git_root, agent, &hint.agent_dockerfile)
                     .await;
                 let text = e.to_string();
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Warning,
                     text: text.clone(),
                 });
-                self.record_import_failure(text);
-                return;
+                return Err(text);
             }
         };
 
@@ -883,8 +903,6 @@ impl ReadyEngine {
                 for step in &pending {
                     frontend.report_step_status(step, StepStatus::Done);
                 }
-                self.summary.agent_image = StepStatus::Done;
-                self.summary.image_source = Some(StepStatus::Done);
                 frontend.report_step_status(
                     &SetupStep::output(format!(
                         "{tag}: imported {} ({}, from {})",
@@ -894,6 +912,7 @@ impl ReadyEngine {
                     )),
                     StepStatus::Done,
                 );
+                Ok(())
             }
             Err(e) => {
                 let text = e.to_string();
@@ -905,16 +924,80 @@ impl ReadyEngine {
                 if matches!(e, EngineError::Container(_))
                     && !crate::engine::oci::retry::is_cancelled(&e)
                 {
-                    self.provision_agent_dockerfile(frontend, git_root, &hint.agent_dockerfile)
-                        .await;
+                    self.provision_agent_dockerfile(
+                        frontend,
+                        git_root,
+                        agent,
+                        &hint.agent_dockerfile,
+                    )
+                    .await;
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Warning,
                         text: crate::engine::oci::external_build_hint(&tag, &hint),
                     });
                 }
-                self.record_import_failure(text);
+                Err(text)
             }
         }
+    }
+
+    /// `ready --build` on an importing runtime: acquire every non-default
+    /// agent's image too, one row per agent. The agents are the ones with a
+    /// `.awman/Dockerfile.<agent>` — the same set `CheckingNonDefaultAgents`
+    /// reports as missing — so the tip it prints leads here.
+    async fn import_other_agent_images(
+        &mut self,
+        frontend: &mut dyn ReadyFrontend,
+        git_root: &std::path::Path,
+    ) {
+        use crate::data::image_tags::agent_image_tag;
+        use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
+
+        let default_agent = self.options.agent.as_str().to_string();
+        let others = RepoDockerfilePaths::new(git_root).discover_agent_dockerfiles();
+        for (agent, _) in &others {
+            if *agent == default_agent {
+                continue;
+            }
+            if self.cancel.check().is_err() {
+                return;
+            }
+            let step: SetupStep = ReadyStep::ImportAgentImageFor(agent.clone()).into();
+            frontend.report_step_status(&step, StepStatus::Running);
+            let tag = agent_image_tag(git_root, agent);
+            let status = if let Some(reason) = self.single_image_default_source(&tag) {
+                StepStatus::Warn(reason)
+            } else {
+                match self.import_agent_image(frontend, git_root, agent).await {
+                    Ok(()) => StepStatus::Done,
+                    Err(msg) => StepStatus::Failed(msg),
+                }
+            };
+            frontend.report_step_status(&step, status);
+        }
+    }
+
+    /// Why `tag` must not be imported from `builtin.imageSource`, if it must
+    /// not: the default source names one fixed image (an archive file or an
+    /// explicit `reference`) and `tag` has no `builtin.images` entry of its
+    /// own. Importing it anyway would install the default agent's image
+    /// under another agent's tag.
+    fn single_image_default_source(&self, tag: &str) -> Option<String> {
+        use crate::data::config::image_source::ImageSourceSpec;
+
+        if self.image_sources.images.contains_key(tag) {
+            return None;
+        }
+        let spec = self.image_sources.default.as_ref()?;
+        let pinned =
+            matches!(spec, ImageSourceSpec::Archive { .. }) || spec.reference_or(tag) != tag;
+        pinned.then(|| {
+            format!(
+                "`builtin.imageSource` ({}) names a single image; add a `builtin.images` \
+                 entry for {tag} to import it",
+                spec.kind()
+            )
+        })
     }
 
     /// Make sure the agent Dockerfile an external-build instruction names
@@ -925,6 +1008,7 @@ impl ReadyEngine {
         &mut self,
         frontend: &mut dyn ReadyFrontend,
         git_root: &std::path::Path,
+        agent: &str,
         agent_dockerfile: &std::path::Path,
     ) {
         if agent_dockerfile.exists() {
@@ -932,7 +1016,7 @@ impl ReadyEngine {
         }
         let project_tag = crate::data::image_tags::project_image_tag(git_root);
         let downloaded = crate::engine::agent::download::download_agent_dockerfile(
-            self.options.agent.as_str(),
+            agent,
             agent_dockerfile,
             &project_tag,
         )
@@ -1806,7 +1890,7 @@ mod tests {
             import_engine(runtime.clone(), true, archive_sources());
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            engine.import_agent_image(&mut frontend, tmp.path()),
+            engine.import_default_agent_image(&mut frontend, tmp.path()),
         )
         .await;
         assert!(
@@ -1838,7 +1922,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             cancel.cancel();
         });
-        engine.import_agent_image(&mut frontend, tmp.path()).await;
+        engine
+            .import_default_agent_image(&mut frontend, tmp.path())
+            .await;
         signal.await.unwrap();
         assert!(runtime
             .cancel_observed
@@ -1855,7 +1941,9 @@ mod tests {
         let runtime = Arc::new(fake);
         let (mut engine, mut frontend, tmp) =
             import_engine(runtime.clone(), false, archive_sources());
-        engine.import_agent_image(&mut frontend, tmp.path()).await;
+        engine
+            .import_default_agent_image(&mut frontend, tmp.path())
+            .await;
         assert!(
             matches!(engine.summary().agent_image, StepStatus::Failed(message) if message.contains("/dev/kvm: Permission denied"))
         );
@@ -1977,9 +2065,13 @@ mod tests {
                 },
             );
             let root = engine.session.git_root().to_path_buf();
-            engine.import_agent_image(&mut frontend, &root).await;
+            engine
+                .import_default_agent_image(&mut frontend, &root)
+                .await;
             engine.image_sources.default = Some(sources[1].clone());
-            engine.import_agent_image(&mut frontend, &root).await;
+            engine
+                .import_default_agent_image(&mut frontend, &root)
+                .await;
             let imports = runtime.imports.lock().unwrap();
             assert_eq!(imports.len(), 2);
             assert_eq!(imports[0].source, sources[0]);
@@ -2037,6 +2129,137 @@ mod tests {
         assert!(
             last.values().all(|s| *s != StepStatus::Running),
             "rows left running: {last:?}"
+        );
+    }
+
+    /// Write `.awman/Dockerfile.<agent>` for each agent so ready discovers it.
+    fn write_agent_dockerfiles(root: &std::path::Path, agents: &[&str]) {
+        let paths = crate::data::repo_dockerfile_paths::RepoDockerfilePaths::new(root);
+        for agent in agents {
+            let path = paths.agent_dockerfile(agent);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "FROM scratch\n").unwrap();
+        }
+    }
+
+    fn docker_store_sources() -> ImageSources {
+        ImageSources {
+            default: Some(
+                crate::data::config::image_source::ImageSourceSpec::DockerStore {
+                    host: None,
+                    tls: None,
+                    reference: None,
+                },
+            ),
+            images: Default::default(),
+        }
+    }
+
+    fn last_status(frontend: &FakeReadyFrontend, step: &str) -> Option<StepStatus> {
+        frontend
+            .statuses
+            .iter()
+            .rev()
+            .find(|(s, _)| s == step)
+            .map(|(_, status)| status.clone())
+    }
+
+    #[tokio::test]
+    async fn import_runtime_build_imports_every_agent_image() {
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        let (mut engine, mut frontend, tmp) =
+            import_engine(runtime.clone(), true, docker_store_sources());
+        write_agent_dockerfiles(tmp.path(), &["claude", "codex", "gemini"]);
+        step_through_image_phases(&mut engine, &mut frontend).await;
+
+        let tags: Vec<String> = runtime
+            .imports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.tag.clone())
+            .collect();
+        let tag = |a| crate::data::image_tags::agent_image_tag(tmp.path(), a);
+        assert_eq!(tags, vec![tag("claude"), tag("codex"), tag("gemini")]);
+        assert!(runtime.imports.lock().unwrap().iter().all(|r| r.refresh));
+        assert_eq!(*runtime.builds.lock().unwrap(), 0);
+        for agent in ["codex", "gemini"] {
+            assert_eq!(
+                last_status(&frontend, &format!("Import agent image: {agent}")),
+                Some(StepStatus::Done)
+            );
+        }
+        assert_eq!(
+            last_status(&frontend, "Import agent image: claude"),
+            None,
+            "the default agent keeps its own summary row"
+        );
+        assert_eq!(engine.summary().agent_image, StepStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn import_runtime_without_build_imports_only_the_default_agent() {
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        let (mut engine, mut frontend, tmp) =
+            import_engine(runtime.clone(), false, docker_store_sources());
+        write_agent_dockerfiles(tmp.path(), &["claude", "codex"]);
+        step_through_image_phases(&mut engine, &mut frontend).await;
+        let imports = runtime.imports.lock().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(
+            imports[0].tag,
+            crate::data::image_tags::agent_image_tag(tmp.path(), "claude")
+        );
+    }
+
+    #[tokio::test]
+    async fn import_runtime_build_never_reuses_a_single_image_default_source() {
+        use crate::data::config::image_source::ImageSourceSpec;
+        // An archive, or a default source pinned to one reference, holds the
+        // default agent's image; importing it under codex's tag would be wrong.
+        let pinned = ImageSources {
+            default: Some(ImageSourceSpec::Registry {
+                registry: Some("ghcr.io".into()),
+                reference: Some("acme/claude:1".into()),
+            }),
+            images: Default::default(),
+        };
+        for sources in [archive_sources(), pinned] {
+            let runtime = Arc::new(FakeImportRuntime::new(false));
+            let (mut engine, mut frontend, tmp) = import_engine(runtime.clone(), true, sources);
+            write_agent_dockerfiles(tmp.path(), &["claude", "codex"]);
+            step_through_image_phases(&mut engine, &mut frontend).await;
+            assert_eq!(runtime.imports.lock().unwrap().len(), 1);
+            match last_status(&frontend, "Import agent image: codex") {
+                Some(StepStatus::Warn(msg)) => assert!(msg.contains("builtin.images"), "{msg}"),
+                other => panic!("expected Warn, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_runtime_build_uses_a_per_tag_source_for_other_agents() {
+        use crate::data::config::image_source::ImageSourceSpec;
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        let (mut engine, mut frontend, tmp) =
+            import_engine(runtime.clone(), true, archive_sources());
+        write_agent_dockerfiles(tmp.path(), &["claude", "codex"]);
+        let codex_tag = crate::data::image_tags::agent_image_tag(tmp.path(), "codex");
+        let codex_source = ImageSourceSpec::Archive {
+            path: "/exports/codex.tar".into(),
+        };
+        engine
+            .image_sources
+            .images
+            .insert(codex_tag.clone(), codex_source.clone());
+        step_through_image_phases(&mut engine, &mut frontend).await;
+        let imports = runtime.imports.lock().unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[1].tag, codex_tag);
+        assert_eq!(imports[1].source, codex_source);
+        assert_eq!(
+            last_status(&frontend, "Import agent image: codex"),
+            Some(StepStatus::Done)
         );
     }
 

@@ -51,7 +51,7 @@ pub fn resolve() -> Result<std::path::PathBuf, EngineError> {
     })?;
     if version.as_ref().map(ToString::to_string).as_deref() != Some("0.7.2") {
         return Err(EngineError::BuiltinRuntimeUnavailable {
-            reason: "executable lacks the matching embedded Microsandbox version section".into(),
+            reason: "executable lacks the matching builtin runtime version section".into(),
         });
     }
     microsandbox::config::set_sdk_msb_path(&executable);

@@ -364,7 +364,7 @@ impl ContainerBackend for BuiltinBackend {
         "builtin"
     }
     fn display_name(&self) -> &'static str {
-        "Builtin Microsandbox (experimental)"
+        "Builtin runtime (experimental)"
     }
     fn capabilities(&self) -> &'static Capabilities {
         &CAPABILITIES
@@ -446,7 +446,11 @@ impl ContainerBackend for BuiltinBackend {
             .collect())
     }
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
-        self.driver.stats(&handle.id)
+        // Key by the awman name, not `handle.id`: stats pollers (the TUI's
+        // `stats_by_name`) only know the name reported with `Running`, and a
+        // handle built from it carries the name as its id. The sandbox id is
+        // always derived from the name, so this is exact for real handles too.
+        self.driver.stats(&naming::sandbox_name_for(&handle.name))
     }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         // An explicit, user-initiated stop may target an agent launched by any

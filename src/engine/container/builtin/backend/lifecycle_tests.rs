@@ -490,6 +490,27 @@ async fn discovery_filters_by_full_name_prefix_and_state() {
     assert!(rig.backend.list_stopped().unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_resolve_from_the_name_the_frontend_was_given() {
+    let rig = Rig::new("session-a");
+    let (id, _execution, _peer) = launch(&rig, &rig.backend, "awman-stats").await;
+    assert_ne!(id, "awman-stats", "sandbox ids are derived, not the name");
+
+    // The TUI only learns the name from `Running { container_name }` and polls
+    // with a handle whose id is that name.
+    let by_name = AgentHandle {
+        id: "awman-stats".into(),
+        name: "awman-stats".into(),
+        image_tag: String::new(),
+        started_at: chrono::Utc::now(),
+    };
+    assert_eq!(rig.backend.stats(&by_name).unwrap().name, "awman-stats");
+
+    let real = rig.backend.list_running_all().unwrap().remove(0);
+    assert_eq!(real.id, id);
+    assert_eq!(rig.backend.stats(&real).unwrap().name, "awman-stats");
+}
+
 #[test]
 fn resource_limits_are_rejected_before_anything_is_created() {
     let rig = Rig::new("session-a");

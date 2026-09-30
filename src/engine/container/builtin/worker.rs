@@ -40,7 +40,7 @@ pub fn dispatch(
             )
         ) {
             eprintln!(
-                "awman: ambient Microsandbox overrides are forbidden for the private embedded worker"
+                "awman: ambient runtime overrides are forbidden for the builtin runtime worker"
             );
             std::process::exit(64);
         }

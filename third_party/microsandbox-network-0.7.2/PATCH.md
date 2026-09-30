@@ -5,8 +5,9 @@ The manifest declares Apache-2.0; `LICENSE` contains the Apache-2.0 text
 carried by the sibling published `microsandbox-filesystem 0.7.2` crate.
 
 Apply `patch -p1 < upstream.diff` to the extracted published archive.
-Patch SHA-256: `993d00b0d99e436e2cebc72a8a5ccbadcfb458b8ba1d9ad4cb242bafdcc2e100`.
-The six changed Rust files add default-off `strict_sni`, retain it through
+Patch SHA-256: `63cceba410585743c1b5afcb71a5e6d0d96a1a7de0ed2f31b3080e044ee5d4bd`.
+The guest host alias is `host.builtin.internal` to match awman's public runtime naming.
+The policy changes in six Rust files add default-off `strict_sni`, retain it through
 config/builder/poll/proxy, and require the actual SNI hostname's DNS binding
 for suffix allows. Ordinary upstream strict opaque-TLS rejection remains unchanged. The exact
 DNS-binding requirement intentionally tightens suffix rules in every mode;

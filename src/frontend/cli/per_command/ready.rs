@@ -69,7 +69,7 @@ impl ReadyFrontend for CliFrontend {
         if has_missing {
             let _ = std::io::Write::write_all(
                 &mut std::io::stderr(),
-                b"Tip: run \"ready --build\" to build all available agent images.\n",
+                b"Tip: run \"ready --build\" to build or import all available agent images.\n",
             );
         }
         let _ = std::io::Write::flush(&mut std::io::stderr());

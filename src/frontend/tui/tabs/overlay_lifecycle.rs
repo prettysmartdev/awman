@@ -118,10 +118,7 @@ impl Tab {
         if let Some(ref rx) = self.command_result_rx {
             match rx.try_recv() {
                 Ok(Ok(outcome)) => {
-                    let cmd_name = match &self.execution_phase {
-                        ExecutionPhase::Running { command } => command.clone(),
-                        _ => String::new(),
-                    };
+                    let cmd_name = self.execution_phase.command_name().to_string();
                     // One exit-code policy, and it is Layer 2's
                     // (`CommandOutcome::exit_code`, F-42). The TUI used to
                     // match two variants itself and report 0 for everything
@@ -154,10 +151,7 @@ impl Tab {
                     self.clear_container_slots();
                 }
                 Ok(Err(err)) => {
-                    let cmd_name = match &self.execution_phase {
-                        ExecutionPhase::Running { command } => command.clone(),
-                        _ => String::new(),
-                    };
+                    let cmd_name = self.execution_phase.command_name().to_string();
                     let err_msg = format!("{err}");
                     if let Ok(mut log) = self.shared.status_log.lock() {
                         log.push(crate::frontend::tui::user_message::StatusLogEntry {
@@ -185,10 +179,7 @@ impl Tab {
                     // right. The *session* is written by `Dispatch`'s
                     // `UnfinishedCommandGuard`, which runs as the panicking
                     // command unwinds (decision Q3, F-22).
-                    let cmd_name = match &self.execution_phase {
-                        ExecutionPhase::Running { command } => command.clone(),
-                        _ => String::new(),
-                    };
+                    let cmd_name = self.execution_phase.command_name().to_string();
                     let err_msg = match crate::frontend::tui::event_loop::panic_log() {
                         Some(log) => format!(
                             "command task ended unexpectedly (likely a panic — see {})",

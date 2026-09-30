@@ -376,3 +376,8 @@
      }
  
      #[test]
+--- a/lib/lib.rs
++++ b/lib/lib.rs
+@@ -37 +37 @@
+-pub(crate) const HOST_ALIAS: &str = "host.microsandbox.internal";
++pub(crate) const HOST_ALIAS: &str = "host.builtin.internal";

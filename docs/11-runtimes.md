@@ -138,7 +138,7 @@ awman ready
 
 Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. The builtin runtime never builds. Build the same images yourself, then tell awman where to import the result from.
 
-**On a Mac, the simplest route is Apple Containers.** If you already use the `apple-containers` runtime, the images are already in its store: set `"imageSource": {"type": "apple-store"}` and run `awman ready` (see [Apple Containers store](#apple-containers-store)). Otherwise build them with `container build` (same arguments as `docker build` below) and use the same source. Docker, a registry, or an archive file work too:
+**On a Mac, the simplest route is Apple Containers.** If you already use the `apple-containers` runtime, the images are already in its store: set `"imageSource": {"type": "apple-local"}` and run `awman ready` (see [Apple Containers store](#apple-containers-store)). Otherwise build them with `container build` (same arguments as `docker build` below) and use the same source. Docker, a registry, or an archive file work too:
 
 **1. Build the images** from the repo root, in this order (the agent image is `FROM` the project image). Running `awman ready` first prints these exact commands for your project and agent, and downloads `.awman/Dockerfile.<agent>` if it is missing:
 
@@ -154,6 +154,7 @@ Build for the host's architecture (`linux/amd64` on x86_64 hosts, `linux/arm64` 
 ```jsonc
 // one of:
 { "type": "docker-store" }                                   // export from a local Docker Engine
+{ "type": "apple-local" }                                    // macOS: export from the local Apple Containers image store
 { "type": "archive", "path": "/abs/path/claude.tar" }        // after: docker save awman-myproject-claude:latest -o /abs/path/claude.tar
 { "type": "registry", "registry": "ghcr.io", "reference": "acme/awman-myproject-claude:latest" }  // after pushing
 ```
@@ -179,15 +180,15 @@ Every source is explicit. A source never falls back to another one, and the same
 | `registry` | `registry`, `reference` (at least one required) | Pulls the image for the host platform from an OCI registry. `reference` defaults to the awman image tag on `registry`; a `reference` naming a different registry than `registry` is refused. Docker Hub names are normalized (`library/`). Manifests and blobs are verified against their digests. |
 | `docker-store` | `host`, `tls`, `reference` (all optional) | Exports the image from a Docker Engine over its API (Engine API 1.41 or newer). `host` defaults to `$DOCKER_HOST`, then the platform default socket (`/var/run/docker.sock`; on macOS `~/.docker/run/docker.sock` is tried first). `host` must start with `unix://` or `tcp://`; plain `tcp://` is allowed only for loopback addresses. `ssh://` and `npipe://` are refused as unsupported. `tls` (`ca`, optional `cert` and `key`, `verify` default `true`) applies only to `tcp://` hosts; `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` are honored when the host comes from `DOCKER_HOST`. |
 | `archive` | `path` (absolute) | Reads a tar from disk: `docker save` output, an OCI image layout, or either one gzip-compressed. Re-imported automatically when the file changes. |
-| `apple-store` | `reference` | macOS only. Exports the image from the Apple Containers image store (see [Apple Containers store](#apple-containers-store)). |
+| `apple-local` | `reference` (optional) | macOS only. Exports the image from the local Apple Containers image store (see [Apple Containers store](#apple-containers-store)). The older spelling `apple-store` is still accepted. |
 
 `reference` defaults to the awman image tag (`awman-<project>-<agent>:latest`) when omitted.
 
 #### Apple Containers store
 
-With `{ "type": "apple-store" }`, `awman ready` asks the Apple Containers service to export the image. awman sends the request itself, from inside the `awman` process. It never runs the `container` CLI, never starts a helper program of its own, and never reads Apple's private store files.
+With `{ "type": "apple-local" }`, `awman ready` asks the Apple Containers service to export the image. awman sends the request itself, from inside the `awman` process. It never runs the `container` CLI, never starts a helper program of its own, and never reads Apple's private store files.
 
-- **Supported releases.** Apple's image-store protocol has no version number, so awman checks the service's release and commit before it asks for any image. The supported releases are 0.12.0, 1.4.1 and 1.5.0. Any other release, including a newer one or a local build, fails with `apple-store image source is not supported: Apple Containers <version> … is not a release awman has verified`. Check your release with `container system version`.
+- **Supported releases.** Apple's image-store protocol has no version number, so awman checks the service's release and commit before it asks for any image. The supported releases are 0.12.0, 1.4.1 and 1.5.0. Any other release, including a newer one or a local build, fails with `apple-local image source is not supported: Apple Containers <version> … is not a release awman has verified`. Check your release with `container system version`.
 - **The service must be running.** If it isn't, `awman ready` fails with `the Apple Containers service is not running` and tells you to run `container system start`.
 - **Exactly one image.** The name must match exactly one image in the store. `docker.io/library/` and a missing `:latest` tag are normalized. If no image matches, or two different images match, the import fails instead of guessing.
 - **Same checks as every other source.** The export is written into awman's private staging area, then checked for platform (`linux/arm64`), digests, size limits and format before it is cached. A cancelled or failed export leaves nothing behind, and an image that was already imported stays usable.
@@ -235,6 +236,8 @@ With `{ "type": "apple-store" }`, `awman ready` asks the Apple Containers servic
 - The base project image is reported as **skipped** (it is only an input to your external build). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
 - With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
 - `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged.
+- `awman ready --build` also imports the image of **every other agent** that has a `.awman/Dockerfile.<agent>` (one **Import agent image: \<agent\>** row each), so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` imports only the default agent and lists any other agents whose images are missing.
+- Other agents use their own `builtin.images` entry when there is one, otherwise `builtin.imageSource`. A `builtin.imageSource` that names a single image — an `archive`, or any source with an explicit `reference` — holds only one agent's image, so for other agents `ready` skips it with a warning instead of importing the wrong image. Give each of those agents its own `builtin.images` entry (for example one archive per agent).
 - If a Dockerfile changed after you built, `ready` warns you to rebuild externally and re-run `awman ready --build`.
 - Older acquisition-cache references without per-source metadata must be acquired again once. Installed images remain runnable without their source.
 - A transient failure while importing (a dropped connection, a stalled transfer, a 5xx from the registry or daemon) is retried automatically, up to a bounded number of attempts and an overall time limit. Errors that won't be fixed by retrying — bad credentials, a digest or platform mismatch, a rejected archive, an unsupported or blocked source — are reported immediately instead. Ctrl-C cancels acquisition and waits for cleanup. If the final runtime import has already begun, cancellation waits for that commit and may leave a complete cached image. Local filesystem or keychain calls may delay the response.
@@ -286,7 +289,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 
 **DNS and HTTPS.** The host-side stack intercepts DNS. For HTTPS authorized by a hostname rule, the visible TLS ClientHello server name (SNI) must be allowed and that exact name must have a DNS binding to the destination IP. An allowed sibling name or a shared IP alone does not authorize the connection. Missing or unlisted visible SNI is refused. The connection remains encrypted end to end: awman cannot inspect encrypted HTTP `Host`/`:authority`, domain fronting behind an allowed server, or the hidden inner name of Encrypted ClientHello (ECH). An allowed ECH outer name proves only that outer name. Use services you trust within this boundary; it is not a guarantee about every logical destination carried inside an allowed encrypted connection. A DNS answer does not authorize UDP/QUIC. Upstream resolvers default to the host's own resolver configuration, or set `nameservers` (global only; IP or `IP:PORT`, never a host name, so resolving a resolver never depends on one).
 
-**Host-local services**, such as an MCP server listening on your host's own loopback address, are reached through `hostPorts`, not through the guest's own `127.0.0.1` — inside the VM, `127.0.0.1` / `::1` / `localhost` is always the guest's own loopback, never the host's. List the TCP port in `hostPorts`; the guest then dials `host.microsandbox.internal:<port>` and the host-side stack connects that to the host's own loopback on the same port. Every other host port stays refused (including port `53`, which is reserved for guest DNS).
+**Host-local services**, such as an MCP server listening on your host's own loopback address, are reached through `hostPorts`, not through the guest's own `127.0.0.1` — inside the VM, `127.0.0.1` / `::1` / `localhost` is always the guest's own loopback, never the host's. List the TCP port in `hostPorts`; the guest then dials `host.builtin.internal:<port>` and the host-side stack connects that to the host's own loopback on the same port. Every other host port stays refused (including port `53`, which is reserved for guest DNS).
 
 **Layering.** The global `builtin.network` block is a ceiling a repo config cannot raise, since repo config is part of the checkout and may be untrusted: a repo may pick a stricter `mode`, a subset of the global `allow` list, and a subset of the global `hostPorts`, but never something wider — asking for more is a config error, not a silent downgrade. `nameservers` and `trustHostCas` are read from the global config only.
 
@@ -330,14 +333,13 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 | `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | The binary lacks the hypervisor entitlement: it was built from source without signing, or modified after signing. Run `make sign-macos BIN=$(command -v awman)`, or reinstall the release binary. |
 | `"awman-macos-arm64" cannot be opened because the developer cannot be verified` | The file is quarantined (downloaded with a browser). Verify its checksum, then `xattr -d com.apple.quarantine <file>` — see [The macOS binary, Gatekeeper and permissions](#the-macos-binary-gatekeeper-and-permissions). |
 | `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
-| `the builtin runtime refuses to start while MSB_PATH is set …` | `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, or `MSB_BACKEND` would replace the embedded runtime. Unset the variable. |
-| `a Microsandbox configuration exists at <path> …` | An existing Microsandbox `config.json` could change the embedded runtime. Move or rename it, or use another runtime. |
+| `the builtin runtime refuses to start while <variable> is set …` | An environment override would replace the builtin runtime. Unset the variable named in the error and retry. |
 | `no image source is configured for '<tag>'` | Set `builtin.imageSource` or `builtin.images` (see [Getting an agent image](#getting-an-agent-image)). |
 | `image <tag> is not imported; run awman ready with an explicit image source`, or `… is not in the builtin image cache …` | Run `awman ready`. |
 | `image '<ref>' was not found in the Docker Engine at <endpoint>` | Build it first, or fix `reference`. |
-| `apple-store image source is not supported: Apple Containers <version> … is not a release awman has verified` | Install a supported Apple Containers release (see [Apple Containers store](#apple-containers-store)), or use another source. |
-| `apple-store image source is blocked: the Apple Containers service is not running …` | Run `container system start`, then `awman ready`. |
-| `apple-store image source is blocked: Apple Containers exists only on macOS …` | Use a `registry`, `docker-store` or `archive` source. |
+| `apple-local image source is not supported: Apple Containers <version> … is not a release awman has verified` | Install a supported Apple Containers release (see [Apple Containers store](#apple-containers-store)), or use another source. |
+| `apple-local image source is blocked: the Apple Containers service is not running …` | Run `container system start`, then `awman ready`. |
+| `apple-local image source is blocked: Apple Containers exists only on macOS …` | Use a `registry`, `docker-store` or `archive` source. |
 | `image '<ref>' is not in the Apple Containers image store`, or `2 different Apple Containers images are named '<ref>'` | Build or pull it with Apple Containers, or remove the stale image. |
 | `digest mismatch …`, `platform mismatch … wanted linux/arm64, found …` | A corrupt transfer, or the image was built for another architecture. Rebuild for the host platform. |
 | `image archive <path> rejected: …` | The archive failed validation; the reason names the problem. |
@@ -661,3 +663,5 @@ awman chat --agent claude                   # runs in Docker container, unchange
 ---
 
 [← GitHub Integration](10-github-integration.md) · [Next: squad →](12-squad.md)
+
+The builtin runtime is powered by Microsandbox, embedded in awman; no separate installation is required.

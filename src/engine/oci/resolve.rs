@@ -84,6 +84,7 @@ pub fn external_build_hint(tag: &str, hint: &BuildHint) -> String {
         "the builtin runtime imports images; it does not build them. Build the image with \
          Docker (or any OCI builder):\n  {}\nthen set `builtin.imageSource` in awman's config \
          to one of:\n  {{\"type\":\"docker-store\"}}  (export from the local Docker Engine)\n  \
+         {{\"type\":\"apple-local\"}}  (macOS: export from the local Apple Containers image store)\n  \
          {{\"type\":\"archive\",\"path\":\"<file>\"}}  (after `docker save {tag} -o <file>`)\n  \
          {{\"type\":\"registry\",\"registry\":\"<host>\",\"reference\":\"<repo>:<tag>\"}}  \
          (after pushing it)\nand run `awman ready` again.",
@@ -157,6 +158,9 @@ mod tests {
                     "docker build -t awman-repo-claude:latest -f /repo/.awman/Dockerfile.claude /repo"
                 ));
                 assert!(hint.contains("docker-store"));
+                assert!(hint.contains(r#"{"type":"apple-local"}"#));
+                assert!(hint.contains("archive"));
+                assert!(hint.contains("registry"));
             }
             other => panic!("expected ImageSourceUnconfigured, got {other:?}"),
         }

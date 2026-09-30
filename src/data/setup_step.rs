@@ -50,6 +50,8 @@ pub enum ReadyStep {
     BuildAgentImage,
     /// Building a *non-default* agent's image, named.
     BuildAgentImageFor(String),
+    /// Importing a *non-default* agent's image (importing runtimes), named.
+    ImportAgentImageFor(String),
     /// The roll-up over the non-default agents.
     OtherAgents,
     /// The roll-up over agents whose images are absent.
@@ -69,6 +71,7 @@ impl fmt::Display for ReadyStep {
             Self::BuildBaseImage => f.write_str("Build base image"),
             Self::BuildAgentImage => f.write_str("Build agent image"),
             Self::BuildAgentImageFor(agent) => write!(f, "Build agent image: {agent}"),
+            Self::ImportAgentImageFor(agent) => write!(f, "Import agent image: {agent}"),
             Self::OtherAgents => f.write_str("Other agents"),
             Self::MissingImages => f.write_str("Missing images"),
             Self::CheckLocalAgent => f.write_str("Check local agent"),
@@ -187,6 +190,10 @@ mod tests {
             (
                 ReadyStep::BuildAgentImageFor("codex".into()).into(),
                 "Build agent image: codex",
+            ),
+            (
+                ReadyStep::ImportAgentImageFor("codex".into()).into(),
+                "Import agent image: codex",
             ),
             (ReadyStep::OtherAgents.into(), "Other agents"),
             (ReadyStep::MissingImages.into(), "Missing images"),

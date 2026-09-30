@@ -153,6 +153,11 @@ belongs to rather than inventing a new code.
 
 ## Runtime and image-source configuration
 
+User-facing labels and explanations call the embedded backend the "builtin runtime"
+or `builtin-experimental`. Dependency names belong in internal implementation
+details and the attribution at the bottom of the runtimes documentation. The
+guest hostname for explicitly allowed host ports is `host.builtin.internal`.
+
 The `runtime` setting selects `docker`, `apple-containers`,
 `docker-sbx-experimental`, or `builtin-experimental` (released for macOS on
 Apple Silicon only; any other host refuses it before doing any work); an unset
@@ -184,7 +189,7 @@ repo config ships with the checkout and may be untrusted. For example:
 ```
 
 Image source objects use one explicit `type`: `registry`, `docker-store`,
-`apple-store`, or `archive`. Registry settings may select anonymous, named
+`apple-local` (alias `apple-store`), or `archive`. Registry settings may select anonymous, named
 environment variables, OS keychain, or Docker-config credentials and may
 declare per-host CA/insecure-registry settings. Docker-store settings may
 select a local or remote Engine endpoint and TLS files. Apple-store acquisition

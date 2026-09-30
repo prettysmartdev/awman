@@ -192,6 +192,10 @@ fn decode_datetime_from_text(value: &str) -> Option<PrimitiveDateTime> {
     None
 }
 
+// awman patch: `time` >= 0.3.55 deprecates the format components below. They
+// still work across the whole `>=0.3.47` range this crate accepts, so keep
+// them and silence the deprecation instead of raising the `time` floor.
+#[allow(deprecated)]
 mod formats {
     use time::format_description::BorrowedFormatItem::{Component, Literal, Optional};
     use time::format_description::{modifier, BorrowedFormatItem, Component::*};

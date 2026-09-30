@@ -34,7 +34,7 @@ pub use model::{config, dns, policy, secrets, tls};
 /// The host-side DNS interceptor matches guest queries against this
 /// name, and agentd writes the same name into `/etc/hosts`.
 #[cfg(feature = "engine")]
-pub(crate) const HOST_ALIAS: &str = "host.microsandbox.internal";
+pub(crate) const HOST_ALIAS: &str = "host.builtin.internal";
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports

@@ -413,14 +413,14 @@ fn builtin_hw_network_dns_auth_ca_proxy_mcp() {
         r#"
 ok dns-public nslookup {allowed}
 ok https-public-image-ca fetch https://{allowed}/
-has mcp-host-alias host-ok fetch http://host.microsandbox.internal:{p}/
-has api-auth-header-intact auth-ok fetch --header "Authorization: Bearer {SYNTHETIC_TOKEN}" http://host.microsandbox.internal:{p}/auth
-refused host-port-not-authorised fetch http://host.microsandbox.internal:{q}/
+has mcp-host-alias host-ok fetch http://host.builtin.internal:{p}/
+has api-auth-header-intact auth-ok fetch --header "Authorization: Bearer {SYNTHETIC_TOKEN}" http://host.builtin.internal:{p}/auth
+refused host-port-not-authorised fetch http://host.builtin.internal:{q}/
 refused guest-loopback-is-not-host fetch http://127.0.0.1:{p}/
 "#
     );
     let control = format!(
-        "has denied-port-positive-control host-ok fetch http://host.microsandbox.internal:{q}/"
+        "has denied-port-positive-control host-ok fetch http://host.builtin.internal:{q}/"
     );
     let plan = json!({"phases": [
         [vm("control", 1, 384, json!({"hostPorts": [q]}), &control)],
@@ -505,8 +505,8 @@ refused doh-by-address fetch --header "accept: application/dns-json" "https://1.
 refused doh-by-name fetch --header "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name={denied}&type=A"
 refused direct-ipv4 fetch http://1.1.1.1/
 refused direct-ipv6 fetch "http://[2606:4700:4700::1111]/"
-refused host-proxy-unauthorised env http_proxy=http://host.microsandbox.internal:{q} https_proxy=http://host.microsandbox.internal:{q} wget -T 8 -O - http://{denied}/
-has mcp-authorised host-ok fetch http://host.microsandbox.internal:{p}/
+refused host-proxy-unauthorised env http_proxy=http://host.builtin.internal:{q} https_proxy=http://host.builtin.internal:{q} wget -T 8 -O - http://{denied}/
+has mcp-authorised host-ok fetch http://host.builtin.internal:{p}/
 "#
     );
     let body = keep(body);
@@ -524,7 +524,7 @@ ok doh-by-address fetch --header "accept: application/dns-json" "https://1.1.1.1
 ok doh-by-name fetch --header "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name={denied}&type=A"
 ok direct-ipv4 fetch http://1.1.1.1/
 ok direct-ipv6 fetch "http://[2606:4700:4700::1111]/"
-has host-proxy-unauthorised host-ok env http_proxy=http://host.microsandbox.internal:{q} https_proxy=http://host.microsandbox.internal:{q} wget -T 8 -O - http://{denied}/
+has host-proxy-unauthorised host-ok env http_proxy=http://host.builtin.internal:{q} https_proxy=http://host.builtin.internal:{q} wget -T 8 -O - http://{denied}/
 "#
     );
     let control = keep(control);

@@ -37,7 +37,7 @@ use std::net::{IpAddr, SocketAddr};
 use serde::{Deserialize, Serialize};
 
 /// Name a guest dials to reach a host port listed in `hostPorts`.
-pub const HOST_ALIAS: &str = "host.microsandbox.internal";
+pub const HOST_ALIAS: &str = "host.builtin.internal";
 
 /// Most entries accepted in `allow` or `hostPorts`; each becomes a policy
 /// rule evaluated per connection.

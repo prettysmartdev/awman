@@ -833,6 +833,64 @@ fn poll_completion_zero_exit_reports_success() {
 }
 
 #[test]
+fn poll_completion_names_command_after_session_refresh() {
+    // The app tick runs `refresh_from_session` before
+    // `poll_command_completion`, so the phase is already `Done` when the
+    // result is read. The success line must still name the command.
+    let mut tab = make_tab();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<CommandOutcome, CommandError>>();
+    tab.command_result_rx = Some(result_rx);
+    tab.execution_phase = ExecutionPhase::Done {
+        command: "ready".into(),
+        exit_code: 0,
+    };
+    result_tx
+        .send(Ok(CommandOutcome::Chat(
+            crate::command::commands::chat::ChatOutcome {
+                agent: Some("claude".into()),
+                exit_code: Some(0),
+            },
+        )))
+        .unwrap();
+    tab.poll_command_completion();
+
+    let logs = log_texts(&tab);
+    assert!(
+        logs.iter()
+            .any(|(_, text)| text == "Command 'ready' completed successfully."),
+        "success line must carry the command name: {logs:?}"
+    );
+}
+
+#[test]
+fn execution_phase_command_name_covers_every_variant() {
+    assert_eq!(ExecutionPhase::Idle.command_name(), "");
+    assert_eq!(
+        ExecutionPhase::Running {
+            command: "chat".into()
+        }
+        .command_name(),
+        "chat"
+    );
+    assert_eq!(
+        ExecutionPhase::Done {
+            command: "ready".into(),
+            exit_code: 0
+        }
+        .command_name(),
+        "ready"
+    );
+    assert_eq!(
+        ExecutionPhase::Error {
+            command: "init".into(),
+            message: "x".into()
+        }
+        .command_name(),
+        "init"
+    );
+}
+
+#[test]
 fn unrendered_container_output_is_surfaced_to_status_log() {
     let mut tab = make_tab();
     let tx = attach_slot_stdout(&mut tab);

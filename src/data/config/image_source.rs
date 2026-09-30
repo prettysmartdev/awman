@@ -41,6 +41,9 @@ pub enum ImageSourceSpec {
         reference: Option<String>,
     },
     /// Export from the local Apple Containers image store (macOS only).
+    /// Spelled `apple-local`; the earlier `apple-store` spelling is still
+    /// accepted.
+    #[serde(rename = "apple-local", alias = "apple-store")]
     AppleStore {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reference: Option<String>,
@@ -56,6 +59,7 @@ pub enum ImageSourceSpec {
 pub enum ImageSourceKind {
     Registry,
     DockerStore,
+    #[serde(rename = "apple-local", alias = "apple-store")]
     AppleStore,
     Archive,
 }
@@ -66,7 +70,7 @@ impl ImageSourceKind {
         match self {
             Self::Registry => "registry",
             Self::DockerStore => "docker-store",
-            Self::AppleStore => "apple-store",
+            Self::AppleStore => "apple-local",
             Self::Archive => "archive",
         }
     }
@@ -236,11 +240,28 @@ mod tests {
         assert_eq!(docker.kind(), ImageSourceKind::DockerStore);
         // Same reference, different source: never equal.
         assert_ne!(registry, docker);
-        let apple: ImageSourceSpec = serde_json::from_str(r#"{"type":"apple-store"}"#).unwrap();
+        let apple: ImageSourceSpec = serde_json::from_str(r#"{"type":"apple-local"}"#).unwrap();
         assert_eq!(apple.kind(), ImageSourceKind::AppleStore);
         let archive: ImageSourceSpec =
             serde_json::from_str(r#"{"type":"archive","path":"/tmp/a.tar"}"#).unwrap();
         assert_eq!(archive.kind(), ImageSourceKind::Archive);
+    }
+
+    #[test]
+    fn apple_local_is_the_spelling_and_apple_store_still_parses() {
+        let old: ImageSourceSpec =
+            serde_json::from_str(r#"{"type":"apple-store","reference":"a:1"}"#).unwrap();
+        let new: ImageSourceSpec =
+            serde_json::from_str(r#"{"type":"apple-local","reference":"a:1"}"#).unwrap();
+        assert_eq!(old, new);
+        assert_eq!(
+            serde_json::to_value(&new).unwrap(),
+            serde_json::json!({"type": "apple-local", "reference": "a:1"})
+        );
+        assert_eq!(ImageSourceKind::AppleStore.as_str(), "apple-local");
+        let kind: ImageSourceKind = serde_json::from_str(r#""apple-store""#).unwrap();
+        assert_eq!(kind, ImageSourceKind::AppleStore);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), r#""apple-local""#);
     }
 
     #[test]

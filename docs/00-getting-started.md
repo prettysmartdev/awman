@@ -101,7 +101,7 @@ The **experimental builtin microVM runtime** (macOS on Apple Silicon only in thi
 | Flag | Effect |
 |------|--------|
 | `--refresh` | Re-run the agent audit and update `Dockerfile.dev` (use after toolchain changes) |
-| `--build` | Force-rebuild the images (builtin runtime: re-import them from the configured image source; nothing is built) |
+| `--build` | Force-rebuild the images, including every agent in `.awman/` (builtin runtime: re-import them all from the configured image sources; nothing is built) |
 | `--no-cache` | Disable the Docker layer cache during builds (builtin runtime: re-import from the source) |
 | `-n`, `--non-interactive` | Run the verification agent in non-interactive mode |
 | `--json` | Print structured JSON instead of human output (implies `-n`) |

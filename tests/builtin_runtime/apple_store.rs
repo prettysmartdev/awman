@@ -105,7 +105,7 @@ fn builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops()
             "runtime": "builtin-experimental", "default_agent": "claude",
             "builtin": {
                 "stateDir": state.path().join("s"),
-                "imageSource": {"type": "apple-store", "reference": reference},
+                "imageSource": {"type": "apple-local", "reference": reference},
                 "network": {"mode": "none"}
             }
         }))
@@ -190,7 +190,7 @@ fn builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops()
             "runtime": "builtin-experimental", "default_agent": "claude",
             "builtin": {
                 "stateDir": fresh_state.path().join("s"),
-                "imageSource": {"type": "apple-store", "reference": reference},
+                "imageSource": {"type": "apple-local", "reference": reference},
                 "network": {"mode": "none"}
             }
         }))
