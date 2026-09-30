@@ -50,6 +50,7 @@ export SPIKE_KERNEL="$previous/kernel.bin"
 test -f "$SPIKE_KERNEL" || export SPIKE_KERNEL="$previous/build-only-kernel.bin"
 export SPIKE_KERNEL_METADATA="$previous/kernel.metadata"
 export MSB_EMBED_ARTIFACTS_DIR="$previous/artifacts"
+export MSB_EMBED_ARTIFACTS_ROOT="$root/third_party/msb-payloads"
 test -f "$MSB_EMBED_ARTIFACTS_DIR/agentd" || export MSB_EMBED_ARTIFACTS_DIR="$previous/build-only-artifacts"
 test -f "$SPIKE_KERNEL"
 test -f "$SPIKE_KERNEL_METADATA"
@@ -67,11 +68,18 @@ printf '%s  %s\n' 488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e98
 tar xf "$output/sqlx-sqlite.crate" -C "$output"
 patch -d "$output/sqlx-sqlite-0.9.0" -p1 < "$scripts/sqlx-sqlite-0.38.patch" > "$output/results/patch.log"
 
+# The probe links awman itself, so it must resolve awman's own dependency
+# graph: the carried patches from awman's Cargo.toml (WI 0120 inventory) apply
+# here too, because [patch] sections do not cross workspaces. The pinned
+# upstream checkout above is the provenance check for the published 0.7.2
+# crates the registry supplies.
+third_party="$root/third_party"
 base=(--manifest-path "$scripts/probe/Cargo.toml"
-    --config "patch.crates-io.microsandbox-cli.path=\"$microsandbox/crates/cli\""
-    --config "patch.crates-io.microsandbox-db.path=\"$microsandbox/crates/db\""
-    --config "patch.crates-io.microsandbox-migration.path=\"$microsandbox/crates/migration\""
-    --config "patch.crates-io.msb_krun.path=\"$previous/msb_krun-0.1.39\"")
+    --config "patch.crates-io.msb_krun.path=\"$third_party/msb_krun-0.1.39\""
+    --config "patch.crates-io.microsandbox.path=\"$third_party/microsandbox-0.7.2\""
+    --config "patch.crates-io.microsandbox-filesystem.path=\"$third_party/microsandbox-filesystem-0.7.2\""
+    --config "patch.crates-io.microsandbox-network.path=\"$third_party/microsandbox-network-0.7.2\""
+    --config "patch.crates-io.microsandbox-types.path=\"$third_party/microsandbox-types-0.7.2\"")
 if cargo metadata "${base[@]}" --format-version 1 > "$output/unpatched.json" 2> "$output/results/unpatched.stderr"; then
     printf 'Unexpected: unpatched graph resolves; investigate newer dependencies.\n' >&2
     exit 1

@@ -85,7 +85,26 @@ pub fn hypervisor(binary: &Path) -> Result<(), String> {
         if String::from_utf8_lossy(&hv.stdout).trim() != "1" {
             return Err("Hypervisor.framework is not supported here (kern.hv_support != 1)".into());
         }
-        let _ = binary;
+        // macOS refuses Hypervisor.framework to a process whose signature
+        // lacks the entitlement; cargo's linker signature has none.
+        let signed = std::process::Command::new("codesign")
+            .args(["-d", "--entitlements", "-", "--xml"])
+            .arg(binary)
+            .output()
+            .map_err(|e| {
+                format!(
+                    "cannot inspect the code signature of {}: {e}",
+                    binary.display()
+                )
+            })?;
+        if !String::from_utf8_lossy(&signed.stdout).contains("com.apple.security.hypervisor") {
+            return Err(format!(
+                "{} lacks the com.apple.security.hypervisor entitlement; run \
+                 `bash tools/macos-sign-test-artifacts.sh <target>/debug` after building \
+                 (make test-builtin does this)",
+                binary.display()
+            ));
+        }
         Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

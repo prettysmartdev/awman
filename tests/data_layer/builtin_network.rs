@@ -31,7 +31,7 @@ fn effective(global: &str, repo: &str) -> EffectiveConfig {
 #[test]
 fn network_config_merge_and_unknown_fields() {
     let eff = effective(
-        r#"{"runtime":"builtin","builtin":{"network":{"mode":"allowlist",
+        r#"{"runtime":"builtin-experimental","builtin":{"network":{"mode":"allowlist",
             "allow":["*.example.com","api.anthropic.com"],"hostPorts":[8765,9000],
             "nameservers":["1.1.1.1"],"trustHostCas":true}}}"#,
         r#"{"builtin":{"vcpus":4,"network":{"allow":["api.example.com"],"hostPorts":[8765]}}}"#,
@@ -66,7 +66,7 @@ fn network_config_merge_and_unknown_fields() {
 
 #[test]
 fn default_policy_is_public_without_host_access() {
-    let network = effective(r#"{"runtime":"builtin"}"#, "{}")
+    let network = effective(r#"{"runtime":"builtin-experimental"}"#, "{}")
         .builtin_network()
         .unwrap();
     assert_eq!(network.mode, NetworkMode::Public);

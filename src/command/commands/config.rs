@@ -108,6 +108,20 @@ const VALID_AGENT_VALUES: &[&str] = &[
 /// Validate and coerce a string value into the appropriate JSON type for the
 /// given field. Returns the coerced `serde_json::Value` or a user-facing error.
 fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, String> {
+    if field == "runtime" {
+        use crate::data::config::RuntimeSelection;
+        return match RuntimeSelection::parse(Some(value)) {
+            Ok(_) => Ok(serde_json::Value::String(value.trim().to_string())),
+            Err(unknown) => Err(format!(
+                "'{}' is not a runtime; valid values: {}{}",
+                unknown.0,
+                RuntimeSelection::valid_values(),
+                RuntimeSelection::hint_for(&unknown.0)
+                    .map(|hint| format!(" ({hint})"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
     if let Some(agent) = agents_to_models_entry_key(field) {
         validate_agents_to_models_key(agent)?;
         let items: Vec<&str> = value
@@ -1114,6 +1128,17 @@ mod tests {
     fn validate_and_coerce_agent_valid() {
         let v = validate_and_coerce("agent", "claude").unwrap();
         assert_eq!(v, serde_json::Value::String("claude".into()));
+    }
+
+    #[test]
+    fn validate_and_coerce_runtime_accepts_only_known_runtimes() {
+        assert_eq!(
+            validate_and_coerce("runtime", "builtin-experimental").unwrap(),
+            serde_json::Value::String("builtin-experimental".into())
+        );
+        let err = validate_and_coerce("runtime", "builtin").unwrap_err();
+        assert!(err.contains("builtin-experimental"), "{err}");
+        assert!(validate_and_coerce("runtime", "dokcer").is_err());
     }
 
     #[test]

@@ -47,19 +47,24 @@ mod resources;
 #[cfg(all(test, unix))]
 mod testing;
 
-/// `(target_os, target_arch)` pairs the builtin runtime supports.
+/// `(target_os, target_arch)` pairs the builtin engine can run on.
 pub(super) const SUPPORTED_TARGETS: &[(&str, &str)] = &[
     ("linux", "x86_64"),
     ("linux", "aarch64"),
     ("macos", "aarch64"),
 ];
 
+/// The subset released as `builtin-experimental`. Linux stays compiled and
+/// unit-tested, but users cannot select it until its native gates pass
+/// (WI 0124).
+pub(super) const RELEASED_TARGETS: &[(&str, &str)] = &[("macos", "aarch64")];
+
 /// Open the builtin backend with `settings`.
 ///
 /// Refusals, in order:
 /// 1. an ambient `MSB_*` override is set → `AmbientRuntimeOverride` (it
 ///    would outrank the embedded runtime);
-/// 2. this OS/architecture is not supported → `BuiltinRuntimeUnavailable`;
+/// 2. this OS/architecture is not released → `BuiltinRuntimeUnavailable`;
 /// 3. this build does not contain the runtime → `BuiltinRuntimeUnavailable`.
 pub(super) fn open(
     settings: BuiltinRuntimeSettings,
@@ -70,7 +75,7 @@ pub(super) fn open(
         });
     }
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    if !is_supported_target(os, arch) {
+    if !is_released_target(os, arch) {
         return Err(EngineError::BuiltinRuntimeUnavailable {
             reason: unsupported_target_reason(os, arch),
         });
@@ -99,18 +104,21 @@ pub(super) fn open(
 }
 
 /// Whether `(os, arch)` is one of [`SUPPORTED_TARGETS`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn is_supported_target(os: &str, arch: &str) -> bool {
     SUPPORTED_TARGETS.contains(&(os, arch))
 }
 
+/// Whether `(os, arch)` is one of [`RELEASED_TARGETS`].
+pub(super) fn is_released_target(os: &str, arch: &str) -> bool {
+    RELEASED_TARGETS.contains(&(os, arch))
+}
+
 fn unsupported_target_reason(os: &str, arch: &str) -> String {
-    let supported: Vec<String> = SUPPORTED_TARGETS
-        .iter()
-        .map(|(os, arch)| format!("{os}/{arch}"))
-        .collect();
     format!(
-        "not supported on {os}/{arch}; supported platforms: {}",
-        supported.join(", ")
+        "the experimental builtin runtime is only available on macOS on Apple Silicon \
+         (macos/aarch64) in this release; this host is {os}/{arch}. Choose another runtime \
+         (docker, apple-containers or docker-sbx-experimental)"
     )
 }
 
@@ -148,13 +156,13 @@ mod tests {
     fn unavailable_build_or_test_isolation_reports_a_precise_reason() {
         match open(settings(Vec::new())) {
             Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
-                if is_supported_target(std::env::consts::OS, std::env::consts::ARCH) {
+                if is_released_target(std::env::consts::OS, std::env::consts::ARCH) {
                     assert!(
                         reason.contains("does not include") || reason.contains("test isolation"),
                         "{reason}"
                     );
                 } else {
-                    assert!(reason.contains("not supported on"), "{reason}");
+                    assert!(reason.contains("only available on macOS"), "{reason}");
                 }
             }
             Err(e) => panic!("expected BuiltinRuntimeUnavailable, got {e:?}"),
@@ -169,8 +177,17 @@ mod tests {
         assert!(is_supported_target("macos", "aarch64"));
         assert!(!is_supported_target("macos", "x86_64"));
         assert!(!is_supported_target("windows", "x86_64"));
-        let reason = unsupported_target_reason("windows", "x86_64");
-        assert!(reason.contains("windows/x86_64"));
-        assert!(reason.contains("macos/aarch64"));
+        assert!(is_released_target("macos", "aarch64"));
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("windows", "x86_64"),
+        ] {
+            assert!(!is_released_target(os, arch), "{os}/{arch}");
+            let reason = unsupported_target_reason(os, arch);
+            assert!(reason.contains(&format!("{os}/{arch}")), "{reason}");
+            assert!(reason.contains("macOS on Apple Silicon"), "{reason}");
+        }
     }
 }

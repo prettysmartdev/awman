@@ -296,6 +296,17 @@ async fn acp_keeps_persistent_binary_clean_framing() {
         .emit(&id, ExecEvent::Stdout(b":\"2.0\"}\n\0".to_vec()));
     assert_eq!(peer.stdout.recv().await.unwrap(), b"{\"jsonrpc\"".to_vec());
     assert_eq!(peer.stdout.recv().await.unwrap(), b":\"2.0\"}\n\0".to_vec());
+    // Injection reaches the agent, and the client closing stdin still ends
+    // the agent's input: an ACP agent exits on EOF.
+    assert!(rig
+        .driver
+        .controls(&id)
+        .contains(&Sent::Stdin(b"{}".to_vec())));
+    drop(peer.stdin);
+    eventually("client EOF reaches the agent", || {
+        rig.driver.controls(&id).last() == Some(&Sent::Eof)
+    })
+    .await;
     rig.driver.emit(&id, ExecEvent::Exited(0));
     execution.wait().await.unwrap();
 }
@@ -899,7 +910,21 @@ fn image_identity_catalog_round_trips_and_only_tracked_images_are_removed() {
     assert!(competing.remove_image("agent:latest").is_err());
     assert!(rig.driver.state.lock().unwrap().removed_images.is_empty());
     drop(pending);
-    rig.backend.remove_image("agent:latest").unwrap();
+    // flock belongs to the open file description, so a child another test
+    // forks in this instant briefly inherits the dropped lease until it execs;
+    // the production fail-fast "busy, retry" answer is correct, so retry here.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match rig.backend.remove_image("agent:latest") {
+            Ok(()) => break,
+            Err(EngineError::BuiltinRuntimeUnavailable { reason })
+                if reason.contains("busy") && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("remove after the lease was released: {e:?}"),
+        }
+    }
     assert_eq!(rig.backend.image_identity("agent:latest").unwrap(), None);
     assert_eq!(
         rig.driver.state.lock().unwrap().removed_images,

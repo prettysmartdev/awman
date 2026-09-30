@@ -364,7 +364,7 @@ impl ContainerBackend for BuiltinBackend {
         "builtin"
     }
     fn display_name(&self) -> &'static str {
-        "Builtin Microsandbox"
+        "Builtin Microsandbox (experimental)"
     }
     fn capabilities(&self) -> &'static Capabilities {
         &CAPABILITIES

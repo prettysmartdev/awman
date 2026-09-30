@@ -72,11 +72,11 @@ CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["prompt","Summarise recent changes","--non-interactive"]}' \
+  -d '{"subcommand":"exec prompt","args":["Summarise recent changes","--non-interactive"]}' \
   | jq -r .command_id)
 
 # 3. Stream the output until the command finishes
-curl -Nsk "$SERVER/v1/commands/$CMD/logs/stream" \
+curl -Nsk "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" \
   | while IFS= read -r line; do
       case "$line" in
@@ -131,12 +131,12 @@ CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
+  -d '{"subcommand":"exec workflow","args":["aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
   | jq -r .command_id)
 
 # 3. Poll status until terminal
 while true; do
-  STATUS=$(curl -sk "$SERVER/v1/commands/$CMD" \
+  STATUS=$(curl -sk "$SERVER/v1/commands/$CMD/status" \
     -H "Authorization: Bearer $KEY" | jq -r .status)
   echo "status=$STATUS"
   [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
@@ -348,13 +348,13 @@ An agent that needs full-screen terminal control (e.g. an interactive editor) re
 
 ### Headless runs on the builtin runtime
 
-Headless, CI, and API-server runs work the same way under `runtime: "builtin"`, with these differences:
+Headless, CI, and API-server runs work the same way under `runtime: "builtin-experimental"` (macOS on Apple Silicon only), with these differences:
 
-- The host needs KVM access (`/dev/kvm`) on Linux — a CI runner or container without it fails with `cannot access /dev/kvm`. There is no Docker daemon requirement to run agents, but every agent image must already be imported: run `awman ready` (with a configured `builtin.imageSource`) as a setup step before `exec` commands. A missing image fails fast with build-and-import instructions rather than building.
+- The host must be an Apple Silicon Mac running the signed `awman-macos-arm64` binary (a macOS CI runner or VM must itself expose Hypervisor.framework). There is no Docker daemon requirement to run agents, but every agent image must already be imported: run `awman ready` (with a configured `builtin.imageSource`) as a setup step before `exec` commands. A missing image fails fast with build-and-import instructions rather than building.
 - Each session's microVM lives and dies with the awman process that launched it. Under `awman api start`, that is the API server; stopping the server stops the VMs it launched.
 - `awman ready --json` includes an `image_source` entry when images were imported.
 
-See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm).
+See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ---
 
@@ -658,12 +658,12 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 | `POST` | `/v1/sessions` | Create a new session |
 | `GET` | `/v1/sessions` | List sessions; accepts optional `?status=active` filter |
 | `GET` | `/v1/sessions/:id` | Get session detail |
+| `GET` | `/v1/sessions/:id/status` | Session setup progress (`status` becomes `ready` when commands can be submitted) |
 | `GET` | `/v1/sessions/:id/queue` | Get queue status for a session (queued, running, recent completed) |
 | `DELETE` | `/v1/sessions/:id` | Close a session |
 | `POST` | `/v1/commands` | Submit a subcommand to a session (enqueued) |
-| `GET` | `/v1/commands/:id` | Get command status and metadata |
-| `GET` | `/v1/commands/:id/logs` | Get captured command output (snapshot) |
-| `GET` | `/v1/commands/:id/logs/stream` | Stream live command output via Server-Sent Events |
+| `GET` | `/v1/commands/:id/status` | Get command status and metadata |
+| `GET` | `/v1/commands/:id/logs` | Stream live command output via Server-Sent Events (ends with `data: [awman:done]`); `?format=json` returns the captured events instead |
 | `GET` | `/v1/workflows/:id` | Get the workflow state for a command |
 | `GET` | `/v1/status` | Server health (uptime, active sessions, running commands) |
 
@@ -788,8 +788,8 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -H 'x-awman-session: a1b2c3d4-e5f6-7890-abcd-ef1234567890' \
   -H 'Content-Type: application/json' \
   -d '{
-    "subcommand": "exec",
-    "args": ["workflow", "aspec/workflows/implement-feature.toml", "--work-item", "0053"]
+    "subcommand": "exec workflow",
+    "args": ["aspec/workflows/implement-feature.toml", "--work-item", "0053"]
   }'
 ```
 
@@ -825,7 +825,7 @@ curl -s http://localhost:9876/v1/commands/e5f6a7b8-c9d0-e1f2-3456-7890abcdef01 \
   -H 'Authorization: Bearer <api-key>'
 
 # Stream output live
-curl -s http://localhost:9876/v1/commands/e5f6a7b8-c9d0-e1f2-3456-7890abcdef01/logs/stream \
+curl -s http://localhost:9876/v1/commands/e5f6a7b8-c9d0-e1f2-3456-7890abcdef01/logs \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -943,14 +943,14 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["prompt","Fix the failing tests","--non-interactive"]}'
+  -d '{"subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}'
 
 # exec workflow via API
 curl -s -X POST http://localhost:9876/v1/commands \
   -H 'Authorization: Bearer <api-key>' \
   -H 'x-awman-session: <session-id>' \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.toml","--work-item","0053"]}'
+  -d '{"subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml","--work-item","0053"]}'
 ```
 
 **Workflow files:** For `exec workflow`, the workflow file path is specified as a positional argument relative to the session's working directory (same format as the CLI). The file must exist within the session's working directory and be a valid TOML or YAML workflow definition. Workflow files are never passed as inline JSON — always use file paths.
@@ -997,8 +997,8 @@ Returns the current status and metadata for a command:
 {
   "id": "e5f6a7b8-...",
   "session_id": "a1b2c3d4-...",
-  "subcommand": "exec",
-  "args": ["workflow", "deploy.toml"],
+  "subcommand": "exec workflow",
+  "args": ["deploy.toml"],
   "status": "queued",
   "queued_at": "2026-04-20T12:00:30Z",
   "queue_position": 2,
@@ -1070,7 +1070,7 @@ Output is written incrementally as the subprocess produces it — not buffered i
 #### Stream command logs (live)
 
 ```sh
-curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
+curl -s http://localhost:9876/v1/commands/<command-id>/logs \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1092,7 +1092,7 @@ Each event is terminated by a blank line (standard SSE format). The sentinel `[a
 **Shell example — stream and print until done:**
 
 ```sh
-curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
+curl -s http://localhost:9876/v1/commands/<command-id>/logs \
   -H 'Authorization: Bearer <api-key>' \
 | while IFS= read -r line; do
     case "$line" in
@@ -1123,7 +1123,7 @@ accordingly. Add `?format=json` to the same URL to fetch the full captured
 event log as one JSON array instead of streaming it:
 
 ```sh
-curl -s "http://localhost:9876/v1/commands/<command-id>/logs/stream?format=json" \
+curl -s "http://localhost:9876/v1/commands/<command-id>/logs?format=json" \
   -H 'Authorization: Bearer <api-key>'
 ```
 
@@ -1151,23 +1151,23 @@ Returns the current queue state for a session — how many commands are queued, 
   "queue_depth": 3,
   "running": {
     "command_id": "cmd-456",
-    "subcommand": "exec",
-    "args": ["workflow", "deploy.toml"],
+    "subcommand": "exec workflow",
+    "args": ["deploy.toml"],
     "started_at": "2026-04-20T12:05:00Z",
     "worker_id": "worker-789"
   },
   "queued": [
     {
       "command_id": "cmd-457",
-      "subcommand": "exec",
-      "args": ["workflow", "test.toml"],
+      "subcommand": "exec workflow",
+      "args": ["test.toml"],
       "queued_at": "2026-04-20T12:01:00Z",
       "position": 0
     },
     {
       "command_id": "cmd-458",
-      "subcommand": "exec",
-      "args": ["prompt", "review the code"],
+      "subcommand": "exec prompt",
+      "args": ["review the code"],
       "queued_at": "2026-04-20T12:02:00Z",
       "position": 1
     }
@@ -1175,8 +1175,8 @@ Returns the current queue state for a session — how many commands are queued, 
   "recent_completed": [
     {
       "command_id": "cmd-455",
-      "subcommand": "exec",
-      "args": ["workflow", "setup.toml"],
+      "subcommand": "exec workflow",
+      "args": ["setup.toml"],
       "status": "done",
       "exit_code": 0,
       "finished_at": "2026-04-20T12:00:00Z"
@@ -1302,14 +1302,14 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.toml"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec workflow","args":["./aspec/workflows/implement-feature.toml"]}' | jq -r .command_id)
 echo "Command: $CMD"
 
 # 3. Poll until done
 # Note: The command will first be in 'queued' status while waiting for a worker.
 # When a worker claims it, status transitions to 'running', then finally 'done' or 'error'.
 while true; do
-  RESP=$(curl -s "$SERVER/v1/commands/$CMD" \
+  RESP=$(curl -s "$SERVER/v1/commands/$CMD/status" \
     -H "Authorization: Bearer $KEY")
   STATUS=$(echo "$RESP" | jq -r .status)
   POSITION=$(echo "$RESP" | jq -r '.queue_position // "N/A"')
@@ -1354,7 +1354,7 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["prompt","Fix the failing tests","--non-interactive"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec prompt","args":["Fix the failing tests","--non-interactive"]}' | jq -r .command_id)
 
 # Poll as usual...
 ```
@@ -2111,10 +2111,10 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
   -H "Authorization: Bearer $KEY" \
   -H "x-awman-session: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"subcommand":"exec","args":["workflow","path/to/workflow.toml"]}' | jq -r .command_id)
+  -d '{"subcommand":"exec workflow","args":["path/to/workflow.toml"]}' | jq -r .command_id)
 
 # Stream live output via SSE (prints each log line as it arrives)
-curl -s "$SERVER/v1/commands/$CMD/logs/stream" \
+curl -s "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" \
 | while IFS= read -r line; do
   case "$line" in
@@ -2125,7 +2125,7 @@ done
 
 # Or poll until done, then fetch the full log
 while true; do
-  STATUS=$(curl -s "$SERVER/v1/commands/$CMD" \
+  STATUS=$(curl -s "$SERVER/v1/commands/$CMD/status" \
     -H "Authorization: Bearer $KEY" | jq -r .status)
   [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
   sleep 5

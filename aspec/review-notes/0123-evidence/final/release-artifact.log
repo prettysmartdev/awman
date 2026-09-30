@@ -1,0 +1,67 @@
+# code patch sha256 2d209a533b4915cd8d771292f7a78cbd3ebb1509988b3028c6b5666cacc4bf56 on base e86ddde0e0e9ef70fd4bdf774a6dcc42062e9635 (WI 0123 working tree)
+== make build (auto-signed)
+Identifier=awman
+CDHash=df937dffe89ae48145d7510c445418d3fe0dd234
+Signature=adhoc
+signed: target/release/awman (ad-hoc, entitlements: {"com.apple.security.hypervisor":true})
+{"com.apple.security.hypervisor":true}
+== release-artifact-check.sh exit=0
+PASS artifact inspection and session trace; raw evidence: /private/tmp/awrel.Z7g3/check
+target=aarch64-apple-darwin
+artifact_sha256=eb1b4b1353bac153fdd66387c8dc64eaa00edd6c9f3df3b99f58fc790a3c8a9e
+artifact_size_bytes=97592304
+Darwin cohix-studio.localdomain 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:17:26 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6041 arm64
+rustc 1.94.0 (4a4ef493e 2026-03-02)
+mode=kernel-enforced sandbox (no root for fs_usage/dtruss)
+profile=session.sb
+-- session.sb
+(version 1)
+(allow default)
+(deny network*)
+(allow network* (local unix-socket) (remote unix-socket))
+(deny process-exec)
+(allow process-exec
+  (literal "/private/tmp/awrel.Z7g3/check/awman")
+  (literal "~/Workspaces/prettysmart/awman/tools/release-offline-session.sh")
+  (literal "/usr/bin/env") (literal "/bin/sh") (literal "/bin/bash") (literal "/bin/sleep")
+  (literal "/bin/cat") (literal "/bin/mkdir") (literal "/bin/chmod") (literal "/bin/ps")
+  (literal "/usr/bin/mktemp") (literal "/usr/bin/grep") (literal "/usr/bin/awk")
+  (literal "/usr/bin/sort") (literal "/usr/bin/tail") (literal "/usr/bin/dirname")
+  (literal "/usr/bin/git") (literal "/usr/bin/xcrun") (literal "/Library/Developer/CommandLineTools/usr/bin/git")
+  (literal "/usr/bin/security")
+  (regex #"/awman-offline\.[^/]+/bin/claude$"))
+-- dynamic dependencies
+/private/tmp/awrel.Z7g3/check/awman:
+	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)
+	/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit (compatibility version 45.0.0, current version 2685.50.120)
+	/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 4424.1.255)
+	/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics (compatibility version 64.0.0, current version 1965.4.5)
+	/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 4424.1.255)
+	/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)
+	/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices (compatibility version 1.0.0, current version 1226.0.0)
+	/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor (compatibility version 1.0.0, current version 259.5.15)
+	/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 61901.101.4)
+	/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration (compatibility version 1.0.0, current version 1405.100.8)
+	/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)
+-- provider info
+{"checkpoint_restore":false,"embedded_guest_agent":true,"embedded_kernel":true,"host_helpers":false,"kernel_sha256":"c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b","libkrun_commit":"2bd0f84ad0956f3032e0490d3b8512b6851eca12","msb_version":"0.7.2","reattach_after_owner_exit":false,"target_arch":"aarch64","target_os":"macos","worker_protocol":"0.7.2/18/awman-1"}
+
+-- offline session
+OFFLINE_SESSION_UID=1234
+OFFLINE_SESSION_PROMPT=offline session sleep=2
+awman: Agent session ended
+PASS offline cached session
+== measure-release-artifact.sh exit=0
+PASS measurements captured without thresholds: /private/tmp/awrel.Z7g3/m
+target=aarch64-apple-darwin
+artifact=~/Workspaces/prettysmart/awman/target/release/awman
+bytes=97592304
+artifact_sha256=eb1b4b1353bac153fdd66387c8dc64eaa00edd6c9f3df3b99f58fc790a3c8a9e
+guest-rss-cold.txt bytes: 300400640
+guest-rss-warm.txt bytes: 300515328
+startup-1.time:        0.68 real         0.00 user         0.01 sys
+startup-1.time:            12517376  maximum resident set size
+workload-cold.time:        2.82 real         0.37 user         0.66 sys
+workload-cold.time:           300728320  maximum resident set size
+workload-warm.time:        2.59 real         0.32 user         0.51 sys
+workload-warm.time:           300974080  maximum resident set size

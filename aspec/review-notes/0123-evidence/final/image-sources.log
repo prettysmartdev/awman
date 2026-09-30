@@ -1,0 +1,16 @@
+# code patch sha256 2d209a533b4915cd8d771292f7a78cbd3ebb1509988b3028c6b5666cacc4bf56 on base e86ddde0e0e9ef70fd4bdf774a6dcc42062e9635 (WI 0123 working tree)
+== public registries (Docker Hub, GHCR)
+PASS: store_registry_public_normal_cases: docker.io/library/alpine:3.22 -> sha256:2e1a7aa4cbc4e9e5222bb4c24a839aa1a6170ea5492d644777ce7b178824e44f (linux/arm64/v8); ghcr.io/linuxcontainers/alpine:latest -> sha256:ceace5415c6b24e6a8da0b1912dc61d1a76cd11d9902eacdb512796db837c623 (linux/arm64)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 8.47s
+== real corpus: every shipped template built by Apple Containers (AWMAN_CORPUS_BUILDER=apple)
+formats ['apple-export'] entries 9
+  antigravity apple-export sha256:a5d7f3c16e0c0259eb5ca1037f8f97983cbe4666d8ab772c4c5ee37a6e49e29b
+  claude apple-export sha256:fccc431f6e6de29d3a92cd9ecb6cdcb35780eb0eb2d7f32943761d1ef9ac7503
+  cline apple-export sha256:601e0e958cb3db316c5cb2800abfb8e0bb4a6289af7c52deda5bf0a7231fa9d4
+  codex apple-export sha256:75e069b1de281a6b8ed699da7e231dde41e31b5bf127caaf1d2012192ac93d95
+  copilot apple-export sha256:e622c41585672dd1871df5d5bb965a3eac9256c79bbf8a3717dbc7884f098b0a
+  crush apple-export sha256:1ebf9c770c093adbb1696dc5ee10bc3d0599df1a7fbb93637bb893f3d1883eb8
+  gemini apple-export sha256:5f199576f2171be0c3a60a6d75294df49c41d4e50c3edc3c90ca54dbb179d5a2
+  maki apple-export sha256:f43d75ebf123f813550eedbf84270994fa639c9765a57b866b71bffa4aebd5fe
+  opencode apple-export sha256:7d37b548d1fdeeb2b9f5a9705fe422026232a889b9c3f7c4425b7f0216884972
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 46 filtered out; finished in 393.43s

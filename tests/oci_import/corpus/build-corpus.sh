@@ -2,6 +2,12 @@
 # Build the real-image corpus consumed by `real_corpus_*` tests.
 #
 # Usage: tests/oci_import/corpus/build-corpus.sh <out-dir> [<git-root>]
+#        AWMAN_CORPUS_BUILDER=apple tests/oci_import/corpus/build-corpus.sh <out-dir>
+#
+# With AWMAN_CORPUS_BUILDER=apple (macOS, no Docker) every image is built with
+# Apple Containers' builder and exported only as `<agent>.apple.tar`; the
+# manifest then declares `formats: ["apple-export"]`. The Docker formats need
+# Docker (WI 0124).
 #
 # For every shipped agent template (`templates/Dockerfile.<agent>`) this
 # builds the project image and the agent image with Docker for the host
@@ -25,11 +31,41 @@ out="$(cd "$out" && pwd)"
 rm -f "$out/manifest.json"
 cd "$root"
 
-command -v docker >/dev/null || { echo 'BLOCKED: Docker is required' >&2; exit 2; }
-docker buildx version >/dev/null || { echo 'BLOCKED: buildx OCI export is required' >&2; exit 2; }
-if [ "$(uname -s)" = Darwin ]; then
-    command -v container >/dev/null || { echo 'BLOCKED: Apple container export is required on macOS' >&2; exit 2; }
+builder="${AWMAN_CORPUS_BUILDER:-docker}"
+if [ "$builder" = apple ]; then
+    [ "$(uname -s)" = Darwin ] || { echo 'BLOCKED: the apple builder needs macOS' >&2; exit 2; }
+    command -v container >/dev/null || { echo 'BLOCKED: Apple Containers is required' >&2; exit 2; }
+else
+    command -v docker >/dev/null || { echo 'BLOCKED: Docker is required' >&2; exit 2; }
+    docker buildx version >/dev/null || { echo 'BLOCKED: buildx OCI export is required' >&2; exit 2; }
+    if [ "$(uname -s)" = Darwin ]; then
+        command -v container >/dev/null || { echo 'BLOCKED: Apple container export is required on macOS' >&2; exit 2; }
+    fi
 fi
+
+# The config digest of the image for $2 inside the OCI layout tar $1,
+# following nested indexes.
+oci_config_digest() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys, tarfile
+tar = tarfile.open(sys.argv[1]); arch = sys.argv[2].split("/")[1]
+blob = lambda d: json.load(tar.extractfile("blobs/sha256/" + d.split(":")[1]))
+def walk(doc):
+    for m in doc.get("manifests", []):
+        if m.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest":
+            continue
+        p = m.get("platform")
+        if p and (p.get("os"), p.get("architecture")) != ("linux", arch):
+            continue
+        child = blob(m["digest"])
+        if "config" in child:
+            return child["config"]["digest"]
+        found = walk(child)
+        if found:
+            return found
+print(walk(json.load(tar.extractfile("index.json"))) or "")
+PY
+}
 
 arch="$(uname -m)"
 case "$arch" in
@@ -39,7 +75,11 @@ case "$arch" in
 esac
 
 project_tag="awman-corpus-project:latest"
-docker build --platform "$platform" -t "$project_tag" -f templates/Dockerfile.project . >&2
+if [ "$builder" = apple ]; then
+    container build --platform "$platform" -t "$project_tag" -f templates/Dockerfile.project . >&2
+else
+    docker build --platform "$platform" -t "$project_tag" -f templates/Dockerfile.project . >&2
+fi
 
 entries=()
 add_entry() {
@@ -56,6 +96,13 @@ for dockerfile in templates/Dockerfile.*; do
     # `awman ready` substitutes; do the same substitution here.
     rendered="$out/Dockerfile.$agent"
     sed "s|{{AWMAN_BASE_IMAGE}}|$project_tag|g" "$dockerfile" > "$rendered"
+    if [ "$builder" = apple ]; then
+        container build --platform "$platform" -t "$tag" -f "$rendered" . >&2
+        container image save "$tag" --platform "$platform" -o "$out/$agent.apple.tar" >&2
+        add_entry "$agent" apple-export "$agent.apple.tar" "$tag" "$platform" \
+            "$(oci_config_digest "$out/$agent.apple.tar" "$platform")"
+        continue
+    fi
     docker build --platform "$platform" -t "$tag" -f "$rendered" . >&2
     config="$(docker image inspect --format '{{.Id}}' "$tag")"
 
@@ -79,8 +126,15 @@ for dockerfile in templates/Dockerfile.*; do
     fi
 done
 
+if [ "$builder" = apple ]; then
+    formats='["apple-export"]'
+elif [ "$(uname -s)" = Darwin ]; then
+    formats='["docker-save","oci-layout","apple-export"]'
+else
+    formats='["docker-save","oci-layout"]'
+fi
 {
-    echo '{"entries":['
+    echo "{\"formats\":$formats,\"entries\":["
     first=1
     for e in "${entries[@]}"; do
         [ $first = 1 ] || echo ','

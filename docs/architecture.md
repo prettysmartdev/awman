@@ -107,7 +107,7 @@ src/
       docker.rs           DockerBackend (pub(super))
       apple.rs            AppleBackend (pub(super); macOS only)
       host_cli_backend.rs Shared body of the CLI-driven backends (Docker, Apple)
-      builtin/            BuiltinBackend: embedded microVM runtime (feature `builtin-runtime`; Linux x86_64/arm64, macOS arm64) — driver, exec bridge, worker entry, state paths
+      builtin/            BuiltinBackend: embedded microVM runtime (feature `builtin-runtime`; released as `builtin-experimental` on macOS arm64; Linux x86_64/arm64 compiled but not released) — driver, exec bridge, worker entry, state paths
       naming.rs           generate_container_name()
     oci/
       mod.rs              ImageAcquirer contract, CachingAcquirer, private archive cache
@@ -854,9 +854,9 @@ impl ContainerRuntime {
 }
 ```
 
-Backend selection rules: `"docker"` or absent → Docker; `"apple-containers"` on macOS → Apple; `"apple-containers"` on non-macOS → `EngineError::BackendUnsupportedOnPlatform`; `"builtin"` → the embedded microVM backend (an error if this build, host, or environment cannot run it); unknown value → fatal `UnknownRuntime` error (no Docker fallback).
+Backend selection rules: `"docker"` or absent → Docker; `"apple-containers"` on macOS → Apple; `"apple-containers"` on non-macOS → `EngineError::BackendUnsupportedOnPlatform`; `"builtin-experimental"` → the embedded microVM backend, released for macOS on Apple Silicon only (`RELEASED_TARGETS`; the engine also compiles for Linux KVM, which WI 0124 enables), or an error if this build, host, or environment cannot run it; unknown value (including the unreleased spelling `"builtin"`) → fatal `UnknownRuntime` error with a hint (no Docker fallback). Commands that need no runtime (`awman config …`) warn and continue so the setting can be fixed.
 
-Backends declare `Capabilities`, including how images are obtained: `Build` (Docker, Apple: `awman ready` builds from Dockerfiles), `Import` (builtin: `awman ready` imports a finished OCI image from a configured source) or `Kit` (Docker Sandboxes). Callers branch on the capability, never on the runtime name. The builtin backend boots each session in a VM through a separate process that is the same awman executable re-invoked with a reserved internal argument; see [Runtimes](11-runtimes.md#builtin-microvm).
+Backends declare `Capabilities`, including how images are obtained: `Build` (Docker, Apple: `awman ready` builds from Dockerfiles), `Import` (builtin: `awman ready` imports a finished OCI image from a configured source) or `Kit` (Docker Sandboxes). Callers branch on the capability, never on the runtime name. The builtin backend boots each session in a VM through a separate process that is the same awman executable re-invoked with a reserved internal argument; see [Runtimes](11-runtimes.md#builtin-microvm-experimental).
 
 #### `ContainerOption`
 

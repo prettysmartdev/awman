@@ -225,3 +225,67 @@ mod spec_tests {
         assert!(spec(Vec::new()).check().is_ok());
     }
 }
+
+/// The home directory `/etc/passwd` gives the image's effective user, the
+/// fallback Docker uses when the image config sets no `HOME`. `user` is the
+/// image `USER` (`name`, `uid`, `name:group` or `uid:gid`); unset or empty
+/// means root. Only an absolute path is returned.
+pub(super) fn passwd_home(passwd: &str, user: Option<&str>) -> Option<String> {
+    let user = user
+        .filter(|u| !u.is_empty())
+        .map(|u| u.split(':').next().unwrap_or(u))
+        .unwrap_or("0");
+    let by_uid = user.parse::<u32>().ok();
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 7 {
+            return None;
+        }
+        let matches = match by_uid {
+            Some(uid) => fields[2].parse::<u32>().ok() == Some(uid),
+            None => fields[0] == user,
+        };
+        (matches && fields[5].starts_with('/')).then(|| fields[5].to_string())
+    })
+}
+
+#[cfg(test)]
+mod passwd_home_tests {
+    use super::passwd_home;
+
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\nprobe:x:1234:1234::/home/probe:/bin/sh\nnohome:x:5:5:::/bin/sh\n";
+
+    #[test]
+    fn unset_user_is_root() {
+        assert_eq!(passwd_home(PASSWD, None).as_deref(), Some("/root"));
+        assert_eq!(passwd_home(PASSWD, Some("")).as_deref(), Some("/root"));
+    }
+
+    #[test]
+    fn named_and_numeric_users_with_or_without_group() {
+        assert_eq!(
+            passwd_home(PASSWD, Some("probe")).as_deref(),
+            Some("/home/probe")
+        );
+        assert_eq!(
+            passwd_home(PASSWD, Some("1234")).as_deref(),
+            Some("/home/probe")
+        );
+        assert_eq!(
+            passwd_home(PASSWD, Some("probe:staff")).as_deref(),
+            Some("/home/probe")
+        );
+        assert_eq!(
+            passwd_home(PASSWD, Some("1234:1234")).as_deref(),
+            Some("/home/probe")
+        );
+    }
+
+    #[test]
+    fn unknown_users_and_relative_or_empty_homes_give_nothing() {
+        assert_eq!(passwd_home(PASSWD, Some("ghost")), None);
+        assert_eq!(passwd_home(PASSWD, Some("99")), None);
+        assert_eq!(passwd_home(PASSWD, Some("nohome")), None);
+        assert_eq!(passwd_home("garbage", None), None);
+    }
+}

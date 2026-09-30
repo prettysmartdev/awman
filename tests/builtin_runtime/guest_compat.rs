@@ -152,7 +152,7 @@ fn builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies() {
         std::fs::write(&executable, probe(agent)).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(home.join(".awman/config.json"), serde_json::to_vec(&serde_json::json!({
-            "runtime": "builtin", "default_agent": agent,
+            "runtime": "builtin-experimental", "default_agent": agent,
             "builtin": {"stateDir": root.join("s"), "imageSource": {"type":"archive", "path":archive}, "network":{"mode":"none"}}
         })).unwrap()).unwrap();
         // Trap both container helpers and accidental host synthetic-agent use.

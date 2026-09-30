@@ -367,6 +367,10 @@ fn restrictive_symlink_rules_hold_against_realistic_layers() {
 
 #[derive(serde::Deserialize)]
 struct CorpusManifest {
+    /// The export formats the builder produced; absent in older corpora,
+    /// which then need the full default set.
+    #[serde(default)]
+    formats: Option<Vec<String>>,
     entries: Vec<CorpusEntry>,
 }
 
@@ -505,12 +509,29 @@ fn real_corpus_every_shipped_template_archive_validates_and_projects() {
             entry.format
         );
     }
-    let formats: &[&str] = if cfg!(target_os = "macos") {
-        &["docker-save", "oci-layout", "apple-export"]
+    // The corpus declares the formats its builder produced; each must be
+    // complete for every shipped template. A Docker-free macOS corpus
+    // (`AWMAN_CORPUS_BUILDER=apple`) declares only `apple-export`; the Docker
+    // formats need Docker (WI 0124). On macOS the Apple format is mandatory.
+    let default_formats: Vec<String> = if cfg!(target_os = "macos") {
+        vec![
+            "docker-save".into(),
+            "oci-layout".into(),
+            "apple-export".into(),
+        ]
     } else {
-        &["docker-save", "oci-layout"]
+        vec!["docker-save".into(), "oci-layout".into()]
     };
-    let missing = missing_pairs(&templates, formats, &covered);
+    let declared = manifest.formats.clone().unwrap_or(default_formats);
+    assert!(!declared.is_empty(), "the corpus declares no formats");
+    if cfg!(target_os = "macos") {
+        assert!(
+            declared.iter().any(|f| f == "apple-export"),
+            "a macOS corpus must include Apple exports: {declared:?}"
+        );
+    }
+    let formats: Vec<&str> = declared.iter().map(String::as_str).collect();
+    let missing = missing_pairs(&templates, &formats, &covered);
     assert!(
         missing.is_empty(),
         "the corpus lacks required template/format pairs for {host}: {missing:?}"

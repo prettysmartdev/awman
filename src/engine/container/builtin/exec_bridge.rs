@@ -41,7 +41,12 @@ fn failed() -> EngineError {
 struct Execution {
     done: std::sync::mpsc::Receiver<Result<AgentExitInfo, EngineError>>,
     control: Arc<dyn ExecControl>,
-    input: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Whether awman may inject input (ACP and interactive sessions).
+    /// Injection goes straight to the exec's control channel, never through a
+    /// clone of the frontend's stdin sender: holding such a clone would keep
+    /// the input stream open forever, so the frontend closing stdin would
+    /// never reach the agent as EOF.
+    injectable: bool,
     owner: Option<CancelTarget>,
     _leases: Vec<crate::engine::credential_refresh::CredentialLease>,
 }
@@ -64,12 +69,11 @@ impl ExecutionBackend for Execution {
         }))
     }
     fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
-        if let Some(tx) = &self.input {
-            tx.send(bytes.to_vec()).map_err(|_| failed())?;
-            Ok(true)
-        } else {
-            Ok(false)
+        if !self.injectable {
+            return Ok(false);
         }
+        self.control.send(Control::Stdin(bytes.to_vec()))?;
+        Ok(true)
     }
 }
 /// Time an interrupted agent gets to exit before it is killed; matches the
@@ -132,11 +136,6 @@ pub fn run(
             .map_err(|_| failed())?;
         io.stdin_tx.send(b"\n".to_vec()).map_err(|_| failed())?;
     }
-    let injector = if persistent_stdin {
-        Some(io.stdin_tx.clone())
-    } else {
-        None
-    };
     drop(io.stdin_tx);
     let control = session.control.clone();
     let server = if let Some(path) = attach_path {
@@ -264,7 +263,7 @@ pub fn run(
         Box::new(Execution {
             done,
             control,
-            input: injector,
+            injectable: persistent_stdin,
             owner,
             _leases: input.leases,
         }),

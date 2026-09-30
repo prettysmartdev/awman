@@ -51,6 +51,12 @@ pub fn net_driver_path() -> PathBuf {
         .join("builtin_net_driver")
 }
 
+/// Whether this host can open a TCP connection to a public IPv6 address.
+fn host_has_ipv6() -> bool {
+    let addr: std::net::SocketAddr = "[2606:4700:4700::1111]:80".parse().unwrap();
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)).is_ok()
+}
+
 fn truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -199,6 +205,7 @@ trap 'rm -f "$probe_output"' EXIT
 fn network_probe_executes_fetch_and_rejects_missing_tools() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    host_timeout_shim(dir.path());
     let wget = dir.path().join("wget");
     std::fs::write(&wget, "#!/bin/sh\nprintf fetch-executed\\n\n").unwrap();
     std::fs::set_permissions(&wget, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -218,6 +225,7 @@ fn network_probe_executes_fetch_and_rejects_missing_tools() {
 fn network_probe_rejects_tls_tool_and_http_failures_as_denial() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    host_timeout_shim(dir.path());
     let wget = dir.path().join("wget");
     for diagnostic in [
         "certificate verify failed",
@@ -241,6 +249,24 @@ fn network_probe_rejects_tls_tool_and_http_failures_as_denial() {
         assert!(stdout.contains("FAIL negative"), "{diagnostic}: {stdout}");
         assert!(!stdout.contains("PASS negative"));
     }
+}
+
+/// The probe prelude needs `timeout`, which guests (busybox) and Linux hosts
+/// have and macOS does not. For these host-side checks of the script itself, a
+/// pass-through stand-in keeps them runnable on any developer host.
+fn host_timeout_shim(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if Command::new("sh")
+        .args(["-c", "command -v timeout"])
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    let shim = dir.join("timeout");
+    std::fs::write(&shim, "#!/bin/sh\nshift\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn script(body: &str) -> String {
@@ -447,6 +473,26 @@ fn builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass() {
     let proxy = HostService::start();
     let (allowed, denied) = (allowed_name(), denied_name());
     let (p, q) = (mcp.port, proxy.port);
+    // IPv6 denial can only be proven where IPv6 is reachable at all: without
+    // host IPv6 the positive control cannot pass, and a "refused" probe would
+    // prove nothing. Such hosts drop the IPv6 probes from both VMs, visibly.
+    let v6 = host_has_ipv6();
+    if !v6 {
+        eprintln!("NOTE: {test}: host has no IPv6 egress; IPv6 probes not exercised");
+    }
+    let keep = |text: String| -> String {
+        text.lines()
+            .filter(|line| v6 || !line.contains("-v6 ") && !line.contains("direct-ipv6"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let v6_names = |names: &[&'static str]| -> Vec<&'static str> {
+        names
+            .iter()
+            .copied()
+            .filter(|n| v6 || !n.ends_with("-v6") && *n != "direct-ipv6")
+            .collect()
+    };
     let body = format!(
         r#"
 ok dns-allowed nslookup {allowed}
@@ -456,13 +502,14 @@ refused dns-direct-resolver nslookup {denied} 8.8.8.8
 refused dns-direct-resolver-v6 nslookup {denied} 2001:4860:4860::8888
 refused https-denied fetch https://{denied}/
 refused doh-by-address fetch --header "accept: application/dns-json" "https://1.1.1.1/dns-query?name={denied}&type=A"
-refused doh-by-name fetch "https://cloudflare-dns.com/dns-query?name={denied}&type=A"
+refused doh-by-name fetch --header "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name={denied}&type=A"
 refused direct-ipv4 fetch http://1.1.1.1/
 refused direct-ipv6 fetch "http://[2606:4700:4700::1111]/"
 refused host-proxy-unauthorised env http_proxy=http://host.microsandbox.internal:{q} https_proxy=http://host.microsandbox.internal:{q} wget -T 8 -O - http://{denied}/
 has mcp-authorised host-ok fetch http://host.microsandbox.internal:{p}/
 "#
     );
+    let body = keep(body);
     // Every public negative target is exercised with the same executable and
     // CA bundle in a preceding permissive guest. Unreachable IPv6, missing CA
     // roots or a stopped resolver therefore fail the positive control instead
@@ -474,12 +521,13 @@ ok dns-direct-resolver nslookup {denied} 8.8.8.8
 ok dns-direct-resolver-v6 nslookup {denied} 2001:4860:4860::8888
 ok https-denied fetch https://{denied}/
 ok doh-by-address fetch --header "accept: application/dns-json" "https://1.1.1.1/dns-query?name={denied}&type=A"
-ok doh-by-name fetch "https://cloudflare-dns.com/dns-query?name={denied}&type=A"
+ok doh-by-name fetch --header "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name={denied}&type=A"
 ok direct-ipv4 fetch http://1.1.1.1/
 ok direct-ipv6 fetch "http://[2606:4700:4700::1111]/"
 has host-proxy-unauthorised host-ok env http_proxy=http://host.microsandbox.internal:{q} https_proxy=http://host.microsandbox.internal:{q} wget -T 8 -O - http://{denied}/
 "#
     );
+    let control = keep(control);
     let network = json!({"mode": "allowlist", "allow": [allowed], "hostPorts": [p]});
     let plan = json!({"phases": [
         [vm("control", 1, 384, json!({"hostPorts": [q]}), &control)],
@@ -488,7 +536,7 @@ has host-proxy-unauthorised host-ok env http_proxy=http://host.microsandbox.inte
     let run = run_plan(test, &archive, plan, &[]);
     run.expect(
         "allowlist",
-        &[
+        &v6_names(&[
             "dns-allowed",
             "https-allowed",
             "dns-denied",
@@ -501,11 +549,11 @@ has host-proxy-unauthorised host-ok env http_proxy=http://host.microsandbox.inte
             "direct-ipv6",
             "host-proxy-unauthorised",
             "mcp-authorised",
-        ],
+        ]),
     );
     run.expect(
         "control",
-        &[
+        &v6_names(&[
             "dns-denied",
             "dns-direct-resolver",
             "dns-direct-resolver-v6",
@@ -515,7 +563,7 @@ has host-proxy-unauthorised host-ok env http_proxy=http://host.microsandbox.inte
             "direct-ipv4",
             "direct-ipv6",
             "host-proxy-unauthorised",
-        ],
+        ]),
     );
     assert_eq!(
         proxy.hits(),
@@ -615,10 +663,16 @@ echo "PASS guest-survives-inner-oom"
         ],
     );
     assert_eq!(run.exit("inner"), Some(0), "{}", run.raw);
+    // The embedded guest agent (upstream microsandbox agentd 0.7.2) reports
+    // every signal death as -1 and does not carry the signal number, so the
+    // builtin runtime cannot report Docker's 137. The in-guest shell above
+    // proves the kill is SIGKILL from the OOM killer; here the contract is
+    // "terminated by a signal", never a clean exit. Documented in
+    // docs/11-runtimes.md.
     assert_eq!(
         run.exit("agent"),
-        Some(137),
-        "an agent killed by the guest OOM killer reports SIGKILL: {}",
+        Some(-1),
+        "an agent killed by the guest OOM killer reports a signal death: {}",
         run.raw
     );
     run.expect("peer", &["peer-unaffected"]);

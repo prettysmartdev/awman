@@ -23,7 +23,7 @@ The split means you can update project tooling without touching the agent setup,
 
 For the Docker Sandboxes runtime, agent environments are set up using **kit YAML specs** instead of Dockerfiles. awman generates per-agent kit files at `~/.awman/kits/<agent>/` when you run `awman ready`. No custom image build or registry push is required. See [Runtimes](11-runtimes.md#docker-sandboxes-experimental).
 
-For the builtin runtime, awman does not build images at all: you build the same two images externally with Docker (or any OCI builder) and `awman ready` **imports** them from an image source you configure (a Docker Engine, an archive file, or a registry). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm).
+For the experimental builtin runtime (macOS on Apple Silicon), awman does not build images at all: you build the same two images elsewhere (with Apple Containers, Docker, or any OCI builder) and `awman ready` **imports** them from an image source you configure (the Apple Containers image store, a Docker Engine, an archive file, or a registry). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ## Agents
 

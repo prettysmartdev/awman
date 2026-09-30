@@ -39,7 +39,7 @@ fn builtin_config(env: EnvSnapshot) -> EffectiveConfig {
         env,
         RepoConfig::default(),
         GlobalConfig {
-            runtime: Some("builtin".into()),
+            runtime: Some("builtin-experimental".into()),
             ..Default::default()
         },
     )
@@ -198,23 +198,30 @@ fn builtin_never_falls_back_to_docker_and_a_typo_is_fatal() {
 #[test]
 fn builtin_selection_parses_and_round_trips() {
     assert_eq!(
-        RuntimeSelection::parse(Some("builtin")),
-        Ok(RuntimeSelection::Builtin)
+        RuntimeSelection::parse(Some("builtin-experimental")),
+        Ok(RuntimeSelection::BuiltinExperimental)
     );
-    assert_eq!(RuntimeSelection::Builtin.as_str(), "builtin");
+    assert_eq!(
+        RuntimeSelection::BuiltinExperimental.as_str(),
+        "builtin-experimental"
+    );
     assert_eq!(
         RuntimeSelection::parse(None),
         Ok(RuntimeSelection::Docker),
         "default unchanged"
     );
     assert_eq!(
-        RuntimeSelection::parse(Some(" builtin ")),
-        Ok(RuntimeSelection::Builtin),
+        RuntimeSelection::parse(Some(" builtin-experimental ")),
+        Ok(RuntimeSelection::BuiltinExperimental),
         "whitespace is trimmed"
     );
     assert!(
-        RuntimeSelection::parse(Some("Builtin")).is_err(),
+        RuntimeSelection::parse(Some("Builtin-Experimental")).is_err(),
         "spellings are exact, never guessed"
     );
-    assert!(RuntimeSelection::valid_values().contains("builtin"));
+    assert!(
+        RuntimeSelection::parse(Some("builtin")).is_err(),
+        "the unreleased spelling is not accepted"
+    );
+    assert!(RuntimeSelection::valid_values().contains("builtin-experimental"));
 }

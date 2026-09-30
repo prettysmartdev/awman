@@ -3,19 +3,21 @@
 Title: Complete the builtin Microsandbox runtime and close all WI 0119 verification gaps
 Issue: n/a
 
+Status: Completed 2026-09-30, resolved by [WI 0123](0123-builtin-native-verification-and-release-closure.md) for the macOS Apple Silicon `builtin-experimental` release; remaining Linux/Docker work is optional in [WI 0124](../0124-builtin-linux-and-docker-gates.md). The ad-hoc signing policy in WI 0123 supersedes the policy below.
+
 Current distribution policy (2026-09-28): signing and notarization are out of
 scope by user instruction. No signing identity, Apple distribution account,
 notarization credentials or explicit ad-hoc signing step is required. Native
 boot and final-artifact checks still apply; failures must be reported honestly.
 
 Final verification (2026-09-28): **NOT ACCEPTED**. All acceptance boxes remain
-unchecked. The [final evidence register](../review-notes/0121-evidence-register.md)
+unchecked. The [final evidence register](../../review-notes/0121-evidence-register.md)
 is authoritative for current verdicts; local hermetic passes do not close the
 missing implementation, native/service/distribution or Git-identity gates.
 The latest continuation adds cancellable production acquisition, explicit strict
 SNI enforcement, shared image-tag leases, genuine cross-driver transactions and
 registered guest/service/corpus scenarios. The user authorized follow-up items
-for work requiring unavailable resources: [WI 0122](completed/0122-native-apple-image-store-bridge.md)
+for work requiring unavailable resources: [WI 0122](0122-native-apple-image-store-bridge.md)
 owns the missing native Apple-store bridge; [WI 0123](0123-builtin-native-verification-and-release-closure.md)
 owns remaining native scenario implementation and full verification/release closure.
 These assignments await resource-qualified agents; creating them is not execution
@@ -29,7 +31,7 @@ registry sources. At that point each acceptance criterion below is either PASS
 for that scope, with linked evidence, or **Deferred (WI 0124, optional)**:
 Linux KVM targets, Docker Engine sources and registry edge cases. Deferred
 criteria do not keep this item open;
-[WI 0124](0124-builtin-linux-and-docker-gates.md) tracks them as optional
+[WI 0124](../0124-builtin-linux-and-docker-gates.md) tracks them as optional
 future work.
 
 ## Summary:
@@ -38,7 +40,7 @@ future work.
   evidence gaps from [WI 0119](0119-strict-embedded-microsandbox-runtime.md).
   Its final review failed acceptance: **2 FAIL, 5 BLOCKED, 2 PASS**, with the
   passing documentation/regression criterion limited to hermetic checks.
-- The [final adversarial review](../review-notes/0119-final-adversarial-verification.md)
+- The [final adversarial review](../../review-notes/0119-final-adversarial-verification.md)
   records the 2026-09-24 baseline, fixes already made, prior-finding dispositions
   and verification limits. The deficiency register below also carries forward
   unresolved risks from the workflow's blocker and coverage notes. It is
@@ -51,7 +53,7 @@ future work.
   target kernel and guest agent, with same-executable worker processes. No host
   agent, extracted executable/firmware DSO/helper script, installed runtime,
   silent fallback, SBX execution/config model or Smolvm integration.
-- [WI 0120](0120-upstream-embedded-kernel-support.md) owns upstream API work and
+- [WI 0120](../0120-upstream-embedded-kernel-support.md) owns upstream API work and
   eventual patch removal. This item owns downstream completion and validation;
   upstream acceptance remains unnecessary for delivery. Record any additional
   local glue patch separately and extend 0120's removal inventory.
@@ -331,36 +333,48 @@ the assumption that get/list never reconcile. Reopen a fix only with evidence.
 
 ## Acceptance criteria
 
-- [ ] D-01/D-02: every mandatory source adapter works through actual services,
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-01/D-02: every mandatory source adapter works through actual services,
   including strict Apple-store and local/remote Docker; real private-registry
   auth/CA/proxy and failure/retry behavior pass; cached execution needs no source.
-- [ ] D-03/D-11: clean-checkout actual awman builds and boots through the current
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-03/D-11: clean-checkout actual awman builds and boots through the current
   embedded provider on Apple Silicon and both Linux KVM architectures; payloads,
   local patches, tracked build inputs and native dependencies are reproducible.
-- [ ] D-04: all required overlay/settings/prompt strategies and image defaults/
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-04: all required overlay/settings/prompt strategies and image defaults/
   overrides pass in non-root guests, including live atomic refresh/writeback with
   multiple consumers; no missing strategy is declared a parity exception.
-- [ ] D-05: tested guest network/auth/DNS/MCP/proxy/CA/denied-egress and memory/CPU/
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-05: tested guest network/auth/DNS/MCP/proxy/CA/denied-egress and memory/CPU/
   OOM contracts exist; unsupported limits/socket-bridge requests fail explicitly.
-- [ ] D-06/D-09: actual frontend/workflow/squad, PTY/ACP, cancellation/reattachment,
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-06/D-09: actual frontend/workflow/squad, PTY/ACP, cancellation/reattachment,
   crash/upgrade/multi-VM and cache concurrency scenarios pass without affecting
   another session or silently truncating protocol streams.
-- [ ] D-07/D-08: isolated SDK coexistence and worker descriptor validation pass;
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-07/D-08: isolated SDK coexistence and worker descriptor validation pass;
   no ambient runtime discovery, host execution, secret leakage or silent fallback.
-- [ ] D-10: pure builtin tests run in the fast hermetic tier; required feature and
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-10: pure builtin tests run in the fast hermetic tier; required feature and
   hardware tiers complete without known linker/disk failures or hidden test skips.
-- [ ] D-12: exact required bundled SQLite resolution, migrations, genuine
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-12: exact required bundled SQLite resolution, migrations, genuine
   bidirectional driver transactions and old/new catalog checks pass on every
   supported native target; no database-contract change or SQLite DSO.
-- [ ] D-13/D-14: the final optimized/stripped/distributed artifacts boot, retain
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-13/D-14: the final optimized/stripped/distributed artifacts boot, retain
   the provider, pass native access/dependency/helper scans and Mac release distribution checks; ABI, licensing materials and measurements are recorded.
-- [ ] D-11/D-15: Windows/Intel Mac existing builds and real Docker/Apple backend
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-11/D-15: Windows/Intel Mac existing builds and real Docker/Apple backend
   regressions pass; onboarding, image-format policy and bounded parity limits are
   implemented or explicitly tested/documented within WI 0119's allowed scope.
-- [ ] `make pre-push`, builtin-feature Clippy `-D warnings`, `make test-builtin`,
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  `make pre-push`, builtin-feature Clippy `-D warnings`, `make test-builtin`,
   enforced hardware jobs and real Docker/Apple/store suites pass at the reviewed
   revision. Required-hardware skips are not counted as successful execution.
-- [ ] D-01–D-15 and all nine WI 0119 acceptance criteria have final linked
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  D-01–D-15 and all nine WI 0119 acceptance criteria have final linked
   evidence with no unresolved mandatory FAIL/BLOCKED verdict. WI 0119 checkboxes,
   this item, docs/specs and WI 0120's patch inventory agree with that evidence.
 

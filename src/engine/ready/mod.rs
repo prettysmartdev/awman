@@ -815,6 +815,9 @@ impl ReadyEngine {
 
         // `--build` / `--no-cache` mean "acquire again from the source".
         let refresh = self.options.build || self.options.no_cache;
+        // Progress rows reported Running here are resolved to Done/Failed
+        // once the import finishes, so no row is left spinning.
+        let mut pending: Vec<SetupStep> = Vec::new();
         if !refresh && self.runtime.image_exists(&tag).unwrap_or(false) {
             let identity = self.runtime.image_identity(&tag).ok().flatten();
             // Nothing configured to compare against: keep the image.
@@ -834,16 +837,15 @@ impl ReadyEngine {
                 return;
             }
             if let (Ok((source, reference)), Some(id)) = (&resolved, &identity) {
-                frontend.report_step_status(
-                    &SetupStep::output(format!(
-                        "{tag}: cached from {} ({}); the configured source is {} ({reference}), \
-                         importing again",
-                        id.source,
-                        id.reference,
-                        source.kind()
-                    )),
-                    StepStatus::Running,
-                );
+                let step = SetupStep::output(format!(
+                    "{tag}: cached from {} ({}); the configured source is {} ({reference}), \
+                     importing again",
+                    id.source,
+                    id.reference,
+                    source.kind()
+                ));
+                frontend.report_step_status(&step, StepStatus::Running);
+                pending.push(step);
             }
         }
 
@@ -864,13 +866,12 @@ impl ReadyEngine {
             }
         };
 
-        frontend.report_step_status(
-            &SetupStep::output(format!(
-                "Importing {tag} from {} ({reference})",
-                source.kind()
-            )),
-            StepStatus::Running,
-        );
+        let importing = SetupStep::output(format!(
+            "Importing {tag} from {} ({reference})",
+            source.kind()
+        ));
+        frontend.report_step_status(&importing, StepStatus::Running);
+        pending.push(importing);
         let request = ImageImportRequest {
             tag: tag.clone(),
             source,
@@ -879,6 +880,9 @@ impl ReadyEngine {
         };
         match import::run(self.runtime.clone(), request, self.cancel.clone(), frontend).await {
             Ok(imported) => {
+                for step in &pending {
+                    frontend.report_step_status(step, StepStatus::Done);
+                }
                 self.summary.agent_image = StepStatus::Done;
                 self.summary.image_source = Some(StepStatus::Done);
                 frontend.report_step_status(
@@ -893,6 +897,9 @@ impl ReadyEngine {
             }
             Err(e) => {
                 let text = e.to_string();
+                for step in &pending {
+                    frontend.report_step_status(step, StepStatus::Failed(text.clone()));
+                }
                 // A missing source image is the common case; say how to
                 // produce it rather than only that it is missing.
                 if matches!(e, EngineError::Container(_))
@@ -2018,6 +2025,19 @@ mod tests {
         );
         assert!(!imports[0].refresh);
         assert_eq!(engine.summary().agent_image, StepStatus::Done);
+        // No progress row is left Running once the import finished.
+        let mut last = std::collections::BTreeMap::new();
+        for (step, status) in &frontend.statuses {
+            last.insert(step.clone(), status.clone());
+        }
+        assert!(
+            last.keys().any(|s| s.contains("importing again")),
+            "{last:?}"
+        );
+        assert!(
+            last.values().all(|s| *s != StepStatus::Running),
+            "rows left running: {last:?}"
+        );
     }
 
     #[tokio::test]

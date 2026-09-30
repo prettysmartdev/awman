@@ -3,6 +3,8 @@
 Title: Builtin OCI agent runtime using strictly embedded Microsandbox
 Issue: n/a
 
+Status: Completed 2026-09-30, resolved by [WI 0123](0123-builtin-native-verification-and-release-closure.md) for the macOS Apple Silicon `builtin-experimental` release; remaining Linux/Docker work is optional in [WI 0124](../0124-builtin-linux-and-docker-gates.md). The ad-hoc signing policy in WI 0123 supersedes the policy below.
+
 Current distribution policy (2026-09-28): signing and notarization are out of
 scope by user instruction. No signing identity, Apple distribution account,
 notarization credentials or explicit ad-hoc signing step is required. Native
@@ -10,11 +12,11 @@ boot and final-artifact checks still apply; failures must be reported honestly.
 
 Follow-up: [WI 0121 — completion and native verification](0121-complete-builtin-runtime-and-native-verification.md)
 tracks every outstanding deficiency from the
-[final adversarial review](../review-notes/0119-final-adversarial-verification.md).
+[final adversarial review](../../review-notes/0119-final-adversarial-verification.md).
 This item remains incomplete until its failed/blocked acceptance criteria have
 the required evidence; creating the follow-up does not close them.
 The resource-qualified continuation is assigned to
-[WI 0122](completed/0122-native-apple-image-store-bridge.md) for the Apple adapter and
+[WI 0122](0122-native-apple-image-store-bridge.md) for the Apple adapter and
 [WI 0123](0123-builtin-native-verification-and-release-closure.md) for native
 scenario, service, build and distribution closure. No original box is satisfied
 by transferring work.
@@ -27,7 +29,7 @@ registry sources. At that point each acceptance criterion below is either PASS
 for that scope, with linked evidence, or **Deferred (WI 0124, optional)**:
 Linux KVM targets, Docker Engine sources and registry edge cases. Deferred
 criteria do not keep this item open;
-[WI 0124](0124-builtin-linux-and-docker-gates.md) tracks them as optional
+[WI 0124](../0124-builtin-linux-and-docker-gates.md) tracks them as optional
 future work.
 
 ## Summary:
@@ -37,7 +39,7 @@ future work.
   another host executable, firmware shared library or host helper script.
 - Initially maintain the required dependency changes as a small, checked-in
   local Cargo patch. Delivery does not depend on upstream accepting a PR.
-  [Work item 0120](0120-upstream-embedded-kernel-support.md) prepares the
+  [Work item 0120](../0120-upstream-embedded-kernel-support.md) prepares the
   upstreamable API and eventual removal of the downstream patch.
 - Required platforms: Apple Silicon macOS, Linux ARM64 and Linux x86_64 with
   accessible KVM. Intel Mac and Windows need not support this backend, but
@@ -84,8 +86,8 @@ an unbounded permanent fork.
 
 ### Final spike findings and evidence
 
-- Reports: [runtime comparison](../../tools/oci-runtime-spike/README.md) and
-  [strict-embedding spike](../../tools/oci-runtime-spike/strict-embed/README.md).
+- Reports: [runtime comparison](../../../tools/oci-runtime-spike/README.md) and
+  [strict-embedding spike](../../../tools/oci-runtime-spike/strict-embed/README.md).
   Executable probes and raw outputs live in `tools/oci-runtime-spike/`.
 - Baselines: Microsandbox `v0.7.2`, commit
   `60d4dc8a436fb9365491567ec21d073e924e3c6d`; `msb_krun 0.1.39`, originating
@@ -123,7 +125,7 @@ an unbounded permanent fork.
 - Existing awman uses `rusqlite 0.40` / `libsqlite3-sys ^0.38`. The pinned msb
   stack uses `sqlx-sqlite 0.9` / `libsqlite3-sys >=0.30.1, <0.38`, producing a
   real Cargo native-links conflict in the unpatched graph. The subsequent
-  [SQLite resolution spike](../../tools/oci-runtime-spike/sqlite-resolution/README.md)
+  [SQLite resolution spike](../../../tools/oci-runtime-spike/sqlite-resolution/README.md)
   resolves it by backporting an already-merged one-line SQLx manifest change.
   It links actual awman library code and the full strict runtime in one Linux
   ARM64 executable without downgrading rusqlite; 33 existing awman store tests,
@@ -283,47 +285,56 @@ an unbounded permanent fork.
 
 ### Acceptance criteria
 
-- [ ] Actual awman links and ships as a single host executable on required
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  Actual awman links and ships as a single host executable on required
   targets; no extracted executable/firmware DSO or separately installed runtime
   is used. Unsupported platforms retain their previous builds/backends.
   **BLOCKED (B-01, B-02, B-15, B-18):** only Linux ARM64 feature build and
   worker-to-KVM failure were exercised here; native x86_64/macOS payloads and
   actual awman guest boots were not verified.
-- [ ] Reproducible local dependency patch, pinned payloads and native dependency
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  Reproducible local dependency patch, pinned payloads and native dependency
   handling are owned by the repository; clean-checkout builds work.
   **BLOCKED (B-02, B-15, B-16):** patch diffs and the ARM64 payload/native
   library were checked, but other native payloads remain unverified and a
   clean-checkout/commit check was unavailable.
-- [ ] The selected SQLx backport (or its validated released replacement)
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  The selected SQLx backport (or its validated released replacement)
   resolves exactly one bundled native SQLite package without changing awman's
   rusqlite baseline or database contracts; the recorded SQLite spike checks
   pass on supported targets.
   **BLOCKED (B-14, B-15):** one `libsqlite3-sys 0.38.2` and the combined link
   were verified, but the complete spike checks and all supported native targets
   were not run.
-- [ ] Native guest execution succeeds on Apple Silicon and Linux ARM64/x86_64
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  Native guest execution succeeds on Apple Silicon and Linux ARM64/x86_64
   with KVM; source inspection or blocked hardware tests are not reported as pass.
   **BLOCKED (B-01, B-18, B-31, B-32):** no guest boot was available in this run.
-- [ ] All mandatory image-source adapters work, including actual Apple-store
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  All mandatory image-source adapters work, including actual Apple-store
   and local/remote Docker-store round trips; cached execution works without them.
   **FAIL:** the mandatory Apple-store adapter is unimplemented and returns
   `ImageSourceBlocked` (B-03/B-23). Actual local/remote Docker-store and private
   registry round trips are separately **BLOCKED** here (B-04/B-24).
-- [ ] All overlay/config/prompt strategies and agreed runtime/frontend/squad
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  All overlay/config/prompt strategies and agreed runtime/frontend/squad
   contracts pass automated tests; known differences are explicit and bounded.
   **FAIL:** required guest network-policy/denied-egress, OOM and real
   workflow/squad integration coverage is absent. Guest-level ownership,
   credential visibility, PTY/ACP, lifecycle and resource verification are
   separately **BLOCKED** on hardware (B-18, B-21, B-29, B-30, B-33, B-55).
-- [ ] Final optimized/LTO artifacts preserve the embedded provider,
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  Final optimized/LTO artifacts preserve the embedded provider,
   boot successfully, and pass the relevant distribution/security checks.
   **BLOCKED (B-05, B-12, B-18, B-31):** optimized artifact
   and provider boot checks require unavailable native hosts and test artifacts.
-- [ ] Documentation/spec changes describe the builtin backend accurately;
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  Documentation/spec changes describe the builtin backend accurately;
   existing Docker/Apple behavior is regression-tested; no SBX model is adopted.
   **BLOCKED:** current hermetic checks do not establish real Docker/Apple
-  regressions. See the [WI 0121 evidence register](../review-notes/0121-evidence-register.md).
-- [ ] WI 0120 has a precise patch inventory and replacement/removal path;
+  regressions. See the [WI 0121 evidence register](../../review-notes/0121-evidence-register.md).
+- [x] **Resolved 2026-09-30 for the macOS `builtin-experimental` release** — see the [WI 0123 resolution table](../../review-notes/0121-evidence-register.md#wi-0123-resolution-macos-apple-silicon-builtin-experimental-release): PASS on Apple Silicon; Linux and Docker parts are Deferred to [WI 0124](../0124-builtin-linux-and-docker-gates.md) (optional). The historical verdict below is kept for reference.
+  WI 0120 has a precise patch inventory and replacement/removal path;
   upstream acceptance is not a completion dependency for this item.
   The inventory includes SQLx, `msb_krun`, guest-agent build inputs, the isolated
   SDK builder, and awman-side glue. **BLOCKED:** tracking and complete-diff

@@ -10,7 +10,7 @@ boot and final-artifact checks still apply; failures must be reported honestly.
 
 ## Summary:
 - Turn the strict-embedding proof and the local dependency patch from
-  [WI 0119](0119-strict-embedded-microsandbox-runtime.md) into a small, reusable,
+  [WI 0119](completed/0119-strict-embedded-microsandbox-runtime.md) into a small, reusable,
   tested upstream change in `superradcompany/libkrun`, the repository publishing
   Microsandbox's `msb_krun` dependency.
 - Support kernel bytes owned by the embedding application without requiring

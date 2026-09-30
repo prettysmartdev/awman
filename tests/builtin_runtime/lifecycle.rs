@@ -160,7 +160,7 @@ fn builtin_hw_actual_awman_cli_synthetic_agent_exit_37() {
     std::fs::write(
         config_dir.join("config.json"),
         serde_json::to_vec(&serde_json::json!({
-            "runtime": "builtin", "default_agent": "claude",
+            "runtime": "builtin-experimental", "default_agent": "claude",
             "builtin": {
                 "stateDir": state.path().join("s"),
                 "imageSource": {"type": "archive", "path": archive},

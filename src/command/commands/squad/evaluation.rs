@@ -402,6 +402,14 @@ impl LocalTaskEvaluator {
             .engines
             .require_container_runtime()
             .map_err(CommandError::from)?;
+        // An importing runtime (builtin) runs agent images built elsewhere;
+        // the project image is only a build input for those, so there is
+        // nothing to build here (see `ReadyEngine`'s import phases).
+        if runtime.capabilities().image_acquisition
+            == crate::engine::agent_runtime::ImageAcquisition::Import
+        {
+            return Ok(());
+        }
         let project_tag = crate::data::image_tags::project_image_tag(root);
         if runtime.image_exists(&project_tag) {
             return Ok(());
@@ -529,12 +537,16 @@ impl LocalTaskEvaluator {
                 }
             }
         }
+        let image_sources = crate::engine::oci::ImageSources::from_config(
+            &session.effective_config().builtin_runtime(),
+        );
         for pool_agent in &pool_agents {
             ensure_agent_image_with_build_output(
                 &self.engines,
                 &git_root,
                 &dockerfiles,
                 pool_agent,
+                &image_sources,
                 &mut sink,
                 Some(&mut build_logs),
             )?;
@@ -763,12 +775,16 @@ impl LocalTaskEvaluator {
                 &dockerfiles,
             )
             .map_err(CommandError::Other)?;
+        let image_sources = crate::engine::oci::ImageSources::from_config(
+            &session.effective_config().builtin_runtime(),
+        );
         for step_agent in &workflow_agents {
             ensure_agent_image_with_build_output(
                 &self.engines,
                 &git_root,
                 &dockerfiles,
                 step_agent,
+                &image_sources,
                 &mut sink,
                 Some(&mut build_logs),
             )?;

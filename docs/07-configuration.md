@@ -247,10 +247,10 @@ Or per-invocation: `awman chat --overlay "env(ANTHROPIC_API_KEY)"`. See [Overlay
 awman config set --global runtime docker                  # default
 awman config set --global runtime apple-containers        # macOS only
 awman config set --global runtime docker-sbx-experimental # experimental
-awman config set --global runtime builtin                  # embedded microVM
+awman config set --global runtime builtin-experimental     # experimental; Apple Silicon only
 ```
 
-See [Runtimes](#runtimes) below. The `builtin` runtime also has its own `builtin` block of settings (VM size, image sources); see [Builtin runtime settings](#builtin-runtime-settings).
+See [Runtimes](#runtimes) below. The `builtin-experimental` runtime also has its own `builtin` block of settings (VM size, image sources); see [Builtin runtime settings](#builtin-runtime-settings).
 
 ### Choose ACP launch mode
 
@@ -385,7 +385,7 @@ The global `runtime` key selects how agent processes are isolated from your host
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple-containers` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
 | `docker-sbx-experimental` | macOS arm64, Windows x86_64 | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](11-runtimes.md) |
-| `builtin` | Linux x86_64 / arm64 (KVM), macOS Apple Silicon | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Requires an awman build that includes it. `awman ready` imports images from a configured source instead of building them. See [Runtimes](11-runtimes.md#builtin-microvm) |
+| `builtin-experimental` | macOS on Apple Silicon only (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in the `awman-macos-arm64` release, which is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source instead of building them. See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
 
 An unrecognized value (e.g. a typo) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). Fix the value in `$HOME/.awman/config.json` and relaunch.
 
@@ -393,11 +393,11 @@ An unrecognized value (e.g. a typo) is a fatal error — awman never falls back 
 
 ### Builtin runtime settings
 
-The optional `builtin` object is read only when `runtime` is `builtin`. It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected.
+The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected.
 
 ```json
 {
-  "runtime": "builtin",
+  "runtime": "builtin-experimental",
   "builtin": {
     "vcpus": 4,
     "memoryMib": 8192,
@@ -488,7 +488,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 |----------|------|---------|---------|-------------------------------------|
 | `default_agent` | string | (unset) | Agent used when no repo agent is configured | yes |
 | `terminal_scrollback_lines` | integer | 10000 | Default scrollback for all repos | yes |
-| `runtime` | string | `docker` | Container runtime: `docker`, `apple-containers`, `docker-sbx-experimental`, `builtin` | yes |
+| `runtime` | string | `docker` | Container runtime: `docker`, `apple-containers`, `docker-sbx-experimental`, `builtin-experimental` (Apple Silicon only) | yes |
 | `builtin` | object | (unset) | Builtin microVM runtime settings; see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`); edit the rest in the file |
 | `yoloDisallowedTools` | string array | `[]` | Machine-wide yolo tool denylist (unless a repo overrides it) | yes |
 | `overlays` | string array | `[]` | Overlay specs applied to every project; additive with other sources | yes |

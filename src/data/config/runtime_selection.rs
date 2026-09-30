@@ -20,8 +20,9 @@ pub enum RuntimeSelection {
     AppleContainers,
     /// Docker Sandboxes, driven through the `sbx` CLI (experimental).
     DockerSbxExperimental,
-    /// The microVM runtime embedded in the awman executable.
-    Builtin,
+    /// The microVM runtime embedded in the awman executable (experimental;
+    /// released for macOS on Apple Silicon only).
+    BuiltinExperimental,
 }
 
 /// A `runtime` value that names no known runtime. Carries the raw value so
@@ -35,7 +36,7 @@ impl RuntimeSelection {
         Self::Docker,
         Self::AppleContainers,
         Self::DockerSbxExperimental,
-        Self::Builtin,
+        Self::BuiltinExperimental,
     ];
 
     /// Interpret a persisted `runtime` value.
@@ -60,8 +61,18 @@ impl RuntimeSelection {
             Self::Docker => "docker",
             Self::AppleContainers => "apple-containers",
             Self::DockerSbxExperimental => "docker-sbx-experimental",
-            Self::Builtin => "builtin",
+            Self::BuiltinExperimental => "builtin-experimental",
         }
+    }
+
+    /// A pointer for a value that is close to a real runtime name, appended
+    /// to the unknown-runtime error. `builtin` was never released under that
+    /// name; the runtime is experimental and spelled `builtin-experimental`.
+    pub fn hint_for(value: &str) -> Option<&'static str> {
+        (value == "builtin").then_some(
+            "the builtin runtime is experimental: set runtime to \"builtin-experimental\" \
+             (macOS on Apple Silicon only)",
+        )
     }
 
     /// Every valid spelling, comma-separated, for error messages.
@@ -114,8 +125,8 @@ mod tests {
     #[test]
     fn surrounding_whitespace_is_ignored() {
         assert_eq!(
-            RuntimeSelection::parse(Some(" builtin ")),
-            Ok(RuntimeSelection::Builtin)
+            RuntimeSelection::parse(Some(" builtin-experimental ")),
+            Ok(RuntimeSelection::BuiltinExperimental)
         );
     }
 
@@ -133,7 +144,19 @@ mod tests {
     fn valid_values_lists_every_runtime_in_order() {
         assert_eq!(
             RuntimeSelection::valid_values(),
-            "docker, apple-containers, docker-sbx-experimental, builtin"
+            "docker, apple-containers, docker-sbx-experimental, builtin-experimental"
         );
+    }
+
+    #[test]
+    fn the_unreleased_builtin_spelling_is_refused_with_a_hint() {
+        assert_eq!(
+            RuntimeSelection::parse(Some("builtin")),
+            Err(UnknownRuntimeValue("builtin".into()))
+        );
+        assert!(RuntimeSelection::hint_for("builtin")
+            .unwrap()
+            .contains("builtin-experimental"));
+        assert_eq!(RuntimeSelection::hint_for("dokcer"), None);
     }
 }

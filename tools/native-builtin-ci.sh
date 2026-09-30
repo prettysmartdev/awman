@@ -43,6 +43,9 @@ cargo build --locked --features builtin-runtime --target "$target" --bin awman
 cargo build --locked --features builtin-runtime --target "$target" --example builtin_hw_driver
 cargo build --locked --features builtin-runtime --target "$target" --example builtin_net_driver
 cargo test --locked --features builtin-runtime --target "$target" --test builtin_runtime --no-run
+# macOS: Hypervisor.framework needs the entitlement on every process that
+# starts a VM (awman and the guest drivers).
+bash tools/macos-sign-test-artifacts.sh "$CARGO_TARGET_DIR/$target/debug"
 test_list=$(cargo test --locked --features builtin-runtime --target "$target" --test builtin_runtime -- --list)
 printf '%s\n' "$test_list"
 printf '%s\n' "$test_list" | grep -Eq '(^|::)builtin_hw_actual_awman_cli_synthetic_agent_exit_37: test$' || {

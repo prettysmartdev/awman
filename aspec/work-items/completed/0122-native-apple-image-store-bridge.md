@@ -14,7 +14,7 @@ hash are in [native evidence notes](../../review-notes/0122-evidence/notes.md).
 The offline builtin run used a locally ad-hoc-signed artifact, because
 Hypervisor.framework requires the `com.apple.security.hypervisor` entitlement;
 reconciling that with the unsigned-distribution policy belongs to WI 0123.
-Parent: [WI 0121](../0121-complete-builtin-runtime-and-native-verification.md), D-01/D-02/D-15; [WI 0119](../0119-strict-embedded-microsandbox-runtime.md), acceptance criterion 5
+Parent: [WI 0121](0121-complete-builtin-runtime-and-native-verification.md), D-01/D-02/D-15; [WI 0119](0119-strict-embedded-microsandbox-runtime.md), acceptance criterion 5
 
 ## Summary:
 

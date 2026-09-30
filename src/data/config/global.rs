@@ -405,10 +405,13 @@ mod tests {
             Ok(RuntimeSelection::Docker)
         );
         let cfg = GlobalConfig {
-            runtime: Some("builtin".into()),
+            runtime: Some("builtin-experimental".into()),
             ..Default::default()
         };
-        assert_eq!(cfg.runtime_selection(), Ok(RuntimeSelection::Builtin));
+        assert_eq!(
+            cfg.runtime_selection(),
+            Ok(RuntimeSelection::BuiltinExperimental)
+        );
         let bad = GlobalConfig {
             runtime: Some("blarg".into()),
             ..Default::default()
@@ -424,7 +427,8 @@ mod tests {
         let json = serde_json::to_string(&GlobalConfig::default()).unwrap();
         assert!(!json.contains("builtin"), "{json}");
         let cfg: GlobalConfig =
-            serde_json::from_str(r#"{"runtime":"builtin","builtin":{"vcpus":4}}"#).unwrap();
+            serde_json::from_str(r#"{"runtime":"builtin-experimental","builtin":{"vcpus":4}}"#)
+                .unwrap();
         assert_eq!(cfg.builtin.as_ref().and_then(|b| b.vcpus), Some(4));
         let back: GlobalConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();

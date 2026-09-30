@@ -1,7 +1,7 @@
 # WI 0119 final adversarial verification — 2026-09-24
 
 Historical review snapshot preserved in the repository on 2026-09-25.
-[WI 0121](../work-items/0121-complete-builtin-runtime-and-native-verification.md)
+[WI 0121](../work-items/completed/0121-complete-builtin-runtime-and-native-verification.md)
 owns completion of the outstanding deficiencies. Log filenames below refer to
 the original workflow artifacts; their availability is not assumed by the
 follow-up, which requires durable, revision-identified evidence for closure.

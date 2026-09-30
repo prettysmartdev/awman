@@ -1,0 +1,5 @@
+# code patch sha256 2d209a533b4915cd8d771292f7a78cbd3ebb1509988b3028c6b5666cacc4bf56 on base e86ddde0e0e9ef70fd4bdf774a6dcc42062e9635 (WI 0123 working tree)
+Intel macOS build (x86_64-apple-darwin, default features), run under Rosetta:
+<scratch>/x86-target/x86_64-apple-darwin/release/awman: Mach-O 64-bit executable x86_64
+Set runtime (global) = builtin-experimental
+    the builtin runtime is unavailable: the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is macos/x86_64. Choose another runtime (docker, apple-containers or docker-sbx-experimental)

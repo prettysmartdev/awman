@@ -5,8 +5,8 @@ Issue: n/a
 
 Status: Open, **optional future work** for a later release. Nothing here
 blocks WI 0123, and WI 0119/0121 are resolved without it.
-Parent: [WI 0121](0121-complete-builtin-runtime-and-native-verification.md)
-Split from: [WI 0123](0123-builtin-native-verification-and-release-closure.md)
+Parent: [WI 0121](completed/0121-complete-builtin-runtime-and-native-verification.md)
+Split from: [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md)
 (the macOS Apple Silicon `builtin-experimental` release)
 
 ## Summary:
@@ -101,7 +101,13 @@ secrets, redact evidence, and never dump ambient credentials.
    boot; trace executable/firmware access and helper/provider retention;
    minimal PATH and enforced-offline cached execution; ABI, measurements,
    notices, corresponding source and relink/source-offer materials.
-10. **Record-keeping:** as each package lands, update the evidence register
+10. **Docker-dependent leftovers from WI 0123:** the live
+    `docker-sbx-experimental` regression (needs a signed-in Docker account,
+    `sbx login`); `docker save` and buildx OCI exports in the real template
+    corpus (`tests/oci_import/corpus/build-corpus.sh` with Docker; WI 0123
+    shipped an Apple-only corpus mode); a native Windows run of the
+    existing-backend refusal checks (CI builds it).
+11. **Record-keeping:** as each package lands, update the evidence register
     rows WI 0123 marked Deferred to PASS, with linked evidence.
 
 ## Edge Case Considerations:

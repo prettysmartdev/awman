@@ -9,17 +9,29 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
-.PHONY: all build install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
+.PHONY: all build sign-macos install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
 
 all: build
 
+# On Apple Silicon the experimental builtin runtime is included when its
+# payload verifies, and the binary is then ad-hoc signed with the hypervisor
+# entitlement (tools/macos-sign.sh): macOS refuses to start a VM otherwise.
+# Other hosts build the existing backends only; the builtin runtime is released
+# for macOS on Apple Silicon only (WI 0124 tracks Linux).
 build:
-	@if bash tools/msb-payloads/verify.sh "$$(rustc -vV | sed -n 's/^host: //p')" >/dev/null 2>&1; then \
-		cargo build --release --features builtin-runtime; \
+	@host="$$(rustc -vV | sed -n 's/^host: //p')"; \
+	if [ "$$host" = aarch64-apple-darwin ] && bash tools/msb-payloads/verify.sh "$$host" >/dev/null 2>&1; then \
+		cargo build --release --features builtin-runtime && \
+		bash tools/macos-sign.sh $(TARGET_DIR)/release/$(BINARY); \
 	else \
-		echo 'Builtin payloads unavailable for this host; building existing backends'; \
+		echo 'Builtin runtime not included for this host; building existing backends'; \
 		cargo build --release; \
 	fi
+
+# Re-sign an existing build, e.g. after stripping or copying it elsewhere:
+# `make sign-macos BIN=/usr/local/bin/awman`.
+sign-macos:
+	bash tools/macos-sign.sh "$(or $(BIN),$(TARGET_DIR)/release/$(BINARY))"
 
 payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
@@ -58,8 +70,16 @@ test-fast:
 # whole embedded VM stack (hundreds of MB each in debug), so building all of them
 # with the feature is needlessly slow and can exhaust memory or disk on CI runners.
 # `--examples` builds the real-guest driver used by the builtin_hw_* tests.
+# On macOS the awman binary and guest drivers are signed with the hypervisor
+# entitlement between building and running (tools/macos-sign-test-artifacts.sh).
+BUILTIN_TEST_ARGS := --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer
 test-builtin:
-	@AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --quiet
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --no-run --quiet
+	@# `cargo test --examples` builds the examples as test targets; the guest
+	@# drivers the hardware tests launch from target/debug/examples/ need a build.
+	@cargo build --quiet --features builtin-runtime --example builtin_hw_driver --example builtin_net_driver
+	@bash tools/macos-sign-test-artifacts.sh $(TARGET_DIR)/debug
+	@AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --quiet
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/test-builtin-network.sh
 
 test-full:

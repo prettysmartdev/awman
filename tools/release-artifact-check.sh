@@ -78,14 +78,42 @@ case "$(uname -s)" in
   ;;
  Darwin)
   command -v sandbox-exec >/dev/null || { echo "BLOCKED: sandbox-exec network denial profile is required for offline cached execution" >&2; exit 4; }
-  if command -v fs_usage >/dev/null; then
+  if [ "$(id -u)" = 0 ] && command -v fs_usage >/dev/null; then
+    # Root: trace every file system call of the session.
     fs_usage -w -f filesys > "$output/session.trace" 2>&1 & trace_pid=$!
     if sandbox-exec -p '(version 1)(deny network*)(allow default)' env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$output/state" > "$output/session.stdout" 2> "$output/session.stderr"; then status=0; else status=$?; fi
-    kill "$trace_pid" 2>/dev/null || true; wait "$trace_pid" 2>/dev/null || true; exit "$status"
+    kill "$trace_pid" 2>/dev/null || true; wait "$trace_pid" 2>/dev/null || true
+    [ "$status" = 0 ] || { tail -40 "$output/session.stderr" >&2; exit "$status"; }
+    grep -Fq "$artifact" "$output/session.trace" || { echo "BLOCKED: Mac trace did not observe the exact distributed artifact" >&2; exit 4; }
   else
-    sudo dtruss -f sandbox-exec -p '(version 1)(deny network*)(allow default)' env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$output/state" > "$output/session.stdout" 2> "$output/session.trace"
+    # Without root, enforce instead of observing: the kernel sandbox denies
+    # all network access and every executable except the artifact itself
+    # (its VM workers re-execute it), the session wrapper's shell and system
+    # tools, and git/security. A host container helper or an extracted
+    # runtime binary cannot run, so a passing session proves none was needed.
+    wrapper=$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")
+    git_real=$(xcrun --find git 2>/dev/null || echo /usr/bin/git)
+    cat > "$output/session.sb" <<SB
+(version 1)
+(allow default)
+(deny network*)
+(allow network* (local unix-socket) (remote unix-socket))
+(deny process-exec)
+(allow process-exec
+  (literal "$artifact")
+  (literal "$wrapper")
+  (literal "/usr/bin/env") (literal "/bin/sh") (literal "/bin/bash") (literal "/bin/sleep")
+  (literal "/bin/cat") (literal "/bin/mkdir") (literal "/bin/chmod") (literal "/bin/ps")
+  (literal "/usr/bin/mktemp") (literal "/usr/bin/grep") (literal "/usr/bin/awk")
+  (literal "/usr/bin/sort") (literal "/usr/bin/tail") (literal "/usr/bin/dirname")
+  (literal "/usr/bin/git") (literal "/usr/bin/xcrun") (literal "$git_real")
+  (literal "/usr/bin/security")
+  (regex #"/awman-offline\.[^/]+/bin/claude$"))
+SB
+    if sandbox-exec -f "$output/session.sb" env -i PATH=/usr/bin:/bin HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$output/state" > "$output/session.stdout" 2> "$output/session.stderr"; then :; else
+      status=$?; tail -40 "$output/session.stderr" >&2; exit "$status"; fi
+    printf 'mode=kernel-enforced sandbox (no root for fs_usage/dtruss)\nprofile=session.sb\n' > "$output/session.trace"
   fi
-  grep -Fq "$artifact" "$output/session.trace" || { echo "BLOCKED: Mac trace did not observe the exact distributed artifact" >&2; exit 4; }
   ;;
 esac
 find "$output/home" "$output/state" -type f \( -name msb -o -name agentd -o -name 'libkrunfw*' \) -print > "$output/helper-scan-after-session.txt"

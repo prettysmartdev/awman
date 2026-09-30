@@ -1,0 +1,31 @@
+# code patch sha256 2d209a533b4915cd8d771292f7a78cbd3ebb1509988b3028c6b5666cacc4bf56 on base e86ddde0e0e9ef70fd4bdf774a6dcc42062e9635 (WI 0123 working tree)
+opt-ins: AWMAN_TEST_BUILTIN=1 REQUIRE_HW=1 NETWORK=1 PRESSURE=1 APPLE_CONTAINER=1 APPLE_FIXTURE_REF REGISTRY_PUBLIC=1 OLD_ARTIFACT(e86ddde0 build)
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 183.49s
+tests run (all passed):
+  acquisition::builtin_hw_cached_execution_after_sources_stop
+  apple_store::builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops
+  frontends::builtin_hw_actual_awman_api_dispatches_into_a_guest
+  frontends::builtin_hw_actual_awman_old_new_upgrade_and_binary_replacement
+  frontends::builtin_hw_actual_awman_owner_crash_then_clean_recovers
+  frontends::builtin_hw_actual_awman_registry_pulled_image_runs_offline
+  frontends::builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest
+  frontends::builtin_hw_actual_awman_workflow_setup_steps_teardown_and_failure
+  guest_compat::builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies
+  hardware::builtin_hw_a_second_client_can_reattach_while_the_launcher_lives
+  hardware::builtin_hw_acp_frames_are_binary_clean_end_to_end
+  hardware::builtin_hw_cancel_stops_within_the_grace_and_removes_the_vm
+  hardware::builtin_hw_concurrent_vms_are_independent
+  hardware::builtin_hw_credential_refresh_reaches_every_consumer_atomically
+  hardware::builtin_hw_every_overlay_settings_and_prompt_variant_is_visible_in_the_guest
+  hardware::builtin_hw_exit_code_and_stream_separation
+  hardware::builtin_hw_image_defaults_hold_and_the_guest_is_not_root
+  hardware::builtin_hw_pty_reports_the_initial_size_and_follows_resizes
+  hardware::builtin_hw_resource_limits_are_enforced_in_the_guest
+  hardware::builtin_hw_runtime_overrides_win_over_image_defaults_but_never_root
+  lifecycle::builtin_hw_actual_awman_cli_synthetic_agent_exit_37
+  network_resources::builtin_hw_denied_egress_blocks_dns_ip_and_proxy_bypass
+  network_resources::builtin_hw_memory_oom_preserves_host_and_peer
+  network_resources::builtin_hw_network_dns_auth_ca_proxy_mcp
+  network_resources::builtin_hw_network_policy_isolated_between_vms
+  network_resources::builtin_hw_offline_cached_execution_under_denial
+  network_resources::builtin_hw_vcpu_load_and_cleanup

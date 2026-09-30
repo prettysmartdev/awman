@@ -154,8 +154,12 @@ belongs to rather than inventing a new code.
 ## Runtime and image-source configuration
 
 The `runtime` setting selects `docker`, `apple-containers`,
-`docker-sbx-experimental`, or `builtin`; an unset value keeps the existing
-Docker default. The builtin block is stored in global or repository config and
+`docker-sbx-experimental`, or `builtin-experimental` (released for macOS on
+Apple Silicon only; any other host refuses it before doing any work); an unset
+value keeps the existing Docker default. The unreleased spelling `builtin` is
+an unknown runtime whose error names `builtin-experimental`. `config set`
+rejects unknown runtime values, and commands that need no runtime keep
+working with an invalid stored value so it can be repaired. The builtin block is stored in global or repository config and
 repo values merge over global values. Its supported keys are `stateDir`,
 `vcpus` (default 2), `memoryMib` (default 4096, minimum 128), `imageSource`,
 per-image `images`, per-host `registries`, and `network` (guest network
@@ -167,7 +171,7 @@ repo config ships with the checkout and may be untrusted. For example:
 
 ```json
 {
-  "runtime": "builtin",
+  "runtime": "builtin-experimental",
   "builtin": {
     "vcpus": 2,
     "memoryMib": 4096,

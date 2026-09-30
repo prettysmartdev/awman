@@ -134,7 +134,11 @@ pub(crate) fn config_home(scratch: &Scratch) -> PathBuf {
     // config in $XDG_CONFIG_HOME/awman when that is set.
     let data = home.join(".config/awman");
     std::fs::create_dir_all(&data).unwrap();
-    std::fs::write(data.join("config.json"), br#"{"runtime":"builtin"}"#).unwrap();
+    std::fs::write(
+        data.join("config.json"),
+        br#"{"runtime":"builtin-experimental"}"#,
+    )
+    .unwrap();
     home
 }
 

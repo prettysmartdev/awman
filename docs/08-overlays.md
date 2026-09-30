@@ -846,7 +846,7 @@ See [Security & Isolation](04-security-and-isolation.md) for additional details 
 
 ## Overlays under the builtin runtime
 
-The [builtin microVM runtime](11-runtimes.md#builtin-microvm) resolves overlays exactly as Docker does — same sources, precedence, merge rules, permissions, and conflict handling — and then mounts the result into the VM:
+The [builtin microVM runtime](11-runtimes.md#builtin-microvm-experimental) resolves overlays exactly as Docker does — same sources, precedence, merge rules, permissions, and conflict handling — and then mounts the result into the VM:
 
 - A `dir()` overlay (and `ssh()`, which is a read-only directory mount) becomes a directory mount; `skill()` and `context()` directories likewise. `ro` and `rw` are honored.
 - A single file becomes a single-file mount. The file's parent directory is never mounted to make it visible.

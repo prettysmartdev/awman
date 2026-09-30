@@ -107,7 +107,7 @@ Output to user
 
 ## Execution Isolation
 
-All agent code execution occurs inside an isolated container or microVM managed by the `ContainerRuntime` (Layer 1). The host is never directly exposed to untrusted code. The builtin backend uses a Linux microVM; selecting it does not run agent code on the host.
+All agent code execution occurs inside an isolated container or microVM managed by the `ContainerRuntime` (Layer 1). The host is never directly exposed to untrusted code. The builtin backend uses a Linux microVM; selecting it does not run agent code on the host. It is released as `builtin-experimental` for macOS on Apple Silicon only (`RELEASED_TARGETS` in `engine::container::builtin`); the engine still compiles and unit-tests for Linux KVM, which WI 0124 enables.
 
 - **Mount scope validation**: Git root, current working directory, or abort
 - **Auth isolation**: API keys stored in secure hashing, env vars injected at container startup only

@@ -522,11 +522,15 @@ impl ExecWorkflowCommand {
         };
 
         // ── Ensure the leader image is built. ───────────────────────────────
+        let image_sources = crate::engine::oci::ImageSources::from_config(
+            &self.session.effective_config().builtin_runtime(),
+        );
         ensure_agent_image(
             &self.engines,
             &git_root_for_scope,
             &paths,
             leader_agent.as_str(),
+            &image_sources,
             frontend.as_mut(),
         )?;
 
@@ -847,12 +851,16 @@ impl ExecWorkflowCommand {
         let resolved_agents =
             resolve_and_validate_workflow_agents(&workflow, &worktree_session, &paths)
                 .map_err(CommandError::Other)?;
+        let image_sources = crate::engine::oci::ImageSources::from_config(
+            &self.session.effective_config().builtin_runtime(),
+        );
         for agent in &resolved_agents {
             ensure_agent_image(
                 &self.engines,
                 &git_root_for_scope,
                 &paths,
                 agent,
+                &image_sources,
                 frontend.as_mut(),
             )?;
         }

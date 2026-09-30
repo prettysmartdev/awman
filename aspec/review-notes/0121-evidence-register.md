@@ -12,9 +12,9 @@ All nine WI 0119 boxes and all WI 0121 acceptance boxes remain unchecked.
 A fixture, capability declaration, configured CI job, skip, or preflight is
 never evidence of guest/service/distribution execution.
 
-The latest user instruction authorizes resource-qualified follow-ups: [WI 0122](../work-items/completed/0122-native-apple-image-store-bridge.md) owns the missing Apple-store implementation; [WI 0123](../work-items/0123-builtin-native-verification-and-release-closure.md) owns remaining native scenarios, full-diff/clean-build verification, services and release closure. These are open assignments awaiting capable runner access, not executed jobs. Their creation does not satisfy an original mandatory gate. The latest final verification section below supersedes earlier snapshot descriptions.
+The latest user instruction authorizes resource-qualified follow-ups: [WI 0122](../work-items/completed/0122-native-apple-image-store-bridge.md) owns the missing Apple-store implementation; [WI 0123](../work-items/completed/0123-builtin-native-verification-and-release-closure.md) owns remaining native scenarios, full-diff/clean-build verification, services and release closure. These are open assignments awaiting capable runner access, not executed jobs. Their creation does not satisfy an original mandatory gate. The latest final verification section below supersedes earlier snapshot descriptions.
 
-Scope split and resolution (2026-09-29): [WI 0123](../work-items/0123-builtin-native-verification-and-release-closure.md) ships `builtin-experimental` on Apple Silicon macOS only, ad-hoc signed, validates the Apple store, archive and normal-case registry sources, and closes this work stream, resolving WI 0119 and WI 0121. When it completes, each row here must be PASS with linked evidence or **Deferred (WI 0124, optional)**. [WI 0124](../work-items/0124-builtin-linux-and-docker-gates.md) holds Linux KVM, Docker Engine and registry edge-case work as optional future work.
+Scope split and resolution (2026-09-29): [WI 0123](../work-items/completed/0123-builtin-native-verification-and-release-closure.md) ships `builtin-experimental` on Apple Silicon macOS only, ad-hoc signed, validates the Apple store, archive and normal-case registry sources, and closes this work stream, resolving WI 0119 and WI 0121. When it completes, each row here must be PASS with linked evidence or **Deferred (WI 0124, optional)**. [WI 0124](../work-items/0124-builtin-linux-and-docker-gates.md) holds Linux KVM, Docker Engine and registry edge-case work as optional future work.
 
 
 ## Reviewed identity and evidence rules
@@ -91,6 +91,42 @@ identify the assertions to run, not an automatic PASS.
 | D-13 | `tools/release-artifact-check.sh`, release workflow, `builtin_final_artifact_retains_worker_provider` | [Enforced distribution prerequisite](0121-evidence/raw/final/distribution-required.log) fails without exact artifact. No optimized/stripped guest boot, final native access/dependency/helper trace, Mac distribution artifact. No native release job executed. **BLOCKED**. |
 | D-14 | `tools/measure-release-artifact.sh`, `NOTICE.third-party.md`, release artifact | Harness/notices exist, but no artifact measurement, Linux ABI audit, complete licensing/relink review or maintainer release disposition. **BLOCKED**. |
 | D-15 | `tests/oci_import/corpus.rs`, corpus builder, guest/onboarding scenarios | Full required format × shipped-template corpus builder/consumer now exists with production size limits; shell syntax and synthetic formats execute. [Matrix notes](0121-evidence/raw/closure/matrix/notes.md). Actual corpus production is **BLOCKED** without Docker/Apple services. Complete onboarding and remaining guest strategy scenarios need WI 0123 implementation: **FAIL**. No parity exemption created. |
+
+### WI 0123 resolution (macOS Apple Silicon `builtin-experimental` release)
+
+This table supersedes the verdicts above for the released scope. Evidence is
+in [WI 0123 notes](0123-evidence/notes.md): one frozen tree, with every log
+carrying its hash. **Deferred** rows are optional future work in
+[WI 0124](../work-items/0124-builtin-linux-and-docker-gates.md) and do not keep
+WI 0119/0121 open.
+
+| Row | macOS evidence | Verdict | Deferred to WI 0124 |
+|---|---|---|---|
+| D-01 | Apple store bridge (WI 0122), archive, real corpus of nine templates ([image-sources](0123-evidence/final/image-sources.log)), offline guest runs ([hardware](0123-evidence/final/hardware.log)) | PASS | — |
+| D-02 | Public Docker Hub/GHCR normal cases ([image-sources](0123-evidence/final/image-sources.log)); registry-pulled image runs offline ([hardware](0123-evidence/final/hardware.log)); private GHCR package with env, Docker-config and keychain credentials | PASS (public and authenticated: [private-registry](0123-evidence/final/private-registry.log)) | Docker Engine sources; registry edge cases (private CA, proxies, expiry, faults) |
+| D-03 | Clean-checkout native CI on Apple Silicon ([clean-checkout](0123-evidence/final/clean-checkout-ci.log)); verified darwin payload | PASS | Linux arm64/x86_64 KVM |
+| D-04 | Nine-agent strategy matrix, overlays, defaults/overrides, credential refresh in non-root guests ([hardware](0123-evidence/final/hardware.log)) | PASS | Linux guests |
+| D-05 | Allowlist/denied egress/isolation/`none`/hostPorts, OOM (signal death reported as `-1`), vCPU ([hardware](0123-evidence/final/hardware.log)) | PASS (IPv6 denial only where the host has IPv6) | Linux guests |
+| D-06 | CLI, workflow, API, squad, PTY, ACP (EOF fixed), cancel, reattach, owner crash and `clean` ([hardware](0123-evidence/final/hardware.log)) | PASS | Linux guests |
+| D-07 | Isolated SDK config and ambient-override refusal (hermetic `runtime_refusal`); no installed runtime used | PASS | Linux |
+| D-08 | Worker descriptor validation in every native boot (lock-mode fix) | PASS | Linux |
+| D-09 | Concurrent VMs (stop/exit race fixed), old/new upgrade and binary replacement, cache invariants ([hardware](0123-evidence/final/hardware.log), [hermetic](0123-evidence/final/hermetic.log)) | PASS | Linux |
+| D-10 | `make pre-push` green on macOS; feature and hardware tiers ([hermetic](0123-evidence/final/hermetic.log)) | PASS | Linux tiers |
+| D-11 | Tracked inputs and clean-checkout build ([clean-checkout](0123-evidence/final/clean-checkout-ci.log)); Intel macOS refusal ([intel](0123-evidence/final/intel-refusal.log)) | PASS (macOS); Windows built in CI only | Linux builds; native Windows run |
+| D-12 | SQLite exact resolution, migrations, old↔new catalog ([sqlite](0123-evidence/final/sqlite.log)) | PASS | Linux targets |
+| D-13 | Signed optimized artifact: linkage, provider, kernel hash, no helpers, offline session under a kernel sandbox ([release-artifact](0123-evidence/final/release-artifact.log)) | PASS (enforced sandbox; syscall trace needs root) | Linux artifacts |
+| D-14 | Size/startup/RSS/disk measurements of the signed artifact ([release-artifact](0123-evidence/final/release-artifact.log)) | PASS | Linux artifacts |
+| D-15 | Apple-built real corpus for every template; existing Apple backend regressions ([apple-backend](0123-evidence/final/apple-backend-regression.log)) | PASS (macOS formats) | Docker-built corpus formats; `sbx` live regression |
+
+WI 0119 criteria for this scope: 1 single executable (macOS) PASS · 2
+reproducible patches/payloads/clean checkout PASS · 3 exactly one bundled
+SQLite PASS · 4 native guest execution PASS on Apple Silicon (Linux Deferred)
+· 5 every mandatory source PASS for Apple store, archive and registry (public
+and authenticated); Docker Engine Deferred · 6 strategies,
+runtime, frontend, workflow and squad contracts PASS · 7 optimized artifact PASS
+· 8 docs/specs and Apple backend regressions PASS (Docker and `sbx` live
+regressions Deferred) · 9 WI 0120 inventory PASS.
+
 
 ## All nine WI 0119 acceptance criteria
 
@@ -266,7 +302,7 @@ substitute for a complete diff or clean checkout. The earlier final sections
 are historical snapshots; this section and the current D-rows supersede them.
 
 The user authorized resource-qualified follow-up work. [WI 0122](../work-items/completed/0122-native-apple-image-store-bridge.md)
-now owns native Apple-store implementation and validation; [WI 0123](../work-items/0123-builtin-native-verification-and-release-closure.md)
+now owns native Apple-store implementation and validation; [WI 0123](../work-items/completed/0123-builtin-native-verification-and-release-closure.md)
 owns remaining native scenario code, services, full-diff/clean builds and
 release closure. Both specify capable-agent assignments and mandatory resource
 preflights. No connected external runner/signing/service agent was available

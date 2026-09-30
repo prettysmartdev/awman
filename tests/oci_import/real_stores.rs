@@ -573,3 +573,244 @@ fn native_keychain_disposable_registry_entry() {
         "pulled {reference} with disposable keychain credentials and verified removal"
     ));
 }
+
+/// Normal-case pulls from real public registries (WI 0123 C.7): anonymous
+/// Bearer tokens from a realm on another host, multi-platform index
+/// selection, blob redirects to storage/CDN hosts, digest pinning, a missing
+/// tag, and cached reuse without contacting the registry.
+///
+/// Opt in with `AWMAN_TEST_IMAGE_STORES=1 AWMAN_TEST_REGISTRY_PUBLIC=1`.
+#[test]
+fn store_registry_public_normal_cases() {
+    const TEST: &str = "store_registry_public_normal_cases";
+    let Some(_) = gated(TEST, "AWMAN_TEST_REGISTRY_PUBLIC", &[]) else {
+        return;
+    };
+    let report = ScenarioReport::start(TEST);
+    let request = |registry: &str, reference: &str, policy| AcquireRequest {
+        tag: format!("awman-public-{}:latest", registry.replace('.', "-")),
+        source: ImageSourceSpec::Registry {
+            registry: Some(registry.into()),
+            reference: Some(reference.into()),
+        },
+        platform: OciPlatform::host_linux(),
+        policy,
+        registries: BTreeMap::new(),
+    };
+    let mut summary = Vec::new();
+    for (registry, reference) in [
+        ("docker.io", "library/alpine:3.22"),
+        ("ghcr.io", "linuxcontainers/alpine:latest"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let acq = acquirer(&temp.path().join("state"));
+        let got = acq
+            .acquire(
+                &request(registry, reference, AcquirePolicy::IfMissing),
+                &mut |_| {},
+            )
+            .unwrap_or_else(|e| panic!("{TEST}: {registry}/{reference}: {e}"));
+        assert_eq!(got.identity.source, ImageSourceKind::Registry);
+        assert!(OciPlatform::host_linux().matches(&got.identity.platform));
+        // Cached reuse never contacts the registry: an unroutable proxy would
+        // fail any request that CachedOnly made.
+        let offline = acquirer_with_env(
+            &temp.path().join("state"),
+            awman::data::config::env::EnvSnapshot::with_overrides([(
+                "HTTPS_PROXY".to_string(),
+                "http://127.0.0.1:9".to_string(),
+            )]),
+        );
+        assert_eq!(
+            offline
+                .acquire(
+                    &request(registry, reference, AcquirePolicy::CachedOnly),
+                    &mut |_| {}
+                )
+                .unwrap(),
+            got
+        );
+        // The same image pinned by its manifest digest.
+        let name = reference.split(':').next().unwrap();
+        let pinned = format!("{name}@{}", got.identity.manifest_digest);
+        let fresh = tempfile::tempdir().unwrap();
+        let by_digest = acquirer(&fresh.path().join("state"))
+            .acquire(
+                &request(registry, &pinned, AcquirePolicy::IfMissing),
+                &mut |_| {},
+            )
+            .unwrap_or_else(|e| panic!("{TEST}: {registry}/{pinned}: {e}"));
+        assert_eq!(
+            by_digest.identity.manifest_digest,
+            got.identity.manifest_digest
+        );
+        summary.push(format!(
+            "{registry}/{reference} -> {} ({})",
+            got.identity.manifest_digest, got.identity.platform
+        ));
+    }
+    // A tag that does not exist is reported as such, not as an auth or
+    // transport failure, and caches nothing.
+    let temp = tempfile::tempdir().unwrap();
+    let missing = acquirer(&temp.path().join("state"))
+        .acquire(
+            &request(
+                "docker.io",
+                "library/alpine:awman-no-such-tag-7f3a",
+                AcquirePolicy::IfMissing,
+            ),
+            &mut |_| {},
+        )
+        .unwrap_err();
+    let detail = missing.to_string().to_ascii_lowercase();
+    assert!(
+        detail.contains("not found") || detail.contains("manifest unknown"),
+        "{missing}"
+    );
+    report.pass(&summary.join("; "));
+}
+
+/// Normal-case authenticated pulls from a real private repository (WI 0123
+/// C.7): credentials from environment variables and from Docker's
+/// `config.json`, a wrong token and no credentials refused, and no secret in
+/// any error. Keychain-sourced credentials are covered by
+/// `native_keychain_disposable_registry_entry` with the same token.
+///
+/// Opt in with `AWMAN_TEST_IMAGE_STORES=1 AWMAN_TEST_REGISTRY_PRIVATE=1` and:
+/// - `AWMAN_TEST_REGISTRY_PRIVATE_REFERENCE`, e.g. `ghcr.io/<you>/awman-probe:latest`
+/// - `AWMAN_TEST_REGISTRY_PRIVATE_USER` and `AWMAN_TEST_REGISTRY_PRIVATE_TOKEN`
+///   (a disposable, read-only token)
+#[test]
+fn store_registry_private_normal_cases() {
+    const TEST: &str = "store_registry_private_normal_cases";
+    let Some(inputs) = gated(
+        TEST,
+        "AWMAN_TEST_REGISTRY_PRIVATE",
+        &[
+            "AWMAN_TEST_REGISTRY_PRIVATE_REFERENCE",
+            "AWMAN_TEST_REGISTRY_PRIVATE_USER",
+            "AWMAN_TEST_REGISTRY_PRIVATE_TOKEN",
+        ],
+    ) else {
+        return;
+    };
+    let report = ScenarioReport::start(TEST);
+    let full = inputs["AWMAN_TEST_REGISTRY_PRIVATE_REFERENCE"].clone();
+    let (registry, reference) = full
+        .split_once('/')
+        .map(|(h, r)| (h.to_string(), r.to_string()))
+        .expect("reference must be <registry>/<repository>:<tag>");
+    let user = inputs["AWMAN_TEST_REGISTRY_PRIVATE_USER"].clone();
+    let token = inputs["AWMAN_TEST_REGISTRY_PRIVATE_TOKEN"].clone();
+    let request = |auth: Option<RegistryAuthSource>| AcquireRequest {
+        tag: "awman-private-probe:latest".into(),
+        source: ImageSourceSpec::Registry {
+            registry: Some(registry.clone()),
+            reference: Some(reference.clone()),
+        },
+        platform: OciPlatform::host_linux(),
+        policy: AcquirePolicy::IfMissing,
+        registries: BTreeMap::from([(
+            registry.clone(),
+            RegistryHostConfig {
+                insecure: false,
+                ca_cert: None,
+                auth,
+            },
+        )]),
+    };
+    let no_secret = |text: &str| {
+        assert!(
+            !text.contains(&token),
+            "{TEST}: an error or log exposed the token"
+        );
+    };
+
+    // 1. Environment variables.
+    let temp = tempfile::tempdir().unwrap();
+    let env = awman::data::config::env::EnvSnapshot::with_overrides([
+        ("AWMAN_PROBE_USER".to_string(), user.clone()),
+        ("AWMAN_PROBE_TOKEN".to_string(), token.clone()),
+    ]);
+    let by_env = acquirer_with_env(&temp.path().join("env"), env)
+        .acquire(
+            &request(Some(RegistryAuthSource::Env {
+                username_var: "AWMAN_PROBE_USER".into(),
+                password_var: "AWMAN_PROBE_TOKEN".into(),
+            })),
+            &mut |_| {},
+        )
+        .unwrap_or_else(|e| {
+            no_secret(&e.to_string());
+            panic!("{TEST}: env-credential pull failed: {e}")
+        });
+    assert_eq!(by_env.identity.source, ImageSourceKind::Registry);
+
+    // 2. Docker config.json (inline `auths`, as `docker login` writes).
+    let docker_dir = temp.path().join("docker");
+    std::fs::create_dir_all(&docker_dir).unwrap();
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}"));
+    std::fs::write(
+        docker_dir.join("config.json"),
+        serde_json::json!({"auths": {registry.clone(): {"auth": encoded}}}).to_string(),
+    )
+    .unwrap();
+    let env = awman::data::config::env::EnvSnapshot::with_overrides([(
+        "DOCKER_CONFIG".to_string(),
+        docker_dir.to_string_lossy().into_owned(),
+    )]);
+    let by_config = acquirer_with_env(&temp.path().join("config"), env)
+        .acquire(
+            &request(Some(RegistryAuthSource::DockerConfig)),
+            &mut |_| {},
+        )
+        .unwrap_or_else(|e| {
+            no_secret(&e.to_string());
+            panic!("{TEST}: docker-config pull failed: {e}")
+        });
+    assert_eq!(
+        by_config.identity.manifest_digest,
+        by_env.identity.manifest_digest
+    );
+
+    // 3. A wrong token and no credentials are refused as authentication
+    //    failures, and never leak a secret.
+    let env = awman::data::config::env::EnvSnapshot::with_overrides([
+        ("AWMAN_PROBE_USER".to_string(), user.clone()),
+        ("AWMAN_PROBE_TOKEN".to_string(), format!("{token}-wrong")),
+    ]);
+    let wrong = acquirer_with_env(&temp.path().join("wrong"), env)
+        .acquire(
+            &request(Some(RegistryAuthSource::Env {
+                username_var: "AWMAN_PROBE_USER".into(),
+                password_var: "AWMAN_PROBE_TOKEN".into(),
+            })),
+            &mut |_| {},
+        )
+        .unwrap_err();
+    no_secret(&wrong.to_string());
+    let anonymous = acquirer(&temp.path().join("anon"))
+        .acquire(&request(None), &mut |_| {})
+        .unwrap_err();
+    no_secret(&anonymous.to_string());
+    for (what, error) in [("wrong token", &wrong), ("anonymous", &anonymous)] {
+        let detail = error.to_string().to_ascii_lowercase();
+        assert!(
+            [
+                "authentication",
+                "unauthorized",
+                "forbidden",
+                "denied",
+                "not found"
+            ]
+            .iter()
+            .any(|w| detail.contains(w)),
+            "{what} must be refused by the registry: {error}"
+        );
+    }
+    report.pass(&format!(
+        "{registry}/{reference}: env and docker-config credentials -> {}; wrong token and anonymous refused",
+        by_env.identity.manifest_digest
+    ));
+}

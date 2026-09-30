@@ -19,6 +19,13 @@ jobs:
             # Payload manifest status is `unverified` (build.rs refuses it); enable
             # once tools/msb-payloads/fetch.sh has run natively and recorded hashes.
             builtin: false
+          # The builtin runtime is released for macOS on Apple Silicon only
+          # (release-macos-builtin below); Linux arm64 ships without it until
+          # WI 0124's native gates pass.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: awman-linux-arm64
+            builtin: false
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: awman-macos-amd64
@@ -126,12 +133,16 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: cargo build --locked --release --features builtin-runtime --target aarch64-apple-darwin --bin awman
-      - name: Prepare the distribution binary (no signing or notarization)
+      - name: Ad-hoc sign the distribution binary (hypervisor entitlement; no notarization)
         run: |
           artifact="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/awman"
           cp "$artifact" awman-macos-arm64
+          # Reproducibility compares the unsigned build; signing changes the bytes.
+          shasum -a 256 awman-macos-arm64 > release-macos-awman.unsigned.sha256
+          bash tools/macos-sign.sh awman-macos-arm64
           shasum -a 256 awman-macos-arm64 > release-macos-awman.sha256
-      - name: Trace and boot the exact distributed artifact
+          codesign -d --entitlements - --xml awman-macos-arm64 > release-macos-awman.entitlements.plist
+      - name: Trace and boot the exact signed, distributed artifact
         run: |
           test -x /opt/awman/release-offline-session.sh || { echo "BLOCKED: native release runner must provision /opt/awman/release-offline-session.sh with cached fixture and enforced network denial"; exit 1; }
           bash tools/release-artifact-check.sh "$PWD/awman-macos-arm64" aarch64-apple-darwin release-evidence/macos /opt/awman/release-offline-session.sh
@@ -148,53 +159,9 @@ jobs:
             third_party/msb-payloads/aarch64-apple-darwin/provenance.txt
           if-no-files-found: ignore
 
-  release-linux-arm64-builtin:
-    name: Linux ARM64 optimized builtin artifact and boot gate
-    runs-on: [self-hosted, linux, arm64, kvm, trace]
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.94.0"
-          targets: aarch64-unknown-linux-gnu
-      - name: Isolate cargo source and target caches
-        shell: bash
-        run: |
-          echo "CARGO_HOME=$(mktemp -d "$RUNNER_TEMP/awman-cargo-home.XXXXXX")" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_DIR=$(mktemp -d "$RUNNER_TEMP/awman-target.XXXXXX")" >> "$GITHUB_ENV"
-      - name: Prepare verified payload and static native library
-        run: |
-          test -r /dev/kvm && test -w /dev/kvm || { echo "BLOCKED: writable KVM is required"; exit 1; }
-          command -v strace >/dev/null || { echo "BLOCKED: strace is required for the release trace"; exit 1; }
-          bash tools/msb-payloads/fetch.sh aarch64-unknown-linux-gnu
-          bash tools/msb-payloads/verify.sh aarch64-unknown-linux-gnu
-          bash third_party/native/libcap-ng/build.sh aarch64-unknown-linux-gnu
-      - name: Build final optimized awman executable
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: cargo build --locked --release --features builtin-runtime --target aarch64-unknown-linux-gnu --bin awman
-      - name: Trace and boot the exact distributed artifact
-        run: |
-          test -x /opt/awman/release-offline-session.sh || { echo "BLOCKED: native release runner must provision /opt/awman/release-offline-session.sh with cached fixture and network namespace isolation"; exit 1; }
-          bash tools/release-artifact-check.sh "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/awman" aarch64-unknown-linux-gnu release-evidence/linux-arm64 /opt/awman/release-offline-session.sh
-          bash tools/measure-release-artifact.sh "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/awman" aarch64-unknown-linux-gnu release-evidence/linux-arm64-measurements /opt/awman/release-workload.sh
-          cp "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/awman" awman-linux-arm64
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: awman-linux-arm64-builtin
-          path: |
-            awman-linux-arm64
-            release-evidence/
-            third_party/msb-payloads/aarch64-unknown-linux-gnu/kernel.meta
-            third_party/msb-payloads/aarch64-unknown-linux-gnu/provenance.txt
-            third_party/native/libcap-ng/aarch64-unknown-linux-gnu/libcap-ng.a
-          if-no-files-found: ignore
-
   release:
     name: Create GitHub Release
-    needs: [build, release-linux-arm64-builtin, release-macos-builtin]
+    needs: [build, release-macos-builtin]
     runs-on: ubuntu-26.04
     permissions:
       contents: write

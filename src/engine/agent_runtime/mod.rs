@@ -348,7 +348,7 @@ pub const VALID_RUNTIMES: &[&str] = &[
     RuntimeSelection::Docker.as_str(),
     RuntimeSelection::AppleContainers.as_str(),
     RuntimeSelection::DockerSbxExperimental.as_str(),
-    RuntimeSelection::Builtin.as_str(),
+    RuntimeSelection::BuiltinExperimental.as_str(),
 ];
 
 /// Factory: pick the right runtime based on `GlobalConfig::runtime`.
@@ -371,7 +371,8 @@ pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineErr
 ///   (macOS only)
 /// - `"docker-sbx-experimental"` → `SandboxRuntime` with the (stubbed)
 ///   Docker Sandbox backend (macOS arm64 / Windows only; see WI 0090)
-/// - `"builtin"` → `ContainerRuntime` with the builtin microVM backend, or
+/// - `"builtin-experimental"` → `ContainerRuntime` with the builtin microVM
+///   backend (released for macOS on Apple Silicon only), or
 ///   the precise reason it cannot run here (`BuiltinRuntimeUnavailable`,
 ///   `AmbientRuntimeOverride`). Never a fall back to another runtime.
 /// - anything else → `EngineError::UnknownRuntime`. A misspelled runtime is
@@ -382,8 +383,11 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
     let selection = config
         .runtime_selection()
         .map_err(|unknown| EngineError::UnknownRuntime {
+            valid: match RuntimeSelection::hint_for(&unknown.0) {
+                Some(hint) => format!("{} ({hint})", RuntimeSelection::valid_values()),
+                None => RuntimeSelection::valid_values(),
+            },
             value: unknown.0,
-            valid: RuntimeSelection::valid_values(),
         })?;
     match selection {
         RuntimeSelection::Docker => Ok(DetectedRuntime::Container(Arc::new(
@@ -404,7 +408,7 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
         RuntimeSelection::DockerSbxExperimental => {
             Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
         }
-        RuntimeSelection::Builtin => {
+        RuntimeSelection::BuiltinExperimental => {
             let settings = BuiltinRuntimeSettings::resolve(config)?;
             Ok(DetectedRuntime::Container(Arc::new(
                 ContainerRuntime::builtin(settings)?,
@@ -542,15 +546,33 @@ mod tests {
     fn valid_runtimes_follow_runtime_selection() {
         let from_selection: Vec<&str> = RuntimeSelection::ALL.iter().map(|s| s.as_str()).collect();
         assert_eq!(VALID_RUNTIMES, from_selection.as_slice());
-        assert!(VALID_RUNTIMES.contains(&"builtin"));
+        assert!(VALID_RUNTIMES.contains(&"builtin-experimental"));
+        assert!(!VALID_RUNTIMES.contains(&"builtin"));
     }
 
-    /// Selecting `builtin` yields the builtin runtime or the precise reason it
-    /// cannot run — never Docker, never a panic.
+    /// The unreleased `builtin` spelling is an unknown runtime whose error
+    /// names `builtin-experimental`, never Docker.
+    #[test]
+    fn plain_builtin_is_refused_with_the_experimental_name() {
+        let cfg = GlobalConfig {
+            runtime: Some("builtin".into()),
+            ..Default::default()
+        };
+        match detect(&cfg) {
+            Err(e @ EngineError::UnknownRuntime { .. }) => {
+                assert!(e.to_string().contains("builtin-experimental"), "{e}")
+            }
+            Err(e) => panic!("expected UnknownRuntime, got {e:?}"),
+            Ok(_) => panic!("plain `builtin` must not select a runtime"),
+        }
+    }
+
+    /// Selecting `builtin-experimental` yields the builtin runtime or the
+    /// precise reason it cannot run — never Docker, never a panic.
     #[test]
     fn detect_builtin_never_falls_back_to_another_runtime() {
         let cfg = GlobalConfig {
-            runtime: Some("builtin".into()),
+            runtime: Some("builtin-experimental".into()),
             ..Default::default()
         };
         match detect(&cfg) {

@@ -44,7 +44,7 @@ ACP is currently supported only by **Cline**. Other agents continue to use the
 standard stdio launch mode.
 
 ACP is available with the Docker and Apple Containers runtimes. The
-`docker-sbx-experimental` runtime does not currently support ACP. The `builtin` runtime carries ACP over its own binary-clean stream, but ACP inside a builtin guest has not yet been verified on real hardware.
+`docker-sbx-experimental` runtime does not currently support ACP. The `builtin-experimental` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
 
 The interactive ACP experience currently ships in the **CLI**. See
 [ACP in the TUI](#acp-in-the-tui) and [Workflows](#workflows-and-unsupported-agents)

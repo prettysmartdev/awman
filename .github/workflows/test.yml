@@ -156,8 +156,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-arm64, target: aarch64-unknown-linux-gnu, runs-on: [self-hosted, linux, arm64, kvm] }
-          - { name: linux-x86_64, target: x86_64-unknown-linux-gnu, runs-on: [self-hosted, linux, x64, kvm] }
+          # The builtin runtime is released for macOS on Apple Silicon only;
+          # WI 0124 re-adds the Linux KVM runners.
           - { name: macos-arm64, target: aarch64-apple-darwin, runs-on: [self-hosted, macOS, ARM64, hypervisor] }
     env:
       AWMAN_TEST_BUILTIN: "1"
@@ -215,8 +215,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-arm64-kvm, target: aarch64-unknown-linux-gnu, runs-on: [self-hosted, linux, arm64, kvm] }
-          - { name: linux-x86_64-kvm, target: x86_64-unknown-linux-gnu, runs-on: [self-hosted, linux, x64, kvm] }
           - { name: macos-arm64-hvf, target: aarch64-apple-darwin, runs-on: [self-hosted, macOS, ARM64, hypervisor] }
     steps:
       - uses: actions/checkout@v7

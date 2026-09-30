@@ -409,9 +409,10 @@ pub(crate) fn ensure_agent_image(
     git_root: &std::path::Path,
     paths: &crate::data::RepoDockerfilePaths,
     agent: &str,
+    sources: &crate::engine::oci::ImageSources,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), CommandError> {
-    ensure_agent_image_with_build_output(engines, git_root, paths, agent, sink, None)
+    ensure_agent_image_with_build_output(engines, git_root, paths, agent, sources, sink, None)
 }
 
 /// [`ensure_agent_image`] with the raw build output optionally redirected to a
@@ -422,12 +423,18 @@ pub(crate) fn ensure_agent_image_with_build_output(
     git_root: &std::path::Path,
     paths: &crate::data::RepoDockerfilePaths,
     agent: &str,
+    sources: &crate::engine::oci::ImageSources,
     sink: &mut dyn UserMessageSink,
     mut build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<(), CommandError> {
     let runtime = engines
         .require_container_runtime()
         .map_err(CommandError::from)?;
+    if runtime.capabilities().image_acquisition
+        == crate::engine::agent_runtime::ImageAcquisition::Import
+    {
+        return import_agent_image(runtime.as_ref(), git_root, paths, agent, sources, sink);
+    }
     let dockerfile = paths.agent_dockerfile(agent);
     if !dockerfile.exists() {
         return Err(CommandError::Other(format!(
@@ -482,4 +489,236 @@ pub(crate) fn ensure_agent_image_with_build_output(
         text: format!("Built image for agent '{agent}'."),
     });
     Ok(())
+}
+
+/// Make `agent`'s image available to an importing runtime (the builtin
+/// runtime), from the same configured image source `awman ready` uses. It
+/// never builds: an importing runtime runs images built elsewhere, and a
+/// missing source is reported with the external build instructions.
+fn import_agent_image(
+    runtime: &dyn crate::engine::agent_runtime::AgentRuntimeEngine,
+    git_root: &std::path::Path,
+    paths: &crate::data::RepoDockerfilePaths,
+    agent: &str,
+    sources: &crate::engine::oci::ImageSources,
+    sink: &mut dyn UserMessageSink,
+) -> Result<(), CommandError> {
+    use crate::engine::agent_runtime::ImageImportRequest;
+    let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
+    if runtime.image_exists(&tag).map_err(CommandError::from)? {
+        return Ok(());
+    }
+    let hint = crate::engine::oci::BuildHint {
+        agent_dockerfile: paths.agent_dockerfile(agent),
+        project: Some((
+            paths.project_dockerfile(),
+            crate::data::image_tags::project_image_tag(git_root),
+        )),
+        context: git_root.to_path_buf(),
+    };
+    let (source, reference) =
+        crate::engine::oci::resolve_source(&tag, sources, &hint).map_err(CommandError::from)?;
+    sink.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!(
+            "Importing image for agent '{agent}' ({tag}) from {} ({reference})…",
+            source.kind()
+        ),
+    });
+    let request = ImageImportRequest {
+        tag: tag.clone(),
+        source,
+        platform: crate::data::oci_identity::OciPlatform::host_linux(),
+        refresh: false,
+    };
+    runtime
+        .import_image(&request, sink)
+        .map(|_| ())
+        .map_err(|e| {
+            CommandError::Other(format!("failed to import image for agent '{agent}': {e}"))
+        })
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::data::config::image_source::ImageSourceSpec;
+    use crate::engine::agent_runtime::{
+        AgentHandle, AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, ImageAcquisition,
+        ImageImportRequest, ImportedImage, ResolvedAgentOptions,
+    };
+    use std::sync::Mutex;
+
+    /// An importing runtime that records imports and refuses to build.
+    struct Importing {
+        caps: Capabilities,
+        present: bool,
+        imports: Mutex<Vec<ImageImportRequest>>,
+    }
+
+    impl Importing {
+        fn new(present: bool) -> Self {
+            let mut caps = crate::engine::container::ContainerRuntime::docker()
+                .capabilities()
+                .clone();
+            caps.image_acquisition = ImageAcquisition::Import;
+            Self {
+                caps,
+                present,
+                imports: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AgentRuntimeEngine for Importing {
+        fn runtime_name(&self) -> &'static str {
+            "fake-import"
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake import"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn build(&self, _: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
+            unreachable!()
+        }
+        fn list_running(&self, _: &Session) -> Result<Vec<AgentHandle>, EngineError> {
+            unreachable!()
+        }
+        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
+            unreachable!()
+        }
+        fn stats(&self, _: &AgentHandle) -> Result<AgentStats, EngineError> {
+            unreachable!()
+        }
+        fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        fn attach(&self, _: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
+            unreachable!()
+        }
+        fn list_running_with_name_prefix(&self, _: &str) -> Result<Vec<AgentHandle>, EngineError> {
+            unreachable!()
+        }
+        fn host_cli(&self) -> Option<&'static str> {
+            None
+        }
+        fn exec_args(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+        ) -> Option<Vec<String>> {
+            None
+        }
+        fn ready_agent(
+            &self,
+            _: &str,
+            _: crate::engine::agent_runtime::ReadyAgentOptions,
+            _: &mut dyn UserMessageSink,
+        ) -> Result<(), EngineError> {
+            unreachable!()
+        }
+        fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
+            Ok(self.present)
+        }
+        fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
+            Ok(None)
+        }
+        fn build_image(
+            &self,
+            _: &str,
+            _: &std::path::Path,
+            _: &std::path::Path,
+            _: bool,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<(), EngineError> {
+            panic!("an importing runtime must never build")
+        }
+        fn import_image(
+            &self,
+            request: &ImageImportRequest,
+            _: &mut dyn UserMessageSink,
+        ) -> Result<ImportedImage, EngineError> {
+            self.imports.lock().unwrap().push(request.clone());
+            Err(EngineError::Other("recorded".into()))
+        }
+    }
+
+    struct Quiet;
+    impl UserMessageSink for Quiet {
+        fn write_message(&mut self, _: UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+
+    fn sources(spec: Option<ImageSourceSpec>) -> crate::engine::oci::ImageSources {
+        crate::engine::oci::ImageSources {
+            default: spec,
+            images: Default::default(),
+        }
+    }
+
+    #[test]
+    fn importing_runtime_imports_from_the_configured_source_and_never_builds() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::data::RepoDockerfilePaths::new(root.path());
+        let runtime = Importing::new(false);
+        let archive = ImageSourceSpec::Archive {
+            path: "/images/agent.tar".into(),
+        };
+        let err = import_agent_image(
+            &runtime,
+            root.path(),
+            &paths,
+            "claude",
+            &sources(Some(archive.clone())),
+            &mut Quiet,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("recorded"), "{err}");
+        let imports = runtime.imports.lock().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, archive);
+        assert_eq!(
+            imports[0].tag,
+            crate::data::image_tags::agent_image_tag(root.path(), "claude")
+        );
+    }
+
+    #[test]
+    fn importing_runtime_keeps_a_present_image_and_reports_a_missing_source() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::data::RepoDockerfilePaths::new(root.path());
+        let present = Importing::new(true);
+        import_agent_image(
+            &present,
+            root.path(),
+            &paths,
+            "claude",
+            &sources(None),
+            &mut Quiet,
+        )
+        .unwrap();
+        assert!(present.imports.lock().unwrap().is_empty());
+        let missing = Importing::new(false);
+        let err = import_agent_image(
+            &missing,
+            root.path(),
+            &paths,
+            "claude",
+            &sources(None),
+            &mut Quiet,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no image source is configured"),
+            "{err}"
+        );
+        assert!(missing.imports.lock().unwrap().is_empty());
+    }
 }

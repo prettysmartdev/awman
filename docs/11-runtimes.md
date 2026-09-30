@@ -11,7 +11,7 @@ awman supports four agent runtimes. The runtime controls how agent processes are
 | `docker` (default) | Linux, macOS, Windows | Linux container (shared kernel) | Docker daemon |
 | `apple-containers` | macOS 26+ only | Lightweight VM per container | macOS 26 Tahoe |
 | `docker-sbx-experimental` | macOS arm64; Windows x86_64 | MicroVM per session | `sbx` CLI + Docker account |
-| `builtin` | Linux x86_64 / arm64 (KVM); macOS Apple Silicon | MicroVM per session, embedded in awman | An awman build that includes the runtime, plus KVM or the macOS hypervisor entitlement. No Docker, `container`, or `sbx` needed to *run* agents |
+| `builtin-experimental` | macOS on Apple Silicon only (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` release binary (or a signed source build). No Docker, `container`, or `sbx` needed to *run* agents |
 
 Set the runtime in your global config:
 
@@ -19,7 +19,7 @@ Set the runtime in your global config:
 awman config set --global runtime docker                   # default
 awman config set --global runtime apple-containers         # macOS 26+ only
 awman config set --global runtime docker-sbx-experimental  # experimental
-awman config set --global runtime builtin                  # embedded microVM; see below
+awman config set --global runtime builtin-experimental     # experimental, Apple Silicon only; see below
 ```
 
 You can switch runtimes at any time — each keeps its own separate state and does not interfere with the others. See [Switching runtimes](#switching-runtimes).
@@ -60,44 +60,75 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 
 ---
 
-## Builtin microVM
+## Builtin microVM (experimental)
 
-`builtin` is designed to run each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable**. Each VM starts another process of that same executable. No separately installed execution runtime is required.
+`builtin-experimental` runs each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable**. Each VM starts another process of that same executable. There is no separate runtime to install, and no Docker, `container` or `sbx` is needed to *run* agents.
 
 **Isolation model:** a hardware-virtualized VM with its own kernel per session. The hypervisor, device emulation, and shared-filesystem implementations form part of the security boundary. The configured project, settings, and overlay mounts grant access to host files. There is no host Docker socket bridge.
 
-> **Status:** the builtin runtime is new. Its configuration, image import, archive validation, and lifecycle logic are covered by automated tests, but starting a real guest, and everything that happens *inside* one (PTY and ACP sessions, resource limits, networking, credential-file access by a non-root user, squad and workflow runs), has so far been exercised only against simulated drivers, not on real KVM or Apple Silicon hosts. Treat it as a preview and see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what is known to differ.
+> **Experimental, macOS on Apple Silicon only.** This runtime is released as an experimental preview, like `docker-sbx-experimental`: behaviour and configuration may still change. In this release it runs only on Macs with Apple Silicon. Its guest behaviour (sessions, PTY and ACP, workflows, squad, the API, resource limits, networking, image import) is tested on real Apple Silicon hardware; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
 
 ### Where it is available
 
-| Host | Requirement |
+| Host | Status |
 |---|---|
-| Linux x86_64 or arm64 | Read/write access to `/dev/kvm` (KVM enabled; usually membership of the `kvm` group) |
-| macOS on Apple Silicon | The awman binary must carry the `com.apple.security.hypervisor` entitlement |
-| macOS on Intel, Windows, other architectures | Not supported. Selecting `builtin` reports `not supported on <os>/<arch>; supported platforms: linux/x86_64, linux/aarch64, macos/aarch64` |
+| macOS on Apple Silicon | Supported (experimental). Needs the `awman-macos-arm64` release binary or a source build (see below). |
+| Linux (x86_64 or arm64), macOS on Intel, Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
 
-The runtime is only present in awman builds compiled with it. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
+The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux, Intel macOS and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
-- **Release configuration:** `awman-linux-arm64` and a separate Apple Silicon job are configured to include the builtin runtime. Neither configuration establishes a published or boot-tested release. The ordinary Linux x86_64 and macOS matrix assets are configured without it.
-- **Building from source:** run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. `make install` includes the runtime automatically when the payloads for your host are verified and otherwise builds the existing runtimes only. Payloads for Linux arm64 and macOS Apple Silicon are verified. The Linux x86_64 payload is not yet verified, so a source build cannot include the runtime there yet.
-- **macOS distribution:** awman is not signed or notarized for the time being. Build and release jobs do not require signing credentials or perform explicit ad-hoc signing. Native guest boot must still succeed with the distributed binary; an OS permission failure remains a failed boot check, not a successful skip.
-- **Running a source build on macOS:** macOS only lets a program start a virtual machine when its code signature carries the `com.apple.security.hypervisor` entitlement, and a plain `cargo`/`make` build has none. Without it, starting an agent fails with `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …`. To use a build you compiled yourself, sign it locally with the entitlement:
+### Enabling it
+
+The runtime is only ever used when you select it explicitly in your **global** config (`~/.awman/config.json`). It is never a default and a repository config cannot select it:
+
+```sh
+awman config set --global runtime builtin-experimental
+awman ready
+```
+
+or edit `~/.awman/config.json` directly:
+
+```json
+{ "runtime": "builtin-experimental" }
+```
+
+The value is exact: `builtin` (without `-experimental`) is not a runtime name and is refused with a message pointing to `builtin-experimental`. `awman config set` refuses unknown runtime values, and if the file already holds one, `awman config …` still works so you can fix it; every command that would run an agent refuses to start until you do.
+
+### The macOS binary, Gatekeeper and permissions
+
+macOS only lets a program start a virtual machine when its code signature carries Apple's `com.apple.security.hypervisor` entitlement. The `awman-macos-arm64` binary is therefore **ad-hoc signed** with exactly that entitlement. It is **not** signed with an Apple Developer ID and **not** notarized. What that means for you:
+
+- **Gatekeeper and quarantine.** A file downloaded with a browser, or received by AirDrop, Mail or Messages, is marked as quarantined, and macOS refuses to open it ("cannot be opened because the developer cannot be verified"). Installing with the installer (`curl -s https://prettysmart.dev/install/awman.sh | sh`), or downloading with `curl` or `gh release download`, does not add the quarantine mark. If you downloaded with a browser, first verify the file against the published checksum (below), then remove the mark:
 
   ```sh
-  cat > hypervisor.plist <<'EOF'
-  <?xml version="1.0" encoding="UTF-8"?>
-  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-  <plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
-  EOF
-  codesign --force --sign - --entitlements hypervisor.plist /usr/local/bin/awman
+  xattr -d com.apple.quarantine ./awman-macos-arm64
   ```
 
-  Sign again after every rebuild or reinstall.
+- **Verify the checksum.** An ad-hoc signature proves the file has not changed since it was signed, not who signed it. The only way to confirm you have the genuine release is to compare its SHA-256 with the value published on the release page:
+
+  ```sh
+  shasum -a 256 awman-macos-arm64
+  ```
+
+- **Don't modify the binary.** Anything that changes the file after signing (for example `strip`, patching, or a tool that relinks it) invalidates the signature, and macOS then refuses to run it or to start VMs from it. Re-sign it (see *Building from source*) or download it again.
+- **Folder-access prompts.** macOS asks before a program reads `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or removable volumes. When you run awman from a terminal, that permission belongs to your terminal app, so upgrading awman changes nothing. The **squad daemon** runs in the background under launchd, so there the permission belongs to awman itself — and because the signature is ad-hoc, macOS treats every new awman version as a new program. If a squad task works in a repository under one of those folders, macOS asks again after each awman upgrade, and the task waits until you answer. Keep squad workspaces elsewhere (for example `~/Workspaces`) to avoid this, or review the grants in **System Settings → Privacy & Security → Files and Folders**. The keychain is not affected: awman reads credentials through Apple's own `security` tool, so keychain access does not change when awman does.
+
+### Building from source
+
+Run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` include the builtin runtime when the payload verifies and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). On other hosts they build the existing runtimes only.
+
+If you copy, strip or otherwise change the binary afterwards, sign it again:
+
+```sh
+make sign-macos BIN=/usr/local/bin/awman
+```
+
+An unsigned build fails to start agents with `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …`.
 
 ### Setup
 
 ```sh
-awman config set --global runtime builtin
+awman config set --global runtime builtin-experimental
 awman ready
 ```
 
@@ -105,7 +136,9 @@ awman ready
 
 ### Getting an agent image
 
-Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. The builtin runtime never builds. Build the same images yourself with Docker (or any OCI builder), then tell awman where to import the result from.
+Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. The builtin runtime never builds. Build the same images yourself, then tell awman where to import the result from.
+
+**On a Mac, the simplest route is Apple Containers.** If you already use the `apple-containers` runtime, the images are already in its store: set `"imageSource": {"type": "apple-store"}` and run `awman ready` (see [Apple Containers store](#apple-containers-store)). Otherwise build them with `container build` (same arguments as `docker build` below) and use the same source. Docker, a registry, or an archive file work too:
 
 **1. Build the images** from the repo root, in this order (the agent image is `FROM` the project image). Running `awman ready` first prints these exact commands for your project and agent, and downloads `.awman/Dockerfile.<agent>` if it is missing:
 
@@ -135,7 +168,7 @@ The image is imported into awman's private store. Docker is used only as a *sour
 
 There is no default source. With none configured, `awman ready` fails with `no image source is configured for '<tag>'` followed by the build commands above, rather than guessing a registry or daemon.
 
-**`awman init` and `builtin`.** `awman init` builds images through the configured runtime, so with `runtime` set to `builtin` its build step fails (`image building; build externally and import with ready is not supported on the builtin runtime`) and the agent audit is skipped. Run `awman init` before selecting `builtin` (or with `docker` temporarily selected), then switch the runtime and run `awman ready` after building externally.
+**`awman init` and `builtin-experimental`.** `awman init` builds images through the configured runtime, so with `runtime` set to `builtin-experimental` its build step fails (`image building; build externally and import with ready is not supported on the builtin runtime`) and the agent audit is skipped. Run `awman init` before selecting `builtin-experimental` (or with `docker` or `apple-containers` temporarily selected), then switch the runtime and run `awman ready` after building externally.
 
 ### Image sources
 
@@ -197,7 +230,7 @@ With `{ "type": "apple-store" }`, `awman ready` asks the Apple Containers servic
 
 `docker-config` supports inline credentials only. If the file names a `credsStore` or `credHelpers` entry, awman reports an authentication error naming the helper and does **not** execute it; use `env` or `keychain` instead. Credentials are sent only to the registry itself (and Docker Hub's own token service); a token server on any other host is contacted anonymously. Registry pulls honor `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
 
-### What `awman ready` does under `builtin`
+### What `awman ready` does under `builtin-experimental`
 
 - The base project image is reported as **skipped** (it is only an input to your external build). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
 - With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
@@ -223,11 +256,11 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 | `builtin.registries` | `{}` | Per-registry settings. |
 | `builtin.network` | `{"mode":"public"}` | Guest network policy — see [Network](#network) below. |
 
-`vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The four object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin`, and an invalid one is an error naming the bad key.
+`vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The four object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin-experimental`, and an invalid one is an error naming the bad key. (The settings block keeps the name `builtin`; only the runtime value carries `-experimental`.)
 
 ### Network
 
-Every session VM gets its own network stack running in the host-side worker process. Allowed HTTPS passes host-side stack tests with end-to-end TLS. Hostname allow rules are limited to TCP; UDP/QUIC is denied because the stack cannot inspect its hostname boundary for those protocols. Enforcement inside real guests remains unverified. Configure it under `builtin.network`, global and/or per repo:
+Every session VM gets its own network stack running in the host-side worker process. Hostname allow rules are limited to TCP; UDP/QUIC is denied because the stack cannot inspect its hostname boundary for those protocols. Configure it under `builtin.network`, global and/or per repo:
 
 ```json
 {
@@ -251,7 +284,7 @@ Every session VM gets its own network stack running in the host-side worker proc
 
 In every mode: inbound connections are refused (awman never publishes a guest port); private/LAN (RFC1918/ULA/CGN), loopback, link-local and cloud-metadata (`169.254.169.254`) destinations are refused; TLS is never intercepted; and the host's own `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` are **not** applied to guest traffic — a proxy the guest is configured to use is just another destination, subject to the same policy.
 
-**DNS and HTTPS.** The host-side stack intercepts DNS. For HTTPS authorized by a hostname rule, the visible TLS ClientHello server name (SNI) must be allowed and that exact name must have a DNS binding to the destination IP. An allowed sibling name or a shared IP alone does not authorize the connection. Missing or unlisted visible SNI is refused. The connection remains encrypted end to end: awman cannot inspect encrypted HTTP `Host`/`:authority`, domain fronting behind an allowed server, or the hidden inner name of Encrypted ClientHello (ECH). An allowed ECH outer name proves only that outer name. Use services you trust within this boundary; it is not a guarantee about every logical destination carried inside an allowed encrypted connection. A DNS answer does not authorize UDP/QUIC. Upstream resolvers default to the host's own resolver configuration, or set `nameservers` (global only; IP or `IP:PORT`, never a host name, so resolving a resolver never depends on one). Native guest tests remain required.
+**DNS and HTTPS.** The host-side stack intercepts DNS. For HTTPS authorized by a hostname rule, the visible TLS ClientHello server name (SNI) must be allowed and that exact name must have a DNS binding to the destination IP. An allowed sibling name or a shared IP alone does not authorize the connection. Missing or unlisted visible SNI is refused. The connection remains encrypted end to end: awman cannot inspect encrypted HTTP `Host`/`:authority`, domain fronting behind an allowed server, or the hidden inner name of Encrypted ClientHello (ECH). An allowed ECH outer name proves only that outer name. Use services you trust within this boundary; it is not a guarantee about every logical destination carried inside an allowed encrypted connection. A DNS answer does not authorize UDP/QUIC. Upstream resolvers default to the host's own resolver configuration, or set `nameservers` (global only; IP or `IP:PORT`, never a host name, so resolving a resolver never depends on one).
 
 **Host-local services**, such as an MCP server listening on your host's own loopback address, are reached through `hostPorts`, not through the guest's own `127.0.0.1` — inside the VM, `127.0.0.1` / `::1` / `localhost` is always the guest's own loopback, never the host's. List the TCP port in `hostPorts`; the guest then dials `host.microsandbox.internal:<port>` and the host-side stack connects that to the host's own loopback on the same port. Every other host port stays refused (including port `53`, which is reserved for guest DNS).
 
@@ -259,7 +292,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 
 **CAs.** By default the guest trusts only the image's own CA bundle. Set `trustHostCas: true` (global only) to also install the host's trusted root CAs in the guest at boot — useful behind a corporate TLS-inspecting proxy. awman never installs an interception CA of its own.
 
-> Hermetic tests validate configuration and serialization, not the enforcement promises above. The known allowlist defects remain unresolved, and guest enforcement, host-port access, and isolation between concurrently running VMs remain unverified on KVM and Apple Silicon.
+> These rules are tested in real guests on Apple Silicon: allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and isolation between VMs running at the same time with different policies. IPv6 denial is verified only on hosts that have IPv6 connectivity.
 
 ### Session lifecycle
 
@@ -276,14 +309,15 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 |---|---|---|
 | Image creation | `ready` builds from Dockerfiles | `ready` imports; you build externally |
 | Fractional CPU | Supported | Rejected (`cannot honour …`): whole vCPUs only |
-| Resource limit enforcement | Container-level limits | VM allocation; enforcement is not yet verified in a real guest |
+| Resource limit enforcement | Container-level limits | VM allocation: the guest sees exactly the configured vCPUs and memory, and memory exhaustion is handled by the guest's own OOM killer without affecting the host or other VMs |
 | `--allow-docker` | Mounts the host Docker socket (Docker only) | **Rejected.** No socket is ever mounted and there is no host daemon bridge |
 | Reattach after the launching awman exits | Docker: yes. Apple: no | No |
-| Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; a host loopback service is reachable only if its port is listed in `builtin.network.hostPorts` (see [Network](#network)). Enforcement on real guest hardware is not yet verified |
-| Egress control | None built in (Docker); per-container network (Apple) | `builtin.network.mode`: `public` (default), `allowlist`, or `none`. HTTPS checks visible SNI plus its exact DNS/IP binding; encrypted HTTP authority and ECH inner names are not inspected. Hostname rules deny UDP/QUIC; native enforcement remains unverified |
+| Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; a host loopback service is reachable only if its port is listed in `builtin.network.hostPorts` (see [Network](#network)) |
+| Egress control | None built in (Docker); per-container network (Apple) | `builtin.network.mode`: `public` (default), `allowlist`, or `none`. HTTPS checks visible SNI plus its exact DNS/IP binding; encrypted HTTP authority and ECH inner names are not inspected. Hostname rules deny UDP/QUIC |
 | Tool allow/deny lists for an agent with no matching flag | See [Agent Sessions](03-agent-sessions.md) | Rejected with an error instead of being silently discarded |
-| Named image `USER` (like `awman` in the templates) | Handled by the container engine | Resolved to a numeric id from the imported image's `/etc/passwd` and `/etc/group`; an unresolvable user is refused. Reading a staged credential file as that user inside a guest is not yet verified |
-| Image `HOME` | From the image | From the imported image; a missing or non-absolute `HOME` is refused |
+| Named image `USER` (like `awman` in the templates) | Handled by the container engine | Resolved to a numeric id from the imported image's `/etc/passwd` and `/etc/group`; an unresolvable user is refused. Agents never run as root |
+| Image `HOME` | From the image | From the image's `HOME`, or else the image user's home directory in `/etc/passwd` (as Docker does); an image with neither is refused |
+| Exit status of an agent killed by a signal | `128 + signal` (for example `137` after the OOM killer) | `-1`: the embedded guest agent reports that the process was killed by a signal but not which one; awman's own exit status is then `1` |
 | Overlays (`dir`, `skill`, `env`, `context`), agent settings and system prompts | Bind mounts / env | Same overlay semantics. Directories are directory mounts and single files are single-file mounts (the parent directory is never mounted). Sockets can't be mounted as overlays |
 
 ### Troubleshooting
@@ -291,9 +325,11 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 | Message | Cause and fix |
 |---|---|
 | `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature` | This awman build lacks the runtime. Use an asset that includes it or build from source (see above), or select another runtime. |
-| `… not supported on <os>/<arch>; supported platforms: …` | Unsupported host. |
-| `cannot access /dev/kvm: …; enable KVM and grant this user read/write access` | Enable virtualization in firmware or VM settings and add your user to the `kvm` group (log out and in). |
-| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | The VM process could not start: repeat the KVM check on Linux; on macOS the binary is missing the hypervisor entitlement. |
+| `the experimental builtin runtime is only available on macOS on Apple Silicon …` | This release supports the builtin runtime only on Apple Silicon Macs. Use `docker`, `apple-containers` or `docker-sbx-experimental`. |
+| `invalid runtime 'builtin' … (the builtin runtime is experimental: set runtime to "builtin-experimental" …)` | The runtime value is `builtin-experimental`. Run `awman config set --global runtime builtin-experimental`. |
+| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | The binary lacks the hypervisor entitlement: it was built from source without signing, or modified after signing. Run `make sign-macos BIN=$(command -v awman)`, or reinstall the release binary. |
+| `"awman-macos-arm64" cannot be opened because the developer cannot be verified` | The file is quarantined (downloaded with a browser). Verify its checksum, then `xattr -d com.apple.quarantine <file>` — see [The macOS binary, Gatekeeper and permissions](#the-macos-binary-gatekeeper-and-permissions). |
+| `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
 | `the builtin runtime refuses to start while MSB_PATH is set …` | `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, or `MSB_BACKEND` would replace the embedded runtime. Unset the variable. |
 | `a Microsandbox configuration exists at <path> …` | An existing Microsandbox `config.json` could change the embedded runtime. Move or rename it, or use another runtime. |
 | `no image source is configured for '<tag>'` | Set `builtin.imageSource` or `builtin.images` (see [Getting an agent image](#getting-an-agent-image)). |
@@ -620,7 +656,7 @@ awman config set --global runtime docker
 awman chat --agent claude                   # runs in Docker container, unchanged
 ```
 
-`awman ready` is per-runtime: running it with `runtime: "docker"` does not touch sbx kits; running it with `runtime: "docker-sbx-experimental"` does not touch Docker images; running it with `runtime: "builtin"` imports into the builtin store and never builds.
+`awman ready` is per-runtime: running it with `runtime: "docker"` does not touch sbx kits; running it with `runtime: "docker-sbx-experimental"` does not touch Docker images; running it with `runtime: "builtin-experimental"` imports into the builtin store and never builds.
 
 ---
 

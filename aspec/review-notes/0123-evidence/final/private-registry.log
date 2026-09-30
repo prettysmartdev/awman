@@ -1,0 +1,12 @@
+# code patch sha256 2d209a533b4915cd8d771292f7a78cbd3ebb1509988b3028c6b5666cacc4bf56 on base e86ddde0e0e9ef70fd4bdf774a6dcc42062e9635 (WI 0123 working tree)
+# private package ghcr.io/cohix/awman-probe:latest (visibility: private); token supplied via environment, never recorded
+== env + docker-config credentials, wrong and missing credentials
+PASS: store_registry_private_normal_cases: ghcr.io/cohix/awman-probe:latest: env and docker-config credentials -> sha256:0ba7c7416d2fa14fa230b112e77d410da4bbd59aff6a3f8ea93e37a3cc678a5a; wrong token and anonymous refused
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 8.46s
+
+== macOS keychain credentials (disposable item, removed afterwards)
+PASS: native_keychain_disposable_registry_entry: pulled cohix/awman-probe:latest with disposable keychain credentials and verified removal
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 47 filtered out; finished in 3.80s
+

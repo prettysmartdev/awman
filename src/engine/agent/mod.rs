@@ -402,7 +402,8 @@ impl AgentEngine {
                 .is_none_or(|home| !home.starts_with('/'))
         {
             return Err(EngineError::Config(format!(
-                "builtin image {image_tag} has no absolute effective HOME"
+                "builtin image {image_tag} has no absolute effective HOME: set `ENV HOME=/path` \
+                 in its Dockerfile, or give its USER an absolute home directory in /etc/passwd"
             )));
         }
         let container_home = image_home.or_else(|| {

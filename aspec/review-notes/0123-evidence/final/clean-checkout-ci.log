@@ -1,0 +1,23 @@
+# code patch sha256 2d209a533b4915cd8d771292f7a78cbd3ebb1509988b3028c6b5666cacc4bf56 on base e86ddde0e0e9ef70fd4bdf774a6dcc42062e9635 (WI 0123 working tree)
+throwaway clone of base + this working tree, committed as one evidence commit: 4d601ebeb5579b04b0a9695c1b7096e4095de84b
+tools/native-builtin-ci.sh aarch64-apple-darwin exit=0
+PASS reproducible build input audit at /private/tmp/awci.ezuH/awman-build-input-audit
+PASS payload aarch64-apple-darwin arch=aarch64 archive_sha256=14a5910c6b395e9d50e001d81388cbe5366f18165c57ede4a5eda3e3315b7dbd kernel_sha256=c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b agent_sha256=ca6dde7a3000d8e93d5dca87fcebf77ebb36ce83377385bae2be70dbead9a5e1 size=24576000 load=0x80000000 entry=0x80000000
+PASS payload aarch64-apple-darwin arch=aarch64 archive_sha256=14a5910c6b395e9d50e001d81388cbe5366f18165c57ede4a5eda3e3315b7dbd kernel_sha256=c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b agent_sha256=ca6dde7a3000d8e93d5dca87fcebf77ebb36ce83377385bae2be70dbead9a5e1 size=24576000 load=0x80000000 entry=0x80000000
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/awman
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/deps/awman-e4a0e7898d7b19ed
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/deps/awman-f167276b0f6b226a
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/examples/builtin_hw_driver
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/examples/builtin_net_driver
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/examples/builtin_hw_driver-31c7203b76c775f4
+signed for local hardware tests: /tmp/awci.ezuH/awman-target.pl22ea/aarch64-apple-darwin/debug/examples/builtin_net_driver-a1692c657653be90
+awman 0.12.0
+{"checkpoint_restore":false,"embedded_guest_agent":true,"embedded_kernel":true,"host_helpers":false,"kernel_sha256":"c3f1897b2ac706450a178700072b43ecb648041c9e88dd26ba8937c37649e24b","libkrun_commit":"2bd0f84ad0956f3032e0490d3b8512b6851eca12","msb_version":"0.7.2","reattach_after_owner_exit":false,"target_arch":"aarch64","target_os":"macos","worker_protocol":"0.7.2/18/awman-1"}
+PASS: builtin_hw_cached_execution_after_sources_stop: cached sha256:0ba7c7416d2fa14fa230b112e77d410da4bbd59aff6a3f8ea93e37a3cc678a5a executed after the source daemon stopped
+PASS: builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops: awman-spike/fixture:latest imported from the Apple store ran offline
+PASS: builtin_hw_actual_awman_api_dispatches_into_a_guest: {"args":["api prompt exit=0","--non-interactive","--agent","claude"],"exit_code":0,"finished_at":"2026-09-29T22:08:37.257604+00:00","id":"7f49c6d6-76b5-4076-ae77-91d5a6950692","log_path":"/tmp/awman-api.3utXq6/home/.awman/api/sessions/9ba2940d-37d2-47f3-852c-c2279f7adb27/commands/7f49c6d6-76b5-4076-ae77-91d5a6950692/output.log","queued_at":"2026-09-29T22:08:36.646830+00:00","result":{"exit_code":0},"session_id":"9ba2940d-37d2-47f3-852c-c2279f7adb27","started_at":"2026-09-29T22:08:36.653001+00:00","status":"done","subcommand":"exec prompt","worker_id":"worker-0-1ba750ad-7d6d-44ba-9f00-a9cbceca7e6a"}
+PASS: builtin_hw_actual_awman_workflow_setup_steps_teardown_and_failure
+PASS: builtin_hw_actual_awman_owner_crash_then_clean_recovers
+PASS: builtin_hw_actual_awman_old_new_upgrade_and_binary_replacement
+PASS: builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 57.42s

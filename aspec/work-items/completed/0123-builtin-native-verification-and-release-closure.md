@@ -10,14 +10,14 @@ no Developer ID identity, notarization, Apple distribution account or signing
 secret. Native boot and final-artifact checks apply to the exact signed
 artifact; failures must be reported honestly.
 
-Status: Open
+Status: Completed 2026-09-30. Evidence: [WI 0123 notes](../../review-notes/0123-evidence/notes.md).
 Parent: [WI 0121](0121-complete-builtin-runtime-and-native-verification.md)
-Dependency: [WI 0122 Apple-store implementation](completed/0122-native-apple-image-store-bridge.md) (completed)
+Dependency: [WI 0122 Apple-store implementation](0122-native-apple-image-store-bridge.md) (completed)
 Closes: this item is the final item of the builtin-runtime work stream.
 Completing it resolves [WI 0119](0119-strict-embedded-microsandbox-runtime.md)
 and [WI 0121](0121-complete-builtin-runtime-and-native-verification.md) for the
 scope below.
-Optional future work: [WI 0124](0124-builtin-linux-and-docker-gates.md) holds
+Optional future work: [WI 0124](../0124-builtin-linux-and-docker-gates.md) holds
 Linux, Docker Engine and registry edge-case work. None of it blocks this item
 or the resolution of WI 0119/0121.
 
@@ -39,8 +39,8 @@ or the resolution of WI 0119/0121.
 - When this item's checks pass, the builtin-runtime work stream is complete:
   WI 0119 and WI 0121 are resolved, with their remaining criteria recorded as
   deferred to WI 0124 rather than open.
-- Authoritative starting points: the [evidence register](../review-notes/0121-evidence-register.md),
-  the [WI 0122 evidence](../review-notes/0122-evidence/notes.md) (first native
+- Authoritative starting points: the [evidence register](../../review-notes/0121-evidence-register.md),
+  the [WI 0122 evidence](../../review-notes/0122-evidence/notes.md) (first native
   macOS guest boots, four macOS fixes), WI 0121 sections A–J, and WI 0120's
   patch inventory.
 
@@ -240,40 +240,112 @@ hardware/network/pressure/real-Apple-store/corpus/final-artifact gates
 successor). Required-hardware opt-outs never count as passes. Keep failed
 attempts alongside successful reruns.
 
-- [ ] Runtime rename, experimental labelling and the platform gate: unit and
+- [x] Runtime rename, experimental labelling and the platform gate: unit and
   CLI tests cover `builtin-experimental`, the refused `builtin`, and every
-  non-Apple-Silicon refusal.
-- [ ] D-01 (macOS): Apple store and archive sources work on the real service;
-  cached execution needs no source (WI 0122 evidence plus archive formats).
-- [ ] D-02 (normal cases): every registry case in C.7 passes against real
-  Docker Hub/GHCR repositories, with no secret in any error or log; evidence
-  records image references and digests (not credentials).
-- [ ] D-03/D-11 (macOS): clean-checkout actual awman builds and boots through
+  non-Apple-Silicon refusal. ([hermetic](../../review-notes/0123-evidence/final/hermetic.log),
+  [Intel refusal](../../review-notes/0123-evidence/final/intel-refusal.log))
+- [x] D-01 (macOS): Apple store and archive sources work on the real service;
+  cached execution needs no source. (WI 0122 evidence; the
+  [real corpus](../../review-notes/0123-evidence/final/image-sources.log) of all nine templates; the
+  offline hardware tests)
+- [x] D-02 (normal cases): every registry case in C.7 passes against real
+  Docker Hub/GHCR repositories, with no secret in any error or log. Public
+  cases in [image-sources](../../review-notes/0123-evidence/final/image-sources.log) plus a
+  registry-pulled image running offline in [hardware](../../review-notes/0123-evidence/final/hardware.log);
+  authenticated pulls from a private GHCR package with environment,
+  Docker-config and keychain credentials, and wrong and missing credentials
+  refused, in [private-registry](../../review-notes/0123-evidence/final/private-registry.log).
+- [x] D-03/D-11 (macOS): clean-checkout actual awman builds and boots through
   the current provider with reproducible payloads and tracked inputs.
-- [ ] D-04: every required strategy/default/override passes in non-root
-  guests on Apple Silicon.
-- [ ] D-05 (macOS): tested guest network and resource contracts; unsupported
-  limits/socket bridges explicitly fail.
-- [ ] D-06/D-09 (macOS): actual frontend/workflow/squad, PTY/ACP,
+  ([clean-checkout CI](../../review-notes/0123-evidence/final/clean-checkout-ci.log))
+- [x] D-04: every required strategy/default/override passes in non-root
+  guests on Apple Silicon. ([hardware](../../review-notes/0123-evidence/final/hardware.log): strategy
+  matrix, overlays, image defaults and overrides, credential refresh)
+- [x] D-05 (macOS): tested guest network and resource contracts; unsupported
+  limits/socket bridges explicitly fail. ([hardware](../../review-notes/0123-evidence/final/hardware.log);
+  IPv6 denial is proven only on hosts with IPv6)
+- [x] D-06/D-09 (macOS): actual frontend/workflow/squad, PTY/ACP,
   cancellation/reattach, crash/upgrade/multi-VM and cache concurrency.
-- [ ] D-07/D-08 (macOS): isolated SDK coexistence and worker validation.
-- [ ] D-10 (macOS): hermetic, feature and hardware tiers complete without
-  hidden skips.
-- [ ] D-12 (macOS): exact bundled SQLite, migrations and old/new catalog
-  checks.
-- [ ] D-13/D-14 (macOS): the exact ad-hoc-signed optimized artifact boots and
+  ([hardware](../../review-notes/0123-evidence/final/hardware.log): workflow, API, squad, owner crash and
+  clean, old/new upgrade and binary replacement, PTY, ACP, cancel, reattach,
+  concurrent VMs; cache invariants in [hermetic](../../review-notes/0123-evidence/final/hermetic.log))
+- [x] D-07/D-08 (macOS): worker descriptor validation runs in every native
+  guest boot; ambient `MSB_*` overrides and an installed Microsandbox
+  configuration are refused (`runtime_refusal`, hermetic tier).
+- [x] D-10 (macOS): hermetic, feature and hardware tiers complete without
+  hidden skips; `make pre-push` is green on macOS.
+- [x] D-12 (macOS): exact bundled SQLite, migrations and old/new catalog
+  checks. ([sqlite](../../review-notes/0123-evidence/final/sqlite.log))
+- [x] D-13/D-14 (macOS): the exact ad-hoc-signed optimized artifact boots and
   passes native scans; entitlements equal the committed file;
-  ABI/license/materials/measurements recorded.
-- [ ] Existing macOS backends and Intel macOS/Windows builds are unaffected.
-- [ ] All docs listed in section D updated; the Gatekeeper, quarantine,
-  integrity and TCC explanations present.
-- [ ] All of the above pass at the same reviewed revision.
-- [ ] Resolution: update WI 0119's acceptance criteria, WI 0121 and the
-  evidence register so every criterion and D-row is either PASS with linked
-  evidence for this scope or explicitly **Deferred (WI 0124, optional)**. No
-  row may remain an unexplained FAIL or BLOCKED. Mark WI 0119, WI 0121 and this
-  item completed and move them to `completed/`. WI 0124 stays open as optional
-  future work.
+  ABI/materials/measurements recorded.
+  ([release artifact](../../review-notes/0123-evidence/final/release-artifact.log))
+- [x] Existing macOS backends and Intel macOS builds are unaffected
+  ([Apple backend](../../review-notes/0123-evidence/final/apple-backend-regression.log),
+  [Intel](../../review-notes/0123-evidence/final/intel-refusal.log)). Windows is built only in CI; the
+  live `docker-sbx-experimental` regression needs a Docker account (WI 0124).
+- [x] All docs listed in section D updated; the Gatekeeper, quarantine,
+  integrity and TCC explanations are present. Release notes text is below,
+  for `release-prep`.
+- [x] All of the above pass at the same reviewed revision: every log records
+  the same code-patch hash ([notes](../../review-notes/0123-evidence/notes.md)).
+- [x] Resolution: WI 0119's acceptance criteria, WI 0121 and the evidence
+  register record every criterion and D-row as PASS for this scope or
+  **Deferred (WI 0124, optional)**. WI 0119, WI 0121 and this item are
+  completed; WI 0124 stays open as optional future work.
+
+## Authenticated registry check (how it was run)
+
+Done 2026-09-30 against the private package `ghcr.io/cohix/awman-probe`
+([log](../../review-notes/0123-evidence/final/private-registry.log)). To repeat it:
+
+1. **A private image.** Push the fixture (or any small `linux/arm64` image)
+   to a private GitHub package, for example with Apple Containers:
+   `container registry login ghcr.io -u <user>`, then
+   `container image tag awman-spike/fixture:latest ghcr.io/<user>/awman-probe:latest`
+   and `container image push ghcr.io/<user>/awman-probe:latest`. Packages
+   pushed to a personal namespace start private.
+2. **A disposable read-only token.** A classic personal access token with
+   only `read:packages`, short expiry, used only for this run.
+3. **Run:**
+   ```sh
+   export AWMAN_TEST_REGISTRY_PRIVATE_REFERENCE=ghcr.io/<user>/awman-probe:latest
+   export AWMAN_TEST_REGISTRY_PRIVATE_USER=<user>
+   export AWMAN_TEST_REGISTRY_PRIVATE_TOKEN=<token>
+   AWMAN_TEST_IMAGE_STORES=1 AWMAN_TEST_REGISTRY_PRIVATE=1 \
+     cargo test --test oci_import store_registry_private_normal_cases -- --nocapture
+   AWMAN_TEST_IMAGE_STORES=1 AWMAN_TEST_REGISTRY=1 AWMAN_TEST_NATIVE_KEYCHAIN=1 \
+     AWMAN_TEST_REGISTRY_HOST=ghcr.io \
+     AWMAN_TEST_REGISTRY_REFERENCE=<user>/awman-probe:latest \
+     AWMAN_TEST_KEYCHAIN_USERNAME=<user> AWMAN_TEST_KEYCHAIN_PASSWORD=<token> \
+     cargo test --test oci_import native_keychain_disposable_registry_entry -- --nocapture
+   ```
+   The first test covers environment-variable and Docker `config.json`
+   credentials plus wrong and missing credentials; the second covers the macOS
+   keychain (it stores and then removes a disposable keychain item). Revoke
+   the token afterwards.
+
+## Release notes (for `release-prep`)
+
+- **Experimental builtin runtime for Apple Silicon.** Set
+  `"runtime": "builtin-experimental"` in `~/.awman/config.json` to run each
+  agent session in a microVM embedded in awman itself: no Docker, `container`
+  or `sbx` needed at run time. `awman ready` imports agent images from the
+  Apple Containers image store, a registry, a Docker Engine or an archive.
+  Workflows, squad, the API server, ACP and PTY sessions, network policies
+  (`public`, `allowlist`, `none`) and resource limits work in real guests.
+  macOS on Apple Silicon only in this release; see
+  [Runtimes](../../../docs/11-runtimes.md#builtin-microvm-experimental).
+- **The Apple Silicon binary is ad-hoc signed.** It carries the hypervisor
+  entitlement the builtin runtime needs, but it is not notarized: a copy
+  downloaded with a browser is quarantined by Gatekeeper, and background squad
+  tasks in `~/Desktop`/`~/Documents` re-prompt for folder access after each
+  upgrade. See
+  [Gatekeeper and permissions](../../../docs/11-runtimes.md#the-macos-binary-gatekeeper-and-permissions).
+- **Fixes:** `awman config set` rejects unknown runtime values, and a bad
+  stored value no longer blocks `awman config`; images without an explicit
+  `HOME` fall back to the user's `/etc/passwd` entry (builtin runtime); the
+  API documentation now shows the real command and status routes.
 
 ## Codebase Integration:
 

@@ -322,9 +322,11 @@ impl Engines {
     ///
     /// * **Valid runtime** → `Ok((runtime, None))`.
     /// * **Unknown `runtime:` string** — a fatal configuration error, never a
-    ///   silent Docker fallback. For a CLI invocation (`command_path`
-    ///   non-empty) the [`EngineError::UnknownRuntime`] is returned so the
-    ///   caller can print it and exit. For the bare-TUI invocation
+    ///   silent Docker fallback, for every command that `requires_runtime`.
+    ///   For such a CLI invocation the [`EngineError::UnknownRuntime`] is
+    ///   returned so the caller can print it and exit. Commands that need no
+    ///   runtime (`awman config …`) get a warning and inert default engines,
+    ///   so the setting can be repaired. For the bare-TUI invocation
     ///   (`command_path` empty) inert default (Docker) engines are still
     ///   constructed — the TUI boots only far enough to show a fatal modal —
     ///   and the error text is returned as the second tuple field for that
@@ -367,13 +369,23 @@ impl Engines {
         match result {
             Ok(detected) => Ok((detected, None)),
             Err(e @ EngineError::UnknownRuntime { .. }) => {
-                // Invalid `runtime:` is fatal. CLI invocations bubble the error
-                // up to be printed and exited on; the bare-TUI invocation
-                // constructs inert default engines (never exercised — the
-                // modal's only action is quit) and returns the message for the
-                // startup modal.
+                // Invalid `runtime:` is fatal for anything that would run an
+                // agent. CLI invocations bubble the error up to be printed and
+                // exited on; the bare-TUI invocation constructs inert default
+                // engines (never exercised — the modal's only action is quit)
+                // and returns the message for the startup modal. Commands that
+                // need no runtime (`awman config …`) warn and continue, so the
+                // setting stays fixable from the CLI.
                 if !command_path.is_empty() {
-                    return Err(e);
+                    if catalogue.requires_runtime(command_path) {
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "warning: {e}; continuing without it so `awman config` can update the \
+                         setting"
+                    );
+                    let fallback = agent_runtime::detect(&GlobalConfig::default())?;
+                    return Ok((fallback, None));
                 }
                 let fallback = agent_runtime::detect(&GlobalConfig::default())?;
                 Ok((fallback, Some(e.to_string())))
@@ -2122,6 +2134,22 @@ mod tests {
             Err(EngineError::UnknownRuntime { .. }) => {}
             Err(other) => panic!("expected UnknownRuntime, got {other:?}"),
             Ok(_) => panic!("an unknown runtime must be an error for CLI invocations"),
+        }
+    }
+
+    #[test]
+    fn detect_unknown_runtime_keeps_config_reachable() {
+        // A stored typo must not lock the user out of the command that fixes
+        // it; `config` never runs an agent, so inert default engines are safe.
+        let cat = CommandCatalogue::get();
+        assert!(!cat.requires_runtime(&["config", "set"]));
+        let cfg = config_with_runtime(Some("builtin"));
+        match Engines::detect(cat, &cfg, &["config", "set"]) {
+            Ok((detected, modal)) => {
+                assert_eq!(detected.engine().runtime_name(), "docker");
+                assert!(modal.is_none());
+            }
+            Err(e) => panic!("config must stay reachable, got {e:?}"),
         }
     }
 

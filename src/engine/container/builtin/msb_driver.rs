@@ -387,18 +387,34 @@ impl SandboxDriver for MsbDriver {
                 .map_err(|_| failure("lookup"))?;
             let info = summary(&handle)?;
             naming::check_owner(&info.labels, &owner)?;
-            if !info.stopped && handle.stop_with_timeout(grace).await.is_err() {
-                handle
+            if !info.stopped
+                && handle.stop_with_timeout(grace).await.is_err()
+                && handle
                     .kill_with_timeout(Duration::from_secs(5))
                     .await
-                    .map_err(|_| failure("stop"))?;
+                    .is_err()
+            {
+                // The agent may have exited, or its launcher's own exit
+                // cleanup stopped it, between the check above and the stop:
+                // then stop and kill both fail although the goal is met.
+                // Only a sandbox that is still running is a failure.
+                let still_running = match backend.sandboxes().get(backend.clone(), &id).await {
+                    Ok(current) => !summary(&current)?.stopped,
+                    Err(_) => false, // already removed
+                };
+                if still_running {
+                    return Err(failure("stop"));
+                }
             }
             active
                 .lock()
                 .map_err(|_| failure("lifecycle registry"))?
                 .remove(&id);
-            if remove {
-                handle.remove().await.map_err(|_| failure("remove"))?;
+            if remove && handle.remove().await.is_err() {
+                // Concurrent cleanup may already have removed it.
+                if backend.sandboxes().get(backend.clone(), &id).await.is_ok() {
+                    return Err(failure("remove"));
+                }
             }
             Ok(())
         })
@@ -455,7 +471,10 @@ impl SandboxDriver for MsbDriver {
                 .find_map(|e| e.strip_prefix("HOME=").map(str::to_owned));
             let mut argv = config.entrypoint.unwrap_or_default();
             argv.extend(config.cmd.unwrap_or_default());
-            let accounts = if needs_image_accounts(config.user.as_deref()) {
+            // `/etc/passwd` is needed to resolve a named USER, and to find
+            // the effective user's home when the config sets no HOME (the
+            // fallback Docker applies).
+            let accounts = if needs_image_accounts(config.user.as_deref()) || home.is_none() {
                 let mut layers: Vec<_> = detail.layers.iter().collect();
                 layers.sort_by_key(|layer| std::cmp::Reverse(layer.position));
                 let cache = microsandbox_image::GlobalCache::new(&local.cache_dir())
@@ -477,6 +496,12 @@ impl SandboxDriver for MsbDriver {
             } else {
                 ImageAccounts::default()
             };
+            let home = home.or_else(|| {
+                accounts
+                    .passwd
+                    .as_deref()
+                    .and_then(|passwd| super::driver::passwd_home(passwd, config.user.as_deref()))
+            });
             Ok(Some(ImageConfigSummary {
                 home,
                 user: config.user,

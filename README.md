@@ -52,6 +52,8 @@ To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.12.0`
 | macOS (Apple Silicon) | `awman-macos-arm64` |
 | Windows (x86_64) | `awman-windows-amd64.exe` |
 
+The Apple Silicon asset includes the experimental builtin microVM runtime and is ad-hoc signed (not notarized). If you download it with a browser, macOS quarantines it: verify its SHA-256 against the release page, then run `xattr -d com.apple.quarantine awman-macos-arm64`. The installer and `mise` do not quarantine it. See [Runtimes: The macOS binary, Gatekeeper and permissions](docs/11-runtimes.md#the-macos-binary-gatekeeper-and-permissions).
+
 **From source** — requires Rust 1.94+ and make:
 
 ```sh
@@ -252,7 +254,7 @@ Every agent runs inside a container built from `Dockerfile.dev` — agents never
 - Overlays are the only way in: opt a session into SSH keys, env vars, extra directories, or your skills library, one at a time
 - awman itself is a statically compiled Rust binary — nothing running in a container can modify it
 
-Docker, Apple Containers (macOS 26+), and Docker Sandboxes (`docker-sbx-experimental`, microVM isolation) are supported runtimes. See [Runtimes](docs/11-runtimes.md) and [Security & Isolation](docs/04-security-and-isolation.md).
+Docker, Apple Containers (macOS 26+), and Docker Sandboxes (`docker-sbx-experimental`, microVM isolation) are supported runtimes. On Apple Silicon Macs, the experimental builtin runtime (`builtin-experimental`) runs each session in a microVM embedded in awman itself, with no Docker or `container` needed at run time; select it explicitly in `~/.awman/config.json`. See [Runtimes](docs/11-runtimes.md) and [Security & Isolation](docs/04-security-and-isolation.md).
 
 ![awman TUI status](./docs/blog/images/tui-status.png)
 

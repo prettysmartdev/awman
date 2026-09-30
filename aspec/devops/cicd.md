@@ -17,9 +17,9 @@ runners don't have:
 | `full-linux-docker` | `ubuntu-latest` | `make test-full` against the runner's Docker daemon (`test-full` sets `AWMAN_TEST_DOCKER=1`; without it the Docker tests see Docker as not installed). Includes the `docker_*`, `real_git_*`, and `real_network_*` integration tests. Depends on `fast`. |
 | `build-macos` | `macos-latest` | `cargo build --release` and `make test-fast`. Smoke-tests cross-platform compilation; does not run Docker tests (macOS hosted runners lack Docker). Depends on `fast`. |
 | `builtin-build` | Linux ARM64 (`ubuntu-24.04-arm`, hosted) | Fetches and verifies the payload, builds the `builtin-runtime` feature, inspects dynamic dependencies, and runs `make test-builtin` — on a hosted runner with no KVM, so `builtin_hw_*` tests SKIP. A build/hermetic gate, not proof of guest execution. Runs on every push/PR (the only builtin job that does). |
-| `builtin-hardware` | self-hosted, per-platform (`linux/arm64/kvm`, `linux/x64/kvm`, `macOS/ARM64/hypervisor`) | Opt-in real-guest matrix (`AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1`): checks hardware prerequisites first and **fails** (never skips) if they're missing, builds a disposable fixture image, then runs `make test-builtin` for real — same-executable worker boot, image import, execution. Only on `workflow_dispatch` or the nightly `schedule`. |
-| `native-typed-provider` | same self-hosted matrix | Clean-checkout gate: `tools/native-builtin-ci.sh <triple>` builds and boots the typed provider from a fresh isolated `CARGO_HOME`/target dir, then `tools/oci-runtime-spike/sqlite-resolution/checks.sh auto` reruns the SQLite resolution checks on that target. Uploads SQLite and native-payload evidence as artifacts. Only on `workflow_dispatch` or `schedule`. |
-| `existing-backend-unsupported-targets` | Windows x86_64 (hosted), Intel Mac (self-hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise "unsupported target" refusal a `builtin` selection reports there. Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |
+| `builtin-hardware` | self-hosted `macOS/ARM64/hypervisor` (the released platform; WI 0124 re-adds `linux/arm64/kvm` and `linux/x64/kvm`) | Opt-in real-guest matrix (`AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1`): checks hardware prerequisites first and **fails** (never skips) if they're missing, builds a disposable fixture image, then runs `make test-builtin` for real — same-executable worker boot, image import, execution. `make test-builtin` builds the guest drivers explicitly and ad-hoc signs awman and the drivers with the hypervisor entitlement (`tools/macos-sign-test-artifacts.sh`) between building and running. Only on `workflow_dispatch` or the nightly `schedule`. |
+| `native-typed-provider` | same self-hosted macOS runner | Clean-checkout gate: `tools/native-builtin-ci.sh <triple>` builds and boots the typed provider from a fresh isolated `CARGO_HOME`/target dir, then `tools/oci-runtime-spike/sqlite-resolution/checks.sh auto` reruns the SQLite resolution checks on that target. Uploads SQLite and native-payload evidence as artifacts. Only on `workflow_dispatch` or `schedule`. |
+| `existing-backend-unsupported-targets` | Windows x86_64 (hosted), Intel Mac (self-hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise refusal a `builtin-experimental` selection reports there (the runtime is released for Apple Silicon only). Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |
 
 Cargo's registry, git cache, and `target/` are cached per-OS to keep warm runs fast.
 
@@ -50,20 +50,25 @@ or temporary files.
 Triggered on tag pushes matching `v[0-9]+.[0-9]+.[0-9]+`.
 
 - `build` builds the ordinary (non-builtin) release binary for each ordinary
-  target (Linux x86_64, macOS x86_64, Windows x86_64) and records
+  target (Linux x86_64, Linux arm64, macOS x86_64, Windows x86_64) and records
   size/startup/RSS measurements and a dependency/`.msbver`/helper-extraction
   scan of the optimized artifact.
-- `release-linux-arm64-builtin` and `release-macos-builtin` build the
-  Linux ARM64 and Apple Silicon assets **with** the builtin runtime from a
-  verified native payload, on isolated Cargo/target directories. No signing or
-  notarization steps, identities, credentials or distribution account are
-  required. The macOS job uploads the binary directly.
-  Both then trace and boot the exact distributed artifact (not a stand-in
-  driver) under an offline session wrapper before it's uploaded.
+- `release-macos-builtin` builds the Apple Silicon asset **with** the
+  experimental builtin runtime from a verified native payload, on isolated
+  Cargo/target directories, then **ad-hoc signs** it with exactly the
+  entitlements in `packaging/macos/awman.entitlements`
+  (`com.apple.security.hypervisor`) via `tools/macos-sign.sh`, which fails if
+  the embedded entitlements differ from that file. There is no Developer ID,
+  notarization, signing secret or distribution account. It records the
+  SHA-256 of the unsigned build (for reproducibility) and of the signed asset,
+  then traces and boots the exact **signed** artifact (not a stand-in driver)
+  under an offline session wrapper (`tools/release-offline-session.sh` is the
+  reference implementation) before uploading it. Linux release assets ship
+  without the builtin runtime until WI 0124.
 - `release` assembles the GitHub Release from all uploaded artifacts plus the
-  matching `docs/releases/<tag>.md` body, and **depends on both builtin gates
-  succeeding** — a release cannot publish while either builtin artifact fails
-  its native boot gate.
+  matching `docs/releases/<tag>.md` body, and **depends on the builtin gate
+  succeeding** — a release cannot publish while the signed Apple Silicon
+  artifact fails its native boot gate.
 
 ## Versioning
 
