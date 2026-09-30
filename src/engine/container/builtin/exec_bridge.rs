@@ -242,6 +242,10 @@ pub fn run(
                 }
             }
         };
+        // Release the frontend before `wait()` can resolve: callers (e.g. the
+        // dynamic-workflow leader) reclaim their shared frontend with
+        // `Arc::try_unwrap` as soon as the exit is observed.
+        drop(frontend);
         input_task.abort();
         resize_task.abort();
         // Give already connected attach clients the terminal frame before the
@@ -619,6 +623,80 @@ mod tests {
         assert!(peer.statuses.lock().unwrap().iter().any(
             |status| matches!(status, AgentStatus::Failed(message) if message.contains("lagged"))
         ));
+    }
+    /// Delays its own drop so a bridge that releases the frontend only after
+    /// publishing the exit is caught deterministically.
+    struct SlowDropFrontend(Box<dyn AgentFrontend>);
+    impl Drop for SlowDropFrontend {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    impl crate::data::message::UserMessageSink for SlowDropFrontend {
+        fn write_message(&mut self, message: crate::data::message::UserMessage) {
+            self.0.write_message(message);
+        }
+        fn replay_queued(&mut self) {
+            self.0.replay_queued();
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentFrontend for SlowDropFrontend {
+        fn report_status(&mut self, status: AgentStatus) {
+            self.0.report_status(status);
+        }
+        fn report_progress(
+            &mut self,
+            progress: crate::engine::agent_runtime::frontend::AgentProgress,
+        ) {
+            self.0.report_progress(progress);
+        }
+        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
+            self.0.take_io()
+        }
+        fn grace_timeout(&self) -> Duration {
+            self.0.grace_timeout()
+        }
+        fn stuck_timeout(&self) -> Duration {
+            self.0.stuck_timeout()
+        }
+    }
+    /// Callers reclaim a shared frontend with `Arc::try_unwrap` as soon as
+    /// `wait()` resolves (the dynamic-workflow leader), so the bridge must have
+    /// dropped it by then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontend_is_released_before_wait_resolves() {
+        let (broadcast, events) = tokio::sync::broadcast::channel(16);
+        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
+        let _ = broadcast.send(ExecEvent::Exited(0));
+        let (frontend, peer) = crate::engine::container::builtin::testing::frontend(None);
+        let frontend = Box::new(SlowDropFrontend(frontend));
+        let mut execution = run(
+            AgentHandle {
+                id: "release".into(),
+                name: "release".into(),
+                image_tag: "test".into(),
+                started_at: chrono::Utc::now(),
+            },
+            ExecSession {
+                events,
+                broadcast,
+                control: Arc::new(RecordingControl(commands)),
+            },
+            frontend,
+            None,
+            None,
+            false,
+            RunInput {
+                seeded_prompt: None,
+                leases: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(execution.wait().await.unwrap().exit_code, 0);
+        // The frontend shares `statuses` with the peer; once it is dropped the
+        // peer holds the only reference. (Arc drops after the slow `Drop`.)
+        assert_eq!(Arc::strong_count(&peer.statuses), 1);
     }
     #[tokio::test]
     async fn attach_disconnect_never_signals_target() {
