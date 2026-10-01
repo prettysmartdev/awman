@@ -4,9 +4,10 @@ Title: Optional local builder matched to the builtin runtime's image source
 Issue: n/a
 
 Status: Open
-Depends on: [WI 0125](0125-builtin-runtime-architecture-conformance.md) — build
-on its single engine-level image acquirer (Step C1) rather than on the
-duplicated Layer 2 import path.
+Precedes: [WI 0126](0126-builtin-runtime-architecture-conformance.md) — that
+refactor folds this builder into its single engine-level image acquirer
+(Step C1). Build on the current import paths; do not wait for or pre-empt
+WI 0126's restructuring.
 
 ## Summary:
 
