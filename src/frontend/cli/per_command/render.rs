@@ -574,6 +574,9 @@ mod tests {
             image_rebuild: StepStatus::Skipped,
             agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
+            image_results: Vec::new(),
+            base_image_results: Vec::new(),
+            ready: true,
             json_requested: false,
             refresh_requested: false,
         };
@@ -664,6 +667,9 @@ mod tests {
             image_rebuild: StepStatus::Skipped,
             agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
+            image_results: Vec::new(),
+            base_image_results: Vec::new(),
+            ready: true,
             json_requested: true,
             refresh_requested: false,
         };
@@ -712,6 +718,9 @@ mod tests {
             image_rebuild: StepStatus::Pending,
             agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
+            image_results: Vec::new(),
+            base_image_results: Vec::new(),
+            ready: false,
             json_requested: true,
             refresh_requested: true,
         };

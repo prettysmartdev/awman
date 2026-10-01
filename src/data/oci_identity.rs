@@ -137,6 +137,99 @@ pub struct ImageIdentity {
     pub source: ImageSourceKind,
 }
 
+/// What a local build produced, as reported by the builder that ran it: the
+/// content the image later imported from that store must match.
+///
+/// A build receipt, not proof of installation. At least one digest is always
+/// present (enforced on construction and deserialization). A Docker image ID
+/// is a config digest, so it is compared with a config digest, never with a
+/// manifest digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    try_from = "BuiltImageIdentityRecord",
+    into = "BuiltImageIdentityRecord"
+)]
+pub struct BuiltImageIdentity {
+    config_digest: Option<Digest>,
+    manifest_digest: Option<Digest>,
+    platform: OciPlatform,
+}
+
+impl BuiltImageIdentity {
+    /// A receipt naming at least one of the two digests.
+    pub fn new(
+        config_digest: Option<Digest>,
+        manifest_digest: Option<Digest>,
+        platform: OciPlatform,
+    ) -> Result<Self, String> {
+        if config_digest.is_none() && manifest_digest.is_none() {
+            return Err("a build receipt needs a config or manifest digest".into());
+        }
+        Ok(Self {
+            config_digest,
+            manifest_digest,
+            platform,
+        })
+    }
+
+    pub fn config_digest(&self) -> Option<&Digest> {
+        self.config_digest.as_ref()
+    }
+
+    pub fn manifest_digest(&self) -> Option<&Digest> {
+        self.manifest_digest.as_ref()
+    }
+
+    pub fn platform(&self) -> &OciPlatform {
+        &self.platform
+    }
+
+    /// Whether `identity` is the content this receipt describes: every
+    /// digest the receipt holds equals the same kind of digest in
+    /// `identity`, and the platforms match.
+    pub fn matches(&self, identity: &ImageIdentity) -> bool {
+        self.config_digest
+            .as_ref()
+            .is_none_or(|d| *d == identity.config_digest)
+            && self
+                .manifest_digest
+                .as_ref()
+                .is_none_or(|d| *d == identity.manifest_digest)
+            && self.platform.matches(&identity.platform)
+    }
+}
+
+/// Serialized form of [`BuiltImageIdentity`], validated on the way in.
+#[derive(Serialize, Deserialize)]
+struct BuiltImageIdentityRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_digest: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest_digest: Option<Digest>,
+    platform: OciPlatform,
+}
+
+impl TryFrom<BuiltImageIdentityRecord> for BuiltImageIdentity {
+    type Error = String;
+    fn try_from(record: BuiltImageIdentityRecord) -> Result<Self, Self::Error> {
+        Self::new(
+            record.config_digest,
+            record.manifest_digest,
+            record.platform,
+        )
+    }
+}
+
+impl From<BuiltImageIdentity> for BuiltImageIdentityRecord {
+    fn from(identity: BuiltImageIdentity) -> Self {
+        Self {
+            config_digest: identity.config_digest,
+            manifest_digest: identity.manifest_digest,
+            platform: identity.platform,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

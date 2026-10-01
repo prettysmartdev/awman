@@ -47,7 +47,16 @@ pub enum ReadyStep {
     /// Fetching the bundled `Dockerfile.<agent>`.
     DownloadAgentDockerfile,
     BuildBaseImage,
+    /// Building the project base image into one source store (the
+    /// source-matched builder builds it once per store it builds agents
+    /// into). `store` is a non-secret store description.
+    BuildBaseImageIn {
+        store: String,
+        tag: String,
+    },
     BuildAgentImage,
+    /// Importing the default agent's image from its configured source.
+    ImportAgentImage,
     /// Building a *non-default* agent's image, named.
     BuildAgentImageFor(String),
     /// Importing a *non-default* agent's image (importing runtimes), named.
@@ -69,7 +78,9 @@ impl fmt::Display for ReadyStep {
             Self::CreateDockerfile(path) => write!(f, "Create {}", path.display()),
             Self::DownloadAgentDockerfile => f.write_str("Download agent Dockerfile"),
             Self::BuildBaseImage => f.write_str("Build base image"),
+            Self::BuildBaseImageIn { store, tag } => write!(f, "Build base image {tag} in {store}"),
             Self::BuildAgentImage => f.write_str("Build agent image"),
+            Self::ImportAgentImage => f.write_str("Import agent image"),
             Self::BuildAgentImageFor(agent) => write!(f, "Build agent image: {agent}"),
             Self::ImportAgentImageFor(agent) => write!(f, "Import agent image: {agent}"),
             Self::OtherAgents => f.write_str("Other agents"),

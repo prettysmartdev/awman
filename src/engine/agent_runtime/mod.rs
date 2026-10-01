@@ -293,6 +293,13 @@ pub struct ImageImportRequest {
     pub platform: OciPlatform,
     /// Re-acquire even when an identity for `tag` is already cached.
     pub refresh: bool,
+    /// The exact content produced by a local build, checked before cache
+    /// publication or installation. Requires `refresh`.
+    pub expected_built_identity: Option<crate::data::oci_identity::BuiltImageIdentity>,
+    /// Immutable selector for export from the same source store. Docker uses
+    /// the build's config digest (image ID), while the cache key and recorded
+    /// identity keep the configured logical reference.
+    pub immutable_export_selector: Option<String>,
 }
 
 /// The result of a successful [`AgentRuntimeEngine::import_image`].
@@ -604,6 +611,8 @@ mod tests {
             },
             platform: OciPlatform::host_linux(),
             refresh: false,
+            expected_built_identity: None,
+            immutable_export_selector: None,
         };
         match rt.import_image(&request, &mut Sink) {
             Err(EngineError::UnsupportedOnRuntime { runtime, operation }) => {

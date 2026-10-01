@@ -419,9 +419,8 @@ refused host-port-not-authorised fetch http://host.builtin.internal:{q}/
 refused guest-loopback-is-not-host fetch http://127.0.0.1:{p}/
 "#
     );
-    let control = format!(
-        "has denied-port-positive-control host-ok fetch http://host.builtin.internal:{q}/"
-    );
+    let control =
+        format!("has denied-port-positive-control host-ok fetch http://host.builtin.internal:{q}/");
     let plan = json!({"phases": [
         [vm("control", 1, 384, json!({"hostPorts": [q]}), &control)],
         [vm("public", 2, 512, json!({"hostPorts": [p]}), &body)]

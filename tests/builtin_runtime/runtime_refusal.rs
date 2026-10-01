@@ -81,19 +81,25 @@ fn builtin_is_unavailable_under_test_isolation_and_creates_nothing() {
     match open(settings(&state)) {
         Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
             assert!(!reason.is_empty());
-            let supported = matches!(
+            // Only the released target (macOS on Apple Silicon) reaches the
+            // test-isolation / feature check; every other host, including
+            // the Linux targets WI 0124 is bringing up, is refused first.
+            let released = matches!(
                 (std::env::consts::OS, std::env::consts::ARCH),
-                ("linux", "x86_64") | ("linux", "aarch64") | ("macos", "aarch64")
+                ("macos", "aarch64")
             );
-            if supported {
+            if released {
                 assert!(
                     reason.contains("test isolation") || reason.contains("does not include"),
                     "{reason}"
                 );
             } else {
-                assert!(reason.contains("not supported on"), "{reason}");
                 assert!(
-                    reason.contains("linux/x86_64") && reason.contains("macos/aarch64"),
+                    reason.contains("only available on") || reason.contains("does not include"),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("does not include") || reason.contains("macos/aarch64"),
                     "{reason}"
                 );
             }

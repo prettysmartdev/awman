@@ -137,7 +137,7 @@ pub const AMBIENT_MSB_OVERRIDES: &[&str] = &[
 ];
 
 /// `DOCKER_HOST` — the Docker Engine endpoint (`unix://`, `tcp://`,
-/// `npipe://`). Read only when a `docker-store` image source names no host.
+/// `npipe://`). Read only when a `docker-local` image source names no host.
 pub const DOCKER_HOST: &str = "DOCKER_HOST";
 
 /// `DOCKER_CERT_PATH` — directory holding `ca.pem`, `cert.pem`, `key.pem` for

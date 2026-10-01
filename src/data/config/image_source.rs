@@ -31,7 +31,9 @@ pub enum ImageSourceSpec {
     },
     /// Export from a Docker Engine over its API. `host` accepts `unix://`,
     /// `tcp://` and `npipe://`; `None` means the platform's default socket.
-    /// `reference` defaults to the awman image tag.
+    /// `reference` defaults to the awman image tag. Spelled `docker-local`;
+    /// the earlier `docker-store` spelling is still accepted.
+    #[serde(rename = "docker-local", alias = "docker-store")]
     DockerStore {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
@@ -58,6 +60,7 @@ pub enum ImageSourceSpec {
 #[serde(rename_all = "kebab-case")]
 pub enum ImageSourceKind {
     Registry,
+    #[serde(rename = "docker-local", alias = "docker-store")]
     DockerStore,
     #[serde(rename = "apple-local", alias = "apple-store")]
     AppleStore,
@@ -65,14 +68,41 @@ pub enum ImageSourceKind {
 }
 
 impl ImageSourceKind {
-    /// The persisted spelling (`"registry"`, `"docker-store"`, …).
+    /// Every kind, in display order.
+    pub const ALL: [ImageSourceKind; 4] = [
+        Self::Registry,
+        Self::DockerStore,
+        Self::AppleStore,
+        Self::Archive,
+    ];
+
+    /// The canonical persisted spelling (`"registry"`, `"docker-local"`, …).
+    /// Always what awman writes and displays.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Registry => "registry",
-            Self::DockerStore => "docker-store",
+            Self::DockerStore => "docker-local",
             Self::AppleStore => "apple-local",
             Self::Archive => "archive",
         }
+    }
+
+    /// Earlier spellings of this kind that are still accepted on input and
+    /// still found in records written before the rename. Never written.
+    pub fn legacy_names(self) -> &'static [&'static str] {
+        match self {
+            Self::DockerStore => &["docker-store"],
+            Self::AppleStore => &["apple-store"],
+            Self::Registry | Self::Archive => &[],
+        }
+    }
+
+    /// Parse a canonical or legacy spelling. Exact match only: no trimming,
+    /// case folding or prefix matching.
+    pub fn parse_name(name: &str) -> Option<ImageSourceKind> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == name || kind.legacy_names().contains(&name))
     }
 }
 
@@ -236,7 +266,7 @@ mod tests {
             serde_json::from_str(r#"{"type":"registry","reference":"ghcr.io/x/y:1"}"#).unwrap();
         assert_eq!(registry.kind(), ImageSourceKind::Registry);
         let docker: ImageSourceSpec =
-            serde_json::from_str(r#"{"type":"docker-store","reference":"ghcr.io/x/y:1"}"#).unwrap();
+            serde_json::from_str(r#"{"type":"docker-local","reference":"ghcr.io/x/y:1"}"#).unwrap();
         assert_eq!(docker.kind(), ImageSourceKind::DockerStore);
         // Same reference, different source: never equal.
         assert_ne!(registry, docker);
@@ -262,6 +292,26 @@ mod tests {
         let kind: ImageSourceKind = serde_json::from_str(r#""apple-store""#).unwrap();
         assert_eq!(kind, ImageSourceKind::AppleStore);
         assert_eq!(serde_json::to_string(&kind).unwrap(), r#""apple-local""#);
+    }
+
+    #[test]
+    fn docker_legacy_spec_and_kind_parse_but_serialize_and_display_canonically() {
+        let old: ImageSourceSpec =
+            serde_json::from_str(r#"{"type":"docker-store","host":"unix:///var/run/docker.sock"}"#)
+                .unwrap();
+        assert_eq!(old.kind(), ImageSourceKind::DockerStore);
+        assert_eq!(serde_json::to_value(old).unwrap()["type"], "docker-local");
+        let kind: ImageSourceKind = serde_json::from_str(r#""docker-store""#).unwrap();
+        assert_eq!(kind.to_string(), "docker-local");
+        assert_eq!(serde_json::to_string(&kind).unwrap(), r#""docker-local""#);
+        assert_eq!(
+            ImageSourceKind::parse_name("apple-store"),
+            Some(ImageSourceKind::AppleStore)
+        );
+        assert_eq!(ImageSourceKind::parse_name("Docker-store"), None);
+        for kind in ImageSourceKind::ALL {
+            assert!(!kind.to_string().contains("store") || kind.to_string().ends_with("local"));
+        }
     }
 
     #[test]

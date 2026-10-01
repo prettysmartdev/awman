@@ -136,7 +136,8 @@ pub(super) const READY: CommandSpec = CommandSpec {
         FlagSpec {
             long: "no-cache",
             short: None,
-            help: "Pass --no-cache to docker build.",
+            help: "Skip the build cache when an image build runs. Has no effect unless a \
+                   build is scheduled (by --build, an audit change, or a missing image).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,

@@ -38,7 +38,7 @@ Docker is the default runtime on all platforms.
 
 **Lifecycle:** containers are ephemeral. The agent container is removed when the session ends. Persistent state lives in your Git repository.
 
-**`awman ready` for Docker** builds per-agent Docker images from the `Dockerfile.<agent>` files in `.awman/`. These images are rebuilt when you run `awman ready --build` or `awman ready --no-cache`.
+**`awman ready` for Docker** builds per-agent Docker images from the `Dockerfile.<agent>` files in `.awman/`. Images are rebuilt when you run `awman ready --build` or when another normal ready rule schedules a build; `--no-cache` disables build cache for builds that run.
 
 See [Security & Isolation](04-security-and-isolation.md) for overlay mounts, the Docker socket flag, and worktree isolation.
 
@@ -56,7 +56,7 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 - macOS only — not available on Linux or Windows. Configuring it on those platforms is an error, not a silent fallback.
 - `--allow-docker` (host Docker socket mount) is not supported under this runtime.
 
-**`awman ready` for Apple Containers** builds the same per-agent images used by Docker, using `container build` instead of `docker build`. The workflow is identical.
+**`awman ready` for Apple Containers** builds the same per-agent images used by Docker, using `container build` instead of `docker build`. Images are rebuilt when you run `awman ready --build` or when another normal ready rule schedules a build; `--no-cache` disables build cache for builds that run.
 
 ---
 
@@ -132,11 +132,11 @@ awman config set --global runtime builtin-experimental
 awman ready
 ```
 
-`awman ready` does not build anything for this runtime. It **imports** a finished image from a source you choose, so the first `awman ready` tells you what to do — see [Getting an agent image](#getting-an-agent-image).
+By default, `awman ready` **imports** a finished image from a source you choose. To opt into source-matched local builds, see [Building from a local image source](#building-from-a-local-image-source).
 
 ### Getting an agent image
 
-Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. The builtin runtime never builds. Build the same images yourself, then tell awman where to import the result from.
+Docker and Apple Containers build `awman-<project>:latest` and `awman-<project>-<agent>:latest` from `Dockerfile.dev` and `.awman/Dockerfile.<agent>`. By default the builtin runtime imports finished images, but you can opt into source-matched builds with `builtin.builder.enabled`; see [Building from a local image source](#building-from-a-local-image-source). Without that setting, build the images yourself and tell awman where to import them from.
 
 **On a Mac, the simplest route is Apple Containers.** If you already use the `apple-containers` runtime, the images are already in its store: set `"imageSource": {"type": "apple-local"}` and run `awman ready` (see [Apple Containers store](#apple-containers-store)). Otherwise build them with `container build` (same arguments as `docker build` below) and use the same source. Docker, a registry, or an archive file work too:
 
@@ -153,7 +153,7 @@ Build for the host's architecture (`linux/amd64` on x86_64 hosts, `linux/arm64` 
 
 ```jsonc
 // one of:
-{ "type": "docker-store" }                                   // export from a local Docker Engine
+{ "type": "docker-local" }                                   // export from a local Docker Engine
 { "type": "apple-local" }                                    // macOS: export from the local Apple Containers image store
 { "type": "archive", "path": "/abs/path/claude.tar" }        // after: docker save awman-myproject-claude:latest -o /abs/path/claude.tar
 { "type": "registry", "registry": "ghcr.io", "reference": "acme/awman-myproject-claude:latest" }  // after pushing
@@ -178,9 +178,9 @@ Every source is explicit. A source never falls back to another one, and the same
 | `type` | Fields | Behavior |
 |---|---|---|
 | `registry` | `registry`, `reference` (at least one required) | Pulls the image for the host platform from an OCI registry. `reference` defaults to the awman image tag on `registry`; a `reference` naming a different registry than `registry` is refused. Docker Hub names are normalized (`library/`). Manifests and blobs are verified against their digests. |
-| `docker-store` | `host`, `tls`, `reference` (all optional) | Exports the image from a Docker Engine over its API (Engine API 1.41 or newer). `host` defaults to `$DOCKER_HOST`, then the platform default socket (`/var/run/docker.sock`; on macOS `~/.docker/run/docker.sock` is tried first). `host` must start with `unix://` or `tcp://`; plain `tcp://` is allowed only for loopback addresses. `ssh://` and `npipe://` are refused as unsupported. `tls` (`ca`, optional `cert` and `key`, `verify` default `true`) applies only to `tcp://` hosts; `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` are honored when the host comes from `DOCKER_HOST`. |
+| `docker-local` | `host`, `tls`, `reference` (all optional) | Exports the image from a Docker Engine over its API (Engine API 1.41 or newer). `host` defaults to `$DOCKER_HOST`, then the platform default socket (`/var/run/docker.sock`; on macOS `~/.docker/run/docker.sock` is tried first). `host` must start with `unix://` or `tcp://`; plain `tcp://` is allowed only for loopback addresses. `ssh://` and `npipe://` are refused as unsupported. `tls` (`ca`, optional `cert` and `key`, `verify` default `true`) applies only to `tcp://` hosts; `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` are honored when the host comes from `DOCKER_HOST`. |
 | `archive` | `path` (absolute) | Reads a tar from disk: `docker save` output, an OCI image layout, or either one gzip-compressed. Re-imported automatically when the file changes. |
-| `apple-local` | `reference` (optional) | macOS only. Exports the image from the local Apple Containers image store (see [Apple Containers store](#apple-containers-store)). The older spelling `apple-store` is still accepted. |
+| `apple-local` | `reference` (optional) | macOS only. Exports the image from the local Apple Containers image store (see [Apple Containers store](#apple-containers-store)). |
 
 `reference` defaults to the awman image tag (`awman-<project>-<agent>:latest`) when omitted.
 
@@ -199,7 +199,7 @@ With `{ "type": "apple-local" }`, `awman ready` asks the Apple Containers servic
 ```json
 {
   "builtin": {
-    "imageSource": { "type": "docker-store" },
+    "imageSource": { "type": "docker-local" },
     "images": {
       "awman-myproject-claude:latest": { "type": "archive", "path": "/opt/images/claude.tar" }
     }
@@ -235,13 +235,25 @@ With `{ "type": "apple-local" }`, `awman ready` asks the Apple Containers servic
 
 - The base project image is reported as **skipped** (it is only an input to your external build). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
 - With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
-- `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged.
+- With the builder disabled (the default), `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged. With the builder enabled, `--build` schedules the usual builds and `--no-cache` applies to any build that runs.
 - `awman ready --build` also imports the image of **every other agent** that has a `.awman/Dockerfile.<agent>` (one **Import agent image: \<agent\>** row each), so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` imports only the default agent and lists any other agents whose images are missing.
 - Other agents use their own `builtin.images` entry when there is one, otherwise `builtin.imageSource`. A `builtin.imageSource` that names a single image — an `archive`, or any source with an explicit `reference` — holds only one agent's image, so for other agents `ready` skips it with a warning instead of importing the wrong image. Give each of those agents its own `builtin.images` entry (for example one archive per agent).
-- If a Dockerfile changed after you built, `ready` warns you to rebuild externally and re-run `awman ready --build`.
+- If a Dockerfile changed after you built, `ready` warns you to rebuild and re-run `awman ready --build`.
 - Older acquisition-cache references without per-source metadata must be acquired again once. Installed images remain runnable without their source.
 - A transient failure while importing (a dropped connection, a stalled transfer, a 5xx from the registry or daemon) is retried automatically, up to a bounded number of attempts and an overall time limit. Errors that won't be fixed by retrying — bad credentials, a digest or platform mismatch, a rejected archive, an unsupported or blocked source — are reported immediately instead. Ctrl-C cancels acquisition and waits for cleanup. If the final runtime import has already begun, cancellation waits for that commit and may leave a complete cached image. Local filesystem or keychain calls may delay the response.
-- Workflow setup/teardown steps use the imported agent image of the repo's configured agent (default `claude`) unless the workflow or config sets an explicit `baseImage`, which must already be imported. A workflow whose agent image is not imported stops at pre-flight with the build instructions instead of offering to build.
+- Workflow setup/teardown steps use the imported agent image of the repo's configured agent (default `claude`) unless the workflow or config sets an explicit `baseImage`, which must already be imported. Workflow preflight only checks and imports images; it never starts a host build. Prepare images with `awman ready` before starting the workflow.
+
+### Building from a local image source
+
+Set `builtin.builder.enabled` to `true` to let `awman ready` build and then import images while keeping `builtin-experimental` as the execution runtime. The setting defaults to `false` and has no effect when another runtime is selected. Each image's resolved source determines the builder: `docker-local` can use the matching local Unix-socket Docker Engine, and `apple-local` can use Apple Containers. TCP and other remote Docker endpoints, registries, and archives are not build targets. For an incompatible source, a requested build is skipped with a warning and the configured source remains the import source; awman never switches stores implicitly.
+
+Plain `awman ready` inspects a compatible local source store when normal readiness rules need to know whether an image exists. If no build is needed, an installed image that matches that source is reused without exporting it again. If the builder cannot be reached but that image is already installed and no build is pending, ready warns and continues with the installed image. A successful build forces a fresh import from the same store and reference, even if the acquisition cache contains an older image.
+
+The project base image is built before dependent agent images in the same source store. Build and import have separate result rows; readiness requires both stages for each required image. A build can succeed while import fails, in which case `awman ready` reports failure and can retry the import on a later run. `--no-cache` affects builds when a build is scheduled; by itself it does not schedule one. Use `--build` to request the usual forced builds.
+
+If a required image stage fails or remains unfinished, `awman ready` reports `awman is not ready.` and exits with status 1, whether or not the builder is enabled. Pending build receipts are stored under the awman data home at `pending-builds/`; per-image build locks are under `locks/image-build/`. Source builds disable BuildKit provenance and SBOM attestations so the exported result has a verifiable single-platform image. Docker `npipe://` endpoints are unsupported for builtin image acquisition or building. A configured source is checked again when an image must be acquired; a cached builtin image is reused only when its identity matches the inspected source.
+
+Docker builds require a local Docker CLI and daemon. If Docker Buildx is installed, its `default` builder must use the `docker` driver; other drivers fail with an actionable error. Apple builds require the Apple Containers CLI/service. The source store is used for building and importing, while agent sessions continue to run only in the builtin microVM.
 
 Importing enforces safety limits: a total archive of up to 32 GiB, up to 8 GiB per layer after decompression, up to 256 layers, and at least 1 GiB of free disk space. Archive metadata and the selected image's layers are validated before import: digests must match, the image must be for the host's Linux platform, and selected images with path traversal, writes through symlinks, device nodes, unsafe hard links, or malformed whiteouts are rejected (`image archive … rejected: <reason>`). Only the selected image and requested tag reach the runtime importer; unselected images and unrelated tags are excluded, while selected config and layer bytes are preserved. Plain and gzip-wrapped tars are supported; zstd-, xz-, or bzip2-wrapped archives, zstd-compressed layers, and non-distributable/foreign layers are refused with a reason naming the problem and, for zstd, the gzip re-export that works instead. Launching a session never pulls or reads any source: it uses only the already-imported image.
 
@@ -251,7 +263,7 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 
 | Key | Default | Meaning |
 |---|---|---|
-| `builtin.stateDir` | `~/.awman/builtin` (under the awman data home) | Private state root. Must be an absolute path without `..`, owned by you with mode `0700`, and contain no symlinks. Keep it short: control sockets live below it and paths are limited to about 100 bytes (`socket path … is longer than the … limit; configure a shorter builtin state directory`). The `AWMAN_BUILTIN_STATE_DIR` environment variable overrides it. |
+| `builtin.stateDir` | `~/.awman/builtin` (under the awman data home) | Private builtin runtime state root for imported images, VM/session state, catalog and control sockets. The value is resolved once from the configuration of the directory where awman starts and is shared by builtin sessions in that process. Must be an absolute path without `..`, owned by you with mode `0700`, and contain no symlinks. Keep it short: control sockets live below it and paths are limited to about 100 bytes (`socket path … is longer than the … limit; configure a shorter builtin state directory`). `AWMAN_BUILTIN_STATE_DIR` overrides config for the process. |
 | `builtin.vcpus` | `2` | Whole vCPUs per session VM, 1–255. Fractional values are rejected, never rounded. |
 | `builtin.memoryMib` | `4096` | Guest memory in MiB, 128 or more. |
 | `builtin.imageSource` | unset | Default image source (see above). |
@@ -259,7 +271,9 @@ The `runtime` key is global; the `builtin` block can be set in the global config
 | `builtin.registries` | `{}` | Per-registry settings. |
 | `builtin.network` | `{"mode":"public"}` | Guest network policy — see [Network](#network) below. |
 
-`vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The four object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin-experimental`, and an invalid one is an error naming the bad key. (The settings block keeps the name `builtin`; only the runtime value carries `-experimental`.)
+Builtin VM settings are resolved once from the configuration of the directory where awman starts and shared by its builtin sessions, including TUI, API, and squad sessions. Repo CPU, memory, and network values in that startup directory override the corresponding global values, subject to the network ceiling below. `vcpus` and `memoryMib` can be changed with `awman config set` (for example `awman config set --global builtin.vcpus 4`). The object-valued keys are shown read-only by `awman config show`; edit them in the JSON file. The `builtin` block is only used when `runtime` is `builtin-experimental`, and an invalid one is an error naming the bad key. (The settings block keeps the name `builtin`; only the runtime value carries `-experimental`.)
+
+The builtin runtime refuses startup if any of these Microsandbox override variables is set: `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, `MSB_BACKEND`, `MSB_CONFIG_PATH`, `MSB_PROFILE`, `MSB_CACHE_DIR`, `MSB_SANDBOXES_DIR`, `MSB_VOLUMES_DIR`, `MSB_SNAPSHOTS_DIR`, `MSB_LOGS_DIR`, or `MSB_SECRETS_DIR`. Unset the named variable and retry.
 
 ### Network
 
@@ -339,7 +353,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 | `image '<ref>' was not found in the Docker Engine at <endpoint>` | Build it first, or fix `reference`. |
 | `apple-local image source is not supported: Apple Containers <version> … is not a release awman has verified` | Install a supported Apple Containers release (see [Apple Containers store](#apple-containers-store)), or use another source. |
 | `apple-local image source is blocked: the Apple Containers service is not running …` | Run `container system start`, then `awman ready`. |
-| `apple-local image source is blocked: Apple Containers exists only on macOS …` | Use a `registry`, `docker-store` or `archive` source. |
+| `apple-local image source is blocked: Apple Containers exists only on macOS …` | Use a `registry`, `docker-local` or `archive` source. |
 | `image '<ref>' is not in the Apple Containers image store`, or `2 different Apple Containers images are named '<ref>'` | Build or pull it with Apple Containers, or remove the stale image. |
 | `digest mismatch …`, `platform mismatch … wanted linux/arm64, found …` | A corrupt transfer, or the image was built for another architecture. Rebuild for the host platform. |
 | `image archive <path> rejected: …` | The archive failed validation; the reason names the problem. |
@@ -658,7 +672,7 @@ awman config set --global runtime docker
 awman chat --agent claude                   # runs in Docker container, unchanged
 ```
 
-`awman ready` is per-runtime: running it with `runtime: "docker"` does not touch sbx kits; running it with `runtime: "docker-sbx-experimental"` does not touch Docker images; running it with `runtime: "builtin-experimental"` imports into the builtin store and never builds.
+`awman ready` is per-runtime: running it with `runtime: "docker"` does not touch sbx kits; running it with `runtime: "docker-sbx-experimental"` does not touch Docker images; running it with `runtime: "builtin-experimental"` imports into the builtin store and builds only when the opt-in builder and a compatible local source schedule a build.
 
 ---
 

@@ -240,6 +240,8 @@ mod driver {
             },
             platform: OciPlatform::host_linux(),
             refresh: false,
+            expected_built_identity: None,
+            immutable_export_selector: None,
         };
         for round in ["first", "cached"] {
             if let Err(error) = importer.import_image(&request, &mut Quiet) {

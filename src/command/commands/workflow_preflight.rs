@@ -530,6 +530,8 @@ fn import_agent_image(
         source,
         platform: crate::data::oci_identity::OciPlatform::host_linux(),
         refresh: false,
+        expected_built_identity: None,
+        immutable_export_selector: None,
     };
     runtime
         .import_image(&request, sink)
@@ -720,5 +722,71 @@ mod import_tests {
             "{err}"
         );
         assert!(missing.imports.lock().unwrap().is_empty());
+    }
+
+    /// C1: `workflow preflight`'s import request and `awman ready`'s image
+    /// acquisition must resolve the same `(source, reference)` for the same
+    /// tag and configured sources — both go through `resolve_source`, `ready`
+    /// via `ImageSourceResolver::resolve_for_image`, which wraps it without
+    /// changing `reference` or (for a non-Docker source) `source`. A
+    /// preflight/ready divergence here would mean the two commands could
+    /// import from different content for an identical tag.
+    #[test]
+    fn preflight_and_ready_resolve_the_same_source_and_reference_for_the_same_tag() {
+        use crate::engine::oci::{BuildHint, ImageSourceResolver};
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::data::RepoDockerfilePaths::new(root.path());
+        let tag = crate::data::image_tags::agent_image_tag(root.path(), "claude");
+        let hint = crate::engine::oci::BuildHint {
+            agent_dockerfile: paths.agent_dockerfile("claude"),
+            project: Some((
+                paths.project_dockerfile(),
+                crate::data::image_tags::project_image_tag(root.path()),
+            )),
+            context: root.path().to_path_buf(),
+        };
+
+        for spec in [
+            ImageSourceSpec::Archive {
+                path: "/images/agent.tar".into(),
+            },
+            ImageSourceSpec::AppleStore { reference: None },
+            ImageSourceSpec::Registry {
+                registry: Some("ghcr.io".into()),
+                reference: None,
+            },
+        ] {
+            // The path `import_agent_image` takes: a direct `resolve_source` call.
+            let (preflight_source, preflight_reference) =
+                crate::engine::oci::resolve_source(&tag, &sources(Some(spec.clone())), &hint)
+                    .unwrap();
+
+            // The path `ReadyEngine` takes: `ImageSourceResolver::resolve_for_image`,
+            // which calls `resolve_source` internally and layers endpoint
+            // resolution on top (a no-op for every non-Docker source kind).
+            let resolved = ImageSourceResolver::new(
+                &sources(Some(spec.clone())),
+                &crate::data::config::env::EnvSnapshot::empty(),
+            )
+            .resolve_for_image(
+                &tag,
+                &BuildHint {
+                    agent_dockerfile: hint.agent_dockerfile.clone(),
+                    project: hint.project.clone(),
+                    context: hint.context.clone(),
+                },
+                crate::data::oci_identity::OciPlatform::host_linux(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                resolved.reference, preflight_reference,
+                "reference must match for {spec:?}"
+            );
+            assert_eq!(
+                resolved.source, preflight_source,
+                "source must match for {spec:?}"
+            );
+        }
     }
 }

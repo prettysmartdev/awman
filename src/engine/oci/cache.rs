@@ -996,6 +996,65 @@ mod tests {
     }
 
     #[test]
+    fn legacy_source_key_reference_is_found_through_spelling_candidates() {
+        use crate::data::oci_source_key::OciSourceKey;
+        let state = tempfile::tempdir().unwrap();
+        let cache = OciCache::open(state.path()).unwrap();
+        let platform = OciPlatform::host_linux();
+        for (kind, locator, old_name, canonical) in [
+            (
+                ImageSourceKind::DockerStore,
+                "unix:///run/docker.sock",
+                "docker-store",
+                "docker-local",
+            ),
+            (
+                ImageSourceKind::AppleStore,
+                "apple-containers",
+                "apple-store",
+                "apple-local",
+            ),
+        ] {
+            let source = OciSourceKey {
+                kind,
+                locator: locator.into(),
+                reference: "team/agent:1".into(),
+                platform: platform.clone(),
+            };
+            let candidates = source.lookup_keys();
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0], source.canonical_key());
+            assert!(candidates[1].contains(&format!("\n{old_name}\n")));
+            let mut legacy_identity = identity();
+            legacy_identity.reference = "team/agent:1".into();
+            legacy_identity.source = kind;
+            let (_dir, staged) = stage(&cache, format!("legacy-{old_name}").as_bytes());
+            cache
+                .commit(
+                    &staged,
+                    &candidates[1],
+                    legacy_identity.clone(),
+                    &validated(),
+                    locator.into(),
+                    None,
+                )
+                .unwrap();
+            let hit = candidates
+                .iter()
+                .find_map(|key| cache.lookup(key).unwrap())
+                .expect("legacy cache hit");
+            assert_eq!(hit.image.identity, legacy_identity);
+            let serialized = serde_json::to_value(&hit.image.identity).unwrap();
+            assert_eq!(serialized["source"], canonical);
+            let mut old_persisted = serialized;
+            old_persisted["source"] = serde_json::Value::String(old_name.into());
+            let decoded: crate::data::oci_identity::ImageIdentity =
+                serde_json::from_value(old_persisted).unwrap();
+            assert_eq!(decoded.source, kind, "legacy persisted identity {old_name}");
+        }
+    }
+
+    #[test]
     fn prune_waits_for_publication_of_an_in_flight_archive() {
         use std::sync::mpsc;
         use std::time::Duration;

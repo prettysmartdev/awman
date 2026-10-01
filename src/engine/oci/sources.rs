@@ -11,8 +11,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::image_source::ImageSourceKind;
 use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
 use crate::data::oci_identity::{Digest, OciPlatform};
+use crate::data::oci_source_key::OciSourceKey;
 use crate::engine::error::EngineError;
 use crate::engine::oci::cache::SourceFingerprint;
 use crate::engine::oci::retry::{CancelToken, Deadline};
@@ -30,6 +32,8 @@ pub(super) struct FetchContext<'a> {
     pub limits: AcquireLimits,
     pub disk: &'a dyn DiskSpace,
     pub platform: &'a OciPlatform,
+    /// Immutable source object to export after a build, if available.
+    pub export_selector: Option<&'a str>,
     /// Cancellation requested by the caller; adapters check it in every
     /// transfer loop.
     pub cancel: &'a CancelToken,
@@ -149,13 +153,23 @@ impl Resolved {
     }
 
     /// The cache key for `reference` on `platform` from this source.
-    pub(super) fn key(&self, kind: &str, reference: &str, platform: &OciPlatform) -> String {
+    pub(super) fn key(
+        &self,
+        kind: ImageSourceKind,
+        reference: &str,
+        platform: &OciPlatform,
+    ) -> OciSourceKey {
         // A registry reference is keyed in its canonical, fully-qualified form.
         let reference = match self {
             Self::Registry { reference, .. } => reference.to_string(),
             _ => reference.to_string(),
         };
-        format!("v1\n{kind}\n{}\n{reference}\n{platform}", self.locator())
+        OciSourceKey {
+            kind,
+            locator: self.locator(),
+            reference,
+            platform: platform.clone(),
+        }
     }
 
     /// Stage the archive. Network sources run here on the caller's thread;
@@ -188,9 +202,13 @@ impl Resolved {
                 ctx,
                 report,
             ),
-            Self::DockerStore { endpoint } => {
-                docker_engine::export(endpoint, reference, ctx, report)
-            }
+            Self::DockerStore { endpoint } => docker_engine::export(
+                endpoint,
+                reference,
+                ctx.export_selector.unwrap_or(reference),
+                ctx,
+                report,
+            ),
             Self::AppleStore => match ctx.apple {
                 Some(transport) => {
                     apple_store::export(transport, awman_tag, reference, ctx, report)
@@ -324,8 +342,8 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            reg.key("registry", "agent:1", &platform),
-            dock.key("docker-store", "agent:1", &platform)
+            reg.key(ImageSourceKind::Registry, "agent:1", &platform),
+            dock.key(ImageSourceKind::DockerStore, "agent:1", &platform)
         );
         assert_eq!(reg.locator(), "https://localhost:5000/agent");
         assert_eq!(dock.locator(), "unix:///run/docker.sock");

@@ -251,6 +251,13 @@ impl EffectiveConfig {
         }
     }
 
+    /// Effective `builtin.builder.enabled`: repo over global per leaf,
+    /// default `false`. Whether it applies to a runtime is the engine's
+    /// decision.
+    pub fn builtin_builder_enabled(&self) -> bool {
+        self.builtin_runtime().builder_enabled()
+    }
+
     /// Effective builtin network policy: the global `builtin.network` block is
     /// the ceiling and the repo block may only narrow it (see
     /// [`BuiltinNetworkConfig::resolve`]). Errors name the offending key.
@@ -1309,6 +1316,62 @@ mod tests {
             EffectiveConfig::default().builtin_runtime(),
             BuiltinRuntimeConfig::default()
         );
+    }
+
+    #[test]
+    fn builtin_builder_enabled_inherits_and_repo_can_disable_global() {
+        use crate::data::config::builtin_runtime::BuiltinBuilderConfig;
+        let global = GlobalConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                builder: Some(BuiltinBuilderConfig {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let inherited = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global.clone(),
+        );
+        assert!(inherited.builtin_builder_enabled());
+        let repo = RepoConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                builder: Some(BuiltinBuilderConfig {
+                    enabled: Some(false),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let disabled = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
+        assert!(!disabled.builtin_builder_enabled());
+        assert!(!EffectiveConfig::default().builtin_builder_enabled());
+    }
+
+    #[test]
+    fn builder_enablement_does_not_select_a_non_builtin_runtime() {
+        use crate::data::config::builtin_runtime::BuiltinBuilderConfig;
+        let global = GlobalConfig {
+            runtime: Some("docker".into()),
+            builtin: Some(BuiltinRuntimeConfig {
+                builder: Some(BuiltinBuilderConfig {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let effective = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert!(effective.builtin_builder_enabled());
+        assert_eq!(effective.runtime_selection(), Ok(RuntimeSelection::Docker));
     }
 
     #[test]

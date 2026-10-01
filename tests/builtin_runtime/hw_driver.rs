@@ -372,6 +372,8 @@ mod driver {
             },
             platform: OciPlatform::host_linux(),
             refresh: false,
+            expected_built_identity: None,
+            immutable_export_selector: None,
         };
         for round in ["first", "cached"] {
             let started = Instant::now();

@@ -27,7 +27,7 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `--refresh` | bool | false | — | — | CLI, TUI, API | Run the Dockerfile agent audit (skipped by default). |
 | `--build` | bool | false | — | — | CLI, TUI, API | Force rebuild the dev container image from Dockerfile.dev. |
-| `--no-cache` | bool | false | — | — | CLI, TUI, API | Pass --no-cache to docker build. |
+| `--no-cache` | bool | false | — | — | CLI, TUI, API | Skip the build cache when an image build runs. Has no effect unless a build is scheduled (by --build, an audit change, or a missing image). |
 | `-n, --non-interactive` | bool | false | — | — | CLI, TUI, API | Run the agent in non-interactive (print) mode instead of interactive mode. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--json` | bool | false | `--non-interactive` | — | CLI, TUI, API | Suppress human output and print structured JSON. Implies --non-interactive. |

@@ -4,7 +4,6 @@
 //! otherwise returns the CLI profile's answers from
 //! `src/command/headless.rs`.
 
-use crate::data::step_status::StepStatus;
 use crate::engine::error::EngineError;
 use crate::engine::ready::{ReadyFrontend, ReadyPhase, ReadySummary};
 
@@ -52,24 +51,23 @@ impl ReadyFrontend for CliFrontend {
         if self.is_json_mode() {
             return;
         }
-        // The rows are the summary's own (F-23); this renders them.
+        // The rows, outcome line and hint are the summary's own (F-23;
+        // readiness now accounts for per-image build/import results too):
+        // this renders them without recomputing any of that itself.
         let box_str = crate::frontend::render_helpers::render_ready_summary(summary);
+        let outcome_line = summary.outcome_line();
         // Write the summary box directly to stderr without the per-line
         // "awman:" prefix used for status updates — the box is multi-line
         // content that reads better unprefixed.
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
-            format!("\n{box_str}awman is ready.\n").as_bytes(),
+            format!("\n{box_str}{outcome_line}\n").as_bytes(),
         );
 
-        let has_missing = summary
-            .non_default_agent_images
-            .iter()
-            .any(|(_, s)| matches!(s, StepStatus::Warn(_)));
-        if has_missing {
+        if let Some(hint) = summary.hint() {
             let _ = std::io::Write::write_all(
                 &mut std::io::stderr(),
-                b"Tip: run \"ready --build\" to build or import all available agent images.\n",
+                format!("Tip: {hint}\n").as_bytes(),
             );
         }
         let _ = std::io::Write::flush(&mut std::io::stderr());

@@ -100,6 +100,20 @@ pub enum LocalAgentPingResult {
     CouldNotRun,
 }
 
+/// Ready-only ping seam. Production uses the sanctioned `HostAgentPinger`;
+/// tests inject a fixed result without starting an agent executable.
+#[async_trait::async_trait]
+pub trait ReadyHostPing: Send + Sync {
+    async fn ping(&self, agent: &AgentName) -> LocalAgentPingResult;
+}
+
+#[async_trait::async_trait]
+impl ReadyHostPing for HostAgentPinger {
+    async fn ping(&self, agent: &AgentName) -> LocalAgentPingResult {
+        HostAgentPinger::ping(self, agent).await
+    }
+}
+
 /// Result of trying to make the host agent rotate its credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRefreshOutcome {

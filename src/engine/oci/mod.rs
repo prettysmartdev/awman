@@ -57,9 +57,26 @@ pub mod verify;
 
 pub use archive::{validate_archive, ImageConfigSummary, ValidatedArchive};
 pub use cache::{CacheRecord, OciCache, PruneReport};
-pub use resolve::{external_build_hint, resolve_source, BuildHint, ImageSources};
+pub use resolve::{
+    external_build_hint, resolve_source, BuildHint, ImageSourceResolver, ImageSources,
+    ResolvedImageSource,
+};
 pub use retry::{CancelToken, RetryPolicy};
 pub use verify::DiskSpace;
+
+/// What a local source store holds under one reference, for one platform,
+/// as seen without exporting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceImage {
+    /// Nothing usable: no such reference, or one for another platform.
+    Absent,
+    /// A single-platform image whose identity the store vouches for.
+    Present(crate::data::oci_identity::BuiltImageIdentity),
+    /// An image the store keeps as a multi-platform index. It can be
+    /// imported (the export selects the platform), but no single-manifest
+    /// identity can be bound to it without exporting it.
+    Unbound,
+}
 
 /// Acquires images from explicit sources into awman's verified archive cache.
 pub trait ImageAcquirer: Send + Sync {
@@ -230,6 +247,8 @@ pub struct CachingAcquirer {
     cancel: CancelToken,
     sleep: Arc<retry::Sleeper<'static>>,
     apple: Option<Arc<dyn apple_store::XpcTransport>>,
+    expected_built_identity: Option<crate::data::oci_identity::BuiltImageIdentity>,
+    export_selector: Option<String>,
 }
 
 impl CachingAcquirer {
@@ -248,6 +267,8 @@ impl CachingAcquirer {
             cancel: CancelToken::new(),
             sleep: Arc::new(std::thread::sleep),
             apple: apple_store::installed_transport(),
+            expected_built_identity: None,
+            export_selector: None,
         }
     }
 
@@ -260,6 +281,23 @@ impl CachingAcquirer {
     /// Stop acquisitions when `token` is cancelled.
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
         self.cancel = token;
+        self
+    }
+
+    /// Require fresh content matching a builder receipt before cache
+    /// publication. A caller must also select `AcquirePolicy::Refresh`.
+    pub fn with_expected_built_identity(
+        mut self,
+        expected: Option<crate::data::oci_identity::BuiltImageIdentity>,
+    ) -> Self {
+        self.expected_built_identity = expected;
+        self
+    }
+
+    /// Pin a source export to an immutable image ID while retaining the
+    /// configured reference as the cache key and installed identity.
+    pub fn with_export_selector(mut self, selector: Option<String>) -> Self {
+        self.export_selector = selector;
         self
     }
 
@@ -293,6 +331,16 @@ impl ImageAcquirer for CachingAcquirer {
         let deadline = retry::Deadline::start(self.retry.deadline);
         let control = retry::OperationControl::new(self.cancel.clone(), deadline);
         control.check()?;
+        if self.expected_built_identity.is_some() && request.policy != AcquirePolicy::Refresh {
+            return Err(EngineError::Config(
+                "a build-bound image acquisition must refresh its source".into(),
+            ));
+        }
+        if self.export_selector.is_some() && self.expected_built_identity.is_none() {
+            return Err(EngineError::Config(
+                "an immutable export selector requires a build receipt".into(),
+            ));
+        }
         let kind = request.source.kind();
         let reference = request.source.reference_or(&request.tag);
         let mut resolved = sources::Resolved::resolve(
@@ -301,7 +349,8 @@ impl ImageAcquirer for CachingAcquirer {
             &request.registries,
             &self.env,
         )?;
-        let key = resolved.key(kind.as_str(), &reference, &request.platform);
+        let source_key = resolved.key(kind, &reference, &request.platform);
+        let key = source_key.canonical_key();
         progress(AcquireProgress::Resolving {
             source: kind,
             reference: reference.clone(),
@@ -309,26 +358,33 @@ impl ImageAcquirer for CachingAcquirer {
 
         let cache = OciCache::open(&self.state_dir)?.controlled(control.clone());
         if request.policy != AcquirePolicy::Refresh {
-            if let Some((hit, lease)) = cache.lookup_leased(&key)? {
-                let archive_changed = match (&resolved, &hit.record.source_fingerprint) {
-                    // An archive re-exported at the same path is re-imported
-                    // (only when the source is allowed to be read at all).
-                    (sources::Resolved::Archive { path }, Some(fp))
-                        if request.policy == AcquirePolicy::IfMissing =>
+            for candidate in source_key.lookup_keys() {
+                if let Some((hit, lease)) = cache.lookup_leased(&candidate)? {
+                    let archive_changed = match (&resolved, &hit.record.source_fingerprint) {
+                        // An archive re-exported at the same path is re-imported
+                        // (only when the source is allowed to be read at all).
+                        (sources::Resolved::Archive { path }, Some(fp))
+                            if request.policy == AcquirePolicy::IfMissing =>
+                        {
+                            cache::SourceFingerprint::of(path).is_some_and(|now| now != *fp)
+                        }
+                        _ => false,
+                    };
+                    if !archive_changed
+                        && hit.image.identity.source == kind
+                        && hit.image.identity.reference == reference
+                        && hit.record.locator == resolved.locator()
+                        && request.platform.matches(&hit.image.identity.platform)
                     {
-                        cache::SourceFingerprint::of(path).is_some_and(|now| now != *fp)
+                        progress(AcquireProgress::Cached {
+                            identity: hit.image.identity.clone(),
+                        });
+                        control.check()?;
+                        return Ok(LeasedImage {
+                            image: hit.image,
+                            _lease: Arc::new(lease),
+                        });
                     }
-                    _ => false,
-                };
-                if !archive_changed && request.platform.matches(&hit.image.identity.platform) {
-                    progress(AcquireProgress::Cached {
-                        identity: hit.image.identity.clone(),
-                    });
-                    control.check()?;
-                    return Ok(LeasedImage {
-                        image: hit.image,
-                        _lease: Arc::new(lease),
-                    });
                 }
             }
             if request.policy == AcquirePolicy::CachedOnly {
@@ -364,6 +420,7 @@ impl ImageAcquirer for CachingAcquirer {
                 limits: self.limits,
                 disk: self.disk.as_ref(),
                 platform: &request.platform,
+                export_selector: self.export_selector.as_deref(),
                 cancel: &self.cancel,
                 deadline,
                 attempt: number,
@@ -421,6 +478,23 @@ impl ImageAcquirer for CachingAcquirer {
             platform: validated.platform.clone(),
             source: kind,
         };
+        if let Some(expected) = &self.expected_built_identity {
+            if !expected.matches(&identity) {
+                return Err(EngineError::ImageDigestMismatch {
+                    reference: reference.clone(),
+                    expected: expected
+                        .config_digest()
+                        .or(expected.manifest_digest())
+                        .expect("validated build receipt")
+                        .to_string(),
+                    actual: if expected.config_digest().is_some() {
+                        identity.config_digest.to_string()
+                    } else {
+                        identity.manifest_digest.to_string()
+                    },
+                });
+            }
+        }
         control.check()?;
         let (committed, lease) = cache.commit_leased(
             &fetched.path,
@@ -555,6 +629,34 @@ mod tests {
                 .as_deref(),
             Some("/home/agent")
         );
+    }
+
+    #[test]
+    fn expected_build_receipt_is_checked_before_cache_publication() {
+        let state = tempfile::tempdir().unwrap();
+        let src = state.path().join("export.tar");
+        std::fs::write(&src, oci_archive(&arm64(), &[layer()]).0).unwrap();
+        let original = acquirer(state.path(), None)
+            .acquire(&request(&src, AcquirePolicy::IfMissing), &mut |_| {})
+            .unwrap();
+        let wrong = crate::data::oci_identity::BuiltImageIdentity::new(
+            Some(
+                crate::data::oci_identity::Digest::parse(&format!("sha256:{}", "f".repeat(64)))
+                    .unwrap(),
+            ),
+            None,
+            arm64(),
+        )
+        .unwrap();
+        let error = acquirer(state.path(), None)
+            .with_expected_built_identity(Some(wrong))
+            .acquire(&request(&src, AcquirePolicy::Refresh), &mut |_| {})
+            .unwrap_err();
+        assert!(matches!(error, EngineError::ImageDigestMismatch { .. }));
+        let cached = acquirer(state.path(), None)
+            .acquire(&request(&src, AcquirePolicy::CachedOnly), &mut |_| {})
+            .unwrap();
+        assert_eq!(cached.identity, original.identity);
     }
 
     #[test]
@@ -938,6 +1040,43 @@ mod tests {
                 let cached =
                     acquire(dir.path(), &request(&sock, AcquirePolicy::CachedOnly)).unwrap();
                 assert_eq!(cached, got);
+            }
+
+            #[test]
+            fn legacy_docker_cache_key_is_found_without_source_contact() {
+                use crate::data::fs::hash::sha256_hex;
+                use crate::data::oci_source_key::OciSourceKey;
+                use crate::engine::oci::cache::OciCache;
+
+                let (dir, sock) = setup();
+                let seen = spawn(
+                    &sock,
+                    standard("1.45", ("linux", "arm64"), archive(), false),
+                );
+                let first = acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
+                let count_before = seen.lock().unwrap().len();
+                let key = OciSourceKey {
+                    kind: ImageSourceKind::DockerStore,
+                    locator: format!("unix://{}", sock.display()),
+                    reference: "awman-x-claude:latest".into(),
+                    platform: arm64(),
+                };
+                let cache = OciCache::open(dir.path()).unwrap();
+                let refs = cache.root().join("refs");
+                let canonical = refs.join(format!("{}.json", sha256_hex(&key.canonical_key())));
+                let legacy_key = format!(
+                    "v1\ndocker-store\n{}\n{}\n{}",
+                    key.locator, key.reference, key.platform
+                );
+                let legacy = refs.join(format!("{}.json", sha256_hex(&legacy_key)));
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&canonical).unwrap()).unwrap();
+                record["key"] = legacy_key.into();
+                std::fs::write(&canonical, serde_json::to_vec(&record).unwrap()).unwrap();
+                std::fs::rename(canonical, legacy).unwrap();
+                let hit = acquire(dir.path(), &request(&sock, AcquirePolicy::IfMissing)).unwrap();
+                assert_eq!(hit.identity, first.identity);
+                assert_eq!(seen.lock().unwrap().len(), count_before);
             }
 
             #[test]

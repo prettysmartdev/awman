@@ -144,6 +144,12 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         ConfigFieldKind::Number,
         Some("memory in MiB, at least 128"),
     ),
+    f(
+        "builtin.builder.enabled",
+        FieldScope::Both,
+        ConfigFieldKind::Bool,
+        Some("true or false (default false): build missing images in the source's own store"),
+    ),
     ConfigFieldSpec {
         name: "builtin.imageSource",
         scope: FieldScope::Both,
@@ -292,6 +298,17 @@ pub fn field_spec(name: &str) -> Option<&'static ConfigFieldSpec> {
     CONFIG_FIELDS.iter().find(|spec| spec.name == name)
 }
 
+/// The value a field takes when neither scope sets it, for fields whose
+/// typed effective view has a fixed default the raw JSON does not show.
+/// `config show` / `config get` use it for the effective column only, so the
+/// global and repo cells still show that nothing is set.
+pub fn implicit_default(name: &str) -> Option<&'static str> {
+    match name {
+        crate::data::config::builtin_runtime::BUILDER_ENABLED_FIELD => Some("false"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +356,15 @@ mod tests {
             .map(|f| f.name)
             .collect();
         assert_eq!(sensitive, vec!["remote.defaultAPIKey"]);
+    }
+
+    #[test]
+    fn builder_enabled_is_a_boolean_editable_in_both_scopes_with_false_default() {
+        let spec = field_spec("builtin.builder.enabled").unwrap();
+        assert_eq!(spec.scope, FieldScope::Both);
+        assert_eq!(spec.kind, ConfigFieldKind::Bool);
+        assert!(!spec.read_only);
+        assert_eq!(implicit_default(spec.name), Some("false"));
+        assert!(spec.hint.unwrap().contains("source's own store"));
     }
 }

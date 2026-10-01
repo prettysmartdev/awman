@@ -199,6 +199,92 @@ pub fn installed_transport() -> Option<Arc<dyn XpcTransport>> {
     NATIVE.get().cloned()
 }
 
+/// Inspect one reference in the source store without exporting it. Used by
+/// the local builder to decide whether an image exists and to obtain a
+/// source-vouched, single-platform manifest receipt after a build. An index
+/// is reported as `Unbound`, not as an error: it remains importable.
+pub fn inspect_local(
+    transport: &dyn XpcTransport,
+    reference: &str,
+    platform: &OciPlatform,
+    control: &crate::engine::container::host_cli_backend::BuildControl,
+) -> Result<crate::engine::oci::SourceImage, EngineError> {
+    control.check()?;
+    let stop = || control.check().is_err();
+    let wait = WaitControl {
+        deadline: control.deadline(),
+        stop: &stop,
+    };
+    let ping = call(
+        transport,
+        CONTRACT.api_service,
+        CONTRACT.ping_route,
+        Vec::new(),
+        &[
+            (CONTRACT.version_key, XpcKind::String),
+            (CONTRACT.commit_key, XpcKind::String),
+            (CONTRACT.build_key, XpcKind::String),
+        ],
+        &wait,
+        &[],
+    )?;
+    check_release(&ping)?;
+    let listed = call(
+        transport,
+        CONTRACT.images_service,
+        CONTRACT.list_route,
+        Vec::new(),
+        &[(CONTRACT.descriptions_key, XpcKind::Data)],
+        &wait,
+        &[],
+    )?;
+    let Some(XpcValue::Data(bytes)) = listed.get(CONTRACT.descriptions_key) else {
+        return Err(unsupported(
+            "the Apple Containers image list reply has no image descriptions".into(),
+        ));
+    };
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|_| unsupported("the Apple Containers image list is invalid".into()))?;
+    let wanted = normalize_reference(reference);
+    if !entries.iter().any(|entry| {
+        entry
+            .get("reference")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| normalize_reference(name) == wanted)
+    }) {
+        return Ok(crate::engine::oci::SourceImage::Absent);
+    }
+    let selected = select_image(bytes, reference)?;
+    control.check()?;
+    // A multi-platform index is a valid import source (the export selects
+    // the platform child), but the listing does not say which child that
+    // is, so it cannot be bound to a single-manifest identity here.
+    let Some(manifest) = expected_manifest(&selected) else {
+        return Ok(crate::engine::oci::SourceImage::Unbound);
+    };
+    // A descriptor that names its platform must name this one; an image for
+    // another architecture is not a usable image for this build.
+    if let Some(found) = descriptor_platform(&selected.description) {
+        if !platform.matches(&found) {
+            return Ok(crate::engine::oci::SourceImage::Absent);
+        }
+    }
+    crate::data::oci_identity::BuiltImageIdentity::new(None, Some(manifest), platform.clone())
+        .map(crate::engine::oci::SourceImage::Present)
+        .map_err(EngineError::Config)
+}
+
+/// The OCI `platform` of a listed entry's descriptor, when it has one.
+fn descriptor_platform(entry: &serde_json::Value) -> Option<OciPlatform> {
+    let platform = entry.get("descriptor")?.get("platform")?;
+    let field = |k: &str| platform.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Some(OciPlatform {
+        os: field("os")?,
+        architecture: field("architecture")?,
+        variant: field("variant").filter(|v| !v.is_empty()),
+    })
+}
+
 // ── Errors ─────────────────────────────────────────────────────────────────
 
 fn blocked(reason: String) -> EngineError {

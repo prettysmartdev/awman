@@ -211,7 +211,7 @@ fn default_endpoint(env: &EnvSnapshot) -> Result<Endpoint, EngineError> {
 }
 
 /// Refuse references that could be mistaken for API paths or queries.
-pub(super) fn validate_reference(reference: &str) -> Result<(), EngineError> {
+pub(crate) fn validate_reference(reference: &str) -> Result<(), EngineError> {
     let ok = !reference.is_empty()
         && reference.len() <= 512
         && !reference.starts_with(['-', '/', '.'])
@@ -389,10 +389,12 @@ fn parse_api(v: &str) -> Option<(u32, u32)> {
 pub(super) fn export(
     endpoint: &Endpoint,
     reference: &str,
+    selector: &str,
     ctx: &FetchContext<'_>,
     _report: Report<'_>,
 ) -> Result<Fetched, EngineError> {
     validate_reference(reference)?;
+    validate_reference(selector)?;
     ctx.cancel.check()?;
     let client = Client::new(
         endpoint,
@@ -433,7 +435,7 @@ pub(super) fn export(
 
     ctx.cancel.check()?;
     let (status, inspect) =
-        client.get_json::<Inspect>(&format!("{prefix}/images/{reference}/json"), metadata())?;
+        client.get_json::<Inspect>(&format!("{prefix}/images/{selector}/json"), metadata())?;
     let Some(inspect) = inspect else {
         return Err(if status == 404 {
             EngineError::Container(format!(
@@ -472,7 +474,7 @@ pub(super) fn export(
         ctx.limits.min_free_bytes,
     )?;
 
-    let mut path = format!("{prefix}/images/{reference}/get");
+    let mut path = format!("{prefix}/images/{selector}/get");
     if use_api >= PLATFORM_API {
         let platform = serde_json::json!({
             "os": ctx.platform.os,

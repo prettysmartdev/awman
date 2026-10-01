@@ -546,6 +546,32 @@ mod tests {
     }
 
     #[test]
+    fn repo_builder_round_trip_keeps_nested_shape_and_rejects_bad_type() {
+        let tmp = make_git_root();
+        let path = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join(REPO_CONFIG_FILENAME),
+            r#"{"builtin":{"builder":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        let loaded = RepoConfig::load(tmp.path()).unwrap();
+        assert!(!loaded.builtin.as_ref().unwrap().builder_enabled());
+        loaded.save(tmp.path()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join(REPO_CONFIG_FILENAME)).unwrap())
+                .unwrap();
+        assert_eq!(json["builtin"]["builder"]["enabled"], false);
+        std::fs::write(
+            path.join(REPO_CONFIG_FILENAME),
+            r#"{"builtin":{"builder":{"enabled":1}}}"#,
+        )
+        .unwrap();
+        let err = RepoConfig::load(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("builtin.builder.enabled"), "{err}");
+    }
+
+    #[test]
     fn load_save_load_round_trip_is_byte_stable() {
         let tmp = make_git_root();
         let original = RepoConfig {
