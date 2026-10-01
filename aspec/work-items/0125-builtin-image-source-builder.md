@@ -107,9 +107,10 @@ For Apple Containers, use `"imageSource": { "type": "apple-local" }`.
 | No configured source | No inferred builder | Existing source-required/reuse behavior and guidance |
 
 Local Docker eligibility must be based on the resolved endpoint, not merely
-the source type or a reachable daemon. In this item, use a supported local
-Unix socket or local named pipe; TCP and other remote transports are not
-eligible, including loopback TCP. Do not let an ambient Docker context or
+the source type or a reachable daemon. In this item, only a local Unix socket
+on a Unix host is eligible; named pipes, TCP and other transports are not,
+including loopback TCP. (Amended 2026-10-01 to match the shipped code: the
+builtin runtime does not support Windows hosts, so a named pipe never applies.) Do not let an ambient Docker context or
 `DOCKER_HOST` redirect a build away from the endpoint used for acquisition.
 Do not replace an explicit source endpoint with the default Docker store.
 
