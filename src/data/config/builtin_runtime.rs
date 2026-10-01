@@ -61,6 +61,100 @@ pub struct BuiltinRuntimeConfig {
     /// `EffectiveConfig::builtin_network`, which the engine enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<BuiltinNetworkConfig>,
+    /// Opt-in source-matched local builder. Merges per leaf (see
+    /// [`BuiltinBuilderConfig::merged_over`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_builder"
+    )]
+    pub builder: Option<BuiltinBuilderConfig>,
+}
+
+/// Dotted name of the builder switch, as config errors and `awman config`
+/// name it.
+pub const BUILDER_ENABLED_FIELD: &str = "builtin.builder.enabled";
+
+/// The `builtin.builder` block: whether `awman ready` may build a missing or
+/// explicitly rebuilt image into the store its configured source exports
+/// from, before importing it. Off unless set to `true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BuiltinBuilderConfig {
+    /// `builtin.builder.enabled`. Only a JSON boolean is accepted; omission
+    /// inherits, and the effective default is `false`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_builder_enabled"
+    )]
+    pub enabled: Option<bool>,
+}
+
+impl BuiltinBuilderConfig {
+    /// `self` layered over `base`, leaf by leaf: an omitted `enabled`
+    /// inherits `base`'s, an explicit value (including `false`) wins.
+    pub fn merged_over(&self, base: &BuiltinBuilderConfig) -> BuiltinBuilderConfig {
+        BuiltinBuilderConfig {
+            enabled: self.enabled.or(base.enabled),
+        }
+    }
+
+    /// Configured `enabled`, or `false`.
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    /// Parse a `builtin.builder.enabled` value typed by a user: exactly
+    /// `true` or `false` after trimming surrounding whitespace. No other
+    /// truthy spellings.
+    pub fn parse_enabled(value: &str) -> Result<bool, String> {
+        match value.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(format!(
+                "{BUILDER_ENABLED_FIELD} must be true or false, not '{other}'"
+            )),
+        }
+    }
+}
+
+/// A present `enabled` must be a JSON boolean: `null`, strings, numbers and
+/// containers are rejected with an error naming the field.
+fn deserialize_builder_enabled<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(enabled) => Ok(Some(enabled)),
+        other => Err(D::Error::custom(format!(
+            "{BUILDER_ENABLED_FIELD} must be true or false, not {other}"
+        ))),
+    }
+}
+
+/// A present `builder` must be an object. Errors inside it carry its path,
+/// so a raw config load names the offending key.
+fn deserialize_builder<'de, D>(deserializer: D) -> Result<Option<BuiltinBuilderConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Err(D::Error::custom(format!(
+            "builtin.builder must be an object holding {BUILDER_ENABLED_FIELD}, not {value}"
+        )));
+    }
+    serde_json::from_value(value).map_err(|e| {
+        let message = e.to_string();
+        if message.contains(BUILDER_ENABLED_FIELD) {
+            D::Error::custom(message)
+        } else {
+            D::Error::custom(format!("builtin.builder: {message}"))
+        }
+    })
 }
 
 impl BuiltinRuntimeConfig {
@@ -83,7 +177,20 @@ impl BuiltinRuntimeConfig {
             registries,
             // Informational only; enforcement resolves both layers.
             network: self.network.clone().or_else(|| base.network.clone()),
+            builder: match (&self.builder, &base.builder) {
+                (Some(repo), Some(global)) => Some(repo.merged_over(global)),
+                (repo, global) => repo.clone().or_else(|| global.clone()),
+            },
         }
+    }
+
+    /// Whether the source-matched local builder is enabled: `false` unless a
+    /// layer set `builtin.builder.enabled` to `true` and no closer layer set
+    /// it to `false`.
+    pub fn builder_enabled(&self) -> bool {
+        self.builder
+            .as_ref()
+            .is_some_and(BuiltinBuilderConfig::enabled_or_default)
     }
 
     /// Configured vCPUs, or [`DEFAULT_VCPUS`].
@@ -244,5 +351,91 @@ mod tests {
         .validate()
         .is_err());
         assert!(BuiltinRuntimeConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn builder_defaults_false_and_accepts_both_boolean_values() {
+        assert!(!BuiltinRuntimeConfig::default().builder_enabled());
+        for enabled in [true, false] {
+            let raw = format!(r#"{{"builder":{{"enabled":{enabled}}}}}"#);
+            let parsed: BuiltinRuntimeConfig = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed.builder_enabled(), enabled);
+            assert_eq!(parsed.builder.unwrap().enabled, Some(enabled));
+        }
+        assert!(
+            !serde_json::from_str::<BuiltinRuntimeConfig>(r#"{"builder":{}}"#)
+                .unwrap()
+                .builder_enabled()
+        );
+    }
+
+    #[test]
+    fn builder_accepts_only_present_json_booleans_and_names_the_field() {
+        for value in ["null", "\"true\"", "1", "[]", "{}"] {
+            let raw = format!(r#"{{"builder":{{"enabled":{value}}}}}"#);
+            let error = serde_json::from_str::<BuiltinRuntimeConfig>(&raw)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(BUILDER_ENABLED_FIELD), "{error}");
+        }
+    }
+
+    #[test]
+    fn builder_serializes_only_as_a_nested_json_object() {
+        let cfg: BuiltinRuntimeConfig = serde_json::from_str(
+            r#"{"builder":{"enabled":true},"imageSource":{"type":"archive","path":"/tmp/a.tar"}}"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(cfg).unwrap();
+        assert_eq!(value["builder"]["enabled"], true);
+        assert!(value.get("builtin.builder.enabled").is_none());
+        assert!(value["imageSource"].is_object());
+    }
+
+    #[test]
+    fn omitted_builder_and_omitted_enabled_are_distinct_but_default_off() {
+        for raw in ["{}", r#"{"builder":{}}"#] {
+            let cfg: BuiltinRuntimeConfig = serde_json::from_str(raw).unwrap();
+            assert!(!cfg.builder_enabled());
+        }
+        let cfg: BuiltinRuntimeConfig =
+            serde_json::from_str(r#"{"builder":{"enabled":true}}"#).unwrap();
+        assert!(cfg.builder_enabled());
+    }
+
+    #[test]
+    fn builder_merges_per_leaf_and_explicit_repo_false_disables_global_true() {
+        let global = BuiltinRuntimeConfig {
+            builder: Some(BuiltinBuilderConfig {
+                enabled: Some(true),
+            }),
+            ..Default::default()
+        };
+        let omitted = BuiltinRuntimeConfig {
+            builder: Some(BuiltinBuilderConfig::default()),
+            ..Default::default()
+        };
+        assert!(omitted.merged_over(&global).builder_enabled());
+        let disabled = BuiltinRuntimeConfig {
+            builder: Some(BuiltinBuilderConfig {
+                enabled: Some(false),
+            }),
+            ..Default::default()
+        };
+        assert!(!disabled.merged_over(&global).builder_enabled());
+        assert!(global
+            .merged_over(&BuiltinRuntimeConfig::default())
+            .builder_enabled());
+    }
+
+    #[test]
+    fn builder_enabled_cli_value_parser_is_strict_and_trimmed() {
+        assert_eq!(BuiltinBuilderConfig::parse_enabled(" true "), Ok(true));
+        assert_eq!(BuiltinBuilderConfig::parse_enabled("false"), Ok(false));
+        for bad in ["yes", "1", "TRUE", "", "null"] {
+            assert!(BuiltinBuilderConfig::parse_enabled(bad)
+                .unwrap_err()
+                .contains(BUILDER_ENABLED_FIELD));
+        }
     }
 }

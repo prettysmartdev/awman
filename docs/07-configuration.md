@@ -401,7 +401,8 @@ The optional `builtin` object is read only when `runtime` is `builtin-experiment
   "builtin": {
     "vcpus": 4,
     "memoryMib": 8192,
-    "imageSource": { "type": "docker-store" },
+    "builder": { "enabled": true },
+    "imageSource": { "type": "docker-local" },
     "images": {
       "awman-myproject-claude:latest": { "type": "archive", "path": "/opt/images/claude.tar" }
     },
@@ -421,19 +422,20 @@ The optional `builtin` object is read only when `runtime` is `builtin-experiment
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images and session VMs; mode `0700`, no symlinks, keep it short. `AWMAN_BUILTIN_STATE_DIR` overrides it |
+| `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images, catalog, control sockets and VM/session state; mode `0700`, no symlinks, keep it short. Resolved once from the startup directory's configuration for all builtin sessions in the process. `AWMAN_BUILTIN_STATE_DIR` overrides it |
 | `builtin.vcpus` | integer 1–255 | `2` | Whole vCPUs per session VM |
 | `builtin.memoryMib` | integer ≥ 128 | `4096` | Guest memory in MiB |
-| `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-store`, `archive`, or `apple-local` (macOS) |
+| `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-local`, `archive`, or `apple-local` (macOS) |
+| `builtin.builder.enabled` | boolean | `false` | Opt in to local source-matched Docker or Apple Containers builds during `awman ready` under `builtin-experimental`; see [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). Repository value overrides global. |
 | `builtin.images` | object (image tag → source) | `{}` | Per-image source; wins over `imageSource` for that tag |
 | `builtin.registries` | object (`host[:port]` → settings) | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
 | `builtin.network` | object | `{"mode":"public"}` | Guest network policy: `mode` (`public`/`allowlist`/`none`), `allow` (allowlist names), `hostPorts` (host loopback ports the guest may reach), `nameservers` and `trustHostCas` (global config only) — see [Runtimes: Network](11-runtimes.md#network) |
 
-Every source object, its fields, the registry settings, and the supported `apple-local` (Apple Containers) releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to build and import an image instead of guessing.
+Every source object, its fields, the registry settings, and the supported `apple-local` (Apple Containers) releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to provide one instead of guessing.
 
 `builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 
-`builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
+`builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. This effective policy applies to every builtin session from that repo, including TUI, API, and squad launches. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
 
 ---
 
@@ -570,7 +572,8 @@ Value handling:
 | `XDG_DATA_HOME` | Global data (workflows, skills, worktrees, API state, and the shared database) goes to `$XDG_DATA_HOME/awman/` |
 | `AWMAN_API_ROOT` | Relocate only the API server storage root |
 | `AWMAN_BUILTIN_STATE_DIR` | Relocate the builtin runtime's private state directory; beats `builtin.stateDir` |
-| `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | Read only when importing a builtin image from a `docker-store` source that sets no `host` |
+| `MSB_PATH`, `MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, `MSB_BACKEND`, `MSB_CONFIG_PATH`, `MSB_PROFILE`, `MSB_CACHE_DIR`, `MSB_SANDBOXES_DIR`, `MSB_VOLUMES_DIR`, `MSB_SNAPSHOTS_DIR`, `MSB_LOGS_DIR`, `MSB_SECRETS_DIR` | Refused when set while starting the builtin runtime; unset the variable before launching builtin sessions |
+| `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | Read only when importing a builtin image from a `docker-local` source that sets no `host` |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` | Honored when the builtin runtime pulls from a `registry` source |
 | `AWMAN_OVERLAYS` | Comma-separated overlay specs (e.g. `env(TOKEN),dir(/a:/b:ro)`); merged with config and flags — see [Overlays](08-overlays.md) |
 | `AWMAN_LAUNCH_MODE` | Choose `stdio` or `acp`; overrides repo `launchMode` and is overridden by `--launch-mode` |

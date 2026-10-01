@@ -42,35 +42,49 @@ impl ReadyFrontend for TuiCommandFrontend {
     }
 
     fn report_phase(&mut self, phase: &ReadyPhase) {
-        self.messages.info(format!("ready: {phase:?}"));
+        // The shared `ReadyPhase` Display text, as the API reports it.
+        self.messages.info(format!("ready: {phase}"));
     }
 
     fn report_summary(&mut self, summary: &ReadySummary) {
-        // The rows are the summary's own (F-23); this renders them.
+        // The rows, outcome line and hint are the summary's own (F-23;
+        // readiness now accounts for per-image build/import results too):
+        // this renders them without recomputing any of that itself.
         for line in crate::frontend::render_helpers::render_ready_summary(summary).lines() {
             self.messages.info(line.to_string());
         }
 
-        let has_missing = summary
-            .non_default_agent_images
-            .iter()
-            .any(|(_, s)| matches!(s, crate::data::step_status::StepStatus::Warn(_)));
-        if has_missing {
-            self.messages.info(
-                "Tip: run \"ready --build\" to build or import all available agent images."
-                    .to_string(),
-            );
+        if let Some(hint) = summary.hint() {
+            self.messages.info(format!("Tip: {hint}"));
         }
 
-        self.messages.success("awman is ready.".to_string());
+        if summary.is_ready() {
+            self.messages.success(summary.outcome_line().to_string());
+        } else {
+            self.messages.error_msg(summary.outcome_line().to_string());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::data::message::MessageLevel;
+    use crate::data::ready_phase::ReadyPhase;
+    use crate::data::ready_summary::ReadySummary;
+    use crate::data::step_status::StepStatus;
     use crate::engine::ready::frontend::ReadyFrontend;
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;
     use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+
+    fn log_texts(frontend: &TuiCommandFrontend) -> Vec<(MessageLevel, String)> {
+        frontend
+            .status_log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.level, e.text.clone()))
+            .collect()
+    }
 
     fn make_frontend() -> (
         TuiCommandFrontend,
@@ -144,5 +158,85 @@ mod tests {
         let result = frontend.ask_run_audit_on_template().unwrap();
         handle.join().unwrap();
         assert!(!result);
+    }
+
+    /// `report_phase` renders the shared `ReadyPhase` `Display` text — the
+    /// same wording the API reports over its event stream (F2 parity).
+    #[test]
+    fn report_phase_uses_the_shared_ready_phase_display() {
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        frontend.report_phase(&ReadyPhase::BuildingBaseImage);
+        let log = log_texts(&frontend);
+        assert!(
+            log.iter()
+                .any(|(_, t)| t == "ready: Building base image..."),
+            "{log:?}"
+        );
+    }
+
+    /// A ready summary renders the rows, then `success` (not a plain `info`)
+    /// with the summary's own `outcome_line()`, plus a `Tip:` line when
+    /// `ReadySummary::hint()` has one — e.g. missing non-default images,
+    /// whose hint verb follows `ReadyImageAction`.
+    #[test]
+    fn report_summary_shows_success_and_the_missing_images_hint_when_ready() {
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        let mut summary = ReadySummary::new("builtin");
+        summary.dockerfile = StepStatus::Done;
+        summary.base_image = StepStatus::Skipped;
+        summary.agent_image = StepStatus::Done;
+        summary.local_agent = StepStatus::Done;
+        summary.audit = StepStatus::Skipped;
+        summary.image_rebuild = StepStatus::Skipped;
+        summary.image_action = crate::data::ready_summary::ReadyImageAction::Import;
+        summary
+            .non_default_agent_images
+            .push(("Missing images".into(), StepStatus::Warn("codex".into())));
+
+        frontend.report_summary(&summary);
+
+        assert!(summary.is_ready(), "sanity: this summary must be ready");
+        let log = log_texts(&frontend);
+        assert!(
+            log.iter()
+                .any(|(level, t)| *level == MessageLevel::Success && t == "awman is ready."),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|(_, t)| t
+                    == "Tip: run \"ready --build\" to import all available agent images."),
+            "{log:?}"
+        );
+    }
+
+    /// A not-ready summary (a failed required image stage) renders `error_msg`
+    /// with the "not ready" outcome line and the fix-and-retry hint — the TUI
+    /// must never show `success` for a run that recorded a failure (the
+    /// behaviour change WI 0125 M-7 fixed: this frontend used to call
+    /// `messages.success("awman is ready.")` unconditionally).
+    #[test]
+    fn report_summary_shows_error_and_the_recovery_hint_when_not_ready() {
+        let (mut frontend, _req_rx, _resp_tx) = make_frontend();
+        let mut summary = ReadySummary::new("builtin");
+        summary.base_image = StepStatus::Failed("daemon unreachable".into());
+
+        frontend.report_summary(&summary);
+
+        assert!(
+            !summary.is_ready(),
+            "sanity: this summary must not be ready"
+        );
+        let log = log_texts(&frontend);
+        assert!(
+            log.iter()
+                .any(|(level, t)| *level == MessageLevel::Error && t == "awman is not ready."),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|(_, t)| t
+                == "Tip: complete the required image steps, then run \"awman ready\" again."),
+            "{log:?}"
+        );
     }
 }

@@ -434,4 +434,18 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
     }
+
+    #[test]
+    fn builtin_builder_global_round_trip_and_invalid_value_error() {
+        let cfg: GlobalConfig =
+            serde_json::from_str(r#"{"builtin":{"builder":{"enabled":true}}}"#).unwrap();
+        let saved = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(saved["builtin"]["builder"]["enabled"], true);
+        assert!(serde_json::from_value::<GlobalConfig>(
+            serde_json::json!({"builtin":{"builder":{"enabled":"true"}}})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("builtin.builder.enabled"));
+    }
 }

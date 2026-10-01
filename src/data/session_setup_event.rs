@@ -115,21 +115,7 @@ impl SessionSetupState {
     /// `current_stage`, persisted to `setup_state.json`, and served over HTTP,
     /// so every consumer of a setup snapshot reads the same words.
     pub fn ready_phase_display(phase: &ReadyPhase) -> String {
-        match phase {
-            ReadyPhase::Preflight => "Running preflight checks...".into(),
-            ReadyPhase::AwaitingDockerfileDecision => "Checking Dockerfile...".into(),
-            ReadyPhase::CreatingDockerfile => "Creating Dockerfile.dev...".into(),
-            ReadyPhase::BuildingBaseImage => "Building base image...".into(),
-            ReadyPhase::BuildingAgentImage => "Building agent image...".into(),
-            ReadyPhase::ImportingBaseImage => "Checking base image...".into(),
-            ReadyPhase::ImportingAgentImage => "Importing agent image...".into(),
-            ReadyPhase::CheckingNonDefaultAgents => "Checking non-default agent images...".into(),
-            ReadyPhase::CheckingLocalAgent => "Checking local agent...".into(),
-            ReadyPhase::RunningAudit => "Running audit...".into(),
-            ReadyPhase::RebuildingAfterAudit => "Rebuilding after audit...".into(),
-            ReadyPhase::Complete => "Ready checks complete".into(),
-            ReadyPhase::Failed(f) => format!("Failed: {}", f.message),
-        }
+        phase.to_string()
     }
 }
 

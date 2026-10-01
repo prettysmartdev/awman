@@ -19,6 +19,7 @@ pub mod log_dirs;
 pub mod overlay_paths;
 pub mod panic_log;
 pub mod path_guard;
+pub mod private_files;
 pub mod remote_slug;
 pub mod skill_dirs;
 pub mod skill_library;

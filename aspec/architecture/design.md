@@ -138,15 +138,17 @@ backends and is not the general runtime contract.
 
 ### Builtin backend capabilities and image sources
 
-The builtin backend imports existing Linux OCI images and executes cached
-images. It does not build images. Images can be acquired from an explicitly
-selected OCI registry, a Docker Engine image store, or an archive; Apple
-Containers store acquisition is currently blocked pending a supported export
-API. A source is typed and explicit, so a registry reference cannot resolve
-against a same-named daemon image. Image identity records reference, platform,
-content digests, and source kind. Users build images externally with the
-existing project Dockerfiles, then configure or import the resulting image.
-Source acquisition is not required after an image is cached.
+The builtin backend imports Linux OCI images and executes cached images. Its
+normal acquisition sources are an explicitly selected OCI registry, Docker
+Engine image store, Apple Containers store, or archive. A source is typed and
+explicit, so a registry reference cannot resolve against a same-named daemon
+image. Image identity records reference, platform, content digests, and source
+kind. With `builtin.builder.enabled`, `ready` may build through the local
+Docker Engine or Apple Containers store selected by that image's resolved
+source, then import from that same source. Other sources retain their normal
+import behavior and never select a substitute builder. Build and import remain
+separate stages; successful build alone is not readiness. Source acquisition
+is not required after an image is cached.
 
 Image-source configuration belongs to the data layer, acquisition and import
 to the engine, and `ready` orchestration to the command layer. Backends do not

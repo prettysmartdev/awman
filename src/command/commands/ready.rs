@@ -8,6 +8,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
+use crate::data::ready_image::{ReadyBaseImageResult, ReadyImageResult};
 use crate::data::ready_summary::AgentCredentialHealth;
 use crate::data::step_status::StepStatus;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
@@ -36,6 +37,19 @@ pub struct ReadyOutcome {
     pub agent_credentials: Vec<AgentCredentialHealth>,
     /// Per non-default agent image status.
     pub non_default_agent_images: Vec<(String, StepStatus)>,
+    /// Per-image build and import results, for runtimes that import images
+    /// (builtin). Empty on build runtimes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_results: Vec<ReadyImageResult>,
+    /// Project base images built into source stores, one per store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_image_results: Vec<ReadyBaseImageResult>,
+    /// Whether every required image is prepared, from
+    /// [`ReadySummary::is_ready`]: no image stage failed and no per-image or
+    /// base-image stage was left pending or running. Drives the process/API
+    /// exit code; the legacy JSON `ready` field also requires the host-side
+    /// checks to have passed.
+    pub ready: bool,
     /// `true` when `--json` was passed; controls how the CLI renders the outcome.
     #[serde(skip)]
     pub json_requested: bool,
@@ -46,6 +60,7 @@ pub struct ReadyOutcome {
 
 impl From<ReadySummary> for ReadyOutcome {
     fn from(s: ReadySummary) -> Self {
+        let ready = s.is_ready();
         Self {
             runtime: s.runtime_name,
             dockerfile: s.dockerfile,
@@ -57,6 +72,9 @@ impl From<ReadySummary> for ReadyOutcome {
             image_rebuild: s.image_rebuild,
             agent_credentials: s.agent_credentials,
             non_default_agent_images: s.non_default_agent_images,
+            image_results: s.image_results,
+            base_image_results: s.base_image_results,
+            ready,
             json_requested: false,
             refresh_requested: false,
         }
@@ -90,13 +108,6 @@ impl ReadyOutcome {
             }
         }
 
-        let any_failed = matches!(self.dockerfile, StepStatus::Failed(_))
-            || matches!(self.base_image, StepStatus::Failed(_))
-            || matches!(self.agent_image, StepStatus::Failed(_))
-            || matches!(self.image_source, Some(StepStatus::Failed(_)))
-            || matches!(self.local_agent, StepStatus::Failed(_))
-            || matches!(self.image_rebuild, StepStatus::Failed(_));
-
         // `docker_daemon` isn't tracked as a separate step in the new engine;
         // if we made it this far, the daemon was reachable.
         let docker_daemon = StepStatus::Done;
@@ -114,8 +125,18 @@ impl ReadyOutcome {
             StepStatus::Skipped
         };
 
+        // `ready` keeps its broad legacy reading: every required image stage
+        // succeeded (`self.ready`) and no host-side check failed either. The
+        // exit status uses the narrower `self.ready` alone.
+        let failed = |s: &StepStatus| matches!(s, StepStatus::Failed(_));
+        let checks_passed = self.ready
+            && ![&self.dockerfile, &self.local_agent, &self.image_rebuild]
+                .into_iter()
+                .any(failed)
+            && !self.non_default_agent_images.iter().any(|(_, s)| failed(s));
+
         let mut result = serde_json::json!({
-            "ready": !any_failed,
+            "ready": checks_passed,
             "runtime": self.runtime,
             "agent_credentials": self.agent_credentials,
             "steps": {
@@ -131,6 +152,26 @@ impl ReadyOutcome {
         });
         if let Some(source) = &self.image_source {
             result["steps"]["image_source"] = step_to_json(source);
+        }
+        // Separate per-image build/import stages and base-image builds, for
+        // runtimes that import images (builtin). Additive: absent entirely
+        // on build runtimes, which never populate them.
+        if !self.image_results.is_empty() {
+            result["image_results"] =
+                serde_json::to_value(&self.image_results).unwrap_or(serde_json::Value::Null);
+            let warnings: Vec<_> = self
+                .image_results
+                .iter()
+                .flat_map(|r| r.warnings.iter())
+                .collect();
+            if !warnings.is_empty() {
+                result["warnings"] =
+                    serde_json::to_value(&warnings).unwrap_or(serde_json::Value::Null);
+            }
+        }
+        if !self.base_image_results.is_empty() {
+            result["base_image_results"] =
+                serde_json::to_value(&self.base_image_results).unwrap_or(serde_json::Value::Null);
         }
         result
     }
@@ -239,9 +280,9 @@ impl Command for ReadyCommand {
             text: "Checking agent image…".into(),
         });
 
-        let sources = crate::engine::oci::ImageSources::from_config(
-            &session.effective_config().builtin_runtime(),
-        );
+        // `ReadyEngine::new` already derives the image sources from this same
+        // session's effective config; a separate `.with_image_sources(...)`
+        // call here would just recompute the identical value in Layer 2.
         let mut engine = ReadyEngine::new(
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
@@ -252,8 +293,7 @@ impl Command for ReadyCommand {
                 .clone(),
             self.engines.agent_engine.clone(),
             options,
-        )
-        .with_image_sources(sources);
+        );
         engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
         let cancel = engine.cancel_token();
         let result = {
@@ -340,6 +380,8 @@ fn credential_health(
 #[cfg(test)]
 mod compat_tests {
     use super::*;
+    use crate::data::config::image_source::ImageSourceKind;
+    use crate::data::ready_image::ReadyImageWarning;
 
     #[test]
     fn builtin_image_source_is_visible_without_changing_docker_json() {
@@ -350,5 +392,124 @@ mod compat_tests {
         builtin.image_source = Some(StepStatus::Done);
         let json = ReadyOutcome::from(builtin).to_legacy_json();
         assert_eq!(json["steps"]["image_source"]["status"], "ok");
+    }
+
+    fn image_result(build: StepStatus, import: StepStatus) -> ReadyImageResult {
+        ReadyImageResult {
+            agent: "claude".into(),
+            tag: "awman-repo-claude:latest".into(),
+            source_kind: Some(ImageSourceKind::DockerStore),
+            reference: Some("awman-repo-claude:latest".into()),
+            build,
+            import,
+            warnings: Vec::new(),
+            optional: false,
+        }
+    }
+
+    /// `From<ReadySummary>` no longer recomputes readiness from a handful of
+    /// legacy fields: `ReadyOutcome::ready` is exactly
+    /// `ReadySummary::is_ready()`, which a failed per-image build or import
+    /// stage affects even though every legacy top-level field
+    /// (`dockerfile`/`local_agent`/`image_rebuild`) stays `Done`.
+    #[test]
+    fn ready_outcome_ready_field_tracks_is_ready_not_just_legacy_fields() {
+        let mut summary = ReadySummary::new("builtin");
+        summary.base_image = StepStatus::Done;
+        summary.agent_image = StepStatus::Done;
+        summary.dockerfile = StepStatus::Done;
+        summary.local_agent = StepStatus::Done;
+        summary.image_rebuild = StepStatus::Skipped;
+        summary
+            .image_results
+            .push(image_result(StepStatus::Done, StepStatus::Done));
+        assert!(ReadyOutcome::from(summary.clone()).ready);
+
+        summary.image_results[0].import = StepStatus::Failed("daemon unreachable".into());
+        let outcome = ReadyOutcome::from(summary);
+        assert!(
+            !outcome.ready,
+            "a failed per-image import must make the outcome not-ready even \
+             though every legacy field is Done"
+        );
+    }
+
+    /// `ReadyOutcome::from` copies `image_results`/`base_image_results`
+    /// through unchanged — it does not drop or recompute them.
+    #[test]
+    fn ready_outcome_carries_image_and_base_image_results_through() {
+        let mut summary = ReadySummary::new("builtin");
+        summary
+            .base_image_results
+            .push(crate::data::ready_image::ReadyBaseImageResult {
+                store: "docker unix:///var/run/docker.sock".into(),
+                tag: "awman-repo:latest".into(),
+                build: StepStatus::Done,
+            });
+        let mut result = image_result(StepStatus::Done, StepStatus::Done);
+        result
+            .warnings
+            .push(ReadyImageWarning::IncompatibleBuilder {
+                tag: "awman-repo-codex:latest".into(),
+                source_kind: ImageSourceKind::Archive,
+                reason: "the configured source is not a local writable image store".into(),
+            });
+        summary.image_results.push(result);
+
+        let outcome = ReadyOutcome::from(summary);
+        assert_eq!(outcome.base_image_results.len(), 1);
+        assert_eq!(outcome.image_results.len(), 1);
+        assert_eq!(outcome.image_results[0].warnings.len(), 1);
+    }
+
+    /// Additive legacy-JSON fields: absent when there is nothing to report
+    /// (an ordinary build-runtime `ready`, as today), present — with
+    /// warnings flattened out of `image_results` — once a builder-enabled
+    /// run recorded any.
+    #[test]
+    fn to_legacy_json_image_fields_are_additive() {
+        let empty = ReadyOutcome::from(ReadySummary::new("docker")).to_legacy_json();
+        assert!(empty.get("image_results").is_none());
+        assert!(empty.get("base_image_results").is_none());
+        assert!(empty.get("warnings").is_none());
+
+        let mut summary = ReadySummary::new("builtin");
+        let mut result = image_result(StepStatus::Done, StepStatus::Done);
+        result
+            .warnings
+            .push(ReadyImageWarning::IncompatibleBuilder {
+                tag: result.tag.clone(),
+                source_kind: ImageSourceKind::Archive,
+                reason: "the configured source is not a local writable image store".into(),
+            });
+        summary.image_results.push(result);
+        let json = ReadyOutcome::from(summary).to_legacy_json();
+        assert_eq!(json["image_results"].as_array().unwrap().len(), 1);
+        assert_eq!(json["warnings"].as_array().unwrap().len(), 1);
+        assert!(json.get("base_image_results").is_none());
+    }
+
+    /// The legacy `ready` field keeps its broad reading (M-7): it additionally
+    /// requires `self.ready`, so a failed per-image stage now also turns the
+    /// legacy `ready` false, even though no top-level legacy field failed.
+    #[test]
+    fn to_legacy_json_ready_requires_image_stages_too() {
+        let mut outcome = ReadyOutcome::from({
+            let mut summary = ReadySummary::new("builtin");
+            summary.base_image = StepStatus::Done;
+            summary.agent_image = StepStatus::Done;
+            summary
+                .image_results
+                .push(image_result(StepStatus::Done, StepStatus::Done));
+            summary
+        });
+        assert_eq!(outcome.to_legacy_json()["ready"], true);
+
+        outcome.ready = false;
+        assert_eq!(
+            outcome.to_legacy_json()["ready"],
+            false,
+            "the legacy field must also go false once self.ready is false"
+        );
     }
 }

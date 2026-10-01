@@ -16,7 +16,7 @@ pub mod background;
 mod builtin;
 pub mod display;
 mod docker;
-mod host_cli_backend;
+pub mod host_cli_backend;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;

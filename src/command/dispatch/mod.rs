@@ -554,6 +554,10 @@ impl CommandOutcome {
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
             Self::SquadAttach(outcome) => outcome.exit_code,
+            // `ReadyOutcome::ready` is `ReadySummary::is_ready()` (WI 0125):
+            // a failed required build/import stage must never exit 0, for
+            // the CLI's process exit code and the API's command status alike.
+            Self::Ready(outcome) if !outcome.ready => 1,
             _ if self.is_partial_failure() => 1,
             _ => 0,
         }
@@ -2253,5 +2257,45 @@ mod tests {
         assert!(partial.is_partial_failure());
         assert_eq!(partial.exit_code(), 1);
         assert_eq!(CommandOutcome::Empty.exit_code(), 0);
+    }
+
+    /// WI 0125 (M-7): a `Ready` outcome's exit code is driven by
+    /// `ReadyOutcome::ready` (set from `ReadySummary::is_ready()` in
+    /// `From<ReadySummary>`), not by whether the engine returned `Ok` —
+    /// `run_to_completion` can return `Ok(summary)` for a summary that
+    /// recorded a failed build/import as a row rather than an `Err`. Before
+    /// this change every `Ready` outcome exited 0 regardless of
+    /// `StepStatus::Failed` anywhere in it.
+    #[test]
+    fn command_outcome_exit_code_reflects_ready_image_failures() {
+        fn ready_outcome(ready: bool) -> CommandOutcome {
+            use crate::command::commands::ready::ReadyOutcome;
+            use crate::data::step_status::StepStatus;
+            CommandOutcome::Ready(ReadyOutcome {
+                runtime: "docker".into(),
+                dockerfile: StepStatus::Done,
+                base_image: StepStatus::Done,
+                agent_image: StepStatus::Done,
+                image_source: None,
+                local_agent: StepStatus::Done,
+                audit: StepStatus::Skipped,
+                image_rebuild: StepStatus::Skipped,
+                agent_credentials: Vec::new(),
+                non_default_agent_images: Vec::new(),
+                image_results: Vec::new(),
+                base_image_results: Vec::new(),
+                ready,
+                json_requested: false,
+                refresh_requested: false,
+            })
+        }
+
+        assert_eq!(ready_outcome(true).exit_code(), 0);
+        assert_eq!(
+            ready_outcome(false).exit_code(),
+            1,
+            "a failed required image stage must exit non-zero on every runtime, \
+             not only builtin"
+        );
     }
 }

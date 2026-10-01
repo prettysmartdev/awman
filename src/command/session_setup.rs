@@ -437,6 +437,9 @@ impl SessionSetup {
             non_interactive: true,
             env_passthrough: None,
         };
+        // `ReadyEngine::new` already derives the image sources from this same
+        // session's effective config; a separate `.with_image_sources(...)`
+        // call here would just recompute the identical value in Layer 2.
         let mut ready_engine = ReadyEngine::new(
             Arc::new(session_guard.clone()),
             Arc::clone(&self.engines.git_engine),
@@ -444,10 +447,7 @@ impl SessionSetup {
             container_runtime,
             Arc::clone(&self.engines.agent_engine),
             ready_options,
-        )
-        .with_image_sources(crate::engine::oci::ImageSources::from_config(
-            &session_guard.effective_config().builtin_runtime(),
-        ));
+        );
         drop(session_guard);
 
         let mut setup_frontend = presenter.ready_frontend();
@@ -460,6 +460,26 @@ impl SessionSetup {
         let ready_outcome = tokio::time::timeout(Duration::from_secs(600), ready_fut).await;
 
         match ready_outcome {
+            // The engine records a failed build or import as a summary row,
+            // not an error. Such a session must not be announced as ready:
+            // its agent would run on a stale (or no) image.
+            Ok(Ok(summary)) if !summary.is_ready() => {
+                let reason = summary
+                    .not_ready_reason()
+                    .unwrap_or_else(|| "a required image stage did not complete".to_string());
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %reason,
+                    "Session setup did not prepare its images"
+                );
+                // Keep the summary so clients can show which stage failed.
+                self.state(|s| s.ready_summary = Some(summary.clone()));
+                self.mark_failed(presenter, "ready", &reason);
+                if self.plan.kind == SessionKind::Remote {
+                    self.delete_clone().await;
+                }
+                self.persist_status("failed");
+            }
             Ok(Ok(summary)) => {
                 self.state(|s| s.set_ready(summary.clone()));
                 presenter.emit(SetupEventPayload::SetupComplete {
@@ -694,5 +714,175 @@ mod tests {
             !presenter.ready_frontend_called,
             "setup must not reach the ready stage"
         );
+    }
+
+    // ── WI 0125 B-1: a not-ready `ReadySummary` must fail setup ─────────────
+    //
+    // `ReadyEngine::run_to_completion` records a failed build/import as a
+    // row in its returned `Ok(summary)`, not as an `Err`. Before the B-1 fix
+    // `SessionSetup` treated any `Ok(summary)` as success, so a session whose
+    // agent image failed to build was still announced "ready".
+
+    /// A `ReadyFrontend` that answers every question but asserts nothing: it
+    /// exists only so `ReadyEngine::run_to_completion` can run to a terminal
+    /// phase without a real TUI/CLI/API frontend attached.
+    struct MinimalReadyFrontend;
+
+    impl crate::data::message::UserMessageSink for MinimalReadyFrontend {
+        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    impl crate::engine::agent::AgentImageFrontend for MinimalReadyFrontend {
+        fn report_step_status(
+            &mut self,
+            _step: &crate::data::setup_step::SetupStep,
+            _status: crate::data::step_status::StepStatus,
+        ) {
+        }
+        fn container_frontend(
+            &mut self,
+        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
+            unreachable!(
+                "Docker is unavailable under test isolation; BuildingBaseImage/\
+                 BuildingAgentImage both fail on the availability check before \
+                 ever reaching a container launch"
+            )
+        }
+    }
+    impl ReadyFrontend for MinimalReadyFrontend {
+        fn ask_create_dockerfile(
+            &mut self,
+            _dockerfile_path: &std::path::Path,
+        ) -> Result<bool, EngineError> {
+            Ok(true)
+        }
+        fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
+            Ok(false)
+        }
+        fn report_phase(&mut self, _phase: &crate::data::ready_phase::ReadyPhase) {}
+        fn report_summary(&mut self, _summary: &crate::data::ready_summary::ReadySummary) {}
+    }
+
+    /// Same recorded surface as `RecordingPresenter`, but with a real (if
+    /// minimal) ready frontend, so a run can reach the ready stage.
+    #[derive(Default)]
+    struct ReadyAwarePresenter {
+        events: Vec<SetupEventPayload>,
+        finished_called: bool,
+    }
+
+    impl ReadyAwarePresenter {
+        fn failures(&self) -> Vec<(String, String)> {
+            self.events
+                .iter()
+                .filter_map(|e| match e {
+                    SetupEventPayload::SetupFailed { stage, error } => {
+                        Some((stage.clone(), error.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl SessionSetupPresenter for ReadyAwarePresenter {
+        fn log(&mut self, _line: &str) {}
+        fn emit(&mut self, event: SetupEventPayload) {
+            self.events.push(event);
+        }
+        fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
+            Box::new(MinimalReadyFrontend)
+        }
+        fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
+            Box::new(RecordingMessageSink::new())
+        }
+        async fn finished(&mut self) {
+            self.finished_called = true;
+        }
+    }
+
+    /// A local session (no clone/branch stages) whose `ReadyEngine` run
+    /// records a failed required image stage (the Docker runtime's base/agent
+    /// image build, with Docker unavailable under test isolation) must reach
+    /// the `failed` terminal state — never be announced `ready` — and must
+    /// keep the (not-ready) summary so clients can show which stage failed.
+    #[tokio::test]
+    async fn a_local_setup_with_a_failed_required_image_stage_fails_not_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let workdir = root.path().to_path_buf();
+        // Pre-create both Dockerfiles so the run reaches the image-build
+        // phases (and the unavailability check) instead of stopping earlier
+        // at a Dockerfile-creation prompt or a network download.
+        std::fs::write(workdir.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        let awman_dir = workdir.join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
+
+        let plan = SessionCreatePlan {
+            kind: SessionKind::Local,
+            resolved_workdir: workdir.clone(),
+            cloned_path: None,
+            repo_url: None,
+            branch: None,
+        };
+
+        let api_root = tempfile::tempdir().unwrap();
+        let paths = ApiPaths::from_root(api_root.path());
+        let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
+        store
+            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
+                id: "sess-local-not-ready",
+                workdir: &workdir.display().to_string(),
+                created_at: "2026-09-22T00:00:00Z",
+                setup_status: SessionSetupStatus::Initializing,
+                kind: SessionKind::Local,
+                cloned_path: None,
+            })
+            .unwrap();
+        let setup_state = Arc::new(std::sync::RwLock::new(SessionSetupState::new()));
+
+        let setup = SessionSetup::new(
+            "sess-local-not-ready".to_string(),
+            plan,
+            test_engines(),
+            Arc::new(SessionManager::in_memory()),
+            Arc::clone(&setup_state),
+            Arc::clone(&store),
+            paths.clone(),
+        );
+        let mut presenter = ReadyAwarePresenter::default();
+        setup.run(&mut presenter).await;
+
+        let failures = presenter.failures();
+        assert_eq!(
+            failures.len(),
+            1,
+            "exactly one failure should be reported; got {failures:?}"
+        );
+        assert_eq!(failures[0].0, "ready");
+
+        let final_state = setup_state.read().unwrap().clone();
+        assert_eq!(final_state.status, SessionSetupStatus::Failed);
+        assert_eq!(
+            final_state.error.as_ref().map(|e| e.stage.as_str()),
+            Some("ready")
+        );
+        assert!(
+            final_state.ready_summary.is_some(),
+            "the not-ready summary must be kept so clients can show which stage failed"
+        );
+        assert!(
+            !final_state.ready_summary.as_ref().unwrap().is_ready(),
+            "the kept summary must itself report not-ready"
+        );
+
+        let row = store.get_session("sess-local-not-ready").unwrap().unwrap();
+        assert_eq!(
+            row.setup_status, "failed",
+            "a summary with a failed required image stage must never persist as ready \
+             (this is the exact regression B-1 fixed)"
+        );
+        assert!(presenter.finished_called, "finished() must run");
     }
 }

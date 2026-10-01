@@ -1044,10 +1044,34 @@ impl ReadyFrontend for ApiDispatchFrontend {
     fn report_phase(&mut self, phase: &ReadyPhase) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "ready".to_string(),
-            message: format!("Ready phase: {phase:?}"),
+            // The shared `ReadyPhase` Display text, as the TUI reports it.
+            message: format!("ready: {phase}"),
         });
     }
-    fn report_summary(&mut self, _summary: &ReadySummary) {}
+
+    /// The rows, outcome line and hint are the summary's own (F-23;
+    /// readiness now accounts for per-image build/import results too). This
+    /// reports them through the same `StatusMessage` event path every other
+    /// `ready` progress line already uses, rather than discarding the
+    /// summary as before.
+    fn report_summary(&mut self, summary: &ReadySummary) {
+        for (label, status) in summary.rows() {
+            self.event_bus.emit(EventPayload::StatusMessage {
+                phase: "ready".to_string(),
+                message: format!("{label}: {}", status.label()),
+            });
+        }
+        if let Some(hint) = summary.hint() {
+            self.event_bus.emit(EventPayload::StatusMessage {
+                phase: "ready".to_string(),
+                message: format!("Tip: {hint}"),
+            });
+        }
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "ready".to_string(),
+            message: summary.outcome_line().to_string(),
+        });
+    }
 }
 
 // ─── Per-command frontend markers ───────────────────────────────────────────
@@ -1177,6 +1201,86 @@ mod tests {
         let sender = bus.sender();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         ApiDispatchFrontend::new(subcommand, &args, sender)
+    }
+
+    // ─── ReadyFrontend::{report_phase, report_summary} ─────────────────────
+    //
+    // Before WI 0125, `report_summary` was a no-op here — the API dropped the
+    // whole `ReadySummary`. It now emits one `StatusMessage` per row, the
+    // hint (if any), and the outcome line, through the same event path every
+    // other ready/init progress line already uses.
+
+    fn status_messages(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let crate::data::execution_event::EventPayload::StatusMessage { message, .. } =
+                event.payload
+            {
+                out.push(message);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn report_phase_emits_a_status_message_with_the_shared_ready_phase_display() {
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("ready", &[], bus.sender());
+
+        ReadyFrontend::report_phase(&mut fe, &ReadyPhase::ImportingAgentImage);
+
+        let messages = status_messages(&mut rx);
+        assert!(
+            messages.contains(&"ready: Importing agent image...".to_string()),
+            "{messages:?}"
+        );
+    }
+
+    /// `report_summary` was a no-op `fn report_summary(&mut self, _summary: &ReadySummary) {}`
+    /// before WI 0125: this is the regression it fixed. Every row, the hint,
+    /// and the outcome line must now reach the event stream.
+    #[test]
+    fn report_summary_emits_rows_hint_and_outcome_line() {
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("ready", &[], bus.sender());
+
+        let mut summary = ReadySummary::new("builtin");
+        summary.dockerfile = StepStatus::Done;
+        summary.base_image = StepStatus::Skipped;
+        summary.agent_image = StepStatus::Failed("daemon unreachable".into());
+
+        ReadyFrontend::report_summary(&mut fe, &summary);
+
+        let messages = status_messages(&mut rx);
+        assert!(
+            !summary.is_ready(),
+            "sanity: this summary must not be ready"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == &format!("Dockerfile: {}", StepStatus::Done.label())),
+            "every row must be reported: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("daemon unreachable")),
+            "the failed row's message must reach the event stream: {messages:?}"
+        );
+        assert!(
+            messages.contains(
+                &"Tip: complete the required image steps, then run \"awman ready\" again."
+                    .to_string()
+            ),
+            "{messages:?}"
+        );
+        assert!(
+            messages.contains(&"awman is not ready.".to_string()),
+            "the outcome line must be the summary's own, last: {messages:?}"
+        );
     }
 
     // ─── flag_bool ────────────────────────────────────────────────────────────

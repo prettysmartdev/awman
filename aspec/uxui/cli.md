@@ -188,23 +188,30 @@ repo config ships with the checkout and may be untrusted. For example:
 }
 ```
 
-Image source objects use one explicit `type`: `registry`, `docker-store`,
-`apple-local` (alias `apple-store`), or `archive`. Registry settings may select anonymous, named
+Image source objects use one explicit `type`: `registry`, `docker-local`,
+`apple-local`, or `archive`. Registry settings may select anonymous, named
 environment variables, OS keychain, or Docker-config credentials and may
-declare per-host CA/insecure-registry settings. Docker-store settings may
-select a local or remote Engine endpoint and TLS files. Apple-store acquisition
+declare per-host CA/insecure-registry settings. Docker-local settings may
+select a local or remote Engine endpoint and TLS files. Apple-local acquisition
 (macOS) is an in-process, version-gated XPC bridge to the Apple Containers
 image helper: it refuses service releases outside the pinned list, never runs
 the `container` CLI or reads the private store, and validates the export like
-any other archive. Off macOS, or without the bridge, it is reported blocked. `ready`
-imports existing images; image building remains an external step using the
-project Dockerfiles. The builtin backend does not build or silently choose
-another source.
+any other archive. Off macOS, or without the bridge, it is reported blocked.
+`builtin.builder.enabled` defaults to false. When enabled, `ready` may build
+only through the local Docker Engine or Apple Containers store selected by
+that image's resolved source, then imports from that same source. Registry,
+archive, remote Docker, and unconfigured sources do not select a builder.
+Incompatible requested builds warn and retain normal source import behavior.
+Workflow preflight and squad image checks remain import-only. The builtin
+backend does not silently choose another source or change the selected
+execution runtime.
 
 The internal `awman machine …` first-argument route is reserved for the
 same-executable microVM worker and is not a public command. Existing runtime
 selection commands and config editing follow the command catalogue; typed
 image-source maps are edited in config rather than guessed from Docker CLI
 flags. The builtin runtime rejects ambient `MSB_PATH`,
-`MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, or `MSB_BACKEND` overrides
-instead of loading an installed runtime.
+`MSB_LIBKRUNFW_PATH`, `MSB_AGENTD_PATH`, `MSB_HOME`, `MSB_BACKEND`,
+`MSB_CONFIG_PATH`, `MSB_PROFILE`, `MSB_CACHE_DIR`, `MSB_SANDBOXES_DIR`,
+`MSB_VOLUMES_DIR`, `MSB_SNAPSHOTS_DIR`, `MSB_LOGS_DIR`, or `MSB_SECRETS_DIR`
+overrides instead of loading an installed runtime.

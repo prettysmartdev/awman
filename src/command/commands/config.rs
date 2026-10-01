@@ -7,7 +7,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::config::config_json::{apply_config_field, config_field_value};
-use crate::data::config::fields::{field_spec, FieldScope, CONFIG_FIELDS};
+use crate::data::config::fields::{field_spec, implicit_default, FieldScope, CONFIG_FIELDS};
 use crate::data::message::UserMessageSink;
 
 /// Field names that were removed in WI-0082 (overlay unification). Naming any
@@ -121,6 +121,13 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
                     .unwrap_or_default()
             )),
         };
+    }
+    if field == crate::data::config::builtin_runtime::BUILDER_ENABLED_FIELD {
+        // The generic bool fallback below also accepts exactly "true"/"false"
+        // and would coerce the same way, but routes through here for the
+        // field-naming error message `parse_enabled` gives on anything else.
+        return crate::data::config::builtin_runtime::BuiltinBuilderConfig::parse_enabled(value)
+            .map(serde_json::Value::Bool);
     }
     if let Some(agent) = agents_to_models_entry_key(field) {
         validate_agents_to_models_key(agent)?;
@@ -463,7 +470,10 @@ pub fn collect_config_rows(
         }
         let g = config_field_value(global, name);
         let r = config_field_value(repo, name);
-        let effective = r.clone().or_else(|| g.clone());
+        let effective = r
+            .clone()
+            .or_else(|| g.clone())
+            .or_else(|| implicit_default(name).map(str::to_string));
         let (global_writable, repo_writable) = field_writability(name);
         rows.push(ConfigFieldRow {
             field: (*name).to_string(),
@@ -806,7 +816,10 @@ impl Command for ConfigCommand {
                     &serde_json::to_value(session.repo_config()).unwrap_or(serde_json::Value::Null),
                     &f.field,
                 );
-                let effective_value = repo_value.clone().or_else(|| global_value.clone());
+                let effective_value = repo_value
+                    .clone()
+                    .or_else(|| global_value.clone())
+                    .or_else(|| implicit_default(&f.field).map(str::to_string));
                 ConfigOutcome::Get(ConfigGetOutcome {
                     field: f.field,
                     global_value,
@@ -1141,6 +1154,73 @@ mod tests {
         assert!(validate_and_coerce("runtime", "dokcer").is_err());
     }
 
+    // ── validate_and_coerce: builtin.builder.enabled (WI 0125) ──────────────
+
+    #[test]
+    fn validate_and_coerce_builder_enabled_accepts_true_and_false() {
+        assert_eq!(
+            validate_and_coerce("builtin.builder.enabled", "true").unwrap(),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            validate_and_coerce("builtin.builder.enabled", "false").unwrap(),
+            serde_json::Value::Bool(false)
+        );
+        // `parse_enabled` trims surrounding whitespace.
+        assert_eq!(
+            validate_and_coerce("builtin.builder.enabled", "  true  ").unwrap(),
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    /// `validate_and_coerce` routes `builtin.builder.enabled` through
+    /// `BuiltinBuilderConfig::parse_enabled` (not the generic bool/string
+    /// fallback), so the error names the field and rejects truthy spellings
+    /// a generic bool coercion might otherwise accept.
+    #[test]
+    fn validate_and_coerce_builder_enabled_rejects_non_boolean_spellings() {
+        for bad in ["yes", "1", "TRUE", ""] {
+            let err = validate_and_coerce("builtin.builder.enabled", bad).unwrap_err();
+            assert!(
+                err.contains("builtin.builder.enabled"),
+                "error for {bad:?} must name the field: {err}"
+            );
+        }
+    }
+
+    /// `config show`/`get` must show the documented default (`false`) as the
+    /// *effective* value when nothing sets it, while leaving the global and
+    /// repo cells unset so scope inheritance stays visible (review-config
+    /// finding 3).
+    #[test]
+    fn collect_config_rows_builder_enabled_effective_default_is_false_but_cells_stay_unset() {
+        let rows = collect_config_rows(&serde_json::json!({}), &serde_json::json!({}));
+        let row = rows
+            .iter()
+            .find(|r| r.field == "builtin.builder.enabled")
+            .expect("builtin.builder.enabled row must be present");
+        assert_eq!(row.effective_value.as_deref(), Some("false"));
+        assert_eq!(row.global_value, None);
+        assert_eq!(row.repo_value, None);
+    }
+
+    /// An explicit repo `false` still displays as the effective value even
+    /// when a global `true` is set — repo overrides global, not merely
+    /// "inherits unless absent".
+    #[test]
+    fn collect_config_rows_builder_enabled_repo_false_overrides_global_true() {
+        let global = serde_json::json!({"builtin": {"builder": {"enabled": true}}});
+        let repo = serde_json::json!({"builtin": {"builder": {"enabled": false}}});
+        let rows = collect_config_rows(&global, &repo);
+        let row = rows
+            .iter()
+            .find(|r| r.field == "builtin.builder.enabled")
+            .unwrap();
+        assert_eq!(row.global_value.as_deref(), Some("true"));
+        assert_eq!(row.repo_value.as_deref(), Some("false"));
+        assert_eq!(row.effective_value.as_deref(), Some("false"));
+    }
+
     #[test]
     fn validate_and_coerce_agent_invalid() {
         let err = validate_and_coerce("agent", "notareal").unwrap_err();
@@ -1416,6 +1496,27 @@ mod tests {
             err.contains("workItems"),
             "the reason must name the field: {err}"
         );
+    }
+
+    #[test]
+    fn builtin_builder_cli_set_round_trips_as_nested_boolean() {
+        let cfg = crate::data::config::repo::RepoConfig::default();
+        let edited = updated_config(
+            &cfg,
+            "builtin.builder.enabled",
+            validate_and_coerce("builtin.builder.enabled", "true").unwrap(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&edited).unwrap();
+        assert_eq!(json["builtin"]["builder"]["enabled"], true);
+        assert!(json.get("builtin.builder.enabled").is_none());
+        assert_eq!(
+            validate_and_coerce("builtin.builder.enabled", "false").unwrap(),
+            serde_json::json!(false)
+        );
+        assert!(validate_and_coerce("builtin.builder.enabled", "yes")
+            .unwrap_err()
+            .contains("builtin.builder.enabled"));
     }
 
     // ── remove_config_field / apply_config_field ─────────────────────────────

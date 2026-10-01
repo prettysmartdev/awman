@@ -190,6 +190,35 @@ fn tmp_entries(state: &Path) -> usize {
         .unwrap_or(0)
 }
 
+#[test]
+fn inspect_local_reports_index_as_unbound_without_exporting() {
+    let fake = Fake::new(
+        serde_json::json!([entry("agent:latest", &digest('a'), INDEX)]),
+        Save::Nothing,
+    );
+    let control = crate::engine::container::host_cli_backend::BuildControl::new(
+        crate::engine::oci::CancelToken::new(),
+        Duration::from_secs(1),
+    );
+    let found = inspect_local(&fake, "agent:latest", &arm64(), &control).unwrap();
+    assert_eq!(found, crate::engine::oci::SourceImage::Unbound);
+    assert_eq!(fake.routes(), vec!["ping", "imageList"]);
+}
+
+#[test]
+fn inspect_local_rejects_wrong_platform_manifest() {
+    let mut listed = entry("agent:latest", &digest('b'), MANIFEST);
+    listed["descriptor"]["platform"] = serde_json::json!({"os": "linux", "architecture": "amd64"});
+    let fake = Fake::new(serde_json::json!([listed]), Save::Nothing);
+    let control = crate::engine::container::host_cli_backend::BuildControl::new(
+        crate::engine::oci::CancelToken::new(),
+        Duration::from_secs(1),
+    );
+    let found = inspect_local(&fake, "agent:latest", &arm64(), &control).unwrap();
+    assert_eq!(found, crate::engine::oci::SourceImage::Absent);
+    assert_eq!(fake.routes(), vec!["ping", "imageList"]);
+}
+
 // ── Release check ──────────────────────────────────────────────────────────
 
 fn ping(version: &str, commit: &str, build: &str) -> XpcReply {

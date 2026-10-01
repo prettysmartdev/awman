@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::data::ready_image::{ReadyBaseImageResult, ReadyImageResult, ReadyImageWarning};
 use crate::data::step_status::StepStatus;
 
 /// Non-secret host credential health shown by `awman ready`.
@@ -31,6 +32,17 @@ pub struct ReadySummary {
     /// show no row for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_source: Option<StepStatus>,
+    /// Per-image build and import results, for runtimes that import images.
+    /// Empty on build runtimes and in summaries written before they existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_results: Vec<ReadyImageResult>,
+    /// Project base images built into source stores, one per store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_image_results: Vec<ReadyBaseImageResult>,
+    /// How `ready --build` prepares agent images here; selects the hint's
+    /// wording.
+    #[serde(default)]
+    pub image_action: ReadyImageAction,
 }
 
 impl ReadySummary {
@@ -48,6 +60,9 @@ impl ReadySummary {
             agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
             image_source: None,
+            image_results: Vec::new(),
+            base_image_results: Vec::new(),
+            image_action: ReadyImageAction::Build,
         }
     }
 
@@ -88,10 +103,165 @@ impl ReadySummary {
         for (label, status) in &self.non_default_agent_images {
             rows.push((label.clone(), status.clone()));
         }
+        for base in &self.base_image_results {
+            rows.push((format!("Base image in {}", base.store), base.build.clone()));
+        }
+        for image in &self.image_results {
+            rows.push((format!("Build image: {}", image.agent), image.build.clone()));
+            rows.push((
+                format!("Import image: {}", image.agent),
+                image.import.clone(),
+            ));
+        }
         for health in &self.agent_credentials {
             rows.push(health.row());
         }
         rows
+    }
+
+    /// Every warning raised while preparing images, in result order.
+    pub fn warnings(&self) -> impl Iterator<Item = &ReadyImageWarning> {
+        self.image_results.iter().flat_map(|r| r.warnings.iter())
+    }
+
+    /// Whether a required step failed: a top-level step `awman ready` owns,
+    /// a non-default agent image, a base-image build, or either stage of any
+    /// per-image result. Warnings and the audit are not failures. This is
+    /// the broad reading the legacy `ready --json` `ready` field reports;
+    /// the exit status and outcome line use [`Self::is_ready`].
+    pub fn has_failures(&self) -> bool {
+        let failed = |s: &StepStatus| matches!(s, StepStatus::Failed(_));
+        [&self.dockerfile, &self.local_agent, &self.image_rebuild]
+            .into_iter()
+            .any(failed)
+            || self.non_default_agent_images.iter().any(|(_, s)| failed(s))
+            || self.has_image_failures()
+    }
+
+    /// Whether a required image stage failed: the base or default agent
+    /// image, the image source, a base-image build in a source store, or
+    /// either stage of a per-image result. Host-side checks (local agent,
+    /// Dockerfile prompt) and optional non-default images are not image
+    /// stages and keep their pre-existing, non-fatal reading.
+    fn has_image_failures(&self) -> bool {
+        let failed = |s: &StepStatus| matches!(s, StepStatus::Failed(_));
+        failed(&self.base_image)
+            || failed(&self.agent_image)
+            || self.image_source.as_ref().is_some_and(failed)
+            || self.base_image_results.iter().any(|b| failed(&b.build))
+            || self
+                .image_results
+                .iter()
+                .filter(|r| !r.optional)
+                .any(ReadyImageResult::has_failure)
+    }
+
+    /// Whether `awman ready` prepared every required image: no image stage
+    /// failed and no per-image or base-image stage was left pending or
+    /// running. Drives the outcome line, the process exit status and remote
+    /// session setup.
+    pub fn is_ready(&self) -> bool {
+        !self.has_image_failures()
+            && self.base_image.is_terminal()
+            && self.agent_image.is_terminal()
+            && self
+                .base_image_results
+                .iter()
+                .all(|b| b.build.is_terminal())
+            && !self
+                .image_results
+                .iter()
+                .filter(|r| !r.optional)
+                .any(ReadyImageResult::is_unfinished)
+    }
+
+    /// Why [`Self::is_ready`] is false: the first failed or unfinished
+    /// required image stage, as `"<row label>: <message>"`. `None` when
+    /// ready.
+    pub fn not_ready_reason(&self) -> Option<String> {
+        if self.is_ready() {
+            return None;
+        }
+        let mut stages: Vec<(String, &StepStatus)> = vec![
+            ("Base image".into(), &self.base_image),
+            ("Agent image".into(), &self.agent_image),
+        ];
+        if let Some(status) = &self.image_source {
+            stages.push(("Image source".into(), status));
+        }
+        for base in &self.base_image_results {
+            stages.push((format!("Base image in {}", base.store), &base.build));
+        }
+        for image in self.image_results.iter().filter(|r| !r.optional) {
+            stages.push((format!("Build image: {}", image.agent), &image.build));
+            stages.push((format!("Import image: {}", image.agent), &image.import));
+        }
+        let failed = stages
+            .iter()
+            .find(|(_, s)| matches!(s, StepStatus::Failed(_)));
+        let unfinished = || stages.iter().find(|(_, s)| !s.is_terminal());
+        Some(match failed.or_else(unfinished) {
+            Some((label, StepStatus::Failed(message))) => format!("{label}: {message}"),
+            Some((label, status)) => format!("{label}: {}", status.label()),
+            None => "a required image stage did not complete".to_string(),
+        })
+    }
+
+    /// The closing line every frontend prints after the summary.
+    pub fn outcome_line(&self) -> &'static str {
+        if self.is_ready() {
+            "awman is ready."
+        } else {
+            "awman is not ready."
+        }
+    }
+
+    /// What to do next, if anything: how to recover from a failure, or how
+    /// to prepare the non-default agent images that are missing. The verb
+    /// follows how this runtime acquires images ([`ReadyImageAction`]).
+    pub fn hint(&self) -> Option<String> {
+        if !self.is_ready() {
+            return Some(
+                "complete the required image steps, then run \"awman ready\" again.".to_string(),
+            );
+        }
+        let missing = self
+            .non_default_agent_images
+            .iter()
+            .any(|(_, s)| matches!(s, StepStatus::Warn(_)));
+        missing.then(|| {
+            format!(
+                "run \"ready --build\" to {} all available agent images.",
+                self.image_action.verb()
+            )
+        })
+    }
+}
+
+/// How `ready --build` prepares agent images on the summary's runtime, set
+/// by the ready engine from the runtime's image-acquisition capability and
+/// whether the builtin builder is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadyImageAction {
+    /// The runtime builds images itself (Docker, Apple Containers).
+    #[default]
+    Build,
+    /// The runtime imports images from their configured sources.
+    Import,
+    /// The runtime imports images, building them first in their source
+    /// store where the source allows it.
+    BuildAndImport,
+}
+
+impl ReadyImageAction {
+    /// The verb phrase used in the hint.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Import => "import",
+            Self::BuildAndImport => "build and import",
+        }
     }
 }
 
@@ -120,6 +290,33 @@ impl AgentCredentialHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfinished_required_images_are_not_ready() {
+        let mut summary = ReadySummary::new("docker");
+        assert!(!summary.is_ready());
+        assert_eq!(
+            summary.not_ready_reason().as_deref(),
+            Some("Base image: pending")
+        );
+        summary.base_image = StepStatus::Done;
+        assert_eq!(
+            summary.not_ready_reason().as_deref(),
+            Some("Agent image: pending")
+        );
+        summary.agent_image = StepStatus::Done;
+        assert!(summary.is_ready());
+    }
+
+    #[test]
+    fn a_failed_local_agent_keeps_completed_images_ready() {
+        let mut summary = ReadySummary::new("docker");
+        summary.base_image = StepStatus::Done;
+        summary.agent_image = StepStatus::Done;
+        summary.local_agent = StepStatus::Failed("unavailable".into());
+        assert!(summary.is_ready());
+        assert!(summary.has_failures());
+    }
 
     #[test]
     fn build_runtimes_show_no_image_source_row() {

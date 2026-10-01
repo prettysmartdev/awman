@@ -539,7 +539,9 @@ impl ContainerBackend for BuiltinBackend {
             },
             &Env::for_image_acquisition(&self.settings.registries),
         )
-        .with_cancel(cancel.clone());
+        .with_cancel(cancel.clone())
+        .with_expected_built_identity(request.expected_built_identity.clone())
+        .with_export_selector(request.immutable_export_selector.clone());
         let acquired = acquirer.acquire(
             &AcquireRequest {
                 tag: request.tag.clone(),
