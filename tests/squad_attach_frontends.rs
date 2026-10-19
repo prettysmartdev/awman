@@ -288,7 +288,9 @@ fn squad_app() -> App {
     App::new(
         CommandCatalogue::get(),
         engines,
-        Arc::new(SessionManager::in_memory()),
+        Arc::new(SessionManager::in_memory(
+            awman::data::config::env::EnvSnapshot::empty(),
+        )),
         Tab::new_squad(session()),
         test_runtime_handle(),
     )

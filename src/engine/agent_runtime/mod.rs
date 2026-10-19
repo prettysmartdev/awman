@@ -31,6 +31,8 @@ use crate::engine::sandbox::SandboxRuntime;
 
 pub mod background;
 pub mod capabilities;
+#[cfg(test)]
+pub(crate) mod conformance;
 pub mod execution;
 pub mod frontend;
 pub mod output_tail;
@@ -411,7 +413,10 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
             Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
         }
         RuntimeSelection::BuiltinExperimental => {
-            let resolved = config.builtin_settings()?;
+            // Process-wide settings only: a repo whose per-launch `builtin`
+            // settings are invalid (e.g. a widening network block) fails its
+            // own launches, not runtime detection for the whole process.
+            let resolved = config.builtin_process_settings()?;
             let settings = BuiltinRuntimeSettings::resolve(&resolved);
             Ok(DetectedRuntime::Container(Arc::new(
                 ContainerRuntime::builtin(settings)?,
@@ -590,6 +595,43 @@ mod tests {
                 assert!(variable.starts_with("MSB_"))
             }
             Err(e) => panic!("expected the builtin runtime or its unavailability, got: {e:?}"),
+        }
+    }
+
+    /// A repo whose per-launch `builtin` settings are invalid (here a network
+    /// block that widens the global one) fails its own launches only. Runtime
+    /// detection, which a TUI or API server started in that repo runs once
+    /// for the whole process, must not refuse on it.
+    #[test]
+    fn detect_builtin_ignores_a_repos_invalid_launch_settings() {
+        use crate::data::config::{FlagConfig, RepoConfig};
+        let config = EffectiveConfig::new(
+            FlagConfig::default(),
+            crate::data::config::env::EnvSnapshot::empty(),
+            RepoConfig {
+                builtin: Some(
+                    serde_json::from_str(r#"{"network":{"mode":"public"},"vcpus":0}"#).unwrap(),
+                ),
+                ..Default::default()
+            },
+            GlobalConfig {
+                runtime: Some("builtin-experimental".into()),
+                builtin: Some(serde_json::from_str(r#"{"network":{"mode":"none"}}"#).unwrap()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            config.builtin_settings().is_err(),
+            "the launch settings are invalid"
+        );
+        match detect_effective(&config) {
+            Ok(rt) => assert_eq!(rt.engine().runtime_name(), "builtin"),
+            Err(
+                EngineError::BuiltinRuntimeUnavailable { .. }
+                | EngineError::BuiltinTargetUnreleased { .. }
+                | EngineError::AmbientRuntimeOverride { .. },
+            ) => {}
+            Err(e) => panic!("detection must not validate per-launch settings, got: {e:?}"),
         }
     }
 

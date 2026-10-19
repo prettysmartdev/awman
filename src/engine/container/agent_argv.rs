@@ -60,10 +60,9 @@ impl AgentArgv {
             argv.extend(options.agent_flags.iter().cloned());
             return Ok(Self(argv));
         }
-        // Some agents take a sub-command (e.g. "run") rather than a flag.
-        if let Some(flag) = &options.non_interactive_flag {
-            argv.push(flag.clone());
-        }
+        // The non-interactive sub-command or flag (`exec`, `run`, `--print`) is
+        // already part of the entrypoint (`agent_matrix::entrypoint_for`); it
+        // is never repeated here.
         // Per-agent mode flags (yolo, auto, plan) — literal args.
         argv.extend(options.agent_mode_flags.iter().cloned());
         for (tools, flag, restriction) in [

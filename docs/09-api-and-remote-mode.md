@@ -1668,7 +1668,7 @@ awman remote exec workflow path/to/workflow.toml --yolo --work-item 0042 --sessi
 | `--remote-addr <URL>` | | Remote host address. Overrides `AWMAN_REMOTE_ADDR` and `remote.defaultAddr` |
 | `--api-key <KEY>` | | API key for the remote server. Overrides `AWMAN_API_KEY` and `remote.defaultAPIKey` |
 
-Plus all `exec workflow` flags (except `--worktree`): `--work-item`, `--yolo`, `--auto`, `--plan`, `--agent`, `--model`, `--overlay`, `--issue`, `-n/--non-interactive`.
+Plus all `exec workflow` flags (except `--worktree`): `--work-item`, `--yolo`, `--auto`, `--plan`, `--agent`, `--model`, `--overlay`, `--issue`, `-n/--non-interactive`. `--agent-flag` is accepted but not forwarded: awman warns, and the remote host uses its own `agentFlags`.
 
 ### Session resolution
 

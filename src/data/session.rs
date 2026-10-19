@@ -422,6 +422,9 @@ pub struct Session {
     created_at_instant: Instant,
 }
 
+/// The agent a session runs when no flag or config names one.
+pub const FALLBACK_AGENT: &str = "claude";
+
 /// Builder-style options for constructing a `Session`.
 #[derive(Debug, Default, Clone)]
 pub struct SessionOpenOptions {
@@ -497,6 +500,41 @@ impl Session {
         opts: SessionOpenOptions,
     ) -> Result<Self, DataError> {
         Self::open_resolved(working_dir, git_root, opts, true)
+    }
+
+    /// Open a session re-rooted at a workflow worktree on behalf of `invoker`.
+    ///
+    /// The worktree checkout is cut from a commit, so its `.awman/config.json`
+    /// lacks the invoker's uncommitted edits ("use last commit", or a resumed
+    /// older worktree, make that common). Some settings must still be the
+    /// invoker's:
+    /// - the repo `builtin` block, whose network, vCPU and memory narrowing is
+    ///   a security control;
+    /// - the repo `agent`, which decides the agent a step runs when it names
+    ///   none (and so which agent `--agent-flag` targets);
+    /// - the env, flags and global config, so a relocated `AWMAN_CONFIG_HOME`
+    ///   is honoured exactly as the invoker honoured it.
+    ///
+    /// Everything else comes from the worktree checkout.
+    pub fn open_worktree_for(
+        working_dir: PathBuf,
+        git_root: PathBuf,
+        invoker: &Session,
+    ) -> Result<Self, DataError> {
+        let mut session = Self::open_at_git_root(
+            working_dir,
+            git_root,
+            SessionOpenOptions {
+                flags: invoker.flags.clone(),
+                env: Some(invoker.env.clone()),
+                available_agents: Some(invoker.available_agents.clone()),
+            },
+        )?;
+        session.repo_config.builtin = invoker.repo_config.builtin.clone();
+        session.repo_config.agent = invoker.repo_config.agent.clone();
+        session.global_config = invoker.global_config.clone();
+        session.default_agent = invoker.default_agent.clone();
+        Ok(session)
     }
 
     /// The one constructor. `is_git_repo` records what the caller's resolution
@@ -597,6 +635,16 @@ impl Session {
 
     pub fn default_agent(&self) -> Option<&AgentName> {
         self.default_agent.as_ref()
+    }
+
+    /// The agent this session runs when nothing names one: its configured
+    /// default agent (flag > repo > global), else `claude`. `ready` prepares
+    /// this agent's image as the required one; every other agent's image is
+    /// optional and may not reuse a single-image default source.
+    pub fn configured_agent(&self) -> AgentName {
+        self.default_agent.clone().unwrap_or_else(|| {
+            AgentName::new(FALLBACK_AGENT).expect("fallback agent name is valid")
+        })
     }
 
     pub fn available_agents(&self) -> &[AgentName] {

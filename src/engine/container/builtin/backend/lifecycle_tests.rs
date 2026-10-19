@@ -372,7 +372,6 @@ async fn acp_keeps_persistent_binary_clean_framing() {
     let mut acp = options("awman-acp");
     acp.acp = true;
     acp.interactive = false;
-    acp.non_interactive_flag = Some("--print".into());
     acp.seeded_prompt = Some("must not be injected".into());
     acp.entrypoint = Some(Entrypoint::new(["cline", "--acp"]));
     let instance = rig.backend.build(acp).unwrap();

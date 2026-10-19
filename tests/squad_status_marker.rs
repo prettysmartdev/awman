@@ -79,6 +79,7 @@ impl AgentRuntimeEngine for FakeRuntime {
             kit_declarative: false,
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+            per_launch_vm_settings: false,
         };
         &CAPS
     }

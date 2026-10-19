@@ -380,13 +380,18 @@ async fn set_pty_active_called_true_then_false_around_engine() {
     let _ = result;
 }
 
+/// A runtime that keeps every frontend it is handed past `wait()`: for
+/// `release_after` and then drops it from a thread of its own (a runtime that
+/// is merely slow to let go), or forever when that is `None`.
 struct HoldingRuntime {
     capabilities: crate::engine::agent_runtime::Capabilities,
     frontends: Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>,
+    release_after: Option<std::time::Duration>,
 }
 
 struct HoldingInstance {
     frontends: Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>,
+    release_after: Option<std::time::Duration>,
 }
 
 struct ImmediateExecution;
@@ -435,6 +440,13 @@ impl crate::engine::agent_runtime::AgentInstance for HoldingInstance {
             text: "held runtime message".into(),
         });
         self.frontends.lock().unwrap().push(frontend);
+        if let Some(delay) = self.release_after {
+            let frontends = self.frontends.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                frontends.lock().unwrap().clear();
+            });
+        }
         let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
         Ok(crate::engine::agent_runtime::AgentExecution::new(
             crate::data::session::AgentHandle {
@@ -469,6 +481,7 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for HoldingRuntime {
     ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
         Ok(Box::new(HoldingInstance {
             frontends: self.frontends.clone(),
+            release_after: self.release_after,
         }))
     }
     fn list_running(
@@ -499,6 +512,7 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for HoldingRuntime {
     ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
         Ok(Box::new(HoldingInstance {
             frontends: self.frontends.clone(),
+            release_after: self.release_after,
         }))
     }
     fn list_running_with_name_prefix(
@@ -552,6 +566,7 @@ async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
                     .capabilities()
                     .clone(),
                 frontends: frontends.clone(),
+                release_after: (!hold_forever).then(|| std::time::Duration::from_millis(300)),
             });
         engines.runtime = runtime.clone();
         engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
@@ -589,9 +604,14 @@ async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
             .unwrap()
             .iter()
             .any(|message| message.text == "held runtime message"));
-        if !hold_forever {
-            frontends.lock().unwrap().clear();
-        }
+        // The runtime, not the test, decides when the frontend goes: still held
+        // after the command returned, then released (or never) by the runtime.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        assert_eq!(
+            frontends.lock().unwrap().is_empty(),
+            !hold_forever,
+            "hold_forever={hold_forever}"
+        );
     }
 }
 
@@ -621,6 +641,7 @@ async fn interactive_phase_survives_runtime_holding_frontend_after_wait() {
         );
         let instance = Box::new(HoldingInstance {
             frontends: frontends.clone(),
+            release_after: (!hold_forever).then(|| std::time::Duration::from_millis(300)),
         });
         let output = tokio::task::spawn_blocking(move || phase.run_instance(instance))
             .await
@@ -634,9 +655,12 @@ async fn interactive_phase_survives_runtime_holding_frontend_after_wait() {
             .unwrap()
             .iter()
             .any(|message| message.text == "held runtime message"));
-        if !hold_forever {
-            frontends.lock().unwrap().clear();
-        }
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        assert_eq!(
+            frontends.lock().unwrap().is_empty(),
+            !hold_forever,
+            "hold_forever={hold_forever}"
+        );
     }
 }
 

@@ -155,7 +155,10 @@ impl ReadySummary {
         failed(&self.base_image)
             || failed(&self.agent_image)
             || self.image_source.as_ref().is_some_and(failed)
-            || self.base_image_results.iter().any(|b| failed(&b.build))
+            || self
+                .base_image_results
+                .iter()
+                .any(|b| !b.optional && failed(&b.build))
             || self
                 .image_results
                 .iter()
@@ -174,6 +177,7 @@ impl ReadySummary {
             && self
                 .base_image_results
                 .iter()
+                .filter(|b| !b.optional)
                 .all(|b| b.build.is_terminal())
             && !self
                 .image_results
@@ -196,7 +200,7 @@ impl ReadySummary {
         if let Some(status) = &self.image_source {
             stages.push(("Image source".into(), status));
         }
-        for base in &self.base_image_results {
+        for base in self.base_image_results.iter().filter(|b| !b.optional) {
             stages.push((format!("Base image in {}", base.store), &base.build));
         }
         for image in self.image_results.iter().filter(|r| !r.optional) {
@@ -382,6 +386,34 @@ mod tests {
         );
         summary.agent_image = StepStatus::Done;
         assert!(summary.is_ready());
+    }
+
+    /// A base image built only for a non-default agent is as optional as that
+    /// agent's image: its failure is reported but `ready` still succeeds. A
+    /// failed base the default agent needs fails readiness.
+    #[test]
+    fn only_a_required_base_image_failure_fails_ready() {
+        let mut summary = ReadySummary::new("builtin");
+        summary.base_image = StepStatus::Done;
+        summary.agent_image = StepStatus::Done;
+        summary.base_image_results.push(ReadyBaseImageResult {
+            store: "apple-containers".into(),
+            tag: "awman-repo:latest".into(),
+            build: StepStatus::Failed("build failed".into()),
+            optional: true,
+        });
+        assert!(summary.is_ready());
+        assert!(summary
+            .rows()
+            .iter()
+            .any(|(l, _)| l.contains("apple-containers")));
+
+        summary.base_image_results[0].optional = false;
+        assert!(!summary.is_ready());
+        assert_eq!(
+            summary.not_ready_reason().as_deref(),
+            Some("Base image in apple-containers: build failed")
+        );
     }
 
     #[test]

@@ -87,7 +87,19 @@ That's it — you have an isolated agent working in your repo.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 
-The **experimental builtin microVM runtime** (macOS on Apple Silicon only in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set --global runtime builtin-experimental`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere; setting `builtin.builder.enabled` opts into building through the configured local image source during `ready`. `awman init` still builds images with the configured runtime, so under `builtin-experimental` its image-build step fails and the agent audit is skipped: run `awman init` while `runtime` is `docker` or `apple-containers`, then switch.
+The **experimental builtin microVM runtime** (macOS on Apple Silicon only in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set --global runtime builtin-experimental`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere. To build and import in one command instead, point the image source at a local store and enable the builder:
+
+```json
+{
+  "runtime": "builtin-experimental",
+  "builtin": {
+    "builder": { "enabled": true },
+    "imageSource": { "type": "docker-local" }
+  }
+}
+```
+
+Then `awman ready` builds the Dockerfiles in that Docker Engine (`apple-local` uses Apple Containers) and imports the result; agents still run only in the builtin microVM. See [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). `awman init` still builds images with the configured runtime, so under `builtin-experimental` its image-build step fails and the agent audit is skipped: run `awman init` while `runtime` is `docker` or `apple-containers`, then switch.
 
 ### `awman init`
 
@@ -101,8 +113,8 @@ The **experimental builtin microVM runtime** (macOS on Apple Silicon only in thi
 | Flag | Effect |
 |------|--------|
 | `--refresh` | Re-run the agent audit and update `Dockerfile.dev` (use after toolchain changes) |
-| `--build` | Force-rebuild the images, including every agent in `.awman/` (builtin runtime: re-import them all from the configured image sources; nothing is built) |
-| `--no-cache` | Disable the Docker layer cache during builds (builtin runtime: re-import from the source) |
+| `--build` | Force-rebuild the images, including every agent in `.awman/` (builtin runtime: re-import them all from the configured image sources, building first when `builtin.builder.enabled` is on and the source is a local store) |
+| `--no-cache` | Disable the layer cache for any build that runs (builtin runtime: also re-import from the source) |
 | `-n`, `--non-interactive` | Run the verification agent in non-interactive mode |
 | `--json` | Print structured JSON instead of human output (implies `-n`) |
 | `--allow-docker` | Mount the host Docker socket into the agent container (not supported by the builtin runtime) |

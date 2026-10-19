@@ -1178,7 +1178,9 @@ fn make_app_no_container_runtime() -> App {
     let catalogue = CommandCatalogue::get();
     let mut engines = crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"));
     engines.container_runtime = None;
-    let session_manager = Arc::new(SessionManager::in_memory());
+    let session_manager = Arc::new(SessionManager::in_memory(
+        crate::data::config::env::EnvSnapshot::empty(),
+    ));
     let tab = Tab::new(make_session());
     App::new(
         catalogue,

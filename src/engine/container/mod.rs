@@ -43,6 +43,15 @@ pub use options::{
 pub use phase_step::PhaseStepContainerSpec;
 pub use runtime::ContainerRuntime;
 
+/// The container-tier runtimes (Docker, Apple Containers, builtin) for the
+/// cross-runtime frontend-release check (`agent_runtime::conformance`).
+#[cfg(all(test, unix))]
+pub(crate) fn conformance_launchers() -> Vec<crate::engine::agent_runtime::conformance::Launcher> {
+    let mut launchers = process::conformance_launchers();
+    launchers.push(builtin::conformance_launcher());
+    launchers
+}
+
 /// Cancellation and deadline for one host build step. Part of the
 /// `image_prep::builder::LocalImageBuilder` seam, so it is public; it carries
 /// no way to run anything.

@@ -305,13 +305,12 @@ impl EffectiveConfig {
             .validate_image_sources()
             .map_err(DataError::BuiltinConfig)?;
         let launch = self.builtin_launch_settings()?;
-        let env = self.env();
         let builder_enabled = builtin.builder_enabled();
+        let process = self.builtin_process_settings()?;
         Ok(ResolvedBuiltinConfig {
-            state_dir: self.builtin_state_dir()?,
-            ambient_overrides: env.ambient_msb_overrides(),
-            test_isolation: crate::data::config::env::test_isolation_active()
-                && !env.test_builtin(),
+            state_dir: process.state_dir,
+            ambient_overrides: process.ambient_overrides,
+            test_isolation: process.test_isolation,
             launch,
             image_source: builtin.image_source,
             images: builtin.images,
@@ -366,6 +365,24 @@ impl EffectiveConfig {
             network,
             repo_state_dir,
         })
+    }
+
+    /// The process-wide builtin settings runtime detection needs. Unlike
+    /// [`EffectiveConfig::builtin_settings`] it does not validate the
+    /// per-session parts (network narrowing, vCPUs, memory, image sources):
+    /// those fail each launch of the repo that sets them, not the process.
+    pub fn builtin_process_settings(
+        &self,
+    ) -> Result<crate::data::config::resolved_builtin::BuiltinProcessConfig, DataError> {
+        let env = self.env();
+        Ok(
+            crate::data::config::resolved_builtin::BuiltinProcessConfig {
+                state_dir: self.builtin_state_dir()?,
+                ambient_overrides: env.ambient_msb_overrides(),
+                test_isolation: crate::data::config::env::test_isolation_active()
+                    && !env.test_builtin(),
+            },
+        )
     }
 
     /// Effective builtin-runtime state directory:

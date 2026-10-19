@@ -282,7 +282,7 @@ See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for secu
 
 ### `--agent-flag <ARG>`
 
-Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`.
+Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` accepts it but does not forward it to the remote host, and warns.
 
 Because the value usually starts with `-`, write it in the `--agent-flag=<value>` form:
 
@@ -414,7 +414,7 @@ Commands submitted through the API (`POST /v1/commands`) run with `--yolo` appli
 ### Security considerations
 
 - `--yolo` removes the human checkpoints that catch unintended agent actions. Only use it with agents and work items you trust.
-- `yoloDisallowedTools` is a floor the agent can never cross — but only Claude enforces it. A launch that carries an allowed- or disallowed-tools list for an agent with no flag for it is refused on Docker, Apple Containers and the builtin runtime alike, with `invalid configuration: this agent declares no <allowed|disallowed>-tools flag, so its <allowed|disallowed>-tools list cannot be applied; awman refuses to launch it without the restriction. Remove the <allowed|disallowed>-tools list or use an agent that supports it.`, rather than starting the agent unrestricted.
+- `yoloDisallowedTools` is a floor the agent can never cross — but only Claude enforces it. A launch that carries an allowed- or disallowed-tools list for an agent with no flag for it is refused on Docker, Apple Containers, the builtin runtime and Docker Sandboxes alike, with `invalid configuration: this agent declares no <allowed|disallowed>-tools flag, so its <allowed|disallowed>-tools list cannot be applied; awman refuses to launch it without the restriction. Remove the <allowed|disallowed>-tools list or use an agent that supports it.`, rather than starting the agent unrestricted.
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
 - Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
 - Copilot and Crush support `--yolo` only — `--auto` has no equivalent for either and is dropped.

@@ -70,9 +70,25 @@ pub struct ReadyEngine {
 }
 
 impl ReadyEngine {
+    /// The builtin settings a `ReadyEngine` for `runtime` needs: resolved and
+    /// validated for a runtime that imports images, `None` for one that builds
+    /// them (Docker, Apple Containers). A `builtin` block is never read, so an
+    /// invalid or widening one cannot fail `ready` on a runtime that ignores it.
+    pub fn builtin_inputs(
+        session: &Session,
+        runtime: &dyn AgentRuntimeEngine,
+    ) -> Result<Option<ResolvedBuiltinConfig>, crate::data::error::DataError> {
+        if runtime.capabilities().image_acquisition == ImageAcquisition::Import {
+            session.effective_config().builtin_settings().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `resolved` comes from [`ReadyEngine::builtin_inputs`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        resolved: ResolvedBuiltinConfig,
+        resolved: Option<ResolvedBuiltinConfig>,
         data_home: std::path::PathBuf,
         session: Arc<Session>,
         git_engine: Arc<GitEngine>,
@@ -82,16 +98,29 @@ impl ReadyEngine {
         options: ReadyEngineOptions,
     ) -> Self {
         let runtime_name = runtime.runtime_name().to_string();
-        let builder_enabled = resolved.builder_enabled;
-        let preparer = crate::engine::image_prep::AgentImagePreparer::new(
-            resolved,
-            runtime.clone(),
-            data_home,
-            crate::engine::image_prep::ImageBuildContext::for_session(
-                &session,
-                options.agent.as_str(),
-            ),
+        let imports = runtime.capabilities().image_acquisition == ImageAcquisition::Import;
+        debug_assert!(
+            imports == resolved.is_some(),
+            "builtin inputs must come from ReadyEngine::builtin_inputs"
         );
+        let builder_enabled = resolved.as_ref().is_some_and(|r| r.builder_enabled);
+        let context = crate::engine::image_prep::ImageBuildContext::for_session(
+            &session,
+            options.agent.as_str(),
+        );
+        let preparer = match resolved {
+            Some(resolved) => crate::engine::image_prep::AgentImagePreparer::new(
+                resolved,
+                runtime.clone(),
+                data_home,
+                context,
+            ),
+            None => crate::engine::image_prep::AgentImagePreparer::for_building_runtime(
+                runtime.clone(),
+                data_home,
+                context,
+            ),
+        };
         let image_policy = crate::engine::image_prep::BuildPolicy::Ready {
             build: options.build,
             no_cache: options.no_cache,
@@ -125,7 +154,7 @@ impl ReadyEngine {
     /// API setup builds missing source images without forcing a rebuild.
     #[allow(clippy::too_many_arguments)]
     pub fn for_session_setup(
-        resolved: ResolvedBuiltinConfig,
+        resolved: Option<ResolvedBuiltinConfig>,
         data_home: std::path::PathBuf,
         session: Arc<Session>,
         git_engine: Arc<GitEngine>,

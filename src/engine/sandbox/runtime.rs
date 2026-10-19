@@ -25,6 +25,7 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
     kit_declarative: true,
     has_image_store: false,
     image_acquisition: crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+    per_launch_vm_settings: false,
 };
 
 pub struct SandboxRuntime {

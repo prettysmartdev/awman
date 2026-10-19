@@ -6,27 +6,16 @@ resolver = "2"
 [workspace.package]
 version = "0.12.0"
 
-[package]
-name = "awman"
-version.workspace = true
-edition = "2021"
-rust-version = "1.94.0"
-description = "A containerized code agent manager"
-# The binary and registered integration tests belong to awman-cli. This
-# package owns only the Layer 0–3 library and its unit tests.
-autotests = false
-autobins = false
-autoexamples = false
+# Shared dependency versions for every workspace member. Members inherit with
+# `dep = { workspace = true, ... }` and add only `optional` and extra
+# `features` (features are additive). Entries that disable default features
+# here stay disabled in every member, so only list `default-features = false`
+# where every member wants it.
+[workspace.dependencies]
+# Path dependencies between members.
+awman = { path = "." }
+awman-host-shims = { path = "crates/awman-host-shims" }
 
-[lib]
-name = "awman"
-path = "src/lib.rs"
-
-[features]
-default = []
-builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
-
-[dependencies]
 anyhow = "1"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -43,7 +32,9 @@ tempfile = "3"
 vt100 = { package = "vt100-ctt", version = "0.17", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-reqwest = { version = "0.13", features = ["rustls", "json", "stream", "blocking"], default-features = false }
+# Base feature set shared by normal and dev dependencies; normal dependencies
+# add `stream` and `blocking`.
+reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 tokio-stream = "0.1"
 unicode-width = "0.2"
 flate2 = "1"
@@ -68,22 +59,103 @@ thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 which = "8"
-hyper = { version = "1", features = ["client", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"], optional = true }
-http-body-util = { version = "0.1", optional = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "rustls-native-certs"], optional = true }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring", "rustls-native-certs"] }
+# Features vary per member (each adds its own).
+nix = "0.31"
+libc = "0.2"
+wiremock = "0.6"
+
+# Built-in runtime SDK pins. These exact versions must match `MSB_VERSION` in
+# `src/data/builtin_runtime.rs` and the vendored crates under `third_party/`;
+# a unit test there checks this table.
+microsandbox = { version = "=0.7.2", default-features = false, features = ["local", "net"] }
+microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"] }
+microsandbox-image = { version = "=0.7.2" }
+microsandbox-network = { version = "=0.7.2", default-features = false, features = ["engine"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
+msb_krun = { version = "=0.1.39" }
+
+[package]
+name = "awman"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.0"
+description = "A containerized code agent manager"
+# The binary and registered integration tests belong to awman-cli. This
+# package owns only the Layer 0–3 library and its unit tests.
+autotests = false
+autobins = false
+autoexamples = false
+
+[lib]
+name = "awman"
+path = "src/lib.rs"
+
+[features]
+default = []
+builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+dirs = { workspace = true }
+portable-pty = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+strip-ansi-escapes = { workspace = true }
+strsim = { workspace = true }
+tempfile = { workspace = true }
+vt100 = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream", "blocking"] }
+tokio-stream = { workspace = true }
+unicode-width = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+sha2 = { workspace = true }
+arboard = { workspace = true }
+shell-words = { workspace = true }
+toml = { workspace = true }
+serde_yaml = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http = { workspace = true }
+chrono = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+which = { workspace = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper-rustls = { workspace = true, optional = true }
 
 [build-dependencies]
-sha2 = "0.11"
-toml = "1"
+sha2 = { workspace = true }
+toml = { workspace = true }
 
 [target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies]
-microsandbox = { version = "=0.7.2", default-features = false, features = ["local", "net"], optional = true }
-microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"], optional = true }
-microsandbox-image = { version = "=0.7.2", optional = true }
-microsandbox-network = { version = "=0.7.2", default-features = false, features = ["engine"], optional = true }
-sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"], optional = true }
-msb_krun = { version = "=0.1.39", optional = true }
+microsandbox = { workspace = true, optional = true }
+microsandbox-cli = { workspace = true, optional = true }
+microsandbox-image = { workspace = true, optional = true }
+microsandbox-network = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+msb_krun = { workspace = true, optional = true }
 
 [patch.crates-io]
 sqlx-sqlite = { path = "third_party/sqlx-sqlite-0.9.0" }
@@ -94,9 +166,9 @@ microsandbox-network = { path = "third_party/microsandbox-network-0.7.2" }
 microsandbox-types = { path = "third_party/microsandbox-types-0.7.2" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process", "fs", "poll", "user"] }
-libc = "0.2"
+nix = { workspace = true, features = ["signal", "process", "fs", "poll", "user"] }
+libc = { workspace = true }
 
 [dev-dependencies]
-reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
-wiremock = "0.6"
+reqwest = { workspace = true }
+wiremock = { workspace = true }

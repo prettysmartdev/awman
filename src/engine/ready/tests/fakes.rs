@@ -218,6 +218,10 @@ pub(crate) struct FakeImportRuntime {
     /// Number of upcoming `import_image` calls that must fail (counts
     /// down), for "build succeeded, import failed" scenarios.
     pub(crate) fail_next_imports: std::sync::atomic::AtomicUsize,
+    /// When set, every `import_image` records how many build-lock files under
+    /// this directory are held by someone else at that moment.
+    pub(crate) lock_probe_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub(crate) locks_held_at_import: std::sync::Mutex<Vec<usize>>,
 }
 
 impl FakeImportRuntime {
@@ -238,6 +242,8 @@ impl FakeImportRuntime {
             cancel_observed: std::sync::atomic::AtomicBool::new(false),
             digest_override: std::sync::Mutex::new(None),
             fail_next_imports: std::sync::atomic::AtomicUsize::new(0),
+            lock_probe_dir: std::sync::Mutex::new(None),
+            locks_held_at_import: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -399,6 +405,10 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeImportRuntime {
         _sink: &mut dyn crate::data::message::UserMessageSink,
     ) -> Result<crate::engine::agent_runtime::ImportedImage, EngineError> {
         self.imports.lock().unwrap().push(request.clone());
+        if let Some(dir) = self.lock_probe_dir.lock().unwrap().clone() {
+            let held = held_lock_files(&dir);
+            self.locks_held_at_import.lock().unwrap().push(held);
+        }
         if self
             .fail_next_imports
             .fetch_update(
@@ -572,4 +582,28 @@ impl LocalImageBuilder for FakeLocalBuilder {
             ))),
         }
     }
+}
+
+/// How many `*.lock` files under `dir` another holder has locked right now:
+/// each is tried once without waiting.
+pub(crate) fn held_lock_files(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "lock"))
+        .filter(|path| {
+            matches!(
+                crate::data::fs::private_files::lock_private_timeout(
+                    path,
+                    crate::data::fs::private_files::LockMode::Exclusive,
+                    std::time::Duration::ZERO,
+                    || Ok(()),
+                ),
+                Ok(None)
+            )
+        })
+        .count()
 }

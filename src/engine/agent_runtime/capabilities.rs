@@ -37,6 +37,12 @@ pub struct Capabilities {
     /// (`engine::oci::resolve`). Nothing folds session config into this
     /// value; a caller that needs the per-image answer asks the preparer.
     pub image_acquisition: ImageAcquisition,
+    /// Each launch is sized and confined by its own session's
+    /// `BuiltinLaunchSettings` (network policy, default vCPUs and memory),
+    /// which the backend refuses to launch without. true: builtin; false:
+    /// Docker, Apple, sandbox, which neither read nor validate a `builtin`
+    /// block. Read by `AgentEngine::builtin_launch_settings`.
+    pub per_launch_vm_settings: bool,
 }
 
 impl Capabilities {

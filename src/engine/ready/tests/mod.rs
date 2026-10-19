@@ -51,7 +51,7 @@ fn make_engine_and_frontend(
         env_passthrough: None,
     };
     let engine = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -135,7 +135,7 @@ async fn creating_dockerfile_phase_writes_file() {
         env_passthrough: None,
     };
     let mut engine2 = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -201,7 +201,7 @@ fn make_engine_at(git_root: &std::path::Path) -> ReadyEngine {
         env_passthrough: None,
     };
     ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -326,7 +326,7 @@ async fn ready_on_a_kit_declarative_runtime_applies_the_kit_and_skips_image_phas
         runtime.clone(),
     ));
     let mut engine = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -405,7 +405,7 @@ pub(crate) fn import_engine(
         dyn_runtime.clone(),
     ));
     let engine = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -562,7 +562,7 @@ async fn a_repo_registries_block_drives_both_resolution_and_the_pull() {
         dyn_runtime.clone(),
     ));
     let mut engine = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -1025,7 +1025,7 @@ pub(crate) fn builder_engine(
     let locks = ImageBuildLockStore::new(tmp.path().join("locks"));
     let receipts = PendingBuiltImageStore::new(tmp.path().join("receipts"));
     let engine = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -1087,7 +1087,7 @@ pub(crate) fn reopen_builder_engine(
         dyn_runtime.clone(),
     ));
     let engine = ReadyEngine::new(
-        session.effective_config().builtin_settings().unwrap(),
+        ReadyEngine::builtin_inputs(&session, dyn_runtime.as_ref()).unwrap(),
         crate::data::config::global::GlobalConfig::data_home_with(session.effective_config().env())
             .unwrap(),
         session,
@@ -1365,4 +1365,29 @@ async fn missing_digest_pinned_local_image_hint_requires_writable_output() {
     let hint = engine.summary().hint().unwrap();
     assert!(hint.contains("writable"), "{hint}");
     assert!(!hint.contains("to build and import codex"), "{hint}");
+}
+
+/// A `builtin` block applies only to the builtin runtime. On a runtime that
+/// builds its own images it is never resolved, so an invalid or widening one
+/// cannot fail `awman ready` or API session setup there; on the builtin
+/// runtime it still fails closed.
+#[test]
+fn builtin_inputs_are_resolved_only_for_an_importing_runtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".awman")).unwrap();
+    std::fs::write(
+        tmp.path().join(".awman/config.json"),
+        r#"{"builtin":{"vcpus":0,"network":{"mode":"public"}}}"#,
+    )
+    .unwrap();
+    let session = Session::for_tests(tmp.path());
+    assert!(session.effective_config().builtin_settings().is_err());
+
+    let builds = FakeKitRuntime::new();
+    assert!(matches!(
+        ReadyEngine::builtin_inputs(&session, &builds),
+        Ok(None)
+    ));
+    let imports = FakeImportRuntime::new(true);
+    assert!(ReadyEngine::builtin_inputs(&session, &imports).is_err());
 }

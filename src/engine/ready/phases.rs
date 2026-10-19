@@ -608,9 +608,10 @@ impl ReadyEngine {
                         );
                     } else if changed && self.imports_images() {
                         self.summary.image_rebuild = StepStatus::Warn(
-                            "Dockerfile changed: rebuild the image externally, then run \
-                             `awman ready --build` to re-import it"
-                                .into(),
+                            crate::data::ready_image::ReadyImageWarning::AuditRebuildUnavailable {
+                                source_configured: self.preparer.default_image_has_source(),
+                            }
+                            .to_string(),
                         );
                     } else if changed {
                         frontend.report_step_status(

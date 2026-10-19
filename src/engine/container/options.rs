@@ -168,7 +168,6 @@ pub enum ContainerOption {
     Model {
         flag: ModelFlagForm,
     },
-    NonInteractivePrintFlag(String),
     /// Container-side `$HOME` remapped from `/root` when a non-root `USER`
     /// directive is detected in the agent's Dockerfile.
     DockerfileUser(String),
@@ -457,7 +456,6 @@ pub struct ResolvedContainerOptions {
     pub disallowed_tools: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub model: Option<ModelFlagForm>,
-    pub non_interactive_flag: Option<String>,
     pub dockerfile_user: Option<String>,
     /// Container labels accumulated from `ContainerOption::Label`, emitted as
     /// one `--label key=value` each (after the hardcoded `awman=true`).
@@ -547,7 +545,6 @@ impl ResolvedContainerOptions {
             ContainerOption::DisallowedTools(v) => self.disallowed_tools.extend(v),
             ContainerOption::AllowedTools(v) => self.allowed_tools.extend(v),
             ContainerOption::Model { flag } => self.model = Some(flag),
-            ContainerOption::NonInteractivePrintFlag(v) => self.non_interactive_flag = Some(v),
             ContainerOption::DockerfileUser(v) => self.dockerfile_user = Some(v),
             ContainerOption::Label { key, value } => self.labels.push((key, value)),
             ContainerOption::AgentModeFlags(v) => self.agent_mode_flags.extend(v),

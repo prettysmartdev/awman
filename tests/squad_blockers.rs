@@ -634,6 +634,7 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
             kit_declarative: true,
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+            per_launch_vm_settings: false,
         };
         &CAPS
     }

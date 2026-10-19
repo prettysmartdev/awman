@@ -333,11 +333,9 @@ pub(crate) async fn execute_prepared(
                 return Err(err);
             }
         };
-        match Session::open_at_git_root(
-            wt.clone(),
-            git_root_for_session,
-            crate::data::session::SessionOpenOptions::default(),
-        ) {
+        // The invoker's builtin block, default agent, env and global config
+        // carry over: the worktree checkout lacks uncommitted edits.
+        match Session::open_worktree_for(wt.clone(), git_root_for_session, &original_session) {
             Ok(s) => s,
             Err(e) => {
                 let err = CommandError::Other(format!("opening worktree session: {e}"));

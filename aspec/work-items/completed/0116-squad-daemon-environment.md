@@ -767,7 +767,7 @@ retained historically.
 
 ## Codebase Integration:
 - follow established conventions, best practices, testing, and architecture patterns from the project's aspec.
-- §2 overlaps `aspec/work-items/0114-architecture-audit-medium-and-low.md:288`
+- §2 overlaps `aspec/work-items/completed/0114-architecture-audit-medium-and-low.md:288`
   (F-47.2), which already calls for `publish_key_to_process_env`'s
   `std::env::set_var` to be replaced by passing the key through
   `SquadServeConfig`. Land whichever comes first and make the other conform; the

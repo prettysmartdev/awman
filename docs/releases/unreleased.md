@@ -55,6 +55,47 @@ rather than at the first request. See
 answered. `""` and an explicit `none` opt-out were previously
 indistinguishable.
 
+### A tool restriction an agent cannot enforce refuses the launch on every runtime
+
+Passing allowed or disallowed tools to an agent that has no flag for that list
+used to drop the restriction silently on Docker and Apple Containers (the
+builtin runtime already refused). Every runtime now refuses the launch
+("this agent declares no allowed-tools flag, so its allowed-tools list cannot
+be applied…"), because running the agent without the restriction you asked
+for is the less safe outcome.
+
+**Who is affected:** workflows and commands that pass a tool list to such an
+agent. Remove the list for that agent, or pick an agent that supports it.
+
+### Exit codes and messages for container failures
+
+- Exit code `3` now means only that the Docker or Apple Containers backend is
+  missing or failing. Builtin runtime and image-builder failures exit `1`.
+- A Docker backend error no longer carries a blanket "install Docker Desktop"
+  line, and a missing container CLI names the runtime it belongs to
+  (`install Apple Containers and retry` for `container`).
+- The CLI, the TUI and the API print the same text for these errors.
+
+### `awman ready` reports its phases
+
+`awman ready` now prints `ready: <phase>` lines on stderr, as the TUI and API
+already did. They are suppressed with `--json`.
+
+### Non-interactive agents receive their subcommand once
+
+`exec prompt`, workflow steps and every other non-interactive launch passed
+the agent's non-interactive form twice (`codex exec exec …`,
+`claude --print --print …`, `crush run run …`), so `codex` and `crush` read
+the second copy as the prompt. It is now passed once.
+
+### Codex interactive launches pass `--no-daemon`
+
+Interactive Codex sessions now start with `--no-daemon`: the image ships no
+app-server daemon, and newer Codex releases refuse to start without one.
+`codex exec` rejects the flag, so awman adds it to interactive launches only.
+An `agentFlags` entry for `--no-daemon` is now redundant: awman drops it from
+interactive launches and warns that non-interactive runs may reject it.
+
 ### Interactive prompts no longer answer themselves on a pipe
 
 Several prompts used to pick an answer for you when there was nobody to ask:
@@ -67,6 +108,59 @@ Several prompts used to pick an answer for you when there was nobody to ask:
   `feature`, `bug` and `enhancement` in the CLI but not in the TUI. Both now
   accept only the digits both display, and dismissing the question abandons
   the interview instead of silently filing a Task.
+
+## Features
+
+### Extra agent flags: `agentFlags` and `--agent-flag`
+
+Add arguments awman doesn't know about to an agent's command, per agent, in
+repo or global config (`"agentFlags": {"codex": ["--search"]}`) or for one run
+(`--agent-flag=--search` on `chat`, `exec prompt` and `exec workflow`). The
+flags go after awman's own and before a seeded prompt. A repo entry replaces
+the global one for that agent, and `[]` turns it off. `remote exec` accepts
+the flag but does not forward it, and now says so. See
+[Configuration](../07-configuration.md).
+
+### Builtin runtime: optional source-matched builder
+
+With `builtin.builder.enabled: true` and a `docker-local` or `apple-local`
+image source, `awman ready` builds the Dockerfiles in that local store and
+imports the result, in one command. Other sources warn once per image and keep
+importing. API session setup builds a missing image the same way; workflow
+preflight and squad never build. `docker-store` and `apple-store` still work
+as aliases for `docker-local` and `apple-local`. See
+[Runtimes](../11-runtimes.md).
+
+## Builtin runtime behaviour
+
+- **Per-session settings.** A repo's `builtin.network`, `vcpus`, `memoryMib`
+  and `registries` apply to every launch for that repo: CLI, each TUI tab, each
+  API session, each squad task and each workflow worktree, even when the
+  narrowing is not committed yet. A repo `builtin.stateDir` that differs from
+  the process's is refused for that repo's launches.
+- **Relocated global config.** TUI tabs, API sessions and workflow worktrees
+  now read the global config from `AWMAN_CONFIG_HOME` when it is set. Before,
+  they read `~/.awman` and, when that file was missing, fell back to the
+  default `public` network instead of your global policy.
+- **One bad repo does not stop the process.** A repo whose `builtin` block is
+  invalid (for example a network block that widens the global one) fails that
+  repo's launches only. It no longer stops a TUI or API server started there.
+- **Builtin config stays out of other runtimes.** `awman ready` and API session
+  setup on Docker or Apple Containers no longer read or validate the `builtin`
+  block.
+- **One image rule.** Workflow preflight and squad prepare images by the same
+  rule as `ready`. An image installed from a different source is re-acquired,
+  and a workflow step for a non-default agent refuses a default source that
+  names a single image (an archive, or a fixed reference), as `ready` does.
+- **A failed base build for a non-default agent is not fatal.** When a
+  non-default agent's image source is a different local store, a failed
+  project-image build in that store is reported, but `ready` still succeeds
+  once every required image is ready.
+- **Waiting is visible.** `chat` and `exec` say when they are waiting for
+  another awman process (such as a running `awman ready --build`) to finish
+  with an image.
+- **Dropped waits release I/O at once.** Aborting a builtin agent releases its
+  terminal output streams immediately instead of at guest exit.
 
 ## Fixes
 

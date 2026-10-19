@@ -3,7 +3,14 @@
 Title: Optional local builder matched to the builtin runtime's image source
 Issue: n/a
 
-Status: Open
+Status: Completed 2026-10-19. Implemented in f940ec98 and restructured by WI 0126
+(fe980408). A 2026-10-19 review fixed two gaps: a failed project-image build
+in a non-default agent's store no longer fails `ready` (base results carry
+`optional`), and the unreachable-builder path keeps its build leases through
+the import. The opt-in native Docker and Apple Containers scenarios from Test
+Considerations now exist (`tests/builtin_runtime/builder_native.rs`,
+`builtin_hw_builder_*`), but they have not yet been run on a native host;
+record that evidence before treating them as coverage.
 Precedes: [WI 0126](0126-builtin-runtime-architecture-conformance.md) — that
 refactor folds this builder into its single engine-level image acquirer
 (Step C1). Build on the current import paths; do not wait for or pre-empt

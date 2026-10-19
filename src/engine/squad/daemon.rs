@@ -300,6 +300,7 @@ mod tests {
                     has_image_store: true,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
+                    per_launch_vm_settings: false,
                 },
             }
         }
@@ -312,6 +313,7 @@ mod tests {
                     has_image_store: false,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+                    per_launch_vm_settings: false,
                 },
             }
         }

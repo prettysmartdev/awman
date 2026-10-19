@@ -249,7 +249,7 @@ impl Command for ExecPromptCommand {
             .collected_overlays(cli_typed, None, None)?;
 
         // Emit deprecation warnings for legacy config fields.
-        LaunchPolicy::for_session(&session).warn_legacy_config(frontend.as_mut());
+        LaunchPolicy::for_session(&session).warn_config(frontend.as_mut());
 
         // The Dockerfile + image setup is container-paradigm only; sandbox
         // runtimes get their per-agent kits from `awman ready` instead.

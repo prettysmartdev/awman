@@ -13,6 +13,13 @@ pub mod naming;
 pub mod options;
 pub mod runtime;
 
+/// The sandbox-tier runtime (dsbx) for the cross-runtime frontend-release
+/// check (`agent_runtime::conformance`).
+#[cfg(all(test, unix))]
+pub(crate) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
+    dsbx::conformance_launcher()
+}
+
 pub use naming::{generate_sandbox_name, sandbox_name_for};
 pub use options::{ResolvedSandboxOptions, SandboxOption};
 pub use runtime::SandboxRuntime;

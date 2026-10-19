@@ -732,44 +732,17 @@ impl ExecutionBackend for ContainerExecution {
     }
 }
 
+/// This module's runtimes for the cross-runtime frontend-release check
+/// (`agent_runtime::conformance`).
+#[cfg(all(test, unix))]
+pub(super) fn conformance_launchers() -> Vec<crate::engine::agent_runtime::conformance::Launcher> {
+    tests::conformance_launchers()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::container::options::{ContainerOption, ResolvedContainerOptions};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    struct SlowDropFrontend(Arc<AtomicBool>);
-
-    impl Drop for SlowDropFrontend {
-        fn drop(&mut self) {
-            std::thread::sleep(Duration::from_millis(5));
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    impl crate::data::message::UserMessageSink for SlowDropFrontend {
-        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    #[async_trait::async_trait]
-    impl crate::engine::agent_runtime::frontend::AgentFrontend for SlowDropFrontend {
-        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
-        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
-        fn take_io(&mut self) -> AgentIo {
-            let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-            let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            AgentIo {
-                stdout,
-                stderr,
-                stdin_tx,
-                stdin_rx,
-                resize: None,
-                initial_size: None,
-            }
-        }
-    }
 
     type OutputReceivers = (
         tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -806,50 +779,6 @@ mod tests {
                 stdin_rx,
                 resize,
                 initial_size,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn docker_and_apple_release_frontend_on_normal_and_dropped_wait() {
-        for original in [ContainerCli::DOCKER, ContainerCli::APPLE] {
-            for drop_wait in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
-                let cli = ContainerCli {
-                    bin: fake_cli(&write_fake_cli(
-                        temp.path(),
-                        if drop_wait {
-                            "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.2; fi\n"
-                        } else {
-                            "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.01; fi\n"
-                        },
-                    ))
-                    .bin,
-                    ..original
-                };
-                let released = Arc::new(AtomicBool::new(false));
-                let instance = test_instance(
-                    cli,
-                    vec![ContainerOption::Image(ImageRef::new("img:latest"))],
-                );
-                let mut execution = instance
-                    .run_with_frontend(Box::new(SlowDropFrontend(released.clone())))
-                    .unwrap();
-                if drop_wait {
-                    assert!(
-                        tokio::time::timeout(Duration::from_millis(10), execution.wait())
-                            .await
-                            .is_err()
-                    );
-                } else {
-                    execution.wait().await.unwrap();
-                }
-                assert!(
-                    released.load(Ordering::SeqCst),
-                    "{} retained its frontend",
-                    original.bin
-                );
             }
         }
     }
@@ -1095,6 +1024,47 @@ mod tests {
             Vec::new(),
             None,
         ))
+    }
+
+    /// Docker and Apple Containers, each over a fake CLI whose `run` sleeps
+    /// briefly or for a long time.
+    #[cfg(unix)]
+    pub(crate) fn conformance_launchers() -> Vec<crate::engine::agent_runtime::conformance::Launcher>
+    {
+        use crate::engine::agent_runtime::conformance::Launcher;
+        [
+            ("docker", ContainerCli::DOCKER),
+            ("apple", ContainerCli::APPLE),
+        ]
+        .into_iter()
+        .map(|(name, original)| {
+            let temp = Arc::new(tempfile::tempdir().unwrap());
+            Launcher {
+                name,
+                launch: Box::new(move |frontend, long| {
+                    let dir = temp.path().join(if long { "long" } else { "short" });
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let script = if long {
+                        "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.3; fi\n"
+                    } else {
+                        "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.01; fi\n"
+                    };
+                    let cli = ContainerCli {
+                        bin: fake_cli(&write_fake_cli(&dir, script)).bin,
+                        ..original
+                    };
+                    test_instance(
+                        cli,
+                        vec![ContainerOption::Image(ImageRef::new("img:latest"))],
+                    )
+                    .run_with_frontend(frontend)
+                    .unwrap()
+                }),
+                // The fake `run` ends by itself.
+                finish: Box::new(|| {}),
+            }
+        })
+        .collect()
     }
 
     /// The ACP path must retain its stdin injector for the whole session; the

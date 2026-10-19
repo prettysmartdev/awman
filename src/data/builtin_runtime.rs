@@ -40,22 +40,73 @@ mod tests {
         assert_eq!(LIBKRUN_COMMIT, "2bd0f84ad0956f3032e0490d3b8512b6851eca12");
     }
 
+    /// SDK crates whose exact pin must equal [`MSB_VERSION`].
+    const MSB_CRATES: [&str; 4] = [
+        "microsandbox",
+        "microsandbox-cli",
+        "microsandbox-image",
+        "microsandbox-network",
+    ];
+
+    /// Every exact-pinned builtin-runtime crate, including those versioned
+    /// independently of [`MSB_VERSION`].
+    const PINNED_CRATES: [&str; 6] = [
+        "microsandbox",
+        "microsandbox-cli",
+        "microsandbox-image",
+        "microsandbox-network",
+        "sqlx",
+        "msb_krun",
+    ];
+
+    fn parse_manifest(name: &str, text: &str) -> toml::Table {
+        text.parse()
+            .unwrap_or_else(|e| panic!("{name} is not valid TOML: {e}"))
+    }
+
+    /// The `[workspace.dependencies]` table of the root manifest.
+    fn workspace_dependencies(root: &toml::Table) -> &toml::Table {
+        root.get("workspace")
+            .and_then(|w| w.get("dependencies"))
+            .and_then(toml::Value::as_table)
+            .expect("root Cargo.toml has no [workspace.dependencies]")
+    }
+
+    /// The version requirement a workspace dependency entry declares.
+    fn pinned_version<'a>(deps: &'a toml::Table, dependency: &str) -> &'a str {
+        deps.get(dependency)
+            .and_then(|d| d.get("version"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("[workspace.dependencies] is missing {dependency}"))
+    }
+
+    /// Every entry for `dependency` in a member's normal, build, dev and
+    /// target-specific dependency tables.
+    fn member_entries<'a>(manifest: &'a toml::Table, dependency: &str) -> Vec<&'a toml::Value> {
+        let mut tables: Vec<&toml::Table> = Vec::new();
+        for section in ["dependencies", "build-dependencies", "dev-dependencies"] {
+            tables.extend(manifest.get(section).and_then(toml::Value::as_table));
+            if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+                for target in targets.values() {
+                    tables.extend(target.get(section).and_then(toml::Value::as_table));
+                }
+            }
+        }
+        tables
+            .into_iter()
+            .filter_map(|t| t.get(dependency))
+            .collect()
+    }
+
     #[test]
     fn constants_match_sdk_dependency_and_payload_pins() {
-        let cargo = include_str!("../../Cargo.toml");
-        for dependency in [
-            "microsandbox",
-            "microsandbox-cli",
-            "microsandbox-image",
-            "microsandbox-network",
-        ] {
-            let line = cargo
-                .lines()
-                .find(|line| line.trim_start().starts_with(&format!("{dependency} =")))
-                .unwrap_or_else(|| panic!("Cargo.toml is missing {dependency}"));
-            assert!(
-                line.contains(&format!("version = \"={MSB_VERSION}\"")),
-                "Cargo.toml pin for {dependency} does not match {MSB_VERSION}: {line}"
+        let root = parse_manifest("Cargo.toml", include_str!("../../Cargo.toml"));
+        let deps = workspace_dependencies(&root);
+        for dependency in MSB_CRATES {
+            assert_eq!(
+                pinned_version(deps, dependency),
+                format!("={MSB_VERSION}"),
+                "[workspace.dependencies] pin for {dependency} does not match {MSB_VERSION}"
             );
         }
 
@@ -66,6 +117,70 @@ mod tests {
         assert!(manifest
             .lines()
             .any(|line| { line.trim() == format!("libkrun_revision = \"{LIBKRUN_COMMIT}\"") }));
+    }
+
+    #[test]
+    fn workspace_members_inherit_sdk_pins_instead_of_restating_them() {
+        let members = [
+            ("Cargo.toml", include_str!("../../Cargo.toml")),
+            (
+                "crates/awman-cli/Cargo.toml",
+                include_str!("../../crates/awman-cli/Cargo.toml"),
+            ),
+            (
+                "crates/awman-host-shims/Cargo.toml",
+                include_str!("../../crates/awman-host-shims/Cargo.toml"),
+            ),
+        ];
+        let root = parse_manifest("Cargo.toml", members[0].1);
+        let deps = workspace_dependencies(&root);
+        for dependency in PINNED_CRATES {
+            assert!(
+                pinned_version(deps, dependency).starts_with('='),
+                "[workspace.dependencies] {dependency} must be an exact `=` pin"
+            );
+        }
+
+        for (name, text) in members {
+            let manifest = parse_manifest(name, text);
+            for dependency in PINNED_CRATES {
+                for entry in member_entries(&manifest, dependency) {
+                    assert_eq!(
+                        entry.get("workspace").and_then(toml::Value::as_bool),
+                        Some(true),
+                        "{name}: {dependency} must use `workspace = true`"
+                    );
+                    assert!(
+                        entry.get("version").is_none(),
+                        "{name}: {dependency} restates a version instead of inheriting it"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vendored_sdk_patches_match_the_pinned_versions() {
+        let root = parse_manifest("Cargo.toml", include_str!("../../Cargo.toml"));
+        let deps = workspace_dependencies(&root);
+        let patches = root
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(toml::Value::as_table)
+            .expect("root Cargo.toml has no [patch.crates-io]");
+        for dependency in ["microsandbox", "microsandbox-network", "msb_krun"] {
+            let version = pinned_version(deps, dependency).trim_start_matches('=');
+            let path = patches
+                .get(dependency)
+                .and_then(|p| p.get("path"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("[patch.crates-io] is missing {dependency}"));
+            assert_eq!(
+                path,
+                format!("third_party/{dependency}-{version}"),
+                "vendored patch for {dependency} does not match its pin"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,9 @@
 Title: Bring the builtin runtime into conformance with the grand architecture
 Issue: n/a (2026-09-30 builtin-runtime architecture review)
 
-Status: Open
-Follows: [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md),
+Status: Completed 2026-10-19. Squash-merged in fe980408; a 2026-10-19 review and its
+fixes are recorded under "Post-merge review (2026-10-19)" below.
+Follows: [WI 0123](0123-builtin-native-verification-and-release-closure.md),
 [WI 0125](0125-builtin-image-source-builder.md) (the image-source builder,
 merged in `f940ec98`; this item brings that code into conformance too, and
 folds it into Step C1's agent-image preparer)
@@ -77,6 +78,78 @@ folds it into Step C1's agent-image preparer)
 8. **A missing tool flag fails closed on every runtime (C5).** An agent
    without an allowed/disallowed-tools flag is a configuration error on
    Docker, Apple and builtin alike.
+
+### Post-merge review (2026-10-19)
+
+The review against this item and the grand architecture found the groups
+implemented, with these defects and gaps, now fixed:
+
+- **A1, security regression.** Sessions opened with default options (TUI new
+  tab, API session setup and restore, workflow worktrees, the dynamic leader)
+  used an empty env snapshot. Their global config was then read from
+  `~/.awman` instead of a relocated `AWMAN_CONFIG_HOME`, and a missing file
+  meant the default `public` network. `SessionManager` now carries the
+  process's `EnvSnapshot` into every session it opens. The test fixture that
+  injected `AWMAN_CONFIG_HOME` itself now opens sessions as production does.
+- **A1, worktrees.** `Session::open_worktree_for` keeps the invoker's repo
+  `builtin` block, default agent, env, flags and global config. The checkout is
+  cut from a commit, so uncommitted narrowing used to be lost, and the default
+  step agent (which `--agent-flag` targets, WI 0127) could drift.
+- **A1, startup.** `detect_effective` resolves only
+  `EffectiveConfig::builtin_process_settings()`. A widening repo block now
+  fails that repo's launches, not the TUI or API process started in it.
+  `ReadyEngine::builtin_inputs` resolves builtin settings only for an importing
+  runtime, so Docker and Apple `ready` and session setup never read the block.
+- **A1, typed option (decision 9 below).** `Capabilities::per_launch_vm_settings`
+  replaces the `runtime_name() == "builtin"` match, and
+  `AgentEngine::builtin_launch_settings` is `pub(crate)`.
+- **C1.** Preflight and `CheckOnly` built `ImageBuildContext` with the prepared
+  agent as `default_agent`, so the single-image default-source guard never
+  fired for a non-default agent. They now use `Session::configured_agent()`,
+  and preflight treats that refusal as an error for the step.
+- **C1, smaller fixes.** The remaining builder-enabled bool check uses
+  `BuilderSelection::Disabled`. An `ImportOnly` run prints "Importing image…"
+  only when the image is not installed. A wait on another process's build lease
+  is announced (`ImageBuildLockStore::try_lock`). The unreachable-builder path
+  keeps its leases through the import.
+- **C5, older bug.** The non-interactive form was emitted twice (entrypoint and
+  `NonInteractivePrintFlag`), for example `codex exec exec`. The option is gone;
+  the entrypoint is the single source.
+- **E1.** Docker and Apple `build_image` refuse a source-bound target or build
+  arguments (`BuildRequest::require_runtime_build`) instead of dropping them.
+- **E3 / exec bridge.** The grace timer and the exit path could both run
+  `finish_owned`; cleanup is now claimed once (`cleanup_claimed`).
+- **B2.** A dropped `wait()` on builtin now releases the frontend's
+  stdout/stderr senders at once (`io_release`). One cross-runtime test,
+  `agent_runtime::conformance`, holds Docker, Apple, builtin and dsbx to the
+  contract and replaces the per-runtime copies. The B1 "slow to release"
+  runtime now releases on its own, after `wait()`, rather than in the test.
+- **F1.** The audit "Dockerfile changed" warning is typed
+  (`ReadyImageWarning::AuditRebuildUnavailable`), and `ContainerRuntimeUnavailable`
+  names the runtime of the missing CLI. The `cli.md` exit-code table matches
+  `EngineError::exit_code()`.
+
+Recorded rather than changed:
+
+- `image_prep/build.rs` returns build-row failures as text: `StepStatus` is
+  Layer 0 display data by design, and the typed error's `Display` is that text.
+- `AgentImagePreparer::plan` and the builtin import both use
+  `Env::for_image_acquisition`, which reads the process environment. Source
+  resolution and the pull must see one endpoint, proxy and credential set, so
+  neither switches to the session snapshot alone.
+- The builtin normal-`wait()` release is not distinguishable from the
+  backend's own drop in `wait_blocking`; the contract holds either way, and
+  the dropped-`wait()` case is the one that depends on the guard.
+
+### Decisions made by the developer (2026-10-19)
+
+9. **A1 stays automatic, gated by a capability.** Per-launch settings keep
+   being resolved for every launch inside `AgentEngine`, so no launch path can
+   forget them, but the gate is `Capabilities::per_launch_vm_settings` rather
+   than the runtime's name. Layer 2 does not set them per call site.
+10. **Worktree sessions carry the invoker's `builtin` block and default
+    agent** (as `agentFlags` already did); everything else comes from the
+    worktree checkout.
 
 ## User Stories
 

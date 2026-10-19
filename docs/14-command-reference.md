@@ -27,7 +27,7 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `--refresh` | bool | false | — | — | CLI, TUI, API | Run the Dockerfile agent audit (skipped by default). |
 | `--build` | bool | false | — | — | CLI, TUI, API | Force rebuild the dev container image from Dockerfile.dev. |
-| `--no-cache` | bool | false | — | — | CLI, TUI, API | Skip the build cache when an image build runs. Has no effect unless a build is scheduled (by --build, an audit change, or a missing image). |
+| `--no-cache` | bool | false | — | — | CLI, TUI, API | Skip the build cache when a build is scheduled, and on the builtin runtime also force a fresh image import. |
 | `-n, --non-interactive` | bool | false | — | — | CLI, TUI, API | Run the agent in non-interactive (print) mode instead of interactive mode. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--json` | bool | false | `--non-interactive` | — | CLI, TUI, API | Suppress human output and print structured JSON. Implies --non-interactive. |
@@ -51,7 +51,7 @@ Available via: CLI, TUI
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
-| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Extra argument appended to the agent command (e.g. --agent-flag=--verbose). Repeatable; replaces the agent's agentFlags config entry. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 
 ---
 
@@ -164,7 +164,7 @@ Available via: CLI, TUI, API
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
-| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Extra argument appended to the agent command (e.g. --agent-flag=--verbose). Repeatable; replaces the agent's agentFlags config entry. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
 
 ### `awman exec workflow`
@@ -192,7 +192,7 @@ Available via: CLI, TUI, API
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
-| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Extra argument appended to the agent command (e.g. --agent-flag=--verbose). Repeatable; replaces the agent's agentFlags config entry. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | `--work-item` | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as work item input. |
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
 | `--leader` | string (optional) | — | — | — | CLI, TUI, API | Agent and model for the dynamic leader, as agent::model (e.g. claude::claude-opus-4-8). Only valid with --dynamic. |
@@ -531,7 +531,7 @@ Available via: CLI, TUI
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
-| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Extra argument appended to the agent command (e.g. --agent-flag=--verbose). Repeatable; replaces the agent's agentFlags config entry. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | `--work-item` | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as work item input. |
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
 | `--leader` | string (optional) | — | — | — | CLI, TUI, API | Agent and model for the dynamic leader, as agent::model (e.g. claude::claude-opus-4-8). Only valid with --dynamic. |
@@ -562,7 +562,7 @@ Available via: CLI, TUI
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
-| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Extra argument appended to the agent command (e.g. --agent-flag=--verbose). Repeatable; replaces the agent's agentFlags config entry. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
 
 ---

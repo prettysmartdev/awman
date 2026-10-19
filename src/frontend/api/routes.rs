@@ -1358,7 +1358,9 @@ mod tests {
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             auth_mode: AuthMode::Disabled,
             engines,
-            sessions: Arc::new(SessionManager::in_memory()),
+            sessions: Arc::new(SessionManager::in_memory(
+                crate::data::config::env::EnvSnapshot::empty(),
+            )),
             event_buses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             setup_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })

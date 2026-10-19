@@ -415,6 +415,62 @@ pub(crate) async fn ensure_agent_image(
     ensure_agent_image_with_build_output(engines, git_root, paths, agent, session, sink, None).await
 }
 
+/// Import-only preparation of the image a workflow or squad step needs, on a
+/// runtime that imports images (WI 0126 C1, `BuildPolicy::ImportOnly`).
+async fn import_agent_image_for_step(
+    runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
+    git_root: &std::path::Path,
+    agent: &str,
+    session: &crate::data::session::Session,
+    sink: &mut dyn UserMessageSink,
+) -> Result<(), CommandError> {
+    use crate::engine::image_prep::{
+        AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext, MessageSink,
+    };
+    let mut preparer = AgentImagePreparer::new(
+        session.effective_config().builtin_settings()?,
+        runtime,
+        crate::data::config::global::GlobalConfig::data_home_with(
+            session.effective_config().env(),
+        )?,
+        // The context's default agent is the session's configured one, not the
+        // agent being prepared: a non-default agent must not reuse a
+        // single-image default source, exactly as `ready` refuses it.
+        ImageBuildContext::for_repo(
+            git_root,
+            session.repo_config(),
+            session.configured_agent().as_str(),
+        ),
+    );
+    let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
+    let result = preparer
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent,
+                policy: BuildPolicy::ImportOnly,
+            },
+            &mut MessageSink(sink),
+        )
+        .await?;
+    match result.import {
+        crate::data::step_status::StepStatus::Failed(error) => {
+            Err(CommandError::Other(if result.source_kind.is_some() {
+                format!("failed to import image for agent '{agent}': {error}")
+            } else {
+                error
+            }))
+        }
+        // A step needs this agent's image. `ready` may skip a non-default
+        // agent whose default source names a single image (it is optional
+        // there); a workflow step running that agent cannot.
+        crate::data::step_status::StepStatus::Warn(reason) => Err(CommandError::Other(format!(
+            "cannot import image for agent '{agent}': {reason}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// [`ensure_agent_image`] with the raw build output optionally redirected to a
 /// [`BuildOutputTarget`] instead of streaming through `sink`. Lifecycle
 /// messages still go to `sink` either way.
@@ -433,38 +489,9 @@ pub(crate) async fn ensure_agent_image_with_build_output(
     if runtime.capabilities().image_acquisition
         == crate::engine::agent_runtime::ImageAcquisition::Import
     {
-        use crate::engine::image_prep::{
-            AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext, MessageSink,
-        };
-        let mut preparer = AgentImagePreparer::new(
-            session.effective_config().builtin_settings()?,
-            runtime.clone(),
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session.effective_config().env(),
-            )?,
-            ImageBuildContext::for_repo(git_root, session.repo_config(), agent),
-        );
-        let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
-        let result = preparer
-            .prepare(
-                &AgentImageRequest {
-                    tag: &tag,
-                    agent,
-                    policy: BuildPolicy::ImportOnly,
-                },
-                &mut MessageSink(sink),
-            )
-            .await?;
-        return match result.import {
-            crate::data::step_status::StepStatus::Failed(error) => {
-                Err(CommandError::Other(if result.source_kind.is_some() {
-                    format!("failed to import image for agent '{agent}': {error}")
-                } else {
-                    error
-                }))
-            }
-            _ => Ok(()),
-        };
+        let runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            runtime.clone();
+        return import_agent_image_for_step(runtime, git_root, agent, session, sink).await;
     }
     let dockerfile = paths.agent_dockerfile(agent);
     if !dockerfile.exists() {
@@ -835,5 +862,50 @@ mod import_tests {
                 "source must match for {spec:?}"
             );
         }
+    }
+
+    /// A default source naming a single image (an archive, or a fixed
+    /// reference) represents only the configured default agent. Preflight
+    /// for a step running any other agent refuses it, exactly as `ready`
+    /// does, rather than importing the default agent's image under the other
+    /// agent's tag.
+    #[tokio::test]
+    async fn preflight_refuses_a_single_image_default_source_for_another_agent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".awman")).unwrap();
+        std::fs::write(
+            root.path().join(".awman/config.json"),
+            r#"{"agent":"claude","builtin":{"imageSource":{"type":"archive","path":"/images/claude.tar"}}}"#,
+        )
+        .unwrap();
+        let session = Session::for_tests(root.path());
+        assert_eq!(session.configured_agent().as_str(), "claude");
+        let runtime = Arc::new(Importing::new(true));
+
+        let err = import_agent_image_for_step(
+            runtime.clone(),
+            root.path(),
+            "codex",
+            &session,
+            &mut Quiet,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("names a single image"), "{err}");
+        assert!(
+            runtime.imports.lock().unwrap().is_empty(),
+            "codex must not be imported from claude's archive"
+        );
+
+        // The configured default agent still imports from it.
+        let _ = import_agent_image_for_step(
+            runtime.clone(),
+            root.path(),
+            "claude",
+            &session,
+            &mut Quiet,
+        )
+        .await;
+        assert_eq!(runtime.imports.lock().unwrap().len(), 1);
     }
 }

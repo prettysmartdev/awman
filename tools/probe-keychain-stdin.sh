@@ -1,6 +1,6 @@
 #!/bin/bash
 # probe-keychain-stdin.sh — macOS only. Investigation tool for work item
-# aspec/work-items/0116-squad-daemon-environment.md, §5.
+# aspec/work-items/completed/0116-squad-daemon-environment.md, §5.
 #
 # Question: can `security add-generic-password` take the secret on stdin
 # instead of as a `-w <value>` argument? Argv is visible to the same user via

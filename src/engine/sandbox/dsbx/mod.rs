@@ -13,6 +13,8 @@ mod ready;
 mod session_config;
 mod spawn;
 
+#[cfg(all(test, unix))]
+pub(super) use backend::conformance_launcher;
 pub(in crate::engine::sandbox) use backend::{run_interactive, DSbxBackend};
 pub(in crate::engine::sandbox) use ready::ready_agent;
 

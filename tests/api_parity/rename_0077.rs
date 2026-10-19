@@ -214,7 +214,9 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
         engines,
-        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory()),
+        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory(
+            awman::data::config::env::EnvSnapshot::empty(),
+        )),
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     });

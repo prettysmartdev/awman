@@ -78,6 +78,11 @@ pub struct ReadyBaseImageResult {
     /// Project image tag built there.
     pub tag: String,
     pub build: StepStatus,
+    /// Built only for non-default agents. Like an optional agent image, its
+    /// failure is reported but does not make `awman ready` fail; a required
+    /// agent that needs the same base fails through its own result.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// A non-default agent image that is not installed, and what `awman ready
@@ -144,6 +149,10 @@ pub enum ReadyImageWarning {
     /// The import from a buildable source failed; rebuilding it there is
     /// the way forward.
     RebuildInSourceStore { tag: String },
+    /// The audit changed `Dockerfile.dev`, but this session cannot rebuild
+    /// the default image: no builder is enabled for it, or no source is
+    /// configured to import a rebuilt image from.
+    AuditRebuildUnavailable { source_configured: bool },
 }
 
 impl std::fmt::Display for ReadyImageWarning {
@@ -188,6 +197,21 @@ impl std::fmt::Display for ReadyImageWarning {
             Self::RebuildInSourceStore { tag } => write!(
                 f,
                 "{tag}: run `awman ready --build` to rebuild it in its source store"
+            ),
+            Self::AuditRebuildUnavailable {
+                source_configured: true,
+            } => write!(
+                f,
+                "Dockerfile changed: rebuild the image in its source store (or enable \
+                 `builtin.builder.enabled` with a `docker-local` or `apple-local` source), then \
+                 run `awman ready --build` to re-import it"
+            ),
+            Self::AuditRebuildUnavailable {
+                source_configured: false,
+            } => write!(
+                f,
+                "Dockerfile changed: rebuild the image externally and configure \
+                 `builtin.imageSource`, then run `awman ready --build` to import it"
             ),
         }
     }
@@ -252,6 +276,23 @@ mod tests {
                 "awman-r-claude:latest: run `awman ready --build` to rebuild it in its source \
                  store",
                 "rebuild-in-source-store",
+            ),
+            (
+                ReadyImageWarning::AuditRebuildUnavailable {
+                    source_configured: true,
+                },
+                "Dockerfile changed: rebuild the image in its source store (or enable \
+                 `builtin.builder.enabled` with a `docker-local` or `apple-local` source), then \
+                 run `awman ready --build` to re-import it",
+                "audit-rebuild-unavailable",
+            ),
+            (
+                ReadyImageWarning::AuditRebuildUnavailable {
+                    source_configured: false,
+                },
+                "Dockerfile changed: rebuild the image externally and configure \
+                 `builtin.imageSource`, then run `awman ready --build` to import it",
+                "audit-rebuild-unavailable",
             ),
         ];
         for (warning, text, kind) in cases {

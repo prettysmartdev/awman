@@ -262,8 +262,8 @@ pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
     FlagSpec {
         long: "agent-flag",
         short: None,
-        help: "Extra argument appended to the agent command (e.g. --agent-flag=--verbose). \
-               Repeatable; replaces the agent's agentFlags config entry.",
+        help: "Repeatable extra argument for the agent command, replacing its agentFlags \
+               entry (pass as --agent-flag=--verbose).",
         kind: FlagKind::VecString,
         default: FlagDefault::EmptyVec,
         frontends: FrontendVisibility::All,

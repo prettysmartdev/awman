@@ -353,6 +353,64 @@ async fn builder_builds_a_base_per_store_across_different_builders() {
     );
 }
 
+/// The base image a non-default agent's store needs is as optional as that
+/// agent's image (WI 0125: preserve non-default-agent failure aggregation).
+/// Its failed build is reported, but `ready` is still ready once every
+/// required image is.
+#[tokio::test]
+async fn a_failed_base_for_a_non_default_agents_store_does_not_fail_ready() {
+    use crate::data::config::image_source::ImageSourceSpec;
+    let platform = crate::data::oci_identity::OciPlatform::host_linux();
+    let runtime = Arc::new(FakeImportRuntime::new(false));
+    let local_builder = Arc::new(FakeLocalBuilder::new());
+    let tmp0 = tempfile::tempdir().unwrap();
+    let socket = tmp0.path().join("docker.sock");
+    let (mut engine, mut frontend, _tmp, _locks, _receipts) = builder_engine(
+        runtime.clone(),
+        true,
+        false,
+        local_docker_sources(&socket),
+        local_builder.clone(),
+    );
+    let git_root = engine.session.git_root().to_path_buf();
+    write_agent_dockerfiles(&git_root, &["claude", "codex"]);
+    let codex_tag = crate::data::image_tags::agent_image_tag(&git_root, "codex");
+    engine.preparer.image_sources.images.insert(
+        codex_tag.clone(),
+        ImageSourceSpec::AppleStore { reference: None },
+    );
+    let project_tag = crate::data::image_tags::project_image_tag(&git_root);
+    // Docker store (claude, the default agent): base builds and verifies.
+    let base_id = built_identity('5', platform.clone());
+    local_builder.script_build(&project_tag, Ok(base_id.clone()));
+    local_builder.script_inspect(&project_tag, Ok(SourceImage::Present(base_id)));
+    // Apple store (codex only): the base build fails.
+    local_builder.script_build(&project_tag, Err("apple base build failed".into()));
+    let claude_tag = crate::data::image_tags::agent_image_tag(&git_root, "claude");
+    local_builder.script_build(&claude_tag, Ok(built_identity('7', platform)));
+
+    step_through_image_phases(&mut engine, &mut frontend).await;
+
+    let summary = engine.summary();
+    assert_eq!(
+        summary.base_image_results.len(),
+        2,
+        "{:?}",
+        summary.base_image_results
+    );
+    let (required, optional): (Vec<_>, Vec<_>) =
+        summary.base_image_results.iter().partition(|b| !b.optional);
+    assert_eq!(required.len(), 1);
+    assert_eq!(required[0].build, StepStatus::Done);
+    assert_eq!(optional.len(), 1);
+    assert!(matches!(optional[0].build, StepStatus::Failed(_)));
+    assert!(
+        summary.is_ready(),
+        "only a non-default agent's store failed: {:?}",
+        summary.not_ready_reason()
+    );
+}
+
 /// An incompatible source (archive) with an attempted build (missing
 /// image) warns exactly once, invokes the local builder zero times, and
 /// still imports normally from the configured source.
@@ -518,6 +576,39 @@ async fn builder_unavailable_with_an_installed_image_warns_and_reuses_it() {
         summary.is_ready(),
         "a build Warn (not Failed) must not block readiness"
     );
+}
+
+/// The unreachable-builder path keeps its store/reference leases through the
+/// import, like every other build path, so no other awman process can
+/// rebuild or retag the reference while it is being imported.
+#[tokio::test]
+async fn builder_unavailable_keeps_its_build_leases_through_the_import() {
+    let runtime = Arc::new(FakeImportRuntime::new(true));
+    let local_builder = Arc::new(FakeLocalBuilder::unavailable("daemon unreachable"));
+    let (mut engine, mut frontend, _tmp, locks, _receipts) = builder_engine(
+        runtime.clone(),
+        false,
+        false,
+        ImageSources::default(),
+        local_builder.clone(),
+    );
+    let socket = engine.session.git_root().join("docker.sock");
+    engine.preparer.image_sources = local_docker_sources(&socket);
+    *runtime.lock_probe_dir.lock().unwrap() = Some(locks.root().to_path_buf());
+
+    step_through_image_phases(&mut engine, &mut frontend).await;
+
+    assert!(matches!(
+        engine.summary().image_results[0].build,
+        StepStatus::Warn(_)
+    ));
+    let held = runtime.locks_held_at_import.lock().unwrap().clone();
+    assert_eq!(held.len(), 1, "one import");
+    assert!(
+        held[0] >= 1,
+        "the build leases must be held during the import"
+    );
+    assert_eq!(held_lock_files(locks.root()), 0, "and released afterwards");
 }
 
 /// A build failure (not an unreachable builder — a failed `docker
@@ -872,4 +963,54 @@ async fn failed_prevalidation_closes_the_cached_image_progress_row() {
     assert_eq!(statuses.len(), 2);
     assert_eq!(statuses[0], &StepStatus::Running);
     assert_eq!(statuses[1], &StepStatus::Failed("collision".into()));
+}
+
+/// A check-only launch (`chat`, `exec`) that has to wait for another awman
+/// process's build lease says so, instead of blocking silently.
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_for_another_processs_build_lease_is_reported() {
+    let runtime = Arc::new(FakeImportRuntime::new(true));
+    let local_builder = Arc::new(FakeLocalBuilder::new());
+    let (mut engine, mut frontend, _tmp, locks, _receipts) = builder_engine(
+        runtime.clone(),
+        false,
+        false,
+        ImageSources::default(),
+        local_builder,
+    );
+    let git_root = engine.session.git_root().to_path_buf();
+    let socket = git_root.join("docker.sock");
+    engine.preparer.image_sources = local_docker_sources(&socket);
+    let tag = crate::data::image_tags::agent_image_tag(&git_root, "claude");
+    let plan = engine.preparer.plan(&tag, "claude");
+    let source = plan.source.expect("local docker source resolves");
+    let store = source.store_key.clone().expect("a local store");
+    let reference = AgentImagePreparer::normalize_build_reference(&source.reference);
+
+    // "Another process": a lease held for a moment on another thread.
+    let held = locks.lock(&store, &reference, || Ok(())).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+    let _ = engine
+        .preparer
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::CheckOnly,
+            },
+            &mut frontend,
+        )
+        .await;
+    release.join().unwrap();
+    assert!(
+        frontend
+            .messages
+            .iter()
+            .any(|m| m.text.contains("Waiting for another awman process")),
+        "{:?}",
+        frontend.messages
+    );
 }
