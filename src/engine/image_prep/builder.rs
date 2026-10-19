@@ -597,6 +597,20 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// A process exit status with `code`, on any host.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
     #[derive(Default)]
     struct RecordingRunner {
         argv: Mutex<Vec<Vec<String>>>,
@@ -609,7 +623,6 @@ mod tests {
             _control: &BuildControl,
             on_line: &mut dyn FnMut(&str),
         ) -> Result<std::process::ExitStatus, EngineError> {
-            use std::os::unix::process::ExitStatusExt;
             let args: Vec<String> = command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().to_string())
@@ -624,7 +637,7 @@ mod tests {
                 on_line(r#"[["driver-type","io.containerd.snapshotter.v1"]]"#);
             }
             self.argv.lock().unwrap().push(args);
-            Ok(std::process::ExitStatus::from_raw(0))
+            Ok(exit_status(0))
         }
     }
 
@@ -706,13 +719,12 @@ mod tests {
             _control: &BuildControl,
             on_line: &mut dyn FnMut(&str),
         ) -> Result<std::process::ExitStatus, EngineError> {
-            use std::os::unix::process::ExitStatusExt;
             let args: Vec<String> = command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().to_string())
                 .collect();
             if args.iter().any(|a| a == "buildx") {
-                return Ok(std::process::ExitStatus::from_raw(1 << 8));
+                return Ok(exit_status(1));
             }
             if args.iter().any(|a| a == "build") {
                 let at = args.iter().position(|a| a == "--iidfile").unwrap();
@@ -726,7 +738,7 @@ mod tests {
             } else if args.iter().any(|a| a == "--format") {
                 on_line(r#"[["driver-type","io.containerd.snapshotter.v1"]]"#);
             }
-            Ok(std::process::ExitStatus::from_raw(0))
+            Ok(exit_status(0))
         }
     }
 

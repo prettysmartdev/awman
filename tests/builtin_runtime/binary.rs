@@ -132,6 +132,17 @@ pub fn has_builtin_runtime() -> bool {
     builtin_info().is_some()
 }
 
+/// Whether the builtin runtime can actually be selected here: the feature
+/// binary on a released target (`RELEASED_TARGETS`, macOS on Apple Silicon).
+/// Linux hosts compile the runtime but refuse it as unreleased (WI 0124).
+pub fn builtin_selectable() -> bool {
+    has_builtin_runtime()
+        && matches!(
+            (std::env::consts::OS, std::env::consts::ARCH),
+            ("macos", "aarch64")
+        )
+}
+
 pub fn host_triple() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",

@@ -276,6 +276,7 @@ mod tests {
     /// target is a perfectly valid one: refreshing hard-resets the directory,
     /// and following the link would let that escape the managed store
     /// (WI-0103 remediation).
+    #[cfg(unix)]
     #[test]
     fn list_libraries_skips_symlinked_entries() {
         let tmp = tempfile::tempdir().unwrap();

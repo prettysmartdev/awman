@@ -4,7 +4,14 @@
 /// in their default/template states. They require a running Docker daemon
 /// and network access, and are skipped if Docker is unavailable.
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
+
+/// The repository root: Cargo runs this test from `crates/awman-cli`, but the
+/// templates and the Docker build context live at the root.
+fn repo_root() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+}
 
 fn docker_available() -> bool {
     Command::new(awman::engine::host_cli::program("docker"))
@@ -29,6 +36,7 @@ fn build_base_image() -> String {
             "templates/Dockerfile.project",
             ".",
         ])
+        .current_dir(repo_root())
         .status()
         .expect("failed to invoke docker build for project base image");
     assert!(
@@ -48,8 +56,8 @@ fn build_template(template_path: &str, tag: &str) {
 
     // Read the template and substitute the {{AWMAN_BASE_IMAGE}} placeholder so
     // Docker receives a valid image reference in the FROM directive.
-    let template_content =
-        std::fs::read_to_string(template_path).expect("failed to read template file");
+    let template_content = std::fs::read_to_string(repo_root().join(template_path))
+        .expect("failed to read template file");
     let dockerfile_content = template_content.replace("{{AWMAN_BASE_IMAGE}}", &base_tag);
 
     // Write the substituted content to a temporary file.
@@ -67,6 +75,7 @@ fn build_template(template_path: &str, tag: &str) {
             tmp_path.to_str().expect("temp path is not valid UTF-8"),
             ".",
         ])
+        .current_dir(repo_root())
         .status()
         .expect("failed to invoke docker build");
 

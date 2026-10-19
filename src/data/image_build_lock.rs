@@ -148,9 +148,12 @@ mod tests {
 
     #[test]
     fn a_second_lease_waits_and_can_cancel_without_stealing_the_lock() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let locks = ImageBuildLockStore::new(dir.path());
         let store = BuildStoreKey::AppleLocal;
         let first = locks.lock(&store, "agent:latest", || Ok(())).unwrap();
@@ -179,9 +182,12 @@ mod tests {
 
     #[test]
     fn try_lock_reports_a_held_lock_without_waiting() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let locks = ImageBuildLockStore::new(dir.path());
         let store = BuildStoreKey::AppleLocal;
         let held = locks

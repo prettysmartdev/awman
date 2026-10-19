@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::binary::{awman, has_builtin_runtime, Scratch};
+use crate::binary::{awman, builtin_selectable, Scratch};
 
 fn clean_with_state(scratch: &Scratch, state: &Path) -> std::process::Output {
     let repo = scratch.dir.path().join("repo");
@@ -20,10 +20,12 @@ fn clean_with_state(scratch: &Scratch, state: &Path) -> std::process::Output {
 }
 
 fn skip() -> bool {
-    if has_builtin_runtime() {
+    if builtin_selectable() {
         return false;
     }
-    eprintln!("SKIP: builtin state-dir test: awman was built without the builtin runtime");
+    eprintln!(
+        "SKIP: builtin state-dir test: awman lacks the builtin runtime or this host is unreleased"
+    );
     true
 }
 

@@ -127,9 +127,12 @@ mod tests {
 
     #[test]
     fn receipt_for_another_key_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let store = PendingBuiltImageStore::new(dir.path());
         let key = PendingBuildKey {
             store: BuildStoreKey::AppleLocal,

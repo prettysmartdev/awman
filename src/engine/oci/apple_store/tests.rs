@@ -118,6 +118,7 @@ impl XpcTransport for Fake {
                     Save::Symlink => {
                         let target = Path::new(out).with_file_name("elsewhere");
                         std::fs::write(&target, b"x").unwrap();
+                        #[cfg(unix)]
                         std::os::unix::fs::symlink(&target, out).unwrap();
                     }
                     Save::Error(code, message) => {
@@ -443,6 +444,7 @@ fn missing_symlinked_malformed_and_oversized_exports_are_rejected() {
     assert!(export_error(Save::Nothing)
         .to_string()
         .contains("wrote no file"));
+    #[cfg(unix)]
     assert!(export_error(Save::Symlink)
         .to_string()
         .contains("not a regular file"));
