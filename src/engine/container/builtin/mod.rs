@@ -18,6 +18,9 @@ use crate::engine::error::EngineError;
 mod backend;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
+mod blocking;
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod catalog;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
@@ -27,6 +30,8 @@ mod embedded;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod exec_bridge;
+#[cfg(all(test, unix))]
+mod fake;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod instance;
@@ -46,6 +51,8 @@ mod paths;
 mod resources;
 #[cfg(all(test, unix))]
 mod testing;
+#[cfg(all(test, unix))]
+pub(crate) use fake::{FakeBuiltin, LaunchedVm};
 
 /// `(target_os, target_arch)` pairs the builtin engine can run on.
 pub(super) const SUPPORTED_TARGETS: &[(&str, &str)] = &[
@@ -64,7 +71,7 @@ pub(super) const RELEASED_TARGETS: &[(&str, &str)] = &[("macos", "aarch64")];
 /// Refusals, in order:
 /// 1. an ambient `MSB_*` override is set → `AmbientRuntimeOverride` (it
 ///    would outrank the embedded runtime);
-/// 2. this OS/architecture is not released → `BuiltinRuntimeUnavailable`;
+/// 2. this OS/architecture is not released → `BuiltinTargetUnreleased`;
 /// 3. this build does not contain the runtime → `BuiltinRuntimeUnavailable`.
 pub(super) fn open(
     settings: BuiltinRuntimeSettings,
@@ -76,8 +83,9 @@ pub(super) fn open(
     }
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     if !is_released_target(os, arch) {
-        return Err(EngineError::BuiltinRuntimeUnavailable {
-            reason: unsupported_target_reason(os, arch),
+        return Err(EngineError::BuiltinTargetUnreleased {
+            os: os.to_string(),
+            arch: arch.to_string(),
         });
     }
     #[cfg(awman_builtin)]
@@ -88,7 +96,7 @@ pub(super) fn open(
             });
         }
         let paths = paths::BuiltinPaths::resolve(&settings.state_dir)?;
-        let driver = msb_driver::MsbDriver::open(paths.clone())?;
+        let driver = msb_driver::MsbDriver::open(paths.clone(), &settings.ambient_overrides)?;
         Ok(Arc::new(backend::BuiltinBackend {
             driver,
             paths,
@@ -114,30 +122,15 @@ pub(super) fn is_released_target(os: &str, arch: &str) -> bool {
     RELEASED_TARGETS.contains(&(os, arch))
 }
 
-fn unsupported_target_reason(os: &str, arch: &str) -> String {
-    format!(
-        "the experimental builtin runtime is only available on macOS on Apple Silicon \
-         (macos/aarch64) in this release; this host is {os}/{arch}. Choose another runtime \
-         (docker, apple-containers or docker-sbx-experimental)"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn settings(ambient: Vec<&'static str>) -> BuiltinRuntimeSettings {
         BuiltinRuntimeSettings {
             state_dir: "/tmp/awman-builtin-test".into(),
-            vcpus: 2,
-            memory_mib: 4096,
-            image_source: None,
-            images: BTreeMap::new(),
-            registries: BTreeMap::new(),
             ambient_overrides: ambient,
             test_isolation: true,
-            network: Default::default(),
         }
     }
 
@@ -153,19 +146,39 @@ mod tests {
     }
 
     #[test]
+    fn every_ambient_override_is_refused_at_open() {
+        for variable in crate::data::config::env::AMBIENT_MSB_OVERRIDES {
+            match open(settings(vec![variable])) {
+                Err(EngineError::AmbientRuntimeOverride { variable: found }) => {
+                    assert_eq!(found, *variable)
+                }
+                Err(error) => panic!("{variable} returned the wrong error: {error:?}"),
+                Ok(_) => panic!("{variable} should be rejected"),
+            }
+        }
+    }
+
+    #[test]
     fn unavailable_build_or_test_isolation_reports_a_precise_reason() {
         match open(settings(Vec::new())) {
             Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
-                if is_released_target(std::env::consts::OS, std::env::consts::ARCH) {
-                    assert!(
-                        reason.contains("does not include") || reason.contains("test isolation"),
-                        "{reason}"
-                    );
-                } else {
-                    assert!(reason.contains("only available on macOS"), "{reason}");
-                }
+                assert!(is_released_target(
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ));
+                assert!(
+                    reason.contains("does not include") || reason.contains("test isolation"),
+                    "{reason}"
+                );
             }
-            Err(e) => panic!("expected BuiltinRuntimeUnavailable, got {e:?}"),
+            Err(e @ EngineError::BuiltinTargetUnreleased { .. }) => {
+                assert!(!is_released_target(
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ));
+                assert!(e.to_string().contains("only available on macOS"), "{e}");
+            }
+            Err(e) => panic!("expected the builtin runtime to be unavailable, got {e:?}"),
             Ok(_) => panic!("the stub never opens"),
         }
     }
@@ -185,7 +198,11 @@ mod tests {
             ("windows", "x86_64"),
         ] {
             assert!(!is_released_target(os, arch), "{os}/{arch}");
-            let reason = unsupported_target_reason(os, arch);
+            let reason = EngineError::BuiltinTargetUnreleased {
+                os: os.into(),
+                arch: arch.into(),
+            }
+            .to_string();
             assert!(reason.contains(&format!("{os}/{arch}")), "{reason}");
             assert!(reason.contains("macOS on Apple Silicon"), "{reason}");
         }

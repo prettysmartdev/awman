@@ -414,7 +414,7 @@ Commands submitted through the API (`POST /v1/commands`) run with `--yolo` appli
 ### Security considerations
 
 - `--yolo` removes the human checkpoints that catch unintended agent actions. Only use it with agents and work items you trust.
-- `yoloDisallowedTools` is a floor the agent can never cross — but only Claude enforces it.
+- `yoloDisallowedTools` is a floor the agent can never cross — but only Claude enforces it. A launch that carries an allowed- or disallowed-tools list for an agent with no flag for it is refused on Docker, Apple Containers and the builtin runtime alike, with `invalid configuration: this agent declares no <allowed|disallowed>-tools flag, so its <allowed|disallowed>-tools list cannot be applied; awman refuses to launch it without the restriction. Remove the <allowed|disallowed>-tools list or use an agent that supports it.`, rather than starting the agent unrestricted.
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
 - Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
 - Copilot and Crush support `--yolo` only — `--auto` has no equivalent for either and is dropped.
@@ -898,7 +898,7 @@ When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to con
 awman ready [--refresh] [--build] [--no-cache] [--non-interactive] [-n] [--allow-docker] [--json]
 ```
 
-Verifies your environment is ready for agent sessions.
+Verifies your environment is ready for agent sessions. Progress lines read `awman: ready: <phase>...` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
 
 | Flag | Description |
 |------|-------------|

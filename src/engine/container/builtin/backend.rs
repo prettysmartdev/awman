@@ -9,20 +9,22 @@ use super::{
 };
 use crate::{
     data::{
-        config::env::Env,
+        config::{builtin_launch::BuiltinLaunchSettings, env::Env},
         message::UserMessageSink,
-        oci_identity::ImageIdentity,
+        oci_identity::{ImageIdentity, InstalledImageIdentity},
         session::{AgentHandle, Session},
     },
     engine::{
         agent_runtime::{
             background::ExecOutput,
             execution::{AgentInstance, AgentStats},
-            Capabilities, DindSupport, ImageAcquisition, ImageImportRequest, ImportedImage,
+            Capabilities, ImageAcquisition, ImageImportRequest, ImportedImage,
         },
         container::{
+            agent_argv::AgentArgv,
             backend::ContainerBackend,
-            options::{ModelFlagForm, OverlayPermission, OverlaySpec, ResolvedContainerOptions},
+            background::BackgroundLaunchRequest,
+            options::{OverlayPermission, OverlaySpec, ResolvedContainerOptions},
             runtime::{BuiltinRuntimeSettings, ContainerImageInfo},
         },
         error::EngineError,
@@ -36,18 +38,10 @@ use std::{
     time::Duration,
 };
 static CAPABILITIES: Capabilities = Capabilities {
-    arbitrary_env_vars: true,
     arbitrary_host_mounts: true,
-    cpu_limits: true,
-    per_resource_stats: true,
-    persistent_lifecycle: false,
     kit_declarative: false,
-    dind: DindSupport::Never,
-    host_paths_visible: true,
-    session_label_supported: true,
     has_image_store: true,
     image_acquisition: ImageAcquisition::Import,
-    fractional_cpu: false,
 };
 pub struct BuiltinBackend {
     pub driver: Arc<dyn SandboxDriver>,
@@ -131,63 +125,6 @@ fn entry_by_uid(passwd: &Option<String>, uid: u32) -> Option<u32> {
             .flatten()
     })
 }
-fn agent_argv(
-    mut argv: Vec<String>,
-    options: &ResolvedContainerOptions,
-) -> Result<Vec<String>, EngineError> {
-    if options.acp {
-        argv.extend(options.agent_flags.iter().cloned());
-        return Ok(argv);
-    }
-    if let Some(flag) = &options.non_interactive_flag {
-        argv.push(flag.clone());
-    }
-    argv.extend(options.agent_mode_flags.iter().cloned());
-    for (tools, flag, label) in [
-        (
-            &options.disallowed_tools,
-            &options.disallowed_tools_flag,
-            "disallowed",
-        ),
-        (
-            &options.allowed_tools,
-            &options.allowed_tools_flag,
-            "allowed",
-        ),
-    ] {
-        if !tools.is_empty() {
-            let flag = flag
-                .as_ref()
-                .ok_or_else(|| EngineError::Config(format!("{label} tools need an agent flag")))?;
-            argv.extend([flag.clone(), tools.join(",")]);
-        }
-    }
-    if let Some(model) = &options.model {
-        match model {
-            ModelFlagForm::Argument(name) => argv.extend(["--model".into(), name.clone()]),
-            ModelFlagForm::Shorthand(flag) => argv.push(flag.clone()),
-        }
-    }
-    if let Some((_, path, flag)) = &options.system_prompt_file {
-        argv.extend([flag.clone(), guest_path(path)?]);
-    }
-    if let Some((flag, text)) = &options.system_prompt_inline {
-        argv.extend([flag.clone(), text.clone()]);
-    }
-    for (flag, path) in &options.agent_add_dirs {
-        argv.extend([flag.clone(), guest_path(path)?]);
-    }
-    argv.extend(options.agent_flags.iter().cloned());
-    if options.interactive {
-        if let Some(prompt) = &options.seeded_prompt {
-            if let Some(flag) = &options.interactive_seed_flag {
-                argv.push(flag.clone());
-            }
-            argv.push(prompt.clone());
-        }
-    }
-    Ok(argv)
-}
 fn mounts(overlays: &[OverlaySpec]) -> Result<Vec<MountSpec>, EngineError> {
     let mut resolved: Vec<MountSpec> = overlays.iter().map(|m| {
         let metadata = std::fs::metadata(&m.host_path).map_err(|e| EngineError::io(&m.host_path, e))?;
@@ -204,6 +141,34 @@ fn mounts(overlays: &[OverlaySpec]) -> Result<Vec<MountSpec>, EngineError> {
     Ok(resolved)
 }
 impl BuiltinBackend {
+    /// The launch's own builtin settings, checked against this process.
+    ///
+    /// Fails closed: a launch that arrives without its session's settings is
+    /// refused rather than given process-wide defaults, and a session whose
+    /// repo `builtin.stateDir` names a different directory than this
+    /// runtime's is refused with both paths (the state directory is
+    /// process-wide; one runtime never opens a second one).
+    fn launch_settings<'a>(
+        &self,
+        launch: Option<&'a BuiltinLaunchSettings>,
+    ) -> Result<&'a BuiltinLaunchSettings, EngineError> {
+        let launch = launch.ok_or_else(|| {
+            EngineError::MissingRequiredOption(
+                "builtin launch settings (the session's network policy, vCPUs and memory)".into(),
+            )
+        })?;
+        if let Some(requested) = &launch.repo_state_dir {
+            let same = *requested == self.settings.state_dir
+                || requested.canonicalize().ok().as_deref() == Some(self.paths.home.as_path());
+            if !same {
+                return Err(EngineError::BuiltinStateDirMismatch {
+                    process: self.settings.state_dir.clone(),
+                    session: requested.clone(),
+                });
+            }
+        }
+        Ok(launch)
+    }
     fn owned(&self, id: &str) -> Result<SandboxSummary, EngineError> {
         let summary = self.driver.get(id)?;
         naming::check_protocol(&summary.labels)?;
@@ -222,6 +187,10 @@ impl BuiltinBackend {
         if options.allow_docker {
             return Err(unsupported("Docker socket bridge"));
         }
+        // Refuse before touching the image store: a launch without its
+        // session's settings, or for a session whose state directory is not
+        // this process's, must not fall back to anything.
+        let launch = self.launch_settings(options.builtin_launch.as_deref())?;
         let image = options
             .image
             .as_ref()
@@ -230,9 +199,9 @@ impl BuiltinBackend {
             .clone();
         let image_lease = self.paths.image_lease(&image, false)?;
         let config = self.driver.image_config(&image)?.ok_or_else(|| {
-            EngineError::Config(format!(
-                "image {image} is not imported; run awman ready with an explicit image source"
-            ))
+            EngineError::BuiltinImageNotImported {
+                image: image.to_string(),
+            }
         })?;
         let name = options
             .name
@@ -243,7 +212,7 @@ impl BuiltinBackend {
         let (vcpus, memory_mib) = resources::resolve(
             options.cpu,
             options.memory,
-            (self.settings.vcpus, self.settings.memory_mib),
+            (launch.vcpus, launch.memory_mib),
         )?;
         let mut overlays = options.overlays.clone();
         if let Some(settings) = &options.agent_settings {
@@ -279,16 +248,17 @@ impl BuiltinBackend {
             mount_owner: image_owner(user.as_deref(), &config.accounts)?,
             vcpus,
             memory_mib,
-            network: network::compile(&self.settings.network),
+            network: network::compile(&launch.network),
         };
-        let argv = agent_argv(
+        // The entrypoint plus the agent tail Docker and Apple append after the
+        // image: one builder, so the three runtimes cannot drift.
+        let argv = AgentArgv::from_options_strict(&options)?.append_to(
             options
                 .entrypoint
                 .as_ref()
                 .map(|e| e.0.clone())
                 .unwrap_or(config.argv),
-            &options,
-        )?;
+        );
         let mut env = Vec::new();
         for key in options.env_passthrough {
             if let Some(value) = crate::data::config::env::host_var(&key.0) {
@@ -334,7 +304,9 @@ impl BuiltinBackend {
     fn identities_path(&self) -> std::path::PathBuf {
         self.paths.home.join("awman-images.json")
     }
-    fn identities(&self) -> Result<std::collections::BTreeMap<String, ImageIdentity>, EngineError> {
+    fn identities(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, InstalledImageIdentity>, EngineError> {
         let path = self.identities_path();
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -345,7 +317,7 @@ impl BuiltinBackend {
     }
     fn save_identities(
         &self,
-        identities: &std::collections::BTreeMap<String, ImageIdentity>,
+        identities: &std::collections::BTreeMap<String, InstalledImageIdentity>,
     ) -> Result<(), EngineError> {
         let bytes = serde_json::to_vec(identities)
             .map_err(|_| EngineError::Other("cannot serialize image identities".into()))?;
@@ -363,16 +335,13 @@ impl BuiltinBackend {
 }
 impl ContainerBackend for BuiltinBackend {
     fn name(&self) -> &'static str {
-        "builtin"
+        crate::engine::container::runtime::BUILTIN_RUNTIME_NAME
     }
     fn display_name(&self) -> &'static str {
         "Builtin runtime (experimental)"
     }
     fn capabilities(&self) -> &'static Capabilities {
         &CAPABILITIES
-    }
-    fn host_cli(&self) -> Option<&'static str> {
-        None
     }
     fn reattach_after_owner_exit(&self) -> bool {
         false
@@ -398,7 +367,7 @@ impl ContainerBackend for BuiltinBackend {
             .spec
             .labels
             .get(naming::LABEL_OWNER)
-            .expect("launch plan owns its labels")
+            .ok_or_else(|| EngineError::Other("builtin launch plan has no owner label".into()))?
             .clone();
         Ok(Box::new(Instance {
             driver: self.driver.clone(),
@@ -482,15 +451,6 @@ impl ContainerBackend for BuiltinBackend {
         }
         Ok(())
     }
-    fn exec_args(
-        &self,
-        _id: &str,
-        _cwd: &str,
-        _entry: &[&str],
-        _env: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        None
-    }
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
         Ok(self.driver.image_config(tag)?.is_some())
     }
@@ -498,14 +458,25 @@ impl ContainerBackend for BuiltinBackend {
         Ok(self.driver.image_config(tag)?.and_then(|c| c.home))
     }
     fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
-        Ok(self.identities()?.remove(tag))
+        Ok(self.identities()?.remove(tag).map(|record| record.identity))
+    }
+    fn image_matches_source(&self, request: &ImageImportRequest) -> Result<bool, EngineError> {
+        let _image = self.paths.image_lease(&request.tag, false)?;
+        let _catalog = self.paths.lock()?;
+        let Some(record) = self.identities()?.remove(&request.tag) else {
+            return Ok(false);
+        };
+        Ok(record.acquisition_source.as_ref() == Some(&request.source)
+            && request.platform.matches(&record.identity.platform)
+            && request
+                .expected_built_identity
+                .as_ref()
+                .is_none_or(|built| built.matches(&record.identity))
+            && self.image_exists(&request.tag)?)
     }
     fn build_image(
         &self,
-        _tag: &str,
-        _file: &Path,
-        _context: &Path,
-        _no_cache: bool,
+        _request: &crate::engine::container::BuildRequest,
         _line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         Err(unsupported(
@@ -539,25 +510,12 @@ impl ContainerBackend for BuiltinBackend {
                 max_layers: 256,
                 min_free_bytes: 1024 * 1024 * 1024,
             },
-            &Env::for_image_acquisition(&self.settings.registries),
+            &Env::for_image_acquisition(&request.registries),
         )
         .with_cancel(cancel.clone())
         .with_expected_built_identity(request.expected_built_identity.clone())
         .with_export_selector(request.immutable_export_selector.clone());
-        let acquired = acquirer.acquire(
-            &AcquireRequest {
-                tag: request.tag.clone(),
-                source: request.source.clone(),
-                platform: request.platform.clone(),
-                policy: if request.refresh {
-                    AcquirePolicy::Refresh
-                } else {
-                    AcquirePolicy::IfMissing
-                },
-                registries: self.settings.registries.clone(),
-            },
-            &mut |_| {},
-        )?;
+        let acquired = acquirer.acquire(&acquire_request(request), &mut |_| {})?;
         // `acquired` carries the lease taken atomically with lookup/publication,
         // through projection, SDK import and identity publication below.
         // Imports serialise on their own lock; the catalog lock is only held
@@ -591,7 +549,13 @@ impl ContainerBackend for BuiltinBackend {
         {
             let _lock = self.paths.lock()?;
             let mut identities = self.identities()?;
-            identities.insert(request.tag.clone(), acquired.identity.clone());
+            identities.insert(
+                request.tag.clone(),
+                InstalledImageIdentity {
+                    identity: acquired.identity.clone(),
+                    acquisition_source: Some(request.source.clone()),
+                },
+            );
             self.save_identities(&identities)?;
         }
         cancel.check()?;
@@ -620,12 +584,17 @@ impl ContainerBackend for BuiltinBackend {
     }
     fn start_background(
         &self,
-        image: &str,
-        workdir: &Path,
-        env: &HashMap<String, String>,
-        overlays: &[OverlaySpec],
+        request: &BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
         self.is_available()?;
+        let launch = self.launch_settings(request.builtin_launch)?;
+        let BackgroundLaunchRequest {
+            image,
+            workdir,
+            env,
+            overlays,
+            ..
+        } = *request;
         let name = format!("awman-background-{}", uuid::Uuid::new_v4().simple());
         let id = naming::sandbox_name_for(&name);
         let mut mounted = mounts(overlays)?;
@@ -644,9 +613,9 @@ impl ContainerBackend for BuiltinBackend {
         }
         let _image_lease = self.paths.image_lease(image, false)?;
         let config = self.driver.image_config(image)?.ok_or_else(|| {
-            EngineError::Config(format!(
-                "image {image} is not imported; run awman ready with an explicit image source"
-            ))
+            EngineError::BuiltinImageNotImported {
+                image: image.to_string(),
+            }
         })?;
         self.driver.create(SandboxSpec {
             name: id.clone(),
@@ -658,9 +627,9 @@ impl ContainerBackend for BuiltinBackend {
             )?,
             mounts: mounted,
             mount_owner: image_owner(config.user.as_deref(), &config.accounts)?,
-            vcpus: self.settings.vcpus,
-            memory_mib: self.settings.memory_mib,
-            network: network::compile(&self.settings.network),
+            vcpus: launch.vcpus,
+            memory_mib: launch.memory_mib,
+            network: network::compile(&launch.network),
         })?;
         self.background_env
             .lock()
@@ -681,16 +650,27 @@ impl ContainerBackend for BuiltinBackend {
         working_dir: &str,
         env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
-        self.exec_in_background_streaming(id, command, working_dir, env, &mut |_| {})
+        self.exec_in_background_streaming(
+            &crate::engine::container::background::BackgroundExecRequest {
+                id,
+                command,
+                working_dir,
+                env,
+            },
+            &mut |_| {},
+        )
     }
     fn exec_in_background_streaming(
         &self,
-        id: &str,
-        command: &str,
-        working_dir: &str,
-        env: Option<&HashMap<String, String>>,
+        request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
+        super::blocking::BlockingOperation::check_context()?;
+        let id = request.id;
+        let command = request.command;
+        let working_dir = request.working_dir;
+        let env = request.env;
+
         self.owned(id)?;
         let state = self
             .background_env
@@ -725,37 +705,39 @@ impl ContainerBackend for BuiltinBackend {
                 }
             }
         });
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut stdout_line = Vec::new();
-        let mut stderr_line = Vec::new();
-        let code = loop {
-            match rx.recv() {
-                Ok(ExecEvent::Stdout(bytes)) => {
-                    stdout.extend_from_slice(&bytes);
-                    lines(&mut stdout_line, bytes, on_line);
+        super::blocking::BlockingOperation::run_borrowed(|| {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut stdout_line = Vec::new();
+            let mut stderr_line = Vec::new();
+            let code = loop {
+                match rx.recv() {
+                    Ok(ExecEvent::Stdout(bytes)) => {
+                        stdout.extend_from_slice(&bytes);
+                        lines(&mut stdout_line, bytes, on_line);
+                    }
+                    Ok(ExecEvent::Stderr(bytes)) => {
+                        stderr.extend_from_slice(&bytes);
+                        lines(&mut stderr_line, bytes, on_line);
+                    }
+                    Ok(ExecEvent::Exited(code)) => break code,
+                    _ => {
+                        return Err(EngineError::Other(
+                            "builtin background exec failed without an exit status".into(),
+                        ))
+                    }
                 }
-                Ok(ExecEvent::Stderr(bytes)) => {
-                    stderr.extend_from_slice(&bytes);
-                    lines(&mut stderr_line, bytes, on_line);
-                }
-                Ok(ExecEvent::Exited(code)) => break code,
-                _ => {
-                    return Err(EngineError::Other(
-                        "builtin background exec failed without an exit status".into(),
-                    ))
+            };
+            for pending in [stdout_line, stderr_line] {
+                if !pending.is_empty() {
+                    on_line(&String::from_utf8_lossy(&pending));
                 }
             }
-        };
-        for pending in [stdout_line, stderr_line] {
-            if !pending.is_empty() {
-                on_line(&String::from_utf8_lossy(&pending));
-            }
-        }
-        Ok(ExecOutput {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            exit_code: code,
+            Ok(ExecOutput {
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                exit_code: code,
+            })
         })
     }
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
@@ -784,63 +766,65 @@ fn lines(pending: &mut Vec<u8>, bytes: Vec<u8>, callback: &mut dyn FnMut(&str)) 
     }
 }
 
+/// The acquisition request an import makes. The registry map is the
+/// importing session's own (`ImageImportRequest.registries`), never state the
+/// backend retained from another session.
+fn acquire_request(request: &ImageImportRequest) -> AcquireRequest {
+    AcquireRequest {
+        tag: request.tag.clone(),
+        source: request.source.clone(),
+        platform: request.platform.clone(),
+        policy: if request.refresh {
+            AcquirePolicy::Refresh
+        } else {
+            AcquirePolicy::IfMissing
+        },
+        registries: request.registries.clone(),
+    }
+}
+
+#[cfg(test)]
+mod acquire_request_tests {
+    use super::*;
+    use crate::data::config::image_source::RegistryHostConfig;
+
+    fn import(insecure: bool) -> ImageImportRequest {
+        let mut registries = std::collections::BTreeMap::new();
+        registries.insert(
+            "r.example".to_string(),
+            RegistryHostConfig {
+                insecure,
+                ..Default::default()
+            },
+        );
+        ImageImportRequest {
+            tag: "awman-repo-claude:latest".into(),
+            source: crate::data::config::image_source::ImageSourceSpec::Archive {
+                path: "/images/agent.tar".into(),
+            },
+            platform: crate::data::oci_identity::OciPlatform::host_linux(),
+            refresh: false,
+            expected_built_identity: None,
+            immutable_export_selector: None,
+            registries,
+        }
+    }
+
+    #[test]
+    fn registries_come_from_each_import_request() {
+        let (a, b) = (import(true), import(false));
+        assert_eq!(acquire_request(&a).registries, a.registries);
+        assert_eq!(acquire_request(&b).registries, b.registries);
+        assert_ne!(
+            acquire_request(&a).registries,
+            acquire_request(&b).registries
+        );
+    }
+}
+
 #[cfg(test)]
 mod compat_tests {
     use super::*;
-
-    #[test]
-    fn maps_agent_flags_without_splitting_values_and_preserves_acp_argv() {
-        let options = ResolvedContainerOptions {
-            interactive: true,
-            agent_mode_flags: vec!["--permission-mode".into(), "plan".into()],
-            allowed_tools: vec!["Bash(git status)".into(), "Read".into()],
-            allowed_tools_flag: Some("--allowedTools".into()),
-            model: Some(ModelFlagForm::Argument("model with spaces".into())),
-            system_prompt_inline: Some(("--system".into(), "first\nsecond".into())),
-            seeded_prompt: Some("task with spaces".into()),
-            ..Default::default()
-        };
-        let base = vec!["claude".into()];
-        assert_eq!(
-            agent_argv(base.clone(), &options).unwrap(),
-            vec![
-                "claude",
-                "--permission-mode",
-                "plan",
-                "--allowedTools",
-                "Bash(git status),Read",
-                "--model",
-                "model with spaces",
-                "--system",
-                "first\nsecond",
-                "task with spaces",
-            ]
-        );
-        let mut acp = options;
-        acp.acp = true;
-        assert_eq!(agent_argv(base.clone(), &acp).unwrap(), base);
-    }
-
-    #[test]
-    fn appends_agent_flags_before_the_prompt_and_after_acp_entrypoint() {
-        let options = ResolvedContainerOptions {
-            interactive: true,
-            model: Some(ModelFlagForm::Argument("gpt-5".into())),
-            agent_flags: vec!["--no-daemon".into()],
-            seeded_prompt: Some("task".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            agent_argv(vec!["codex".into()], &options).unwrap(),
-            vec!["codex", "--model", "gpt-5", "--no-daemon", "task"]
-        );
-        let mut acp = options;
-        acp.acp = true;
-        assert_eq!(
-            agent_argv(vec!["cline".into(), "--acp".into()], &acp).unwrap(),
-            vec!["cline", "--acp", "--no-daemon"]
-        );
-    }
 
     #[test]
     fn maps_single_file_without_mounting_its_parent_and_rejects_socket() {
@@ -935,6 +919,8 @@ mod compat_tests {
     }
 }
 
+#[cfg(test)]
+mod launch_settings_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

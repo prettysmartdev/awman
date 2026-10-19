@@ -1,6 +1,7 @@
 //! Configuration concerns for awman: per-repo config, global config, env-var
 //! reads, typed flag values, and the merged effective view.
 
+pub mod builtin_launch;
 pub mod builtin_network;
 pub mod builtin_runtime;
 pub mod config_json;
@@ -13,6 +14,7 @@ pub mod image_source;
 pub mod leader_spec;
 pub mod overlays;
 pub mod repo;
+pub mod resolved_builtin;
 pub mod runtime_selection;
 
 pub use builtin_network::{
@@ -34,6 +36,7 @@ pub use repo::{
     AgentAuthMode, ApiConfig, AuthRefreshConfig, DynamicWorkflowsConfig, LaunchMode, RemoteConfig,
     RepoConfig, SquadConfig, WorkItemsConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
+pub use resolved_builtin::ResolvedBuiltinConfig;
 pub use runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 
 /// Built-in default number of scrollback lines for the container terminal emulator.

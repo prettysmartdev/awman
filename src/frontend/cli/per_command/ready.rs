@@ -40,9 +40,18 @@ impl ReadyFrontend for CliFrontend {
         .unwrap_or_else(|| self.headless.run_audit_on_template()))
     }
 
-    fn report_phase(&mut self, _phase: &ReadyPhase) {
-        // The ReadyPhase enum is an internal state-machine token; users see
-        // progress through `report_step_status` and the final summary box.
+    fn report_phase(&mut self, phase: &ReadyPhase) {
+        // The shared `ReadyPhase` Display text, as the TUI and API report it
+        // (WI 0126 F3). Progress goes to stderr; with --json it is
+        // suppressed so stdout and stderr stay machine-clean.
+        if self.is_json_mode() {
+            return;
+        }
+        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+        self.messages.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("ready: {phase}"),
+        });
     }
 
     fn report_summary(&mut self, summary: &ReadySummary) {
@@ -71,5 +80,46 @@ impl ReadyFrontend for CliFrontend {
             );
         }
         let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::command::dispatch::catalogue::CommandCatalogue;
+    use crate::data::ready_phase::ReadyPhase;
+    use crate::engine::ready::ReadyFrontend;
+    use crate::frontend::cli::command_frontend::CliFrontend;
+
+    fn frontend(args: &[&str]) -> CliFrontend {
+        let matches = CommandCatalogue::get()
+            .build_clap_command()
+            .try_get_matches_from(args)
+            .unwrap();
+        let mut frontend = CliFrontend::new(matches);
+        // Queue instead of writing to stderr, so the test can read it.
+        frontend.messages.set_pty_active(true);
+        frontend
+    }
+
+    /// WI 0126 F3: the CLI reports the phase with the same `ReadyPhase`
+    /// Display text the TUI and the API use.
+    #[test]
+    fn report_phase_uses_the_shared_ready_phase_display() {
+        let mut cli = frontend(&["awman", "ready"]);
+        cli.report_phase(&ReadyPhase::BuildingBaseImage);
+        let texts: Vec<&str> = cli
+            .messages
+            .pending()
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert_eq!(texts, ["ready: Building base image..."]);
+    }
+
+    #[test]
+    fn report_phase_is_silent_in_json_mode() {
+        let mut cli = frontend(&["awman", "ready", "--json"]);
+        cli.report_phase(&ReadyPhase::BuildingBaseImage);
+        assert_eq!(cli.messages.pending_count(), 0);
     }
 }

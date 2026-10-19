@@ -29,13 +29,15 @@ use crate::engine::workflow::actions::{
 /// `(phase, description, attempt, of)` for each `on_phase_step_fixing`.
 type SharedPhaseFixingCalls = Arc<Mutex<Vec<(PhaseKind, String, u32, u32)>>>;
 
-struct FakeExecWorkflowFrontend {
+pub(crate) struct FakeExecWorkflowFrontend {
     pty_active_calls: Vec<bool>,
     /// Per-step container names received via `report_parallel_step_container`.
     parallel_containers: Arc<Mutex<Vec<(String, String)>>>,
     replay_queued_count: usize,
     summary_calls: Vec<WorkflowSummary>,
     messages: Vec<UserMessage>,
+    shared_messages: Arc<Mutex<Vec<UserMessage>>>,
+    interactive_recovery: bool,
     next_action_response: NextAction,
     /// What `ask_workflow_resume` answers. `Fresh` keeps the historical
     /// behaviour of every test that does not care.
@@ -49,18 +51,31 @@ struct FakeExecWorkflowFrontend {
 }
 
 impl FakeExecWorkflowFrontend {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pty_active_calls: vec![],
             parallel_containers: Arc::new(Mutex::new(Vec::new())),
             replay_queued_count: 0,
             summary_calls: vec![],
             messages: vec![],
+            shared_messages: Arc::new(Mutex::new(Vec::new())),
+            interactive_recovery: false,
             next_action_response: NextAction::LaunchNext,
             resume_response: WorkflowResumeDecision::Fresh,
             resume_prompts: Vec::new(),
             phase_fixing: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub(crate) fn with_shared_messages(messages: Arc<Mutex<Vec<UserMessage>>>) -> Self {
+        let mut frontend = Self::new();
+        frontend.shared_messages = messages;
+        frontend
+    }
+
+    fn interactive(mut self) -> Self {
+        self.interactive_recovery = true;
+        self
     }
 
     fn answering_resume(mut self, response: WorkflowResumeDecision) -> Self {
@@ -73,6 +88,7 @@ impl crate::engine::git::GitFrontend for FakeExecWorkflowFrontend {}
 
 impl UserMessageSink for FakeExecWorkflowFrontend {
     fn write_message(&mut self, msg: UserMessage) {
+        self.shared_messages.lock().unwrap().push(msg.clone());
         self.messages.push(msg);
     }
     fn replay_queued(&mut self) {
@@ -100,6 +116,9 @@ impl AgentFrontend for FakeExecWorkflowFrontend {
 }
 
 impl WorkflowFrontend for FakeExecWorkflowFrontend {
+    fn supports_interactive_recovery(&self) -> bool {
+        self.interactive_recovery
+    }
     fn show_workflow_control_board(
         &mut self,
         _state: &WorkflowState,
@@ -359,6 +378,382 @@ async fn set_pty_active_called_true_then_false_around_engine() {
     // Instead, we use the shared-arc pattern to peek at the state after.
     // For this test, simply verifying no panic is the structural assertion.
     let _ = result;
+}
+
+struct HoldingRuntime {
+    capabilities: crate::engine::agent_runtime::Capabilities,
+    frontends: Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>,
+}
+
+struct HoldingInstance {
+    frontends: Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>,
+}
+
+struct ImmediateExecution;
+
+impl crate::engine::agent_runtime::execution::ExecutionBackend for ImmediateExecution {
+    fn wait_blocking(
+        self: Box<Self>,
+    ) -> Result<crate::engine::agent_runtime::AgentExitInfo, EngineError> {
+        let now = chrono::Utc::now();
+        Ok(crate::engine::agent_runtime::AgentExitInfo {
+            exit_code: 0,
+            signal: None,
+            started_at: now,
+            ended_at: now,
+        })
+    }
+
+    fn cancel(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn cancel_handle(&self) -> crate::engine::agent_runtime::CancelHandle {
+        crate::engine::agent_runtime::CancelHandle::new(|| Ok(()))
+    }
+}
+
+impl crate::engine::agent_runtime::AgentInstance for HoldingInstance {
+    fn handle_preview(&self) -> crate::engine::agent_runtime::AgentHandlePreview {
+        crate::engine::agent_runtime::AgentHandlePreview {
+            id: "held-id".into(),
+            name: "held-container".into(),
+            image: "held-image".into(),
+        }
+    }
+
+    fn run_with_frontend(
+        self: Box<Self>,
+        mut frontend: Box<dyn AgentFrontend>,
+    ) -> Result<crate::engine::agent_runtime::AgentExecution, EngineError> {
+        frontend.report_status(AgentStatus::Running {
+            container_name: "held-container".into(),
+        });
+        let _io = frontend.take_io();
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "held runtime message".into(),
+        });
+        self.frontends.lock().unwrap().push(frontend);
+        let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+        Ok(crate::engine::agent_runtime::AgentExecution::new(
+            crate::data::session::AgentHandle {
+                id: "held-id".into(),
+                name: "held-container".into(),
+                image_tag: "held-image".into(),
+                started_at: chrono::Utc::now(),
+            },
+            Box::new(ImmediateExecution),
+            Arc::new(stuck_tx),
+            None,
+        ))
+    }
+}
+
+impl crate::engine::agent_runtime::AgentRuntimeEngine for HoldingRuntime {
+    fn runtime_name(&self) -> &'static str {
+        "holding-runtime"
+    }
+    fn display_name(&self) -> &'static str {
+        "Holding runtime"
+    }
+    fn capabilities(&self) -> &crate::engine::agent_runtime::Capabilities {
+        &self.capabilities
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn build(
+        &self,
+        _: crate::engine::agent_runtime::ResolvedAgentOptions,
+    ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+        Ok(Box::new(HoldingInstance {
+            frontends: self.frontends.clone(),
+        }))
+    }
+    fn list_running(
+        &self,
+        _: &Session,
+    ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+        Ok(vec![])
+    }
+    fn list_running_all(&self) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+        Ok(vec![])
+    }
+    fn stats(
+        &self,
+        _: &crate::data::session::AgentHandle,
+    ) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
+        Ok(crate::engine::agent_runtime::AgentStats {
+            name: "held-container".into(),
+            cpu_percent: 0.0,
+            memory_mb: 0.0,
+        })
+    }
+    fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn attach(
+        &self,
+        _: &crate::data::session::AgentHandle,
+    ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+        Ok(Box::new(HoldingInstance {
+            frontends: self.frontends.clone(),
+        }))
+    }
+    fn list_running_with_name_prefix(
+        &self,
+        _: &str,
+    ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+        Ok(vec![])
+    }
+    fn ready_agent(
+        &self,
+        _: &str,
+        _: crate::engine::agent_runtime::ReadyAgentOptions,
+        _: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
+        Ok(true)
+    }
+    fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
+        Ok(Some("/root".into()))
+    }
+    fn build_image(
+        &self,
+        _request: &crate::engine::container::BuildRequest,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
+    for hold_forever in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let workflow_path = write_minimal_workflow(temp.path(), "held.toml");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let resolver = crate::data::session::StaticGitRootResolver::new(temp.path());
+        let session =
+            Session::open(temp.path().to_path_buf(), &resolver, Default::default()).unwrap();
+        let mut engines = Engines::for_tests(temp.path());
+        let frontends = Arc::new(Mutex::new(Vec::new()));
+        let runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
+            Arc::new(HoldingRuntime {
+                capabilities: crate::engine::container::ContainerRuntime::docker()
+                    .capabilities()
+                    .clone(),
+                frontends: frontends.clone(),
+            });
+        engines.runtime = runtime.clone();
+        engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            engines.overlay_engine.clone(),
+            runtime,
+        ));
+        let flags = ExecWorkflowCommandFlags {
+            workflow: Some(workflow_path),
+            work_item: None,
+            non_interactive: true,
+            plan: false,
+            allow_docker: false,
+            worktree: false,
+            yolo: false,
+            auto: false,
+            agent: None,
+            model: None,
+            launch_mode: None,
+            overlay: vec![],
+            agent_flags: None,
+            max_concurrent: None,
+            issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
+            dynamic: false,
+            leader: None,
+        };
+        let frontend = FakeExecWorkflowFrontend::new();
+        let messages = frontend.shared_messages.clone();
+        let outcome = ExecWorkflowCommand::new(flags, engines, session)
+            .run_with_frontend(Box::new(frontend))
+            .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(!frontends.lock().unwrap().is_empty());
+        assert!(messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.text == "held runtime message"));
+        if !hold_forever {
+            frontends.lock().unwrap().clear();
+        }
+    }
+}
+
+#[tokio::test]
+async fn interactive_phase_survives_runtime_holding_frontend_after_wait() {
+    for hold_forever in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let frontend = FakeExecWorkflowFrontend::new();
+        let messages = frontend.shared_messages.clone();
+        let shared = SharedWorkflowFrontend::new(Box::new(frontend));
+        let frontends = Arc::new(Mutex::new(Vec::new()));
+        let phase = phase_container::InteractivePhaseContainer::new(
+            Arc::new(crate::engine::container::ContainerRuntime::docker()),
+            shared.clone(),
+            &crate::engine::workflow::PhaseStepRef {
+                kind: PhaseKind::Setup,
+                index: 0,
+                description: "held phase".into(),
+            },
+            "held-image",
+            phase_container::PhaseContainerWorkspace {
+                workdir: temp.path().to_path_buf(),
+                env: HashMap::new(),
+                overlays: Vec::new(),
+                builtin_launch: None,
+            },
+        );
+        let instance = Box::new(HoldingInstance {
+            frontends: frontends.clone(),
+        });
+        let output = tokio::task::spawn_blocking(move || phase.run_instance(instance))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(!frontends.lock().unwrap().is_empty());
+        shared.replay_queued();
+        assert!(messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.text == "held runtime message"));
+        if !hold_forever {
+            frontends.lock().unwrap().clear();
+        }
+    }
+}
+
+#[tokio::test]
+async fn dynamic_workflow_survives_runtime_holding_leader_frontend() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join(".awman")).unwrap();
+    std::fs::create_dir_all(temp.path().join("aspec/work-items")).unwrap();
+    std::fs::write(
+        temp.path().join(".awman/Dockerfile.claude"),
+        "FROM scratch\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("aspec/work-items/0042-test.md"),
+        "test work item\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+    let resolver = crate::data::session::StaticGitRootResolver::new(temp.path());
+    let session = Session::open(temp.path().to_path_buf(), &resolver, Default::default()).unwrap();
+    let frontends = Arc::new(Mutex::new(Vec::new()));
+    let runtime = crate::engine::container::test_support::holding_runtime(frontends.clone());
+    let mut engines = Engines::for_tests(temp.path());
+    engines.runtime = runtime.clone();
+    engines.container_runtime = Some(runtime.clone());
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime,
+    ));
+    let frontend = FakeExecWorkflowFrontend::new();
+    let messages = frontend.shared_messages.clone();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        ExecWorkflowCommand::new(
+            make_dynamic_flags(true, None, Some("0042"), None, false, None),
+            engines,
+            session,
+        )
+        .run_with_frontend(Box::new(frontend)),
+    )
+    .await
+    .expect("dynamic workflow timed out");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert!(
+        frontends.lock().unwrap().len() >= 2,
+        "leader and generated step must both run"
+    );
+    assert!(messages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|message| message.text == "held runtime message"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_command_survives_retained_interactive_setup_frontend() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("interactive.toml"),
+        "[[setup]]\ntype = \"run_shell\"\ncommand = \"echo setup\"\n\n[[steps]]\nname = \"test-step\"\nagent = \"claude\"\nprompt = \"work\"\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(temp.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let resolver = crate::data::session::StaticGitRootResolver::new(temp.path());
+    let session = Session::open(temp.path().to_path_buf(), &resolver, Default::default()).unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let runtime = crate::engine::container::test_support::holding_runtime(held.clone());
+    let mut engines = Engines::for_tests(temp.path());
+    engines.runtime = runtime.clone();
+    engines.container_runtime = Some(runtime.clone());
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime,
+    ));
+    let frontend = FakeExecWorkflowFrontend::new().interactive();
+    let messages = frontend.shared_messages.clone();
+    let outcome = ExecWorkflowCommand::new(
+        make_dynamic_flags(false, Some("interactive.toml"), None, None, false, None),
+        engines,
+        session,
+    )
+    .run_with_frontend(Box::new(frontend))
+    .await;
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert!(
+        held.lock().unwrap().len() >= 2,
+        "setup and main step must retain frontends"
+    );
+    assert!(messages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|message| message.text == "held runtime message"));
 }
 
 #[tokio::test]
@@ -2488,8 +2883,7 @@ fn leader_control_board_maps_actions() {
     fn outcome_for(action: NextAction) -> LeaderControlOutcome {
         let mut fe = FakeExecWorkflowFrontend::new();
         fe.next_action_response = action;
-        let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
-            Arc::new(Mutex::new(Box::new(fe)));
+        let shared = SharedWorkflowFrontend::new(Box::new(fe));
         show_leader_control_board(&shared, "leader")
     }
 
@@ -2989,12 +3383,6 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for RecordingRuntime {
     ) -> Result<Vec<crate::engine::agent_runtime::AgentHandle>, EngineError> {
         Ok(Vec::new())
     }
-    fn host_cli(&self) -> Option<&'static str> {
-        None
-    }
-    fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Option<Vec<String>> {
-        None
-    }
     fn ready_agent(
         &self,
         _: &str,
@@ -3011,10 +3399,7 @@ impl crate::engine::agent_runtime::AgentRuntimeEngine for RecordingRuntime {
     }
     fn build_image(
         &self,
-        _: &str,
-        _: &Path,
-        _: &Path,
-        _: bool,
+        _: &crate::engine::container::BuildRequest,
         _: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         Ok(())
@@ -3230,8 +3615,7 @@ async fn record_leader_launch(
         leader: Some("codex::gpt-5".into()),
     };
     let cmd = ExecWorkflowCommand::new(flags, engines, invoking);
-    let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
-        Arc::new(Mutex::new(Box::new(FakeExecWorkflowFrontend::new())));
+    let shared = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
     let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let result = cmd
         .drive_leader_agent(
@@ -3285,4 +3669,107 @@ async fn dynamic_leader_keeps_config_when_cli_targets_another_agent() {
         launch_for(&launches, "codex"),
         &["codex", "exec", "--no-daemon"].map(String::from)
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+    use crate::engine::agent_runtime::DetectedRuntime;
+    use crate::engine::container::FakeBuiltin;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"builtin":{"network":{"mode":"allowlist","allow":["*.example.com"]}}}"#,
+    )
+    .unwrap();
+    let fake = Arc::new(FakeBuiltin::new());
+    fake.import("phase-image");
+    for (policy, should_fail) in [
+        (
+            r#"{"vcpus":1,"memoryMib":1024,"network":{"allow":["api.example.com"]}}"#,
+            false,
+        ),
+        (r#"{"vcpus":3,"network":{"mode":"none"}}"#, false),
+        (r#"{"network":{"mode":"public"}}"#, true),
+        (r#"{"stateDir":"/different-state"}"#, true),
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".awman")).unwrap();
+        std::fs::write(
+            repo.path().join(".awman/config.json"),
+            format!(r#"{{"builtin":{policy}}}"#),
+        )
+        .unwrap();
+        let session = Session::open(
+            repo.path().into(),
+            &StaticGitRootResolver::new(repo.path()),
+            SessionOpenOptions {
+                env: Some(EnvSnapshot::with_overrides([(
+                    AWMAN_CONFIG_HOME,
+                    home.path().to_str().unwrap(),
+                )])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let engines =
+            Engines::from_detected(DetectedRuntime::Container(fake.runtime.clone()), &session)
+                .unwrap();
+        for kind in [PhaseKind::Setup, PhaseKind::Teardown] {
+            let frontend = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
+            let factory = phase_container::PhaseContainerFactory {
+                runtime: &fake.runtime,
+                frontend: &frontend,
+                agent_engine: &engines.agent_engine,
+                session: &session,
+                image: "phase-image",
+                workdir: repo.path(),
+                interactive: true,
+            };
+            let step = crate::engine::workflow::PhaseStepRef {
+                kind,
+                index: 0,
+                description: "shell step".into(),
+            };
+            let built = factory.build(&step, &HashMap::new(), &[]);
+            let creates = fake.creates();
+            if should_fail {
+                let error = match built {
+                    Err(error) => error,
+                    Ok(container) => {
+                        tokio::task::spawn_blocking(move || container.exec("true", None))
+                            .await
+                            .unwrap()
+                            .unwrap_err()
+                    }
+                };
+                assert!(
+                    matches!(
+                        error,
+                        EngineError::Data(_) | EngineError::BuiltinStateDirMismatch { .. }
+                    ),
+                    "{error}"
+                );
+                assert_eq!(fake.creates(), creates);
+            } else {
+                let container = built.unwrap();
+                let task = tokio::task::spawn_blocking(move || container.exec("true", None));
+                let vm = fake.finish_phase_execution().await;
+                let output = task.await.unwrap().unwrap();
+                assert_eq!(output.exit_code, 0);
+                let settings = session
+                    .effective_config()
+                    .builtin_launch_settings()
+                    .unwrap();
+                assert_eq!(vm.vcpus, settings.vcpus);
+                assert_eq!(vm.memory_mib, settings.memory_mib);
+                assert_eq!(
+                    vm.network_policy,
+                    FakeBuiltin::policy_for(&settings.network)
+                );
+            }
+        }
+    }
 }

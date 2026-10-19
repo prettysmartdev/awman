@@ -129,7 +129,9 @@ CLI binary. It selects a backend, checks availability, creates/attaches/stops
 agent instances, streams execution, lists and removes agents, inspects/removes
 images, and either builds or imports images according to backend capabilities.
 Docker and Apple container backends implement these operations through their
-host CLIs. The builtin backend implements them through the embedded SDK and
+host CLIs. The builtin backend (a container-tier driver: tiers follow capability
+shape — OCI images, ephemeral lifecycle, host mounts — not isolation
+technology) implements them through the embedded SDK and
 microVM worker; it has no host runtime CLI, and operations that do not apply
 are reported as unsupported. Command orchestration chooses operations from
 backend capabilities (including build, import, or kit image acquisition), and
@@ -143,15 +145,30 @@ normal acquisition sources are an explicitly selected OCI registry, Docker
 Engine image store, Apple Containers store, or archive. A source is typed and
 explicit, so a registry reference cannot resolve against a same-named daemon
 image. Image identity records reference, platform, content digests, and source
-kind. With `builtin.builder.enabled`, `ready` may build through the local
-Docker Engine or Apple Containers store selected by that image's resolved
-source, then import from that same source. Other sources retain their normal
-import behavior and never select a substitute builder. Build and import remain
-separate stages; successful build alone is not readiness. Source acquisition
-is not required after an image is cached.
+kind. With `builtin.builder.enabled`, a command whose `BuildPolicy` allows it
+may build through the local Docker Engine (Unix socket) or Apple Containers
+store selected by that image's resolved source, then import from that same
+source. `ready` (`Ready`) and API session setup (`SessionSetup`, only when the
+compatible source store lacks the image) may build; workflow preflight, dynamic
+workflow and squad evaluation (`ImportOnly`) and the agent availability check
+(`CheckOnly`) never do. Other sources retain their normal import behavior and
+never select a substitute builder. Build and import remain separate stages;
+successful build alone is not readiness. Source acquisition is not required
+after an image is cached.
 
-Image-source configuration belongs to the data layer, acquisition and import
-to the engine, and `ready` orchestration to the command layer. Backends do not
+The Layer 1 `AgentImagePreparer` owns this lifecycle for one image: it resolves
+the image's source once, derives a single `BuilderSelection` (local Docker,
+local Apple, incompatible, unconfigured or disabled) from it, builds through
+the `LocalImageBuilder` handle when the policy allows, and acquires with
+provenance checks. `LocalImageBuilder` exposes build-time operations only; it
+cannot start or run an agent, which stays inside the builtin runtime.
+
+Image-source configuration belongs to the data layer (which also resolves the
+session's builtin settings into process-wide and per-launch parts), acquisition,
+build and import to the engine, and `ready` orchestration to the command layer.
+The builtin runtime itself is process-wide (state directory, embedded runtime,
+ambient-override check), while network policy, vCPUs and memory are per-launch
+settings taken from each session's effective config. Backends do not
 silently switch sources or substitute Docker, Apple containers, SBX, an
 installed Microsandbox runtime, a host agent, or a downloaded/extracted helper
 when an operation is unavailable.
@@ -228,3 +245,5 @@ Lower layers request input/output from higher layers via traits:
 - Similar traits for each command needing user interaction
 
 This approach decouples business logic from presentation while preserving the ability to customize behavior per frontend.
+
+A command owns its frontend for its whole lifetime. Commands that hand the same frontend to several phases or runtimes hold it behind a shared handle (`SharedWorkflowFrontend`) and pass clones; they never reclaim it. In exchange, a runtime must drop the frontend no later than when `AgentExecution::wait()` resolves, when the `wait()` future is dropped, or when the execution is dropped.

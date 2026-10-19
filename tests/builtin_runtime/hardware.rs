@@ -55,7 +55,7 @@ pub fn fixture_archive() -> Option<PathBuf> {
             let status = Command::new("cargo")
                 .args(["run", "--locked", "--quiet", "--manifest-path"])
                 .arg(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
                         .join("tools/oci-runtime-spike/fixture/Cargo.toml"),
                 )
                 .arg("--")
@@ -121,7 +121,10 @@ pub(crate) fn scenario(test: &str, name: &str) -> Option<Run> {
         .args(["--tag", TAG, "--work"])
         .arg(work.path())
         .arg("--scripts")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/oci-runtime-spike"))
+        .arg(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .join("tools/oci-runtime-spike"),
+        )
         .output()
         .expect("spawn the guest driver");
     let raw = format!(

@@ -10,25 +10,21 @@
 //! `image_home_dir`, `start_background` — are inherent methods; the
 //! cross-paradigm subset is also reachable through `AgentRuntimeEngine`.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::data::config::builtin_network::BuiltinNetworkSettings;
-use crate::data::config::effective::EffectiveConfig;
-use crate::data::config::env::test_isolation_active;
-use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
+use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
 use crate::data::oci_identity::ImageIdentity;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
-    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ImageAcquisition,
+    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, ImageAcquisition,
     ImageImportRequest, ImportedImage, ReadyAgentOptions, ResolvedAgentOptions,
 };
 use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
-use crate::engine::container::background::BackgroundContainer;
+use crate::engine::container::background::{BackgroundContainer, BackgroundLaunchRequest};
 use crate::engine::container::docker::DockerBackend;
-use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
+use crate::engine::container::options::ResolvedContainerOptions;
 use crate::engine::container::phase_step::PhaseStepContainerSpec;
 use crate::engine::error::EngineError;
 
@@ -48,41 +44,27 @@ pub struct ContainerImageInfo {
 /// Containers): image-based, built locally, ephemeral, arbitrary mounts/env,
 /// label-based session attribution, fractional CPU limits.
 pub(super) static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
-    arbitrary_env_vars: true,
     arbitrary_host_mounts: true,
-    cpu_limits: true,
-    per_resource_stats: true,
-    persistent_lifecycle: false,
     kit_declarative: false,
-    dind: DindSupport::OnRequest,
-    host_paths_visible: true,
-    session_label_supported: true,
     has_image_store: true,
     image_acquisition: ImageAcquisition::Build,
-    fractional_cpu: true,
 };
 
-/// Everything the builtin microVM backend needs, resolved from global config,
-/// repo config and the environment by the caller (Layer 2, or
-/// `agent_runtime::detect`) before `ContainerRuntime::builtin` is called.
+/// The process-wide part of the builtin microVM backend's settings: one
+/// builtin runtime per process owns these. Resolved from the effective config
+/// the process starts with (`agent_runtime::detect_effective`) before
+/// `ContainerRuntime::builtin` is called.
+///
+/// Everything a launch is sized and confined by (default vCPUs and memory,
+/// network policy) is per session instead: it arrives with each launch as
+/// [`BuiltinLaunchSettings`](crate::data::config::builtin_launch::BuiltinLaunchSettings),
+/// resolved from that session's own config.
+/// Image sources, registries and the builder flag are per-session image
+/// acquisition inputs and never live here either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltinRuntimeSettings {
     /// Private state root (catalog, caches, control sockets).
     pub state_dir: PathBuf,
-    /// Whole vCPUs per agent VM.
-    pub vcpus: u8,
-    /// Guest memory per agent VM, in MiB.
-    pub memory_mib: u32,
-    /// Default image source for images that are not cached.
-    pub image_source: Option<ImageSourceSpec>,
-    /// Per-image source overrides keyed by awman image tag.
-    pub images: BTreeMap<String, ImageSourceSpec>,
-    /// Registry host settings keyed by `host[:port]`.
-    pub registries: BTreeMap<String, RegistryHostConfig>,
-    /// Guest network policy, already layered and validated
-    /// (`EffectiveConfig::builtin_network`). The backend compiles it into
-    /// every VM it creates; there is no per-launch override.
-    pub network: BuiltinNetworkSettings,
     /// The ambient `MSB_*` overrides present in the environment. Any entry
     /// makes the backend refuse to start (`AmbientRuntimeOverride`).
     pub ambient_overrides: Vec<&'static str>,
@@ -92,27 +74,19 @@ pub struct BuiltinRuntimeSettings {
 }
 
 impl BuiltinRuntimeSettings {
-    /// Resolve from the effective config (repo `builtin` block merged over the
-    /// global one) and its environment snapshot. Invalid values — zero
-    /// resources, a meaningless image source, a network block that
-    /// widens the global policy or contradicts itself — are a configuration error.
-    pub fn resolve(config: &EffectiveConfig) -> Result<Self, EngineError> {
-        let builtin = config.builtin_runtime();
-        builtin.validate().map_err(EngineError::Config)?;
-        let env = config.env();
-        Ok(Self {
-            state_dir: config.builtin_state_dir()?,
-            vcpus: builtin.vcpus_or_default(),
-            memory_mib: builtin.memory_mib_or_default(),
-            image_source: builtin.image_source,
-            images: builtin.images,
-            registries: builtin.registries,
-            network: config.builtin_network().map_err(EngineError::Config)?,
-            ambient_overrides: env.ambient_msb_overrides(),
-            test_isolation: test_isolation_active() && !env.test_builtin(),
-        })
+    /// Select the process-owned fields from Layer 0's fully resolved config.
+    /// All merging, defaults and validation have already happened there.
+    pub fn resolve(resolved: &ResolvedBuiltinConfig) -> Self {
+        Self {
+            state_dir: resolved.state_dir.clone(),
+            ambient_overrides: resolved.ambient_overrides.clone(),
+            test_isolation: resolved.test_isolation,
+        }
     }
 }
+
+/// [`ContainerRuntime::runtime_name`] of the builtin microVM backend.
+pub const BUILTIN_RUNTIME_NAME: &str = "builtin";
 
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
@@ -145,6 +119,13 @@ impl ContainerRuntime {
         })
     }
 
+    /// Wrap an already-constructed backend. Test-only: lets hermetic tests run
+    /// a real backend over a fake driver.
+    #[cfg(test)]
+    pub(super) fn with_backend(backend: Arc<dyn ContainerBackend>) -> Self {
+        Self { backend }
+    }
+
     /// Static name of the chosen backend (e.g. `"docker"`).
     pub fn runtime_name(&self) -> &'static str {
         self.backend.name()
@@ -159,11 +140,6 @@ impl ContainerRuntime {
     /// Static description of what the chosen backend can do.
     pub fn capabilities(&self) -> &Capabilities {
         self.backend.capabilities()
-    }
-
-    /// The host CLI the chosen backend drives, if any.
-    pub fn host_cli(&self) -> Option<&'static str> {
-        self.backend.host_cli()
     }
 
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
@@ -183,14 +159,10 @@ impl ContainerRuntime {
     /// cannot build images.
     pub fn build_image(
         &self,
-        tag: &str,
-        dockerfile: &Path,
-        context: &Path,
-        no_cache: bool,
+        request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
-        self.backend
-            .build_image(tag, dockerfile, context, no_cache, on_line)
+        self.backend.build_image(request, on_line)
     }
 
     /// Read the image's baked-in `$HOME` from its config. Used by
@@ -250,19 +222,6 @@ impl ContainerRuntime {
         self.backend.remove_image(id)
     }
 
-    /// Argv (after the host CLI name) for `exec -it` into a running
-    /// container. `None` when the backend drives no host CLI.
-    pub fn exec_args(
-        &self,
-        container_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        self.backend
-            .exec_args(container_id, working_dir, entrypoint, env_vars)
-    }
-
     /// Attach to an already-running container this process did not start.
     /// Delegates to the backend; the returned instance runs through the
     /// existing `run_with_frontend` path.
@@ -294,23 +253,28 @@ impl ContainerRuntime {
     ///
     /// Delegates to the backend's `start_background`. The returned
     /// `BackgroundContainer` retains a shared reference to the backend so
-    /// later `exec` and `kill` calls flow through the same trait.
-    pub fn start_background(
+    /// later `exec` and `kill` calls flow through the same trait. The builtin
+    /// backend sizes and confines the container with the request's
+    /// `builtin_launch`, exactly as it does a foreground launch.
+    pub fn launch_background(
         &self,
-        image: &str,
-        workdir: &Path,
-        env: &HashMap<String, String>,
-        overlays: &[OverlaySpec],
+        request: &BackgroundLaunchRequest<'_>,
     ) -> Result<BackgroundContainer, EngineError> {
-        let container_id = self
-            .backend
-            .start_background(image, workdir, env, overlays)?;
-        let workdir_str = workdir.display().to_string();
+        let container_id = self.backend.start_background(request)?;
+        let workdir_str = request.workdir.display().to_string();
         Ok(BackgroundContainer::new(
             container_id,
             Arc::clone(&self.backend),
             workdir_str,
         ))
+    }
+
+    /// Start an idle container with the launching session's resolved settings.
+    pub fn start_background(
+        &self,
+        request: &BackgroundLaunchRequest<'_>,
+    ) -> Result<BackgroundContainer, EngineError> {
+        self.launch_background(request)
     }
 
     /// Best-effort check whether the container runtime is reachable.
@@ -373,26 +337,12 @@ impl AgentRuntimeEngine for ContainerRuntime {
         ContainerRuntime::stop(self, handle)
     }
 
-    fn exec_args(
-        &self,
-        agent_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        ContainerRuntime::exec_args(self, agent_id, working_dir, entrypoint, env_vars)
-    }
-
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         ContainerRuntime::attach(self, handle)
     }
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         ContainerRuntime::list_running_with_name_prefix(self, prefix)
-    }
-
-    fn host_cli(&self) -> Option<&'static str> {
-        ContainerRuntime::host_cli(self)
     }
 
     fn reattach_after_owner_exit(&self) -> bool {
@@ -431,13 +381,10 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn build_image(
         &self,
-        tag: &str,
-        dockerfile: &Path,
-        context: &Path,
-        no_cache: bool,
+        request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
-        ContainerRuntime::build_image(self, tag, dockerfile, context, no_cache, on_line)
+        ContainerRuntime::build_image(self, request, on_line)
     }
 
     fn import_image(
@@ -459,6 +406,10 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
         self.backend.image_identity(tag)
+    }
+
+    fn image_matches_source(&self, request: &ImageImportRequest) -> Result<bool, EngineError> {
+        self.backend.image_matches_source(request)
     }
 }
 
@@ -489,6 +440,7 @@ pub(crate) fn wait_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::config::effective::EffectiveConfig;
     use crate::engine::agent_runtime::ResolvedAgentOptions;
     use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
@@ -541,26 +493,16 @@ mod tests {
     }
 
     #[test]
-    fn cli_backends_state_their_host_cli_and_reattach_model() {
+    fn cli_backends_state_their_reattach_model() {
         let docker = ContainerRuntime::docker();
         let apple = ContainerRuntime::apple();
-        assert_eq!(docker.host_cli(), Some("docker"));
-        assert_eq!(apple.host_cli(), Some("container"));
         assert!(<ContainerRuntime as AgentRuntimeEngine>::reattach_after_owner_exit(&docker));
         assert!(!<ContainerRuntime as AgentRuntimeEngine>::reattach_after_owner_exit(&apple));
-        for rt in [&docker, &apple] {
-            let args = rt
-                .exec_args("ctr", "/w", &["sh"], &[])
-                .expect("CLI backends have exec argv");
-            assert_eq!(args, vec!["exec", "-it", "-w", "/w", "ctr", "sh"]);
-        }
     }
 
     #[test]
-    fn builtin_settings_apply_defaults_and_reject_invalid_config() {
-        use crate::data::config::builtin_runtime::{
-            BuiltinRuntimeConfig, DEFAULT_MEMORY_MIB, DEFAULT_VCPUS,
-        };
+    fn builtin_process_settings_hold_only_process_wide_values() {
+        use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
         use crate::data::config::env::{EnvSnapshot, AWMAN_BUILTIN_STATE_DIR, MSB_PATH};
         use crate::data::config::{FlagConfig, GlobalConfig, RepoConfig};
 
@@ -568,37 +510,6 @@ mod tests {
             (AWMAN_BUILTIN_STATE_DIR, "/s"),
             (MSB_PATH, "/elsewhere/msb"),
         ]);
-        let effective = |builtin: BuiltinRuntimeConfig| {
-            EffectiveConfig::new(
-                FlagConfig::default(),
-                env.clone(),
-                RepoConfig::default(),
-                GlobalConfig {
-                    builtin: Some(builtin),
-                    ..Default::default()
-                },
-            )
-        };
-        let settings =
-            BuiltinRuntimeSettings::resolve(&effective(BuiltinRuntimeConfig::default())).unwrap();
-        assert_eq!(settings.state_dir, PathBuf::from("/s"));
-        assert_eq!(settings.vcpus, DEFAULT_VCPUS);
-        assert_eq!(settings.memory_mib, DEFAULT_MEMORY_MIB);
-        assert_eq!(settings.ambient_overrides, vec![MSB_PATH]);
-        assert!(settings.test_isolation, "unit tests are always isolated");
-        assert_eq!(settings.network, BuiltinNetworkSettings::default());
-
-        let invalid = effective(BuiltinRuntimeConfig {
-            vcpus: Some(0),
-            ..Default::default()
-        });
-        assert!(matches!(
-            BuiltinRuntimeSettings::resolve(&invalid),
-            Err(EngineError::Config(_))
-        ));
-
-        // A repo network block may narrow the global policy but never widen
-        // it; a widening request is a configuration error, not a downgrade.
         let layered = |global: &str, repo: &str| {
             EffectiveConfig::new(
                 FlagConfig::default(),
@@ -613,35 +524,54 @@ mod tests {
                 },
             )
         };
-        let narrowed = BuiltinRuntimeSettings::resolve(&layered(
-            r#"{"network":{"hostPorts":[8765]}}"#,
-            r#"{"network":{"mode":"allowlist","allow":["api.example.com"]}}"#,
-        ))
-        .unwrap();
+        let resolved = layered("{}", "{}").builtin_settings().unwrap();
+        let settings = BuiltinRuntimeSettings::resolve(&resolved);
         assert_eq!(
-            narrowed.network.mode,
-            crate::data::config::NetworkMode::Allowlist
+            settings,
+            BuiltinRuntimeSettings {
+                state_dir: PathBuf::from("/s"),
+                ambient_overrides: vec![MSB_PATH],
+                test_isolation: true,
+            },
+            "unit tests are always isolated"
         );
-        assert_eq!(narrowed.network.host_ports, vec![8765]);
-        for widen in [
+
+        // Layer 0's complete resolved value validates resources and policy.
+        for (global, repo) in [
             (
                 r#"{"network":{"mode":"none"}}"#,
                 r#"{"network":{"mode":"public"}}"#,
             ),
             (r#"{}"#, r#"{"network":{"hostPorts":[8765]}}"#),
+            (r#"{}"#, r#"{"vcpus":0}"#),
+            (r#"{}"#, r#"{"memoryMib":64}"#),
         ] {
-            assert!(matches!(
-                BuiltinRuntimeSettings::resolve(&layered(widen.0, widen.1)),
-                Err(EngineError::Config(message)) if message.contains("builtin.network")
-            ));
+            assert!(
+                layered(global, repo).builtin_settings().is_err(),
+                "{repo} must fail during Layer 0 resolution"
+            );
         }
-        let too_small = effective(BuiltinRuntimeConfig {
-            memory_mib: Some(64),
-            ..Default::default()
-        });
+
+        // A meaningless image source is still refused up front.
+        let bad_source = EffectiveConfig::new(
+            FlagConfig::default(),
+            env.clone(),
+            RepoConfig::default(),
+            GlobalConfig {
+                builtin: Some(BuiltinRuntimeConfig {
+                    image_source: Some(
+                        crate::data::config::image_source::ImageSourceSpec::Archive {
+                            path: "".into(),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
         assert!(matches!(
-            BuiltinRuntimeSettings::resolve(&too_small),
-            Err(EngineError::Config(_))
+            bad_source.builtin_settings(),
+            Err(crate::data::error::DataError::BuiltinConfig(_))
         ));
 
         // The ambient override is refused before anything else.

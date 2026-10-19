@@ -39,7 +39,7 @@
 //! awman does not run the `container` CLI, ship or extract a helper
 //! executable or library, or fall back to another source.
 //!
-//! The unsafe libxpc calls live outside this library, in the binary's
+//! The native libxpc calls live in the awman-host-shims workspace crate, in its
 //! `apple_xpc` module, behind the safe [`XpcTransport`] trait; the library
 //! keeps `#![forbid(unsafe_code)]`. A build without that transport (any
 //! non-macOS target, or library tests) refuses the source with
@@ -207,7 +207,7 @@ pub fn inspect_local(
     transport: &dyn XpcTransport,
     reference: &str,
     platform: &OciPlatform,
-    control: &crate::engine::container::host_cli_backend::BuildControl,
+    control: &crate::engine::container::BuildControl,
 ) -> Result<crate::engine::oci::SourceImage, EngineError> {
     control.check()?;
     let stop = || control.check().is_err();
@@ -391,9 +391,11 @@ fn call(
             "interrupted" => EngineError::Network(format!(
                 "Apple Containers `{route}` was interrupted: {message}"
             )),
-            _ => EngineError::Container(format!(
-                "Apple Containers `{route}` failed ({code}): {message}"
-            )),
+            _ => EngineError::AppleImageStoreFailed {
+                route: route.to_string(),
+                code,
+                message,
+            },
         });
     }
     Ok(reply)
@@ -651,7 +653,8 @@ pub(super) fn export(
         0,
         ctx.limits.min_free_bytes,
     )?;
-    let export_dir = create_private_dir(&ctx.staging_dir.join("apple-export"))?;
+    let export_dir = ctx.staging_dir.join("apple-export");
+    crate::data::fs::private_files::create_private_dir_new(&export_dir)?;
     let out = export_dir.join("image.tar");
     let descriptions = serde_json::to_vec(&[&selected.description])
         .map_err(|e| EngineError::Other(format!("encoding image description: {e}")))?;
@@ -692,15 +695,6 @@ pub(super) fn export(
         expected_manifest: expected_manifest(&selected),
         fingerprint: None,
     })
-}
-
-/// Create `dir` (which must not exist) readable only by this user.
-fn create_private_dir(dir: &Path) -> Result<PathBuf, EngineError> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir).map_err(|e| EngineError::io(dir, e))?;
-    Ok(dir.to_path_buf())
 }
 
 fn rejected(reason: &str) -> EngineError {

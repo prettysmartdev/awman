@@ -482,6 +482,8 @@ While a session is being prepared (`cloning_repository`, `setting_up_branch`, `r
 grep '\[a1b2c3d4\]' ~/.awman/api/awman.log
 ```
 
+Session setup runs the same `ready` image step as `awman ready`: under the builtin runtime it builds an image only when `builtin.builder.enabled` is true and the image is missing, and otherwise imports (re-acquiring an image installed from a different source than the one now configured). Each session uses the builtin settings of its own repo.
+
 To silence this verbose stream, set `AWMAN_API_VERBOSE_SETUP=0` before starting the server. The lines are then emitted at `debug` level and dropped by the default `info` filter; they remain available via `RUST_LOG=debug`.
 
 ### Kill

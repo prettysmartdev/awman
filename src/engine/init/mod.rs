@@ -316,9 +316,15 @@ impl InitEngine {
                 let mut sink = |line: &str| {
                     frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                 };
-                let result =
-                    self.runtime
-                        .build_image(&tag, &dockerfile_path, &git_root, false, &mut sink);
+                let result = self.runtime.build_image(
+                    &crate::engine::container::BuildRequest::runtime(
+                        &tag,
+                        &dockerfile_path,
+                        &git_root,
+                        false,
+                    ),
+                    &mut sink,
+                );
                 match result {
                     Ok(()) => {
                         self.summary.image_build = StepStatus::Done;
@@ -356,10 +362,12 @@ impl InitEngine {
                         frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                     };
                     let result = self.runtime.build_image(
-                        &agent_tag,
-                        &agent_dockerfile,
-                        &git_root,
-                        false,
+                        &crate::engine::container::BuildRequest::runtime(
+                            &agent_tag,
+                            &agent_dockerfile,
+                            &git_root,
+                            false,
+                        ),
                         &mut sink,
                     );
                     match result {
@@ -483,10 +491,12 @@ impl InitEngine {
                         frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                     };
                     let result = self.runtime.build_image(
-                        &tag,
-                        &dockerfile_path,
-                        &git_root,
-                        false,
+                        &crate::engine::container::BuildRequest::runtime(
+                            &tag,
+                            &dockerfile_path,
+                            &git_root,
+                            false,
+                        ),
                         &mut sink,
                     );
                     match result {
@@ -519,10 +529,12 @@ impl InitEngine {
                                 );
                             };
                             let _ = self.runtime.build_image(
-                                &agent_tag,
-                                &agent_dockerfile,
-                                &git_root,
-                                false,
+                                &crate::engine::container::BuildRequest::runtime(
+                                    &agent_tag,
+                                    &agent_dockerfile,
+                                    &git_root,
+                                    false,
+                                ),
                                 &mut agent_sink,
                             );
                         }

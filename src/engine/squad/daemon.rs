@@ -282,7 +282,7 @@ mod tests {
 
     use crate::data::config::env::{AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
     use crate::data::fs::task_store::{MountScope, Task, TaskStatus};
-    use crate::engine::agent_runtime::{Capabilities, DindSupport};
+    use crate::engine::agent_runtime::Capabilities;
     use crate::engine::squad::{EvaluationOutcome, EvaluationRequest};
 
     /// A container-tier runtime that touches nothing. `bootstrap` only ever
@@ -295,19 +295,11 @@ mod tests {
         fn container() -> Self {
             Self {
                 caps: Capabilities {
-                    arbitrary_env_vars: true,
                     arbitrary_host_mounts: true,
-                    cpu_limits: true,
-                    per_resource_stats: true,
-                    persistent_lifecycle: false,
                     kit_declarative: false,
-                    dind: DindSupport::OnRequest,
-                    host_paths_visible: true,
-                    session_label_supported: true,
                     has_image_store: true,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
-                    fractional_cpu: true,
                 },
             }
         }
@@ -315,19 +307,11 @@ mod tests {
         fn sandbox() -> Self {
             Self {
                 caps: Capabilities {
-                    arbitrary_env_vars: false,
                     arbitrary_host_mounts: false,
-                    cpu_limits: false,
-                    per_resource_stats: false,
-                    persistent_lifecycle: true,
                     kit_declarative: true,
-                    dind: DindSupport::Always,
-                    host_paths_visible: false,
-                    session_label_supported: false,
                     has_image_store: false,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-                    fractional_cpu: false,
                 },
             }
         }
@@ -353,10 +337,7 @@ mod tests {
         }
         fn build_image(
             &self,
-            _tag: &str,
-            _dockerfile: &std::path::Path,
-            _context: &std::path::Path,
-            _no_cache: bool,
+            _request: &crate::engine::container::BuildRequest,
             _on_line: &mut dyn FnMut(&str),
         ) -> Result<(), crate::engine::error::EngineError> {
             Ok(())
@@ -401,15 +382,6 @@ mod tests {
         fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
-        fn exec_args(
-            &self,
-            _: &str,
-            _: &str,
-            _: &[&str],
-            _: &[(&str, &str)],
-        ) -> Option<Vec<String>> {
-            None
-        }
         fn attach(
             &self,
             _: &crate::data::session::AgentHandle,
@@ -421,9 +393,6 @@ mod tests {
             _: &str,
         ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
             Ok(vec![])
-        }
-        fn host_cli(&self) -> Option<&'static str> {
-            Some("fake")
         }
     }
 

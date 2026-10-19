@@ -132,6 +132,17 @@ pub struct ResolvedSandboxOptions {
 }
 
 impl ResolvedSandboxOptions {
+    pub(crate) fn validate_tool_restrictions(
+        &self,
+    ) -> Result<(), crate::engine::error::EngineError> {
+        let matrix = crate::engine::agent::agent_matrix::matrix_for(&self.agent_id)?;
+        matrix.validate_tool_restrictions(
+            &self.allowed_tools,
+            &self.disallowed_tools,
+            crate::engine::agent::agent_matrix::RunParadigm::Sandbox,
+        )
+    }
+
     pub fn resolve(options: impl IntoIterator<Item = SandboxOption>) -> Self {
         let mut r = Self::default();
         for opt in options {
@@ -184,6 +195,40 @@ impl ResolvedSandboxOptions {
             SandboxOption::PermissionMode(v) => self.permission_mode = Some(v),
             SandboxOption::KeepAfterExit => self.keep_after_exit = true,
             SandboxOption::UnsupportedNote(v) => self.unsupported_notes.push(v),
+        }
+    }
+}
+
+#[cfg(test)]
+mod restriction_tests {
+    use super::*;
+    use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
+    use crate::engine::error::EngineError;
+    use crate::engine::sandbox::SandboxRuntime;
+
+    #[test]
+    fn direct_sandbox_options_cannot_bypass_tool_validation() {
+        for agent in crate::engine::agent::agent_matrix::SUPPORTED_AGENTS {
+            for allowed in [true, false] {
+                let options = ResolvedSandboxOptions::resolve([
+                    SandboxOption::AgentId((*agent).into()),
+                    if allowed {
+                        SandboxOption::AllowedTools(vec!["Read".into()])
+                    } else {
+                        SandboxOption::DisallowedTools(vec!["Bash".into()])
+                    },
+                ]);
+                let result =
+                    SandboxRuntime::for_tests().build(ResolvedAgentOptions::Sandbox(options));
+                if *agent == "claude" {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(
+                        matches!(result, Err(EngineError::ToolRestrictionFlagMissing { .. })),
+                        "{agent}"
+                    );
+                }
+            }
         }
     }
 }

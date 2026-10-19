@@ -763,10 +763,10 @@ impl<'a> Session<'a> {
         let resp = self.get(&url, Some(&accept), Some(METADATA_TIMEOUT))?;
         let shown = self.reference.to_string();
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(EngineError::Container(format!(
-                "image {shown} was not found in registry {}",
-                self.reference.registry
-            )));
+            return Err(EngineError::SourceImageNotFound {
+                reference: shown,
+                location: format!("registry {}", self.reference.registry),
+            });
         }
         if !resp.status().is_success() {
             return Err(EngineError::Network(format!(
@@ -1096,7 +1096,7 @@ pub(super) fn pull(
     }
 
     let blobs_dir = ctx.staging_dir.join("blobs");
-    crate::engine::oci::verify::create_private_dir(&blobs_dir)?;
+    crate::data::fs::private_files::create_private_dir(&blobs_dir)?;
 
     // Config first: it decides the platform before any layer is fetched.
     let config_digest = Digest::parse(&manifest.config.digest)

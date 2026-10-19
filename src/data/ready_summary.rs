@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::data::ready_image::{ReadyBaseImageResult, ReadyImageResult, ReadyImageWarning};
+use crate::data::ready_image::{
+    MissingAgentImage, ReadyBaseImageResult, ReadyImagePlan, ReadyImageResult, ReadyImageWarning,
+};
 use crate::data::step_status::StepStatus;
 
 /// Non-secret host credential health shown by `awman ready`.
@@ -27,6 +29,10 @@ pub struct ReadySummary {
     #[serde(default)]
     pub agent_credentials: Vec<AgentCredentialHealth>,
     pub non_default_agent_images: Vec<(String, StepStatus)>,
+    /// The non-default agent images behind a "Missing images" row, each with
+    /// what `ready --build` would do for it. Drives [`Self::hint`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_images: Vec<MissingAgentImage>,
     /// Where the agent image came from, for runtimes that import images
     /// instead of building them (builtin). `None` on build runtimes, which
     /// show no row for it.
@@ -59,6 +65,7 @@ impl ReadySummary {
             work_items_config: StepStatus::Pending,
             agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
+            missing_images: Vec::new(),
             image_source: None,
             image_results: Vec::new(),
             base_image_results: Vec::new(),
@@ -217,24 +224,93 @@ impl ReadySummary {
     }
 
     /// What to do next, if anything: how to recover from a failure, or how
-    /// to prepare the non-default agent images that are missing. The verb
-    /// follows how this runtime acquires images ([`ReadyImageAction`]).
+    /// to prepare the non-default agent images that are missing.
+    ///
+    /// Derived per image. A failed required image result names its own
+    /// next step (configure a source, retry the import, rebuild); missing
+    /// non-default images are grouped by what `ready --build` would do for
+    /// each ([`ReadyImagePlan`]). Only a failure no per-image result
+    /// explains (a build runtime's base or agent image row) gets the
+    /// generic retry line, and only a summary without per-image data falls
+    /// back to the summary-wide [`ReadyImageAction`] verb.
     pub fn hint(&self) -> Option<String> {
         if !self.is_ready() {
-            return Some(
-                "complete the required image steps, then run \"awman ready\" again.".to_string(),
-            );
+            let failed = self
+                .image_results
+                .iter()
+                .filter(|r| !r.optional)
+                .find(|r| r.has_failure());
+            return Some(match failed {
+                Some(image) => Self::failed_image_hint(image),
+                None => {
+                    "complete the required image steps, then run \"awman ready\" again.".to_string()
+                }
+            });
         }
         let missing = self
             .non_default_agent_images
             .iter()
             .any(|(_, s)| matches!(s, StepStatus::Warn(_)));
-        missing.then(|| {
-            format!(
+        if !missing {
+            return None;
+        }
+        if self.missing_images.is_empty() {
+            return Some(format!(
                 "run \"ready --build\" to {} all available agent images.",
                 self.image_action.verb()
+            ));
+        }
+        let agents = |plan: ReadyImagePlan| {
+            let names: Vec<&str> = self
+                .missing_images
+                .iter()
+                .filter(|m| m.plan == plan)
+                .map(|m| m.agent.as_str())
+                .collect();
+            (!names.is_empty()).then(|| names.join(", "))
+        };
+        let mut steps = Vec::new();
+        for (plan, verb) in [
+            (ReadyImagePlan::Build, "build"),
+            (ReadyImagePlan::Import, "import"),
+            (ReadyImagePlan::BuildAndImport, "build and import"),
+        ] {
+            if let Some(names) = agents(plan) {
+                steps.push(format!("run \"ready --build\" to {verb} {names}."));
+            }
+        }
+        if let Some(names) = agents(ReadyImagePlan::ConfigureSource) {
+            steps.push(format!(
+                "configure an image source for {names} (`builtin.imageSource` or a \
+                 `builtin.images` entry), then run \"ready --build\"."
+            ));
+        }
+        if let Some(names) = agents(ReadyImagePlan::ConfigureBuildOutput) {
+            steps.push(format!(
+                "configure a writable, distinct image source reference for {names} (`builtin.images`), then run \"ready --build\"."
+            ));
+        }
+        Some(steps.join(" "))
+    }
+
+    /// The next step for one failed required image, from its stages.
+    fn failed_image_hint(image: &ReadyImageResult) -> String {
+        let agent = &image.agent;
+        if image.source_kind.is_none() {
+            format!(
+                "configure an image source for {agent} (`builtin.imageSource` or a \
+                 `builtin.images` entry), then run \"awman ready\" again."
             )
-        })
+        } else if matches!(image.build, StepStatus::Failed(_)) {
+            format!("fix the {agent} image build, then run \"awman ready --build\" again.")
+        } else if image.build == StepStatus::Done {
+            format!(
+                "the {agent} image was built but not imported; run \"awman ready\" again to \
+                 retry the import."
+            )
+        } else {
+            format!("fix the {agent} image source, then run \"awman ready\" again.")
+        }
     }
 }
 
@@ -336,5 +412,141 @@ mod tests {
         let labels: Vec<String> = summary.rows().into_iter().map(|(l, _)| l).collect();
         let agent = labels.iter().position(|l| l == "Agent image").unwrap();
         assert_eq!(labels[agent + 1], "Image source");
+    }
+
+    fn ready_builtin() -> ReadySummary {
+        let mut summary = ReadySummary::new("builtin");
+        summary.base_image = StepStatus::Skipped;
+        summary.agent_image = StepStatus::Done;
+        summary
+    }
+
+    fn missing(summary: &mut ReadySummary, images: &[(&str, ReadyImagePlan)]) {
+        let names: Vec<&str> = images.iter().map(|(a, _)| *a).collect();
+        summary
+            .non_default_agent_images
+            .push(("Missing images".into(), StepStatus::Warn(names.join(", "))));
+        summary.missing_images = images
+            .iter()
+            .map(|(agent, plan)| MissingAgentImage {
+                agent: agent.to_string(),
+                plan: *plan,
+            })
+            .collect();
+    }
+
+    /// WI 0126 F2: each missing image's own plan picks its step; one
+    /// summary can mix them.
+    #[test]
+    fn missing_image_hint_is_derived_per_image() {
+        let mut summary = ready_builtin();
+        missing(
+            &mut summary,
+            &[
+                ("codex", ReadyImagePlan::Import),
+                ("cline", ReadyImagePlan::BuildAndImport),
+                ("gemini", ReadyImagePlan::ConfigureSource),
+                ("opencode", ReadyImagePlan::Import),
+            ],
+        );
+        // The summary-wide verb must not leak into a per-image hint.
+        summary.image_action = ReadyImageAction::Build;
+        assert_eq!(
+            summary.hint().as_deref(),
+            Some(
+                "run \"ready --build\" to import codex, opencode. run \"ready --build\" to build \
+                 and import cline. configure an image source for gemini (`builtin.imageSource` \
+                 or a `builtin.images` entry), then run \"ready --build\"."
+            )
+        );
+
+        let mut docker = ReadySummary::new("docker");
+        docker.base_image = StepStatus::Done;
+        docker.agent_image = StepStatus::Done;
+        missing(&mut docker, &[("codex", ReadyImagePlan::Build)]);
+        assert_eq!(
+            docker.hint().as_deref(),
+            Some("run \"ready --build\" to build codex.")
+        );
+    }
+
+    #[test]
+    fn a_summary_without_per_image_data_keeps_the_summary_wide_verb() {
+        let mut summary = ready_builtin();
+        summary.image_action = ReadyImageAction::BuildAndImport;
+        summary
+            .non_default_agent_images
+            .push(("Missing images".into(), StepStatus::Warn("codex".into())));
+        assert_eq!(
+            summary.hint().as_deref(),
+            Some("run \"ready --build\" to build and import all available agent images.")
+        );
+        summary.non_default_agent_images = vec![("Other agents".into(), StepStatus::Done)];
+        assert_eq!(summary.hint(), None);
+    }
+
+    fn failed_default(build: StepStatus, import: StepStatus, sourced: bool) -> ReadySummary {
+        let mut summary = ready_builtin();
+        let mut image = ReadyImageResult::new("claude", "awman-r-claude:latest");
+        image.build = build;
+        image.import = import;
+        if sourced {
+            image.source_kind =
+                Some(crate::data::config::image_source::ImageSourceKind::DockerStore);
+        }
+        summary.image_results.push(image);
+        summary
+    }
+
+    /// WI 0126 F2: a failed required image names its own next step instead
+    /// of the generic "complete the required image steps" line.
+    #[test]
+    fn a_failed_image_hint_names_its_next_step() {
+        let failed = || StepStatus::Failed("x".into());
+        let cases = [
+            (
+                failed_default(StepStatus::Skipped, failed(), false),
+                "configure an image source for claude (`builtin.imageSource` or a \
+                 `builtin.images` entry), then run \"awman ready\" again.",
+            ),
+            (
+                failed_default(failed(), StepStatus::Skipped, true),
+                "fix the claude image build, then run \"awman ready --build\" again.",
+            ),
+            (
+                failed_default(StepStatus::Done, failed(), true),
+                "the claude image was built but not imported; run \"awman ready\" again to \
+                 retry the import.",
+            ),
+            (
+                failed_default(StepStatus::Skipped, failed(), true),
+                "fix the claude image source, then run \"awman ready\" again.",
+            ),
+        ];
+        for (summary, hint) in cases {
+            assert!(!summary.is_ready());
+            assert_eq!(summary.hint().as_deref(), Some(hint));
+        }
+        // A failure no per-image result explains keeps the generic line.
+        let mut docker = ReadySummary::new("docker");
+        docker.base_image = failed();
+        assert_eq!(
+            docker.hint().as_deref(),
+            Some("complete the required image steps, then run \"awman ready\" again.")
+        );
+    }
+
+    #[test]
+    fn missing_images_serialize_only_when_present() {
+        let summary = ready_builtin();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("missing_images"), "{json}");
+        let mut summary = ready_builtin();
+        missing(&mut summary, &[("codex", ReadyImagePlan::ConfigureSource)]);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            json["missing_images"],
+            serde_json::json!([{"agent": "codex", "plan": "configure-source"}])
+        );
     }
 }

@@ -2,47 +2,41 @@
 //!
 //! Layer 2 reads these flags to decide how to map cross-paradigm options
 //! before calling `build()`, instead of matching on concrete runtime types.
+//!
+//! Every flag here has a production reader. A flag that no decision branches
+//! on is deleted rather than kept as documentation (WI 0126 C7 removed
+//! `arbitrary_env_vars`, `cpu_limits`, `fractional_cpu`, `per_resource_stats`,
+//! `persistent_lifecycle`, `host_paths_visible`, `session_label_supported` and
+//! `dind`). Where a runtime cannot honour a request (builtin and
+//! `--allow-docker`, fractional `--cpus`), its backend refuses the launch with
+//! a typed error; that is the single enforcement point.
 
 /// Paradigm-specific flags Layer 2 can branch on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
-    /// Arbitrary `-e KEY=VALUE` env vars can be injected at launch.
-    /// true: container; false: sandbox.
-    pub arbitrary_env_vars: bool,
     /// Arbitrary host paths can be bind-mounted.
-    /// true: container; false: sandbox.
+    /// true: container; false: sandbox. Read by [`Self::squad_supported`].
     pub arbitrary_host_mounts: bool,
-    /// CPU limits can be applied per agent.
-    /// true: container; false: sandbox.
-    pub cpu_limits: bool,
-    /// Per-handle CPU/memory stats are available.
-    /// true: container; false: sandbox.
-    pub per_resource_stats: bool,
-    /// The agent environment persists across runs (stop preserves state).
-    /// false: container; true: sandbox.
-    pub persistent_lifecycle: bool,
     /// The agent environment is declared via a kit/template rather than a
-    /// locally-built image. false: container; true: sandbox.
+    /// locally-built image. false: container; true: sandbox. Read by the
+    /// chat/exec/workflow commands to pick the option paradigm.
     pub kit_declarative: bool,
-    /// Docker-in-Docker support model.
-    pub dind: DindSupport,
-    /// Host paths outside the workspace are visible to the agent.
-    /// true: container; false: sandbox (workspace only).
-    pub host_paths_visible: bool,
-    /// Agents can be attributed to a session via a runtime label.
-    /// true: container; false: sandbox (uses names).
-    pub session_label_supported: bool,
     /// The runtime keeps a local image store that can accumulate dangling
     /// images and needs reclaiming. true: container; false: sandbox, whose
     /// agent environments are declared by kit and have no image layer cache
-    /// of awman's own to sweep.
+    /// of awman's own to sweep. Read by `awman clean`.
     pub has_image_store: bool,
     /// How the runtime obtains an agent image. `Build`: container (Docker,
     /// Apple); `Import`: builtin; `Kit`: sandbox.
+    ///
+    /// Static by design. What a runtime *can* do is a capability; what a
+    /// session *will* do for a given image (build locally, import, or warn
+    /// that the source is incompatible with the local builder) depends on
+    /// that session's config and the image's resolved source, and is decided
+    /// per image by the preparer's `BuilderSelection`
+    /// (`engine::oci::resolve`). Nothing folds session config into this
+    /// value; a caller that needs the per-image answer asks the preparer.
     pub image_acquisition: ImageAcquisition,
-    /// CPU limits may be fractional (`--cpus 1.5`). true: container; false:
-    /// builtin (whole vCPUs) and sandbox (no CPU limits at all).
-    pub fractional_cpu: bool,
 }
 
 impl Capabilities {
@@ -69,17 +63,6 @@ pub enum ImageAcquisition {
     Kit,
 }
 
-/// How a runtime provides Docker-in-Docker to its agents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DindSupport {
-    /// Every sandbox VM has a private DinD daemon.
-    Always,
-    /// Available when explicitly requested (`--allow-docker`).
-    OnRequest,
-    /// Not available.
-    Never,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,33 +76,13 @@ mod tests {
         let rt = ContainerRuntime::docker();
         let caps = rt.capabilities();
         assert!(
-            caps.arbitrary_env_vars,
-            "docker supports arbitrary env vars"
-        );
-        assert!(
             caps.arbitrary_host_mounts,
             "docker supports arbitrary host mounts"
         );
-        assert!(caps.cpu_limits, "docker supports cpu limits");
-        assert!(
-            caps.per_resource_stats,
-            "docker supports per-resource stats"
-        );
-        assert!(!caps.persistent_lifecycle, "docker is ephemeral");
         assert!(!caps.kit_declarative, "docker uses local images, not kits");
-        assert_eq!(
-            caps.dind,
-            DindSupport::OnRequest,
-            "docker dind is on-request"
-        );
-        assert!(caps.host_paths_visible, "docker can mount host paths");
-        assert!(
-            caps.session_label_supported,
-            "docker supports session labels"
-        );
         assert!(caps.has_image_store, "docker keeps a local image store");
         assert_eq!(caps.image_acquisition, ImageAcquisition::Build);
-        assert!(caps.fractional_cpu, "docker accepts fractional --cpus");
+        assert!(caps.squad_supported());
     }
 
     #[test]
@@ -141,32 +104,16 @@ mod tests {
             Ok(rt) => {
                 let caps = rt.capabilities();
                 assert!(
-                    !caps.arbitrary_env_vars,
-                    "sandbox cannot inject arbitrary env"
-                );
-                assert!(
                     !caps.arbitrary_host_mounts,
                     "sandbox cannot bind arbitrary paths"
                 );
-                assert!(!caps.cpu_limits, "sandbox does not enforce cpu limits");
-                assert!(
-                    !caps.per_resource_stats,
-                    "sandbox has no per-resource stats"
-                );
-                assert!(caps.persistent_lifecycle, "sandbox is persistent");
                 assert!(caps.kit_declarative, "sandbox uses kit/template");
-                assert_eq!(caps.dind, DindSupport::Always, "sandbox always has dind");
-                assert!(!caps.host_paths_visible, "sandbox cannot see host paths");
-                assert!(
-                    !caps.session_label_supported,
-                    "sandbox uses names, not labels"
-                );
                 assert!(
                     !caps.has_image_store,
                     "sandbox has no local image store to reclaim"
                 );
                 assert_eq!(caps.image_acquisition, ImageAcquisition::Kit);
-                assert!(!caps.fractional_cpu, "sandbox has no cpu limits");
+                assert!(!caps.squad_supported());
             }
             Err(_) => {
                 // Unsupported platform — platform guard test covers this branch.

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::config::repo::LaunchMode;
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
@@ -18,6 +19,7 @@ use crate::engine::auth::{AgentCredentials, CredentialDelivery, RefreshableCrede
 use crate::engine::container::options::{
     ContainerOption, EnvLiteral, EnvVar, ImageRef, PlanMode, YoloMode,
 };
+use crate::engine::container::runtime::BUILTIN_RUNTIME_NAME;
 use crate::engine::error::EngineError;
 use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, OverlayRequest};
 use crate::engine::sandbox::options::SandboxOption;
@@ -148,29 +150,29 @@ impl AgentEngine {
         if self.runtime.capabilities().image_acquisition
             == crate::engine::agent_runtime::ImageAcquisition::Import
         {
-            let tag = agent_image_tag(session.git_root(), agent.as_str());
-            if image_exists(&tag) {
-                return Ok(());
-            }
-            let paths = RepoDockerfilePaths::new(session.git_root());
-            let hint = crate::engine::oci::BuildHint {
-                agent_dockerfile: paths.agent_dockerfile(agent.as_str()),
-                project: Some((
-                    paths.project_dockerfile(),
-                    project_image_tag(session.git_root()),
-                )),
-                context: session.git_root().to_path_buf(),
+            use crate::engine::image_prep::{
+                AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext,
             };
-            if config.builtin_runtime().image_source_for(&tag).is_some() {
-                return Err(EngineError::Config(format!(
-                    "builtin image {tag} is not imported; run awman ready to acquire its configured source"
-                )));
-            }
-            return Err(EngineError::ImageSourceUnconfigured {
-                tag: tag.clone(),
-                hint: crate::engine::oci::external_build_hint(&tag, &hint),
-            });
+            let tag = agent_image_tag(session.git_root(), agent.as_str());
+            let mut preparer = AgentImagePreparer::new(
+                config.builtin_settings()?,
+                self.runtime.clone(),
+                crate::data::config::global::GlobalConfig::data_home_with(config.env())?,
+                ImageBuildContext::for_session(session, agent.as_str()),
+            );
+            preparer
+                .prepare(
+                    &AgentImageRequest {
+                        tag: &tag,
+                        agent: agent.as_str(),
+                        policy: BuildPolicy::CheckOnly,
+                    },
+                    frontend,
+                )
+                .await?;
+            return Ok(());
         }
+
         // Check for the project base image. If absent, fail with a structured
         // error: agent images are layered FROM the project image.
         let project_tag = project_image_tag(session.git_root());
@@ -217,10 +219,12 @@ impl AgentEngine {
                 frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
             };
             match self.runtime.build_image(
-                &agent_tag,
-                &agent_dockerfile,
-                session.git_root(),
-                false,
+                &crate::engine::container::BuildRequest::runtime(
+                    &agent_tag,
+                    &agent_dockerfile,
+                    session.git_root(),
+                    false,
+                ),
                 &mut sink,
             ) {
                 Ok(()) => {
@@ -255,6 +259,25 @@ impl AgentEngine {
         Ok(())
     }
 
+    /// This session's builtin launch settings (default vCPUs and memory,
+    /// network policy) when the engine's runtime is the builtin one, resolved
+    /// from the session's own `EffectiveConfig` for every launch; `None` for
+    /// every other runtime, which has no use for them and must not fail on a
+    /// `builtin` block it never reads.
+    ///
+    /// `build_options` carries the value as `ContainerOption::BuiltinLaunch`.
+    /// Background setup/teardown launches pass it in their
+    /// `BackgroundLaunchRequest`.
+    pub fn builtin_launch_settings(
+        &self,
+        session: &Session,
+    ) -> Result<Option<BuiltinLaunchSettings>, EngineError> {
+        if self.runtime.runtime_name() != BUILTIN_RUNTIME_NAME {
+            return Ok(None);
+        }
+        Ok(Some(session.effective_config().builtin_launch_settings()?))
+    }
+
     /// Build the `ContainerOption` list for running an agent container.
     pub fn build_options(
         &self,
@@ -279,6 +302,10 @@ impl AgentEngine {
         // Plan-mode support, ACP support and the plan/yolo conflict are all
         // matrix facts, checked identically on both paradigms.
         matrix.validate_run(run, agent_matrix::RunParadigm::Container)?;
+        // Resolved first so a repo block that cannot be honoured (a widening
+        // network policy, a foreign state directory) fails this launch before
+        // anything else is prepared for it.
+        let builtin_launch = self.builtin_launch_settings(session)?;
 
         let image_tag = run
             .image_tag_override
@@ -308,6 +335,9 @@ impl AgentEngine {
                 value: session.id().to_string(),
             },
         ];
+        if let Some(launch) = builtin_launch {
+            options.push(ContainerOption::BuiltinLaunch(launch));
+        }
 
         // Select the persistent piped-stdio (`-i`, no PTY) container path when
         // launching over ACP. Emitted only when actually ACP so ordinary stdio
@@ -1488,6 +1518,119 @@ mod tests {
 
     // Scenario 1: project image absent → returns AgentRequiresProjectImage error.
     #[tokio::test]
+    async fn ensure_available_checks_enabled_builder_provenance_and_pending_receipts() {
+        use crate::data::config::{
+            env::{EnvSnapshot, AWMAN_CONFIG_HOME},
+            flags::FlagConfig,
+            global::GlobalConfig,
+            repo::RepoConfig,
+        };
+        use crate::data::image_build_lock::BuildStoreKey;
+        use crate::data::image_build_state::{
+            PendingBuildKey, PendingBuiltImage, PendingBuiltImageStore,
+        };
+        use crate::data::oci_identity::{BuiltImageIdentity, Digest, OciPlatform};
+        use crate::engine::ready::tests::fakes::FakeImportRuntime;
+        for scenario in ["pending", "changed", "invalid"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut engine, session) = make_agent_engine(tmp.path());
+            let runtime = Arc::new(FakeImportRuntime::new(true));
+            engine.runtime = runtime.clone();
+            let agent = AgentName::new("claude").unwrap();
+            let tag = agent_image_tag(session.git_root(), "claude");
+            let source = crate::data::config::image_source::ImageSourceSpec::DockerStore {
+                host: Some("unix:///test/docker.sock".into()),
+                tls: None,
+                reference: None,
+            };
+            *runtime.cached_request.lock().unwrap() =
+                Some(crate::engine::agent_runtime::ImageImportRequest {
+                    tag: tag.clone(),
+                    source: source.clone(),
+                    platform: OciPlatform::host_linux(),
+                    refresh: false,
+                    expected_built_identity: None,
+                    immutable_export_selector: None,
+                    registries: Default::default(),
+                });
+            let config = |source| {
+                let mut global: GlobalConfig =
+                    serde_json::from_str(r#"{"builtin":{"builder":{"enabled":true}}}"#).unwrap();
+                global.builtin.as_mut().unwrap().image_source = Some(source);
+                EffectiveConfig::new(
+                    FlagConfig::default(),
+                    EnvSnapshot::with_overrides([(
+                        AWMAN_CONFIG_HOME,
+                        tmp.path().to_str().unwrap(),
+                    )]),
+                    RepoConfig::default(),
+                    global,
+                )
+            };
+            let mut frontend = FakeAgentFrontend::new();
+            engine
+                .ensure_available(
+                    &session,
+                    &agent,
+                    &config(source.clone()),
+                    &mut frontend,
+                    |_| panic!("container probe must not run"),
+                )
+                .await
+                .unwrap();
+            let changed_source = if scenario == "pending" {
+                let key = PendingBuildKey {
+                    store: BuildStoreKey::Docker {
+                        endpoint: "unix:///test/docker.sock".into(),
+                    },
+                    reference: tag.clone(),
+                    platform: OciPlatform::host_linux(),
+                    install_tag: tag.clone(),
+                };
+                let identity = BuiltImageIdentity::new(
+                    Some(Digest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap()),
+                    None,
+                    OciPlatform::host_linux(),
+                )
+                .unwrap();
+                PendingBuiltImageStore::under_data_home(tmp.path())
+                    .save(&PendingBuiltImage { key, identity }, || Ok(()))
+                    .unwrap();
+                source
+            } else {
+                crate::data::config::image_source::ImageSourceSpec::DockerStore {
+                    host: Some(
+                        if scenario == "invalid" {
+                            "tcp://build.example:2375"
+                        } else {
+                            "unix:///other/docker.sock"
+                        }
+                        .into(),
+                    ),
+                    tls: None,
+                    reference: None,
+                }
+            };
+            let error = engine
+                .ensure_available(
+                    &session,
+                    &agent,
+                    &config(changed_source),
+                    &mut frontend,
+                    |_| panic!("container probe must not run"),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, EngineError::BuiltinImageNeedsPreparation { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("awman ready"));
+            assert!(runtime.imports.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn ensure_available_fails_when_project_image_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
@@ -2388,48 +2531,43 @@ mod tests {
     /// tests. Does not implement build() — only capabilities() is exercised.
     struct FakeRuntime {
         caps: crate::engine::agent_runtime::Capabilities,
+        name: &'static str,
     }
 
     impl FakeRuntime {
         fn sandbox() -> Self {
-            use crate::engine::agent_runtime::{Capabilities, DindSupport};
+            use crate::engine::agent_runtime::Capabilities;
             Self {
                 caps: Capabilities {
-                    arbitrary_env_vars: false,
                     arbitrary_host_mounts: false,
-                    cpu_limits: false,
-                    per_resource_stats: false,
-                    persistent_lifecycle: true,
                     kit_declarative: true,
-                    dind: DindSupport::Always,
-                    host_paths_visible: false,
-                    session_label_supported: false,
                     has_image_store: false,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-                    fractional_cpu: false,
                 },
+                name: "fake-sbx",
             }
         }
 
         fn container() -> Self {
-            use crate::engine::agent_runtime::{Capabilities, DindSupport};
+            use crate::engine::agent_runtime::Capabilities;
             Self {
                 caps: Capabilities {
-                    arbitrary_env_vars: true,
                     arbitrary_host_mounts: true,
-                    cpu_limits: true,
-                    per_resource_stats: true,
-                    persistent_lifecycle: false,
                     kit_declarative: false,
-                    dind: DindSupport::OnRequest,
-                    host_paths_visible: true,
-                    session_label_supported: true,
                     has_image_store: true,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
-                    fractional_cpu: true,
                 },
+                name: "fake-container",
+            }
+        }
+
+        /// A container-tier runtime reporting the builtin backend's name.
+        fn builtin() -> Self {
+            Self {
+                name: BUILTIN_RUNTIME_NAME,
+                ..Self::container()
             }
         }
     }
@@ -2454,20 +2592,13 @@ mod tests {
         }
         fn build_image(
             &self,
-            _tag: &str,
-            _dockerfile: &std::path::Path,
-            _context: &std::path::Path,
-            _no_cache: bool,
+            _request: &crate::engine::container::BuildRequest,
             _on_line: &mut dyn FnMut(&str),
         ) -> Result<(), crate::engine::error::EngineError> {
             Ok(())
         }
         fn runtime_name(&self) -> &'static str {
-            if self.caps.kit_declarative {
-                "fake-sbx"
-            } else {
-                "fake-container"
-            }
+            self.name
         }
         fn display_name(&self) -> &'static str {
             "Fake Runtime"
@@ -2508,15 +2639,6 @@ mod tests {
         fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
-        fn exec_args(
-            &self,
-            _: &str,
-            _: &str,
-            _: &[&str],
-            _: &[(&str, &str)],
-        ) -> Option<Vec<String>> {
-            None
-        }
         fn attach(
             &self,
             _: &crate::data::session::AgentHandle,
@@ -2530,9 +2652,6 @@ mod tests {
             _: &str,
         ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
             Ok(vec![])
-        }
-        fn host_cli(&self) -> Option<&'static str> {
-            Some("fake")
         }
     }
 
@@ -2557,6 +2676,103 @@ mod tests {
             ),
             "kit_declarative runtime must yield Sandbox variant; got {result:?}"
         );
+    }
+
+    /// A session over a temp repo whose `.awman/config.json` holds
+    /// `repo_builtin`, with global config `global_builtin` pinned in a temp
+    /// config home. Returns the temp dirs so they outlive the session.
+    fn builtin_session(
+        global_builtin: &str,
+        repo_builtin: Option<&str>,
+    ) -> (
+        crate::data::session::Session,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            format!(r#"{{"builtin":{global_builtin}}}"#),
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        if let Some(block) = repo_builtin {
+            let dir = repo.path().join(".awman");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), format!(r#"{{"builtin":{block}}}"#)).unwrap();
+        }
+        let session = crate::data::session::Session::for_tests_isolated(repo.path(), home.path());
+        (session, repo, home)
+    }
+
+    #[test]
+    fn builtin_launch_settings_come_from_each_sessions_own_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::builtin()));
+        let global = r#"{"vcpus":4,"network":{"mode":"allowlist","allow":["*.example.com"]}}"#;
+        let (narrowing, _r1, _h1) = builtin_session(
+            global,
+            Some(r#"{"vcpus":1,"network":{"allow":["api.example.com"]}}"#),
+        );
+        let (plain, _r2, _h2) = builtin_session(global, None);
+
+        let narrowed = engine.builtin_launch_settings(&narrowing).unwrap().unwrap();
+        assert_eq!(narrowed.vcpus, 1);
+        assert_eq!(narrowed.network.allow.len(), 1);
+        assert_eq!(narrowed.network.allow[0].to_string(), "api.example.com");
+        let inherited = engine.builtin_launch_settings(&plain).unwrap().unwrap();
+        assert_eq!(inherited.vcpus, 4);
+        assert_eq!(inherited.network.allow[0].to_string(), "*.example.com");
+
+        // `build_options` carries exactly that value as a typed option.
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        for (session, expected) in [(&narrowing, &narrowed), (&plain, &inherited)] {
+            let options = engine
+                .build_options(session, &agent, &AgentRunOptions::default())
+                .unwrap();
+            let carried: Vec<_> = options
+                .iter()
+                .filter_map(|o| match o {
+                    ContainerOption::BuiltinLaunch(launch) => Some(launch),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(carried, vec![expected]);
+        }
+    }
+
+    #[test]
+    fn a_widening_repo_block_fails_builtin_launches_only() {
+        let (widening, _r, _h) = builtin_session(
+            r#"{"network":{"mode":"none"}}"#,
+            Some(r#"{"network":{"mode":"public"}}"#),
+        );
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (builtin, _) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::builtin()));
+        let error = builtin
+            .build_options(&widening, &agent, &AgentRunOptions::default())
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("invalid configuration: ")
+                && error.to_string().contains("builtin.network"),
+            "{error}"
+        );
+
+        // Docker never reads the builtin block, so it neither fails on it nor
+        // carries it.
+        let (docker, _) =
+            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::container()));
+        assert_eq!(docker.builtin_launch_settings(&widening).unwrap(), None);
+        let options = docker
+            .build_options(&widening, &agent, &AgentRunOptions::default())
+            .unwrap();
+        assert!(!options
+            .iter()
+            .any(|o| matches!(o, ContainerOption::BuiltinLaunch(_))));
     }
 
     #[test]

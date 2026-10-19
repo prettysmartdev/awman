@@ -2,8 +2,6 @@
 //! start a guest, touch the state directory of a real installation, or fall
 //! back to another runtime.
 
-use std::collections::BTreeMap;
-
 use awman::data::config::effective::EffectiveConfig;
 use awman::data::config::env::EnvSnapshot;
 use awman::data::config::flags::FlagConfig;
@@ -15,15 +13,49 @@ use awman::engine::container::runtime::BuiltinRuntimeSettings;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::error::EngineError;
 
+#[test]
+fn startup_overrides_use_the_json_frontend_and_hide_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        r#"{"runtime":"builtin-experimental"}"#,
+    )
+    .unwrap();
+    for variable in awman::data::config::env::AMBIENT_MSB_OVERRIDES {
+        use std::os::unix::ffi::OsStringExt;
+        for value in [
+            std::ffi::OsString::from(""),
+            std::ffi::OsString::from("private-override-value"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+                .args(["ready", "--json"])
+                .current_dir(tmp.path())
+                .env("AWMAN_CONFIG_HOME", &config)
+                .env(variable, &value)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                    panic!(
+                        "{variable}: stdout={:?}, stderr={:?}",
+                        output.stdout, output.stderr
+                    )
+                });
+            let error = json["error"].as_str().unwrap();
+            assert!(error.contains(variable), "{error}");
+            assert!(!error.contains("private-override-value"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("private-override-value"));
+        }
+    }
+}
+
 fn settings(state: &std::path::Path) -> BuiltinRuntimeSettings {
     BuiltinRuntimeSettings {
         state_dir: state.into(),
-        vcpus: 2,
-        memory_mib: 4096,
-        image_source: None,
-        images: BTreeMap::new(),
-        registries: BTreeMap::new(),
-        network: Default::default(),
         ambient_overrides: Vec::new(),
         test_isolation: true,
     }
@@ -104,6 +136,13 @@ fn builtin_is_unavailable_under_test_isolation_and_creates_nothing() {
                 );
             }
         }
+        // Every host but the released target is refused with its own typed
+        // error, before the test-isolation / feature check.
+        Err(e @ EngineError::BuiltinTargetUnreleased { .. }) => {
+            let reason = e.to_string();
+            assert!(reason.contains("only available on"), "{reason}");
+            assert!(reason.contains("macos/aarch64"), "{reason}");
+        }
         other => panic!(
             "the builtin runtime must be unavailable by default: {:?}",
             other.map(|_| ())
@@ -125,7 +164,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
         ("AWMAN_CONFIG_HOME", dir.as_str()),
         ("AWMAN_TEST_ISOLATION", "1"),
     ]));
-    let resolved = BuiltinRuntimeSettings::resolve(&config).unwrap();
+    let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_settings().unwrap());
     let isolated = std::env::var("AWMAN_TEST_ISOLATION").is_ok();
     if isolated {
         assert!(
@@ -133,10 +172,11 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
             "isolation without the gate must disable builtin"
         );
     }
+    let launch = config.builtin_launch_settings().unwrap();
     assert_eq!(
-        (resolved.vcpus, resolved.memory_mib),
+        (launch.vcpus, launch.memory_mib),
         (2, 4096),
-        "documented defaults"
+        "documented per-launch defaults"
     );
     assert!(resolved.ambient_overrides.is_empty());
 
@@ -144,7 +184,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
         ("AWMAN_CONFIG_HOME", dir.as_str()),
         ("AWMAN_TEST_BUILTIN", "1"),
     ]));
-    let resolved = BuiltinRuntimeSettings::resolve(&gated).unwrap();
+    let resolved = BuiltinRuntimeSettings::resolve(&gated.builtin_settings().unwrap());
     assert!(
         !resolved.test_isolation,
         "AWMAN_TEST_BUILTIN=1 opts back in"
@@ -160,7 +200,7 @@ fn builtin_ambient_msb_variables_reach_the_settings_and_block_detection() {
         ("MSB_PATH", "/somewhere/else/msb"),
         ("MSB_LIBKRUNFW_PATH", "/somewhere/else/libkrunfw"),
     ]));
-    let resolved = BuiltinRuntimeSettings::resolve(&config).unwrap();
+    let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_settings().unwrap());
     assert_eq!(
         resolved.ambient_overrides,
         vec!["MSB_PATH", "MSB_LIBKRUNFW_PATH"]

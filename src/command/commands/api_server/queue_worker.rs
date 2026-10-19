@@ -14,6 +14,49 @@ use crate::data::fs::api_db::{CommandRecord, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session_manager::SessionManager;
 
+/// The completion projection persisted by the queue worker, shared by the
+/// command row, its result JSON and final metadata.
+struct QueuedCommandResult {
+    exit_code: i32,
+    status: &'static str,
+    result_json: String,
+}
+impl QueuedCommandResult {
+    fn new(result: &Result<CommandOutcome, crate::command::error::CommandError>) -> Self {
+        let exit_code = result.as_ref().map_or_else(
+            |error| i32::from(error.exit_code()),
+            CommandOutcome::exit_code,
+        );
+        let status = if result.is_ok() && exit_code == 0 {
+            "done"
+        } else {
+            "error"
+        };
+        let mut json = serde_json::json!({ "exit_code": exit_code });
+        if let Err(error) = result {
+            json["error"] = serde_json::Value::String(error.to_string());
+        }
+        Self {
+            exit_code,
+            status,
+            result_json: json.to_string(),
+        }
+    }
+
+    fn persist(
+        &self,
+        store: &SqliteSessionStore,
+        command_id: &str,
+    ) -> Result<(), crate::data::error::DataError> {
+        store.complete_command(
+            command_id,
+            self.status,
+            Some(self.exit_code),
+            Some(&self.result_json),
+        )
+    }
+}
+
 /// Factory implemented by the HTTP frontend. Queue lifecycle code only knows
 /// the dispatch capability it needs, never the concrete API frontend type.
 pub trait ApiCommandFrontendFactory: Send + Sync {
@@ -269,12 +312,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }
         };
 
-        let exit_code = result.as_ref().map(CommandOutcome::exit_code).unwrap_or(1);
-        let status = if result.is_ok() && exit_code == 0 {
-            "done"
-        } else {
-            "error"
-        };
+        let completion = QueuedCommandResult::new(&result);
+        let exit_code = completion.exit_code;
+        let status = completion.status;
         let success = status == "done";
 
         if success {
@@ -300,28 +340,11 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             );
         }
 
-        let result_json = match &result {
-            Ok(_) => serde_json::to_string(&serde_json::json!({
-                "exit_code": exit_code,
-            }))
-            .ok(),
-            Err(e) => serde_json::to_string(&serde_json::json!({
-                "exit_code": exit_code,
-                "error": e.to_string(),
-            }))
-            .ok(),
-        };
-
         if let Err(ref e) = result {
             tracing::error!(command_id = %command_id, error = %e, "Command failed");
         }
 
-        let _ = self.store.complete_command(
-            &command_id,
-            status,
-            Some(exit_code),
-            result_json.as_deref(),
-        );
+        let _ = completion.persist(&self.store, &command_id);
 
         // Write final metadata.
         {
@@ -518,4 +541,61 @@ fn spawn_tracing_subscriber(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::command::error::CommandError;
+    use crate::engine::error::EngineError;
+
+    #[test]
+    fn queued_failures_persist_the_shared_code_in_row_and_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(temp.path()).unwrap();
+        store
+            .insert_session("session", "/work", "2026-10-02")
+            .unwrap();
+        for (index, (error, expected)) in [
+            (
+                CommandError::Engine(EngineError::ContainerRuntimeUnavailable {
+                    binary: "docker".into(),
+                }),
+                3,
+            ),
+            (
+                CommandError::Engine(EngineError::BuiltinAttachUnavailable {
+                    name: "agent".into(),
+                    detail: "closed".into(),
+                }),
+                1,
+            ),
+            (CommandError::Aborted, 130),
+            (
+                CommandError::MissingRequiredArgument {
+                    command: vec!["prompt".into()],
+                    argument: "prompt".into(),
+                },
+                2,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index.to_string();
+            store
+                .enqueue_command(&id, "session", "prompt", "{}", "log")
+                .unwrap();
+            let command = store.claim_next_command("worker").unwrap().unwrap();
+            assert_eq!(command.id, id);
+            let completion = QueuedCommandResult::new(&Err(error));
+            completion.persist(&store, &id).unwrap();
+            let saved = store.get_command(&id).unwrap().unwrap();
+            assert_eq!(saved.status, "error");
+            assert_eq!(saved.exit_code, Some(expected));
+            let json: serde_json::Value =
+                serde_json::from_str(saved.result.as_ref().unwrap()).unwrap();
+            assert_eq!(json["exit_code"], expected);
+        }
+    }
 }

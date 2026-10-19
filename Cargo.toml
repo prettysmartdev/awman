@@ -1,18 +1,22 @@
+[workspace]
+members = [".", "crates/awman-cli", "crates/awman-host-shims"]
+default-members = [".", "crates/awman-cli", "crates/awman-host-shims"]
+resolver = "2"
+
+[workspace.package]
+version = "0.12.0"
+
 [package]
 name = "awman"
-version = "0.12.0"
+version.workspace = true
 edition = "2021"
 rust-version = "1.94.0"
 description = "A containerized code agent manager"
-# Top-level tests/ targets reference the old (oldsrc) library API; they are
-# rebuilt from scratch in work item 0072 alongside the deletion of oldsrc/.
-# Suppress auto-discovery so `cargo test` only runs Layer 0–3 unit tests
-# until then.
+# The binary and registered integration tests belong to awman-cli. This
+# package owns only the Layer 0–3 library and its unit tests.
 autotests = false
-
-[[bin]]
-name = "awman"
-path = "src/main.rs"
+autobins = false
+autoexamples = false
 
 [lib]
 name = "awman"
@@ -73,7 +77,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 sha2 = "0.11"
 toml = "1"
 
-[target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies]
+[target.'cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_env = "gnu", any(target_arch = "aarch64", target_arch = "x86_64"))))'.dependencies]
 microsandbox = { version = "=0.7.2", default-features = false, features = ["local", "net"], optional = true }
 microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"], optional = true }
 microsandbox-image = { version = "=0.7.2", optional = true }
@@ -96,138 +100,3 @@ libc = "0.2"
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 wiremock = "0.6"
-
-# ── New architecture integration tests (WI 0073) ─────────────────────────────
-# autotests = false suppresses the legacy tests/; these explicit entries
-# target the new src/ API only.
-
-[[test]]
-name = "data_layer"
-path = "tests/data_layer/main.rs"
-
-[[test]]
-name = "builtin_runtime"
-path = "tests/builtin_runtime/main.rs"
-
-[[test]]
-name = "oci_import"
-path = "tests/oci_import/main.rs"
-
-[[test]]
-name = "engine_tests"
-path = "tests/engine/main.rs"
-
-[[test]]
-name = "command_tests"
-path = "tests/command/main.rs"
-
-[[test]]
-name = "cli_parity"
-path = "tests/cli_parity/main.rs"
-
-[[test]]
-name = "api_parity"
-path = "tests/api_parity/main.rs"
-
-[[test]]
-name = "binary_smoke"
-path = "tests/binary_smoke/main.rs"
-
-# Real-guest driver for the `builtin_hw_*` tests (WI 0119). It must be its own
-# executable: the embedded worker re-runs the current executable, and Cargo's
-# test executables (in `deps/`) are refused as worker hosts. Built only with
-# the builtin feature (`make test-builtin`).
-[[example]]
-name = "builtin_hw_driver"
-path = "tests/builtin_runtime/hw_driver.rs"
-required-features = ["builtin-runtime"]
-
-[[example]]
-name = "builtin_net_driver"
-path = "tests/builtin_runtime/network_resources/driver.rs"
-required-features = ["builtin-runtime"]
-
-# ── WI 0101 squad test coverage (tests-squad step) ──────────────────────────────
-# `autotests = false` above means top-level `tests/*.rs` files are NOT
-# auto-discovered in this repo despite the usual Cargo convention; each needs
-# its own explicit [[test]] entry or `cargo test` silently never builds it.
-
-[[test]]
-name = "squad_naming"
-path = "tests/squad_naming.rs"
-
-[[test]]
-name = "squad_runtime_discovery"
-path = "tests/squad_runtime_discovery.rs"
-
-[[test]]
-name = "squad_attach"
-path = "tests/squad_attach.rs"
-
-[[test]]
-name = "squad_status_marker"
-path = "tests/squad_status_marker.rs"
-
-[[test]]
-name = "squad_scheduler"
-path = "tests/squad_scheduler.rs"
-
-[[test]]
-name = "squad_repair_loop"
-path = "tests/squad_repair_loop.rs"
-
-[[test]]
-name = "squad_daemon_http"
-path = "tests/squad_daemon_http.rs"
-
-[[test]]
-name = "squad_daemon_e2e"
-path = "tests/squad_daemon_e2e.rs"
-
-[[test]]
-name = "squad_mutual_exclusion"
-path = "tests/squad_mutual_exclusion.rs"
-
-[[test]]
-name = "squad_sandbox_refusal"
-path = "tests/squad_sandbox_refusal.rs"
-
-[[test]]
-name = "squad_cli_gateway"
-path = "tests/squad_cli_gateway.rs"
-
-[[test]]
-name = "squad_tui_tab"
-path = "tests/squad_tui_tab.rs"
-
-[[test]]
-name = "squad_attach_frontends"
-path = "tests/squad_attach_frontends.rs"
-
-[[test]]
-name = "squad_blockers"
-path = "tests/squad_blockers.rs"
-
-[[test]]
-name = "squad_auth_key"
-path = "tests/squad_auth_key.rs"
-
-[[test]]
-name = "squad_env_sync"
-path = "tests/squad_env_sync.rs"
-
-[[test]]
-name = "squad_env_cli"
-path = "tests/squad_env_cli.rs"
-
-[[test]]
-name = "squad_env_daemon"
-path = "tests/squad_env_daemon.rs"
-
-# WI 0114 tests-audit: this one still builds against the current API; the
-# other thirteen unregistered `tests/*.rs` files reference the pre-WI-0072
-# `oldsrc` surface (`awman::commands`, `awman::workflow`, `awman::tui`, …)
-# and are recorded as dead in `40-tests-audit.md`.
-[[test]]
-name = "dockerfile_build"
-path = "tests/dockerfile_build.rs"

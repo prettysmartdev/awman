@@ -857,7 +857,7 @@ Use the default agent (claude) for steps that specify 'codex'? [y/N]:
 
 If all required images are already available, the pre-flight check completes silently and the first step launches immediately.
 
-**Builtin runtime.** Workflow preflight only checks and imports images; it never starts a host build, even when `builtin.builder.enabled` is true. If a required agent image is not imported, the workflow stops before the first step and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+**Builtin runtime.** Workflow preflight is import-only: it never starts a host build, even when `builtin.builder.enabled` is true, but it does re-acquire an image that is installed from a different source than the one now configured (an installed image with no configured source is kept). If a required agent image is not imported, the workflow stops before the first step and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ### Unknown agents
 

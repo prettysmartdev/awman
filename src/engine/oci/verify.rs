@@ -346,41 +346,10 @@ impl Write for StagingSink<'_> {
 /// Create a new file readable and writable only by this user. Fails if it
 /// already exists, so a staging name can never be pre-planted.
 pub(super) fn create_private_file(path: &Path) -> Result<File, EngineError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path).map_err(|e| EngineError::io(path, e))
-}
-
-/// Create `dir` (and parents) and restrict it to this user. A pre-existing
-/// `dir` must be a real directory owned by this user: a symlink (or someone
-/// else's directory) is refused rather than followed and re-permissioned.
-pub(super) fn create_private_dir(dir: &Path) -> Result<(), EngineError> {
-    std::fs::create_dir_all(dir).map_err(|e| EngineError::io(dir, e))?;
-    let meta = std::fs::symlink_metadata(dir).map_err(|e| EngineError::io(dir, e))?;
-    if !meta.file_type().is_dir() {
-        return Err(EngineError::Config(format!(
-            "image cache directory {} is not a plain directory (symlinks are refused)",
-            dir.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.uid() != nix::unistd::geteuid().as_raw() {
-            return Err(EngineError::Config(format!(
-                "image cache directory {} is owned by another user",
-                dir.display()
-            )));
-        }
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| EngineError::io(dir, e))?;
-    }
-    Ok(())
+    crate::data::fs::private_files::create_private_file_new(path).map_err(|e| match e {
+        crate::data::error::DataError::Io { source, .. } => EngineError::io(path, source),
+        other => other.into(),
+    })
 }
 
 /// Hash a whole file: `(hex, size)`.
@@ -506,7 +475,7 @@ pub(super) mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("a/b");
-        create_private_dir(&sub).unwrap();
+        crate::data::fs::private_files::create_private_dir(&sub).unwrap();
         let mode = std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         create_private_file(&sub.join("f")).unwrap();
@@ -561,7 +530,7 @@ pub(super) mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         let link = dir.path().join("images");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(create_private_dir(&link).is_err());
+        assert!(crate::data::fs::private_files::create_private_dir(&link).is_err());
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "the symlink target was not re-permissioned");
     }

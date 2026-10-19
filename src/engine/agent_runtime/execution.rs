@@ -69,6 +69,8 @@ pub trait AgentInstance: Send + Sync {
 
     /// Run the agent with the supplied frontend bound to its I/O. Consumes
     /// `self` and produces an `AgentExecution` that the caller awaits.
+    /// A runtime MUST release the frontend by the time `wait()` resolves,
+    /// its future is dropped, or the execution is dropped.
     fn run_with_frontend(
         self: Box<Self>,
         frontend: Box<dyn AgentFrontend>,
@@ -119,11 +121,20 @@ pub(crate) trait ExecutionBackend: Send {
     fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError>;
     fn cancel(&self) -> Result<(), EngineError>;
 
-    /// Return a standalone cancel handle that works even after `wait()` has
-    /// moved the backend into a blocking task. Default returns `None` for
-    /// backends that don't support mid-step cancellation.
-    fn cancel_handle(&self) -> Option<CancelHandle> {
+    fn frontend_for_wait(&mut self) -> Option<FrontendWaitGuard> {
         None
+    }
+
+    /// Return a standalone cancel handle that works after `wait()` moves the
+    /// backend into a blocking task. Every backend must provide one so a
+    /// dropped wait future can stop the child and release its frontend.
+    fn cancel_handle(&self) -> CancelHandle;
+
+    /// Whether dropping the owning `AgentExecution` should cancel the child.
+    /// Reattachable runtimes override this because process shutdown must not
+    /// turn ownership release into container removal.
+    fn cancel_on_execution_drop(&self) -> bool {
+        true
     }
 
     /// Best-effort: push raw bytes into the running agent's stdin.
@@ -135,6 +146,42 @@ pub(crate) trait ExecutionBackend: Send {
     /// the engine falls back to a fresh launch.
     fn try_inject_stdin(&self, _bytes: &[u8]) -> Result<bool, EngineError> {
         Ok(false)
+    }
+}
+
+pub(crate) struct FrontendWaitGuard {
+    frontend: Arc<std::sync::Mutex<Box<dyn AgentFrontend>>>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl FrontendWaitGuard {
+    pub(crate) fn new(frontend: Box<dyn AgentFrontend>) -> Self {
+        Self {
+            frontend: Arc::new(std::sync::Mutex::new(frontend)),
+            cleanup: None,
+        }
+    }
+
+    pub(crate) fn from_shared(
+        frontend: Arc<std::sync::Mutex<Box<dyn AgentFrontend>>>,
+        cleanup: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            frontend,
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<std::sync::Mutex<Box<dyn AgentFrontend>>> {
+        Arc::downgrade(&self.frontend)
+    }
+}
+
+impl Drop for FrontendWaitGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
     }
 }
 
@@ -201,17 +248,25 @@ impl AgentExecution {
         self.stuck_tx.clone()
     }
 
-    /// Block until the agent exits. Transitions the execution to `Finished`
-    /// state; the execution remains in scope so callers can pass it to
-    /// `inject_prompt` afterwards.
+    /// Block until the agent exits. A runtime MUST release its frontend no
+    /// later than when this resolves, when this future is dropped, or when
+    /// the execution is dropped. Dropping an in-flight wait requests backend
+    /// cancellation on a background thread so blocking host commands cannot
+    /// stall a Tokio worker. Dropping an unwaited execution requests
+    /// cancellation only from backends that opt in; Docker opts out to keep
+    /// its reattach-after-owner-exit behavior when no wait is active. Call
+    /// [`Self::detach`] before handing off work that may outlive this owner.
     pub async fn wait(&mut self) -> Result<AgentExitInfo, EngineError> {
         // Temporarily replace with Detached while we run the future so that the
         // execution is in a safe state if the task is dropped mid-await.
         match std::mem::replace(&mut self.inner, ExecutionState::Detached) {
-            ExecutionState::Running(backend) => {
+            ExecutionState::Running(mut backend) => {
+                let _frontend_guard = backend.frontend_for_wait();
+                let mut cancellation = WaitCancellation(Some(backend.cancel_handle()));
                 let info = tokio::task::spawn_blocking(move || backend.wait_blocking())
                     .await
                     .map_err(|e| EngineError::Other(format!("execution join error: {e}")))?;
+                cancellation.0 = None;
                 let info = info?;
                 self.inner = ExecutionState::Finished(info.clone());
                 Ok(info)
@@ -237,10 +292,10 @@ impl AgentExecution {
 
     /// Extract a standalone cancel handle. Must be called before `wait()`
     /// which moves the backend into a blocking task. Returns `None` when the
-    /// execution is not in Running state or the backend doesn't support it.
+    /// execution is not in Running state.
     pub fn cancel_handle(&self) -> Option<CancelHandle> {
         match &self.inner {
-            ExecutionState::Running(b) => b.cancel_handle(),
+            ExecutionState::Running(b) => Some(b.cancel_handle()),
             _ => None,
         }
     }
@@ -263,7 +318,34 @@ impl AgentExecution {
     /// joining. Useful for API background mode.
     pub fn detach(mut self) -> AgentHandle {
         self.inner = ExecutionState::Detached;
-        self.handle
+        self.handle.clone()
+    }
+}
+
+struct WaitCancellation(Option<CancelHandle>);
+
+impl Drop for WaitCancellation {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            // Backend cancellation may synchronously invoke a host CLI. Drop
+            // can run on a Tokio worker, so never execute it on this thread.
+            std::thread::spawn(move || {
+                let _ = cancel.cancel();
+            });
+        }
+    }
+}
+
+impl Drop for AgentExecution {
+    fn drop(&mut self) {
+        if let ExecutionState::Running(backend) = &self.inner {
+            if backend.cancel_on_execution_drop() {
+                let cancel = backend.cancel_handle();
+                std::thread::spawn(move || {
+                    let _ = cancel.cancel();
+                });
+            }
+        }
     }
 }
 
@@ -272,6 +354,125 @@ mod tests {
     use super::*;
     use crate::engine::container::instance::{handle_now, ContainerId};
     use crate::engine::container::options::{ContainerName, ImageRef};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ReleaseProbe(Arc<AtomicBool>);
+
+    impl Drop for ReleaseProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct WaitingBackend {
+        done: std::sync::mpsc::Receiver<AgentExitInfo>,
+        cancel: std::sync::mpsc::Sender<AgentExitInfo>,
+        wait_started: std::sync::mpsc::Sender<()>,
+        _frontend: ReleaseProbe,
+    }
+
+    impl ExecutionBackend for WaitingBackend {
+        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
+            let _ = self.wait_started.send(());
+            self.done
+                .recv()
+                .map_err(|error| EngineError::Other(error.to_string()))
+        }
+
+        fn cancel(&self) -> Result<(), EngineError> {
+            let _ = self.cancel.send(make_exit_info(KILLED_EXIT_CODE));
+            Ok(())
+        }
+
+        fn cancel_handle(&self) -> CancelHandle {
+            let cancel = self.cancel.clone();
+            CancelHandle::new(move || {
+                let _ = cancel.send(make_exit_info(KILLED_EXIT_CODE));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_releases_fake_backend_after_normal_and_dropped_wait() {
+        for drop_wait in [false, true] {
+            let released = Arc::new(AtomicBool::new(false));
+            let (done, received) = std::sync::mpsc::channel();
+            let (started, wait_started) = std::sync::mpsc::channel();
+            let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+            let mut execution = AgentExecution::new(
+                make_handle(),
+                Box::new(WaitingBackend {
+                    done: received,
+                    cancel: done.clone(),
+                    wait_started: started,
+                    _frontend: ReleaseProbe(released.clone()),
+                }),
+                Arc::new(stuck_tx),
+                None,
+            );
+            if drop_wait {
+                let task = tokio::spawn(async move { execution.wait().await });
+                tokio::task::spawn_blocking(move || {
+                    wait_started
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("wait_blocking must start before cancellation");
+                })
+                .await
+                .unwrap();
+                task.abort();
+                let _ = task.await;
+            } else {
+                done.send(make_exit_info(0)).unwrap();
+                execution.wait().await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !released.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("blocking backend retained frontend after wait");
+        }
+    }
+
+    #[test]
+    fn dropped_wait_cancellation_runs_outside_the_dropping_thread() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let cancellation = WaitCancellation(Some(CancelHandle::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+            Ok(())
+        })));
+        drop(cancellation);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("cancellation closure did not start");
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn dropping_unwaited_execution_releases_frontend() {
+        let released = Arc::new(AtomicBool::new(false));
+        let (done, received) = std::sync::mpsc::channel();
+        let (started, _wait_started) = std::sync::mpsc::channel();
+        let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+        let execution = AgentExecution::new(
+            make_handle(),
+            Box::new(WaitingBackend {
+                done: received,
+                cancel: done,
+                wait_started: started,
+                _frontend: ReleaseProbe(released.clone()),
+            }),
+            Arc::new(stuck_tx),
+            None,
+        );
+        drop(execution);
+        assert!(released.load(Ordering::SeqCst));
+    }
 
     fn make_handle() -> AgentHandle {
         let id = ContainerId::new("test-container-id");

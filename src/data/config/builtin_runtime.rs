@@ -1,8 +1,8 @@
 //! `BuiltinRuntimeConfig` — the `builtin` block of global and repo config.
 //!
 //! Only read when `runtime` is `builtin`. Every field is optional: global and
-//! repo blocks merge per field (repo wins, map entries merge per key), and the
-//! engine applies the defaults below to whatever is still unset.
+//! repo blocks merge per field (repo wins, map entries merge per key). Layer 0
+//! applies defaults and validation when resolving `EffectiveConfig`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -160,6 +160,11 @@ where
 impl BuiltinRuntimeConfig {
     /// `self` layered over `base`: every scalar `self` sets wins, and map
     /// entries merge per key with `self`'s entry winning.
+    ///
+    /// `network` is left out (`None`): a repo network block may only narrow
+    /// the global one, which a field-wise merge cannot express, so the only
+    /// enforced network policy is `EffectiveConfig::builtin_network`, which
+    /// resolves both layers. A merged view never carries an unenforced value.
     pub fn merged_over(&self, base: &BuiltinRuntimeConfig) -> BuiltinRuntimeConfig {
         let mut images = base.images.clone();
         images.extend(self.images.clone());
@@ -175,8 +180,7 @@ impl BuiltinRuntimeConfig {
                 .or_else(|| base.image_source.clone()),
             images,
             registries,
-            // Informational only; enforcement resolves both layers.
-            network: self.network.clone().or_else(|| base.network.clone()),
+            network: None,
             builder: match (&self.builder, &base.builder) {
                 (Some(repo), Some(global)) => Some(repo.merged_over(global)),
                 (repo, global) => repo.clone().or_else(|| global.clone()),
@@ -203,16 +207,22 @@ impl BuiltinRuntimeConfig {
         self.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB)
     }
 
-    /// The source for `awman_tag`: its per-image override, else the default
-    /// `image_source`. `None` means nothing is configured.
-    pub fn image_source_for(&self, awman_tag: &str) -> Option<&ImageSourceSpec> {
-        self.images.get(awman_tag).or(self.image_source.as_ref())
+    /// Reject values that cannot be honoured: zero vCPUs, memory below
+    /// [`MIN_MEMORY_MIB`], or an image source that fails
+    /// [`ImageSourceSpec::validate`].
+    ///
+    /// The network block is not checked here: `EffectiveConfig::builtin_network`
+    /// validates the global and the repo block each on its own before
+    /// combining them, so every launch already rejects a contradictory block
+    /// in either layer (and a merged view carries no network to check).
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_resources()?;
+        self.validate_image_sources()
     }
 
-    /// Reject values that cannot be honoured: zero vCPUs, memory below
-    /// [`MIN_MEMORY_MIB`], an image source that fails
-    /// [`ImageSourceSpec::validate`], or a contradictory network block.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Reject zero vCPUs and memory below [`MIN_MEMORY_MIB`]: the per-launch
+    /// sizing checks.
+    pub fn validate_resources(&self) -> Result<(), String> {
         if self.vcpus == Some(0) {
             return Err("builtin.vcpus must be at least 1".into());
         }
@@ -221,11 +231,11 @@ impl BuiltinRuntimeConfig {
                 "builtin.memoryMib must be at least {MIN_MEMORY_MIB}"
             ));
         }
-        if let Some(network) = &self.network {
-            network
-                .validate()
-                .map_err(|e| format!("builtin.network: {e}"))?;
-        }
+        Ok(())
+    }
+
+    /// Reject an image source that fails [`ImageSourceSpec::validate`].
+    pub fn validate_image_sources(&self) -> Result<(), String> {
         if let Some(source) = &self.image_source {
             source
                 .validate()
@@ -270,7 +280,11 @@ mod tests {
         let cfg = BuiltinRuntimeConfig::default();
         assert_eq!(cfg.vcpus_or_default(), DEFAULT_VCPUS);
         assert_eq!(cfg.memory_mib_or_default(), DEFAULT_MEMORY_MIB);
-        assert!(cfg.image_source_for("awman-x:latest").is_none());
+        assert!(cfg
+            .images
+            .get("awman-x:latest")
+            .or(cfg.image_source.as_ref())
+            .is_none());
     }
 
     #[test]
@@ -313,18 +327,38 @@ mod tests {
         assert_eq!(merged.memory_mib, Some(8192));
         assert_eq!(merged.image_source, global.image_source);
         assert_eq!(
-            merged.image_source_for("a"),
+            merged.images.get("a").or(merged.image_source.as_ref()),
             Some(&ImageSourceSpec::Archive {
                 path: "/repo-a".into()
             })
         );
         assert_eq!(
-            merged.image_source_for("b"),
+            merged.images.get("b").or(merged.image_source.as_ref()),
             Some(&ImageSourceSpec::Archive {
                 path: "/global-b".into()
             })
         );
-        assert_eq!(merged.image_source_for("c"), global.image_source.as_ref());
+        assert_eq!(
+            merged.images.get("c").or(merged.image_source.as_ref()),
+            global.image_source.as_ref()
+        );
+    }
+
+    #[test]
+    fn merged_view_never_carries_a_network_block() {
+        let global: BuiltinRuntimeConfig =
+            serde_json::from_str(r#"{"network":{"mode":"allowlist","allow":["a.example"]}}"#)
+                .unwrap();
+        let repo: BuiltinRuntimeConfig =
+            serde_json::from_str(r#"{"network":{"mode":"none"}}"#).unwrap();
+        assert_eq!(repo.merged_over(&global).network, None);
+        assert_eq!(
+            BuiltinRuntimeConfig::default().merged_over(&global).network,
+            None
+        );
+        // The persisted blocks themselves keep their network (config show,
+        // config files and `EffectiveConfig::builtin_network` read them).
+        assert!(global.network.is_some() && repo.network.is_some());
     }
 
     #[test]

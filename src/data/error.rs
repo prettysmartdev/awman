@@ -75,6 +75,22 @@ pub enum DataError {
     #[error("invalid path {path}: {reason}")]
     InvalidPath { path: PathBuf, reason: String },
 
+    /// The builtin runtime state directory or one of its locks is unusable
+    /// (relative path, symlink, wrong owner or permissions).
+    #[error("{0}")]
+    BuiltinState(String),
+
+    /// Another awman process holds a builtin runtime state lock.
+    #[error(
+        "builtin runtime is busy: another awman process held {lock} for {waited_secs}s; retry shortly"
+    )]
+    BuiltinStateBusy { lock: String, waited_secs: u64 },
+
+    /// A `builtin` config block that cannot be honoured for a launch: zero
+    /// resources, or a repo network block that would widen the global one.
+    #[error("invalid configuration: {0}")]
+    BuiltinConfig(String),
+
     #[error("{0}")]
     Other(String),
 }

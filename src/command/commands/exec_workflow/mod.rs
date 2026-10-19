@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -435,9 +435,11 @@ mod factory;
 mod issue;
 mod phase_container;
 mod prepare;
+mod shared_frontend;
+use shared_frontend::SharedWorkflowFrontend;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // The child modules' items are `pub(super)`; re-exporting them here is what
 // lets each one say `use super::*;` and see the others, exactly as they all

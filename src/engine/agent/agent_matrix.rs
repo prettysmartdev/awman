@@ -248,6 +248,7 @@ impl AgentMatrix {
         run: &super::AgentRunOptions,
         paradigm: RunParadigm,
     ) -> Result<(), EngineError> {
+        self.validate_tool_restrictions(&run.allowed_tools, &run.disallowed_tools, paradigm)?;
         if matches!(run.plan, Some(PlanMode::Enabled)) && self.plan_flag.is_none() {
             return Err(EngineError::PlanModeUnsupported {
                 agent: self.agent.to_string(),
@@ -274,6 +275,32 @@ impl AgentMatrix {
             return Err(EngineError::ConflictingOptions(
                 "plan and yolo modes are mutually exclusive".into(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Sandbox apply scripts deliver tool permissions only for Claude. Check
+    /// delivery before provisioning, including direct backend option callers.
+    pub(crate) fn validate_tool_restrictions(
+        &self,
+        allowed: &[String],
+        disallowed: &[String],
+        paradigm: RunParadigm,
+    ) -> Result<(), EngineError> {
+        use crate::engine::error::ToolRestriction;
+        for (tools, flag, restriction) in [
+            (
+                disallowed,
+                self.disallowed_tools_flag,
+                ToolRestriction::Disallowed,
+            ),
+            (allowed, self.allowed_tools_flag, ToolRestriction::Allowed),
+        ] {
+            if !tools.is_empty()
+                && (flag.is_none() || (paradigm == RunParadigm::Sandbox && self.agent != "claude"))
+            {
+                return Err(EngineError::ToolRestrictionFlagMissing { restriction });
+            }
         }
         Ok(())
     }
@@ -1274,6 +1301,29 @@ mod tests {
                 m.validate_run(&run, paradigm),
                 Err(EngineError::PlanModeUnsupported { ref agent }) if agent == "opencode"
             ));
+        }
+    }
+
+    #[test]
+    fn tool_restrictions_fail_closed_on_both_paradigms() {
+        for agent in ["codex", "cline", "gemini", "copilot", "opencode"] {
+            for allowed in [true, false] {
+                let mut run = run_with(None, None, None);
+                if allowed {
+                    run.allowed_tools.push("Read".into());
+                } else {
+                    run.disallowed_tools.push("Bash".into());
+                }
+                for paradigm in [RunParadigm::Container, RunParadigm::Sandbox] {
+                    assert!(
+                        matches!(
+                            matrix_for(agent).unwrap().validate_run(&run, paradigm),
+                            Err(EngineError::ToolRestrictionFlagMissing { .. })
+                        ),
+                        "{agent} {paradigm:?}"
+                    );
+                }
+            }
         }
     }
 

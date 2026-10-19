@@ -18,8 +18,7 @@ use awman::data::oci_identity::OciPlatform;
 use awman::engine::error::EngineError;
 use awman::engine::oci::archive::prepare_runtime_archive;
 use awman::engine::oci::{
-    cached_image_config, prune_cache, validate_archive, AcquirePolicy, AcquireRequest,
-    ImageAcquirer,
+    AcquirePolicy, AcquireRequest, ArchiveValidator, ImageAcquirer, OciCache,
 };
 
 use crate::support::*;
@@ -73,7 +72,7 @@ fn host_os_arch() -> (&'static str, &'static str) {
 }
 
 fn is_cache_miss(err: &EngineError) -> bool {
-    matches!(err, EngineError::Container(m) if m.contains("not in the builtin image cache") && m.contains("awman ready"))
+    matches!(err, EngineError::ImageNotCached { .. }) && err.to_string().contains("awman ready")
 }
 
 #[test]
@@ -201,7 +200,9 @@ fn source_deletion_replacement_and_shared_bytes_keep_per_reference_identity() {
         .unwrap();
     assert_eq!(from_a.archive, from_b.archive, "shared bytes, one archive");
     assert_eq!(cached_archives(&state), 1);
-    assert!(cached_image_config(&state, &from_a.archive)
+    assert!(OciCache::open(&state)
+        .unwrap()
+        .image_config(&from_a.archive)
         .unwrap()
         .is_some());
 
@@ -258,11 +259,10 @@ fn source_deletion_replacement_and_shared_bytes_keep_per_reference_identity() {
     // archive.
     drop(from_a);
     drop(from_b);
-    let report = prune_cache(
-        &state,
-        std::slice::from_ref(&replaced.identity.manifest_digest),
-    )
-    .unwrap();
+    let report = OciCache::open(&state)
+        .unwrap()
+        .prune(std::slice::from_ref(&replaced.identity.manifest_digest))
+        .unwrap();
     assert_eq!(report.archives_removed, 1);
     assert_eq!(cached_archives(&state), 1);
     assert!(is_cache_miss(
@@ -286,7 +286,10 @@ fn source_deletion_replacement_and_shared_bytes_keep_per_reference_identity() {
 fn acquisition_holds_lease_before_publication_callback_and_through_cloned_handoff() {
     const CHILD_STATE: &str = "AWMAN_TEST_LEASE_PRUNE_STATE";
     if let Some(state) = std::env::var_os(CHILD_STATE) {
-        let report = prune_cache(Path::new(&state), &[]).unwrap();
+        let report = OciCache::open(Path::new(&state))
+            .unwrap()
+            .prune(&[])
+            .unwrap();
         assert_eq!(report.archives_removed, 0);
         assert_eq!(report.archives_in_use, 1);
         return;
@@ -330,7 +333,14 @@ fn acquisition_holds_lease_before_publication_callback_and_through_cloned_handof
             std::fs::remove_file(&source).unwrap();
         }
     }
-    assert_eq!(prune_cache(&state, &[]).unwrap().archives_removed, 1);
+    assert_eq!(
+        OciCache::open(&state)
+            .unwrap()
+            .prune(&[])
+            .unwrap()
+            .archives_removed,
+        1
+    );
 }
 
 #[test]
@@ -410,7 +420,11 @@ fn a_pre_metadata_cache_record_is_migrated_by_one_reacquisition() {
     for entry in std::fs::read_dir(cache_dir(&state).join("refs")).unwrap() {
         strip(&entry.unwrap().path());
     }
-    assert!(cached_image_config(&state, &got.archive).unwrap().is_none());
+    assert!(OciCache::open(&state)
+        .unwrap()
+        .image_config(&got.archive)
+        .unwrap()
+        .is_none());
 
     // Cached-only cannot serve an unreadable record: an actionable miss.
     let err = acq
@@ -429,7 +443,9 @@ fn a_pre_metadata_cache_record_is_migrated_by_one_reacquisition() {
         )
         .unwrap();
     assert_eq!(migrated.identity, got.identity);
-    assert!(cached_image_config(&state, &migrated.archive)
+    assert!(OciCache::open(&state)
+        .unwrap()
+        .image_config(&migrated.archive)
         .unwrap()
         .is_some_and(|c| c.home.as_deref() == Some("/home/agent")));
     std::fs::remove_file(&a).unwrap();
@@ -486,24 +502,22 @@ fn unselected_images_and_tags_never_reach_the_runtime_projection() {
             !text.contains("bin/other"),
             "{name}: other image's layer absent"
         );
-        let checked = validate_archive(
-            &projected,
-            &OciPlatform::host_linux(),
-            &[],
-            &limits(),
-            &mut |_| {},
-        )
+        let checked = ArchiveValidator {
+            platform: &OciPlatform::host_linux(),
+            wanted_refs: &[],
+            limits: &limits(),
+        }
+        .validate(&projected, &mut |_| {})
         .expect("a projection is unambiguous without any wanted refs");
         assert_eq!(checked.config_digest, got.identity.config_digest);
         // The archive without a selecting reference is ambiguous: the
         // original bytes are never what the SDK sees.
-        assert!(validate_archive(
-            &path,
-            &OciPlatform::host_linux(),
-            &[],
-            &limits(),
-            &mut |_| {}
-        )
+        assert!(ArchiveValidator {
+            platform: &OciPlatform::host_linux(),
+            wanted_refs: &[],
+            limits: &limits()
+        }
+        .validate(&path, &mut |_| {})
         .is_err());
     }
 }

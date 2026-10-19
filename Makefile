@@ -13,6 +13,9 @@ AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
 all: build
 
+# The workspace has one distribution executable (awman-cli's awman target).
+# awman and awman-host-shims are libraries, including the private re-exec worker.
+
 # On Apple Silicon the experimental builtin runtime is included when its
 # payload verifies, and the binary is then ad-hoc signed with the hypervisor
 # entitlement (tools/macos-sign.sh): macOS refuses to start a VM otherwise.
@@ -21,11 +24,11 @@ all: build
 build:
 	@host="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	if [ "$$host" = aarch64-apple-darwin ] && bash tools/msb-payloads/verify.sh "$$host" >/dev/null 2>&1; then \
-		cargo build --release --features builtin-runtime && \
+		cargo build --workspace --bins --release --features builtin-runtime && \
 		bash tools/macos-sign.sh $(TARGET_DIR)/release/$(BINARY); \
 	else \
 		echo 'Builtin runtime not included for this host; building existing backends'; \
-		cargo build --release; \
+		cargo build --workspace --bins --release; \
 	fi
 
 # Re-sign an existing build, e.g. after stripping or copying it elsewhere:
@@ -72,7 +75,7 @@ test-fast:
 # `--examples` builds the real-guest driver used by the builtin_hw_* tests.
 # On macOS the awman binary and guest drivers are signed with the hypervisor
 # entitlement between building and running (tools/macos-sign-test-artifacts.sh).
-BUILTIN_TEST_ARGS := --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer
+BUILTIN_TEST_ARGS := --workspace --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer
 test-builtin:
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --no-run --quiet
 	@# `cargo test --examples` builds the examples as test targets; the guest
@@ -104,8 +107,8 @@ docs-reference:
 # behind: every test body after the handful that need no temp directory
 # then dies on, or crawls against, a /tmp that cannot take another one.
 pre-push: architecture-lint
-	cargo fmt --check
-	cargo clippy --all-targets -- -D warnings
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
 	$(MAKE) --no-print-directory test
 
 clean:

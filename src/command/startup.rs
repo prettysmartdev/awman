@@ -18,6 +18,19 @@ use crate::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 
+/// A fatal startup failure selected for frontend presentation. The inert
+/// engine bundle only allows the frontend to open its quit-only modal.
+pub struct RuntimeStartupFailure {
+    pub error: crate::command::error::CommandError,
+}
+impl RuntimeStartupFailure {
+    pub(crate) fn new(error: EngineError) -> Self {
+        Self {
+            error: error.into(),
+        }
+    }
+}
+
 /// The command-aware startup coordinator for one binary invocation.
 pub struct Startup {
     command_path: Vec<String>,
@@ -101,7 +114,7 @@ impl Startup {
 pub struct StartupOutcome {
     pub session: Session,
     pub engines: Engines,
-    pub fatal_runtime_error: Option<String>,
+    pub fatal_runtime_error: Option<RuntimeStartupFailure>,
     messages: Vec<String>,
 }
 
@@ -109,7 +122,7 @@ impl StartupOutcome {
     fn new(
         session: Session,
         engines: Engines,
-        fatal_runtime_error: Option<String>,
+        fatal_runtime_error: Option<RuntimeStartupFailure>,
         messages: Vec<String>,
     ) -> Self {
         Self {
@@ -123,5 +136,65 @@ impl StartupOutcome {
     /// Messages collected during startup in the order they must be presented.
     pub fn messages(&self) -> &[String] {
         &self.messages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::error::CommandError;
+    use crate::data::config::env::{EnvSnapshot, AMBIENT_MSB_OVERRIDES, AWMAN_CONFIG_HOME};
+
+    #[test]
+    fn tui_startup_preserves_override_failure_for_the_fatal_frontend() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.json"),
+            r#"{"runtime":"builtin-experimental"}"#,
+        )
+        .unwrap();
+        for variable in AMBIENT_MSB_OVERRIDES {
+            let env = EnvSnapshot::with_overrides([
+                (AWMAN_CONFIG_HOME, temp.path().to_str().unwrap()),
+                (*variable, ""),
+            ]);
+            let outcome = Startup::new(Vec::new())
+                .run(temp.path().into(), env)
+                .unwrap();
+            let failure = outcome
+                .fatal_runtime_error
+                .expect("builtin open error must reach the modal");
+            assert_eq!(failure.error.exit_code(), 1);
+            assert_eq!(
+                failure.error.to_string(),
+                EngineError::AmbientRuntimeOverride {
+                    variable: variable.to_string()
+                }
+                .to_string()
+            );
+            assert!(matches!(
+                failure.error,
+                CommandError::Engine(EngineError::AmbientRuntimeOverride { .. })
+            ));
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn tui_startup_preserves_the_unsupported_target_error() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.json"),
+            r#"{"runtime":"builtin-experimental"}"#,
+        )
+        .unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, temp.path().to_str().unwrap())]);
+        let outcome = Startup::new(Vec::new())
+            .run(temp.path().into(), env)
+            .unwrap();
+        assert!(matches!(
+            outcome.fatal_runtime_error.unwrap().error,
+            CommandError::Engine(EngineError::BuiltinTargetUnreleased { .. })
+        ));
     }
 }

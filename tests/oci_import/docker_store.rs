@@ -258,7 +258,10 @@ fn store_docker_missing_image_names_the_endpoint_and_is_not_retried() {
         .acquire(&req, &mut |_| {})
         .unwrap_err();
     let text = err.to_string();
-    assert!(matches!(err, EngineError::Container(_)), "{err:?}");
+    assert!(
+        matches!(err, EngineError::SourceImageNotFound { .. }),
+        "{err:?}"
+    );
     assert!(
         text.contains("missing/agent:9") && text.contains("unix://"),
         "{text}"

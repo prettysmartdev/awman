@@ -39,89 +39,29 @@
 //! Records hold no secrets: the locator is a registry host and repository, a
 //! Docker endpoint without credentials, or an archive path. Image `Env` is
 //! not recorded.
+//!
+//! The layout, record types and private-file primitives live in Layer 0
+//! (`data::oci_cache`); this module is the acquisition-facing policy over
+//! them: leases, commit order, verification on lookup and pruning.
 
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
+use crate::data::error::DataError;
+use crate::data::oci_cache::{
+    CacheRecord, OciCacheStore, RefRecord, SourceFingerprint, RECORD_VERSION,
+};
 use crate::data::oci_identity::{Digest, ImageIdentity};
 use crate::engine::error::EngineError;
-use crate::engine::oci::archive::{ImageConfigSummary, ValidatedArchive};
-use crate::engine::oci::verify::{create_private_dir, create_private_file, sha256_hex};
+use crate::engine::oci::archive::ValidatedArchive;
 use crate::engine::oci::{AcquiredImage, ArchiveFormat};
 
-/// Directory name under the builtin state directory.
-pub const CACHE_DIR: &str = "oci-cache";
-const RECORD_VERSION: u32 = 1;
+pub use crate::data::oci_cache::CACHE_DIR;
+
 /// Staging directories without a lease file that are older than this belong
 /// to a crashed acquisition. Leased staging is judged by its lock instead.
 const STALE_STAGING: Duration = Duration::from_secs(24 * 60 * 60);
-/// Records and refs are small JSON documents; anything larger is foreign or
-/// damaged and is a miss, read without allocating its full size.
-const MAX_RECORD_BYTES: u64 = 1 << 20;
-/// The lease file inside a leased staging directory.
-const STAGING_LEASE: &str = ".lease";
-
-/// What a cached archive is, persisted next to it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheRecord {
-    pub version: u32,
-    pub identity: ImageIdentity,
-    /// `"oci-layout"` or `"docker-save"`.
-    pub archive_format: String,
-    pub bytes: u64,
-    pub archive_sha256: String,
-    /// RFC 3339.
-    pub acquired_at: String,
-    /// Non-secret description of where it came from.
-    pub locator: String,
-    /// For archive sources: the source file's size and mtime when imported,
-    /// so a re-exported archive at the same path is re-imported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_fingerprint: Option<SourceFingerprint>,
-    pub config: ImageConfigSummary,
-}
-
-/// Size and modification time of a local source file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceFingerprint {
-    pub len: u64,
-    pub mtime_ns: u128,
-}
-
-impl SourceFingerprint {
-    pub(super) fn of(path: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
-        let mtime_ns = meta
-            .modified()
-            .ok()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
-        Some(Self {
-            len: meta.len(),
-            mtime_ns,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RefRecord {
-    version: u32,
-    key: String,
-    archive_sha256: String,
-    // The same archive can be acquired from different sources or contain
-    // several selected images. Keep provenance and selection with the ref,
-    // rather than borrowing whichever record last wrote the shared archive.
-    // Older refs without this field are cache misses and must be revalidated.
-    record: CacheRecord,
-}
 
 /// A cache hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,28 +121,28 @@ impl Staging {
     }
 }
 
-/// The cache rooted at `<state_dir>/oci-cache`.
+/// The acquisition-facing cache: policy over the Layer 0 [`OciCacheStore`].
 #[derive(Debug, Clone)]
 pub struct OciCache {
-    root: PathBuf,
+    store: OciCacheStore,
     control: super::retry::OperationControl,
 }
 
 impl OciCache {
+    /// Non-secret defaults recorded for a cached archive.
+    pub fn image_config(
+        &self,
+        archive: &Path,
+    ) -> Result<Option<super::ImageConfigSummary>, EngineError> {
+        Ok(self
+            .record_for_archive(archive)?
+            .map(|record| record.config))
+    }
+
     /// Open (creating, owner-only) the cache under `state_dir`.
     pub fn open(state_dir: &Path) -> Result<Self, EngineError> {
-        let root = state_dir.join(CACHE_DIR);
-        for dir in [
-            root.clone(),
-            root.join("images"),
-            root.join("refs"),
-            root.join("leases"),
-            root.join("tmp"),
-        ] {
-            create_private_dir(&dir)?;
-        }
         Ok(Self {
-            root,
+            store: OciCacheStore::open(state_dir)?,
             control: Default::default(),
         })
     }
@@ -212,87 +152,40 @@ impl OciCache {
         self
     }
 
+    /// Run a Layer 0 operation that takes a `check` hook. The hook polls this
+    /// cache's cancellation and deadline; the engine error that stopped it is
+    /// returned as-is rather than flattened into a `DataError`.
+    fn with_control<T>(
+        &self,
+        op: impl FnOnce(&mut dyn FnMut() -> Result<(), DataError>) -> Result<T, DataError>,
+    ) -> Result<T, EngineError> {
+        crate::engine::error::run_checked(|| self.control.check(), op)
+    }
+
     /// A leased private staging directory; see [`Staging`]. Created under
     /// the shared cache lock so prune never sees it between creation and
     /// locking.
     pub fn staging_leased(&self) -> Result<Staging, EngineError> {
         let _guard = self.lock(false)?;
         let dir = self.staging()?;
-        let path = dir.path().join(STAGING_LEASE);
-        let file = open_private_lock(&path, true)?.ok_or_else(|| {
-            EngineError::Other(format!("staging lease {} vanished", path.display()))
-        })?;
-        file.try_lock().map_err(|e| match e {
-            std::fs::TryLockError::Error(e) => EngineError::io(&path, e),
-            std::fs::TryLockError::WouldBlock => {
-                EngineError::Other(format!("staging lease {} is already held", path.display()))
-            }
-        })?;
+        let file = self.store.lock_staging_lease(dir.path())?;
         Ok(Staging { dir, _lease: file })
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.store.root()
     }
 
     /// A fresh private staging directory, removed when dropped.
     pub(super) fn staging(&self) -> Result<tempfile::TempDir, EngineError> {
-        let tmp = self.root.join("tmp");
-        tempfile::Builder::new()
-            .prefix("acq-")
-            .tempdir_in(&tmp)
-            .map_err(|e| EngineError::io(tmp, e))
+        Ok(self.store.new_staging_dir()?)
     }
 
     /// The cache's cross-process lock: exclusive for `commit`/`prune`,
     /// shared for readers, so pruning can never observe (and delete) an
     /// archive whose record or ref is still being written. Released on drop.
     fn lock(&self, exclusive: bool) -> Result<std::fs::File, EngineError> {
-        let path = self.root.join("cache.lock");
-        let file = open_private_lock(&path, true)?.ok_or_else(|| {
-            EngineError::Other(format!("image cache lock {} vanished", path.display()))
-        })?;
-        loop {
-            self.control.check()?;
-            let locked = if exclusive {
-                file.try_lock()
-            } else {
-                file.try_lock_shared()
-            };
-            match locked {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::Error(e)) => return Err(EngineError::io(&path, e)),
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-            }
-        }
-        self.control.check()?;
-        Ok(file)
-    }
-
-    fn ref_path(&self, key: &str) -> PathBuf {
-        self.root
-            .join("refs")
-            .join(format!("{}.json", sha256_hex(key.as_bytes())))
-    }
-
-    fn archive_path(&self, archive_sha256: &str) -> PathBuf {
-        self.root
-            .join("images")
-            .join(format!("{archive_sha256}.tar"))
-    }
-
-    fn lease_path(&self, archive_sha256: &str) -> PathBuf {
-        self.root
-            .join("leases")
-            .join(format!("{archive_sha256}.lock"))
-    }
-
-    fn record_path(&self, archive_sha256: &str) -> PathBuf {
-        self.root
-            .join("images")
-            .join(format!("{archive_sha256}.json"))
+        self.with_control(|check| self.store.lock(exclusive, check))
     }
 
     /// The cached image `key` resolved to, if its record and archive are
@@ -321,38 +214,28 @@ impl OciCache {
     /// path). `Ok(None)` when it is not (or no longer) an intact cache
     /// entry: the caller must acquire again rather than use the path.
     pub fn lease_archive(&self, archive: &Path) -> Result<Option<ArchiveLease>, EngineError> {
-        let Some(stem) = archive.file_stem().and_then(|s| s.to_str()) else {
+        let Some(stem) = self.store.archive_stem(archive) else {
             return Ok(None);
         };
-        if archive.parent() != Some(self.root.join("images").as_path())
-            || archive.extension().and_then(|e| e.to_str()) != Some("tar")
-        {
-            return Ok(None);
-        }
         let _guard = self.lock(false)?;
-        if self.load(stem, false)?.is_none() {
+        if self.load(&stem, false)?.is_none() {
             return Ok(None);
         }
-        self.lease_locked(stem).map(Some)
+        self.lease_locked(&stem).map(Some)
     }
 
     /// Callers hold the cache lock (shared suffices): prune, which deletes
     /// lease files, holds it exclusively.
     fn lease_locked(&self, archive_sha256: &str) -> Result<ArchiveLease, EngineError> {
-        let path = self.lease_path(archive_sha256);
-        let file = open_private_lock(&path, true)?
-            .ok_or_else(|| EngineError::Other(format!("lease {} vanished", path.display())))?;
-        file.lock_shared().map_err(|e| EngineError::io(&path, e))?;
         Ok(ArchiveLease {
-            archive: self.archive_path(archive_sha256),
+            archive: self.store.archive_path(archive_sha256),
             archive_sha256: archive_sha256.to_string(),
-            _file: file,
+            _file: self.store.lease_shared(archive_sha256)?,
         })
     }
 
     fn lookup_locked(&self, key: &str) -> Result<Option<CachedImage>, EngineError> {
-        let path = self.ref_path(key);
-        let Some(reference) = read_json::<RefRecord>(&path)? else {
+        let Some(reference) = self.store.read_ref(key)? else {
             return Ok(None);
         };
         if reference.version != RECORD_VERSION || reference.key != key {
@@ -384,19 +267,18 @@ impl OciCache {
         if archive_sha256.len() != 64 || !archive_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(None);
         }
-        let Some(record) = read_json::<CacheRecord>(&self.record_path(archive_sha256))? else {
+        let Some(record) = self.store.read_record(archive_sha256)? else {
             return Ok(None);
         };
-        let archive = self.archive_path(archive_sha256);
+        let archive = self.store.archive_path(archive_sha256);
         // A symlink (or anything but a plain file) in place of an archive is
         // a miss, never followed.
-        let Ok(meta) = std::fs::symlink_metadata(&archive) else {
+        let Some(len) = self.store.archive_len(archive_sha256) else {
             return Ok(None);
         };
-        if !meta.file_type().is_file()
-            || record.version != RECORD_VERSION
+        if record.version != RECORD_VERSION
             || record.archive_sha256 != archive_sha256
-            || meta.len() != record.bytes
+            || len != record.bytes
         {
             return Ok(None);
         }
@@ -426,14 +308,11 @@ impl OciCache {
 
     /// The record stored next to a cached archive path.
     pub fn record_for_archive(&self, archive: &Path) -> Result<Option<CacheRecord>, EngineError> {
-        let Some(stem) = archive.file_stem().and_then(|s| s.to_str()) else {
+        let Some(stem) = self.store.image_stem(archive) else {
             return Ok(None);
         };
-        if archive.parent() != Some(self.root.join("images").as_path()) {
-            return Ok(None);
-        }
         let _guard = self.lock(false)?;
-        Ok(self.load(stem, false)?.map(|c| c.record))
+        Ok(self.load(&stem, false)?.map(|c| c.record))
     }
 
     /// Move a validated, staged archive into the cache and point `key` at
@@ -499,38 +378,39 @@ impl OciCache {
         };
 
         let _guard = self.lock(true)?;
-        let archive = self.archive_path(&archive_sha256);
-        let record_path = self.record_path(&archive_sha256);
+        let archive = self.store.archive_path(&archive_sha256);
+        let record_path = self.store.record_path(&archive_sha256);
         // Bytes another ref already publishes are shared and must survive a
         // failure here; bytes this commit introduced must not linger as an
         // unreferenced partial entry.
-        let introduced = std::fs::symlink_metadata(&archive).is_err();
+        let introduced = !self.store.archive_exists(&archive_sha256);
         let published = (|| {
-            std::fs::rename(staged, &archive).map_err(|e| EngineError::io(&archive, e))?;
+            self.store.adopt_archive(staged, &archive_sha256)?;
             fault::check(fault::Stage::ArchivePublished, &archive)?;
-            write_json_atomic(&record_path, &record)?;
+            self.store
+                .write_record(&archive_sha256, &record, || Ok(()))?;
             fault::check(fault::Stage::RecordPublished, &record_path)?;
             self.control.check()?;
-            write_json_atomic_controlled(
-                &self.ref_path(key),
-                &RefRecord {
-                    version: RECORD_VERSION,
-                    key: key.to_string(),
-                    archive_sha256: archive_sha256.clone(),
-                    record: record.clone(),
-                },
-                &self.control,
-            )
+            self.with_control(|check| {
+                self.store.write_ref(
+                    key,
+                    &RefRecord {
+                        version: RECORD_VERSION,
+                        key: key.to_string(),
+                        archive_sha256: archive_sha256.clone(),
+                        record: record.clone(),
+                    },
+                    check,
+                )
+            })
         })();
         if let Err(e) = published {
             if introduced {
-                let _ = std::fs::remove_file(&record_path);
-                let _ = std::fs::remove_file(&archive);
+                self.store.discard_entry(&archive_sha256);
             }
             return Err(e);
         }
-        sync_dir(&self.root.join("images"));
-        sync_dir(&self.root.join("refs"));
+        self.store.sync_committed();
 
         let hit = self.load(&archive_sha256, false)?.ok_or_else(|| {
             EngineError::Other(format!(
@@ -551,22 +431,23 @@ impl OciCache {
     /// an [`ArchiveLease`] and staging held by a live [`Staging`] are kept.
     pub fn prune(&self, keep: &[Digest]) -> Result<PruneReport, EngineError> {
         let _guard = self.lock(true)?;
+        let store = &self.store;
         let mut report = PruneReport::default();
         // Commits hold the exclusive lock while writing, so any `.*.tmp`
         // left now is from a process that died mid-write.
-        for dir in ["images", "refs"] {
-            for entry in read_dir(&self.root.join(dir))? {
+        for dir in [store.images_dir(), store.refs_dir()] {
+            for entry in store.read_dir(&dir)? {
                 let path = entry.path();
-                if is_interrupted_write(&path) {
-                    remove_file(&path)?;
+                if store.is_interrupted_write(&path) {
+                    store.remove_file(&path)?;
                     report.interrupted_writes_removed += 1;
                 }
             }
         }
         let keep: BTreeSet<&str> = keep.iter().map(Digest::as_str).collect();
         let mut referenced = BTreeSet::new();
-        for entry in read_dir(&self.root.join("refs"))? {
-            if let Some(reference) = read_json::<RefRecord>(&entry.path())? {
+        for entry in store.read_dir(&store.refs_dir())? {
+            if let Some(reference) = store.read_ref_at(&entry.path())? {
                 if reference.version == RECORD_VERSION
                     && keep.contains(reference.record.identity.manifest_digest.as_str())
                 {
@@ -574,9 +455,9 @@ impl OciCache {
                 }
             }
         }
-        let images = self.root.join("images");
+        let images = store.images_dir();
         let mut kept = BTreeSet::new();
-        for entry in read_dir(&images)? {
+        for entry in store.read_dir(&images)? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("tar") {
                 continue;
@@ -597,262 +478,62 @@ impl OciCache {
                 kept.insert(stem);
                 continue;
             }
-            let Some(reclaimed) = self.reclaim_lease(&stem)? else {
+            let Some(reclaimed) = store.reclaim_lease(&stem)? else {
                 report.archives_in_use += 1;
                 kept.insert(stem);
                 continue;
             };
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            remove_file(&path)?;
-            let _ = std::fs::remove_file(self.record_path(&stem));
+            store.remove_file(&path)?;
+            store.discard_record(&stem);
             // No one can open the lease file without the cache lock, which
             // this prune holds exclusively, so removing it cannot strand a
             // future lease on an unlinked inode.
             if reclaimed.is_some() {
-                remove_file(&self.lease_path(&stem))?;
+                store.remove_file(&store.lease_path(&stem))?;
             }
             report.archives_removed += 1;
             report.bytes_freed += size;
         }
         // Records without an archive.
-        for entry in read_dir(&images)? {
+        for entry in store.read_dir(&images)? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 if !kept.contains(stem) {
-                    remove_file(&path)?;
+                    store.remove_file(&path)?;
                 }
             }
         }
         // Leases whose archive is gone and no one holds.
-        for entry in read_dir(&self.root.join("leases"))? {
+        for entry in store.read_dir(&store.leases_dir())? {
             let path = entry.path();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if !kept.contains(stem) && self.reclaim_lease(stem)?.is_some() {
-                remove_file(&path)?;
+            if !kept.contains(stem) && store.reclaim_lease(stem)?.is_some() {
+                store.remove_file(&path)?;
             }
         }
-        for entry in read_dir(&self.root.join("refs"))? {
+        for entry in store.read_dir(&store.refs_dir())? {
             let path = entry.path();
-            let live = read_json::<RefRecord>(&path)
+            let live = store
+                .read_ref_at(&path)
                 .ok()
                 .flatten()
                 .is_some_and(|r| kept.contains(&r.archive_sha256));
             if !live {
-                remove_file(&path)?;
+                store.remove_file(&path)?;
                 report.refs_removed += 1;
             }
         }
-        for entry in read_dir(&self.root.join("tmp"))? {
-            if staging_is_abandoned(&entry)? {
-                let path = entry.path();
-                let removed = match entry.file_type() {
-                    Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
-                    _ => std::fs::remove_file(&path),
-                };
-                if removed.is_ok() {
-                    report.staging_removed += 1;
-                }
+        for entry in store.read_dir(&store.tmp_dir())? {
+            if store.staging_is_abandoned(&entry, STALE_STAGING)?
+                && store.remove_staging_entry(&entry)
+            {
+                report.staging_removed += 1;
             }
         }
         Ok(report)
     }
-
-    /// Callers hold the exclusive cache lock. `Ok(None)` when a lease on
-    /// `archive_sha256` is held; otherwise the (possibly absent) lease file,
-    /// locked exclusively so it cannot be taken while it is removed.
-    fn reclaim_lease(
-        &self,
-        archive_sha256: &str,
-    ) -> Result<Option<Option<std::fs::File>>, EngineError> {
-        let path = self.lease_path(archive_sha256);
-        let Some(file) = open_private_lock(&path, false)? else {
-            return Ok(Some(None));
-        };
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Some(file))),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(EngineError::io(&path, e)),
-        }
-    }
-}
-
-/// `.<name>.<uuid>.tmp`, as written by [`write_json_atomic`].
-fn is_interrupted_write(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with('.') && n.ends_with(".tmp"))
-}
-
-/// A staging entry prune may remove: a leased directory whose lease no one
-/// holds (its acquisition ended or crashed), or an unleased entry older than
-/// [`STALE_STAGING`]. Callers hold the exclusive cache lock.
-fn staging_is_abandoned(entry: &std::fs::DirEntry) -> Result<bool, EngineError> {
-    let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-    if is_dir {
-        if let Some(lease) = open_private_lock(&entry.path().join(STAGING_LEASE), false)? {
-            return match lease.try_lock() {
-                Ok(()) => Ok(true),
-                Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-                Err(std::fs::TryLockError::Error(e)) => Err(EngineError::io(entry.path(), e)),
-            };
-        }
-    }
-    Ok(entry
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age > STALE_STAGING))
-}
-
-/// Open (optionally creating) a lock or lease file without following a
-/// symlink. It must be a single-link, owner-only regular file owned by this
-/// user, so a planted symlink, hardlink or foreign file is refused rather
-/// than locked (and later removed). `Ok(None)` when absent and not created.
-fn open_private_lock(path: &Path, create: bool) -> Result<Option<std::fs::File>, EngineError> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(EngineError::Config(format!(
-                "image cache lock {} cannot be opened safely (symlinks are refused): {e}",
-                path.display()
-            )))
-        }
-    };
-    let meta = file.metadata().map_err(|e| EngineError::io(path, e))?;
-    let refused = |why: &str| {
-        Err(EngineError::Config(format!(
-            "image cache lock {} {why}; remove it and retry",
-            path.display()
-        )))
-    };
-    if !meta.is_file() {
-        return refused("is not a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.nlink() != 1 {
-            return refused("has other hard links");
-        }
-        if meta.uid() != nix::unistd::geteuid().as_raw() {
-            return refused("is owned by another user");
-        }
-        if meta.mode() & 0o077 != 0 {
-            return refused("is accessible to other users");
-        }
-    }
-    Ok(Some(file))
-}
-
-fn read_dir(dir: &Path) -> Result<Vec<std::fs::DirEntry>, EngineError> {
-    match std::fs::read_dir(dir) {
-        Ok(it) => Ok(it.flatten().collect()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(EngineError::io(dir, e)),
-    }
-}
-
-fn remove_file(path: &Path) -> Result<(), EngineError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(EngineError::io(path, e)),
-    }
-}
-
-/// `Ok(None)` when absent or unparseable (a torn or foreign file is a miss,
-/// not an error). A symlink, a non-regular file or a record larger than
-/// [`MAX_RECORD_BYTES`] is also a miss; it is neither followed nor read in
-/// full.
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, EngineError> {
-    use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        // ELOOP: a symlink in place of a record.
-        #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
-        Err(e) => return Err(EngineError::io(path, e)),
-    };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| EngineError::io(path, e))?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Ok(None);
-    }
-    Ok(serde_json::from_slice(&bytes).ok())
-}
-
-/// Write `value` to a unique sibling, fsync, then rename over `path`.
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), EngineError> {
-    write_json_atomic_controlled(path, value, &Default::default())
-}
-
-fn write_json_atomic_controlled<T: Serialize>(
-    path: &Path,
-    value: &T,
-    control: &super::retry::OperationControl,
-) -> Result<(), EngineError> {
-    control.check()?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let bytes = serde_json::to_vec_pretty(value).map_err(|e| EngineError::Other(e.to_string()))?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("record"),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = create_private_file(&tmp)?;
-    let written = file
-        .write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| EngineError::io(&tmp, e));
-    if let Err(e) = written.and_then(|_| {
-        control.check()?;
-        std::fs::rename(&tmp, path).map_err(|e| EngineError::io(path, e))
-    }) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Best-effort directory fsync so a committed rename survives a crash.
-fn sync_dir(dir: &Path) {
-    #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
 }
 
 /// Commit fault injection for the interrupted-publication and ENOSPC tests.
@@ -895,6 +576,9 @@ mod fault {
 mod tests {
     use super::*;
     use crate::data::config::image_source::ImageSourceKind;
+    use crate::data::fs::private_files::open_private_lock;
+    use crate::data::oci_cache::ImageConfigSummary;
+    use crate::data::oci_cache::{MAX_RECORD_BYTES, STAGING_LEASE};
     use crate::data::oci_identity::OciPlatform;
     use crate::engine::oci::verify::sha256_digest;
 
@@ -916,17 +600,48 @@ mod tests {
 
     #[test]
     fn cancelled_reference_write_keeps_previous_reference() {
-        use crate::engine::oci::retry::{CancelToken, Deadline, OperationControl};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ref.json");
-        write_json_atomic(&path, &"previous").unwrap();
+        use crate::engine::oci::retry::{is_cancelled, CancelToken, Deadline, OperationControl};
+        let state = tempfile::tempdir().unwrap();
+        let cache = OciCache::open(state.path()).unwrap();
+        let hit = commit(&cache, b"x", "k", identity());
         let token = CancelToken::new();
         token.cancel();
         let control =
             OperationControl::new(token, Deadline::start(std::time::Duration::from_secs(1)));
-        assert!(write_json_atomic_controlled(&path, &"new", &control).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\"previous\"");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let before = std::fs::read(cache.ref_path("k")).unwrap();
+        let cancelled = cache.clone().controlled(control);
+        let replacement = RefRecord {
+            version: RECORD_VERSION,
+            key: "k-replacement".into(),
+            archive_sha256: hit.record.archive_sha256.clone(),
+            record: hit.record.clone(),
+        };
+        let err = cancelled
+            .with_control(|check| cancelled.store.write_ref("k", &replacement, check))
+            .unwrap_err();
+        assert!(is_cancelled(&err), "the cancellation error survives: {err}");
+        assert!(cache.lookup("k").unwrap().is_some(), "previous ref kept");
+        assert_eq!(
+            std::fs::read(cache.ref_path("k")).unwrap(),
+            before,
+            "a cancelled publication must not touch the ref bytes"
+        );
+        let leftovers = std::fs::read_dir(cache.root().join("refs"))
+            .unwrap()
+            .count();
+        assert_eq!(leftovers, 1, "no temporary sibling is left behind");
+    }
+
+    impl OciCache {
+        fn ref_path(&self, key: &str) -> PathBuf {
+            self.store.ref_path(key)
+        }
+        fn lease_path(&self, sha: &str) -> PathBuf {
+            self.store.lease_path(sha)
+        }
+        fn record_path(&self, sha: &str) -> PathBuf {
+            self.store.record_path(sha)
+        }
     }
 
     fn validated() -> ValidatedArchive {

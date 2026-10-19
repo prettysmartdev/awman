@@ -109,4 +109,15 @@ case "${AWMAN_TEST_BUILTIN:-}" in
 esac
 export TMPDIR="$run_dir"
 
-cargo test "$@" < /dev/null
+# Include relocated worker/XPC unit tests as well as awman's suite.
+workspace_args=(--workspace)
+for arg in "$@"; do
+    # Arguments after `--` belong to libtest, not Cargo package selection.
+    [[ "$arg" == "--" ]] && break
+    case "$arg" in
+        --workspace | --all | -p | -p?* | --package | --package=* | --manifest-path | --manifest-path=*)
+            workspace_args=()
+            ;;
+    esac
+done
+cargo test "${workspace_args[@]}" "$@" < /dev/null

@@ -268,7 +268,10 @@ fn docker_roundtrip(test: &'static str, endpoint_key: &str, use_tls: bool, mutua
             &mut |_| {},
         )
         .unwrap_err();
-    assert!(matches!(err, EngineError::Container(_)), "{err:?}");
+    assert!(
+        matches!(err, EngineError::SourceImageNotFound { .. }),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("does-not-exist"));
     report.pass(&format!(
         "export, cached reuse, missing-image finality{}: {} ({} bytes)",

@@ -21,6 +21,8 @@ use crate::engine::container::options::{
 /// Everything a foreground setup/teardown step container needs.
 #[derive(Debug, Clone)]
 pub struct PhaseStepContainerSpec<'a> {
+    /// Session-scoped settings, also required by interactive builtin steps.
+    pub builtin_launch: Option<&'a crate::data::config::builtin_launch::BuiltinLaunchSettings>,
     /// The project's base image.
     pub image: &'a str,
     /// The workspace, mounted read-write at its own path and used as the
@@ -64,6 +66,9 @@ impl PhaseStepContainerSpec<'_> {
                 permission: OverlayPermission::ReadWrite,
             }),
         ];
+        if let Some(settings) = self.builtin_launch {
+            options.push(ContainerOption::BuiltinLaunch(settings.clone()));
+        }
         options.extend(self.overlays.iter().cloned().map(ContainerOption::Overlay));
 
         let mut names: Vec<&String> = self.env.keys().collect();
@@ -106,6 +111,7 @@ mod tests {
         step_env: Option<&'a HashMap<String, String>>,
     ) -> PhaseStepContainerSpec<'a> {
         PhaseStepContainerSpec {
+            builtin_launch: None,
             image: "awman-proj:latest",
             workdir,
             overlays,

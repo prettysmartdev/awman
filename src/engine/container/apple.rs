@@ -3,12 +3,10 @@
 //! / `list` / `stats` / `stop` surface).
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::data::message::UserMessageSink;
 use crate::engine::agent_runtime::background::ExecOutput;
 use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
-use crate::engine::container::options::OverlaySpec;
 use crate::engine::container::runtime::{ContainerImageInfo, CONTAINER_CAPABILITIES};
 use crate::engine::container::{background, host_cli_backend};
 
@@ -189,6 +187,9 @@ impl ContainerBackend for AppleBackend {
         let name = options.name.clone().unwrap_or_else(|| {
             ContainerName::new(crate::engine::container::naming::generate_container_name())
         });
+        // Refuse a launch whose agent argv cannot be built (a tool list the
+        // agent has no flag for) before any lease or child exists.
+        crate::engine::container::agent_argv::AgentArgv::from_options(&options)?;
         // Register a refresh lease for every file-delivered credential BEFORE
         // the container is built and its child spawned — the single choke point
         // (INV-6). No-op for every launch that carries no such credential.
@@ -312,12 +313,15 @@ impl ContainerBackend for AppleBackend {
         // socket (see `attach_socket.rs`), and this instance connects to it.
         // Docker keeps its native `docker attach`; the semantics are the same
         // either way — the real agent TTY, never a sibling shell.
-        let path = crate::engine::container::attach_socket::attach_socket_path(&handle.name)
-            .ok_or_else(|| {
-                EngineError::Container(
-                    "cannot resolve the attach socket directory (no home directory)".into(),
-                )
-            })?;
+        let path = crate::engine::container::attach_socket::attach_socket_path(
+            &crate::data::config::env::Env::from_process(),
+            &handle.name,
+        )
+        .ok_or_else(|| {
+            EngineError::Container(
+                "cannot resolve the attach socket directory (no home directory)".into(),
+            )
+        })?;
         Ok(Box::new(
             crate::engine::container::attach_socket::SocketAttachInstance {
                 handle: handle.clone(),
@@ -354,10 +358,6 @@ impl ContainerBackend for AppleBackend {
         &CONTAINER_CAPABILITIES
     }
 
-    fn host_cli(&self) -> Option<&'static str> {
-        Some(ContainerCli::APPLE.bin)
-    }
-
     fn reattach_after_owner_exit(&self) -> bool {
         false
     }
@@ -373,21 +373,6 @@ impl ContainerBackend for AppleBackend {
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
         host_cli_backend::cli_remove(ContainerCli::APPLE, "rm", id)
-    }
-
-    fn exec_args(
-        &self,
-        agent_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        Some(host_cli_backend::cli_exec_args(
-            agent_id,
-            working_dir,
-            entrypoint,
-            env_vars,
-        ))
     }
 
     fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
@@ -406,12 +391,14 @@ impl ContainerBackend for AppleBackend {
 
     fn build_image(
         &self,
-        tag: &str,
-        dockerfile: &Path,
-        context: &Path,
-        no_cache: bool,
+        request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
+        let tag = request.reference.as_str();
+        let dockerfile = request.dockerfile.as_path();
+        let context = request.context.as_path();
+        let no_cache = request.no_cache;
+
         host_cli_backend::cli_build_image(
             ContainerCli::APPLE,
             tag,
@@ -437,14 +424,19 @@ impl ContainerBackend for AppleBackend {
         host_cli_backend::cli_remove(ContainerCli::APPLE, "rmi", id)
     }
 
+    /// Docker and Apple Containers have no builtin launch settings; the
+    /// request's `builtin_launch` is ignored.
     fn start_background(
         &self,
-        image: &str,
-        workdir: &Path,
-        env: &HashMap<String, String>,
-        overlays: &[OverlaySpec],
+        request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
-        background::default_start_background(ContainerCli::APPLE, image, workdir, env, overlays)
+        background::default_start_background(
+            ContainerCli::APPLE,
+            request.image,
+            request.workdir,
+            request.env,
+            request.overlays,
+        )
     }
 
     fn exec_in_background(
@@ -459,12 +451,14 @@ impl ContainerBackend for AppleBackend {
 
     fn exec_in_background_streaming(
         &self,
-        id: &str,
-        command: &str,
-        working_dir: &str,
-        env: Option<&HashMap<String, String>>,
+        request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
+        let id = request.id;
+        let command = request.command;
+        let working_dir = request.working_dir;
+        let env = request.env;
+
         background::default_exec_in_background_streaming(
             ContainerCli::APPLE,
             id,
@@ -586,7 +580,10 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
             }
         });
 
-    let path = match crate::engine::container::attach_socket::attach_socket_path(container_name) {
+    let path = match crate::engine::container::attach_socket::attach_socket_path(
+        &crate::data::config::env::Env::from_process(),
+        container_name,
+    ) {
         Some(path) => path,
         None => {
             tracing::warn!(

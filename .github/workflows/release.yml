@@ -54,9 +54,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.builtin }}" = true ]; then
-            cargo build --locked --release --features builtin-runtime --target ${{ matrix.target }}
+            cargo build --workspace --locked --release --features builtin-runtime --target ${{ matrix.target }}
           else
-            cargo build --locked --release --target ${{ matrix.target }}
+            cargo build --workspace --locked --release --target ${{ matrix.target }}
           fi
 
       - name: Record release size and startup measurements
@@ -132,7 +132,7 @@ jobs:
       - name: Build final optimized awman executable
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo build --locked --release --features builtin-runtime --target aarch64-apple-darwin --bin awman
+        run: cargo build --workspace --locked --release --features builtin-runtime --target aarch64-apple-darwin --bin awman
       - name: Ad-hoc sign the distribution binary (hypervisor entitlement; no notarization)
         run: |
           artifact="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/awman"

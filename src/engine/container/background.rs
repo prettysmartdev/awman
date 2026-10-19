@@ -10,15 +10,43 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::engine::agent_runtime::background::{AgentExec, ExecOutput};
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::options::OverlaySpec;
 use crate::engine::container::process::ContainerCli;
 use crate::engine::error::EngineError;
 
+/// One command executed inside an existing background container.
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundExecRequest<'a> {
+    pub id: &'a str,
+    pub command: &'a str,
+    pub working_dir: &'a str,
+    pub env: Option<&'a HashMap<String, String>>,
+}
+
+/// An idle setup/teardown container with per-session builtin settings.
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundLaunchRequest<'a> {
+    /// The project's base image.
+    pub image: &'a str,
+    /// The workspace, mounted read-write at its own path.
+    pub workdir: &'a Path,
+    /// Host-resolved `env()` overlay values, passed through by name.
+    pub env: &'a HashMap<String, String>,
+    /// The phase's resolved overlays.
+    pub overlays: &'a [OverlaySpec],
+    /// The launching session's builtin launch settings (from
+    /// `AgentEngine::builtin_launch_settings`). Only the builtin backend reads
+    /// them, and it refuses to start without them; every other backend
+    /// ignores them.
+    pub builtin_launch: Option<&'a BuiltinLaunchSettings>,
+}
+
 /// A running background container that accepts `exec` calls.
 ///
-/// Created by `ContainerRuntime::start_background`. Must be explicitly killed
+/// Created by `ContainerRuntime::launch_background`. Must be explicitly killed
 /// via `kill()` when the phase is complete. Implements `Drop` as a safety net
 /// for best-effort cleanup.
 pub struct BackgroundContainer {
@@ -104,10 +132,12 @@ impl AgentExec for BackgroundContainer {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
         self.backend.exec_in_background_streaming(
-            &self.container_id,
-            command,
-            &self.working_dir,
-            env,
+            &crate::engine::container::background::BackgroundExecRequest {
+                id: &self.container_id,
+                command,
+                working_dir: &self.working_dir,
+                env,
+            },
             on_line,
         )
     }
@@ -432,15 +462,6 @@ mod tests {
         fn stop(&self, _h: &AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
-        fn exec_args(
-            &self,
-            _id: &str,
-            _wd: &str,
-            _ep: &[&str],
-            _env: &[(&str, &str)],
-        ) -> Option<Vec<String>> {
-            None
-        }
         fn attach(&self, _h: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
             unimplemented!("not exercised by BackgroundContainer lifecycle tests")
         }
@@ -458,9 +479,6 @@ mod tests {
         }
         fn capabilities(&self) -> &'static Capabilities {
             &crate::engine::container::runtime::CONTAINER_CAPABILITIES
-        }
-        fn host_cli(&self) -> Option<&'static str> {
-            None
         }
         fn reattach_after_owner_exit(&self) -> bool {
             false
@@ -485,10 +503,7 @@ mod tests {
         }
         fn build_image(
             &self,
-            _tag: &str,
-            _dockerfile: &std::path::Path,
-            _context: &std::path::Path,
-            _no_cache: bool,
+            _request: &crate::engine::container::BuildRequest,
             _on_line: &mut dyn FnMut(&str),
         ) -> Result<(), EngineError> {
             unimplemented!("not exercised by BackgroundContainer lifecycle tests")
@@ -511,10 +526,7 @@ mod tests {
         }
         fn start_background(
             &self,
-            _image: &str,
-            _workdir: &std::path::Path,
-            _env: &HashMap<String, String>,
-            _overlays: &[OverlaySpec],
+            _request: &BackgroundLaunchRequest<'_>,
         ) -> Result<String, EngineError> {
             let id = "bg-test".to_string();
             self.events.lock().unwrap().push("start".into());
@@ -540,10 +552,7 @@ mod tests {
         }
         fn exec_in_background_streaming(
             &self,
-            _id: &str,
-            _command: &str,
-            _wd: &str,
-            _env: Option<&HashMap<String, String>>,
+            _request: &crate::engine::container::background::BackgroundExecRequest<'_>,
             _on_line: &mut dyn FnMut(&str),
         ) -> Result<ExecOutput, EngineError> {
             unimplemented!("not exercised by BackgroundContainer lifecycle tests")
@@ -561,7 +570,13 @@ mod tests {
     fn explicit_kill_records_one_stop_event() {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
-            .start_background("img", std::path::Path::new("/w"), &HashMap::new(), &[])
+            .start_background(&BackgroundLaunchRequest {
+                image: "img",
+                workdir: std::path::Path::new("/w"),
+                env: &HashMap::new(),
+                overlays: &[],
+                builtin_launch: None,
+            })
             .unwrap();
         let bg = BackgroundContainer::new(
             id,
@@ -583,7 +598,13 @@ mod tests {
     fn drop_without_explicit_kill_still_kills_once() {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
-            .start_background("img", std::path::Path::new("/w"), &HashMap::new(), &[])
+            .start_background(&BackgroundLaunchRequest {
+                image: "img",
+                workdir: std::path::Path::new("/w"),
+                env: &HashMap::new(),
+                overlays: &[],
+                builtin_launch: None,
+            })
             .unwrap();
         {
             let _bg = BackgroundContainer::new(
@@ -608,7 +629,13 @@ mod tests {
     fn explicit_kill_then_drop_kills_only_once() {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
-            .start_background("img", std::path::Path::new("/w"), &HashMap::new(), &[])
+            .start_background(&BackgroundLaunchRequest {
+                image: "img",
+                workdir: std::path::Path::new("/w"),
+                env: &HashMap::new(),
+                overlays: &[],
+                builtin_launch: None,
+            })
             .unwrap();
         let bg = BackgroundContainer::new(
             id,

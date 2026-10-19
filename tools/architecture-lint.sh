@@ -126,6 +126,51 @@ frontend"
 # Layer 2: command/ must NOT import frontend
 check_layer 2 'crate::frontend([^A-Za-z0-9_]|$)' "$SRC/command" "frontend"
 
+# WI 0126 D1: host shims are Layer 0 glue. They may depend on awman's data
+# contracts, but must not couple worker/XPC code to higher-layer internals.
+SHIMS="$REPO_ROOT/crates/awman-host-shims/src"
+shim_layer_matches=$(grep -rnP 'awman::(?!data::)' "$SHIMS" --include='*.rs' 2>/dev/null || true)
+if [ -n "$shim_layer_matches" ]; then
+    echo ""
+    echo "architecture-lint: awman-host-shims may import only awman::data:: paths:"
+    echo "$shim_layer_matches" | while IFS= read -r line; do
+        echo "VIOLATION [host-shims-layer]: $line"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+# Also check grouped imports, where awman::{data::..., engine::...} would not
+# contain a direct `awman::engine` path.
+shim_group_matches=$(
+    find "$SHIMS" -type f -name '*.rs' -print0 2>/dev/null |
+    while IFS= read -r -d '' f; do
+        awk -v file="$f" '
+            BEGIN { buf=""; start=0 }
+            {
+                if (buf != "") {
+                    buf = buf " " $0
+                    if (index($0, "}") != 0) {
+                        print file ":" start ":" buf
+                        buf=""; start=0
+                    }
+                    next
+                }
+                if (match($0, /use[[:space:]]+awman::\{/)) {
+                    if (index($0, "}") != 0) print file ":" NR ":" $0
+                    else { buf=$0; start=NR }
+                }
+            }
+        ' "$f"
+    done | grep -E 'awman::\{.*(engine|command|frontend)::' || true
+)
+if [ -n "$shim_group_matches" ]; then
+    echo ""
+    echo "architecture-lint: grouped host-shims imports may not name engine/command/frontend:"
+    echo "$shim_group_matches" | while IFS= read -r line; do
+        echo "VIOLATION [host-shims-layer]: $line"
+        echo "1" >> "$VIOLATION_FILE"
+    done
+fi
+
 # Layer 3: frontend/ can import everything — no check needed.
 
 # Lint-suppression guard (WI 0113 F-12): a crate- or module-level

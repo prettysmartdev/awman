@@ -72,7 +72,7 @@ pub struct SandboxSummary {
     pub stopped: bool,
 }
 #[derive(Clone, Default)]
-pub struct ImageConfigSummary {
+pub struct SandboxImageConfig {
     pub home: Option<String>,
     pub user: Option<String>,
     pub workdir: Option<String>,
@@ -147,7 +147,7 @@ pub trait SandboxDriver: Send + Sync {
     ) -> Result<(), EngineError>;
     fn remove_stopped(&self, id: &str) -> Result<(), EngineError>;
     fn stats(&self, id: &str) -> Result<AgentStats, EngineError>;
-    fn image_config(&self, tag: &str) -> Result<Option<ImageConfigSummary>, EngineError>;
+    fn image_config(&self, tag: &str) -> Result<Option<SandboxImageConfig>, EngineError>;
     fn import_archive(&self, path: PathBuf, tag: String) -> Result<(), EngineError>;
     fn remove_image(&self, tag: &str) -> Result<(), EngineError>;
 }

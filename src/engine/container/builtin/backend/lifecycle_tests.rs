@@ -19,12 +19,6 @@ pub(super) struct Rig {
 pub(super) fn settings(state_dir: &std::path::Path) -> BuiltinRuntimeSettings {
     BuiltinRuntimeSettings {
         state_dir: state_dir.into(),
-        vcpus: 2,
-        memory_mib: 4096,
-        image_source: None,
-        images: BTreeMap::new(),
-        registries: BTreeMap::new(),
-        network: Default::default(),
         ambient_overrides: Vec::new(),
         test_isolation: false,
     }
@@ -69,6 +63,29 @@ impl Rig {
     }
 }
 
+/// The launch settings of a session with no `builtin` block anywhere.
+pub(super) fn default_launch() -> &'static BuiltinLaunchSettings {
+    static DEFAULT: std::sync::LazyLock<BuiltinLaunchSettings> =
+        std::sync::LazyLock::new(BuiltinLaunchSettings::default);
+    &DEFAULT
+}
+
+/// A background launch request carrying [`default_launch`]'s settings.
+pub(super) fn background<'a>(
+    image: &'a str,
+    workdir: &'a std::path::Path,
+    env: &'a HashMap<String, String>,
+    overlays: &'a [OverlaySpec],
+) -> BackgroundLaunchRequest<'a> {
+    BackgroundLaunchRequest {
+        image,
+        workdir,
+        env,
+        overlays,
+        builtin_launch: Some(default_launch()),
+    }
+}
+
 pub(super) fn options(name: &str) -> ResolvedContainerOptions {
     ResolvedContainerOptions {
         image: Some(ImageRef::new("agent:latest")),
@@ -76,12 +93,103 @@ pub(super) fn options(name: &str) -> ResolvedContainerOptions {
         name: Some(ContainerName::new(name)),
         working_dir: Some("/workspace".into()),
         remove_on_exit: true,
+        builtin_launch: Some(Box::new(default_launch().clone())),
         ..Default::default()
     }
 }
 
 fn token_of(driver: &FakeDriver, id: &str) -> String {
     driver.spec(id).labels[naming::LABEL_OWNER].clone()
+}
+
+#[test]
+fn installed_provenance_checks_store_and_pending_content_without_acquisition() {
+    let rig = Rig::new("provenance");
+    let identity = ImageIdentity {
+        reference: "agent:latest".into(),
+        manifest_digest: Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+        config_digest: Digest::parse(&format!("sha256:{}", "b".repeat(64))).unwrap(),
+        platform: OciPlatform::host_linux(),
+        source: ImageSourceKind::DockerStore,
+    };
+    let source = crate::data::config::image_source::ImageSourceSpec::DockerStore {
+        host: Some("unix:///first.sock".into()),
+        tls: None,
+        reference: None,
+    };
+    let record = InstalledImageIdentity {
+        identity: identity.clone(),
+        acquisition_source: Some(source.clone()),
+    };
+    let mut catalog = BTreeMap::from([("agent:latest".into(), record)]);
+    rig.backend.save_identities(&catalog).unwrap();
+    let mut request = ImageImportRequest {
+        tag: "agent:latest".into(),
+        source: source.clone(),
+        platform: OciPlatform::host_linux(),
+        refresh: false,
+        expected_built_identity: None,
+        immutable_export_selector: None,
+        registries: Default::default(),
+    };
+    assert!(rig.backend.image_matches_source(&request).unwrap());
+    request.source = crate::data::config::image_source::ImageSourceSpec::DockerStore {
+        host: Some("unix:///second.sock".into()),
+        tls: None,
+        reference: None,
+    };
+    assert!(!rig.backend.image_matches_source(&request).unwrap());
+    request.source = source;
+    request.expected_built_identity = Some(
+        crate::data::oci_identity::BuiltImageIdentity::new(
+            Some(Digest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap()),
+            None,
+            OciPlatform::host_linux(),
+        )
+        .unwrap(),
+    );
+    assert!(!rig.backend.image_matches_source(&request).unwrap());
+    request.expected_built_identity = None;
+    catalog.get_mut("agent:latest").unwrap().acquisition_source = None;
+    rig.backend.save_identities(&catalog).unwrap();
+    assert_eq!(
+        rig.backend.image_identity("agent:latest").unwrap(),
+        Some(identity)
+    );
+    assert!(!rig.backend.image_matches_source(&request).unwrap());
+    assert_eq!(rig.driver.creates(), 0);
+}
+
+#[tokio::test]
+async fn current_thread_launch_and_background_streaming_refuse_before_waiting() {
+    let rig = Rig::new("single-thread");
+    let lease = rig.backend.paths.home.join("blocked-boot.lease");
+    let (_boot_started, release) = rig.driver.pause_next_boot(lease.clone());
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        true
+    });
+    let instance = rig.backend.build(options("single-thread-agent")).unwrap();
+    let (fe, _peer) = frontend(None);
+    assert!(matches!(
+        instance.run_with_frontend(fe),
+        Err(EngineError::BuiltinBlockingContextUnsupported)
+    ));
+    let request = crate::engine::container::background::BackgroundExecRequest {
+        id: "never-created",
+        command: "true",
+        working_dir: "/workspace",
+        env: None,
+    };
+    assert!(matches!(
+        rig.backend
+            .exec_in_background_streaming(&request, &mut |_| {}),
+        Err(EngineError::BuiltinBlockingContextUnsupported)
+    ));
+    assert!(timer.await.unwrap());
+    assert_eq!(rig.driver.creates(), 0);
+    assert!(!lease.exists());
+    drop(release);
 }
 
 fn new_spec(name: &str, owner: &str) -> SandboxSpec {
@@ -132,7 +240,7 @@ async fn lifecycle_create_exec_exit_and_remove() {
     assert_eq!(spec.image, "agent:latest");
     assert_eq!(
         spec.network.policy_json(),
-        network::compile(&rig.backend.settings.network).policy_json()
+        network::compile(&default_launch().network).policy_json()
     );
     assert_eq!((spec.vcpus, spec.memory_mib), (2, 4096));
     assert_eq!(spec.labels[naming::LABEL_NAME], "awman-t1");
@@ -567,8 +675,10 @@ fn unsupported_requests_fail_closed_without_side_effects() {
         ..options("awman-missing")
     };
     match rig.backend.build(missing).err().unwrap() {
-        EngineError::Config(message) => assert!(message.contains("not imported"), "{message}"),
-        other => panic!("expected a Config error, got {other:?}"),
+        EngineError::BuiltinImageNotImported { image } => {
+            assert_eq!(image, "never-imported:latest")
+        }
+        other => panic!("expected BuiltinImageNotImported, got {other:?}"),
     }
     let tools_without_flag = ResolvedContainerOptions {
         allowed_tools: vec!["Read".into()],
@@ -589,12 +699,12 @@ fn hypervisor_and_test_isolation_gate_every_launch_path() {
     );
     assert!(rig
         .backend
-        .start_background(
+        .start_background(&background(
             "agent:latest",
             std::path::Path::new("/tmp"),
             &HashMap::new(),
             &[]
-        )
+        ))
         .is_err());
     assert_eq!(rig.driver.creates(), 0);
 
@@ -616,19 +726,18 @@ fn capabilities_describe_an_importing_hostless_runtime() {
         caps.image_acquisition,
         crate::engine::agent_runtime::ImageAcquisition::Import
     );
-    assert!(!caps.fractional_cpu);
-    assert_eq!(rig.backend.host_cli(), None);
-    assert!(rig.backend.exec_args("id", "/", &["sh"], &[]).is_none());
     assert!(!rig.backend.reattach_after_owner_exit());
     assert_eq!(rig.backend.name(), "builtin");
     assert!(rig.backend.list_dangling_images().unwrap().is_empty());
     assert!(rig
         .backend
         .build_image(
-            "t",
-            std::path::Path::new("Dockerfile"),
-            std::path::Path::new("."),
-            false,
+            &crate::engine::container::BuildRequest::runtime(
+                "t",
+                std::path::Path::new("Dockerfile"),
+                std::path::Path::new("."),
+                false
+            ),
             &mut |_| {}
         )
         .is_err());
@@ -741,7 +850,7 @@ fn background_sandbox_env_lives_in_memory_and_exec_runs_as_the_image_user() {
     env.insert("SETUP_TOKEN".to_string(), "bg-SECRET-3".to_string());
     let id = rig
         .backend
-        .start_background(
+        .start_background(&background(
             "agent:latest",
             work.path(),
             &env,
@@ -750,13 +859,13 @@ fn background_sandbox_env_lives_in_memory_and_exec_runs_as_the_image_user() {
                 container_path: "/extra".into(),
                 permission: OverlayPermission::ReadOnly,
             }],
-        )
+        ))
         .unwrap();
 
     let spec = rig.driver.spec(&id);
     assert_eq!(
         spec.network.policy_json(),
-        network::compile(&rig.backend.settings.network).policy_json()
+        network::compile(&default_launch().network).policy_json()
     );
     let guest_work = work.path().to_str().unwrap();
     assert_eq!(spec.mounts[0].guest, guest_work, "workdir mounts first, rw");
@@ -800,9 +909,15 @@ fn background_sandbox_env_lives_in_memory_and_exec_runs_as_the_image_user() {
     extra_env.insert("STEP_VAR".to_string(), "1".to_string());
     let output = rig
         .backend
-        .exec_in_background_streaming(&id, "echo hi", "/work", Some(&extra_env), &mut |line| {
-            lines.push(line.to_string())
-        })
+        .exec_in_background_streaming(
+            &crate::engine::container::background::BackgroundExecRequest {
+                id: &id,
+                command: "echo hi",
+                working_dir: "/work",
+                env: Some(&extra_env),
+            },
+            &mut |line| lines.push(line.to_string()),
+        )
         .unwrap();
     emitter.join().unwrap();
     assert_eq!(output.exit_code, 3);
@@ -834,7 +949,12 @@ fn a_background_exec_that_fails_is_an_error_not_a_zero_exit() {
     let work = tempfile::tempdir_in("/tmp").unwrap();
     let id = rig
         .backend
-        .start_background("agent:latest", work.path(), &HashMap::new(), &[])
+        .start_background(&background(
+            "agent:latest",
+            work.path(),
+            &HashMap::new(),
+            &[],
+        ))
         .unwrap();
     let driver = rig.driver.clone();
     let emitter = std::thread::spawn({
@@ -907,6 +1027,18 @@ fn image_identity_catalog_round_trips_and_only_tracked_images_are_removed() {
     assert_eq!(rig.backend.image_identity("agent:latest").unwrap(), None);
     let mut catalog = BTreeMap::new();
     catalog.insert("agent:latest".to_string(), identity.clone());
+    let catalog = catalog
+        .into_iter()
+        .map(|(tag, identity)| {
+            (
+                tag,
+                InstalledImageIdentity {
+                    identity,
+                    acquisition_source: None,
+                },
+            )
+        })
+        .collect();
     rig.backend.save_identities(&catalog).unwrap();
     assert_eq!(
         rig.backend.image_identity("agent:latest").unwrap(),
@@ -1076,4 +1208,104 @@ async fn a_newer_awman_with_the_same_protocol_attaches_to_an_older_owners_sandbo
         rig.driver.finished()[0].1.starts_with("old-awman-session/"),
         "the launching owner's token, not the attaching session's"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cancelled_blocking_boot_stops_vm_removes_lease_and_catalog_entry() {
+    let rig = Rig::new("cancelled-boot");
+    let instance = rig.backend.build(options("awman-cancelled-boot")).unwrap();
+    let id = instance.handle_preview().id;
+    let lease = rig.backend.paths.home.join("run/boot.lease");
+    let (started, release) = rig.driver.pause_next_boot(lease.clone());
+    let (frontend, _peer) = frontend(None);
+    let boot = tokio::task::spawn_blocking(move || instance.run_with_frontend(frontend));
+    started.await.unwrap();
+    assert!(lease.exists(), "fake boot holds a VM lease");
+    assert_eq!(
+        rig.driver.names(),
+        std::slice::from_ref(&id),
+        "boot published its catalog entry"
+    );
+    let attach = rig.backend.paths.attach(&id, &token_of(&rig.driver, &id));
+    // Running spawn_blocking work cannot be aborted. Abandon its result, as
+    // happens when a launch future is cancelled, then let boot complete.
+    boot.abort();
+    drop(boot);
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if rig.driver.names().is_empty() && !lease.exists() && !attach.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("abandoned boot must clean up");
+    assert_eq!(rig.driver.finished().len(), 1);
+    assert!(!attach.exists());
+    // The launch's pre-publication image lease must also be released.
+    assert!(rig.backend.paths.image_lease("agent:latest", true).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn direct_worker_boot_releases_its_worker_until_the_vm_is_ready() {
+    let rig = Rig::new("direct-worker-boot");
+    let instance = rig
+        .backend
+        .build(options("awman-direct-worker-boot"))
+        .unwrap();
+    let (started, release) = rig
+        .driver
+        .pause_next_boot(rig.backend.paths.home.join("run/boot.lease"));
+    let (frontend, _peer) = frontend(None);
+    let launch = tokio::spawn(async move { instance.run_with_frontend(frontend).unwrap() });
+
+    started.await.unwrap();
+    let (progress, progressed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        progress.send(()).unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), progressed)
+        .await
+        .expect("runtime worker should service sibling tasks while boot waits")
+        .unwrap();
+
+    release.send(()).unwrap();
+    let execution = tokio::time::timeout(Duration::from_secs(5), launch)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(execution);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn attach_bind_failure_after_exec_cleans_up_created_sandbox_and_image_lease() {
+    let rig = Rig::new("attach-bind-failure");
+    let instance = rig
+        .backend
+        .build(options("awman-attach-bind-failure"))
+        .unwrap();
+    rig.driver.fail_next_attach_bind(rig.backend.paths.clone());
+    let (frontend, _peer) = frontend(None);
+
+    let error = match instance.run_with_frontend(frontend) {
+        Ok(_) => panic!("attach bind failure should abort launch"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("attach"), "{error}");
+    assert!(rig.driver.names().is_empty(), "created sandbox was removed");
+    assert_eq!(rig.driver.finished().len(), 1, "created VM was stopped");
+    let attach = std::fs::read_dir(rig.backend.paths.home.join("attach"))
+        .unwrap()
+        .next()
+        .expect("failed bind leaves the injected pre-existing endpoint")
+        .unwrap()
+        .path();
+    assert!(
+        attach.exists(),
+        "cleanup must preserve the pre-existing endpoint"
+    );
+    assert!(rig.backend.paths.image_lease("agent:latest", true).is_ok());
+    std::fs::remove_file(attach).unwrap();
 }

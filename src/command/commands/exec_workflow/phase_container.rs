@@ -18,22 +18,73 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use super::ExecWorkflowCommandFrontend;
+use super::SharedWorkflowFrontend;
 use crate::engine::agent_runtime::background::{AgentExec, ExecOutput};
+use crate::engine::agent_runtime::execution::AgentInstance;
 use crate::engine::container::options::OverlaySpec;
 use crate::engine::container::{ContainerRuntime, PhaseStepContainerSpec};
 use crate::engine::error::EngineError;
 use crate::engine::workflow::PhaseStepRef;
 
-type SharedFrontend = Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>;
-
 /// How long to wait, after the container exits, for the runtime to finish
 /// reading the last of its output into the transcript. Reading normally
 /// ends at the process's EOF; this only bounds a reader that never does.
 const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) struct PhaseContainerWorkspace {
+    pub workdir: PathBuf,
+    pub env: HashMap<String, String>,
+    pub overlays: Vec<OverlaySpec>,
+    pub builtin_launch: Option<crate::data::config::builtin_launch::BuiltinLaunchSettings>,
+}
+
+/// The setup and teardown factories share this launch boundary. Resolve the
+/// session policy before choosing whether the step owns a foreground PTY.
+pub(crate) struct PhaseContainerFactory<'a> {
+    pub runtime: &'a Arc<ContainerRuntime>,
+    pub frontend: &'a SharedWorkflowFrontend,
+    pub agent_engine: &'a crate::engine::agent::AgentEngine,
+    pub session: &'a crate::data::session::Session,
+    pub image: &'a str,
+    pub workdir: &'a std::path::Path,
+    pub interactive: bool,
+}
+impl PhaseContainerFactory<'_> {
+    pub fn build(
+        &self,
+        step: &PhaseStepRef,
+        env: &HashMap<String, String>,
+        overlays: &[OverlaySpec],
+    ) -> Result<Box<dyn AgentExec>, EngineError> {
+        let launch = self.agent_engine.builtin_launch_settings(self.session)?;
+        if self.interactive {
+            return Ok(Box::new(InteractivePhaseContainer::new(
+                self.runtime.clone(),
+                self.frontend.clone(),
+                step,
+                self.image,
+                PhaseContainerWorkspace {
+                    workdir: self.workdir.to_path_buf(),
+                    env: env.clone(),
+                    overlays: overlays.to_vec(),
+                    builtin_launch: launch,
+                },
+            )));
+        }
+        Ok(Box::new(self.runtime.start_background(
+            &crate::engine::container::background::BackgroundLaunchRequest {
+                image: self.image,
+                workdir: self.workdir,
+                env,
+                overlays,
+                builtin_launch: launch.as_ref(),
+            },
+        )?))
+    }
+}
 
 /// One setup/teardown step's container, not yet started. The engine asks the
 /// phase's container factory for one of these per step, then calls
@@ -44,32 +95,26 @@ const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// the headless path hands `ContainerRuntime::start_background`.
 pub(crate) struct InteractivePhaseContainer {
     runtime: Arc<ContainerRuntime>,
-    frontend: SharedFrontend,
+    frontend: SharedWorkflowFrontend,
     step: PhaseStepRef,
     image: String,
-    workdir: PathBuf,
-    env: HashMap<String, String>,
-    overlays: Vec<OverlaySpec>,
+    workspace: PhaseContainerWorkspace,
 }
 
 impl InteractivePhaseContainer {
     pub(crate) fn new(
         runtime: Arc<ContainerRuntime>,
-        frontend: SharedFrontend,
+        frontend: SharedWorkflowFrontend,
         step: &PhaseStepRef,
         image: &str,
-        workdir: PathBuf,
-        env: HashMap<String, String>,
-        overlays: Vec<OverlaySpec>,
+        workspace: PhaseContainerWorkspace,
     ) -> Self {
         Self {
             runtime,
             frontend,
             step: step.clone(),
             image: image.to_string(),
-            workdir,
-            env,
-            overlays,
+            workspace,
         }
     }
 
@@ -79,28 +124,36 @@ impl InteractivePhaseContainer {
         step_env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
         let instance = self.runtime.build_phase_step(&PhaseStepContainerSpec {
+            builtin_launch: self.workspace.builtin_launch.as_ref(),
             image: &self.image,
-            workdir: &self.workdir,
-            overlays: &self.overlays,
-            env: &self.env,
+            workdir: &self.workspace.workdir,
+            overlays: &self.workspace.overlays,
+            env: &self.workspace.env,
             command,
             step_env,
         })?;
+        self.run_instance(instance)
+    }
 
+    pub(crate) fn run_instance(
+        &self,
+        instance: Box<dyn AgentInstance>,
+    ) -> Result<ExecOutput, EngineError> {
         self.frontend
             .lock()
             .unwrap()
             .report_phase_step_interactive_launch(self.step.kind, &self.step.description);
 
-        let mut execution = match instance.run_with_frontend(Box::new(Arc::clone(&self.frontend))) {
-            Ok(e) => e,
-            Err(e) => {
-                // `take_io` may already have put the terminal in raw mode (CLI)
-                // or readied a container window (TUI); hand it back.
-                self.report_exited(-1);
-                return Err(e);
-            }
-        };
+        let mut execution =
+            match instance.run_with_frontend(self.frontend.clone().into_agent_frontend()) {
+                Ok(e) => e,
+                Err(e) => {
+                    // `take_io` may already have put the terminal in raw mode (CLI)
+                    // or readied a container window (TUI); hand it back.
+                    self.report_exited(-1);
+                    return Err(e);
+                }
+            };
         let transcript = execution.output_tail();
 
         let exit = tokio::runtime::Handle::current().block_on(execution.wait());

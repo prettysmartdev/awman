@@ -35,94 +35,72 @@ impl AgentInstance for Instance {
     }
     fn run_with_frontend(
         self: Box<Self>,
+        frontend: Box<dyn AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
+        super::blocking::BlockingOperation::run(move || self.run(frontend))
+    }
+}
+impl Instance {
+    fn run(
+        self: Box<Self>,
         mut frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
         frontend.report_status(crate::engine::agent_runtime::frontend::AgentStatus::Starting);
         let id = self.plan.spec.name.clone();
         let _image_lease = self.plan.image_lease;
+        // This owner-scoped guard covers partial creates, boot errors and unwinds.
+        // A dropped spawn_blocking waiter cannot abort boot: its eventual
+        // AgentExecution is dropped and its cancel handle owns normal cleanup.
+        let mut launch_cleanup = LaunchCleanup {
+            driver: self.driver.clone(),
+            id: id.clone(),
+            owner: self.owner.clone(),
+            armed: true,
+        };
         self.driver.create(self.plan.spec)?;
         let mut request = self.plan.command;
-        // Read I/O only once; this adapter gives the bridge the captured channels.
+        // Capture channels once and pass them directly to the bridge.
         let io = frontend.take_io();
         request.tty = io.initial_size;
         request.stdin = true;
         let persistent = self.plan.persistent_stdin || request.tty.is_some();
-        let session = match self.driver.exec(&id, request) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = self
-                    .driver
-                    .stop_owned(&id, &self.owner, std::time::Duration::from_secs(2));
-                return Err(e);
-            }
-        };
-        let handle = match self.driver.get(&id) {
-            Ok(summary) => summary.handle,
-            Err(error) => {
-                let _ = self
-                    .driver
-                    .stop_owned(&id, &self.owner, std::time::Duration::from_secs(2));
-                return Err(error);
-            }
-        };
+        let session = self.driver.exec(&id, request)?;
+        let handle = self.driver.get(&id)?.handle;
         let path = self.paths.attach(&id, &self.owner);
-        let cleanup = Some((
-            self.driver.clone(),
-            self.owner.clone(),
-            self.plan.remove_on_exit,
-        ));
-        match super::exec_bridge::run(
-            handle,
-            session,
-            Box::new(CapturedFrontend {
-                frontend,
-                io: Some(io),
-            }),
-            cleanup,
-            Some(path),
-            persistent,
-            super::exec_bridge::RunInput {
+        let cleanup = Some(super::exec_bridge::CleanupTarget {
+            driver: self.driver.clone(),
+            owner: self.owner.clone(),
+            remove_on_exit: self.plan.remove_on_exit,
+        });
+        let execution =
+            super::exec_bridge::ExecBridge::new(super::exec_bridge::ExecBridgeOptions {
+                handle,
+                session,
+                cleanup,
+                attach_path: Some(path),
+                persistent_stdin: persistent,
                 seeded_prompt: self.plan.seeded_prompt,
                 leases: self.plan.leases,
-            },
-        ) {
-            Ok(execution) => Ok(execution),
-            Err(error) => {
-                let _ = self
-                    .driver
-                    .stop_owned(&id, &self.owner, std::time::Duration::from_secs(2));
-                Err(error)
-            }
+                io,
+            })
+            .run(frontend)?;
+        launch_cleanup.armed = false;
+        Ok(execution)
+    }
+}
+
+struct LaunchCleanup {
+    driver: Arc<dyn SandboxDriver>,
+    id: String,
+    owner: String,
+    armed: bool,
+}
+impl Drop for LaunchCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ =
+                self.driver
+                    .stop_owned(&self.id, &self.owner, std::time::Duration::from_secs(2));
         }
-    }
-}
-struct CapturedFrontend {
-    frontend: Box<dyn AgentFrontend>,
-    io: Option<crate::engine::agent_runtime::frontend::AgentIo>,
-}
-impl crate::data::message::UserMessageSink for CapturedFrontend {
-    fn write_message(&mut self, message: crate::data::message::UserMessage) {
-        self.frontend.write_message(message);
-    }
-    fn replay_queued(&mut self) {
-        self.frontend.replay_queued();
-    }
-}
-#[async_trait::async_trait]
-impl AgentFrontend for CapturedFrontend {
-    fn report_status(&mut self, status: crate::engine::agent_runtime::frontend::AgentStatus) {
-        self.frontend.report_status(status);
-    }
-    fn report_progress(&mut self, progress: crate::engine::agent_runtime::frontend::AgentProgress) {
-        self.frontend.report_progress(progress);
-    }
-    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        self.io.take().expect("I/O taken once")
-    }
-    fn grace_timeout(&self) -> std::time::Duration {
-        self.frontend.grace_timeout()
-    }
-    fn stuck_timeout(&self) -> std::time::Duration {
-        self.frontend.stuck_timeout()
     }
 }

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }
 
 fn read(relative: &str) -> String {

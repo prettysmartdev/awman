@@ -18,19 +18,12 @@ use awman::engine::error::EngineError;
 use awman::frontend::cli;
 use awman::frontend::tui;
 
-#[path = "engine/container/builtin/worker.rs"]
-mod builtin_worker;
-
-#[cfg(target_os = "macos")]
-#[path = "engine/oci/apple_xpc.rs"]
-mod apple_xpc;
-
 fn main() -> Result<ExitCode> {
-    if builtin_worker::dispatch(std::env::vars_os()) {
+    if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return Ok(ExitCode::SUCCESS);
     }
     #[cfg(target_os = "macos")]
-    awman::engine::oci::apple_store::install_transport(std::sync::Arc::new(apple_xpc::NativeXpc));
+    awman::engine::oci::apple_store::install_transport(std::sync::Arc::new(awman_cli::NativeXpc));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -68,16 +61,10 @@ async fn frontend_main() -> Result<ExitCode> {
     let startup = Startup::new(detect_path);
     let outcome = match startup.run(working_dir, Env::from_process()) {
         Ok(outcome) => outcome,
-        Err(error)
-            if matches!(
-                error.downcast_ref::<EngineError>(),
-                Some(EngineError::UnknownRuntime { .. })
-            ) =>
-        {
-            eprintln!("awman: {error}");
-            return Ok(ExitCode::from(2));
-        }
-        Err(error) => return Err(error),
+        Err(error) => match error.downcast::<EngineError>() {
+            Ok(error) => return Ok(cli::render_startup_error(matches, error.into())),
+            Err(error) => return Err(error),
+        },
     };
     for message in outcome.messages() {
         eprintln!("{message}");

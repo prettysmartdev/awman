@@ -33,6 +33,7 @@ use crate::command::commands::status::{StatusCommand, StatusCommandFrontend};
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
+use crate::command::startup::RuntimeStartupFailure;
 use crate::data::config::global::GlobalConfig;
 use crate::data::config::EffectiveConfig;
 use crate::data::fs::{ApiPaths, AuthPathResolver, DataPaths, SquadPaths};
@@ -105,7 +106,7 @@ fn lease_factory_for(
 #[derive(Clone)]
 pub struct Engines {
     /// Cross-paradigm trait-object handle. Used for build(), list_running(),
-    /// stats(), stop(), exec_args(), is_available(), capabilities() and
+    /// stats(), stop(), attach(), is_available(), capabilities() and
     /// other operations that exist on both paradigms.
     pub runtime: Arc<dyn AgentRuntimeEngine>,
 
@@ -181,6 +182,12 @@ impl Engines {
         // than being defaulted away and leaving the daemon quietly running on
         // settings the user did not write.
         let global = GlobalConfig::load()?;
+        // Only the runtime's process-wide parts (for builtin: the state
+        // directory and the ambient-override check) come from the global
+        // config. Every launch resolves its own builtin settings (network,
+        // vCPUs, memory) from the task's session through
+        // `AgentEngine::builtin_launch_settings`, so a task inherits its
+        // repo's narrowing.
         let detected = agent_runtime::detect(&global)?;
         let runtime = detected.engine();
         let container_runtime = detected.container_runtime();
@@ -344,7 +351,7 @@ impl Engines {
         catalogue: &CommandCatalogue,
         config: &GlobalConfig,
         command_path: &[&str],
-    ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
+    ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
         Self::detect_result(catalogue, agent_runtime::detect(config), command_path)
     }
 
@@ -353,7 +360,7 @@ impl Engines {
         catalogue: &CommandCatalogue,
         config: &EffectiveConfig,
         command_path: &[&str],
-    ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
+    ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
         Self::detect_result(
             catalogue,
             agent_runtime::detect_effective(config),
@@ -365,7 +372,7 @@ impl Engines {
         catalogue: &CommandCatalogue,
         result: Result<DetectedRuntime, EngineError>,
         command_path: &[&str],
-    ) -> Result<(DetectedRuntime, Option<String>), EngineError> {
+    ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
         match result {
             Ok(detected) => Ok((detected, None)),
             Err(e @ EngineError::UnknownRuntime { .. }) => {
@@ -388,9 +395,13 @@ impl Engines {
                     return Ok((fallback, None));
                 }
                 let fallback = agent_runtime::detect(&GlobalConfig::default())?;
-                Ok((fallback, Some(e.to_string())))
+                Ok((fallback, Some(RuntimeStartupFailure::new(e))))
             }
             Err(e) => {
+                if command_path.is_empty() {
+                    let inert = agent_runtime::detect(&GlobalConfig::default())?;
+                    return Ok((inert, Some(RuntimeStartupFailure::new(e))));
+                }
                 // A configured runtime this host can't construct must not lock
                 // the user out of `awman config` — the documented way to switch
                 // the runtime back. The catalogue decides which commands need a
@@ -1072,6 +1083,9 @@ pub(crate) fn parse_agent_flags(
     })?;
     Ok(Some(raw.to_vec()))
 }
+
+#[cfg(all(test, unix))]
+mod builtin_launch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2191,7 +2205,10 @@ mod tests {
             "docker",
             "the TUI fallback must be the default Docker runtime"
         );
-        let msg = modal.expect("the TUI path must return a fatal-modal message");
+        let msg = modal
+            .expect("the TUI path must return a fatal-modal message")
+            .error
+            .to_string();
         assert!(
             msg.contains("totally-bogus-runtime"),
             "modal message must name the bad runtime; got: {msg}"

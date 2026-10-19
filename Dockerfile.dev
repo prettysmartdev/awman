@@ -78,4 +78,7 @@ RUN curl -sSf https://sh.rustup.rs \
 USER awman
 ENV HOME=/home/awman
 
+# Mount the complete Cargo workspace here, including crates/awman-cli and
+# crates/awman-host-shims. The root manifest selects all three packages;
+# cargo build still emits just target/<profile>/awman. No worker image is needed.
 WORKDIR /workspace

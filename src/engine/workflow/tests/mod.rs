@@ -338,17 +338,15 @@ impl crate::engine::agent_runtime::execution::ExecutionBackend for BlockingBacke
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
+    fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let flag = self.cancel_flag.clone();
         let completion = self.completion.clone();
-        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
-            move || {
-                flag.store(true, Ordering::Relaxed);
-                let (_, cvar) = &*completion;
-                cvar.notify_all();
-                Ok(())
-            },
-        ))
+        crate::engine::agent_runtime::execution::CancelHandle::new(move || {
+            flag.store(true, Ordering::Relaxed);
+            let (_, cvar) = &*completion;
+            cvar.notify_all();
+            Ok(())
+        })
     }
 }
 

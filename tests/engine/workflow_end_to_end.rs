@@ -318,7 +318,7 @@ fn state_next_ready_uses_dag_correctly() {
 #[test]
 fn workflow_state_v1_fixture_deserializes_cleanly() {
     let fixture = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
         "/tests/fixtures/workflow_state/v1.json",
     ))
     .expect("fixture file must exist");
@@ -381,7 +381,7 @@ fn workflow_state_v1_fixture_round_trip_through_store() {
     // Loading the fixture, persisting it via the store, and reloading must
     // produce the same object — the round-trip is lossless across schema-v1.
     let fixture = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
         "/tests/fixtures/workflow_state/v1.json",
     ))
     .unwrap();

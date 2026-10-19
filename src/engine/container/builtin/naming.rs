@@ -1,6 +1,6 @@
 use crate::engine::error::EngineError;
 use std::collections::BTreeMap;
-pub const PROTOCOL: &str = "0.7.2/18/awman-1";
+pub const PROTOCOL: &str = crate::data::builtin_runtime::WORKER_PROTOCOL;
 pub const LABEL_AWMAN: &str = "awman";
 pub const LABEL_NAME: &str = "awman.name";
 pub const LABEL_OWNER: &str = "awman.owner.token";

@@ -3,6 +3,15 @@
 Development: local
 Build tools: make, cargo, docker
 
+Cargo workspace: the root `awman` package owns the Layer 0–3 library;
+`crates/awman-cli` owns the single `awman` executable and integration tests;
+`crates/awman-host-shims` owns the builtin worker and native Apple XPC transport.
+All three are default workspace members, so ordinary root `cargo build`,
+`cargo test`, and `--features builtin-runtime` commands continue to work.
+The worker remains a private re-exec route of the same executable.
+Use `-p awman-cli --bin awman` when selecting the executable by package.
+Static builds use `cargo build --workspace --release --bins --target x86_64-unknown-linux-musl`.
+
 ## Workflows:
 
 Developer Loop:

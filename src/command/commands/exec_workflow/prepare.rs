@@ -6,7 +6,6 @@
 //! Split out of `commands/exec_workflow.rs` by WI 0114 F-51. A child module
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
-use super::phase_container::InteractivePhaseContainer;
 use super::*;
 use crate::engine::workflow::PhaseStepRef;
 
@@ -221,7 +220,7 @@ pub(crate) async fn execute_prepared(
     flags: &ExecWorkflowCommandFlags,
     engines: &Engines,
     prepared: PreparedRun,
-    frontend: Box<dyn ExecWorkflowCommandFrontend>,
+    frontend: SharedWorkflowFrontend,
     squad_identity: Option<&crate::engine::squad::launcher::SquadContainerIdentity>,
     task_workspace: Option<&Path>,
     workflow_state_root: Option<&Path>,
@@ -243,14 +242,13 @@ pub(crate) async fn execute_prepared(
         launch_modes,
         skip_state_resume_prompt,
     } = prepared;
-    let mut frontend = frontend;
 
     // When the run is inside an isolated worktree (--worktree, or implied by
     // --yolo/--dynamic), any `checkout_create_branch` setup step is redundant:
     // the worktree already put the run on its own branch. Skip-and-warn, not
     // a failure.
     if worktree_path.is_some() {
-        skip_checkout_branch_steps_in_worktree(&mut workflow, frontend.as_mut());
+        frontend.with(|frontend| skip_checkout_branch_steps_in_worktree(&mut workflow, frontend));
     }
 
     // 5b. Detect a persisted workflow-state file and ask the user where to
@@ -277,18 +275,22 @@ pub(crate) async fn execute_prepared(
         let store =
             crate::data::workflow_state_store::WorkflowStateStore::at_git_root(git_root_for_state);
         let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
-        let decision = offer_state_resume(
-            &store,
-            &workflow,
-            &workflow_name,
-            work_item_context.as_ref().map(|c| c.number),
-            worktree_path.as_deref(),
-            frontend.as_mut(),
-        )?;
+        let decision = frontend.with(|frontend| {
+            offer_state_resume(
+                &store,
+                &workflow,
+                &workflow_name,
+                work_item_context.as_ref().map(|c| c.number),
+                worktree_path.as_deref(),
+                frontend,
+            )
+        })?;
         if decision == StateResumeOutcome::Cancelled {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: "exec workflow: cancelled; the saved run is unchanged.".to_string(),
+            frontend.with(|frontend| {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: "exec workflow: cancelled; the saved run is unchanged.".to_string(),
+                })
             });
             return Ok(ExecWorkflowOutcome {
                 workflow: workflow_name,
@@ -300,10 +302,7 @@ pub(crate) async fn execute_prepared(
 
     // 6. Set PTY active — queues user messages during the engine run.
     frontend.set_pty_active(true);
-
-    // 7. Wrap the frontend in Arc<Mutex> so both the workflow engine and
-    //    CommandLayerFactory can share it for the duration of the engine run.
-    let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> = Arc::new(Mutex::new(frontend));
+    let shared = frontend.clone();
 
     let flags_arc = Arc::new(flags.clone());
 
@@ -355,8 +354,6 @@ pub(crate) async fn execute_prepared(
     session.set_flags(workflow_flag_config(flags));
 
     // 9. Run the engine with three-phase coordination.
-    // The engine block is scoped so proxy + factory are dropped before we
-    // reclaim the frontend via Arc::try_unwrap.
     let yolo = flags.yolo;
     let setup_steps: Vec<crate::data::workflow_definition::SetupStep> =
         workflow.setup.iter().map(|e| e.step.clone()).collect();
@@ -407,9 +404,9 @@ pub(crate) async fn execute_prepared(
                 .map(|c| c.permission)
         });
     let (engine_result, step_counts) = {
-        let proxy = Arc::clone(&shared);
+        let proxy = shared.clone();
         let factory = CommandLayerFactory {
-            shared: Arc::clone(&shared),
+            shared: shared.clone(),
             engines: engines.clone(),
             flags: Arc::clone(&flags_arc),
             cli_typed_overlays: cli_typed.clone(),
@@ -427,7 +424,7 @@ pub(crate) async fn execute_prepared(
                 .with_work_item_context(engine_work_item_context)
                 .with_state_root(workflow_state_root.map(Path::to_path_buf)),
             crate::engine::workflow::WorkflowEngineDeps {
-                frontend: Box::new(proxy),
+                frontend: proxy.into_workflow_frontend(),
                 agent_factory: Box::new(factory),
             },
         )
@@ -534,7 +531,7 @@ pub(crate) async fn execute_prepared(
                 );
                 let mount = mount_path.clone();
                 let base = base_image.clone();
-                let shared_for_factory = Arc::clone(&shared);
+                let shared_for_factory = shared.clone();
                 let setup_result = tokio::task::block_in_place(|| {
                     let factory = |step: &PhaseStepRef| -> Result<
                         Box<dyn crate::engine::agent_runtime::background::AgentExec>,
@@ -550,19 +547,16 @@ pub(crate) async fn execute_prepared(
                             })?
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
-                        if interactive_phase_steps {
-                            return Ok(Box::new(InteractivePhaseContainer::new(
-                                Arc::clone(&runtime),
-                                Arc::clone(&shared_for_factory),
-                                step,
-                                &base,
-                                mount.clone(),
-                                env.clone(),
-                                overlays.clone(),
-                            )));
+                        super::phase_container::PhaseContainerFactory {
+                            runtime: &runtime,
+                            frontend: &shared_for_factory,
+                            agent_engine: &engines.agent_engine,
+                            session: &session,
+                            image: &base,
+                            workdir: &mount,
+                            interactive: interactive_phase_steps,
                         }
-                        let container = runtime.start_background(&base, &mount, env, overlays)?;
-                        Ok(Box::new(container))
+                        .build(step, env, overlays)
                     };
                     let r = engine.run_phase(
                         PhaseKind::Setup,
@@ -662,20 +656,16 @@ pub(crate) async fn execute_prepared(
                             })?
                             .as_ref()
                             .map_err(|e| EngineError::Other(e.to_string()))?;
-                        if interactive_phase_steps {
-                            return Ok(Box::new(InteractivePhaseContainer::new(
-                                Arc::clone(&runtime),
-                                Arc::clone(&shared),
-                                step,
-                                &base_image,
-                                mount.clone(),
-                                env.clone(),
-                                overlays.clone(),
-                            )));
+                        super::phase_container::PhaseContainerFactory {
+                            runtime: &runtime,
+                            frontend: &shared,
+                            agent_engine: &engines.agent_engine,
+                            session: &session,
+                            image: &base_image,
+                            workdir: &mount,
+                            interactive: interactive_phase_steps,
                         }
-                        let container =
-                            runtime.start_background(&base_image, &mount, env, overlays)?;
-                        Ok(Box::new(container))
+                        .build(step, env, overlays)
                     };
                     engine
                         .run_phase(
@@ -726,12 +716,6 @@ pub(crate) async fn execute_prepared(
         (result, (completed, failed))
     };
 
-    // 8. Reclaim exclusive ownership of the frontend after proxy + factory drop.
-    let mut frontend = Arc::try_unwrap(shared)
-        .unwrap_or_else(|_| panic!("no other Arc references remain after engine block"))
-        .into_inner()
-        .unwrap();
-
     // 9. PTY inactive — flush queued messages.
     frontend.set_pty_active(false);
     frontend.replay_queued();
@@ -769,17 +753,22 @@ pub(crate) async fn execute_prepared(
         Ok(WorkflowOutcome::Paused) => None,
         Err(_) => Some(1),
     };
-    frontend.report_workflow_summary(&WorkflowSummary {
-        steps_completed: step_counts.0,
-        steps_failed: step_counts.1.max(if had_error { 1 } else { 0 }),
+    frontend.with(|frontend| {
+        frontend.report_workflow_summary(&WorkflowSummary {
+            steps_completed: step_counts.0,
+            steps_failed: step_counts.1.max(if had_error { 1 } else { 0 }),
+        })
     });
 
     // 12. Worktree finalize.
     if let Some(lifecycle) = worktree_lifecycle {
-        if let Err(e) = lifecycle.finalize(&mut *frontend, had_error).await {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: worktree finalize failed: {e}"),
+        let result = frontend.finalize_worktree(lifecycle, had_error).await;
+        if let Err(e) = result {
+            frontend.with(|frontend| {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec workflow: worktree finalize failed: {e}"),
+                })
             });
             return Err(e);
         }
@@ -789,9 +778,11 @@ pub(crate) async fn execute_prepared(
     // 13. Surface engine errors after lifecycle cleanup.
     if let Err(e) = engine_result {
         let err = CommandError::from(e);
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Error,
-            text: format!("exec workflow: workflow engine error: {err}"),
+        frontend.with(|frontend| {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: workflow engine error: {err}"),
+            })
         });
         return Err(err);
     }

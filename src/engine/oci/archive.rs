@@ -28,6 +28,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::data::oci_cache::ImageConfigSummary;
 use crate::data::oci_identity::{Digest, OciPlatform};
 use crate::engine::error::EngineError;
 use crate::engine::oci::verify::{
@@ -67,108 +68,96 @@ pub struct ValidatedArchive {
     pub diff_ids: Vec<Digest>,
 }
 
-/// The non-secret image defaults the runtime needs before first boot.
-/// Image `Env` is deliberately not kept (it may carry baked-in secrets);
-/// only `HOME` is extracted from it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImageConfigSummary {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub home: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
-}
-
 /// Validate the archive at `path` and select the image for `platform`.
 ///
 /// `wanted_refs` disambiguates archives that hold several images (a name
 /// from `docker save`'s `RepoTags` or an OCI `ref.name` annotation); it
 /// never selects an image of the wrong platform.
-pub fn validate_archive(
-    path: &Path,
-    platform: &OciPlatform,
-    wanted_refs: &[String],
-    limits: &AcquireLimits,
-    progress: &mut dyn FnMut(AcquireProgress),
-) -> Result<ValidatedArchive, EngineError> {
-    validate_archive_controlled(
-        path,
-        platform,
-        wanted_refs,
-        limits,
-        progress,
-        &Default::default(),
-    )
+pub struct ArchiveValidator<'a> {
+    pub platform: &'a OciPlatform,
+    pub wanted_refs: &'a [String],
+    pub limits: &'a AcquireLimits,
 }
-
-pub(crate) fn validate_archive_controlled(
-    path: &Path,
-    platform: &OciPlatform,
-    wanted_refs: &[String],
-    limits: &AcquireLimits,
-    progress: &mut dyn FnMut(AcquireProgress),
-    control: &super::retry::OperationControl,
-) -> Result<ValidatedArchive, EngineError> {
-    control.check()?;
-    let reject = |reason: String| EngineError::ImageArchiveRejected {
-        path: path.to_path_buf(),
-        reason,
-    };
-    let size = std::fs::metadata(path)
-        .map_err(|e| EngineError::io(path, e))?
-        .len();
-    if size > limits.max_archive_bytes {
-        return Err(reject(format!(
-            "archive is {size} bytes; the limit is {}",
-            limits.max_archive_bytes
-        )));
+impl ArchiveValidator<'_> {
+    pub fn validate(
+        &self,
+        path: &Path,
+        progress: &mut dyn FnMut(AcquireProgress),
+    ) -> Result<ValidatedArchive, EngineError> {
+        self.validate_controlled(path, progress, &Default::default())
     }
+    pub(crate) fn validate_controlled(
+        &self,
+        path: &Path,
+        progress: &mut dyn FnMut(AcquireProgress),
+        control: &super::retry::OperationControl,
+    ) -> Result<ValidatedArchive, EngineError> {
+        let Self {
+            platform,
+            wanted_refs,
+            limits,
+        } = *self;
+        control.check()?;
+        let reject = |reason: String| EngineError::ImageArchiveRejected {
+            path: path.to_path_buf(),
+            reason,
+        };
+        let size = std::fs::metadata(path)
+            .map_err(|e| EngineError::io(path, e))?
+            .len();
+        if size > limits.max_archive_bytes {
+            return Err(reject(format!(
+                "archive is {size} bytes; the limit is {}",
+                limits.max_archive_bytes
+            )));
+        }
 
-    let outer = scan_outer_controlled(path, limits, control)?;
-    let selected = if outer.entries.contains_key("manifest.json") {
-        select_docker_save(path, &outer, platform, wanted_refs)?
-    } else if outer.entries.contains_key("oci-layout") && outer.entries.contains_key("index.json") {
-        check_oci_layout_marker(path, &outer)?;
-        select_oci_layout(path, &outer, platform, wanted_refs)?
-    } else {
-        return Err(reject(
-            "neither a docker-save archive (manifest.json) nor an OCI image layout \
+        let outer = scan_outer_controlled(path, limits, control)?;
+        let selected = if outer.entries.contains_key("manifest.json") {
+            select_docker_save(path, &outer, platform, wanted_refs)?
+        } else if outer.entries.contains_key("oci-layout")
+            && outer.entries.contains_key("index.json")
+        {
+            check_oci_layout_marker(path, &outer)?;
+            select_oci_layout(path, &outer, platform, wanted_refs)?
+        } else {
+            return Err(reject(
+                "neither a docker-save archive (manifest.json) nor an OCI image layout \
              (oci-layout + index.json)"
-                .into(),
-        ));
-    };
+                    .into(),
+            ));
+        };
 
-    if selected.layers.len() > limits.max_layers {
-        return Err(reject(format!(
-            "image has {} layers; the limit is {}",
-            selected.layers.len(),
-            limits.max_layers
-        )));
+        if selected.layers.len() > limits.max_layers {
+            return Err(reject(format!(
+                "image has {} layers; the limit is {}",
+                selected.layers.len(),
+                limits.max_layers
+            )));
+        }
+        if selected.layers.len() != selected.diff_ids.len() {
+            return Err(reject(format!(
+                "image config lists {} diff_ids for {} layers",
+                selected.diff_ids.len(),
+                selected.layers.len()
+            )));
+        }
+
+        scan_layers(path, &outer, &selected, limits, control)?;
+        progress(AcquireProgress::Verifying {
+            digest: selected.manifest_digest.clone(),
+        });
+        control.check()?;
+
+        Ok(ValidatedArchive {
+            format: selected.format,
+            manifest_digest: selected.manifest_digest,
+            config_digest: selected.config_digest,
+            platform: selected.platform,
+            config: selected.config,
+            diff_ids: selected.diff_ids,
+        })
     }
-    if selected.layers.len() != selected.diff_ids.len() {
-        return Err(reject(format!(
-            "image config lists {} diff_ids for {} layers",
-            selected.diff_ids.len(),
-            selected.layers.len()
-        )));
-    }
-
-    scan_layers(path, &outer, &selected, limits, control)?;
-    progress(AcquireProgress::Verifying {
-        digest: selected.manifest_digest.clone(),
-    });
-    control.check()?;
-
-    Ok(ValidatedArchive {
-        format: selected.format,
-        manifest_digest: selected.manifest_digest,
-        config_digest: selected.config_digest,
-        platform: selected.platform,
-        config: selected.config,
-        diff_ids: selected.diff_ids,
-    })
 }
 
 /// Project an acquired archive onto exactly the validated image before SDK
@@ -192,14 +181,12 @@ pub(crate) fn prepare_runtime_archive_controlled(
     control.check()?;
     let path = &acquired.archive;
     let refs = [tag.to_string(), acquired.identity.reference.clone()];
-    let validated = validate_archive_controlled(
-        path,
-        &acquired.identity.platform,
-        &refs,
+    let validated = ArchiveValidator {
+        platform: &acquired.identity.platform,
+        wanted_refs: &refs,
         limits,
-        &mut |_| {},
-        control,
-    )?;
+    }
+    .validate_controlled(path, &mut |_| {}, control)?;
     if validated.manifest_digest != acquired.identity.manifest_digest
         || validated.config_digest != acquired.identity.config_digest
     {
@@ -1802,7 +1789,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.tar");
         std::fs::write(&path, bytes).unwrap();
-        validate_archive(&path, platform, &[], &limits(), &mut |_| {})
+        ArchiveValidator {
+            platform,
+            wanted_refs: &[],
+            limits: &limits(),
+        }
+        .validate(&path, &mut |_| {})
     }
 
     fn base_layer() -> Vec<u8> {
@@ -2011,7 +2003,14 @@ pub(crate) mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let mut small = limits();
         small.max_layer_bytes = 1024 * 1024;
-        let reason = rejected_reason(validate_archive(&path, &arm64(), &[], &small, &mut |_| {}));
+        let reason = rejected_reason(
+            ArchiveValidator {
+                platform: &arm64(),
+                wanted_refs: &[],
+                limits: &small,
+            }
+            .validate(&path, &mut |_| {}),
+        );
         assert!(reason.contains("limit"), "{reason}");
     }
 
@@ -2024,16 +2023,26 @@ pub(crate) mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let mut l = limits();
         l.max_archive_bytes = 100;
-        assert!(
-            rejected_reason(validate_archive(&path, &arm64(), &[], &l, &mut |_| {}))
-                .contains("limit")
-        );
+        assert!(rejected_reason(
+            ArchiveValidator {
+                platform: &arm64(),
+                wanted_refs: &[],
+                limits: &l
+            }
+            .validate(&path, &mut |_| {})
+        )
+        .contains("limit"));
         let mut l = limits();
         l.max_layers = 1;
-        assert!(
-            rejected_reason(validate_archive(&path, &arm64(), &[], &l, &mut |_| {}))
-                .contains("layers")
-        );
+        assert!(rejected_reason(
+            ArchiveValidator {
+                platform: &arm64(),
+                wanted_refs: &[],
+                limits: &l
+            }
+            .validate(&path, &mut |_| {})
+        )
+        .contains("layers"));
     }
 
     #[test]
@@ -2165,13 +2174,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.tar");
         std::fs::write(&path, &bytes).unwrap();
-        let v = validate_archive(
-            &path,
-            &arm64(),
-            &["two:latest".into()],
-            &limits(),
-            &mut |_| {},
-        )
+        let v = ArchiveValidator {
+            platform: &arm64(),
+            wanted_refs: &["two:latest".into()],
+            limits: &limits(),
+        }
+        .validate(&path, &mut |_| {})
         .unwrap();
         assert_eq!(v.config_digest, sha256_digest(&c2));
     }
@@ -2225,13 +2233,12 @@ pub(crate) mod tests {
             let dir = tempfile::tempdir().unwrap();
             let input = dir.path().join("input.tar");
             std::fs::write(&input, bytes).unwrap();
-            let checked = validate_archive(
-                &input,
-                &platform,
-                &["selected:latest".into()],
-                &limits(),
-                &mut |_| {},
-            )
+            let checked = ArchiveValidator {
+                platform: &platform,
+                wanted_refs: &["selected:latest".into()],
+                limits: &limits(),
+            }
+            .validate(&input, &mut |_| {})
             .unwrap();
             let acquired = crate::engine::oci::AcquiredImage {
                 identity: crate::data::oci_identity::ImageIdentity {
@@ -2247,7 +2254,13 @@ pub(crate) mod tests {
             };
             let (_projected, output) =
                 prepare_runtime_archive(&acquired, "awman-test:latest", &limits()).unwrap();
-            let result = validate_archive(&output, &platform, &[], &limits(), &mut |_| {}).unwrap();
+            let result = ArchiveValidator {
+                platform: &platform,
+                wanted_refs: &[],
+                limits: &limits(),
+            }
+            .validate(&output, &mut |_| {})
+            .unwrap();
             assert_eq!(result.config_digest, checked.config_digest);
             assert_eq!(result.diff_ids, checked.diff_ids);
             let before = scan_outer(&input, &limits()).unwrap();

@@ -1,5 +1,6 @@
 //! Version-marker hardening for the shared catalog.
 use super::*;
+use crate::engine::container::builtin::naming::PROTOCOL;
 use std::os::unix::fs::symlink;
 
 fn paths() -> (tempfile::TempDir, BuiltinPaths) {
@@ -15,14 +16,16 @@ fn a_symlinked_version_marker_is_never_followed() {
     let outside = temp.path().join("outside");
     std::fs::write(&outside, PROTOCOL).unwrap();
     symlink(&outside, paths.home.join("awman-runtime-version")).unwrap();
-    assert!(check(&paths).is_err());
+    assert!(paths.check_catalog().is_err());
 }
 
 #[test]
 fn concurrent_first_starts_agree_on_one_marker() {
     let (_temp, paths) = paths();
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..6).map(|_| scope.spawn(|| check(&paths))).collect();
+        let handles: Vec<_> = (0..6)
+            .map(|_| scope.spawn(|| paths.check_catalog()))
+            .collect();
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
@@ -38,7 +41,7 @@ fn an_old_protocol_marker_names_both_versions_and_changes_nothing() {
     let (_temp, paths) = paths();
     let marker = paths.home.join("awman-runtime-version");
     std::fs::write(&marker, "0.6.9/17/awman-0").unwrap();
-    match check(&paths) {
+    match paths.check_catalog() {
         Err(EngineError::WorkerProtocolMismatch { expected, found }) => {
             assert_eq!(expected, PROTOCOL);
             assert_eq!(found, "0.6.9/17/awman-0");

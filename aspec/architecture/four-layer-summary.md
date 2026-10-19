@@ -57,7 +57,29 @@
 - **No business logic. No containers. No git. No network.**
 
 ### Layer 1: Engine (`src/engine/`)
-- ContainerRuntime (Docker, Apple containers)
+- ContainerRuntime (container tier: Docker, Apple containers and the builtin
+  microVM backend) and SandboxRuntime (sandbox tier: Docker Sandboxes). Tiers
+  are defined by capability shape, not isolation technology: OCI images,
+  ephemeral lifecycle and host mounts make a container-tier runtime; a
+  persistent per-session VM with its own lifecycle makes a sandbox-tier one.
+  Runtime selection is `agent_runtime::detect_effective(&EffectiveConfig)`
+  over `docker` / unset, `apple-containers`, `docker-sbx-experimental` and
+  `builtin-experimental`.
+- Builtin settings scope: one process-wide runtime (state dir, embedded
+  runtime, ambient `MSB_*` override check); per-launch settings (network,
+  vCPUs, memory) are resolved from each `Session`'s `EffectiveConfig` and
+  carried in `ResolvedContainerOptions`. A repo `builtin.stateDir` that differs
+  from the process's is rejected at launch.
+- `AgentImagePreparer` (builtin image preparation) — resolves an image's
+  source once and, when `builtin.builder.enabled` and the source is a local
+  Docker (Unix socket) or Apple store, may run a source-matched build before
+  importing from that same source. It reaches host Docker/Apple builds only
+  through `LocalImageBuilder` (build-time operations only; agent execution
+  never leaves the builtin runtime). `BuildPolicy` decides which commands may
+  build: `Ready`, `SessionSetup`, `ImportOnly`, `CheckOnly`.
+- Agent-execution release contract: a runtime MUST drop the frontend no later
+  than when `AgentExecution::wait()` resolves, when the `wait()` future is
+  dropped, or when the execution is dropped.
 - WorkflowEngine (multi-step DAG execution)
 - GitEngine (repos, worktrees, merges; owns diff summaries)
 - OverlayEngine (container mounts, env vars)
@@ -103,6 +125,10 @@
 - All business logic (agent selection, defaults, error handling)
 - Calls Layer 1 engines, reads/writes Layer 0
 - Receives frontend traits to delegate user input
+- Frontend ownership: a command owns its frontend for its whole lifetime and
+  never reclaims it. Multi-phase commands (`ExecWorkflowCommand`) hold it
+  behind a shared handle (`SharedWorkflowFrontend`) and pass clones of the
+  handle to phases and runtimes; no `Arc::try_unwrap`.
 - **All logic shared by CLI, TUI, API.**
 
 ### Layer 3: Frontend (`src/frontend/`)
@@ -182,6 +208,15 @@ see WI 0113 F-02/F-03/F-05.
 ❌ **Dense `pub fn` with 10 parameters**  
 → Create a struct with a builder or options pattern
 
+❌ **A command hands its frontend to a runtime, then tries to take it back
+(`Arc::try_unwrap` + `panic!`)**  
+→ Keep the frontend behind the shared handle for the command's lifetime and
+hand out clones; the runtime drops its clone by the engine release contract.
+
+❌ **Builtin per-launch settings (network, vCPUs, memory) resolved once per
+process**  
+→ Resolve them per launch from the session's `EffectiveConfig`.
+
 ❌ **Frontends have different commands**  
 → All commands come from `CommandCatalogue` (Layer 2)
 
@@ -260,4 +295,4 @@ All three frontends now support `foo` identically — because the logic is in La
 
 ---
 
-**Last Updated**: September 23, 2026 (WI 0114)
+**Last Updated**: October 1, 2026

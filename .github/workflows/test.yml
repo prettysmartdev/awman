@@ -37,10 +37,10 @@ jobs:
         run: make architecture-lint
 
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Hermetic tests
         run: make test-fast
@@ -98,10 +98,42 @@ jobs:
             ${{ runner.os }}-cargo-mac-v2-
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --workspace --release
 
       - name: Hermetic tests
         run: make test-fast
+
+  static-workspace-build:
+    name: Static workspace build (${{ matrix.features || 'default' }})
+    runs-on: ubuntu-24.04
+    needs: fast
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "builtin-runtime"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+          targets: x86_64-unknown-linux-musl
+      - name: Install static C toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build the one distribution executable
+        env:
+          BUILD_FEATURES: ${{ matrix.features }}
+        run: |
+          args=()
+          if [ -n "$BUILD_FEATURES" ]; then args=(--features "$BUILD_FEATURES"); fi
+          cargo build --workspace --locked --release --target x86_64-unknown-linux-musl --bins "${args[@]}"
+      - name: Smoke-test static executable
+        run: |
+          artifact=target/x86_64-unknown-linux-musl/release/awman
+          "$artifact" --version
+          if readelf -l "$artifact" | grep -q INTERP; then
+            echo 'Expected a static executable without a dynamic loader'
+            exit 1
+          fi
 
   builtin-build:
     name: Builtin build (${{ matrix.target }})
@@ -132,7 +164,7 @@ jobs:
       - name: "Build builtin runtime (2 jobs: each test binary links the whole VM stack)"
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo build --locked --features builtin-runtime --target ${{ matrix.target }}
+        run: cargo build --workspace --locked --features builtin-runtime --target ${{ matrix.target }}
       - name: Inspect dynamic dependencies
         run: |
           if [ "${{ runner.os }}" = macOS ]; then otool -L target/${{ matrix.target }}/debug/awman; else ldd target/${{ matrix.target }}/debug/awman; fi
@@ -199,7 +231,7 @@ jobs:
       - name: Build tests, awman and the guest driver
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo test --locked --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --no-run
+        run: cargo test --workspace --locked --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer --no-run
       - name: Builtin tests including real guests
         run: make test-builtin
       - name: Report (SKIP/BLOCKED/RUN per hardware test)
@@ -273,6 +305,6 @@ jobs:
           toolchain: "1.94.0"
           targets: ${{ matrix.target }}
       - name: Build default existing backends (builtin feature disabled)
-        run: cargo build --locked --target "${{ matrix.target }}" --bin awman
+        run: cargo build --workspace --locked --target "${{ matrix.target }}" --bin awman
       - name: Assert unsupported builtin selection reports a precise target error
-        run: cargo test --locked --target "${{ matrix.target }}" --lib unavailable_build_or_test_isolation_reports_a_precise_reason -- --nocapture
+        run: cargo test --workspace --locked --target "${{ matrix.target }}" --lib unavailable_build_or_test_isolation_reports_a_precise_reason -- --nocapture

@@ -126,8 +126,11 @@ fn network_unsupported_policy_is_an_explicit_error() {
         let eff = effective(&global, "{}");
         let error = eff.builtin_network().unwrap_err();
         assert!(error.contains(needle), "{block}: {error}");
-        // The block is also refused by the builtin block's own validation.
-        assert!(eff.builtin_runtime().validate().is_err(), "{block}");
+        // Every launch refuses it too: per-launch settings resolve the network
+        // through the same layered check (the merged `builtin` view carries
+        // no network of its own to validate).
+        assert!(eff.builtin_launch_settings().is_err(), "{block}");
+        assert_eq!(eff.builtin_runtime().network, None, "{block}");
     }
     let too_many: Vec<String> = (0..=MAX_NETWORK_ENTRIES)
         .map(|i| format!("\"h{i}.example.com\""))

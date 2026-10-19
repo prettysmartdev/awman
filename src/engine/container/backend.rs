@@ -9,7 +9,6 @@
 //! drives no host CLI implements each operation natively.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::data::message::UserMessageSink;
 use crate::data::oci_identity::ImageIdentity;
@@ -17,7 +16,8 @@ use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::background::ExecOutput;
 use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
 use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
-use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
+use crate::engine::container::background::BackgroundLaunchRequest;
+use crate::engine::container::options::ResolvedContainerOptions;
 use crate::engine::container::runtime::ContainerImageInfo;
 use crate::engine::error::EngineError;
 
@@ -36,11 +36,6 @@ pub(super) trait ContainerBackend: Send + Sync {
     /// What this backend can do. Docker and Apple share
     /// `runtime::CONTAINER_CAPABILITIES`; the builtin backend has its own.
     fn capabilities(&self) -> &'static Capabilities;
-
-    /// The host CLI this backend drives (`"docker"`, `"container"`), or `None`
-    /// when it drives none. Every backend states its own (F-32), so adding a
-    /// backend cannot forget to declare one.
-    fn host_cli(&self) -> Option<&'static str>;
 
     /// Whether `attach` still reaches an agent after the launching process has
     /// exited. See `AgentRuntimeEngine::reattach_after_owner_exit`.
@@ -87,16 +82,6 @@ pub(super) trait ContainerBackend: Send + Sync {
     /// per-item failures.
     fn remove_agent(&self, id: &str) -> Result<(), EngineError>;
 
-    /// Argv (after the host CLI name) for an interactive exec into a running
-    /// agent, used by TUI re-attach. `None` when the backend has no host CLI.
-    fn exec_args(
-        &self,
-        agent_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>>;
-
     // ─── Image store ────────────────────────────────────────────────────────
 
     /// Whether `tag` exists in the backend's local image store.
@@ -116,14 +101,15 @@ pub(super) trait ContainerBackend: Send + Sync {
         Ok(None)
     }
 
+    fn image_matches_source(&self, _request: &ImageImportRequest) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+
     /// Build `tag` from `dockerfile` in `context`, streaming output to
     /// `on_line`. Backends that cannot build answer `UnsupportedOnRuntime`.
     fn build_image(
         &self,
-        tag: &str,
-        dockerfile: &Path,
-        context: &Path,
-        no_cache: bool,
+        request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError>;
 
@@ -157,12 +143,12 @@ pub(super) trait ContainerBackend: Send + Sync {
     // ─── Background lifecycle (setup/teardown) ──────────────────────────────
 
     /// Start an idle agent for setup/teardown `exec` calls; returns its id.
+    /// The builtin backend sizes and confines it with
+    /// `request.builtin_launch` and refuses when it is absent; other backends
+    /// ignore it.
     fn start_background(
         &self,
-        image: &str,
-        workdir: &Path,
-        env: &HashMap<String, String>,
-        overlays: &[OverlaySpec],
+        request: &BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError>;
 
     fn exec_in_background(
@@ -175,10 +161,7 @@ pub(super) trait ContainerBackend: Send + Sync {
 
     fn exec_in_background_streaming(
         &self,
-        id: &str,
-        command: &str,
-        working_dir: &str,
-        env: Option<&HashMap<String, String>>,
+        request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError>;
 

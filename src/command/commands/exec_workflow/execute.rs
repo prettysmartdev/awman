@@ -31,6 +31,7 @@ impl Command for ExecWorkflowCommand {
         if self.flags.dynamic {
             return self.run_dynamic(frontend).await;
         }
+        let mut frontend = SharedWorkflowFrontend::new(frontend);
 
         // Non-dynamic: the positional path is required.
         let workflow_arg = match &self.flags.workflow {
@@ -59,11 +60,13 @@ impl Command for ExecWorkflowCommand {
         // so we never fire it twice (early CLI check + post-load TOML scan).
         let mut deprecation_warned = false;
         if let Some(agent) = self.flags.agent.as_deref() {
-            deprecation_warned = emit_deprecation_warning(agent, frontend.as_mut());
+            deprecation_warned =
+                frontend.with(|frontend| emit_deprecation_warning(agent, frontend));
         }
 
         // Emit deprecation warnings for legacy config fields.
-        LaunchPolicy::for_session(&self.session).warn_legacy_config(frontend.as_mut());
+        frontend
+            .with(|frontend| LaunchPolicy::for_session(&self.session).warn_legacy_config(frontend));
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
@@ -104,7 +107,7 @@ impl Command for ExecWorkflowCommand {
         // the warning fires for the same agent the engine will actually launch.
         if !deprecation_warned {
             for agent in workflow_agents(&workflow, &self.session) {
-                if emit_deprecation_warning(&agent, frontend.as_mut()) {
+                if frontend.with(|frontend| emit_deprecation_warning(&agent, frontend)) {
                     deprecation_warned = true;
                     break;
                 }
@@ -115,18 +118,15 @@ impl Command for ExecWorkflowCommand {
         // teardown step's overlays — workflow step progression state is not
         // available during those phases, so the dynamic prompt fields will
         // be empty.
-        warn_context_workflow_in_phase(&workflow, frontend.as_mut());
+        frontend.with(|frontend| warn_context_workflow_in_phase(&workflow, frontend));
         let _ = deprecation_warned;
 
         // ACP compatibility is a workflow-wide pre-flight check.  Do it
         // before mount scope, worktree preparation, image setup, overlays, or
         // the workflow engine so `fallback: error` cannot leave partial work.
-        let launch_modes = match validate_workflow_acp_preflight(
-            &workflow,
-            &self.session,
-            &self.flags,
-            frontend.as_mut(),
-        ) {
+        let launch_modes = match frontend.with(|frontend| {
+            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
+        }) {
             Ok(modes) => modes,
             Err(e) => return Err(CommandError::from(e)),
         };
@@ -134,7 +134,9 @@ impl Command for ExecWorkflowCommand {
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
         let git_root_for_scope = self.session.git_root().to_path_buf();
-        let mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
+        let mount_path = match frontend
+            .with(|frontend| MountScope::resolve(&cwd, &git_root_for_scope, frontend))
+        {
             Ok(p) => p,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -159,7 +161,9 @@ impl Command for ExecWorkflowCommand {
                 std::sync::Arc::clone(&self.engines.git_engine),
                 self.session.env(),
             );
-            match router.fetch_issue_with_progress(issue_ref, &git_root_for_scope, &mut *frontend) {
+            match frontend.with(|frontend| {
+                router.fetch_issue_with_progress(issue_ref, &git_root_for_scope, frontend)
+            }) {
                 Ok((issue, source)) => {
                     let work_items_dir = self
                         .session
@@ -312,14 +316,16 @@ impl Command for ExecWorkflowCommand {
             let store =
                 crate::data::workflow_state_store::WorkflowStateStore::at_git_root(state_root);
             let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
-            let resumed = match offer_state_resume(
-                &store,
-                &workflow,
-                &workflow_name,
-                work_item_context.as_ref().map(|c| c.number),
-                Some(lifecycle.worktree_path()),
-                &mut *frontend,
-            )? {
+            let resumed = match frontend.with(|frontend| {
+                offer_state_resume(
+                    &store,
+                    &workflow,
+                    &workflow_name,
+                    work_item_context.as_ref().map(|c| c.number),
+                    Some(lifecycle.worktree_path()),
+                    frontend,
+                )
+            })? {
                 StateResumeOutcome::Cancelled => {
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Info,
@@ -336,9 +342,9 @@ impl Command for ExecWorkflowCommand {
             };
             state_resume_settled = true;
 
-            let wt_path = match lifecycle
-                .prepare_with_existing(
-                    &mut *frontend,
+            let prepared_worktree = frontend
+                .prepare_worktree(
+                    lifecycle,
                     // An accepted resume is an answer to the existing-worktree
                     // question: the saved run lives in that worktree, and
                     // recreating it would throw away both the commits and the
@@ -347,9 +353,9 @@ impl Command for ExecWorkflowCommand {
                         crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision::Resume,
                     ),
                 )
-                .await
-            {
-                Ok(p) => p,
+                .await;
+            let (lifecycle, wt_path) = match prepared_worktree {
+                Ok(prepared) => prepared,
                 Err(e) => {
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Error,

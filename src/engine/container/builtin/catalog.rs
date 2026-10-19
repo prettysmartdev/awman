@@ -1,61 +1,29 @@
 //! Refuse unknown catalog contracts before asking the SDK to run migrations.
-use super::{naming::PROTOCOL, paths::BuiltinPaths};
+//!
+//! The marker file, its lock and the "unversioned catalog" rule live in
+//! Layer 0 (`BuiltinState::check_runtime_marker`); the engine supplies the
+//! protocol it speaks and turns a mismatch into its error.
+use super::paths::BuiltinPaths;
+use crate::data::builtin_state::RuntimeMarker;
 use crate::engine::error::EngineError;
-use std::{
-    fs::OpenOptions,
-    io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
-};
-pub fn check(paths: &BuiltinPaths) -> Result<(), EngineError> {
-    let _lock = paths.lock()?;
-    let path = paths.home.join("awman-runtime-version");
-    if !path.exists()
-        && std::fs::read_dir(paths.home.join("db"))
-            .map_err(|e| EngineError::io(paths.home.join("db"), e))?
-            .next()
-            .is_some()
-    {
-        return Err(EngineError::WorkerProtocolMismatch {
-            expected: PROTOCOL.into(),
-            found: "unversioned existing catalog".into(),
-        });
-    }
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(PROTOCOL.as_bytes())
-                .map_err(|e| EngineError::io(&path, e))?;
-            file.sync_all().map_err(|e| EngineError::io(&path, e))?;
+
+impl BuiltinPaths {
+    /// Check that the state directory's catalog uses this worker protocol.
+    pub fn check_catalog(&self) -> Result<(), EngineError> {
+        match self.check_runtime_marker(super::naming::PROTOCOL)? {
+            RuntimeMarker::Created | RuntimeMarker::Matches => Ok(()),
+            RuntimeMarker::Mismatch { found } => Err(EngineError::WorkerProtocolMismatch {
+                expected: super::naming::PROTOCOL.into(),
+                found,
+            }),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut found = String::new();
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
-                .map_err(|e| EngineError::io(&path, e))?
-                .take(128)
-                .read_to_string(&mut found)
-                .map_err(|e| EngineError::io(&path, e))?;
-            if found != PROTOCOL {
-                return Err(EngineError::WorkerProtocolMismatch {
-                    expected: PROTOCOL.into(),
-                    found,
-                });
-            }
-        }
-        Err(e) => return Err(EngineError::io(&path, e)),
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     #[test]
     fn incompatible_catalog_is_preserved_without_migration() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -64,7 +32,7 @@ mod tests {
         let marker = paths.home.join("awman-runtime-version");
         std::fs::write(&marker, b"future-protocol").unwrap();
         assert!(matches!(
-            check(&paths),
+            paths.check_catalog(),
             Err(EngineError::WorkerProtocolMismatch { .. })
         ));
         assert_eq!(std::fs::read(&marker).unwrap(), b"future-protocol");
@@ -75,8 +43,8 @@ mod tests {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let paths =
             BuiltinPaths::resolve(&temp.path().canonicalize().unwrap().join("state")).unwrap();
-        check(&paths).unwrap();
-        check(&paths).unwrap();
+        paths.check_catalog().unwrap();
+        paths.check_catalog().unwrap();
         let guard = paths.lock().unwrap();
         let other = OpenOptions::new()
             .read(true)
@@ -93,7 +61,7 @@ mod tests {
         let paths =
             BuiltinPaths::resolve(&temp.path().canonicalize().unwrap().join("state")).unwrap();
         std::fs::write(paths.home.join("db/catalog.sqlite"), b"existing data").unwrap();
-        assert!(check(&paths).is_err());
+        assert!(paths.check_catalog().is_err());
         assert!(!paths.home.join("awman-runtime-version").exists());
     }
 }

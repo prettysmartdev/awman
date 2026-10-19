@@ -165,7 +165,7 @@ pub(crate) struct DynamicExecution {
     lifecycle: WorktreeLifecycle,
     worktree_git_mount: Option<crate::engine::container::options::OverlaySpec>,
     skip_state_resume_prompt: bool,
-    frontend: Box<dyn ExecWorkflowCommandFrontend>,
+    frontend: SharedWorkflowFrontend,
 }
 
 /// Copy the leader's generated `workflow.toml` to its stable per-work-item path
@@ -262,9 +262,11 @@ impl ExecWorkflowCommand {
     /// `run_with_frontend`.
     pub(crate) async fn run_dynamic(
         self,
-        mut frontend: Box<dyn ExecWorkflowCommandFrontend>,
+        frontend: Box<dyn ExecWorkflowCommandFrontend>,
     ) -> Result<ExecWorkflowOutcome, CommandError> {
-        LaunchPolicy::for_session(&self.session).warn_legacy_config(frontend.as_mut());
+        let mut frontend = SharedWorkflowFrontend::new(frontend);
+        frontend
+            .with(|frontend| LaunchPolicy::for_session(&self.session).warn_legacy_config(frontend));
 
         // ── Effective (implied) flags: --dynamic forces --yolo, --worktree,
         //    and context(workflow) (WI-0092 §4). Computed once so all
@@ -327,29 +329,30 @@ impl ExecWorkflowCommand {
         // state file inside its own worktree. Both survive a Ctrl-C abort and
         // both die with the worktree, so an existing worktree is the one place
         // worth looking before paying for another leader-design pass.
-        let resume_plan =
-            match self.offer_dynamic_resume(&lifecycle, wi_number, frontend.as_mut())? {
-                DynamicResumeOutcome::Resume(plan) => Some(plan),
-                DynamicResumeOutcome::Fresh => None,
-                DynamicResumeOutcome::Cancelled => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: format!(
-                            "exec workflow: cancelled; the previous dynamic run for work item \
+        let resume_plan = match frontend
+            .with(|frontend| self.offer_dynamic_resume(&lifecycle, wi_number, frontend))?
+        {
+            DynamicResumeOutcome::Resume(plan) => Some(plan),
+            DynamicResumeOutcome::Fresh => None,
+            DynamicResumeOutcome::Cancelled => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!(
+                        "exec workflow: cancelled; the previous dynamic run for work item \
                          {wi_number:04} is unchanged."
-                        ),
-                    });
-                    return Ok(ExecWorkflowOutcome {
-                        workflow: format!("dynamic-{wi_number:04}"),
-                        exit_code: None,
-                        worktree_used: false,
-                    });
-                }
-            };
+                    ),
+                });
+                return Ok(ExecWorkflowOutcome {
+                    workflow: format!("dynamic-{wi_number:04}"),
+                    exit_code: None,
+                    worktree_used: false,
+                });
+            }
+        };
 
-        let worktree_path = lifecycle
-            .prepare_with_existing(
-                &mut *frontend,
+        let (lifecycle, worktree_path) = frontend
+            .prepare_worktree(
+                lifecycle,
                 // A confirmed resume is an answer to the existing-worktree
                 // question; asking it again would be the same question twice.
                 resume_plan.is_some().then_some(
@@ -455,7 +458,7 @@ impl ExecWorkflowCommand {
                     &leader_agent,
                     None,
                     None,
-                    frontend.as_mut(),
+                    frontend.lock().unwrap().as_mut(),
                 )?;
         let context_dir = leader_context_overlays
             .iter()
@@ -522,17 +525,15 @@ impl ExecWorkflowCommand {
         };
 
         // ── Ensure the leader image is built. ───────────────────────────────
-        let image_sources = crate::engine::oci::ImageSources::from_config(
-            &self.session.effective_config().builtin_runtime(),
-        );
         ensure_agent_image(
             &self.engines,
             &git_root_for_scope,
             &paths,
             leader_agent.as_str(),
-            &image_sources,
-            frontend.as_mut(),
-        )?;
+            &self.session,
+            &mut frontend.clone(),
+        )
+        .await?;
 
         let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
             &format!("{wi_number:04}"),
@@ -554,8 +555,7 @@ impl ExecWorkflowCommand {
             .unwrap_or_default();
 
         // ── Wrap the frontend so the agent run + yolo ticks can share it. ───
-        let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
-            Arc::new(Mutex::new(frontend));
+        let shared = frontend.clone();
 
         // ── Wire an engine request channel so Ctrl-W opens the Workflow
         //    Control Board during the leader phase (the leader runs without a
@@ -582,7 +582,7 @@ impl ExecWorkflowCommand {
             let current_prompt = repair.prompt().to_string();
             let drive = self
                 .drive_leader_agent(
-                    Arc::clone(&shared),
+                    shared.clone(),
                     &leader_session,
                     &leader_agent,
                     leader_model.as_deref(),
@@ -665,12 +665,6 @@ impl ExecWorkflowCommand {
             }
         };
 
-        // ── Reclaim the frontend and execute the generated workflow. ────────
-        let frontend = Arc::try_unwrap(shared)
-            .unwrap_or_else(|_| panic!("no other Arc references remain after leader phase"))
-            .into_inner()
-            .unwrap();
-
         // Stash the generated workflow inside the worktree so a failed run can
         // be resumed without a second leader-design pass (WI-0115 §2).
         save_dynamic_workflow_copy(&state_git_root, wi_number, &generated_path);
@@ -695,7 +689,7 @@ impl ExecWorkflowCommand {
                 lifecycle,
                 worktree_git_mount,
                 skip_state_resume_prompt: false,
-                frontend,
+                frontend: shared,
             })
             .await?;
 
@@ -844,37 +838,38 @@ impl ExecWorkflowCommand {
             lifecycle,
             worktree_git_mount,
             skip_state_resume_prompt,
-            mut frontend,
+            frontend,
         } = exec;
 
         // ── Build any missing agent images before execution (WI-0092 §9b). ──
         let resolved_agents =
             resolve_and_validate_workflow_agents(&workflow, &worktree_session, &paths)
                 .map_err(CommandError::Other)?;
-        let image_sources = crate::engine::oci::ImageSources::from_config(
-            &self.session.effective_config().builtin_runtime(),
-        );
         for agent in &resolved_agents {
             ensure_agent_image(
                 &self.engines,
                 &git_root_for_scope,
                 &paths,
                 agent,
-                &image_sources,
-                frontend.as_mut(),
-            )?;
+                &self.session,
+                &mut frontend.clone(),
+            )
+            .await?;
         }
 
         // The dynamically generated workflow is not known until after the
         // leader phase, so this is its first possible whole-workflow ACP
         // pre-flight. It still runs before any generated workflow step.
-        let launch_modes = validate_workflow_acp_preflight(
-            &workflow,
-            &base_session,
-            &effective_flags,
-            frontend.as_mut(),
-        )
-        .map_err(CommandError::from)?;
+        let launch_modes = frontend
+            .with(|frontend| {
+                validate_workflow_acp_preflight(
+                    &workflow,
+                    &base_session,
+                    &effective_flags,
+                    frontend,
+                )
+            })
+            .map_err(CommandError::from)?;
 
         // Build the CLI overlay list (includes the implied context(workflow)).
         let mut cli_typed = Vec::new();
@@ -925,7 +920,7 @@ impl ExecWorkflowCommand {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn drive_leader_agent(
         &self,
-        shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+        shared: SharedWorkflowFrontend,
         session: &Session,
         agent: &crate::data::session::AgentName,
         model: Option<&str>,
@@ -1005,7 +1000,7 @@ impl ExecWorkflowCommand {
         shared.lock().unwrap().set_pty_active(true);
 
         let proxy = AgentFrontendProxy {
-            frontend: Arc::clone(&shared),
+            frontend: shared.clone(),
             acp: false,
             io: None,
         };
@@ -1138,7 +1133,7 @@ impl ExecWorkflowCommand {
 /// constructed so the shared `show_workflow_control_board` renderer has a
 /// running step to name.
 pub(crate) fn show_leader_control_board(
-    shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    shared: &SharedWorkflowFrontend,
     label: &str,
 ) -> LeaderControlOutcome {
     use crate::data::workflow_state::{StepState, WorkflowState};
@@ -1180,7 +1175,7 @@ pub(crate) fn show_leader_control_board(
 pub(crate) fn apply_leader_control_outcome(
     outcome: LeaderControlOutcome,
     cancel: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
-    shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    shared: &SharedWorkflowFrontend,
 ) -> Option<LeaderDriveOutcome> {
     use crate::engine::agent_runtime::execution::KILLED_EXIT_CODE;
 
@@ -1221,7 +1216,7 @@ pub(crate) enum LeaderCountdownOutcome {
 /// right-arrow / advance action carries the "Start dynamic workflow" label via
 /// [`AvailableActions::launch_next_label`].
 pub(crate) async fn run_leader_yolo_countdown(
-    shared: &Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    shared: &SharedWorkflowFrontend,
     wait_rx: &mut tokio::sync::oneshot::Receiver<i32>,
     stuck_rx: &mut tokio::sync::broadcast::Receiver<
         crate::engine::agent_runtime::execution::StuckEvent,

@@ -24,7 +24,7 @@ use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::agent_runtime::execution::AgentInstance;
 use awman::engine::agent_runtime::{
-    AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ResolvedAgentOptions,
+    AgentRuntimeEngine, AgentStats, Capabilities, ResolvedAgentOptions,
 };
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
@@ -57,10 +57,7 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
     }
     fn build_image(
         &self,
-        _tag: &str,
-        _dockerfile: &std::path::Path,
-        _context: &std::path::Path,
-        _no_cache: bool,
+        _request: &awman::engine::container::BuildRequest,
         _on_line: &mut dyn FnMut(&str),
     ) -> Result<(), awman::engine::error::EngineError> {
         Ok(())
@@ -73,18 +70,10 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
     }
     fn capabilities(&self) -> &Capabilities {
         static CAPS: Capabilities = Capabilities {
-            arbitrary_env_vars: false,
             arbitrary_host_mounts: false,
-            cpu_limits: false,
-            per_resource_stats: false,
-            persistent_lifecycle: true,
             kit_declarative: true,
-            dind: DindSupport::Always,
-            host_paths_visible: false,
-            session_label_supported: false,
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-            fractional_cpu: false,
         };
         &CAPS
     }
@@ -106,15 +95,6 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
     fn stop(&self, _handle: &AgentHandle) -> Result<(), EngineError> {
         unimplemented!("never reached — require_container_tier refuses first")
     }
-    fn exec_args(
-        &self,
-        _agent_id: &str,
-        _working_dir: &str,
-        _entrypoint: &[&str],
-        _env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        unimplemented!("never reached — require_container_tier refuses first")
-    }
     fn attach(&self, _handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         unimplemented!("never reached — require_container_tier refuses first")
     }
@@ -123,9 +103,6 @@ impl AgentRuntimeEngine for FakeSandboxRuntime {
         _prefix: &str,
     ) -> Result<Vec<AgentHandle>, EngineError> {
         unimplemented!("never reached — require_container_tier refuses first")
-    }
-    fn host_cli(&self) -> Option<&'static str> {
-        Some("sbx")
     }
 }
 

@@ -67,7 +67,10 @@ fn run_driver(test: &str, scenario: &str, archive: &Path) -> Option<Run> {
         .args(["--tag", TAG, "--work"])
         .arg(work.path())
         .arg("--scripts")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/oci-runtime-spike"))
+        .arg(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .join("tools/oci-runtime-spike"),
+        )
         .output()
         .expect("spawn the guest driver");
     let raw = format!(

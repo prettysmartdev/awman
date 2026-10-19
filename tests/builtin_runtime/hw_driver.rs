@@ -19,12 +19,9 @@
 
 #![deny(unsafe_code)]
 
-#[path = "../../src/engine/container/builtin/worker.rs"]
-mod builtin_worker;
-
 #[cfg(not(awman_builtin))]
 fn main() -> std::process::ExitCode {
-    if builtin_worker::dispatch(std::env::vars_os()) {
+    if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return std::process::ExitCode::SUCCESS;
     }
     println!("BLOCKED\tthis target has no builtin runtime payload");
@@ -38,6 +35,7 @@ mod driver {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
+    use awman::data::config::builtin_launch::BuiltinLaunchSettings;
     use awman::data::config::env::Env;
     use awman::data::config::image_source::ImageSourceSpec;
     use awman::data::message::{UserMessage, UserMessageSink};
@@ -55,6 +53,9 @@ mod driver {
     use awman::engine::container::ContainerRuntime;
 
     type Res<T> = Result<T, String>;
+
+    /// The scenario's per-launch settings, set once in `run`.
+    static LAUNCH: std::sync::OnceLock<BuiltinLaunchSettings> = std::sync::OnceLock::new();
 
     struct Args {
         scenario: String,
@@ -165,6 +166,7 @@ mod driver {
             image: Some(ImageRef::new(tag)),
             name: Some(ContainerName::new(name)),
             remove_on_exit: true,
+            builtin_launch: LAUNCH.get().cloned().map(Box::new),
             ..Default::default()
         }
     }
@@ -343,14 +345,14 @@ mod driver {
             }
         };
         std::fs::create_dir_all(&args.work).unwrap();
-        let settings = BuiltinRuntimeSettings {
-            network: Default::default(),
-            state_dir: args.state.clone(),
+        // Per-launch defaults ride with every launch's options (`options`).
+        let _ = LAUNCH.set(BuiltinLaunchSettings {
             vcpus: if args.scenario == "limits" { 1 } else { 2 },
             memory_mib: if args.scenario == "limits" { 512 } else { 1024 },
-            image_source: None,
-            images: BTreeMap::new(),
-            registries: BTreeMap::new(),
+            ..BuiltinLaunchSettings::default()
+        });
+        let settings = BuiltinRuntimeSettings {
+            state_dir: args.state.clone(),
             ambient_overrides: Env::from_process().ambient_msb_overrides(),
             test_isolation: false,
         };
@@ -374,6 +376,7 @@ mod driver {
             refresh: false,
             expected_built_identity: None,
             immutable_export_selector: None,
+            registries: Default::default(),
         };
         for round in ["first", "cached"] {
             let started = Instant::now();
@@ -659,7 +662,7 @@ mod driver {
 
 #[cfg(awman_builtin)]
 fn main() -> std::process::ExitCode {
-    if builtin_worker::dispatch(std::env::vars_os()) {
+    if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return std::process::ExitCode::SUCCESS;
     }
     tokio::runtime::Builder::new_multi_thread()

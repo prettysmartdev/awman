@@ -5,7 +5,8 @@
 #[used]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__TEXT,__msbver"))]
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".msbver"))]
-static MSB_VERSION: [u8; 5] = *b"0.7.2";
+static MSB_VERSION: [u8; 5] =
+    awman::data::builtin_runtime::version_bytes(awman::data::builtin_runtime::MSB_VERSION);
 
 pub fn retain() {
     std::hint::black_box(&MSB_VERSION);

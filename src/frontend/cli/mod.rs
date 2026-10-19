@@ -70,6 +70,12 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
     }
 }
 
+/// Present a typed startup failure through the same renderer as dispatch,
+/// including JSON output for API-daemon startup commands invoked by the CLI.
+pub fn render_startup_error(matches: ArgMatches, error: CommandError) -> ExitCode {
+    render_error_for_mode(&error, CliFrontend::new(matches).is_json_mode())
+}
+
 fn render_error_for_mode(error: &CommandError, json: bool) -> ExitCode {
     if json {
         println!("{}", serde_json::json!({ "error": format_error(error) }));
@@ -237,144 +243,11 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::WorkflowFileNotFound { path } => {
             format!("workflow file not found: {}", path.display())
         }
-        CommandError::Engine(e) => match e {
-            // The five remote-transport variants have Layer 2 twins, and
-            // `From<EngineError> for CommandError` maps them onto those, so `?`
-            // never lands here. A directly-constructed `Engine(Remote*)` still
-            // renders exactly like its twin above.
-            crate::engine::error::EngineError::RemoteTimeout => {
-                "remote request timed out".into()
-            }
-            crate::engine::error::EngineError::RemoteConnectionRefused(reason) => {
-                format!("remote connection refused: {reason}")
-            }
-            crate::engine::error::EngineError::RemoteHttpStatus { status, body } => {
-                format!("remote returned HTTP {status}: {body}")
-            }
-            crate::engine::error::EngineError::MalformedSseEvent(msg) => {
-                format!("malformed SSE event from remote: {msg}")
-            }
-            crate::engine::error::EngineError::RemoteTransport(msg) => {
-                format!("remote transport error: {msg}")
-            }
-            crate::engine::error::EngineError::UnknownRuntime { value, valid } => format!(
-                "invalid runtime '{value}' in global config ($HOME/.awman/config.json); \
-                 valid values: {valid}"
-            ),
-            crate::engine::error::EngineError::AgentRequiresProjectImage { tag } => format!(
-                "agent image build requires the project base image first ({tag}); run `awman ready --build`"
-            ),
-            crate::engine::error::EngineError::Container(msg) => format!(
-                "container backend error: {msg}\n  awman requires Docker; install Docker Desktop / docker-engine and retry"
-            ),
-            crate::engine::error::EngineError::ContainerImageNotFound { image } => format!(
-                "image not found: '{image}'. Run `make build` or build the base image manually."
-            ),
-            crate::engine::error::EngineError::Network(msg) => {
-                format!("network error: {msg}")
-            }
-            crate::engine::error::EngineError::PlanModeUnsupported { agent } => {
-                format!("plan mode is not supported by agent {agent}")
-            }
-            crate::engine::error::EngineError::ConflictingOptions(msg) => {
-                format!("conflicting container options: {msg}")
-            }
-            crate::engine::error::EngineError::Sandbox(msg) => {
-                format!("sandbox backend error: {msg}")
-            }
-            crate::engine::error::EngineError::UnsupportedOnRuntime { runtime, operation } => {
-                format!(
-                    "{operation} is not supported on the {runtime} runtime; \
-                     change `runtime` in the global config to one that provides it"
-                )
-            }
-            crate::engine::error::EngineError::OptionVariantMismatch { runtime, got } => format!(
-                "runtime {runtime} was given {got}-paradigm options; this indicates a Layer 2 dispatch bug"
-            ),
-            crate::engine::error::EngineError::MissingRequiredOption(opt) => {
-                format!("missing required container option: {opt}")
-            }
-            crate::engine::error::EngineError::MergeConflict {
-                branch,
-                worktree_path,
-            } => format!(
-                "merge conflict on branch {branch}; resolve in worktree at {}",
-                worktree_path.display()
-            ),
-            crate::engine::error::EngineError::ContainerRuntimeUnavailable { binary } => {
-                format!(
-                    "container runtime '{binary}' not found on PATH; install Docker and retry"
-                )
-            }
-            crate::engine::error::EngineError::AgentDockerfileDownloadFailed { agent, message } => {
-                format!("failed to download Dockerfile for agent '{agent}': {message}")
-            }
-            crate::engine::error::EngineError::AgentImageBuildFailed { agent, exit_code } => {
-                format!("agent image build failed for agent '{agent}' (exit code {exit_code})")
-            }
-            crate::engine::error::EngineError::ImageBuildExitNonzero { tag, exit_code } => {
-                format!("image build for tag '{tag}' exited with code {exit_code}")
-            }
-            crate::engine::error::EngineError::Data(e) => format!("{e}"),
-            crate::engine::error::EngineError::Io { path, source } => {
-                format!("io error at {}: {source}", path.display())
-            }
-            crate::engine::error::EngineError::SquadRuntimeUnsupported { .. }
-            | crate::engine::error::EngineError::SquadDaemonStartup(_)
-            | crate::engine::error::EngineError::SquadDaemonConflict(_)
-            | crate::engine::error::EngineError::SquadDaemonUnreachable(_) => format!("{e}"),
-            // Builtin runtime and image acquisition (WI 0119): the engine's own
-            // messages already name the cause and the fix.
-            crate::engine::error::EngineError::BuiltinRuntimeUnavailable { .. }
-            | crate::engine::error::EngineError::AmbientRuntimeOverride { .. }
-            | crate::engine::error::EngineError::UnsupportedImageSource { .. }
-            | crate::engine::error::EngineError::ImageSourceBlocked { .. }
-            | crate::engine::error::EngineError::ImageSourceUnconfigured { .. }
-            | crate::engine::error::EngineError::ImageDigestMismatch { .. }
-            | crate::engine::error::EngineError::ImagePlatformMismatch { .. }
-            | crate::engine::error::EngineError::ImageArchiveRejected { .. }
-            | crate::engine::error::EngineError::InsufficientDiskSpace { .. }
-            | crate::engine::error::EngineError::UnsupportedResourceRequest { .. }
-            | crate::engine::error::EngineError::SocketPathTooLong { .. }
-            | crate::engine::error::EngineError::WorkerProtocolMismatch { .. } => format!("{e}"),
-            crate::engine::error::EngineError::Git(msg) => {
-                format!("git operation failed: {msg}")
-            }
-            crate::engine::error::EngineError::OptionNotSupportedByBackend { option, backend } => {
-                format!("container option {option} is not supported by backend {backend}")
-            }
-            crate::engine::error::EngineError::BackendUnsupportedOnPlatform { backend, platform } => {
-                format!("backend {backend} is not supported on platform {platform}")
-            }
-            crate::engine::error::EngineError::InvalidAdvanceAction(msg) => {
-                format!("invalid advance action: {msg}")
-            }
-            crate::engine::error::EngineError::UnsupportedWorkflowSchemaVersion { found, supported } => {
-                format!("workflow state schema version {found} is newer than supported version {supported}")
-            }
-            crate::engine::error::EngineError::WorkflowResumeIncompatible(msg) => {
-                format!("workflow resume incompatible: {msg}")
-            }
-            crate::engine::error::EngineError::Auth(msg) => {
-                format!("auth error: {msg}")
-            }
-            crate::engine::error::EngineError::Config(msg) => {
-                format!("invalid configuration: {msg}")
-            }
-            crate::engine::error::EngineError::NotImplemented(msg) => {
-                format!("not implemented: {msg}")
-            }
-            // ACP (WI 0104). Minimal build-plumbing arms so the exhaustive match
-            // compiles after the foundation step added these variants; the
-            // cli-frontend step owns the final user-facing wording.
-            crate::engine::error::EngineError::AcpUnsupported { agent } => {
-                format!("agent '{agent}' does not support ACP (Agent Client Protocol) launch mode")
-            }
-            crate::engine::error::EngineError::Acp(msg) => {
-                format!("ACP protocol error: {msg}")
-            }
-            crate::engine::error::EngineError::Other(msg) => msg.to_string(),
-        },
+        // The engine owns its user-facing text, guidance included (WI 0126
+        // F1), so the CLI, the TUI and the API print the same words. The
+        // five remote-transport variants are mapped onto their Layer 2 twins
+        // by `From<EngineError> for CommandError` and never land here.
+        CommandError::Engine(e) => e.to_string(),
         CommandError::Data(e) => format!("{e}"),
         CommandError::NotAvailableForFrontend { command, frontend } => {
             format!("command `{command}` is not available via the {frontend} frontend")
@@ -432,64 +305,7 @@ fn render_error(err: &CommandError) -> ExitCode {
 ///   130 — user aborted (Ctrl-C)
 ///   1 — every other failure
 pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
-    match err {
-        CommandError::Aborted => 130,
-
-        // Exit 2 — invalid usage / parse / flag conflict
-        CommandError::UnknownCommand { .. }
-        | CommandError::UnknownFlag { .. }
-        | CommandError::MissingRequiredFlag { .. }
-        | CommandError::MissingRequiredArgument { .. }
-        | CommandError::UnexpectedArgument { .. }
-        | CommandError::MutuallyExclusive { .. }
-        | CommandError::InvalidFlagValue { .. }
-        | CommandError::InvalidArgumentValue { .. }
-        | CommandError::CommandBoxParse(_)
-        | CommandError::InvalidOverlaySpec { .. }
-        | CommandError::UnknownConfigField { .. }
-        | CommandError::InteractiveInputUnavailable { .. }
-        // Session-creation validation failures are invalid-usage class.
-        | CommandError::SessionInvalidType { .. }
-        | CommandError::SessionWorkdirRequired
-        | CommandError::SessionWorkdirUnresolvable { .. }
-        | CommandError::SessionWorkdirNotAllowed { .. }
-        | CommandError::SessionRepoUrlRequired
-        | CommandError::SessionRepoUrlEmpty
-        | CommandError::SessionRepoUrlInvalidScheme { .. } => 2,
-
-        // Exit 4 — missing referenced resource
-        CommandError::WorkItemNotFound { .. }
-        | CommandError::SpecTemplateMissing { .. }
-        | CommandError::WorkflowFileNotFound { .. }
-        | CommandError::ApiWorkdirNotFound { .. } => 4,
-
-        // Exit 3 — missing container runtime
-        CommandError::Engine(crate::engine::error::EngineError::Container(_))
-        | CommandError::Engine(crate::engine::error::EngineError::ContainerRuntimeUnavailable {
-            ..
-        }) => 3,
-
-        // Exit 1 — remaining engine errors (catch-all for unlisted EngineError variants)
-        CommandError::Engine(_) => 1,
-        CommandError::Data(_) => 1,
-        CommandError::MergeConflict { .. } => 1,
-        CommandError::MissingRemoteAddress
-        | CommandError::MissingApiKey
-        | CommandError::RemoteTimeout
-        | CommandError::RemoteConnectionRefused(_)
-        | CommandError::RemoteHttpStatus { .. }
-        | CommandError::MalformedSseEvent(_)
-        | CommandError::RemoteTransport(_) => 1,
-        CommandError::ApiServerAlreadyRunning { .. }
-        | CommandError::ApiServerNotRunning
-        | CommandError::ApiServerAuthMissing
-        | CommandError::RemoteSessionMissing
-        | CommandError::RemoteSessionKillFailed { .. } => 1,
-        CommandError::NotImplemented(_) => 1,
-        CommandError::NotAvailableForFrontend { .. } => 1,
-        CommandError::SquadKeyMissing => 1,
-        CommandError::Other(_) => 1,
-    }
+    err.exit_code()
 }
 
 #[cfg(test)]
@@ -497,6 +313,131 @@ mod tests {
     use super::*;
     use crate::command::dispatch::catalogue::CommandCatalogue;
     use crate::command::error::CommandError;
+
+    /// Keep the user-facing text aligned at the actual CLI, TUI, and API
+    /// message sinks. The engine owns the wording; this harness catches a
+    /// frontend that adds/removes text or routes ready warnings differently.
+    #[test]
+    fn builtin_and_ready_messages_have_cross_frontend_text_parity() {
+        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+        use crate::data::ready_image::ReadyImageWarning;
+        use crate::data::ready_summary::{ReadyImageAction, ReadySummary};
+        use crate::data::step_status::StepStatus;
+        use crate::engine::error::EngineError;
+        use crate::frontend::api::command_frontend::ApiDispatchFrontend;
+
+        fn message_texts(
+            cases: &[(MessageLevel, String)],
+        ) -> (Vec<String>, Vec<String>, Vec<String>) {
+            let matches = CommandCatalogue::get()
+                .build_clap_command()
+                .try_get_matches_from(["awman", "ready"])
+                .unwrap();
+            let mut cli = crate::frontend::cli::command_frontend::CliFrontend::new(matches);
+            cli.messages.set_pty_active(true);
+
+            let (mut tui, _dialog_rx, _dialog_tx) =
+                crate::frontend::tui::tests::test_command_frontend(&["ready"], Default::default());
+
+            let bus = crate::command::commands::api_server::event_bus::EventBus::new(32);
+            let mut api_rx = bus.subscribe();
+            let args = Vec::new();
+            let mut api = ApiDispatchFrontend::new("ready", &args, bus.sender());
+
+            for (level, text) in cases {
+                let msg = || UserMessage {
+                    level: *level,
+                    text: text.clone(),
+                };
+                UserMessageSink::write_message(&mut cli, msg());
+                UserMessageSink::write_message(&mut tui, msg());
+                UserMessageSink::write_message(&mut api, msg());
+            }
+
+            let cli_texts = cli
+                .messages
+                .pending()
+                .iter()
+                .map(|message| message.text.clone())
+                .collect();
+            let tui_texts = tui
+                .status_log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect();
+            let mut api_texts = Vec::new();
+            while let Ok(event) = api_rx.try_recv() {
+                if let crate::data::execution_event::EventPayload::StatusMessage {
+                    message, ..
+                } = event.payload
+                {
+                    api_texts.push(message);
+                }
+            }
+            (cli_texts, tui_texts, api_texts)
+        }
+
+        let attach = EngineError::BuiltinAttachUnavailable {
+            name: "awman-demo".into(),
+            detail: "connection refused".into(),
+        };
+        let ambient = EngineError::AmbientRuntimeOverride {
+            variable: "MSB_PATH".into(),
+        };
+        let attach_text = attach.to_string();
+        let ambient_text = ambient.to_string();
+        assert_eq!(
+            format_error(&CommandError::from(attach)),
+            format!("awman: {attach_text}")
+        );
+        assert_eq!(
+            format_error(&CommandError::from(ambient)),
+            format!("awman: {ambient_text}")
+        );
+
+        let incompatible = ReadyImageWarning::IncompatibleBuilder {
+            tag: "awman-demo".into(),
+            source_kind: crate::data::config::image_source::ImageSourceKind::Archive,
+            reason: "archive sources are read-only".into(),
+        }
+        .to_string();
+        let build_ok_import_failed = ReadyImageWarning::BuildOkImportFailed {
+            tag: "awman-demo".into(),
+        }
+        .to_string();
+        let mut summary = ReadySummary::new("builtin");
+        summary.dockerfile = StepStatus::Done;
+        summary.base_image = StepStatus::Skipped;
+        summary.agent_image = StepStatus::Done;
+        summary.local_agent = StepStatus::Done;
+        summary.audit = StepStatus::Skipped;
+        summary.image_action = ReadyImageAction::BuildAndImport;
+        summary
+            .non_default_agent_images
+            .push(("Missing images".into(), StepStatus::Warn("codex".into())));
+        summary
+            .missing_images
+            .push(crate::data::ready_image::MissingAgentImage {
+                agent: "codex".into(),
+                plan: crate::data::ready_image::ReadyImagePlan::BuildAndImport,
+            });
+        let ready_hint = format!("Tip: {}", summary.hint().unwrap());
+
+        let cases = [
+            (MessageLevel::Error, attach_text),
+            (MessageLevel::Error, ambient_text),
+            (MessageLevel::Warning, incompatible),
+            (MessageLevel::Warning, build_ok_import_failed),
+            (MessageLevel::Info, ready_hint),
+        ];
+        let expected: Vec<String> = cases.iter().map(|(_, text)| text.clone()).collect();
+        let (cli, tui, api) = message_texts(&cases);
+        assert_eq!(cli, expected, "CLI text drifted");
+        assert_eq!(tui, expected, "TUI text drifted");
+        assert_eq!(api, expected, "API text drifted");
+    }
 
     // ─── error_exit_code — data-table test over every CommandError variant ─────
 
@@ -571,6 +512,42 @@ mod tests {
                 "expected exit code 1 for {err:?}"
             );
         }
+    }
+
+    /// WI 0126 F1: builtin and builder failures exit 1 and print the
+    /// engine's own text (the same words the TUI and the API show), never
+    /// the Docker install advice that used to follow every `Container`.
+    #[test]
+    fn builtin_and_builder_failures_exit_1_with_the_engine_text() {
+        use crate::engine::error::{BuilderFailure, EngineError};
+        let errors = [
+            EngineError::BuiltinAttachUnavailable {
+                name: "awman-x".into(),
+                detail: "gone".into(),
+            },
+            EngineError::BuiltinImageNotImported {
+                image: "awman-x:latest".into(),
+            },
+            EngineError::BuilderUnavailable {
+                builder: "Apple Containers".into(),
+                detail: "down".into(),
+            },
+            EngineError::ImageBuilder(BuilderFailure::AppleImageMissing),
+            EngineError::ImageAcquisitionCancelled,
+        ];
+        for engine in errors {
+            let text = engine.to_string();
+            let err = CommandError::from(engine);
+            assert_eq!(error_exit_code(&err), 1, "{err:?}");
+            assert_eq!(format_error(&err), format!("awman: {text}"));
+            assert!(!format_error(&err).contains("Docker"), "{err:?}");
+        }
+        let docker = CommandError::from(EngineError::Container("daemon down".into()));
+        assert_eq!(error_exit_code(&docker), 3);
+        assert_eq!(
+            format_error(&docker),
+            "awman: container backend error: daemon down"
+        );
     }
 
     // ─── command_path_from_matches – frontend selection logic ─────────────────

@@ -535,6 +535,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "awman-cli"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-trait",
+ "awman",
+ "awman-host-shims",
+ "axum",
+ "axum-server",
+ "base64 0.23.1",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "flate2",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "libc",
+ "microsandbox",
+ "microsandbox-cli",
+ "microsandbox-image",
+ "microsandbox-network",
+ "msb_krun",
+ "nix 0.31.3",
+ "portable-pty",
+ "ratatui",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "shell-words",
+ "sqlx",
+ "strip-ansi-escapes",
+ "strsim",
+ "subtle",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+ "uuid",
+ "vt100-ctt",
+ "which",
+ "wiremock",
+]
+
+[[package]]
+name = "awman-host-shims"
+version = "0.12.0"
+dependencies = [
+ "awman",
+ "clap",
+ "libc",
+ "microsandbox-cli",
+ "msb_krun",
+ "nix 0.31.3",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

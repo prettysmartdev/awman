@@ -21,7 +21,7 @@ use awman::engine::error::EngineError;
 use awman::engine::oci::archive::prepare_runtime_archive;
 use awman::engine::oci::format::SUPPORTED_LAYER_MEDIA_TYPES;
 use awman::engine::oci::{
-    validate_archive, AcquirePolicy, AcquireRequest, AcquiredImage, ArchiveFormat, ImageAcquirer,
+    AcquirePolicy, AcquireRequest, AcquiredImage, ArchiveFormat, ArchiveValidator, ImageAcquirer,
 };
 
 use crate::support::*;
@@ -112,13 +112,12 @@ fn projected_layers(projected: &Path, format: ArchiveFormat) -> Vec<Vec<u8>> {
 /// The assertions every corpus member must satisfy.
 fn check_preservation(acquired: &AcquiredImage, source_layers: &[Vec<u8>]) {
     let (_dir, projected) = prepare_runtime_archive(acquired, TAG, &limits()).unwrap();
-    let again = validate_archive(
-        &projected,
-        &OciPlatform::host_linux(),
-        &[TAG.to_string()],
-        &limits(),
-        &mut |_| {},
-    )
+    let again = ArchiveValidator {
+        platform: &OciPlatform::host_linux(),
+        wanted_refs: &[TAG.to_string()],
+        limits: &limits(),
+    }
+    .validate(&projected, &mut |_| {})
     .unwrap();
     assert_eq!(again.config_digest, acquired.identity.config_digest);
     assert_eq!(again.platform, acquired.identity.platform);
@@ -451,18 +450,19 @@ fn real_corpus_every_shipped_template_archive_validates_and_projects() {
     let Some(dir) = real_corpus() else { return };
     let manifest: CorpusManifest =
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-    let templates: Vec<String> =
-        std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("templates"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                e.file_name()
-                    .to_str()?
-                    .strip_prefix("Dockerfile.")
-                    .map(str::to_string)
-            })
-            .filter(|t| t != "project")
-            .collect();
+    let templates: Vec<String> = std::fs::read_dir(
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join("templates"),
+    )
+    .unwrap()
+    .filter_map(|e| e.ok())
+    .filter_map(|e| {
+        e.file_name()
+            .to_str()?
+            .strip_prefix("Dockerfile.")
+            .map(str::to_string)
+    })
+    .filter(|t| t != "project")
+    .collect();
     let host = OciPlatform::host_linux().to_string();
     let mut covered = std::collections::BTreeSet::new();
     for entry in manifest.entries.iter().filter(|e| e.platform == host) {
@@ -492,13 +492,12 @@ fn real_corpus_every_shipped_template_archive_validates_and_projects() {
         assert_eq!(got.archive_format, expected_format, "{}", entry.archive);
         let (_dir, projected) =
             prepare_runtime_archive(&got, &entry.reference, &production_limits).unwrap();
-        let again = validate_archive(
-            &projected,
-            &OciPlatform::host_linux(),
-            std::slice::from_ref(&entry.reference),
-            &production_limits,
-            &mut |_| {},
-        )
+        let again = ArchiveValidator {
+            platform: &OciPlatform::host_linux(),
+            wanted_refs: std::slice::from_ref(&entry.reference),
+            limits: &production_limits,
+        }
+        .validate(&projected, &mut |_| {})
         .unwrap();
         assert_eq!(again.config_digest, got.identity.config_digest);
         assert_eq!(again.platform, got.identity.platform);

@@ -172,7 +172,16 @@ policy: `mode` `public`/`allowlist`/`none`, default `public`; `allow`;
 `hostPorts`; global-only `nameservers`/`trustHostCas`). A repo `network`
 block may only narrow the global one — a stricter mode, a subset of the
 global `allow` list, a subset of the global `hostPorts` — never widen it, since
-repo config ships with the checkout and may be untrusted. For example:
+repo config ships with the checkout and may be untrusted. Network, `vcpus`
+and `memoryMib` are resolved per session at every launch, so a repo's values
+apply wherever an agent for that repo runs (CLI, a TUI tab, an API session or a
+squad task). The state directory is resolved in this order: the
+`AWMAN_BUILTIN_STATE_DIR` environment variable, then `builtin.stateDir` (repo
+over global), then `<data home>/builtin`. It is effectively process-wide: a
+repo `builtin.stateDir` that resolves to a different directory than the
+process's is rejected for that launch with an error naming both paths, while a
+value equal to the process's is accepted. Keep the directory path short, since
+control sockets live beneath it. For example:
 
 ```json
 {
@@ -202,9 +211,19 @@ only through the local Docker Engine or Apple Containers store selected by
 that image's resolved source, then imports from that same source. Registry,
 archive, remote Docker, and unconfigured sources do not select a builder.
 Incompatible requested builds warn and retain normal source import behavior.
-Workflow preflight and squad image checks remain import-only. The builtin
-backend does not silently choose another source or change the selected
-execution runtime.
+API session setup may also build, when the compatible source store lacks the
+image; it never forces a rebuild. Workflow preflight (static and dynamic) and
+squad image checks remain import-only: they never build or probe a builder, and
+they re-acquire an image that is present but was imported from a different
+source than the one now resolved, so an image they accept is the one `ready`
+would have accepted. The builtin backend does not silently choose another
+source or change the selected execution runtime.
+
+An agent that lacks an allowed/disallowed-tools flag is rejected with a
+configuration error on every runtime (Docker, Apple Containers, builtin and Docker Sandboxes),
+rather than launching with the tool restriction silently dropped.
+Sandbox tool lists also require a supported native settings delivery path;
+currently only Claude's sandbox startup script applies them.
 
 The internal `awman machine …` first-argument route is reserved for the
 same-executable microVM worker and is not a public command. Existing runtime

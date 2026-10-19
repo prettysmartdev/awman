@@ -36,18 +36,10 @@ impl AgentRuntimeEngine for ImportRuntime {
     }
     fn capabilities(&self) -> &Capabilities {
         static CAPS: Capabilities = Capabilities {
-            arbitrary_env_vars: true,
             arbitrary_host_mounts: true,
-            cpu_limits: true,
-            per_resource_stats: true,
-            persistent_lifecycle: false,
             kit_declarative: false,
-            dind: crate::engine::agent_runtime::DindSupport::Never,
-            host_paths_visible: true,
-            session_label_supported: true,
             has_image_store: true,
             image_acquisition: crate::engine::agent_runtime::ImageAcquisition::Import,
-            fractional_cpu: false,
         };
         &CAPS
     }
@@ -72,9 +64,6 @@ impl AgentRuntimeEngine for ImportRuntime {
     fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
         Ok(())
     }
-    fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Option<Vec<String>> {
-        None
-    }
     fn attach(
         &self,
         _: &AgentHandle,
@@ -83,9 +72,6 @@ impl AgentRuntimeEngine for ImportRuntime {
     }
     fn list_running_with_name_prefix(&self, _: &str) -> Result<Vec<AgentHandle>, EngineError> {
         Ok(Vec::new())
-    }
-    fn host_cli(&self) -> Option<&'static str> {
-        None
     }
     fn ready_agent(
         &self,
@@ -103,10 +89,7 @@ impl AgentRuntimeEngine for ImportRuntime {
     }
     fn build_image(
         &self,
-        _: &str,
-        _: &Path,
-        _: &Path,
-        _: bool,
+        _request: &crate::engine::container::BuildRequest,
         _: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         Err(unsupported("image building"))
@@ -234,7 +217,13 @@ impl World {
         }
     }
 
-    fn plan(&self, agent: &str, run: &AgentRunOptions) -> Result<LaunchPlan, EngineError> {
+    /// The options the real `AgentEngine` resolves for `agent`, as every
+    /// container-tier backend receives them.
+    fn resolved(
+        &self,
+        agent: &str,
+        run: &AgentRunOptions,
+    ) -> Result<ResolvedContainerOptions, EngineError> {
         let agent = AgentName::new(agent).unwrap();
         let options = self.engine.build_options_with_credentials(
             &self.session,
@@ -246,7 +235,11 @@ impl World {
         resolved.name = Some(crate::engine::container::options::ContainerName::new(
             format!("awman-matrix-{}", agent.as_str()),
         ));
-        self.rig.backend.plan(resolved)
+        Ok(resolved)
+    }
+
+    fn plan(&self, agent: &str, run: &AgentRunOptions) -> Result<LaunchPlan, EngineError> {
+        self.rig.backend.plan(self.resolved(agent, run)?)
     }
 }
 
@@ -437,6 +430,164 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
             }
         }
     }
+}
+
+/// Docker/Apple vs builtin agent argv parity (C5, decision 8). Docker and
+/// Apple share `docker::build_run_argv`; whatever follows the image there is
+/// exactly the command builtin hands the sandbox, for every agent and every
+/// launch shape. A tool list the agent has no flag for is refused by all
+/// three, with the same typed error.
+#[test]
+fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
+    use crate::data::config::repo::LaunchMode;
+    use crate::engine::agent::agent_matrix::ModelFlagDelivery;
+    use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
+    use crate::engine::error::ToolRestriction;
+
+    let world = world(Some(HOME));
+    let mut checked = 0;
+    for agent in SUPPORTED_AGENTS {
+        let matrix = matrix_for(agent).unwrap();
+        let model = (!matches!(matrix.model_flag, ModelFlagDelivery::Unsupported))
+            .then(|| "some-model".to_string());
+        let mut table: Vec<(&str, AgentRunOptions)> = vec![
+            // The shape `awman ready`'s audit launches every agent with.
+            (
+                "ready",
+                AgentRunOptions {
+                    initial_prompt: Some("audit".into()),
+                    ..Default::default()
+                },
+            ),
+            ("interactive", world.run_options(false)),
+            ("non-interactive", world.run_options(true)),
+            (
+                "yolo+model",
+                AgentRunOptions {
+                    yolo: Some(YoloMode::Enabled),
+                    model: model.clone(),
+                    ..world.run_options(false)
+                },
+            ),
+            (
+                "auto",
+                AgentRunOptions {
+                    auto: Some(AutoMode::Enabled),
+                    ..world.run_options(true)
+                },
+            ),
+            (
+                "tools",
+                AgentRunOptions {
+                    allowed_tools: vec!["Read".into(), "Bash(git status)".into()],
+                    disallowed_tools: vec!["Write".into()],
+                    ..world.run_options(false)
+                },
+            ),
+        ];
+        if matrix.plan_flag.is_some() {
+            table.push((
+                "plan",
+                AgentRunOptions {
+                    plan: Some(PlanMode::Enabled),
+                    ..world.run_options(false)
+                },
+            ));
+        }
+        if matrix.supports_acp {
+            table.push((
+                "acp",
+                AgentRunOptions {
+                    launch_mode: LaunchMode::Acp,
+                    ..world.run_options(false)
+                },
+            ));
+            for (label, allowed, disallowed) in [
+                ("acp+allowed", vec!["Read".to_string()], vec![]),
+                ("acp+disallowed", vec![], vec!["Write".to_string()]),
+            ] {
+                table.push((
+                    label,
+                    AgentRunOptions {
+                        launch_mode: LaunchMode::Acp,
+                        allowed_tools: allowed,
+                        disallowed_tools: disallowed,
+                        ..world.run_options(false)
+                    },
+                ));
+            }
+        }
+        for (label, run) in table {
+            let context = format!("{agent} ({label})");
+            let resolved = match world.resolved(agent, &run) {
+                Ok(resolved) => resolved,
+                Err(EngineError::ToolRestrictionFlagMissing { restriction }) => {
+                    let expected = if !run.disallowed_tools.is_empty()
+                        && matrix.disallowed_tools_flag.is_none()
+                    {
+                        ToolRestriction::Disallowed
+                    } else {
+                        assert!(
+                            !run.allowed_tools.is_empty() && matrix.allowed_tools_flag.is_none(),
+                            "{context}"
+                        );
+                        ToolRestriction::Allowed
+                    };
+                    assert_eq!(restriction, expected, "{context}");
+                    checked += 1;
+                    continue;
+                }
+                Err(error) => panic!("{context}: {error}"),
+            };
+            let image = resolved.image.clone().expect("image");
+            let docker = crate::engine::container::docker::build_run_argv(
+                resolved.name.as_ref().unwrap(),
+                &image,
+                &resolved,
+            );
+            let builtin = world.rig.backend.plan(resolved);
+            let lacks_flag = !run.disallowed_tools.is_empty()
+                && matrix.disallowed_tools_flag.is_none()
+                || !run.allowed_tools.is_empty() && matrix.allowed_tools_flag.is_none();
+            let acp_restricted = matches!(run.launch_mode, LaunchMode::Acp)
+                && (!run.allowed_tools.is_empty() || !run.disallowed_tools.is_empty());
+            if acp_restricted {
+                for (runtime, result) in [
+                    ("docker/apple", docker.map(|_| ())),
+                    ("builtin", builtin.map(|_| ())),
+                ] {
+                    assert!(
+                        matches!(result, Err(EngineError::Config(_))),
+                        "{context}: {runtime} must refuse a restricted ACP launch, got {result:?}"
+                    );
+                }
+            } else if lacks_flag {
+                let restriction = if matrix.disallowed_tools_flag.is_none() {
+                    ToolRestriction::Disallowed
+                } else {
+                    ToolRestriction::Allowed
+                };
+                for (runtime, result) in [
+                    ("docker/apple", docker.map(|_| ())),
+                    ("builtin", builtin.map(|_| ())),
+                ] {
+                    match result {
+                        Err(EngineError::ToolRestrictionFlagMissing { restriction: got }) => {
+                            assert_eq!(got, restriction, "{context}: {runtime}")
+                        }
+                        other => panic!("{context}: {runtime} must refuse, got {other:?}"),
+                    }
+                }
+            } else {
+                let docker = docker.unwrap_or_else(|e| panic!("{context}: docker: {e}"));
+                let plan = builtin.unwrap_or_else(|e| panic!("{context}: builtin: {e}"));
+                let after_image = &docker[docker.iter().position(|a| *a == image.0).unwrap() + 1..];
+                assert_eq!(after_image, plan.command.argv.as_slice(), "{context}");
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= SUPPORTED_AGENTS.len() * 6);
 }
 
 #[test]

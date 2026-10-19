@@ -295,7 +295,7 @@ fn migration_is_noop_when_amux_dir_absent() {
 /// human to fill in later live in such comments.
 #[test]
 fn docs_internal_links_all_resolve() {
-    let docs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    let docs_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")).join("docs");
     assert!(
         docs_dir.is_dir(),
         "docs/ directory not found at {docs_dir:?}"

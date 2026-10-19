@@ -429,7 +429,9 @@ An unrecognized value (e.g. a typo) is a fatal error — awman never falls back 
 
 ### Builtin runtime settings
 
-The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected.
+The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected. `network`, `vcpus`, `memoryMib`, `registries`, the image sources and `builder.enabled` are resolved for each session from that session's own repo, so the TUI, the API and squad each honour the repo a session runs in, even when several repos share one awman process.
+
+`builtin.stateDir` is the exception: the state directory is process-wide. If a repo's `builtin.stateDir` resolves to a different directory than the one the awman process uses, the launch is refused with an error naming both paths (`this repository's builtin.stateDir resolves to <repo path>, but this awman process uses the builtin state directory <process path>`). Remove the repo's `stateDir` or set it to the process's path. `AWMAN_BUILTIN_STATE_DIR` outranks every config layer, so it never causes this mismatch.
 
 ```json
 {
@@ -458,7 +460,7 @@ The optional `builtin` object is read only when `runtime` is `builtin-experiment
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images, catalog, control sockets and VM/session state; mode `0700`, no symlinks, keep it short. Resolved once from the startup directory's configuration for all builtin sessions in the process. `AWMAN_BUILTIN_STATE_DIR` overrides it |
+| `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images, catalog, control sockets and VM/session state; mode `0700`, no symlinks, keep it short. Process-wide: one state directory serves every builtin session in the awman process, so a repo value that resolves to a different directory is rejected (see below). `AWMAN_BUILTIN_STATE_DIR` overrides it |
 | `builtin.vcpus` | integer 1–255 | `2` | Whole vCPUs per session VM |
 | `builtin.memoryMib` | integer ≥ 128 | `4096` | Guest memory in MiB |
 | `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-local`, `archive`, or `apple-local` (macOS) |
@@ -471,7 +473,7 @@ Every source object, its fields, the registry settings, and the supported `apple
 
 `builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 
-`builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. This effective policy applies to every builtin session from that repo, including TUI, API, and squad launches. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
+`builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. This effective policy applies to every builtin launch in that repo, including TUI, API, and squad sessions. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
 
 ---
 

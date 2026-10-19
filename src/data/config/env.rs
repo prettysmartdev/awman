@@ -126,6 +126,30 @@ pub const MSB_HOME: &str = "MSB_HOME";
 /// `MSB_BACKEND` — Microsandbox's backend override. See [`MSB_PATH`].
 pub const MSB_BACKEND: &str = "MSB_BACKEND";
 
+/// `MSB_CONFIG_PATH` — Microsandbox's configuration-file override. See [`MSB_PATH`].
+pub const MSB_CONFIG_PATH: &str = "MSB_CONFIG_PATH";
+
+/// `MSB_PROFILE` — Microsandbox's profile override. See [`MSB_PATH`].
+pub const MSB_PROFILE: &str = "MSB_PROFILE";
+
+/// `MSB_CACHE_DIR` — Microsandbox's cache-directory override. See [`MSB_PATH`].
+pub const MSB_CACHE_DIR: &str = "MSB_CACHE_DIR";
+
+/// `MSB_SANDBOXES_DIR` — Microsandbox's sandbox-directory override. See [`MSB_PATH`].
+pub const MSB_SANDBOXES_DIR: &str = "MSB_SANDBOXES_DIR";
+
+/// `MSB_VOLUMES_DIR` — Microsandbox's volume-directory override. See [`MSB_PATH`].
+pub const MSB_VOLUMES_DIR: &str = "MSB_VOLUMES_DIR";
+
+/// `MSB_SNAPSHOTS_DIR` — Microsandbox's snapshot-directory override. See [`MSB_PATH`].
+pub const MSB_SNAPSHOTS_DIR: &str = "MSB_SNAPSHOTS_DIR";
+
+/// `MSB_LOGS_DIR` — Microsandbox's log-directory override. See [`MSB_PATH`].
+pub const MSB_LOGS_DIR: &str = "MSB_LOGS_DIR";
+
+/// `MSB_SECRETS_DIR` — Microsandbox's secrets-directory override. See [`MSB_PATH`].
+pub const MSB_SECRETS_DIR: &str = "MSB_SECRETS_DIR";
+
 /// Every ambient Microsandbox override the builtin runtime refuses to run
 /// under. Never add these to [`ForwardedEnv::NAMES`].
 pub const AMBIENT_MSB_OVERRIDES: &[&str] = &[
@@ -134,6 +158,14 @@ pub const AMBIENT_MSB_OVERRIDES: &[&str] = &[
     MSB_AGENTD_PATH,
     MSB_HOME,
     MSB_BACKEND,
+    MSB_CONFIG_PATH,
+    MSB_PROFILE,
+    MSB_CACHE_DIR,
+    MSB_SANDBOXES_DIR,
+    MSB_VOLUMES_DIR,
+    MSB_SNAPSHOTS_DIR,
+    MSB_LOGS_DIR,
+    MSB_SECRETS_DIR,
 ];
 
 /// `DOCKER_HOST` — the Docker Engine endpoint (`unix://`, `tcp://`,
@@ -329,6 +361,12 @@ impl EnvSnapshot {
             .map(PathBuf::from)
     }
 
+    /// `HOME` as a `PathBuf` if captured and non-empty. A process snapshot
+    /// resolves it at capture time; an empty snapshot has none.
+    pub fn home_dir(&self) -> Option<PathBuf> {
+        self.get(HOME).filter(|v| !v.is_empty()).map(PathBuf::from)
+    }
+
     /// `AWMAN_ATTACH_DIR` as a `PathBuf` if set and non-empty.
     pub fn attach_dir(&self) -> Option<PathBuf> {
         self.get(AWMAN_ATTACH_DIR)
@@ -479,16 +517,16 @@ impl Env {
             AWMAN_TEST_SBX,
             AWMAN_TEST_BUILTIN,
             AWMAN_BUILTIN_STATE_DIR,
-            MSB_PATH,
-            MSB_LIBKRUNFW_PATH,
-            MSB_AGENTD_PATH,
-            MSB_HOME,
-            MSB_BACKEND,
             DOCKER_HOST,
             DOCKER_CERT_PATH,
             DOCKER_TLS_VERIFY,
         ];
         let mut values = HashMap::new();
+        // The home directory is resolved here, once, so nothing above Layer 0
+        // consults the ambient environment (or the passwd database) for it.
+        if let Some(home) = dirs::home_dir() {
+            values.insert(HOME.to_string(), home.to_string_lossy().into_owned());
+        }
         for k in keys {
             let read = if Self::PUBLISHED_KEYS.contains(&k) {
                 host_var(k)
@@ -497,6 +535,13 @@ impl Env {
             };
             if let Some(v) = read {
                 values.insert(k.to_string(), v);
+            }
+        }
+        // These SDK overrides are presence-sensitive, and may be non-UTF-8.
+        // Store a marker because their contents are never used by awman.
+        for &name in AMBIENT_MSB_OVERRIDES {
+            if host_var_os(name).is_some() {
+                values.insert(name.to_string(), String::new());
             }
         }
         EnvSnapshot { values }
@@ -833,6 +878,18 @@ mod tests {
     // ── AWMAN_ATTACH_DIR (F-37) ──────────────────────────────────────────
 
     #[test]
+    fn home_dir_comes_from_the_snapshot_only() {
+        assert!(EnvSnapshot::empty().home_dir().is_none());
+        assert!(EnvSnapshot::with_overrides([(HOME, "")])
+            .home_dir()
+            .is_none());
+        assert_eq!(
+            EnvSnapshot::with_overrides([(HOME, "/home/a")]).home_dir(),
+            Some(PathBuf::from("/home/a"))
+        );
+    }
+
+    #[test]
     fn attach_dir_returns_none_when_absent() {
         assert!(EnvSnapshot::empty().attach_dir().is_none());
     }
@@ -1067,6 +1124,71 @@ mod tests {
                 "{name} must not be forwarded"
             );
         }
+    }
+
+    #[test]
+    fn documented_ambient_msb_override_list_matches_the_constant() {
+        let documentation = include_str!("../../../aspec/uxui/cli.md");
+        let section = documentation
+            .split_once("The builtin runtime rejects ambient ")
+            .expect("CLI documentation contains the builtin ambient override paragraph")
+            .1
+            .split_once("overrides instead of loading")
+            .expect("CLI paragraph ends after the override list")
+            .0;
+        let documented: Vec<&str> = section
+            .split('`')
+            .filter(|word| word.starts_with("MSB_"))
+            .collect();
+        assert_eq!(documented, AMBIENT_MSB_OVERRIDES);
+    }
+
+    #[test]
+    fn all_ambient_msb_names_are_captured_from_process() {
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous_overlay = daemon_overlay_snapshot();
+        set_daemon_overlay(DaemonEnvMap::new());
+        let previous: Vec<_> = AMBIENT_MSB_OVERRIDES
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for &name in AMBIENT_MSB_OVERRIDES {
+            std::env::set_var(name, "set");
+        }
+        assert_eq!(
+            Env::from_process().ambient_msb_overrides(),
+            AMBIENT_MSB_OVERRIDES
+        );
+        for (name, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+        set_daemon_overlay(previous_overlay);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ambient_msb_path_is_captured_from_process() {
+        use std::os::unix::ffi::OsStringExt;
+        let _lock = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous_overlay = daemon_overlay_snapshot();
+        set_daemon_overlay(DaemonEnvMap::new());
+        let previous = std::env::var_os(MSB_PATH);
+        std::env::set_var(MSB_PATH, std::ffi::OsString::from_vec(vec![0xff]));
+        assert_eq!(Env::from_process().ambient_msb_overrides(), vec![MSB_PATH]);
+        if let Some(value) = previous {
+            std::env::set_var(MSB_PATH, value);
+        } else {
+            std::env::remove_var(MSB_PATH);
+        }
+        set_daemon_overlay(previous_overlay);
     }
 
     #[test]

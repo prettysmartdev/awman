@@ -112,7 +112,15 @@ fn docker_background_container_start_exec_kill() {
     let overlays = [];
 
     let container = runtime
-        .start_background("alpine:latest", tmp.path(), &env, &overlays)
+        .start_background(
+            &awman::engine::container::background::BackgroundLaunchRequest {
+                image: "alpine:latest",
+                workdir: tmp.path(),
+                env: &env,
+                overlays: &overlays,
+                builtin_launch: None,
+            },
+        )
         .expect("start_background must succeed");
 
     let container_id = container.container_id().to_string();
@@ -163,7 +171,15 @@ fn docker_background_container_exec_nonzero_exit() {
     let overlays = [];
 
     let container = runtime
-        .start_background("alpine:latest", tmp.path(), &env, &overlays)
+        .start_background(
+            &awman::engine::container::background::BackgroundLaunchRequest {
+                image: "alpine:latest",
+                workdir: tmp.path(),
+                env: &env,
+                overlays: &overlays,
+                builtin_launch: None,
+            },
+        )
         .expect("start_background must succeed");
 
     let output = container
@@ -193,7 +209,15 @@ fn docker_background_container_env_var_injected() {
     let overlays = [];
 
     let container = runtime
-        .start_background("alpine:latest", tmp.path(), &env, &overlays)
+        .start_background(
+            &awman::engine::container::background::BackgroundLaunchRequest {
+                image: "alpine:latest",
+                workdir: tmp.path(),
+                env: &env,
+                overlays: &overlays,
+                builtin_launch: None,
+            },
+        )
         .expect("start_background must succeed");
 
     let output = container
@@ -239,7 +263,15 @@ fn docker_background_container_overlay_mount_applied() {
     }];
 
     let container = runtime
-        .start_background("alpine:latest", workdir.path(), &env, &overlays)
+        .start_background(
+            &awman::engine::container::background::BackgroundLaunchRequest {
+                image: "alpine:latest",
+                workdir: workdir.path(),
+                env: &env,
+                overlays: &overlays,
+                builtin_launch: None,
+            },
+        )
         .expect("start_background must succeed with overlays");
 
     let output = container
@@ -269,7 +301,15 @@ fn docker_background_container_image_not_found() {
     let overlays = [];
     let bad_image = "amux-nonexistent-image-xyzzy:no-such-tag";
 
-    let result = runtime.start_background(bad_image, tmp.path(), &env, &overlays);
+    let result = runtime.start_background(
+        &awman::engine::container::background::BackgroundLaunchRequest {
+            image: bad_image,
+            workdir: tmp.path(),
+            env: &env,
+            overlays: &overlays,
+            builtin_launch: None,
+        },
+    );
 
     let err = match result {
         Ok(_) => panic!("start_background must fail for missing image"),

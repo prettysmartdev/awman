@@ -137,6 +137,17 @@ pub struct ImageIdentity {
     pub source: ImageSourceKind,
 }
 
+/// Installed content and its resolved acquisition source. Older identity
+/// records remain readable; a missing source requires ready to establish
+/// provenance before a builder-enabled check-only launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledImageIdentity {
+    #[serde(flatten)]
+    pub identity: ImageIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquisition_source: Option<crate::data::config::image_source::ImageSourceSpec>,
+}
+
 /// What a local build produced, as reported by the builder that ran it: the
 /// content the image later imported from that store must match.
 ///

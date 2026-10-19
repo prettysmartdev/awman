@@ -631,8 +631,8 @@ fn double_fork_spawn(
         .stderr(open_log());
 
     // On Unix this matches old-amux exactly: a single Command::spawn. True
-    // setsid daemonization would require `pre_exec`, which is unsafe — and this
-    // crate is `#![forbid(unsafe_code)]`. The systemd-run / launchd happy paths
+    // setsid daemonization would require `pre_exec`, which is unsafe — and this crate's
+    // `#![forbid(unsafe_code)]` rule disallows. The systemd-run / launchd happy paths
     // above handle real detachment when the OS supports it.
 
     // On Windows, ensure the child gets its own process group so a Ctrl-C

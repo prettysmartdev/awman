@@ -18,7 +18,7 @@ use crate::data::config::effective::EffectiveConfig;
 // impl on `self.frontend`.
 
 pub(crate) struct AgentFrontendProxy {
-    pub(crate) frontend: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    pub(crate) frontend: SharedWorkflowFrontend,
     pub(crate) acp: bool,
     /// Each workflow container must receive the I/O sink paired with its own
     /// `Running { container_name }` callback. Keeping the taken I/O on this
@@ -44,11 +44,15 @@ impl AgentFrontend for AgentFrontendProxy {
     }
 
     fn report_progress(&mut self, progress: crate::engine::agent_runtime::frontend::AgentProgress) {
-        self.frontend.report_progress(progress);
+        self.frontend
+            .with(|frontend| frontend.report_progress(progress));
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        let mut io = self.io.take().unwrap_or_else(|| self.frontend.take_io());
+        let mut io = self
+            .io
+            .take()
+            .unwrap_or_else(|| self.frontend.with(|frontend| frontend.take_io()));
         if self.acp {
             // ACP framing is line-delimited JSON, never a PTY stream.
             io.initial_size = None;
@@ -58,17 +62,17 @@ impl AgentFrontend for AgentFrontendProxy {
     }
 
     fn grace_timeout(&self) -> std::time::Duration {
-        self.frontend.grace_timeout()
+        self.frontend.with(|frontend| frontend.grace_timeout())
     }
 
     fn stuck_timeout(&self) -> std::time::Duration {
-        self.frontend.stuck_timeout()
+        self.frontend.with(|frontend| frontend.stuck_timeout())
     }
 }
 
 impl UserMessageSink for AgentFrontendProxy {
     fn write_message(&mut self, msg: UserMessage) {
-        self.frontend.write_message(msg);
+        self.frontend.with(|frontend| frontend.write_message(msg));
     }
 
     fn replay_queued(&mut self) {
@@ -83,7 +87,7 @@ impl UserMessageSink for AgentFrontendProxy {
 // `AgentFrontendProxy` to it via `run_with_frontend`.
 
 pub(crate) struct CommandLayerFactory {
-    pub(crate) shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
+    pub(crate) shared: SharedWorkflowFrontend,
     pub(crate) engines: Engines,
     pub(crate) flags: Arc<ExecWorkflowCommandFlags>,
     pub(crate) cli_typed_overlays: Vec<TypedOverlay>,
@@ -358,7 +362,7 @@ impl AgentExecutionFactory for CommandLayerFactory {
         };
         let instance = self.engines.runtime.build(resolved)?;
         let proxy = AgentFrontendProxy {
-            frontend: Arc::clone(&self.shared),
+            frontend: self.shared.clone(),
             acp: run_opts.launch_mode == crate::data::config::repo::LaunchMode::Acp,
             io: None,
         };

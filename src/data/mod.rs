@@ -5,6 +5,9 @@
 //! operations, no workflow execution, no command logic, and no frontend code
 //! is permitted at this layer. See `aspec/architecture/2026-grand-architecture.md`.
 
+pub mod builtin_runtime;
+#[cfg(unix)]
+pub mod builtin_state;
 pub mod ci_poll_event;
 pub mod config;
 pub mod dynamic_workflow_assets;
@@ -18,6 +21,7 @@ pub mod issue;
 pub mod message;
 pub mod migration;
 pub mod network;
+pub mod oci_cache;
 pub mod oci_identity;
 pub mod oci_source_key;
 pub mod prompt;

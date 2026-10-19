@@ -1,99 +1,40 @@
 //! Source-matched local image builders. Selection is pure; only an opted-in
 //! ready build invokes a host CLI. Runtimes still execute in builtin.
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::data::config::image_source::{ImageSourceKind, ImageSourceSpec};
 use crate::data::oci_identity::{BuiltImageIdentity, Digest, OciPlatform};
-use crate::engine::container::host_cli_backend::{
-    bound_docker_command, build_local_docker, tail, BuildControl, HostBuildRequest,
-    HostCommandRunner, ProcessHostCommandRunner, PROBE_TIMEOUT, SOURCE_BUILD_TIMEOUT,
+use crate::engine::container::host_build::{
+    tail, BuildArgv, HostCommandRunner, ProcessHostCommandRunner, PROBE_TIMEOUT,
 };
-use crate::engine::error::EngineError;
-use crate::engine::oci::docker_engine::Endpoint;
-use crate::engine::oci::ResolvedImageSource;
+use crate::engine::container::BuildControl;
+use crate::engine::error::{BuilderFailure, EngineError};
 pub use crate::engine::oci::SourceImage;
 
 /// How long one source-store inspection may take. Longer than a probe: the
 /// Apple bridge may wait for launchd to start its service.
 pub const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalBuilderTarget {
-    Docker { endpoint: String },
-    Apple,
-}
-
-impl LocalBuilderTarget {
-    /// The builder as named in messages: the container system and, for
-    /// Docker, the endpoint it is bound to.
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Docker { endpoint } => format!("Docker at {endpoint}"),
-            Self::Apple => "Apple Containers".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuilderSelection {
-    Local(LocalBuilderTarget),
-    Incompatible(ImageSourceKind),
-    Unconfigured,
-}
-
-impl BuilderSelection {
-    pub fn from_source(source: Option<&ResolvedImageSource>) -> Self {
-        let Some(source) = source else {
-            return Self::Unconfigured;
-        };
-        match (&source.source, &source.docker_endpoint) {
-            // Acquisition reads Unix sockets only on Unix hosts, so only
-            // there can a build and its import share one endpoint.
-            (ImageSourceSpec::DockerStore { .. }, Some(Endpoint::Unix(_))) if cfg!(unix) => {
-                Self::Local(LocalBuilderTarget::Docker {
-                    endpoint: source.docker_endpoint.as_ref().unwrap().describe(),
-                })
-            }
-            (ImageSourceSpec::AppleStore { .. }, _) => Self::Local(LocalBuilderTarget::Apple),
-            _ => Self::Incompatible(source.source.kind()),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalImageBuildRequest {
-    pub target: LocalBuilderTarget,
-    pub reference: String,
-    pub dockerfile: PathBuf,
-    pub context: PathBuf,
-    pub platform: OciPlatform,
-    /// `--build-arg` values; empty for every current ready build, as for the
-    /// Docker runtime's builds.
-    pub build_args: Vec<(String, String)>,
-    pub no_cache: bool,
-}
+pub use crate::engine::container::{BuildRequest, BuildTarget};
 
 /// Fakeable seam for the whole ready flow. Implementations may hold a fake
 /// store and script probe, inspect, build, failure and cancellation outcomes.
 pub trait LocalImageBuilder: Send + Sync {
-    fn probe(&self, target: &LocalBuilderTarget, control: &BuildControl)
-        -> Result<(), EngineError>;
+    fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError>;
     fn inspect(
         &self,
-        target: &LocalBuilderTarget,
+        target: &BuildTarget,
         reference: &str,
         platform: &OciPlatform,
         control: &BuildControl,
     ) -> Result<SourceImage, EngineError>;
     fn build(
         &self,
-        request: &LocalImageBuildRequest,
+        request: &BuildRequest,
         control: &BuildControl,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<BuiltImageIdentity, EngineError>;
@@ -112,15 +53,19 @@ impl Default for HostLocalImageBuilder {
 }
 
 impl HostLocalImageBuilder {
-    pub fn with_runner(runner: Arc<dyn HostCommandRunner>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_runner(runner: Arc<dyn HostCommandRunner>) -> Self {
         Self { runner }
     }
 }
 
-fn bound_command(target: &LocalBuilderTarget) -> Command {
-    match target {
-        LocalBuilderTarget::Docker { endpoint } => bound_docker_command(endpoint),
-        LocalBuilderTarget::Apple => Command::new(crate::engine::host_cli::program("container")),
+impl HostLocalImageBuilder {
+    fn bound_command(target: &BuildTarget) -> Command {
+        match target {
+            BuildTarget::Runtime => Command::new(crate::engine::host_cli::program("docker")),
+            BuildTarget::Docker { endpoint } => Self::bound_docker_command(endpoint),
+            BuildTarget::Apple => Command::new(crate::engine::host_cli::program("container")),
+        }
     }
 }
 
@@ -159,11 +104,42 @@ const MANIFEST_MEDIA_TYPES: &[&str] = &[
 /// manifest (or index). Newer Engines also report a descriptor. The identity holds the digest
 /// in the matching field, so it is compared with the same kind of digest
 /// after export.
-pub fn classify_docker_inspect(
-    json: &str,
-    platform: &OciPlatform,
-) -> Result<SourceImage, EngineError> {
-    classify_docker_inspect_for_store(json, platform, false)
+impl HostLocalImageBuilder {
+    /// Run one builder CLI command. A missing CLI or a failed process means
+    /// the builder is unavailable; it is never reported as the selected
+    /// runtime missing (which would advise installing Docker and exit 3).
+    fn run_host(
+        &self,
+        target: &BuildTarget,
+        command: Command,
+        control: &BuildControl,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<std::process::ExitStatus, EngineError> {
+        self.runner
+            .run(command, control, on_line)
+            .map_err(|e| match e {
+                EngineError::ContainerRuntimeUnavailable { binary } => {
+                    EngineError::BuilderUnavailable {
+                        builder: target.describe(),
+                        detail: format!("`{binary}` was not found on PATH"),
+                    }
+                }
+                EngineError::Container(detail) => EngineError::BuilderUnavailable {
+                    builder: target.describe(),
+                    detail,
+                },
+                other => other,
+            })
+    }
+}
+
+impl HostLocalImageBuilder {
+    pub fn classify_docker_inspect(
+        json: &str,
+        platform: &OciPlatform,
+    ) -> Result<SourceImage, EngineError> {
+        classify_docker_inspect_for_store(json, platform, false)
+    }
 }
 
 fn classify_docker_inspect_for_store(
@@ -172,9 +148,9 @@ fn classify_docker_inspect_for_store(
     containerd_store: bool,
 ) -> Result<SourceImage, EngineError> {
     let inspect: DockerInspect = serde_json::from_str(json).map_err(|e| {
-        EngineError::Container(format!(
-            "Docker returned an unreadable image inspection: {e}"
-        ))
+        EngineError::ImageBuilder(BuilderFailure::UnreadableInspection {
+            detail: e.to_string(),
+        })
     })?;
     let found = OciPlatform {
         os: inspect.os,
@@ -202,57 +178,61 @@ fn classify_docker_inspect_for_store(
 impl HostLocalImageBuilder {
     fn docker_uses_containerd_store(
         &self,
-        target: &LocalBuilderTarget,
+        target: &BuildTarget,
         control: &BuildControl,
     ) -> Result<bool, EngineError> {
-        let mut command = bound_command(target);
+        let mut command = Self::bound_command(target);
         command.args(["info", "--format", "{{json .DriverStatus}}"]);
         let mut lines = Vec::new();
-        let status = self
-            .runner
-            .run(command, &control.bounded(PROBE_TIMEOUT), &mut |line| {
+        let status = self.run_host(
+            target,
+            command,
+            &control.bounded(PROBE_TIMEOUT),
+            &mut |line| {
                 lines.push(line.to_string());
-            })?;
+            },
+        )?;
         if !status.success() {
-            return Err(EngineError::Container(format!(
-                "{} could not identify its image store (exit {})",
-                target.describe(),
-                status.code().unwrap_or(-1)
-            )));
+            return Err(EngineError::ImageBuilder(
+                BuilderFailure::ImageStoreUnknown {
+                    builder: target.describe(),
+                    exit_code: status.code().unwrap_or(-1),
+                },
+            ));
         }
         let raw = lines
             .iter()
             .find(|line| line.trim_start().starts_with('['))
             .ok_or_else(|| {
-                EngineError::Container(format!(
-                    "{} did not report its image store; cannot verify the image ID",
-                    target.describe()
-                ))
+                EngineError::ImageBuilder(BuilderFailure::ImageStoreUnreported {
+                    builder: target.describe(),
+                })
             })?;
         let status: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-            EngineError::Container(format!(
-                "{} reported an unreadable image store: {e}",
-                target.describe()
-            ))
+            EngineError::ImageBuilder(BuilderFailure::ImageStoreUnreadable {
+                builder: target.describe(),
+                detail: e.to_string(),
+            })
         })?;
         Ok(status.to_string().contains("io.containerd.snapshotter.v1"))
     }
 
     fn inspect_docker(
         &self,
-        target: &LocalBuilderTarget,
+        target: &BuildTarget,
         reference: &str,
         platform: &OciPlatform,
         control: &BuildControl,
     ) -> Result<SourceImage, EngineError> {
-        let mut command = bound_command(target);
+        let mut command = Self::bound_command(target);
         command.args(["image", "inspect", "--format", "{{json .}}", reference]);
         let mut lines = Vec::new();
-        let status = self
-            .runner
-            .run(command, &control.bounded(INSPECT_TIMEOUT), &mut |line| {
-                lines.push(line.to_string())
-            })?;
+        let status = self.run_host(
+            target,
+            command,
+            &control.bounded(INSPECT_TIMEOUT),
+            &mut |line| lines.push(line.to_string()),
+        )?;
         if !status.success() {
             let missing = lines
                 .iter()
@@ -260,22 +240,22 @@ impl HostLocalImageBuilder {
             return if missing {
                 Ok(SourceImage::Absent)
             } else {
-                Err(EngineError::Container(format!(
-                    "{} could not inspect {reference} (exit {}): {}",
-                    target.describe(),
-                    status.code().unwrap_or(-1),
-                    tail(&lines)
-                )))
+                Err(EngineError::ImageBuilder(BuilderFailure::InspectFailed {
+                    builder: target.describe(),
+                    reference: reference.to_string(),
+                    exit_code: status.code().unwrap_or(-1),
+                    output: tail(&lines),
+                }))
             };
         }
         let json = lines
             .iter()
             .find(|line| line.trim_start().starts_with('{'))
             .ok_or_else(|| {
-                EngineError::Container(format!(
-                    "{} returned no image inspection for {reference}",
-                    target.describe()
-                ))
+                EngineError::ImageBuilder(BuilderFailure::InspectionMissing {
+                    builder: target.describe(),
+                    reference: reference.to_string(),
+                })
             })?;
         let containerd_store = if json.contains("\"Descriptor\"") {
             false
@@ -287,58 +267,68 @@ impl HostLocalImageBuilder {
 }
 
 impl LocalImageBuilder for HostLocalImageBuilder {
-    fn probe(
-        &self,
-        target: &LocalBuilderTarget,
-        control: &BuildControl,
-    ) -> Result<(), EngineError> {
-        let mut command = bound_command(target);
+    fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError> {
+        let mut command = Self::bound_command(target);
         let what = match target {
-            LocalBuilderTarget::Docker { .. } => {
+            BuildTarget::Runtime => {
+                return Err(EngineError::Config(
+                    "source builder requires an explicit source store".into(),
+                ))
+            }
+            BuildTarget::Docker { .. } => {
                 command.arg("info");
                 "docker info"
             }
-            LocalBuilderTarget::Apple => {
+            BuildTarget::Apple => {
                 command.args(["system", "status"]);
                 "container system status"
             }
         };
         let mut lines = Vec::new();
-        let status = self
-            .runner
-            .run(command, &control.bounded(PROBE_TIMEOUT), &mut |line| {
+        let status = self.run_host(
+            target,
+            command,
+            &control.bounded(PROBE_TIMEOUT),
+            &mut |line| {
                 lines.push(line.to_string());
                 if lines.len() > 50 {
                     lines.remove(0);
                 }
-            })?;
+            },
+        )?;
         if status.success() {
             Ok(())
         } else {
-            Err(EngineError::Container(format!(
-                "the {} image builder is unavailable (`{what}` exited {}): {}",
-                target.describe(),
-                status.code().unwrap_or(-1),
-                tail(&lines)
-            )))
+            Err(EngineError::BuilderUnavailable {
+                builder: target.describe(),
+                detail: format!(
+                    "`{what}` exited {}: {}",
+                    status.code().unwrap_or(-1),
+                    tail(&lines)
+                ),
+            })
         }
     }
 
     fn inspect(
         &self,
-        target: &LocalBuilderTarget,
+        target: &BuildTarget,
         reference: &str,
         platform: &OciPlatform,
         control: &BuildControl,
     ) -> Result<SourceImage, EngineError> {
         self.probe(target, control)?;
         match target {
-            LocalBuilderTarget::Apple => {
+            BuildTarget::Runtime => Err(EngineError::Config(
+                "source builder requires an explicit source store".into(),
+            )),
+            BuildTarget::Apple => {
                 let transport =
                     crate::engine::oci::apple_store::installed_transport().ok_or_else(|| {
-                        EngineError::Container(
-                            "Apple Containers image transport is unavailable".into(),
-                        )
+                        EngineError::BuilderUnavailable {
+                            builder: target.describe(),
+                            detail: "the Apple Containers image transport is unavailable".into(),
+                        }
                     })?;
                 crate::engine::oci::apple_store::inspect_local(
                     transport.as_ref(),
@@ -347,35 +337,23 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                     &control.bounded(INSPECT_TIMEOUT),
                 )
             }
-            LocalBuilderTarget::Docker { .. } => {
-                self.inspect_docker(target, reference, platform, control)
-            }
+            BuildTarget::Docker { .. } => self.inspect_docker(target, reference, platform, control),
         }
     }
 
     fn build(
         &self,
-        request: &LocalImageBuildRequest,
+        request: &BuildRequest,
         control: &BuildControl,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<BuiltImageIdentity, EngineError> {
         self.probe(&request.target, control)?;
         match &request.target {
-            LocalBuilderTarget::Docker { endpoint } => {
-                let image_id = build_local_docker(
-                    self.runner.as_ref(),
-                    &HostBuildRequest {
-                        endpoint,
-                        tag: &request.reference,
-                        dockerfile: &request.dockerfile,
-                        context: &request.context,
-                        platform: &request.platform,
-                        build_args: &request.build_args,
-                        no_cache: request.no_cache,
-                    },
-                    control,
-                    on_line,
-                )?;
+            BuildTarget::Runtime => Err(EngineError::Config(
+                "source builder requires an explicit source store".into(),
+            )),
+            BuildTarget::Docker { .. } => {
+                let image_id = self.build_local_docker(request, control, on_line)?;
                 // Classify the ID the build itself reported, never the tag,
                 // which a concurrent retag could already have moved.
                 let built = self.inspect_docker(
@@ -391,35 +369,37 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                     {
                         Ok(identity)
                     }
-                    SourceImage::Present(_) => Err(EngineError::Container(format!(
-                        "{} reported image {image_id} for {}, but inspecting it returned a \
-                         different image",
-                        request.target.describe(),
-                        request.reference
-                    ))),
-                    SourceImage::Unbound => Err(EngineError::Container(format!(
-                        "{} stored the build of {} as a multi-platform index; awman needs a \
-                         single {} image to verify the import",
-                        request.target.describe(),
-                        request.reference,
-                        request.platform
-                    ))),
-                    SourceImage::Absent => Err(EngineError::Container(format!(
-                        "{} reported image {image_id} for {}, but it is not a {} image in that \
-                         store",
-                        request.target.describe(),
-                        request.reference,
-                        request.platform
-                    ))),
+                    SourceImage::Present(_) => Err(EngineError::ImageBuilder(
+                        BuilderFailure::BuiltImageChanged {
+                            builder: request.target.describe(),
+                            image_id: image_id.to_string(),
+                            reference: request.reference.clone(),
+                        },
+                    )),
+                    SourceImage::Unbound => Err(EngineError::ImageBuilder(
+                        BuilderFailure::MultiPlatformOutput {
+                            builder: request.target.describe(),
+                            reference: request.reference.clone(),
+                            platform: request.platform.to_string(),
+                        },
+                    )),
+                    SourceImage::Absent => Err(EngineError::ImageBuilder(
+                        BuilderFailure::BuiltImageMissing {
+                            builder: request.target.describe(),
+                            image_id: image_id.to_string(),
+                            reference: request.reference.clone(),
+                            platform: request.platform.to_string(),
+                        },
+                    )),
                 }
             }
-            LocalBuilderTarget::Apple => {
-                let mut command = bound_command(&request.target);
+            BuildTarget::Apple => {
+                let mut command = Self::bound_command(&request.target);
                 let platform = request.platform.to_string();
-                let argv = crate::engine::container::host_cli_backend::BuildArgv {
+                let argv = crate::engine::container::host_build::BuildArgv {
                     platform: Some(&platform),
                     build_args: &request.build_args,
-                    ..crate::engine::container::host_cli_backend::BuildArgv::new(
+                    ..crate::engine::container::host_build::BuildArgv::new(
                         &request.reference,
                         &request.dockerfile,
                         &request.context,
@@ -428,7 +408,7 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                 };
                 command.args(argv.to_args());
                 let mut produced_manifest = None;
-                let status = self.runner.run(command, control, &mut |line| {
+                let status = self.run_host(&request.target, command, control, &mut |line| {
                     if let Some(marker) = line.find("exporting manifest sha256:") {
                         let digest = line[marker + "exporting manifest ".len()..]
                             .split_whitespace()
@@ -445,9 +425,7 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                     });
                 }
                 let produced_manifest = produced_manifest.ok_or_else(|| {
-                    EngineError::Container(
-                        "Apple builder did not report a verifiable output manifest digest".into(),
-                    )
+                    EngineError::ImageBuilder(BuilderFailure::AppleManifestUnreported)
                 })?;
                 let installed = match self.inspect(
                     &request.target,
@@ -465,16 +443,15 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                         .map_err(EngineError::Config);
                     }
                     SourceImage::Absent => {
-                        return Err(EngineError::Container(
-                            "Apple builder produced no inspectable image".into(),
-                        ))
+                        return Err(EngineError::ImageBuilder(BuilderFailure::AppleImageMissing))
                     }
                 };
                 if installed.manifest_digest() != Some(&produced_manifest) {
-                    return Err(EngineError::Container(format!(
-                        "Apple image {} changed between build and source-store inspection",
-                        request.reference
-                    )));
+                    return Err(EngineError::ImageBuilder(
+                        BuilderFailure::AppleImageChanged {
+                            reference: request.reference.clone(),
+                        },
+                    ));
                 }
                 Ok(installed)
             }
@@ -482,15 +459,142 @@ impl LocalImageBuilder for HostLocalImageBuilder {
     }
 }
 
-pub fn build_control(cancel: crate::engine::oci::CancelToken) -> BuildControl {
-    BuildControl::new(cancel, SOURCE_BUILD_TIMEOUT)
+impl HostLocalImageBuilder {
+    pub(crate) fn bound_docker_command(endpoint: &str) -> Command {
+        let mut command = Command::new(crate::engine::host_cli::program("docker"));
+        command.args(["--host", endpoint]);
+        for key in DOCKER_AMBIENT_ENV {
+            command.env_remove(key);
+        }
+        command.env("DOCKER_HOST", endpoint);
+        command
+    }
 }
+
+impl HostLocalImageBuilder {
+    pub(crate) fn build_local_docker(
+        &self,
+        request: &crate::engine::container::BuildRequest,
+        control: &BuildControl,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<Digest, EngineError> {
+        let crate::engine::container::BuildTarget::Docker { endpoint } = &request.target else {
+            return Err(EngineError::Config(
+                "source-bound Docker build needs a Docker endpoint".into(),
+            ));
+        };
+        let path = self.docker_build_path(endpoint, control)?;
+        let iid = tempfile::NamedTempFile::new().map_err(|e| {
+            EngineError::ImageBuilder(BuilderFailure::ImageIdFileCreate {
+                detail: e.to_string(),
+            })
+        })?;
+        let platform = request.platform.to_string();
+        let argv = BuildArgv {
+            buildx: matches!(path, DockerBuildPath::BuildKit),
+            platform: Some(&platform),
+            iidfile: Some(iid.path()),
+            build_args: &request.build_args,
+            ..BuildArgv::new(
+                &request.reference,
+                &request.dockerfile,
+                &request.context,
+                request.no_cache,
+            )
+        };
+        let mut command = Self::bound_docker_command(endpoint);
+        command.args(argv.to_args());
+        let status = self.run_host(&request.target, command, control, on_line)?;
+        if !status.success() {
+            return Err(EngineError::ImageBuildExitNonzero {
+                tag: request.reference.clone(),
+                exit_code: status.code().unwrap_or(-1),
+            });
+        }
+        let raw = std::fs::read_to_string(iid.path()).map_err(|e| {
+            EngineError::ImageBuilder(BuilderFailure::ImageIdFileRead {
+                detail: e.to_string(),
+            })
+        })?;
+        Digest::parse(raw.trim()).map_err(|e| {
+            EngineError::ImageBuilder(BuilderFailure::ImageIdFileInvalid {
+                detail: e.to_string(),
+            })
+        })
+    }
+}
+
+impl HostLocalImageBuilder {
+    fn docker_build_path(
+        &self,
+        endpoint: &str,
+        control: &BuildControl,
+    ) -> Result<DockerBuildPath, EngineError> {
+        let probe = control.bounded(PROBE_TIMEOUT);
+        let mut version = Self::bound_docker_command(endpoint);
+        version.args(["buildx", "version"]);
+        let target = BuildTarget::Docker {
+            endpoint: endpoint.to_string(),
+        };
+        if !self
+            .run_host(&target, version, &probe, &mut |_| {})?
+            .success()
+        {
+            return Ok(DockerBuildPath::Legacy);
+        }
+        let mut inspect = Self::bound_docker_command(endpoint);
+        inspect.args(["buildx", "inspect", "default"]);
+        let mut lines = Vec::new();
+        let status = self.run_host(&target, inspect, &probe, &mut |line| {
+            lines.push(line.to_string())
+        })?;
+        let driver = lines.iter().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "Driver").then(|| value.trim().to_string())
+        });
+        match (status.success(), driver.as_deref()) {
+            (true, Some("docker")) => Ok(DockerBuildPath::BuildKit),
+            (true, other) => Err(EngineError::ImageBuilder(
+                BuilderFailure::UnsupportedBuildxDriver {
+                    endpoint: endpoint.to_string(),
+                    driver: other.unwrap_or("unknown").to_string(),
+                },
+            )),
+            (false, _) => Err(EngineError::ImageBuilder(
+                BuilderFailure::BuildxInspectFailed {
+                    endpoint: endpoint.to_string(),
+                    exit_code: status.code().unwrap_or(-1),
+                    output: tail(&lines),
+                },
+            )),
+        }
+    }
+}
+
+/// Which Docker build path a bound endpoint uses, decided the way the
+/// `docker` CLI decides it: BuildKit through buildx when buildx is
+/// installed, the legacy builder otherwise. awman never downgrades a
+/// buildx-capable CLI to the legacy builder.
+enum DockerBuildPath {
+    /// buildx is installed and the endpoint's `default` builder uses the
+    /// `docker` driver, so its output is stored in that same Engine.
+    BuildKit,
+    /// No buildx: `docker build` uses the legacy builder, as it would for
+    /// the Docker runtime on this host.
+    Legacy,
+}
+/// Environment that could redirect a Docker command away from the endpoint
+/// it is bound to.
+const DOCKER_AMBIENT_ENV: &[&str] = &[
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "BUILDX_BUILDER",
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::config::image_source::DockerTlsConfig;
-    use crate::engine::oci::docker_engine::Endpoint;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -528,7 +632,7 @@ mod tests {
     fn host_builder_binds_inspection_and_classifies_old_containerd_ids() {
         let runner = Arc::new(RecordingRunner::default());
         let builder = HostLocalImageBuilder::with_runner(runner.clone());
-        let target = LocalBuilderTarget::Docker {
+        let target = BuildTarget::Docker {
             endpoint: "unix:///run/explicit.sock".into(),
         };
         let image = builder
@@ -536,7 +640,7 @@ mod tests {
                 &target,
                 "agent:latest",
                 &OciPlatform::host_linux(),
-                &build_control(crate::engine::oci::CancelToken::new()),
+                &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
             )
             .unwrap();
         assert!(
@@ -582,7 +686,7 @@ mod tests {
             platform.os,
             platform.architecture
         );
-        match classify_docker_inspect(&json, &platform).unwrap() {
+        match HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap() {
             SourceImage::Present(identity) => {
                 assert_eq!(identity.config_digest().unwrap().as_str(), digest('a'));
                 assert!(identity.manifest_digest().is_none());
@@ -622,7 +726,7 @@ mod tests {
             platform.architecture,
             digest('b'),
         );
-        match classify_docker_inspect(&json, &platform).unwrap() {
+        match HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap() {
             SourceImage::Present(identity) => {
                 assert_eq!(identity.manifest_digest().unwrap().as_str(), digest('b'));
                 assert!(identity.config_digest().is_none());
@@ -644,7 +748,7 @@ mod tests {
             platform.architecture,
             digest('c'),
         );
-        match classify_docker_inspect(&json, &platform).unwrap() {
+        match HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap() {
             SourceImage::Present(identity) => {
                 assert_eq!(identity.manifest_digest().unwrap().as_str(), digest('c'));
             }
@@ -666,7 +770,7 @@ mod tests {
             digest('d'),
         );
         assert_eq!(
-            classify_docker_inspect(&json, &platform).unwrap(),
+            HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap(),
             SourceImage::Unbound
         );
     }
@@ -684,7 +788,7 @@ mod tests {
             wrong.architecture,
         );
         assert_eq!(
-            classify_docker_inspect(&json, &platform).unwrap(),
+            HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap(),
             SourceImage::Absent
         );
     }
@@ -695,111 +799,6 @@ mod tests {
     #[test]
     fn classify_docker_inspect_malformed_json_is_an_error() {
         let platform = host_platform();
-        assert!(classify_docker_inspect("not json", &platform).is_err());
-    }
-
-    // ── BuilderSelection::from_source ────────────────────────────────────
-
-    fn resolved(source: ImageSourceSpec, docker_endpoint: Option<Endpoint>) -> ResolvedImageSource {
-        ResolvedImageSource {
-            source,
-            reference: "awman-repo-claude:latest".into(),
-            platform: host_platform(),
-            store: "unix:///var/run/docker.sock".into(),
-            docker_endpoint,
-        }
-    }
-
-    #[test]
-    fn no_source_is_unconfigured() {
-        assert_eq!(
-            BuilderSelection::from_source(None),
-            BuilderSelection::Unconfigured
-        );
-    }
-
-    #[test]
-    fn docker_store_on_a_local_unix_socket_is_the_local_docker_builder() {
-        let source = resolved(
-            ImageSourceSpec::DockerStore {
-                host: Some("unix:///var/run/docker.sock".into()),
-                tls: None,
-                reference: None,
-            },
-            Some(Endpoint::Unix("/var/run/docker.sock".into())),
-        );
-        assert_eq!(
-            BuilderSelection::from_source(Some(&source)),
-            BuilderSelection::Local(LocalBuilderTarget::Docker {
-                endpoint: "unix:///var/run/docker.sock".into(),
-            })
-        );
-    }
-
-    /// Every TCP endpoint is incompatible for building, including loopback
-    /// and TLS — only a local Unix socket is eligible in this item.
-    #[test]
-    fn docker_store_on_any_tcp_endpoint_is_incompatible() {
-        for tls in [
-            None,
-            Some(DockerTlsConfig {
-                ca: "/ca.pem".into(),
-                cert: Some("/cert.pem".into()),
-                key: Some("/key.pem".into()),
-                verify: true,
-            }),
-        ] {
-            let source = resolved(
-                ImageSourceSpec::DockerStore {
-                    host: Some("tcp://127.0.0.1:2375".into()),
-                    tls: tls.clone(),
-                    reference: None,
-                },
-                Some(Endpoint::Tcp {
-                    host: "127.0.0.1".into(),
-                    port: 2375,
-                    tls,
-                }),
-            );
-            assert_eq!(
-                BuilderSelection::from_source(Some(&source)),
-                BuilderSelection::Incompatible(ImageSourceKind::DockerStore),
-                "TCP must be incompatible even for loopback"
-            );
-        }
-    }
-
-    #[test]
-    fn apple_store_is_always_the_local_apple_builder() {
-        let source = resolved(ImageSourceSpec::AppleStore { reference: None }, None);
-        assert_eq!(
-            BuilderSelection::from_source(Some(&source)),
-            BuilderSelection::Local(LocalBuilderTarget::Apple)
-        );
-    }
-
-    #[test]
-    fn archive_and_registry_sources_are_incompatible() {
-        let archive = resolved(
-            ImageSourceSpec::Archive {
-                path: "/exports/agent.tar".into(),
-            },
-            None,
-        );
-        assert_eq!(
-            BuilderSelection::from_source(Some(&archive)),
-            BuilderSelection::Incompatible(ImageSourceKind::Archive)
-        );
-        let registry = resolved(
-            ImageSourceSpec::Registry {
-                registry: Some("ghcr.io".into()),
-                reference: None,
-            },
-            None,
-        );
-        assert_eq!(
-            BuilderSelection::from_source(Some(&registry)),
-            BuilderSelection::Incompatible(ImageSourceKind::Registry)
-        );
+        assert!(HostLocalImageBuilder::classify_docker_inspect("not json", &platform).is_err());
     }
 }

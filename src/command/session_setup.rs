@@ -437,10 +437,28 @@ impl SessionSetup {
             non_interactive: true,
             env_passthrough: None,
         };
-        // `ReadyEngine::new` already derives the image sources from this same
-        // session's effective config; a separate `.with_image_sources(...)`
-        // call here would just recompute the identical value in Layer 2.
-        let mut ready_engine = ReadyEngine::new(
+        let (resolved_builtin, data_home) = match session_guard
+            .effective_config()
+            .builtin_settings()
+            .and_then(|resolved| {
+                crate::data::config::global::GlobalConfig::data_home_with(
+                    session_guard.effective_config().env(),
+                )
+                .map(|data_home| (resolved, data_home))
+            }) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                drop(session_guard);
+                tracing::error!(session_id = %session_id, error = %e, "Invalid builtin configuration");
+                self.mark_failed(presenter, "ready", &e.to_string());
+                self.persist_status("failed");
+                self.finish(presenter).await;
+                return;
+            }
+        };
+        let mut ready_engine = ReadyEngine::for_session_setup(
+            resolved_builtin,
+            data_home,
             Arc::new(session_guard.clone()),
             Arc::clone(&self.engines.git_engine),
             Arc::clone(&self.engines.overlay_engine),

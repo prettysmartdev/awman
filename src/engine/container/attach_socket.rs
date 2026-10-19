@@ -30,48 +30,28 @@
 //!
 //! ## Wire protocol
 //!
-//! Symmetric length-prefixed frames: `tag: u8, len: u32 LE, payload: [u8; len]`.
+//! The shared [`attach_protocol`](super::attach_protocol) frames: this server
+//! sends `Output` (raw PTY bytes) and `Lagged` (this client's output is
+//! incomplete; detach with error), and accepts `Stdin` and `Resize`.
 //!
-//! - server → client: [`OUTPUT_FRAME`] — raw PTY output bytes.
-//!   [`LAGGED_FRAME`] — this client's output is incomplete; detach with error.
-//! - client → server: [`STDIN_FRAME`] — raw stdin bytes for the agent;
-//!   [`RESIZE_FRAME`] — 4-byte payload `cols: u16 LE, rows: u16 LE`.
+//! ## Socket path
+//!
+//! This rendezvous socket lives under `~/.awman/attach/` (or
+//! `$AWMAN_ATTACH_DIR`), named by a hash of the container name. The builtin
+//! runtime resolves its own attach sockets with `BuiltinPaths::attach`, inside
+//! its private state home (keyed by sandbox id and owner, subject to that
+//! home's socket-length budget and `AWMAN_BUILTIN_STATE_DIR`). The two stay
+//! separate because the endpoints have different owners, lifetimes and state
+//! roots; both are pure functions of their inputs (the home directory comes
+//! from the `EnvSnapshot` too) and never read the process environment
+//! themselves.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::data::config::env::EnvSnapshot;
 use crate::data::session::AgentHandle;
 use crate::engine::error::EngineError;
-
-/// Server → client: raw PTY output bytes.
-pub(crate) const OUTPUT_FRAME: u8 = 0;
-/// Client → server: raw stdin bytes.
-pub(crate) const STDIN_FRAME: u8 = 1;
-/// Client → server: `cols: u16 LE, rows: u16 LE`.
-pub(crate) const RESIZE_FRAME: u8 = 2;
-/// Server → client: the output channel overran this client. No later output
-/// or successful exit may be presented as a complete stream.
-pub(crate) const LAGGED_FRAME: u8 = 3;
-/// Upper bound on a single frame's payload; anything larger is a protocol
-/// violation and closes the connection.
-const MAX_FRAME_LEN: u32 = 1 << 20;
-
-/// Encode one frame.
-pub(crate) fn encode_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(5 + payload.len());
-    frame.push(tag);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(payload);
-    frame
-}
-
-/// Encode a resize frame.
-pub(crate) fn encode_resize(cols: u16, rows: u16) -> Vec<u8> {
-    let mut payload = [0u8; 4];
-    payload[..2].copy_from_slice(&cols.to_le_bytes());
-    payload[2..].copy_from_slice(&rows.to_le_bytes());
-    encode_frame(RESIZE_FRAME, &payload)
-}
 
 /// The directory attach sockets live in: `$AWMAN_ATTACH_DIR` when set (used
 /// by tests and relocated setups), else `~/.awman/attach/`. Both the serving
@@ -81,20 +61,21 @@ pub(crate) fn encode_resize(cols: u16, rows: u16) -> Vec<u8> {
 /// The variable is declared and parsed in Layer 0
 /// ([`EnvSnapshot::attach_dir`]); nothing above Layer 0 reads the environment
 /// directly (F-37).
-pub(crate) fn default_attach_socket_dir() -> Option<PathBuf> {
-    if let Some(dir) = crate::data::config::env::Env::from_process().attach_dir() {
+pub(crate) fn default_attach_socket_dir(env: &EnvSnapshot) -> Option<PathBuf> {
+    if let Some(dir) = env.attach_dir() {
         return Some(dir);
     }
-    dirs::home_dir().map(|home| home.join(".awman").join("attach"))
+    env.home_dir()
+        .map(|home| home.join(".awman").join("attach"))
 }
 
 /// The socket path for one container. The filename is a hash of the container
 /// name rather than the name itself: unix socket paths have a hard length
 /// limit (104 bytes on macOS), which a home prefix plus a full squad container
 /// name can exceed.
-pub(crate) fn attach_socket_path(container_name: &str) -> Option<PathBuf> {
+pub(crate) fn attach_socket_path(env: &EnvSnapshot, container_name: &str) -> Option<PathBuf> {
     let digest = crate::data::fs::hash::sha256_hex(container_name);
-    default_attach_socket_dir().map(|dir| dir.join(format!("{}.sock", &digest[..16])))
+    default_attach_socket_dir(env).map(|dir| dir.join(format!("{}.sock", &digest[..16])))
 }
 
 /// What the socket server needs from the owning PTY bridge.
@@ -140,9 +121,13 @@ pub(crate) struct SocketAttachInstance {
 mod unix_impl {
     use super::*;
     use std::sync::atomic::AtomicBool;
-    use std::sync::Mutex;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
+
+    use crate::engine::container::attach_protocol::{
+        is_protocol_violation, parse_resize, read_frame, resize_payload, write_frame,
+        write_frame_bounded, Tag, WRITE_TIMEOUT,
+    };
 
     use crate::engine::agent_runtime::execution::{
         AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, CancelHandle,
@@ -150,6 +135,7 @@ mod unix_impl {
     };
     use crate::engine::agent_runtime::frontend::AgentFrontend;
     use crate::engine::agent_runtime::output_tail::OutputTail;
+    use crate::engine::container::io_bridge::{OutputActivity, StuckConfig, StuckDetector};
 
     /// Bind the socket and start serving. Never fails the container run —
     /// callers log and continue without attach support on error.
@@ -245,8 +231,7 @@ mod unix_impl {
         loop {
             match output_rx.recv().await {
                 Ok(bytes) => {
-                    if write_half
-                        .write_all(&encode_frame(OUTPUT_FRAME, &bytes))
+                    if write_frame_bounded(&mut write_half, Tag::Output, &bytes, WRITE_TIMEOUT)
                         .await
                         .is_err()
                     {
@@ -254,7 +239,8 @@ mod unix_impl {
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = write_half.write_all(&encode_frame(LAGGED_FRAME, &[])).await;
+                    let _ =
+                        write_frame_bounded(&mut write_half, Tag::Lagged, &[], WRITE_TIMEOUT).await;
                     break;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -270,28 +256,17 @@ mod unix_impl {
         resize: Arc<dyn Fn(u16, u16) + Send + Sync>,
     ) {
         loop {
-            let mut header = [0u8; 5];
-            if read_half.read_exact(&mut header).await.is_err() {
+            let Ok((tag, payload)) = read_frame(&mut read_half).await else {
                 break;
-            }
-            let tag = header[0];
-            let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
-            if len > MAX_FRAME_LEN {
-                break;
-            }
-            let mut payload = vec![0u8; len as usize];
-            if read_half.read_exact(&mut payload).await.is_err() {
-                break;
-            }
+            };
             match tag {
-                STDIN_FRAME => {
+                Tag::Stdin => {
                     if stdin.send(payload).is_err() {
                         break;
                     }
                 }
-                RESIZE_FRAME if len == 4 => {
-                    let cols = u16::from_le_bytes([payload[0], payload[1]]);
-                    let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                Tag::Resize if parse_resize(&payload).is_some() => {
+                    let (cols, rows) = parse_resize(&payload).unwrap_or_default();
                     (resize)(cols, rows);
                 }
                 _ => break,
@@ -356,8 +331,7 @@ mod unix_impl {
             let stdin_injector = io.stdin_tx.clone();
             tokio::spawn(async move {
                 if let Some((cols, rows)) = initial_size {
-                    if write_half
-                        .write_all(&encode_resize(cols, rows))
+                    if write_frame(&mut write_half, Tag::Resize, &resize_payload(cols, rows))
                         .await
                         .is_err()
                     {
@@ -368,17 +342,16 @@ mod unix_impl {
                     tokio::select! {
                         bytes = stdin_rx.recv() => {
                             let Some(bytes) = bytes else { break };
-                            if write_half
-                                .write_all(&encode_frame(STDIN_FRAME, &bytes))
-                                .await
-                                .is_err()
-                            {
+                            if write_frame(&mut write_half, Tag::Stdin, &bytes).await.is_err() {
                                 break;
                             }
                         }
                         size = recv_resize(&mut resize_rx) => {
                             let Some((cols, rows)) = size else { break };
-                            if write_half.write_all(&encode_resize(cols, rows)).await.is_err() {
+                            if write_frame(&mut write_half, Tag::Resize, &resize_payload(cols, rows))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -389,62 +362,60 @@ mod unix_impl {
             // Reader: framed output → frontend stdout, with the same activity
             // tracking the PTY bridge feeds its stuck detector from.
             let output_tail = Arc::new(OutputTail::with_default_capacity());
-            let activity: crate::engine::container::io_bridge::SharedActivity =
-                Arc::new(Mutex::new(None));
-            let first_byte = Arc::new(AtomicBool::new(false));
+            let output_activity = OutputActivity::new();
             let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<(), EngineError>>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stdout_tx = io.stdout;
             let tail = Arc::clone(&output_tail);
-            let act = Arc::clone(&activity);
-            let fb = Arc::clone(&first_byte);
+            let act = output_activity.clone();
             tokio::spawn(async move {
                 let mut outcome = Err(EngineError::Container(
                     "attach endpoint closed without an exit status; reconnect if the launcher is still alive".into(),
                 ));
                 loop {
-                    let mut header = [0u8; 5];
-                    if read_half.read_exact(&mut header).await.is_err() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
-                    if header[0] == LAGGED_FRAME && len == 0 {
-                        outcome = Err(EngineError::Container(
-                            "attach output lagged; reconnect to the live agent".into(),
-                        ));
-                        break;
-                    }
-                    if header[0] != OUTPUT_FRAME || len > MAX_FRAME_LEN {
-                        outcome = Err(EngineError::Container("invalid attach output frame".into()));
-                        break;
-                    }
-                    let mut payload = vec![0u8; len as usize];
-                    if read_half.read_exact(&mut payload).await.is_err() {
-                        break;
-                    }
-                    if let Ok(mut guard) = act.lock() {
-                        *guard = Some(std::time::Instant::now());
-                    }
-                    fb.store(true, std::sync::atomic::Ordering::Release);
+                    let payload = match read_frame(&mut read_half).await {
+                        Ok((Tag::Output, payload)) => payload,
+                        Ok((Tag::Lagged, _)) => {
+                            outcome = Err(EngineError::Container(
+                                "attach output lagged; reconnect to the live agent".into(),
+                            ));
+                            break;
+                        }
+                        Ok(_) => {
+                            outcome =
+                                Err(EngineError::Container("invalid attach output frame".into()));
+                            break;
+                        }
+                        Err(error) => {
+                            if is_protocol_violation(&error) {
+                                outcome = Err(EngineError::Container(
+                                    "invalid attach output frame".into(),
+                                ));
+                            }
+                            break;
+                        }
+                    };
+                    act.touch();
                     tail.push_bytes(&payload);
                     let _ = stdout_tx.send(payload);
                 }
                 let _ = exit_tx.send(outcome);
             });
 
-            let stuck_tx = crate::engine::container::io_bridge::spawn_stuck_detector(
-                activity,
-                first_byte,
-                grace_timeout,
-                stuck_timeout,
-                std::time::Duration::ZERO,
-                None,
+            let stuck_tx = StuckDetector::spawn(
+                StuckConfig {
+                    grace_timeout,
+                    stuck_timeout,
+                    container_start_delay: std::time::Duration::ZERO,
+                    cancel_on_grace_expired: None,
+                },
+                &output_activity,
             );
 
             let backend = SocketAttachExecution {
                 exit_rx,
                 shutdown,
-                shutdown_for_handle,
+                shutdown_for_handle: Arc::new(shutdown_for_handle),
                 stdin_injector,
                 started_at,
                 cancelled,
@@ -474,7 +445,7 @@ mod unix_impl {
     struct SocketAttachExecution {
         exit_rx: std::sync::mpsc::Receiver<Result<(), EngineError>>,
         shutdown: std::os::unix::net::UnixStream,
-        shutdown_for_handle: std::os::unix::net::UnixStream,
+        shutdown_for_handle: Arc<std::os::unix::net::UnixStream>,
         stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         started_at: chrono::DateTime<chrono::Utc>,
         cancelled: Arc<AtomicBool>,
@@ -512,17 +483,14 @@ mod unix_impl {
             Ok(())
         }
 
-        fn cancel_handle(&self) -> Option<CancelHandle> {
-            let stream = match self.shutdown_for_handle.try_clone() {
-                Ok(stream) => stream,
-                Err(_) => return None,
-            };
+        fn cancel_handle(&self) -> CancelHandle {
+            let stream = Arc::clone(&self.shutdown_for_handle);
             let cancelled = Arc::clone(&self.cancelled);
-            Some(CancelHandle::new(move || {
+            CancelHandle::new(move || {
                 cancelled.store(true, std::sync::atomic::Ordering::Release);
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 Ok(())
-            }))
+            })
         }
     }
 }
@@ -548,30 +516,35 @@ mod tests {
     };
 
     #[test]
-    fn frames_are_length_prefixed_and_resize_carries_cols_then_rows() {
-        assert_eq!(
-            encode_frame(STDIN_FRAME, b"hi"),
-            vec![STDIN_FRAME, 2, 0, 0, 0, b'h', b'i']
-        );
-        assert_eq!(
-            encode_resize(0x0102, 0x0304),
-            vec![RESIZE_FRAME, 4, 0, 0, 0, 0x02, 0x01, 0x04, 0x03]
-        );
-    }
-
-    #[test]
     fn socket_paths_are_deterministic_short_and_name_scoped() {
-        std::env::set_var("AWMAN_ATTACH_DIR", "/tmp/awman-attach-test");
-        let a = attach_socket_path("awman-squad-some-quite-long-task-name-0123abcd").unwrap();
-        let b = attach_socket_path("awman-squad-some-quite-long-task-name-0123abcd").unwrap();
-        let c = attach_socket_path("awman-squad-other-89abcdef").unwrap();
-        std::env::remove_var("AWMAN_ATTACH_DIR");
+        let env = EnvSnapshot::with_overrides([("AWMAN_ATTACH_DIR", "/tmp/awman-attach-test")]);
+        let a = attach_socket_path(&env, "awman-squad-some-quite-long-task-name-0123abcd").unwrap();
+        let b = attach_socket_path(&env, "awman-squad-some-quite-long-task-name-0123abcd").unwrap();
+        let c = attach_socket_path(&env, "awman-squad-other-89abcdef").unwrap();
         assert_eq!(a, b, "the path must be derivable in any process");
         assert_ne!(a, c);
         let file = a.file_name().unwrap().to_str().unwrap();
         // Hashed filename: bounded length regardless of container-name length,
         // because unix socket paths have a hard OS limit (104 bytes on macOS).
         assert_eq!(file.len(), "0123456789abcdef.sock".len(), "{file}");
+    }
+
+    #[test]
+    fn default_dir_derives_from_snapshot_home_not_process_home() {
+        let a = EnvSnapshot::with_overrides([("HOME", "/home/session-a")]);
+        assert_eq!(
+            default_attach_socket_dir(&a),
+            Some(PathBuf::from("/home/session-a/.awman/attach"))
+        );
+        // No HOME in the snapshot: no ambient fallback.
+        assert_eq!(default_attach_socket_dir(&EnvSnapshot::empty()), None);
+        // An explicit attach dir wins over HOME.
+        let both =
+            EnvSnapshot::with_overrides([("HOME", "/home/a"), ("AWMAN_ATTACH_DIR", "/run/x")]);
+        assert_eq!(
+            default_attach_socket_dir(&both),
+            Some(PathBuf::from("/run/x"))
+        );
     }
 
     /// A test-side handle to a sender the frontend creates lazily.
@@ -801,6 +774,51 @@ mod tests {
             .await
             .unwrap();
         assert!(result.unwrap_err().to_string().contains("lagged"));
+    }
+
+    /// The server speaks the shared codec: raw frames in, tagged frames out,
+    /// and a lagging client is sent `Lagged` (tag 6), never a stderr tag.
+    #[tokio::test]
+    async fn server_speaks_the_shared_codec_on_a_raw_socket() {
+        use crate::engine::container::attach_protocol::{
+            read_frame, resize_payload, write_frame, Tag,
+        };
+        let mut server = start_server();
+        let mut stream = tokio::net::UnixStream::connect(&server.path).await.unwrap();
+        write_frame(&mut stream, Tag::Resize, &resize_payload(100, 30))
+            .await
+            .unwrap();
+        write_frame(&mut stream, Tag::Stdin, &[0, 255, 13])
+            .await
+            .unwrap();
+        let stdin = tokio::time::timeout(Duration::from_secs(2), server.stdin_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stdin, [0, 255, 13]);
+        assert_eq!(server.resizes.lock().unwrap().as_slice(), [(100, 30)]);
+        server.output.send(b"screen".to_vec()).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).await.unwrap(),
+            (Tag::Output, b"screen".to_vec())
+        );
+        for byte in 0..256 {
+            server.output.send(vec![byte as u8]).unwrap();
+        }
+        loop {
+            let (tag, _) = read_frame(&mut stream).await.unwrap();
+            if tag == Tag::Lagged {
+                assert_eq!(tag as u8, 6);
+                break;
+            }
+            assert_eq!(tag, Tag::Output);
+        }
+        // Server-to-client tags are not valid client input: the server drops us.
+        let mut stream = tokio::net::UnixStream::connect(&server.path).await.unwrap();
+        write_frame(&mut stream, Tag::Exit, &0_i32.to_le_bytes())
+            .await
+            .unwrap();
+        assert!(read_frame(&mut stream).await.is_err());
     }
 
     /// No serving process → a clear, attributable error instead of a doomed

@@ -14,7 +14,7 @@ pub const IMAGE_COMPLETE: &str = "image-contract-pass";
 pub const GUEST_COMPLETE: &str = "guest-suite-complete";
 
 fn script(name: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
         .join("tools/oci-runtime-spike")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

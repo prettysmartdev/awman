@@ -79,6 +79,11 @@ impl CliUserMessageQueue {
     pub(crate) fn pending_count(&self) -> usize {
         self.queue.len()
     }
+
+    /// The queued messages, oldest first. Test-only introspection helper.
+    pub(crate) fn pending(&self) -> &[UserMessage] {
+        &self.queue
+    }
 }
 
 #[cfg(test)]

@@ -10,13 +10,14 @@
 //! as inherent methods on the concrete runtimes and are reached through the
 //! typed handles `agent_runtime::detect()` hands back.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::config::env::Env;
 use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::GlobalConfig;
-use crate::data::config::image_source::ImageSourceSpec;
+use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
 use crate::data::config::repo::RepoConfig;
 use crate::data::config::runtime_selection::RuntimeSelection;
 use crate::data::oci_identity::{ImageIdentity, OciPlatform};
@@ -35,7 +36,7 @@ pub mod frontend;
 pub mod output_tail;
 
 pub use background::{AgentExec, ExecOutput};
-pub use capabilities::{Capabilities, DindSupport, ImageAcquisition};
+pub use capabilities::{Capabilities, ImageAcquisition};
 pub use execution::{
     AgentExecution, AgentExitInfo, AgentHandle, AgentHandlePreview, AgentInstance, AgentStats,
     CancelHandle, StuckEvent,
@@ -164,24 +165,13 @@ pub trait AgentRuntimeEngine: Send + Sync {
     ///   - sandbox:   stop (preserve persistent volume)
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
-    /// Argv (after the host CLI name) for an exec/re-attach against an
-    /// existing agent through [`Self::host_cli`]. `None` when the runtime has no
-    /// host CLI (builtin); callers must handle `None` and use [`Self::attach`].
-    fn exec_args(
-        &self,
-        agent_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>>;
-
     /// Attach to an already-running agent this process did not start.
     ///
     /// Returns a `Box<dyn AgentInstance>` so the result flows into the same
     /// `run_with_frontend(Box<dyn AgentFrontend>) -> AgentExecution` path a
     /// freshly-built instance uses — `CliFrontend` and `TuiContainerProxy`
     /// both drive an attach session unchanged. The instance opens an
-    /// `exec`/`sbx exec` session (argv from `exec_args`); its execution never
+    /// attach session through the runtime's own channel; its execution never
     /// stops the target on grace-expiry, because this process does not own it.
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError>;
 
@@ -190,11 +180,6 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// Apple's client-side prefix predicate, sandbox `sbx ls` name filter.
     /// The name prefix is the one identity channel all three tiers share.
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError>;
-
-    /// The host CLI this runtime drives (`"docker"`, `"container"`, `"sbx"`),
-    /// or `None` for a runtime that drives no host CLI (builtin). Every
-    /// runtime states its own, so adding one cannot forget to.
-    fn host_cli(&self) -> Option<&'static str>;
 
     /// Whether [`Self::attach`] still reaches an agent after the process that
     /// launched it has exited. Docker: yes (`docker attach`). Apple: no (the
@@ -241,10 +226,7 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// `on_line`.
     fn build_image(
         &self,
-        tag: &str,
-        dockerfile: &std::path::Path,
-        context: &std::path::Path,
-        no_cache: bool,
+        request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError>;
 
@@ -280,6 +262,12 @@ pub trait AgentRuntimeEngine: Send + Sync {
     fn image_identity(&self, _tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
         Ok(None)
     }
+
+    /// Verify installed provenance using local metadata only. Unknown
+    /// provenance is refused; this operation must never acquire an image.
+    fn image_matches_source(&self, _request: &ImageImportRequest) -> Result<bool, EngineError> {
+        Ok(false)
+    }
 }
 
 /// What [`AgentRuntimeEngine::import_image`] should import.
@@ -300,6 +288,10 @@ pub struct ImageImportRequest {
     /// the build's config digest (image ID), while the cache key and recorded
     /// identity keep the configured logical reference.
     pub immutable_export_selector: Option<String>,
+    /// Registry host settings (`builtin.registries`) from the importing
+    /// session's config, used for the pull itself. The same session value
+    /// resolved the source, so resolution and pull never disagree.
+    pub registries: BTreeMap<String, RegistryHostConfig>,
 }
 
 /// The result of a successful [`AgentRuntimeEngine::import_image`].
@@ -382,6 +374,9 @@ pub fn detect(global_config: &GlobalConfig) -> Result<DetectedRuntime, EngineErr
 ///   backend (released for macOS on Apple Silicon only), or
 ///   the precise reason it cannot run here (`BuiltinRuntimeUnavailable`,
 ///   `AmbientRuntimeOverride`). Never a fall back to another runtime.
+///   Only the process-wide builtin settings (`BuiltinRuntimeSettings`) come
+///   from `config`; each launch brings its own session's
+///   `BuiltinLaunchSettings`.
 /// - anything else → `EngineError::UnknownRuntime`. A misspelled runtime is
 ///   a fatal configuration error, never a silent fall back to Docker: the
 ///   user asked for an isolation model awman can't identify, and launching
@@ -416,7 +411,8 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
             Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
         }
         RuntimeSelection::BuiltinExperimental => {
-            let settings = BuiltinRuntimeSettings::resolve(config)?;
+            let resolved = config.builtin_settings()?;
+            let settings = BuiltinRuntimeSettings::resolve(&resolved);
             Ok(DetectedRuntime::Container(Arc::new(
                 ContainerRuntime::builtin(settings)?,
             )))
@@ -587,6 +583,9 @@ mod tests {
             Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
                 assert!(!reason.is_empty())
             }
+            Err(EngineError::BuiltinTargetUnreleased { os, arch }) => {
+                assert!(!os.is_empty() && !arch.is_empty())
+            }
             Err(EngineError::AmbientRuntimeOverride { variable }) => {
                 assert!(variable.starts_with("MSB_"))
             }
@@ -613,6 +612,7 @@ mod tests {
             refresh: false,
             expected_built_identity: None,
             immutable_export_selector: None,
+            registries: Default::default(),
         };
         match rt.import_image(&request, &mut Sink) {
             Err(EngineError::UnsupportedOnRuntime { runtime, operation }) => {
@@ -625,7 +625,6 @@ mod tests {
             .image_identity("awman-x-claude:latest")
             .unwrap()
             .is_none());
-        assert_eq!(rt.host_cli(), Some("docker"));
         assert!(rt.reattach_after_owner_exit());
         assert_eq!(rt.capabilities().image_acquisition, ImageAcquisition::Build);
     }

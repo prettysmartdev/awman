@@ -438,10 +438,10 @@ pub(super) fn export(
         client.get_json::<Inspect>(&format!("{prefix}/images/{selector}/json"), metadata())?;
     let Some(inspect) = inspect else {
         return Err(if status == 404 {
-            EngineError::Container(format!(
-                "image '{reference}' was not found in the Docker Engine at {}",
-                client.endpoint
-            ))
+            EngineError::SourceImageNotFound {
+                reference: reference.to_string(),
+                location: format!("the Docker Engine at {}", client.endpoint),
+            }
         } else {
             EngineError::Network(format!(
                 "Docker Engine at {} answered {status} when inspecting '{reference}'",

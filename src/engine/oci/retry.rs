@@ -108,17 +108,14 @@ impl CancelToken {
     }
 }
 
-/// The message every cancellation error carries, so callers can recognise it.
-pub const CANCELLED_MESSAGE: &str = "image acquisition was cancelled";
-
 /// The error an acquisition returns when it was cancelled.
 pub fn cancelled() -> EngineError {
-    EngineError::Container(CANCELLED_MESSAGE.into())
+    EngineError::ImageAcquisitionCancelled
 }
 
 /// Whether `err` is the cancellation error.
 pub fn is_cancelled(err: &EngineError) -> bool {
-    matches!(err, EngineError::Container(m) if m == CANCELLED_MESSAGE)
+    matches!(err, EngineError::ImageAcquisitionCancelled)
 }
 
 /// Whether a failed attempt may be repeated. Only transport-level failures

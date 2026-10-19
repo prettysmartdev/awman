@@ -38,8 +38,22 @@ fn checked_bytes(path: &PathBuf, expected: &str, limit: u64, hint: &str) -> Vec<
 }
 
 fn main() {
+    // All workspace packages verify the same repository-owned payload inputs.
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let root = manifest_dir
+        .ancestors()
+        .find(|path| {
+            path.join("third_party/msb-payloads/manifest.toml")
+                .is_file()
+        })
+        .expect("workspace payload manifest");
     println!("cargo:rustc-check-cfg=cfg(awman_builtin)");
-    println!("cargo:rerun-if-changed=third_party/msb-payloads/manifest.toml");
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("third_party/msb-payloads/manifest.toml")
+            .display()
+    );
     if env::var_os("CARGO_FEATURE_BUILTIN_RUNTIME").is_none() {
         return;
     }
@@ -53,8 +67,8 @@ fn main() {
         return;
     }
     let hint = format!("tools/msb-payloads/fetch.sh {target}");
-    let manifest_source =
-        fs::read_to_string("third_party/msb-payloads/manifest.toml").expect("payload manifest");
+    let manifest_source = fs::read_to_string(root.join("third_party/msb-payloads/manifest.toml"))
+        .expect("payload manifest");
     let manifest: toml::Value = toml::from_str(&manifest_source).expect("valid payload manifest");
     let record = manifest
         .get("targets")
@@ -66,9 +80,9 @@ fn main() {
         "verified",
         "{target} payload is unverified; run {hint} natively and record hashes"
     );
-    let root = PathBuf::from("third_party/msb-payloads");
-    let kernel_path = root.join(&target).join("kernel.bin");
-    let agent_path = root.join(&arch).join("agentd");
+    let payload_root = root.join("third_party/msb-payloads");
+    let kernel_path = payload_root.join(&target).join("kernel.bin");
+    let agent_path = payload_root.join(&arch).join("agentd");
     let size = integer(record, "size");
     assert!(
         (64 * 1024..=64 * 1024 * 1024).contains(&size),
@@ -76,7 +90,7 @@ fn main() {
     );
     let kernel = checked_bytes(&kernel_path, field(record, "kernel_sha256"), size, &hint);
     assert_eq!(kernel.len() as u64, size, "kernel size mismatch");
-    let metadata = root.join(&target).join("kernel.meta");
+    let metadata = payload_root.join(&target).join("kernel.meta");
     println!("cargo:rerun-if-changed={}", metadata.display());
     let metadata = fs::read_to_string(&metadata)
         .unwrap_or_else(|e| panic!("kernel metadata: {e}; run {hint}"));
@@ -106,7 +120,7 @@ fn main() {
         "agent architecture mismatch for {target}"
     );
     if target.ends_with("linux-gnu") {
-        let native = PathBuf::from("third_party/native/libcap-ng/lib/libcap-ng.a");
+        let native = root.join("third_party/native/libcap-ng/lib/libcap-ng.a");
         assert!(
             native.is_file(),
             "{} missing; run third_party/native/libcap-ng/build.sh",

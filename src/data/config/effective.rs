@@ -7,12 +7,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::data::config::builtin_network::{BuiltinNetworkConfig, BuiltinNetworkSettings};
 use crate::data::config::builtin_runtime::{BuiltinRuntimeConfig, DEFAULT_STATE_SUBDIR};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
 use crate::data::config::repo::{AgentAuthMode, LaunchMode, RepoConfig};
+use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
 use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::config::{DEFAULT_AGENT_STUCK_TIMEOUT_SECS, DEFAULT_SCROLLBACK_LINES};
 use crate::data::error::DataError;
@@ -266,21 +268,56 @@ impl EffectiveConfig {
     }
 
     /// Effective builtin-runtime settings: the repo `builtin` block merged over
-    /// the global one field by field (map entries per key). Defaults for
-    /// unset fields are applied by the reader.
+    /// the global one field by field (map entries per key). Defaults and
+    /// validation are applied by Layer 0 in [`Self::builtin_settings`].
+    ///
+    /// The view never carries `network`: the enforced policy is
+    /// [`Self::builtin_network`] (global ceiling, repo may only narrow), and
+    /// a merged copy would be a value nobody enforces.
     pub fn builtin_runtime(&self) -> BuiltinRuntimeConfig {
         let global = self.global.builtin.clone().unwrap_or_default();
-        match &self.repo.builtin {
+        let merged = match &self.repo.builtin {
             Some(repo) => repo.merged_over(&global),
             None => global,
+        };
+        BuiltinRuntimeConfig {
+            network: None,
+            ..merged
         }
     }
 
     /// Effective `builtin.builder.enabled`: repo over global per leaf,
     /// default `false`. Whether it applies to a runtime is the engine's
     /// decision.
-    pub fn builtin_builder_enabled(&self) -> bool {
+    #[cfg(test)]
+    fn builtin_builder_enabled(&self) -> bool {
         self.builtin_runtime().builder_enabled()
+    }
+
+    /// Resolve all builtin-runtime settings for the engine boundary.
+    ///
+    /// Layer 0 applies defaults, validates resources and image sources,
+    /// enforces global network ceilings against repo policy, and supplies the
+    /// session's image-acquisition inputs in one typed value.
+    pub fn builtin_settings(&self) -> Result<ResolvedBuiltinConfig, DataError> {
+        let builtin = self.builtin_runtime();
+        builtin
+            .validate_image_sources()
+            .map_err(DataError::BuiltinConfig)?;
+        let launch = self.builtin_launch_settings()?;
+        let env = self.env();
+        let builder_enabled = builtin.builder_enabled();
+        Ok(ResolvedBuiltinConfig {
+            state_dir: self.builtin_state_dir()?,
+            ambient_overrides: env.ambient_msb_overrides(),
+            test_isolation: crate::data::config::env::test_isolation_active()
+                && !env.test_builtin(),
+            launch,
+            image_source: builtin.image_source,
+            images: builtin.images,
+            registries: builtin.registries,
+            builder_enabled,
+        })
     }
 
     /// Effective builtin network policy: the global `builtin.network` block is
@@ -294,6 +331,41 @@ impl EffectiveConfig {
                 .and_then(|b| b.network.as_ref()),
             self.repo.builtin.as_ref().and_then(|b| b.network.as_ref()),
         )
+    }
+
+    /// The builtin settings one launch for this session is sized and confined
+    /// by: default vCPUs and memory, and the network policy (global ceiling
+    /// narrowed by the repo block). Resolved per session at every launch, so
+    /// many sessions can share one builtin runtime and each keep its own
+    /// repo's values.
+    ///
+    /// Fails closed: zero resources or a repo network block that would widen
+    /// the global one is a [`DataError::BuiltinConfig`] for this launch. A
+    /// repo `builtin.stateDir` is resolved (with the usual precedence) into
+    /// [`BuiltinLaunchSettings::repo_state_dir`] for the runtime to compare
+    /// with its own process-wide directory.
+    pub fn builtin_launch_settings(&self) -> Result<BuiltinLaunchSettings, DataError> {
+        let builtin = self.builtin_runtime();
+        builtin
+            .validate_resources()
+            .map_err(DataError::BuiltinConfig)?;
+        let network = self.builtin_network().map_err(DataError::BuiltinConfig)?;
+        let repo_sets_state_dir = self
+            .repo
+            .builtin
+            .as_ref()
+            .is_some_and(|b| b.state_dir.is_some());
+        let repo_state_dir = if repo_sets_state_dir {
+            Some(self.builtin_state_dir()?)
+        } else {
+            None
+        };
+        Ok(BuiltinLaunchSettings {
+            vcpus: builtin.vcpus_or_default(),
+            memory_mib: builtin.memory_mib_or_default(),
+            network,
+            repo_state_dir,
+        })
     }
 
     /// Effective builtin-runtime state directory:
@@ -1451,6 +1523,165 @@ mod tests {
     }
 
     #[test]
+    fn builtin_settings_resolve_defaults_and_process_values() {
+        let resolved = EffectiveConfig::default().builtin_settings().unwrap();
+        assert_eq!(
+            resolved.launch.vcpus,
+            crate::data::config::builtin_runtime::DEFAULT_VCPUS
+        );
+        assert_eq!(
+            resolved.launch.memory_mib,
+            crate::data::config::builtin_runtime::DEFAULT_MEMORY_MIB
+        );
+        assert_eq!(resolved.launch.network, BuiltinNetworkSettings::default());
+        assert!(!resolved.builder_enabled);
+        assert!(resolved.image_source.is_none());
+        assert!(resolved.images.is_empty());
+        assert!(resolved.registries.is_empty());
+        assert!(!resolved.state_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn builtin_settings_apply_network_narrowing_and_reject_widening() {
+        use crate::data::config::builtin_network::{BuiltinNetworkConfig, NetworkMode};
+        let global = GlobalConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                network: Some(BuiltinNetworkConfig {
+                    mode: Some(NetworkMode::Allowlist),
+                    allow: Some(vec!["*.example.com".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let narrowed = RepoConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                network: Some(BuiltinNetworkConfig {
+                    mode: Some(NetworkMode::Allowlist),
+                    allow: Some(vec!["api.example.com".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            narrowed,
+            global.clone(),
+        )
+        .builtin_settings()
+        .unwrap();
+        assert_eq!(resolved.launch.network.allow.len(), 1);
+        assert_eq!(resolved.launch.network.allow[0].name(), "api.example.com");
+
+        let widening = RepoConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                network: Some(BuiltinNetworkConfig {
+                    mode: Some(NetworkMode::Public),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            make_effective(
+                FlagConfig::default(),
+                EnvSnapshot::empty(),
+                widening,
+                global
+            )
+            .builtin_settings(),
+            Err(DataError::BuiltinConfig(_))
+        ));
+
+        let invalid_resources = RepoConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                vcpus: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            make_effective(
+                FlagConfig::default(),
+                EnvSnapshot::empty(),
+                invalid_resources,
+                GlobalConfig::default(),
+            )
+            .builtin_settings(),
+            Err(DataError::BuiltinConfig(_))
+        ));
+    }
+
+    #[test]
+    fn builtin_settings_return_registry_builder_and_normalized_legacy_sources() {
+        use crate::data::config::image_source::{ImageSourceKind, ImageSourceSpec};
+        let global: BuiltinRuntimeConfig = serde_json::from_str(
+            r#"{
+                "imageSource":{"type":"docker-store","host":"unix:///tmp/docker.sock"},
+                "images":{"agent:latest":{"type":"apple-store"}},
+                "registries":{"registry.example":{"insecure":true}},
+                "builder":{"enabled":true}
+            }"#,
+        )
+        .unwrap();
+        let resolved = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig {
+                builtin: Some(global),
+                ..Default::default()
+            },
+        )
+        .builtin_settings()
+        .unwrap();
+
+        assert!(resolved.builder_enabled);
+        assert!(resolved.registries.contains_key("registry.example"));
+        assert!(matches!(
+            resolved.image_source,
+            Some(ImageSourceSpec::DockerStore { .. })
+        ));
+        assert_eq!(
+            resolved.image_source.as_ref().unwrap().kind(),
+            ImageSourceKind::DockerStore
+        );
+        assert_eq!(
+            resolved.images.get("agent:latest").unwrap().kind(),
+            ImageSourceKind::AppleStore
+        );
+    }
+
+    #[test]
+    fn builtin_settings_preserve_session_state_dir_for_runtime_check() {
+        let repo = RepoConfig {
+            builtin: Some(BuiltinRuntimeConfig {
+                state_dir: Some("/repo/builtin-state".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo,
+            GlobalConfig::default(),
+        )
+        .builtin_settings()
+        .unwrap();
+        assert_eq!(
+            resolved.launch.repo_state_dir,
+            Some("/repo/builtin-state".into())
+        );
+        assert_eq!(resolved.state_dir, resolved.launch.repo_state_dir.unwrap());
+    }
+
+    #[test]
     fn builtin_builder_enabled_inherits_and_repo_can_disable_global() {
         use crate::data::config::builtin_runtime::BuiltinBuilderConfig;
         let global = GlobalConfig {
@@ -1554,6 +1785,151 @@ mod tests {
         assert_eq!(
             eff.builtin_state_dir().unwrap(),
             PathBuf::from("/env-state")
+        );
+    }
+
+    fn builtin_layers(global: &str, repo: Option<&str>, env: EnvSnapshot) -> EffectiveConfig {
+        make_effective(
+            FlagConfig::default(),
+            env,
+            RepoConfig {
+                builtin: repo.map(|r| serde_json::from_str(r).unwrap()),
+                ..Default::default()
+            },
+            GlobalConfig {
+                builtin: Some(serde_json::from_str(global).unwrap()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn builtin_runtime_view_has_no_network_in_either_layer_shape() {
+        let global_only = builtin_layers(
+            r#"{"network":{"mode":"none"},"vcpus":3}"#,
+            None,
+            EnvSnapshot::empty(),
+        );
+        assert_eq!(global_only.builtin_runtime().network, None);
+        assert_eq!(global_only.builtin_runtime().vcpus, Some(3));
+        let layered = builtin_layers(
+            r#"{"network":{"mode":"allowlist","allow":["*.example.com"]}}"#,
+            Some(r#"{"network":{"allow":["api.example.com"]}}"#),
+            EnvSnapshot::empty(),
+        );
+        assert_eq!(layered.builtin_runtime().network, None);
+        assert_eq!(layered.builtin_network().unwrap().allow.len(), 1);
+    }
+
+    /// `BuiltinRuntimeConfig::validate` no longer checks the network block:
+    /// `builtin_network` rejects a self-contradictory block in either layer,
+    /// naming the layer, which covers everything the merged-block check did.
+    #[test]
+    fn builtin_network_rejects_a_contradictory_block_in_either_layer() {
+        let contradictory = r#"{"network":{"mode":"none","hostPorts":[8765]}}"#;
+        let global = builtin_layers(contradictory, None, EnvSnapshot::empty());
+        let error = global.builtin_network().unwrap_err();
+        assert!(error.starts_with("global builtin.network: "), "{error}");
+        assert!(matches!(
+            global.builtin_launch_settings(),
+            Err(DataError::BuiltinConfig(_))
+        ));
+        let repo = builtin_layers("{}", Some(contradictory), EnvSnapshot::empty());
+        let error = repo.builtin_network().unwrap_err();
+        assert!(error.starts_with("repo builtin.network: "), "{error}");
+        // A repo block that only restates the global mode is not narrowing
+        // anything, but is consistent and accepted.
+        let shadowing = builtin_layers(
+            r#"{"network":{"mode":"none"}}"#,
+            Some(r#"{"network":{"mode":"none"}}"#),
+            EnvSnapshot::empty(),
+        );
+        assert!(shadowing.builtin_network().is_ok());
+    }
+
+    #[test]
+    fn builtin_launch_settings_default_without_any_builtin_block() {
+        assert_eq!(
+            EffectiveConfig::default()
+                .builtin_launch_settings()
+                .unwrap(),
+            BuiltinLaunchSettings::default()
+        );
+    }
+
+    #[test]
+    fn builtin_launch_settings_take_repo_resources_and_narrowed_network() {
+        let settings = builtin_layers(
+            r#"{"vcpus":4,"memoryMib":8192,"network":{"hostPorts":[8765]}}"#,
+            Some(r#"{"vcpus":1,"network":{"mode":"allowlist","allow":["api.example.com"]}}"#),
+            EnvSnapshot::empty(),
+        )
+        .builtin_launch_settings()
+        .unwrap();
+        assert_eq!((settings.vcpus, settings.memory_mib), (1, 8192));
+        assert_eq!(
+            settings.network.mode,
+            crate::data::config::NetworkMode::Allowlist
+        );
+        assert_eq!(settings.network.allow.len(), 1);
+        assert_eq!(settings.network.host_ports, vec![8765]);
+        assert_eq!(settings.repo_state_dir, None);
+    }
+
+    #[test]
+    fn builtin_launch_settings_reject_widening_and_bad_resources() {
+        for (global, repo) in [
+            (
+                r#"{"network":{"mode":"none"}}"#,
+                r#"{"network":{"mode":"public"}}"#,
+            ),
+            (r#"{}"#, r#"{"network":{"hostPorts":[8765]}}"#),
+        ] {
+            match builtin_layers(global, Some(repo), EnvSnapshot::empty()).builtin_launch_settings()
+            {
+                Err(DataError::BuiltinConfig(message)) => {
+                    assert!(message.contains("builtin.network"), "{message}")
+                }
+                other => panic!("a widening repo block must fail closed: {other:?}"),
+            }
+        }
+        for repo in [r#"{"vcpus":0}"#, r#"{"memoryMib":64}"#] {
+            assert!(matches!(
+                builtin_layers("{}", Some(repo), EnvSnapshot::empty()).builtin_launch_settings(),
+                Err(DataError::BuiltinConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn builtin_launch_settings_name_a_repo_state_dir_only_when_the_repo_sets_one() {
+        let global_only = builtin_layers(r#"{"stateDir":"/g"}"#, None, EnvSnapshot::empty());
+        assert_eq!(
+            global_only
+                .builtin_launch_settings()
+                .unwrap()
+                .repo_state_dir,
+            None
+        );
+        let repo = builtin_layers(
+            r#"{"stateDir":"/g"}"#,
+            Some(r#"{"stateDir":"/r"}"#),
+            EnvSnapshot::empty(),
+        );
+        assert_eq!(
+            repo.builtin_launch_settings().unwrap().repo_state_dir,
+            Some(PathBuf::from("/r"))
+        );
+        // The environment variable outranks every config layer, so the repo
+        // value resolves to the same directory the process uses.
+        let env = EnvSnapshot::with_overrides([(
+            crate::data::config::env::AWMAN_BUILTIN_STATE_DIR,
+            "/env-state",
+        )]);
+        let overridden = builtin_layers("{}", Some(r#"{"stateDir":"/r"}"#), env);
+        assert_eq!(
+            overridden.builtin_launch_settings().unwrap().repo_state_dir,
+            Some(PathBuf::from("/env-state"))
         );
     }
 

@@ -226,7 +226,7 @@ impl AgentInstance for ContainerInstance {
     ) -> Result<AgentExecution, EngineError> {
         let cli = self.cli;
         let post_bridge = self.post_bridge;
-        let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options);
+        let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options)?;
         let started_at = chrono::Utc::now();
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
@@ -716,15 +716,19 @@ impl ExecutionBackend for ContainerExecution {
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
+    fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let bin = self.cli.bin;
         let name = self.container_name.clone();
-        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
-            move || {
-                stop_and_remove(bin, &name);
-                Ok(())
-            },
-        ))
+        crate::engine::agent_runtime::execution::CancelHandle::new(move || {
+            stop_and_remove(bin, &name);
+            Ok(())
+        })
+    }
+
+    fn cancel_on_execution_drop(&self) -> bool {
+        // Docker containers are explicitly reattachable after their owner
+        // exits. A dropped, never-awaited execution must not remove one.
+        false
     }
 }
 
@@ -732,6 +736,217 @@ impl ExecutionBackend for ContainerExecution {
 mod tests {
     use super::*;
     use crate::engine::container::options::{ContainerOption, ResolvedContainerOptions};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SlowDropFrontend(Arc<AtomicBool>);
+
+    impl Drop for SlowDropFrontend {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(5));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl crate::data::message::UserMessageSink for SlowDropFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::agent_runtime::frontend::AgentFrontend for SlowDropFrontend {
+        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
+        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
+        fn take_io(&mut self) -> AgentIo {
+            let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            AgentIo {
+                stdout,
+                stderr,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
+    }
+
+    type OutputReceivers = (
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    );
+
+    struct IoProbeFrontend {
+        receivers: Arc<Mutex<Option<OutputReceivers>>>,
+        initial_size: Option<(u16, u16)>,
+    }
+    impl crate::data::message::UserMessageSink for IoProbeFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    #[async_trait::async_trait]
+    impl crate::engine::agent_runtime::frontend::AgentFrontend for IoProbeFrontend {
+        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
+        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
+        fn take_io(&mut self) -> AgentIo {
+            let (stdout, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr, stderr_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (resize, initial_size) = if self.initial_size.is_some() {
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (Some(rx), self.initial_size)
+            } else {
+                (None, None)
+            };
+            *self.receivers.lock().unwrap() = Some((stdout_rx, stderr_rx));
+            AgentIo {
+                stdout,
+                stderr,
+                stdin_tx,
+                stdin_rx,
+                resize,
+                initial_size,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_and_apple_release_frontend_on_normal_and_dropped_wait() {
+        for original in [ContainerCli::DOCKER, ContainerCli::APPLE] {
+            for drop_wait in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let cli = ContainerCli {
+                    bin: fake_cli(&write_fake_cli(
+                        temp.path(),
+                        if drop_wait {
+                            "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.2; fi\n"
+                        } else {
+                            "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.01; fi\n"
+                        },
+                    ))
+                    .bin,
+                    ..original
+                };
+                let released = Arc::new(AtomicBool::new(false));
+                let instance = test_instance(
+                    cli,
+                    vec![ContainerOption::Image(ImageRef::new("img:latest"))],
+                );
+                let mut execution = instance
+                    .run_with_frontend(Box::new(SlowDropFrontend(released.clone())))
+                    .unwrap();
+                if drop_wait {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(10), execution.wait())
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    execution.wait().await.unwrap();
+                }
+                assert!(
+                    released.load(Ordering::SeqCst),
+                    "{} retained its frontend",
+                    original.bin
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_and_apple_close_io_and_cancel_dropped_wait_on_piped_and_pty_paths() {
+        for original in [ContainerCli::DOCKER, ContainerCli::APPLE] {
+            for initial_size in [None, Some((80, 24))] {
+                for drop_wait in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let log = temp.path().join("calls");
+                    let script = format!(
+                        "#!/bin/sh\necho \"$1\" >> {}\nif [ \"$1\" = run ]; then sleep 0.15; fi\n",
+                        log.display()
+                    );
+                    let cli = ContainerCli {
+                        bin: fake_cli(&write_fake_cli(temp.path(), &script)).bin,
+                        ..original
+                    };
+                    let receivers = Arc::new(Mutex::new(None));
+                    let mut execution = test_instance(
+                        cli,
+                        vec![ContainerOption::Image(ImageRef::new("img:latest"))],
+                    )
+                    .run_with_frontend(Box::new(IoProbeFrontend {
+                        receivers: receivers.clone(),
+                        initial_size,
+                    }))
+                    .unwrap();
+                    if drop_wait {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), execution.wait())
+                                .await
+                                .is_err()
+                        );
+                    } else {
+                        execution.wait().await.unwrap();
+                    }
+                    let (mut stdout, mut stderr) = receivers.lock().unwrap().take().unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        assert!(stdout.recv().await.is_none(), "stdout sender remained open");
+                        assert!(stderr.recv().await.is_none(), "stderr sender remained open");
+                    })
+                    .await
+                    .expect("container bridge did not release output senders");
+                    let calls = tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+                            if calls.lines().any(|line| line == "run")
+                                && (!drop_wait
+                                    || (calls.lines().any(|line| line == "stop")
+                                        && calls.lines().any(|line| line == "rm")))
+                            {
+                                break calls;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("container command did not complete expected lifecycle");
+                    assert_eq!(calls.lines().any(|line| line == "stop"), drop_wait);
+                    assert_eq!(calls.lines().any(|line| line == "rm"), drop_wait);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_unwaited_docker_execution_preserves_reattachable_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("calls");
+        let script = format!(
+            "#!/bin/sh\necho \"$1\" >> {}\nif [ \"$1\" = run ]; then sleep 0.1; fi\n",
+            log.display()
+        );
+        let cli = ContainerCli {
+            bin: fake_cli(&write_fake_cli(temp.path(), &script)).bin,
+            ..ContainerCli::DOCKER
+        };
+        let execution = test_instance(
+            cli,
+            vec![ContainerOption::Image(ImageRef::new("img:latest"))],
+        )
+        .run_with_frontend(Box::new(IoProbeFrontend {
+            receivers: Arc::new(Mutex::new(None)),
+            initial_size: None,
+        }))
+        .unwrap();
+        drop(execution);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(calls.lines().any(|line| line == "run"), "{calls}");
+        assert!(!calls.lines().any(|line| line == "stop"), "{calls}");
+        assert!(!calls.lines().any(|line| line == "rm"), "{calls}");
+    }
 
     fn resolve(opts: Vec<ContainerOption>) -> ResolvedContainerOptions {
         ResolvedContainerOptions::resolve(opts).expect("resolve")

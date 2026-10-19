@@ -293,3 +293,62 @@ impl From<DataError> for CommandError {
         }
     }
 }
+
+impl CommandError {
+    /// Shared process and API completion classification.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+        CommandError::Aborted => 130,
+
+        // Exit 2 — invalid usage / parse / flag conflict
+        CommandError::UnknownCommand { .. }
+        | CommandError::UnknownFlag { .. }
+        | CommandError::MissingRequiredFlag { .. }
+        | CommandError::MissingRequiredArgument { .. }
+        | CommandError::UnexpectedArgument { .. }
+        | CommandError::MutuallyExclusive { .. }
+        | CommandError::InvalidFlagValue { .. }
+        | CommandError::InvalidArgumentValue { .. }
+        | CommandError::CommandBoxParse(_)
+        | CommandError::InvalidOverlaySpec { .. }
+        | CommandError::UnknownConfigField { .. }
+        | CommandError::InteractiveInputUnavailable { .. }
+        // Session-creation validation failures are invalid-usage class.
+        | CommandError::SessionInvalidType { .. }
+        | CommandError::SessionWorkdirRequired
+        | CommandError::SessionWorkdirUnresolvable { .. }
+        | CommandError::SessionWorkdirNotAllowed { .. }
+        | CommandError::SessionRepoUrlRequired
+        | CommandError::SessionRepoUrlEmpty
+        | CommandError::SessionRepoUrlInvalidScheme { .. } => 2,
+
+        // Exit 4 — missing referenced resource
+        CommandError::WorkItemNotFound { .. }
+        | CommandError::SpecTemplateMissing { .. }
+        | CommandError::WorkflowFileNotFound { .. }
+        | CommandError::ApiWorkdirNotFound { .. } => 4,
+
+        // Engine failures carry their own class (3 only for a missing or
+        // failing Docker/Apple Containers backend, 1 otherwise).
+        CommandError::Engine(e) => e.exit_code(),
+        CommandError::Data(_) => 1,
+        CommandError::MergeConflict { .. } => 1,
+        CommandError::MissingRemoteAddress
+        | CommandError::MissingApiKey
+        | CommandError::RemoteTimeout
+        | CommandError::RemoteConnectionRefused(_)
+        | CommandError::RemoteHttpStatus { .. }
+        | CommandError::MalformedSseEvent(_)
+        | CommandError::RemoteTransport(_) => 1,
+        CommandError::ApiServerAlreadyRunning { .. }
+        | CommandError::ApiServerNotRunning
+        | CommandError::ApiServerAuthMissing
+        | CommandError::RemoteSessionMissing
+        | CommandError::RemoteSessionKillFailed { .. } => 1,
+        CommandError::NotImplemented(_) => 1,
+        CommandError::NotAvailableForFrontend { .. } => 1,
+        CommandError::SquadKeyMissing => 1,
+        CommandError::Other(_) => 1,
+    }
+    }
+}

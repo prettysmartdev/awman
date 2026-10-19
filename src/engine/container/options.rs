@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::engine::auth::RefreshableCredentialDelivery;
 
 /// A reference to a container image (e.g. `awman-myproj-claude:latest`).
@@ -225,6 +226,11 @@ pub enum ContainerOption {
     /// Keep the container's whole output in its `OutputTail` instead of the
     /// last `DEFAULT_OUTPUT_TAIL_LINES` lines.
     FullTranscript,
+    /// The session's builtin launch settings (default vCPUs and memory,
+    /// network policy), resolved by `AgentEngine` from the session's
+    /// `EffectiveConfig`. Only the builtin backend reads them, and it refuses
+    /// to launch without them; every other backend ignores them.
+    BuiltinLaunch(BuiltinLaunchSettings),
 }
 
 /// Injection-time dedup: drop any entry from `agent_credentials` whose
@@ -470,6 +476,9 @@ pub struct ResolvedContainerOptions {
     pub startup_grace: Option<std::time::Duration>,
     /// From `ContainerOption::FullTranscript`.
     pub full_transcript: bool,
+    /// From `ContainerOption::BuiltinLaunch`; read by the builtin backend
+    /// only. `None` makes a builtin launch fail closed.
+    pub builtin_launch: Option<Box<BuiltinLaunchSettings>>,
 }
 
 impl ResolvedContainerOptions {
@@ -548,6 +557,7 @@ impl ResolvedContainerOptions {
             ContainerOption::KeepContainer => self.remove_on_exit = false,
             ContainerOption::StartupGrace(v) => self.startup_grace = Some(v),
             ContainerOption::FullTranscript => self.full_transcript = true,
+            ContainerOption::BuiltinLaunch(v) => self.builtin_launch = Some(Box::new(v)),
             ContainerOption::SystemPromptFile {
                 host_path,
                 container_path,
@@ -612,6 +622,38 @@ impl From<ResolveError> for crate::engine::error::EngineError {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ─── WI-0126 A1: builtin launch settings ride with the options ──────────
+
+    #[test]
+    fn builtin_launch_is_absent_unless_given() {
+        let resolved =
+            ResolvedContainerOptions::resolve([ContainerOption::Image(ImageRef::new("img"))])
+                .unwrap();
+        assert_eq!(resolved.builtin_launch, None);
+    }
+
+    #[test]
+    fn builtin_launch_option_maps_to_the_resolved_field_last_one_wins() {
+        let first = BuiltinLaunchSettings {
+            vcpus: 1,
+            ..BuiltinLaunchSettings::default()
+        };
+        let second = BuiltinLaunchSettings {
+            memory_mib: 512,
+            repo_state_dir: Some(PathBuf::from("/s")),
+            ..BuiltinLaunchSettings::default()
+        };
+        let resolved = ResolvedContainerOptions::resolve([
+            ContainerOption::BuiltinLaunch(first),
+            ContainerOption::BuiltinLaunch(second.clone()),
+        ])
+        .unwrap();
+        assert_eq!(resolved.builtin_launch.as_deref(), Some(&second));
+        // Generic resource limits stay separate: the settings are defaults.
+        assert_eq!(resolved.cpu, None);
+        assert_eq!(resolved.memory, None);
+    }
 
     // ─── WI-0114 F-38: the lease factory is carried, not reached for ────────
 

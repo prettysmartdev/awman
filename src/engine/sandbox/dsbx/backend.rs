@@ -201,6 +201,7 @@ pub(in crate::engine::sandbox) fn run_interactive(
     options: ResolvedSandboxOptions,
     mut frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
+    options.validate_tool_restrictions()?;
     let agent = require_agent(&options)?;
     let name = resolve_sandbox_name(&options);
     let kit_dir = kit_dir_for(&agent)?;
@@ -493,7 +494,8 @@ fn spawn_pty_bridged(
         sandbox_name: name,
         started_at,
         output: bridge.output,
-        sink: frontend,
+        sink: Some(frontend),
+        wait_sink: None,
     };
     // Sandbox-class runtimes have no container output tail; failure-log capture
     // is a container-paradigm feature.
@@ -553,7 +555,8 @@ fn spawn_piped(
         sandbox_name: name,
         started_at,
         output: bridge.output,
-        sink: frontend,
+        sink: Some(frontend),
+        wait_sink: None,
     };
     Ok(AgentExecution::new(
         handle,
@@ -580,7 +583,8 @@ struct DSbxExecution {
     output: std::sync::Arc<std::sync::Mutex<io_bridge::OutputCapture>>,
     /// The launch frontend, retained so a non-zero exit can replay the
     /// captured output as messages in the execution window.
-    sink: Box<dyn AgentFrontend>,
+    sink: Option<Box<dyn AgentFrontend>>,
+    wait_sink: Option<std::sync::Weak<std::sync::Mutex<Box<dyn AgentFrontend>>>>,
 }
 
 impl DSbxExecution {
@@ -612,20 +616,36 @@ impl DSbxExecution {
         if lines.is_empty() {
             return;
         }
-        self.sink.write_message(UserMessage {
-            level: MessageLevel::Error,
-            text: format!("sbx exited with code {exit_code}; last output:"),
-        });
-        for line in lines {
-            self.sink.write_message(UserMessage {
+        let report = |sink: &mut dyn AgentFrontend| {
+            sink.write_message(UserMessage {
                 level: MessageLevel::Error,
-                text: line,
+                text: format!("sbx exited with code {exit_code}; last output:"),
             });
+            for line in lines {
+                sink.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: line,
+                });
+            }
+        };
+        if let Some(sink) = self.sink.as_mut() {
+            report(sink.as_mut());
+        } else if let Some(sink) = self.wait_sink.as_ref().and_then(std::sync::Weak::upgrade) {
+            report(sink.lock().unwrap().as_mut());
         }
     }
 }
 
 impl ExecutionBackend for DSbxExecution {
+    fn frontend_for_wait(
+        &mut self,
+    ) -> Option<crate::engine::agent_runtime::execution::FrontendWaitGuard> {
+        let frontend = self.sink.take()?;
+        let guard = crate::engine::agent_runtime::execution::FrontendWaitGuard::new(frontend);
+        self.wait_sink = Some(guard.downgrade());
+        Some(guard)
+    }
+
     fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
         if let Some(mut child) = self.pty_child.take() {
             let status = child
@@ -681,20 +701,101 @@ impl ExecutionBackend for DSbxExecution {
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
+    fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let name = self.sandbox_name.clone();
-        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
-            move || {
-                let _ = SbxCommand::new(["stop", &name]).run_quiet();
-                Ok(())
-            },
-        ))
+        crate::engine::agent_runtime::execution::CancelHandle::new(move || {
+            let _ = SbxCommand::new(["stop", &name]).run_quiet();
+            Ok(())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct DropProbeFrontend(Arc<AtomicBool>);
+
+    impl Drop for DropProbeFrontend {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl crate::data::message::UserMessageSink for DropProbeFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl AgentFrontend for DropProbeFrontend {
+        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
+        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
+        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
+            unreachable!()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dsbx_releases_frontend_on_normal_and_dropped_wait() {
+        for drop_wait in [false, true] {
+            let child = std::process::Command::new("sleep")
+                .arg(if drop_wait { "30" } else { "0.01" })
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let released = Arc::new(AtomicBool::new(false));
+            let backend = DSbxExecution {
+                child: Some(child),
+                pty_child: None,
+                pty_master: None,
+                stdin_injector: None,
+                sandbox_name: format!("awman-dsbx-release-test-{pid}"),
+                started_at: Utc::now(),
+                output: Arc::new(std::sync::Mutex::new(io_bridge::OutputCapture::default())),
+                sink: Some(Box::new(DropProbeFrontend(released.clone()))),
+                wait_sink: None,
+            };
+            let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+            let mut execution = AgentExecution::new(
+                AgentHandle {
+                    id: pid.to_string(),
+                    name: format!("awman-dsbx-release-test-{pid}"),
+                    image_tag: "test".into(),
+                    started_at: Utc::now(),
+                },
+                Box::new(backend),
+                Arc::new(stuck_tx),
+                None,
+            );
+            if drop_wait {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), execution.wait())
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    released.load(Ordering::SeqCst),
+                    "frontend was not released when wait was dropped"
+                );
+                let status = std::process::Command::new("sh")
+                    .args(["-c", &format!("kill -9 {pid}")])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            } else {
+                execution.wait().await.unwrap();
+            }
+            assert!(
+                released.load(Ordering::SeqCst),
+                "frontend retained after wait future ended"
+            );
+        }
+    }
     use crate::engine::sandbox::naming::worktree_hash;
     use crate::engine::sandbox::options::SandboxOption;
 

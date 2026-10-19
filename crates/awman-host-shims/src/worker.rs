@@ -1,16 +1,13 @@
-//! Included only by the binary, before its async/frontend startup.
+//! Private worker dispatch, before the binary's async/frontend startup.
 #[cfg(awman_builtin)]
-#[path = "embedded/kernel.rs"]
-mod kernel;
-#[cfg(awman_builtin)]
-#[path = "embedded/version.rs"]
-mod version;
+use crate::{kernel, version};
 
 /// Return true only for the reserved, first-argument internal routes.
-pub fn dispatch(
+pub fn dispatch_worker(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    arguments: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> bool {
-    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let arguments: Vec<std::ffi::OsString> = arguments.into_iter().skip(1).collect();
     let worker = is_worker_invocation(&arguments);
     let info = arguments.first().map(std::ffi::OsString::as_os_str)
         == Some(std::ffi::OsStr::new("__awman-builtin-info"));
@@ -21,24 +18,10 @@ pub fn dispatch(
     // through the data layer's String-based environment snapshot. Never print
     // values. Build-time payload variables do not affect runtime resolution.
     for (key, _) in environment {
-        if matches!(
-            key.to_str(),
-            Some(
-                "MSB_PATH"
-                    | "MSB_LIBKRUNFW_PATH"
-                    | "MSB_AGENTD_PATH"
-                    | "MSB_HOME"
-                    | "MSB_BACKEND"
-                    | "MSB_CONFIG_PATH"
-                    | "MSB_PROFILE"
-                    | "MSB_CACHE_DIR"
-                    | "MSB_SANDBOXES_DIR"
-                    | "MSB_VOLUMES_DIR"
-                    | "MSB_SNAPSHOTS_DIR"
-                    | "MSB_LOGS_DIR"
-                    | "MSB_SECRETS_DIR"
-            )
-        ) {
+        if awman::data::config::env::AMBIENT_MSB_OVERRIDES
+            .iter()
+            .any(|name| key == std::ffi::OsStr::new(name))
+        {
             eprintln!(
                 "awman: ambient runtime overrides are forbidden for the builtin runtime worker"
             );
@@ -52,9 +35,10 @@ pub fn dispatch(
             println!(
                 "{}",
                 serde_json::json!({
-                    "msb_version": "0.7.2", "worker_protocol": "0.7.2/18/awman-1",
+                    "msb_version": awman::data::builtin_runtime::MSB_VERSION,
+                    "worker_protocol": awman::data::builtin_runtime::WORKER_PROTOCOL,
                     "target_os": std::env::consts::OS, "target_arch": std::env::consts::ARCH,
-                    "libkrun_commit": "2bd0f84ad0956f3032e0490d3b8512b6851eca12",
+                    "libkrun_commit": awman::data::builtin_runtime::LIBKRUN_COMMIT,
                     "kernel_sha256": kernel::KERNEL_SHA256,
                     "embedded_kernel": true, "embedded_guest_agent": true,
                     "host_helpers": false, "reattach_after_owner_exit": false,
@@ -63,7 +47,7 @@ pub fn dispatch(
             );
             return true;
         }
-        enter();
+        enter(arguments);
     }
     #[cfg(not(awman_builtin))]
     {
@@ -73,7 +57,7 @@ pub fn dispatch(
 }
 
 #[cfg(awman_builtin)]
-fn enter() -> ! {
+fn enter(arguments: Vec<std::ffi::OsString>) -> ! {
     use clap::Parser;
     #[derive(Parser)]
     #[command(disable_help_flag = true, disable_version_flag = true)]
@@ -82,7 +66,7 @@ fn enter() -> ! {
         args: microsandbox_cli::machine_cmd::MachineArgs,
     }
     // Parse errors are deliberately generic: private invocations must not echo argv.
-    let parsed = Worker::try_parse_from(std::env::args_os().skip(1));
+    let parsed = Worker::try_parse_from(arguments);
     let Ok(parsed) = parsed else {
         eprintln!("awman: invalid private worker invocation (inherited descriptors required)");
         std::process::exit(64);
@@ -128,7 +112,7 @@ fn is_worker_invocation(arguments: &[std::ffi::OsString]) -> bool {
 
 /// Inherited descriptors named on the private worker argv.
 ///
-/// awman always spawns attached (`msb_driver.rs`), and SDK 0.7.2 then passes
+/// awman always spawns attached (`msb_driver.rs`), and the pinned SDK then passes
 /// `--config-fd`, `--parent-watch-fd` and (launch contract patch 18)
 /// `--lifecycle-lock-fd`. `--startup-fd` exists only for detached spawns
 /// (`microsandbox/lib/runtime/spawn.rs`), so it is optional and checked only
@@ -157,7 +141,7 @@ impl WorkerDescriptors {
         fds.iter().all(|fd| *fd >= 3) && fds.windows(2).all(|pair| pair[0] != pair[1])
     }
 
-    /// SDK 0.7.2 maps these descriptors to fixed slots before exec. Checking
+    /// The pinned SDK maps these descriptors to fixed slots before exec. Checking
     /// the slots prevents a caller from naming a different open host handle.
     fn sdk_slots(&self) -> bool {
         self.config == Some(96)
@@ -200,14 +184,17 @@ enum FdRole {
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 #[allow(unsafe_code)]
 fn descriptor_role(fd: i32, role: FdRole) -> bool {
+    // SAFETY: F_GETFD only probes the integer descriptor; invalid numbers return an error.
     if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return false;
     }
+    // SAFETY: F_GETFL reads descriptor flags without transferring ownership.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return false;
     }
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat points to writable storage for one libc::stat; invalid fds fail.
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
         return false;
     }
@@ -342,7 +329,7 @@ mod tests {
 
     #[test]
     fn worker_route_requires_machine_and_config_fd() {
-        // Exact attached argv shape rendered by SDK 0.7.2 `spawn.rs`.
+        // Exact attached argv shape rendered by the pinned SDK `spawn.rs`.
         assert!(is_worker_invocation(&argv(&[
             "machine",
             "--name",

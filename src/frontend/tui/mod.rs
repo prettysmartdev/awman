@@ -70,7 +70,7 @@ pub enum InitialTab {
 pub async fn run(
     _matches: clap::ArgMatches,
     ctx: RuntimeContext,
-    fatal_runtime_error: Option<String>,
+    fatal_runtime_error: Option<crate::command::startup::RuntimeStartupFailure>,
     initial_tab: InitialTab,
 ) -> ExitCode {
     let catalogue = CommandCatalogue::get();
@@ -79,6 +79,11 @@ pub async fn run(
 
     // Build the App and decide whether the normal startup auto-spawn runs — it
     // does only for a directory-bound tab, never for the squad tab.
+    let initial_tab = if fatal_runtime_error.is_some() {
+        InitialTab::Normal
+    } else {
+        initial_tab
+    };
     let (mut app, run_startup_spawn) = match initial_tab {
         InitialTab::Normal => {
             let session = ctx.session.read().await.clone();
@@ -135,16 +140,13 @@ pub async fn run(
         },
     };
 
-    if let Some(message) = fatal_runtime_error {
+    if let Some(failure) = fatal_runtime_error {
         app.active_dialog = Some(Dialog::FatalError {
             title: "Invalid Runtime Configuration".to_string(),
-            body: format!(
-                "{message}\n\nUpdate the 'runtime' value in $HOME/.awman/config.json \
-                 and restart awman."
-            ),
+            body: failure.error.to_string(),
         });
         return match event_loop::run_event_loop(&mut app) {
-            Ok(()) => ExitCode::from(2),
+            Ok(()) => ExitCode::from(failure.error.exit_code()),
             Err(e) => {
                 eprintln!("awman: TUI error: {e}");
                 ExitCode::from(1)

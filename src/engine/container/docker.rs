@@ -10,13 +10,11 @@
 //! `portable-pty`. Otherwise it uses `Stdio::piped()`.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::path::PathBuf;
 
 use crate::data::message::UserMessageSink;
 use crate::engine::agent_runtime::background::ExecOutput;
 use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
-use crate::engine::container::options::OverlaySpec;
 use crate::engine::container::runtime::CONTAINER_CAPABILITIES;
 use crate::engine::container::{background, host_cli_backend};
 
@@ -26,6 +24,7 @@ use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, AgentStats, ExecutionBackend,
 };
+use crate::engine::container::agent_argv::AgentArgv;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::container::process::{ContainerCli, ContainerInstance};
@@ -52,6 +51,9 @@ impl ContainerBackend for DockerBackend {
         let name = options.name.clone().unwrap_or_else(|| {
             ContainerName::new(crate::engine::container::naming::generate_container_name())
         });
+        // Refuse a launch whose agent argv cannot be built (a tool list the
+        // agent has no flag for) before any lease or child exists.
+        AgentArgv::from_options(&options)?;
         // Register a refresh lease for every file-delivered credential BEFORE
         // the container is built and its child spawned — the single choke point
         // (INV-6). No-op for every launch that carries no such credential.
@@ -398,10 +400,6 @@ impl ContainerBackend for DockerBackend {
         &CONTAINER_CAPABILITIES
     }
 
-    fn host_cli(&self) -> Option<&'static str> {
-        Some(ContainerCli::DOCKER.bin)
-    }
-
     fn reattach_after_owner_exit(&self) -> bool {
         true
     }
@@ -422,33 +420,20 @@ impl ContainerBackend for DockerBackend {
         host_cli_backend::cli_remove(ContainerCli::DOCKER, "rm", id)
     }
 
-    fn exec_args(
-        &self,
-        agent_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        Some(host_cli_backend::cli_exec_args(
-            agent_id,
-            working_dir,
-            entrypoint,
-            env_vars,
-        ))
-    }
-
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
         host_cli_backend::cli_image_exists(ContainerCli::DOCKER, tag)
     }
 
     fn build_image(
         &self,
-        tag: &str,
-        dockerfile: &Path,
-        context: &Path,
-        no_cache: bool,
+        request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
+        let tag = request.reference.as_str();
+        let dockerfile = request.dockerfile.as_path();
+        let context = request.context.as_path();
+        let no_cache = request.no_cache;
+
         host_cli_backend::cli_build_image(
             ContainerCli::DOCKER,
             tag,
@@ -474,14 +459,19 @@ impl ContainerBackend for DockerBackend {
         host_cli_backend::cli_remove(ContainerCli::DOCKER, "rmi", id)
     }
 
+    /// Docker and Apple Containers have no builtin launch settings; the
+    /// request's `builtin_launch` is ignored.
     fn start_background(
         &self,
-        image: &str,
-        workdir: &Path,
-        env: &HashMap<String, String>,
-        overlays: &[OverlaySpec],
+        request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
-        background::default_start_background(ContainerCli::DOCKER, image, workdir, env, overlays)
+        background::default_start_background(
+            ContainerCli::DOCKER,
+            request.image,
+            request.workdir,
+            request.env,
+            request.overlays,
+        )
     }
 
     fn exec_in_background(
@@ -496,12 +486,14 @@ impl ContainerBackend for DockerBackend {
 
     fn exec_in_background_streaming(
         &self,
-        id: &str,
-        command: &str,
-        working_dir: &str,
-        env: Option<&HashMap<String, String>>,
+        request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
+        let id = request.id;
+        let command = request.command;
+        let working_dir = request.working_dir;
+        let env = request.env;
+
         background::default_exec_in_background_streaming(
             ContainerCli::DOCKER,
             id,
@@ -821,14 +813,12 @@ impl ExecutionBackend for AttachExecution {
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
+    fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let pid = self.child_pid;
-        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
-            move || {
-                kill_local_exec(pid);
-                Ok(())
-            },
-        ))
+        crate::engine::agent_runtime::execution::CancelHandle::new(move || {
+            kill_local_exec(pid);
+            Ok(())
+        })
     }
 }
 
@@ -876,7 +866,7 @@ pub(super) fn build_run_argv(
     name: &ContainerName,
     image: &ImageRef,
     options: &ResolvedContainerOptions,
-) -> Vec<String> {
+) -> Result<Vec<String>, EngineError> {
     let mut args: Vec<String> = vec!["run".into()];
     if options.remove_on_exit {
         args.push("--rm".into());
@@ -1044,100 +1034,12 @@ pub(super) fn build_run_argv(
         }
     }
 
-    // ACP launches are complete at the entrypoint (`cline --acp`). Everything an
-    // ACP agent needs — the prompt, model, tool policy, permission decisions — is
-    // delivered over the JSON-RPC 2.0 channel (`session/*`), never as argv. Any
-    // stdio-mode flag or positional appended past the entrypoint would be handed
-    // to the agent as raw argv and corrupt the launch (e.g. `cline --acp task`,
-    // `cline --acp task --yolo`). So emit nothing after the entrypoint for ACP
-    // except the user's own `agentFlags`, which they configured for exactly
-    // this agent and launch.
-    if options.acp {
-        args.extend(options.agent_flags.iter().cloned());
-        return args;
-    }
-
-    // Mode flags appended to the agent argv.
-    if let Some(flag) = &options.non_interactive_flag {
-        // Some agents take a sub-command (e.g. "run") rather than a flag.
-        args.push(flag.clone());
-    }
-    // Per-agent mode flags (yolo, auto, plan) — appended as literal args.
-    for flag in &options.agent_mode_flags {
-        args.push(flag.clone());
-    }
-
-    // Disallowed tools.
-    if !options.disallowed_tools.is_empty() {
-        if let Some(flag_name) = options.disallowed_tools_flag.as_deref() {
-            args.push(flag_name.to_string());
-            args.push(options.disallowed_tools.join(","));
-        }
-    }
-    // Allowed tools.
-    if !options.allowed_tools.is_empty() {
-        if let Some(flag_name) = options.allowed_tools_flag.as_deref() {
-            args.push(flag_name.to_string());
-            args.push(options.allowed_tools.join(","));
-        }
-    }
-
-    // Model flag.
-    if let Some(model) = &options.model {
-        match model {
-            crate::engine::container::options::ModelFlagForm::Argument(name) => {
-                args.push("--model".into());
-                args.push(name.clone());
-            }
-            crate::engine::container::options::ModelFlagForm::Shorthand(s) => {
-                args.push(s.clone());
-            }
-        }
-    }
-
-    // System prompt file: agent-side CLI flag (after the image/entrypoint).
-    if let Some((_host_path, container_path, flag)) = &options.system_prompt_file {
-        args.push(flag.clone());
-        args.push(container_path.display().to_string());
-    }
-
-    // System prompt inline: pass the flag + text as agent argv.
-    if let Some((flag, text)) = &options.system_prompt_inline {
-        args.push(flag.clone());
-        args.push(text.clone());
-    }
-
-    // Agent add-dir flags.
-    for (flag, container_path) in &options.agent_add_dirs {
-        args.push(flag.clone());
-        args.push(container_path.display().to_string());
-    }
-
-    // User-configured extra agent args (`agentFlags` / `--agent-flag`): after
-    // every awman-generated flag, before the seeded prompt positional.
-    args.extend(options.agent_flags.iter().cloned());
-
-    // Interactive + seeded prompt: deliver the prompt so the agent receives it
-    // as its initial task. Most agents take it as the final positional arg;
-    // agents that declare an `interactive_seed_flag` (e.g. opencode `--prompt`)
-    // take it as a flag pair, because their bare positional means something else
-    // (opencode treats it as a project directory and `open()`s it → ENAMETOOLONG).
-    // Stdin stays inherited. Non-interactive + seeded prompt is handled via
-    // stdin piping at spawn time.
-    //
-    // ACP is excluded: an ACP session delivers its prompt over the JSON-RPC
-    // channel (`session/prompt`), never as argv — appending it here would pass
-    // raw prompt text to `cline --acp` as a positional and corrupt the launch.
-    if options.interactive && !options.acp {
-        if let Some(prompt) = &options.seeded_prompt {
-            if let Some(flag) = &options.interactive_seed_flag {
-                args.push(flag.clone());
-            }
-            args.push(prompt.clone());
-        }
-    }
-
-    args
+    // The agent's own argv tail, shared with Apple (same builder) and builtin.
+    // ACP launches are complete at the entrypoint (`cline --acp`): everything an
+    // ACP agent needs travels over the JSON-RPC channel, so the tail carries
+    // only the user's own `agentFlags`.
+    // A tool list the agent has no flag for refuses the launch (fail closed).
+    Ok(AgentArgv::from_options(options)?.append_to(args))
 }
 
 fn parse_stats_line(line: &str, fallback_name: &str) -> Result<AgentStats, EngineError> {
@@ -1266,7 +1168,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"--rm".to_string()));
         assert!(argv.contains(&"--label".to_string()));
@@ -1295,7 +1198,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let labels: Vec<&String> = argv
             .iter()
             .enumerate()
@@ -1333,7 +1237,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let awman = argv
             .iter()
             .position(|a| a == AWMAN_LABEL)
@@ -1353,7 +1258,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert_eq!(argv.iter().filter(|a| a.as_str() == "--label").count(), 1);
     }
 
@@ -1371,7 +1277,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "-v" && w[1] == "/h/p:/c/p:ro"));
@@ -1395,7 +1302,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.windows(2)
                 .any(|w| w[0] == "-e" && w[1] == "AWMAN_TEST_ENV_DOCKER"),
@@ -1450,7 +1358,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
 
         assert!(
             argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
@@ -1498,7 +1407,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(!argv.iter().any(|a| a.contains(bad)), "argv: {argv:?}");
         set_daemon_overlay(DaemonEnvMap::new());
     }
@@ -1531,7 +1441,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(argv
             .iter()
             .any(|a| a.contains("docker.sock") || a.contains("docker_engine")));
@@ -1548,7 +1459,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
         let claude_pos = argv.iter().position(|a| a == "claude").unwrap();
         let print_pos = argv.iter().position(|a| a == "--print").unwrap();
@@ -1570,7 +1482,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let vol_arg = argv
             .windows(2)
             .find(|w| w[0] == "-v")
@@ -1596,7 +1509,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"));
@@ -1612,7 +1526,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.contains(&"-i".to_string()),
             "seeded prompt needs -i flag"
@@ -1634,7 +1549,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.contains(&"-it".to_string()),
             "interactive+seeded must use -it for PTY"
@@ -1665,7 +1581,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.windows(2)
                 .any(|w| w[0] == "--prompt" && w[1] == "do the task"),
@@ -1694,7 +1611,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.contains(&"-i".to_string()),
             "interactive ACP run needs -i; argv: {argv:?}"
@@ -1717,7 +1635,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.contains(&"-i".to_string()),
             "non-interactive ACP run still needs -i; argv: {argv:?}"
@@ -1741,7 +1660,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             !argv.iter().any(|a| a == "do the task"),
             "ACP must not append the seeded prompt as an argv positional; argv: {argv:?}"
@@ -1769,7 +1689,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
         assert_eq!(
             &argv[img_pos + 1..],
@@ -1803,7 +1724,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
         assert_eq!(
             &argv[img_pos + 1..],
@@ -1835,7 +1757,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
         assert_eq!(
             &argv[img_pos + 1..],
@@ -1858,7 +1781,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &acp,
-        );
+        )
+        .unwrap();
         for banned in ["-p", "--publish", "--network", "--net", "--add-host"] {
             assert!(
                 !argv.iter().any(|a| a == banned),
@@ -1876,7 +1800,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &plain,
-        );
+        )
+        .unwrap();
         let count_v = |v: &[String]| v.iter().filter(|a| a.as_str() == "-v").count();
         assert_eq!(
             count_v(&argv),
@@ -1895,7 +1820,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.contains(&"-it".to_string()),
             "interactive run needs -it flag"
@@ -1912,7 +1838,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "-w" && w[1] == "/workspace"));
@@ -1929,7 +1856,8 @@ mod tests {
             &CN::new("my-container"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.windows(2)
                 .any(|w| w[0] == "--name" && w[1] == "my-container"),
@@ -1950,7 +1878,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             !argv.iter().any(|a| a.contains("yolo")),
             "yolo must not add a docker flag"
@@ -2012,7 +1941,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         // The name-only `-e KEY` pair must be present.
         assert!(
             argv.windows(2)
@@ -2041,7 +1971,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.windows(2).any(|w| w[0] == "-e" && w[1] == "TOKEN"),
             "credential name must still be present as `-e TOKEN`; argv: {argv:?}"
@@ -2065,7 +1996,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         assert!(
             argv.windows(2).any(|w| w[0] == "-e" && w[1] == "MULTILINE"),
             "credential name must be present as `-e MULTILINE`; argv: {argv:?}"
@@ -2088,7 +2020,8 @@ mod tests {
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
-        );
+        )
+        .unwrap();
         for name in ["KEY_A", "KEY_B"] {
             assert!(
                 argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),

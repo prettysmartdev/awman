@@ -47,7 +47,9 @@ async fn an_agent_that_ignores_interrupt_is_killed_and_removed_after_the_grace()
     let id = sandbox(&driver, "awman-stubborn", "a/1");
     let (control, log) = recorder();
     let (owner, _finished) = target(&driver, &id, "a/1", true);
-    cancel(control, Some(owner), Duration::from_millis(100)).unwrap();
+    ExecCancelHandle::new(control, Some(owner), Duration::from_millis(100))
+        .cancel()
+        .unwrap();
     assert_eq!(
         *log.lock().unwrap(),
         [Sent::Interrupt],
@@ -65,7 +67,9 @@ async fn keep_is_honoured_when_a_cancel_has_to_kill() {
     let id = sandbox(&driver, "awman-kept", "a/1");
     let (control, _log) = recorder();
     let (owner, _finished) = target(&driver, &id, "a/1", false);
-    cancel(control, Some(owner), Duration::from_millis(50)).unwrap();
+    ExecCancelHandle::new(control, Some(owner), Duration::from_millis(50))
+        .cancel()
+        .unwrap();
     settle("kill after the grace", || driver.finished().len() == 1).await;
     assert!(!driver.finished()[0].2);
     assert_eq!(driver.is_stopped(&id), Some(true), "stopped but preserved");
@@ -77,7 +81,9 @@ async fn no_kill_when_the_exit_path_finishes_inside_the_grace() {
     let id = sandbox(&driver, "awman-graceful", "a/1");
     let (control, log) = recorder();
     let (owner, finished) = target(&driver, &id, "a/1", true);
-    cancel(control, Some(owner), Duration::from_millis(600)).unwrap();
+    ExecCancelHandle::new(control, Some(owner), Duration::from_millis(600))
+        .cancel()
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
     finished.store(true, Ordering::Release);
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -93,7 +99,9 @@ async fn a_delayed_cancel_from_a_previous_launch_cannot_stop_the_replacement() {
     let id = sandbox(&driver, "awman-reused", "session/launch-2");
     let (control, log) = recorder();
     let (stale_owner, _finished) = target(&driver, &id, "session/launch-1", true);
-    cancel(control, Some(stale_owner), Duration::from_millis(50)).unwrap();
+    ExecCancelHandle::new(control, Some(stale_owner), Duration::from_millis(50))
+        .cancel()
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         driver.finished().is_empty(),
@@ -106,7 +114,25 @@ async fn a_delayed_cancel_from_a_previous_launch_cannot_stop_the_replacement() {
 #[tokio::test]
 async fn cancel_without_ownership_only_interrupts() {
     let (control, log) = recorder();
-    cancel(control, None, Duration::from_millis(10)).unwrap();
+    ExecCancelHandle::new(control, None, Duration::from_millis(10))
+        .cancel()
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(*log.lock().unwrap(), [Sent::Interrupt]);
+}
+
+#[tokio::test]
+async fn repeated_cancel_uses_one_interrupt_and_one_grace_task() {
+    let driver = FakeDriver::new();
+    let id = sandbox(&driver, "awman-repeated", "owner");
+    let (control, log) = recorder();
+    let (owner, _finished) = target(&driver, &id, "owner", true);
+    let cancel = ExecCancelHandle::new(control, Some(owner), Duration::from_millis(30));
+    cancel.cancel().unwrap();
+    cancel.clone().cancel().unwrap();
+    cancel.cancel().unwrap();
+    settle("one cancellation cleanup", || driver.finished().len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(*log.lock().unwrap(), [Sent::Interrupt, Sent::Kill]);
+    assert_eq!(driver.finished().len(), 1);
 }

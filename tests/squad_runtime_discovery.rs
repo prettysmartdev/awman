@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use awman::data::session::{AgentHandle, Session};
 use awman::engine::agent_runtime::{
-    AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ResolvedAgentOptions,
+    AgentRuntimeEngine, AgentStats, Capabilities, ResolvedAgentOptions,
 };
 use awman::engine::container::naming::generate_squad_container_name;
 use awman::engine::container::ContainerRuntime;
@@ -49,10 +49,7 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
     }
     fn build_image(
         &self,
-        _tag: &str,
-        _dockerfile: &std::path::Path,
-        _context: &std::path::Path,
-        _no_cache: bool,
+        _request: &awman::engine::container::BuildRequest,
         _on_line: &mut dyn FnMut(&str),
     ) -> Result<(), awman::engine::error::EngineError> {
         Ok(())
@@ -66,18 +63,10 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
     fn capabilities(&self) -> &Capabilities {
         // Static so `&Capabilities` can be returned without allocation.
         static CAPS: Capabilities = Capabilities {
-            arbitrary_env_vars: true,
             arbitrary_host_mounts: true,
-            cpu_limits: true,
-            per_resource_stats: true,
-            persistent_lifecycle: false,
             kit_declarative: false,
-            dind: DindSupport::Never,
-            host_paths_visible: true,
-            session_label_supported: false,
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-            fractional_cpu: false,
         };
         &CAPS
     }
@@ -102,23 +91,11 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
     fn stop(&self, _handle: &AgentHandle) -> Result<(), EngineError> {
         unimplemented!("not exercised by discovery tests")
     }
-    fn exec_args(
-        &self,
-        _agent_id: &str,
-        _working_dir: &str,
-        _entrypoint: &[&str],
-        _env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        unimplemented!("not exercised by discovery tests")
-    }
     fn attach(
         &self,
         _handle: &AgentHandle,
     ) -> Result<Box<dyn awman::engine::agent_runtime::execution::AgentInstance>, EngineError> {
         unimplemented!("not exercised by discovery tests")
-    }
-    fn host_cli(&self) -> Option<&'static str> {
-        Some("no-label-fake")
     }
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         // Mirrors the sandbox tier's own filter (`retain(|h| h.name.starts_with(prefix))`)

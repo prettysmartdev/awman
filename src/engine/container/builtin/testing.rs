@@ -2,6 +2,7 @@
 //! and a channel-backed frontend. No VM, hypervisor, SDK or real HOME.
 use super::driver::*;
 use super::naming;
+use super::paths::BuiltinPaths;
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::session::AgentHandle;
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
@@ -48,7 +49,7 @@ pub struct FakeSandbox {
 #[derive(Default)]
 pub struct FakeState {
     pub sandboxes: Vec<FakeSandbox>,
-    pub images: HashMap<String, ImageConfigSummary>,
+    pub images: HashMap<String, SandboxImageConfig>,
     pub creates: usize,
     /// `(id, owner token, remove)` for every `finish_owned` that was accepted.
     pub finished: Vec<(String, String, bool)>,
@@ -57,17 +58,49 @@ pub struct FakeState {
     pub hypervisor_error: Option<String>,
 }
 
+struct BootGate {
+    started: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    lease: PathBuf,
+}
+
 #[derive(Default)]
 pub struct FakeDriver {
     pub state: Mutex<FakeState>,
+    boot: Mutex<Option<BootGate>>,
+    lease: Mutex<Option<PathBuf>>,
+    attach_bind_failure: Mutex<Option<BuiltinPaths>>,
 }
 
 impl FakeDriver {
+    /// Arrange for the next successful exec to leave an endpoint at the
+    /// launcher's attach path, forcing `AttachServer::bind` to fail.
+    pub fn fail_next_attach_bind(&self, paths: BuiltinPaths) {
+        *self.attach_bind_failure.lock().unwrap() = Some(paths);
+    }
+
+    pub fn pause_next_boot(
+        &self,
+        lease: PathBuf,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        *self.boot.lock().unwrap() = Some(BootGate {
+            started,
+            release: wait,
+            lease,
+        });
+        (observed, release)
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    pub fn with_image(self: Arc<Self>, tag: &str, config: ImageConfigSummary) -> Arc<Self> {
+    pub fn with_image(self: Arc<Self>, tag: &str, config: SandboxImageConfig) -> Arc<Self> {
         self.state.lock().unwrap().images.insert(tag.into(), config);
         self
     }
@@ -202,6 +235,13 @@ impl SandboxDriver for FakeDriver {
             events: None,
             controls: Arc::new(Mutex::new(Vec::new())),
         });
+        drop(state);
+        if let Some(boot) = self.boot.lock().unwrap().take() {
+            std::fs::write(&boot.lease, b"booting").unwrap();
+            *self.lease.lock().unwrap() = Some(boot.lease);
+            let _ = boot.started.send(());
+            boot.release.recv_timeout(Duration::from_secs(20)).unwrap();
+        }
         Ok(())
     }
 
@@ -230,13 +270,23 @@ impl SandboxDriver for FakeDriver {
             .iter_mut()
             .find(|s| s.spec.name == id && !s.stopped)
             .ok_or_else(|| EngineError::Other("no such running sandbox".into()))?;
+        let owner = sandbox.spec.labels[naming::LABEL_OWNER].clone();
         sandbox.execs.push(request);
         let (broadcast, events) = tokio::sync::broadcast::channel(256);
         sandbox.events = Some(broadcast.clone());
+        let controls = sandbox.controls.clone();
+        drop(state);
+        if let Some(paths) = self.attach_bind_failure.lock().unwrap().take() {
+            let path = paths.attach(id, &owner);
+            std::fs::create_dir_all(path.parent().unwrap())
+                .map_err(|e| EngineError::io(path.parent().unwrap(), e))?;
+            std::fs::write(&path, b"pre-existing endpoint")
+                .map_err(|e| EngineError::io(&path, e))?;
+        }
         Ok(ExecSession {
             events,
             broadcast,
-            control: Arc::new(Recorder(sandbox.controls.clone())),
+            control: Arc::new(Recorder(controls)),
         })
     }
 
@@ -254,8 +304,23 @@ impl SandboxDriver for FakeDriver {
             .position(|s| s.spec.name == id)
             .ok_or_else(|| EngineError::Other("no such sandbox".into()))?;
         naming::check_owner(&state.sandboxes[position].spec.labels, owner)?;
+        // A forced stop ends the fake guest's live exec stream too.
+        if state.sandboxes[position]
+            .controls
+            .lock()
+            .unwrap()
+            .contains(&Sent::Kill)
+        {
+            if let Some(events) = &state.sandboxes[position].events {
+                let _ = events.send(ExecEvent::Exited(137));
+            }
+        }
         state.sandboxes[position].stopped = true;
         state.finished.push((id.into(), owner.into(), remove));
+        if let Some(lease) = self.lease.lock().unwrap().take() {
+            std::fs::remove_file(lease).unwrap();
+        }
+
         if remove {
             state.sandboxes.remove(position);
         }
@@ -284,7 +349,7 @@ impl SandboxDriver for FakeDriver {
         })
     }
 
-    fn image_config(&self, tag: &str) -> Result<Option<ImageConfigSummary>, EngineError> {
+    fn image_config(&self, tag: &str) -> Result<Option<SandboxImageConfig>, EngineError> {
         Ok(self.state.lock().unwrap().images.get(tag).cloned())
     }
 
@@ -369,8 +434,8 @@ impl AgentFrontend for TestFrontend {
 
 /// An image config resembling the spike fixture: named non-root USER, HOME,
 /// WORKDIR, entrypoint script and account database.
-pub fn fixture_image() -> ImageConfigSummary {
-    ImageConfigSummary {
+pub fn fixture_image() -> SandboxImageConfig {
+    SandboxImageConfig {
         home: Some("/home/probe".into()),
         user: Some("probe".into()),
         workdir: Some("/image-work".into()),

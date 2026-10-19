@@ -21,6 +21,14 @@ runners don't have:
 | `native-typed-provider` | same self-hosted macOS runner | Clean-checkout gate: `tools/native-builtin-ci.sh <triple>` builds and boots the typed provider from a fresh isolated `CARGO_HOME`/target dir, then `tools/oci-runtime-spike/sqlite-resolution/checks.sh auto` reruns the SQLite resolution checks on that target. Uploads SQLite and native-payload evidence as artifacts. Only on `workflow_dispatch` or `schedule`. |
 | `existing-backend-unsupported-targets` | Windows x86_64 (hosted), Intel Mac (self-hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise refusal a `builtin-experimental` selection reports there (the runtime is released for Apple Silicon only). Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |
 
+Workspace builds select the root library, `awman-cli`, and `awman-host-shims`;
+only `awman-cli` has a binary target, named `awman`. Workspace tests include
+the relocated worker and native transport unit tests. The
+`static-workspace-build` job builds and smoke-tests the single
+`x86_64-unknown-linux-musl` release executable with and without the builtin feature.
+The builtin and unsupported-target matrices use the same workspace. The musl
+feature build reports builtin as unsupported and excludes the GNU-only SDK dependencies.
+
 Cargo's registry, git cache, and `target/` are cached per-OS to keep warm runs fast.
 
 The hardware-gated jobs are separate from `fast` and `full-linux-docker`; those

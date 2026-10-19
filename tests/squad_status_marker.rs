@@ -27,7 +27,7 @@ use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::agent_runtime::execution::AgentInstance;
 use awman::engine::agent_runtime::{
-    AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ResolvedAgentOptions,
+    AgentRuntimeEngine, AgentStats, Capabilities, ResolvedAgentOptions,
 };
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::naming::generate_squad_container_name;
@@ -62,10 +62,7 @@ impl AgentRuntimeEngine for FakeRuntime {
     }
     fn build_image(
         &self,
-        _tag: &str,
-        _dockerfile: &std::path::Path,
-        _context: &std::path::Path,
-        _no_cache: bool,
+        _request: &awman::engine::container::BuildRequest,
         _on_line: &mut dyn FnMut(&str),
     ) -> Result<(), awman::engine::error::EngineError> {
         Ok(())
@@ -78,18 +75,10 @@ impl AgentRuntimeEngine for FakeRuntime {
     }
     fn capabilities(&self) -> &Capabilities {
         static CAPS: Capabilities = Capabilities {
-            arbitrary_env_vars: true,
             arbitrary_host_mounts: true,
-            cpu_limits: true,
-            per_resource_stats: true,
-            persistent_lifecycle: false,
             kit_declarative: false,
-            dind: DindSupport::Never,
-            host_paths_visible: true,
-            session_label_supported: false,
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-            fractional_cpu: false,
         };
         &CAPS
     }
@@ -116,15 +105,6 @@ impl AgentRuntimeEngine for FakeRuntime {
     fn stop(&self, _handle: &AgentHandle) -> Result<(), EngineError> {
         unimplemented!("not exercised by the status test")
     }
-    fn exec_args(
-        &self,
-        _agent_id: &str,
-        _working_dir: &str,
-        _entrypoint: &[&str],
-        _env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        unimplemented!("not exercised by the status test")
-    }
     fn attach(&self, _handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         unimplemented!("not exercised by the status test")
     }
@@ -135,9 +115,6 @@ impl AgentRuntimeEngine for FakeRuntime {
             .filter(|h| h.name.starts_with(prefix))
             .cloned()
             .collect())
-    }
-    fn host_cli(&self) -> Option<&'static str> {
-        Some("fake")
     }
 }
 

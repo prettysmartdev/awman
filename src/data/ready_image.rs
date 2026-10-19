@@ -80,6 +80,34 @@ pub struct ReadyBaseImageResult {
     pub build: StepStatus,
 }
 
+/// A non-default agent image that is not installed, and what `awman ready
+/// --build` would do about it. Recorded per image, so the hint names the
+/// right step for each image rather than one verb for the whole summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingAgentImage {
+    pub agent: String,
+    pub plan: ReadyImagePlan,
+}
+
+/// What `awman ready --build` would do for one missing agent image, decided
+/// from the runtime and, on importing runtimes, the image's configured source
+/// and builder selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadyImagePlan {
+    /// The runtime builds images itself (Docker, Apple Containers).
+    Build,
+    /// Imported from its configured source; nothing is built.
+    Import,
+    /// Built into its source store, then imported from it.
+    BuildAndImport,
+    /// No usable source is configured, so nothing can acquire it yet.
+    ConfigureSource,
+    /// The selected local output is read-only or collides with another
+    /// build. A writable, distinct source reference is needed before --build.
+    ConfigureBuildOutput,
+}
+
 /// A non-fatal condition raised while preparing one image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -93,6 +121,29 @@ pub enum ReadyImageWarning {
         /// Why that source cannot be built into (non-secret).
         reason: String,
     },
+    /// The source store could not be inspected, so the installed image was
+    /// kept instead of rebuilding.
+    BuilderUnreachable {
+        tag: String,
+        /// The builder as named in messages (e.g. `Docker at unix://…`).
+        builder: String,
+        detail: String,
+    },
+    /// An earlier build's receipt names an image the source no longer
+    /// exposes as one platform image; the import is refreshed instead.
+    BuiltImageNotExposed { tag: String, reference: String },
+    /// An earlier build's receipt names an image the source reference no
+    /// longer holds; the image it holds now is imported.
+    StaleBuildReceipt { tag: String, reference: String },
+    /// The image was imported, but its build receipt could not be removed;
+    /// a later run re-imports the same content.
+    ReceiptNotCleared { tag: String, detail: String },
+    /// The build succeeded and only the import failed; the receipt lets the
+    /// next run retry the import without rebuilding.
+    BuildOkImportFailed { tag: String },
+    /// The import from a buildable source failed; rebuilding it there is
+    /// the way forward.
+    RebuildInSourceStore { tag: String },
 }
 
 impl std::fmt::Display for ReadyImageWarning {
@@ -108,6 +159,109 @@ impl std::fmt::Display for ReadyImageWarning {
                  '{source_kind}', which cannot build Dockerfiles ({reason}); skipping build \
                  and importing from the configured source"
             ),
+            Self::BuilderUnreachable {
+                tag,
+                builder,
+                detail,
+            } => write!(
+                f,
+                "{tag}: {builder} is unreachable; using the installed image ({detail})"
+            ),
+            Self::BuiltImageNotExposed { tag, reference } => write!(
+                f,
+                "{tag}: {reference} no longer exposes the image an earlier `awman ready` built; \
+                 refreshing the source import"
+            ),
+            Self::StaleBuildReceipt { tag, reference } => write!(
+                f,
+                "{tag}: {reference} no longer holds the image an earlier `awman ready` built for \
+                 it; importing the image it holds now (run `awman ready --build` to rebuild)"
+            ),
+            Self::ReceiptNotCleared { tag, detail } => {
+                write!(f, "{tag}: could not clear its build receipt: {detail}")
+            }
+            Self::BuildOkImportFailed { tag } => write!(
+                f,
+                "{tag}: the build succeeded but the import failed; run `awman ready` again to \
+                 retry the import"
+            ),
+            Self::RebuildInSourceStore { tag } => write!(
+                f,
+                "{tag}: run `awman ready --build` to rebuild it in its source store"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WI 0126 F1/F3: the builder warnings that used to be free text are
+    /// typed and render the same words in every frontend and in
+    /// `ready --json`.
+    #[test]
+    fn builder_warnings_render_their_wording_and_serialize_by_kind() {
+        let tag = || "awman-r-claude:latest".to_string();
+        let cases = [
+            (
+                ReadyImageWarning::BuilderUnreachable {
+                    tag: tag(),
+                    builder: "Docker at unix:///d.sock".into(),
+                    detail: "down".into(),
+                },
+                "awman-r-claude:latest: Docker at unix:///d.sock is unreachable; using the \
+                 installed image (down)",
+                "builder-unreachable",
+            ),
+            (
+                ReadyImageWarning::BuiltImageNotExposed {
+                    tag: tag(),
+                    reference: "a:1".into(),
+                },
+                "awman-r-claude:latest: a:1 no longer exposes the image an earlier `awman \
+                 ready` built; refreshing the source import",
+                "built-image-not-exposed",
+            ),
+            (
+                ReadyImageWarning::StaleBuildReceipt {
+                    tag: tag(),
+                    reference: "a:1".into(),
+                },
+                "awman-r-claude:latest: a:1 no longer holds the image an earlier `awman ready` \
+                 built for it; importing the image it holds now (run `awman ready --build` to \
+                 rebuild)",
+                "stale-build-receipt",
+            ),
+            (
+                ReadyImageWarning::ReceiptNotCleared {
+                    tag: tag(),
+                    detail: "denied".into(),
+                },
+                "awman-r-claude:latest: could not clear its build receipt: denied",
+                "receipt-not-cleared",
+            ),
+            (
+                ReadyImageWarning::BuildOkImportFailed { tag: tag() },
+                "awman-r-claude:latest: the build succeeded but the import failed; run `awman \
+                 ready` again to retry the import",
+                "build-ok-import-failed",
+            ),
+            (
+                ReadyImageWarning::RebuildInSourceStore { tag: tag() },
+                "awman-r-claude:latest: run `awman ready --build` to rebuild it in its source \
+                 store",
+                "rebuild-in-source-store",
+            ),
+        ];
+        for (warning, text, kind) in cases {
+            assert_eq!(warning.to_string(), text);
+            let json = serde_json::to_value(&warning).unwrap();
+            assert_eq!(json["kind"], kind);
+            assert_eq!(
+                serde_json::from_value::<ReadyImageWarning>(json).unwrap(),
+                warning
+            );
         }
     }
 }

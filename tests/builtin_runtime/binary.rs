@@ -459,7 +459,8 @@ fn builtin_info_reports_the_strict_embedded_contract() {
     // The kernel hash is the one the checksum-verified build input pins.
     let manifest: toml::Value = toml::from_str(
         &std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/msb-payloads/manifest.toml"),
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .join("third_party/msb-payloads/manifest.toml"),
         )
         .unwrap(),
     )

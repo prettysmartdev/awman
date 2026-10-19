@@ -280,10 +280,12 @@ impl Command for ReadyCommand {
             text: "Checking agent image…".into(),
         });
 
-        // `ReadyEngine::new` already derives the image sources from this same
-        // session's effective config; a separate `.with_image_sources(...)`
-        // call here would just recompute the identical value in Layer 2.
+        let resolved_builtin = session.effective_config().builtin_settings()?;
         let mut engine = ReadyEngine::new(
+            resolved_builtin,
+            crate::data::config::global::GlobalConfig::data_home_with(
+                session.effective_config().env(),
+            )?,
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),

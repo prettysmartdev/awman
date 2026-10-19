@@ -55,10 +55,12 @@ pub mod sources;
 mod transport;
 pub mod verify;
 
-pub use archive::{validate_archive, ImageConfigSummary, ValidatedArchive};
-pub use cache::{CacheRecord, OciCache, PruneReport};
+pub use crate::data::oci_cache::CacheRecord;
+pub use crate::data::oci_cache::ImageConfigSummary;
+pub use archive::{ArchiveValidator, ValidatedArchive};
+pub use cache::{OciCache, PruneReport};
 pub use resolve::{
-    external_build_hint, resolve_source, BuildHint, ImageSourceResolver, ImageSources,
+    resolve_source, BuildHint, ImageBuildGuidance, ImageSourceResolver, ImageSources,
     ResolvedImageSource,
 };
 pub use retry::{CancelToken, RetryPolicy};
@@ -220,21 +222,6 @@ pub fn default_acquirer(
     )
 }
 
-/// The non-secret image defaults recorded when `archive` (an
-/// [`AcquiredImage::archive`] path) was cached: `USER`, `HOME`, `WORKDIR`.
-pub fn cached_image_config(
-    state_dir: &Path,
-    archive: &Path,
-) -> Result<Option<ImageConfigSummary>, EngineError> {
-    let cache = OciCache::open(state_dir)?;
-    Ok(cache.record_for_archive(archive)?.map(|r| r.config))
-}
-
-/// Remove cached archives whose manifest digest is not in `keep`.
-pub fn prune_cache(state_dir: &Path, keep: &[Digest]) -> Result<PruneReport, EngineError> {
-    OciCache::open(state_dir)?.prune(keep)
-}
-
 /// The cache-backed acquirer. The disk probe, retry policy, cancellation
 /// token and sleeper are injectable so the insufficient-space, retry and
 /// cancellation paths are testable without a real disk or real waiting.
@@ -282,6 +269,31 @@ impl CachingAcquirer {
     pub fn with_cancel(mut self, token: CancelToken) -> Self {
         self.cancel = token;
         self
+    }
+
+    /// Validate before cache publication (also shared by recording importers).
+    pub(crate) fn check_built_identity(
+        expected: Option<&crate::data::oci_identity::BuiltImageIdentity>,
+        identity: &ImageIdentity,
+    ) -> Result<(), EngineError> {
+        if let Some(expected) = expected {
+            if !expected.matches(identity) {
+                return Err(EngineError::ImageDigestMismatch {
+                    reference: identity.reference.clone(),
+                    expected: expected
+                        .config_digest()
+                        .or(expected.manifest_digest())
+                        .expect("validated build receipt")
+                        .to_string(),
+                    actual: if expected.config_digest().is_some() {
+                        identity.config_digest.to_string()
+                    } else {
+                        identity.manifest_digest.to_string()
+                    },
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Require fresh content matching a builder receipt before cache
@@ -366,7 +378,8 @@ impl ImageAcquirer for CachingAcquirer {
                         (sources::Resolved::Archive { path }, Some(fp))
                             if request.policy == AcquirePolicy::IfMissing =>
                         {
-                            cache::SourceFingerprint::of(path).is_some_and(|now| now != *fp)
+                            crate::data::oci_cache::SourceFingerprint::of(path)
+                                .is_some_and(|now| now != *fp)
                         }
                         _ => false,
                     };
@@ -388,13 +401,10 @@ impl ImageAcquirer for CachingAcquirer {
                 }
             }
             if request.policy == AcquirePolicy::CachedOnly {
-                return Err(EngineError::Container(format!(
-                    "image '{}' is not in the builtin image cache ({} {}); run `awman ready` \
-                     to import it",
-                    request.tag,
-                    kind,
-                    resolved.locator()
-                )));
+                return Err(EngineError::ImageNotCached {
+                    tag: request.tag.clone(),
+                    source_desc: format!("{} {}", kind, resolved.locator()),
+                });
             }
         }
         self.cancel.check()?;
@@ -429,11 +439,13 @@ impl ImageAcquirer for CachingAcquirer {
             let fetch = |report: sources::Report<'_>| {
                 let fetched = resolved.fetch(&request.tag, &reference, &ctx, report)?;
                 self.cancel.check()?;
-                let validated = archive::validate_archive_controlled(
+                let validated = archive::ArchiveValidator {
+                    platform: &request.platform,
+                    wanted_refs: &fetched.wanted_refs,
+                    limits: &self.limits,
+                }
+                .validate_controlled(
                     &fetched.path,
-                    &request.platform,
-                    &fetched.wanted_refs,
-                    &self.limits,
                     &mut |p| report(p),
                     &control,
                 )?;
@@ -478,23 +490,7 @@ impl ImageAcquirer for CachingAcquirer {
             platform: validated.platform.clone(),
             source: kind,
         };
-        if let Some(expected) = &self.expected_built_identity {
-            if !expected.matches(&identity) {
-                return Err(EngineError::ImageDigestMismatch {
-                    reference: reference.clone(),
-                    expected: expected
-                        .config_digest()
-                        .or(expected.manifest_digest())
-                        .expect("validated build receipt")
-                        .to_string(),
-                    actual: if expected.config_digest().is_some() {
-                        identity.config_digest.to_string()
-                    } else {
-                        identity.manifest_digest.to_string()
-                    },
-                });
-            }
-        }
+        Self::check_built_identity(self.expected_built_identity.as_ref(), &identity)?;
         control.check()?;
         let (committed, lease) = cache.commit_leased(
             &fetched.path,
@@ -622,7 +618,9 @@ mod tests {
             .unwrap();
         assert_eq!(again, first);
         assert_eq!(
-            cached_image_config(state.path(), &first.archive)
+            OciCache::open(state.path())
+                .unwrap()
+                .image_config(&first.archive)
                 .unwrap()
                 .unwrap()
                 .home

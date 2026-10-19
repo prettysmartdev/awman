@@ -421,9 +421,17 @@ impl LocalTaskEvaluator {
         });
         build_logs.begin(&project_tag);
         let result = runtime
-            .build_image(&project_tag, &dockerfile, root, false, &mut |line: &str| {
-                build_logs.line(line);
-            })
+            .build_image(
+                &crate::engine::container::BuildRequest::runtime(
+                    &project_tag,
+                    &dockerfile,
+                    root,
+                    false,
+                ),
+                &mut |line: &str| {
+                    build_logs.line(line);
+                },
+            )
             .map_err(|error| {
                 CommandError::Other(format!(
                     "failed to build the task workspace's base image from {}: {error}",
@@ -537,19 +545,17 @@ impl LocalTaskEvaluator {
                 }
             }
         }
-        let image_sources = crate::engine::oci::ImageSources::from_config(
-            &session.effective_config().builtin_runtime(),
-        );
         for pool_agent in &pool_agents {
             ensure_agent_image_with_build_output(
                 &self.engines,
                 &git_root,
                 &dockerfiles,
                 pool_agent,
-                &image_sources,
+                &session,
                 &mut sink,
                 Some(&mut build_logs),
-            )?;
+            )
+            .await?;
         }
 
         // The overlay set is collected once, here, and reused for the prompt
@@ -775,19 +781,17 @@ impl LocalTaskEvaluator {
                 &dockerfiles,
             )
             .map_err(CommandError::Other)?;
-        let image_sources = crate::engine::oci::ImageSources::from_config(
-            &session.effective_config().builtin_runtime(),
-        );
         for step_agent in &workflow_agents {
             ensure_agent_image_with_build_output(
                 &self.engines,
                 &git_root,
                 &dockerfiles,
                 step_agent,
-                &image_sources,
+                &session,
                 &mut sink,
                 Some(&mut build_logs),
-            )?;
+            )
+            .await?;
         }
 
         // Record the engine's own state file on the run row *before* the
@@ -1200,6 +1204,119 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::collections::HashMap;
+
+    struct HoldingFrontends {
+        messages: Arc<std::sync::Mutex<Vec<UserMessage>>>,
+    }
+
+    impl SquadRunFrontends for HoldingFrontends {
+        fn leader_frontend(
+            &self,
+            _: &str,
+            _: &crate::data::fs::RunId,
+            _: &Path,
+            _: &str,
+            _: MountScopeDecision,
+        ) -> Result<Box<dyn AgentFrontend>, CommandError> {
+            Ok(Box::new(
+                crate::command::commands::exec_workflow::tests::FakeExecWorkflowFrontend::with_shared_messages(self.messages.clone()),
+            ))
+        }
+
+        fn workflow_frontend(
+            &self,
+            _: &str,
+            _: &crate::data::fs::RunId,
+            _: &Path,
+            _: MountScopeDecision,
+        ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError> {
+            Ok(Box::new(
+                crate::command::commands::exec_workflow::tests::FakeExecWorkflowFrontend::with_shared_messages(self.messages.clone()),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn squad_evaluation_survives_retained_workflow_frontend() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".awman")).unwrap();
+        std::fs::write(
+            temp.path().join(".awman/Dockerfile.claude"),
+            "FROM scratch\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        let task_dir = temp.path().join("task-workspace");
+        let run_log_dir = temp.path().join("run-logs");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::create_dir_all(&run_log_dir).unwrap();
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = crate::engine::container::test_support::holding_runtime(held.clone());
+        let mut engines = Engines::for_tests(temp.path());
+        engines.runtime = runtime.clone();
+        engines.container_runtime = Some(runtime.clone());
+        engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            engines.overlay_engine.clone(),
+            runtime,
+        ));
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let evaluator = LocalTaskEvaluator::new(
+            engines,
+            EnvSnapshot::with_overrides([(
+                "AWMAN_SQUAD_ROOT",
+                temp.path().join("squad").to_string_lossy().as_ref(),
+            )]),
+            Arc::new(HoldingFrontends {
+                messages: messages.clone(),
+            }),
+        );
+        let mut squad_task = task(Some("claude"), None);
+        squad_task.repo_scope = temp.path().to_path_buf();
+        let outcome = evaluator
+            .evaluate(EvaluationRequest {
+                task: squad_task,
+                run_id: crate::data::fs::RunId::new(),
+                task_dir,
+                run_log_dir,
+                guidance: None,
+                agents_to_models: None,
+                default_leader: None,
+                progress: Arc::new(crate::engine::squad::NoRunProgress),
+            })
+            .await;
+        assert!(
+            matches!(outcome, EvaluationOutcome::WorkflowExecuted { .. }),
+            "{}",
+            match outcome {
+                EvaluationOutcome::Failed { ref error, .. } => error.as_str(),
+                _ => "unexpected outcome",
+            }
+        );
+        assert!(held.lock().unwrap().len() >= 2);
+        assert!(messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.text == "held runtime message"));
+    }
 
     // ── WI 0112 Part 6: the leader's exit and verdict decide together ──────
 

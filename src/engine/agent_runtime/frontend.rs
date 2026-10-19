@@ -11,15 +11,44 @@ use async_trait::async_trait;
 use crate::data::message::UserMessageSink;
 use crate::engine::container::timing::{DEFAULT_GRACE_TIMEOUT, DEFAULT_STUCK_TIMEOUT};
 
-/// What stage an agent execution is in.
+/// What stage an agent execution is in, as reported to
+/// [`AgentFrontend::report_status`].
+///
+/// What a frontend can expect, on every runtime:
+///
+/// - `Running { container_name }` exactly once per `run_with_frontend`
+///   (fresh launch or attach), after the agent process or exec session exists
+///   and before any output is bridged. This is the only status every backend
+///   emits, and the only one a frontend may rely on.
+/// - Everything else is advisory. Builtin additionally reports `Starting`
+///   (sandbox boot, before `Running`) and a terminal `Exited(code)` or
+///   `Failed(reason)` from its exec event stream. Docker, Apple and the
+///   sandbox tier do not: their frontend is consumed by `take_io` and dropped
+///   when `run_with_frontend` returns, and their exit status comes from the
+///   host CLI child, which only [`AgentExecution::wait`] observes.
+/// - The authoritative end of an execution is `AgentExecution::wait()` (an
+///   `AgentExitInfo` or an error), on every runtime. A frontend must not wait
+///   for `Exited` or `Failed` to learn that an agent finished.
+/// - `Building`, `Pulling` and `Stopping` are not emitted by any backend
+///   today. Image build and import progress travels through the
+///   `UserMessageSink` / image-preparation sink instead.
+///
+/// [`AgentExecution::wait`]: crate::engine::agent_runtime::AgentExecution::wait
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentStatus {
     Building,
     Pulling,
+    /// Builtin only: the sandbox is booting.
     Starting,
-    Running { container_name: String },
+    /// Every backend, once per `run_with_frontend`.
+    Running {
+        container_name: String,
+    },
     Stopping,
+    /// Builtin only: the guest process exited with this code. Others report
+    /// the exit through `AgentExecution::wait`.
     Exited(i32),
+    /// Builtin only: the exec stream failed. `wait` returns the error too.
     Failed(String),
 }
 

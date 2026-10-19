@@ -61,6 +61,29 @@ pub fn create_private_dir(dir: &Path) -> Result<(), DataError> {
     Ok(())
 }
 
+/// Create `dir`, which must not already exist, readable only by this user.
+/// The parent must exist.
+pub fn create_private_dir_new(dir: &Path) -> Result<(), DataError> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| io_err(dir, e))
+}
+
+/// Create `path`, which must not already exist, readable and writable only by
+/// this user. Exclusive creation means a staging name can never be
+/// pre-planted (or be a symlink that is followed).
+pub fn create_private_file_new(path: &Path) -> Result<File, DataError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|e| io_err(path, e))
+}
+
 /// Open `path` without following a symlink, creating it owner-only when
 /// `create` is set, and check it is a private regular file. `Ok(None)` when
 /// it is absent and `create` is not set.
@@ -108,19 +131,48 @@ fn open_private(path: &Path, create: bool, write: bool) -> Result<Option<File>, 
     Ok(Some(file))
 }
 
-/// Take an exclusive cross-process lock on the private lock file at `path`,
-/// creating it if needed. Waits until it is free, calling `check` before
-/// every attempt so a caller can abandon the wait (cancellation, deadline)
-/// by returning an error. The lock is released when the file is dropped.
+/// Open the private lock or lease file at `path` (read-write), creating it
+/// owner-only when `create` is set. `Ok(None)` when it is absent and not
+/// created. A symlink, hard link, foreign or group/world-accessible file is
+/// refused, never locked.
+pub fn open_private_lock(path: &Path, create: bool) -> Result<Option<File>, DataError> {
+    open_private(path, create, true)
+}
+
+/// Whether a lock is exclusive or shared among readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    Exclusive,
+    Shared,
+}
+
+/// Take an exclusive cross-process lock on the private lock file at `path`;
+/// see [`lock_private`].
 pub fn lock_private_exclusive(
     path: &Path,
+    check: impl FnMut() -> Result<(), DataError>,
+) -> Result<File, DataError> {
+    lock_private(path, LockMode::Exclusive, check)
+}
+
+/// Take a cross-process lock on the private lock file at `path`, creating it
+/// if needed. Waits until it is free, calling `check` before every attempt so
+/// a caller can abandon the wait (cancellation, deadline) by returning an
+/// error. The lock is released when the file is dropped.
+pub fn lock_private(
+    path: &Path,
+    mode: LockMode,
     mut check: impl FnMut() -> Result<(), DataError>,
 ) -> Result<File, DataError> {
     let file = open_private(path, true, true)?
         .ok_or_else(|| DataError::Other(format!("lock {} vanished", path.display())))?;
     loop {
         check()?;
-        match file.try_lock() {
+        let locked = match mode {
+            LockMode::Exclusive => file.try_lock(),
+            LockMode::Shared => file.try_lock_shared(),
+        };
+        match locked {
             Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL),
             Err(std::fs::TryLockError::Error(e)) => return Err(io_err(path, e)),
@@ -128,6 +180,35 @@ pub fn lock_private_exclusive(
     }
     check()?;
     Ok(file)
+}
+
+/// Like [`lock_private`], but gives up after `wait` once the lock is still
+/// held by someone else: `Ok(None)` means "busy". One attempt is always made,
+/// so a zero `wait` is a try-lock. `check` runs before every attempt.
+pub fn lock_private_timeout(
+    path: &Path,
+    mode: LockMode,
+    wait: Duration,
+    mut check: impl FnMut() -> Result<(), DataError>,
+) -> Result<Option<File>, DataError> {
+    let file = open_private(path, true, true)?
+        .ok_or_else(|| DataError::Other(format!("lock {} vanished", path.display())))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        check()?;
+        let locked = match mode {
+            LockMode::Exclusive => file.try_lock(),
+            LockMode::Shared => file.try_lock_shared(),
+        };
+        match locked {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(LOCK_POLL)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(io_err(path, e)),
+        }
+    }
 }
 
 /// Read the private JSON record at `path`. `Ok(None)` when it does not
@@ -181,6 +262,62 @@ pub fn write_private_json_atomic<T: Serialize>(
     Ok(())
 }
 
+/// Read a small JSON record where anything unusable is a miss, not an error:
+/// absent, a symlink or other non-regular file, larger than `max_bytes`, or
+/// unparsable all give `Ok(None)`. The file is never followed through a
+/// symlink and is read without allocating more than `max_bytes`. Only a
+/// failure to open or read an otherwise ordinary file is an error.
+pub fn read_private_json_or_miss<T: DeserializeOwned>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<T>, DataError> {
+    use std::io::Read;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // ELOOP: a symlink in place of a record.
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(e) => return Err(io_err(path, e)),
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_err(path, e))?;
+    if bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+/// Whether `path` is the leftover sibling of an interrupted
+/// [`write_private_json_atomic`] (`.<name>.<uuid>.tmp`).
+pub fn is_interrupted_private_write(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.') && n.ends_with(".tmp"))
+}
+
+/// Best-effort directory fsync so a committed rename survives a crash.
+pub fn sync_private_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 /// Remove the record at `path`. Absent is success.
 pub fn remove_private_file(path: &Path) -> Result<(), DataError> {
     match std::fs::remove_file(path) {
@@ -194,6 +331,25 @@ pub fn remove_private_file(path: &Path) -> Result<(), DataError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn create_private_file_new_is_exclusive_and_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("stage");
+        drop(create_private_file_new(&path).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(matches!(
+            create_private_file_new(&path),
+            Err(DataError::Io { .. })
+        ));
+        let link = root.path().join("link");
+        symlink(root.path().join("elsewhere"), &link).unwrap();
+        assert!(create_private_file_new(&link).is_err());
+        assert!(!root.path().join("elsewhere").exists());
+    }
 
     #[test]
     fn private_records_refuse_symlinks_and_public_permissions() {

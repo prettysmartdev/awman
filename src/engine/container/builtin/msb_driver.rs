@@ -30,12 +30,14 @@ fn failure(operation: &str) -> EngineError {
 fn create_error(error: &microsandbox::MicrosandboxError, name: &str, image: &str) -> EngineError {
     use microsandbox::MicrosandboxError as E;
     match error {
-        E::SandboxAlreadyExists(_) | E::SandboxStillRunning(_) => EngineError::Other(format!(
-            "a builtin sandbox for agent '{name}' already exists; stop or remove it (awman clean) or choose another name"
-        )),
-        E::ImageNotFound(_) => EngineError::Config(format!(
-            "image {image} is not in the builtin image store; run awman ready to import it"
-        )),
+        E::SandboxAlreadyExists(_) | E::SandboxStillRunning(_) => {
+            EngineError::BuiltinSandboxExists {
+                name: name.to_string(),
+            }
+        }
+        E::ImageNotFound(_) => EngineError::BuiltinImageNotImported {
+            image: image.to_string(),
+        },
         E::Io(io) if io.kind() == std::io::ErrorKind::StorageFull => EngineError::Other(
             "builtin sandbox creation failed: no space left on device".into(),
         ),
@@ -63,9 +65,21 @@ impl Drop for MsbDriver {
     }
 }
 impl MsbDriver {
-    pub fn open(paths: BuiltinPaths) -> Result<Arc<Self>, EngineError> {
-        let executable = super::embedded::resolve()?;
-        super::catalog::check(&paths)?;
+    pub fn open(
+        paths: BuiltinPaths,
+        ambient_overrides: &[&'static str],
+    ) -> Result<Arc<Self>, EngineError> {
+        let ambient_overrides = ambient_overrides.to_vec();
+        super::blocking::BlockingOperation::run(move || {
+            Self::open_blocking(paths, &ambient_overrides)
+        })
+    }
+    fn open_blocking(
+        paths: BuiltinPaths,
+        ambient_overrides: &[&'static str],
+    ) -> Result<Arc<Self>, EngineError> {
+        let executable = super::embedded::EmbeddedRuntime::resolve(ambient_overrides)?;
+        paths.check_catalog()?;
         // This pinned SDK entrypoint starts with GlobalConfig::default() and
         // never loads installed msb config or resolves paths from HOME/XDG.
         // All state roots below are owned by awman and remain explicit.
@@ -119,13 +133,17 @@ impl MsbDriver {
         &self,
         future: impl Future<Output = Result<T, EngineError>> + Send + 'static,
     ) -> Result<T, EngineError> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let backend = self.backend();
-        self.runtime.spawn(async move {
-            let _ = tx.send(microsandbox::backend::with_backend(backend, future).await);
-        });
-        rx.recv().map_err(|_| failure("control task"))?
+        let runtime = self.runtime.clone();
+        super::blocking::BlockingOperation::run(move || {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            runtime.spawn(async move {
+                let _ = tx.send(microsandbox::backend::with_backend(backend, future).await);
+            });
+            rx.recv().map_err(|_| failure("control task"))?
+        })
     }
+
     fn backend(&self) -> Arc<dyn Backend> {
         self.local.clone()
     }
@@ -452,7 +470,7 @@ impl SandboxDriver for MsbDriver {
             })
         })
     }
-    fn image_config(&self, tag: &str) -> Result<Option<ImageConfigSummary>, EngineError> {
+    fn image_config(&self, tag: &str) -> Result<Option<SandboxImageConfig>, EngineError> {
         let local = self.local.clone();
         let tag = tag.to_string();
         self.call(async move {
@@ -462,7 +480,7 @@ impl SandboxDriver for MsbDriver {
                 Err(_) => return Err(failure("image inspection")),
             };
             let Some(config) = detail.config else {
-                return Ok(Some(ImageConfigSummary::default()));
+                return Ok(Some(SandboxImageConfig::default()));
             };
             let home = config
                 .env
@@ -502,7 +520,7 @@ impl SandboxDriver for MsbDriver {
                     .as_deref()
                     .and_then(|passwd| super::driver::passwd_home(passwd, config.user.as_deref()))
             });
-            Ok(Some(ImageConfigSummary {
+            Ok(Some(SandboxImageConfig {
                 home,
                 user: config.user,
                 workdir: config.working_dir,

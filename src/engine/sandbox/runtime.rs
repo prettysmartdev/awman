@@ -11,8 +11,7 @@ use crate::data::session::Session;
 use crate::engine::agent_runtime::execution::{AgentExitInfo, ExecutionBackend, StuckEvent};
 use crate::engine::agent_runtime::{
     AgentExecution, AgentFrontend, AgentHandle, AgentHandlePreview, AgentInstance,
-    AgentRuntimeEngine, AgentStats, Capabilities, DindSupport, ReadyAgentOptions,
-    ResolvedAgentOptions,
+    AgentRuntimeEngine, AgentStats, Capabilities, ReadyAgentOptions, ResolvedAgentOptions,
 };
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::backend::SandboxBackend;
@@ -22,18 +21,10 @@ use crate::engine::sandbox::options::ResolvedSandboxOptions;
 /// Capabilities shared by sandbox-class runtimes: kit-declarative,
 /// persistent, workspace-only mounts, private DinD per VM.
 static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
-    arbitrary_env_vars: false,
     arbitrary_host_mounts: false,
-    cpu_limits: false,
-    per_resource_stats: false,
-    persistent_lifecycle: true,
     kit_declarative: true,
-    dind: DindSupport::Always,
-    host_paths_visible: false,
-    session_label_supported: false,
     has_image_store: false,
     image_acquisition: crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-    fractional_cpu: false,
 };
 
 pub struct SandboxRuntime {
@@ -145,6 +136,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
         match options {
             ResolvedAgentOptions::Sandbox(opts) => {
+                opts.validate_tool_restrictions()?;
                 Ok(Box::new(SandboxAgentInstance { options: opts }))
             }
             other => Err(EngineError::OptionVariantMismatch {
@@ -171,31 +163,6 @@ impl AgentRuntimeEngine for SandboxRuntime {
         self.backend.stop(handle)
     }
 
-    fn exec_args(
-        &self,
-        agent_id: &str,
-        _working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Option<Vec<String>> {
-        // `sbx exec -it [--env K=V…] <sandbox-name> <entrypoint…>`.
-        //
-        // `agent_id` carries the deterministic sandbox name for re-attach.
-        // Per Phase 0 #3 (Issue #63), the caller passes COLUMNS/LINES through
-        // `env_vars` so TUI apps inside the VM see a real terminal size; they
-        // are emitted as `--env` like any other variable. The kit's default
-        // working directory is the mounted workspace, so `working_dir` needs
-        // no translation here.
-        let mut args = vec!["exec".to_string(), "-it".to_string()];
-        for (k, v) in env_vars {
-            args.push("--env".to_string());
-            args.push(format!("{k}={v}"));
-        }
-        args.push(agent_id.to_string());
-        args.extend(entrypoint.iter().map(|s| s.to_string()));
-        Some(args)
-    }
-
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         Ok(Box::new(SandboxAttachInstance {
             handle: handle.clone(),
@@ -208,10 +175,6 @@ impl AgentRuntimeEngine for SandboxRuntime {
         let mut running = self.backend.list_running()?;
         running.retain(|h| h.name.starts_with(prefix));
         Ok(running)
-    }
-
-    fn host_cli(&self) -> Option<&'static str> {
-        Some(self.backend.cli_binary())
     }
 
     fn ready_agent(
@@ -241,10 +204,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn build_image(
         &self,
-        _tag: &str,
-        _dockerfile: &std::path::Path,
-        _context: &std::path::Path,
-        _no_cache: bool,
+        _request: &crate::engine::container::BuildRequest,
         _on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         Err(EngineError::UnsupportedOnRuntime {
@@ -301,7 +261,7 @@ struct SandboxAttachInstance {
     cli_binary: &'static str,
 }
 
-/// Build the `sbx exec` argv, mirroring `SandboxRuntime::exec_args`:
+/// Build the `sbx exec` argv:
 /// `exec -it [--env K=V…] <name> <entrypoint…>`.
 fn sbx_attach_argv(name: &str, env_vars: &[(&str, &str)], entrypoint: &[&str]) -> Vec<String> {
     let mut args = vec!["exec".to_string(), "-it".to_string()];
@@ -603,14 +563,12 @@ impl ExecutionBackend for SandboxAttachExecution {
         Ok(())
     }
 
-    fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
+    fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let pid = self.child_pid;
-        Some(crate::engine::agent_runtime::execution::CancelHandle::new(
-            move || {
-                kill_local_sbx_exec(pid);
-                Ok(())
-            },
-        ))
+        crate::engine::agent_runtime::execution::CancelHandle::new(move || {
+            kill_local_sbx_exec(pid);
+            Ok(())
+        })
     }
 }
 

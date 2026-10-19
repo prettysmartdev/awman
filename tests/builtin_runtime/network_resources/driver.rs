@@ -21,12 +21,9 @@
 
 #![deny(unsafe_code)]
 
-#[path = "../../../src/engine/container/builtin/worker.rs"]
-mod builtin_worker;
-
 #[cfg(not(awman_builtin))]
 fn main() -> std::process::ExitCode {
-    if builtin_worker::dispatch(std::env::vars_os()) {
+    if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return std::process::ExitCode::SUCCESS;
     }
     println!("BLOCKED\tthis target has no builtin runtime payload");
@@ -35,11 +32,11 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(awman_builtin)]
 mod driver {
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::time::Duration;
 
+    use awman::data::config::builtin_launch::BuiltinLaunchSettings;
     use awman::data::config::builtin_network::BuiltinNetworkConfig;
     use awman::data::config::env::Env;
     use awman::data::config::image_source::ImageSourceSpec;
@@ -169,21 +166,27 @@ mod driver {
         out
     }
 
-    fn runtime_for(args: &Args, vm: &Vm) -> Result<ContainerRuntime, String> {
+    /// One runtime per VM over the shared state directory, plus that VM's
+    /// per-launch settings (vCPUs, memory, network policy).
+    fn runtime_for(
+        args: &Args,
+        vm: &Vm,
+    ) -> Result<(ContainerRuntime, BuiltinLaunchSettings), String> {
         let network = BuiltinNetworkConfig::resolve(Some(&vm.network), None)
             .map_err(|e| format!("network: {e}"))?;
         let settings = BuiltinRuntimeSettings {
             state_dir: args.state.clone(),
-            vcpus: vm.vcpus,
-            memory_mib: vm.memory_mib,
-            image_source: None,
-            images: BTreeMap::new(),
-            registries: BTreeMap::new(),
-            network,
             ambient_overrides: Env::from_process().ambient_msb_overrides(),
             test_isolation: false,
         };
-        ContainerRuntime::builtin(settings).map_err(|e| e.to_string())
+        let launch = BuiltinLaunchSettings {
+            vcpus: vm.vcpus,
+            memory_mib: vm.memory_mib,
+            network,
+            repo_state_dir: None,
+        };
+        let runtime = ContainerRuntime::builtin(settings).map_err(|e| e.to_string())?;
+        Ok((runtime, launch))
     }
 
     struct Running {
@@ -223,7 +226,7 @@ mod driver {
                 script: String::new(),
             },
         ) {
-            Ok(runtime) => runtime,
+            Ok((runtime, _)) => runtime,
             Err(error) => {
                 println!("BLOCKED\t{error}");
                 return ExitCode::from(77);
@@ -242,6 +245,7 @@ mod driver {
             refresh: false,
             expected_built_identity: None,
             immutable_export_selector: None,
+            registries: Default::default(),
         };
         for round in ["first", "cached"] {
             if let Err(error) = importer.import_image(&request, &mut Quiet) {
@@ -255,8 +259,8 @@ mod driver {
         for phase in &plan.phases {
             let mut running = Vec::new();
             for vm in phase {
-                let runtime = match runtime_for(&args, vm) {
-                    Ok(runtime) => runtime,
+                let (runtime, launch) = match runtime_for(&args, vm) {
+                    Ok(pair) => pair,
                     Err(error) => {
                         println!("REFUSED\t{}\t{error}", vm.name);
                         continue;
@@ -267,6 +271,7 @@ mod driver {
                     name: Some(ContainerName::new(format!("awman-net-{}", vm.name))),
                     remove_on_exit: true,
                     entrypoint: Some(Entrypoint::new(["/bin/sh", "-c", vm.script.as_str()])),
+                    builtin_launch: Some(Box::new(launch)),
                     ..Default::default()
                 };
                 let started = runtime.build(options).and_then(|instance| {
@@ -327,7 +332,7 @@ mod driver {
 
 #[cfg(awman_builtin)]
 fn main() -> std::process::ExitCode {
-    if builtin_worker::dispatch(std::env::vars_os()) {
+    if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return std::process::ExitCode::SUCCESS;
     }
     tokio::runtime::Builder::new_multi_thread()

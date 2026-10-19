@@ -18,7 +18,6 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::data::oci_identity::{Digest, OciPlatform};
 use crate::engine::oci::CancelToken;
 
 use crate::engine::container::process::ContainerCli;
@@ -123,6 +122,10 @@ pub struct BuildControl {
 }
 
 impl BuildControl {
+    pub fn source_build(cancel: CancelToken) -> Self {
+        Self::new(cancel, SOURCE_BUILD_TIMEOUT)
+    }
+
     /// Cancellable and bounded by `timeout` from now.
     pub fn new(cancel: CancelToken, timeout: Duration) -> Self {
         Self {
@@ -158,7 +161,7 @@ impl BuildControl {
     pub fn check(&self) -> Result<(), EngineError> {
         self.cancel.check()?;
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
-            return Err(EngineError::Container("image build timed out".into()));
+            return Err(EngineError::ImageBuildTimedOut);
         }
         Ok(())
     }
@@ -291,129 +294,8 @@ impl HostCommandRunner for ProcessHostCommandRunner {
 /// How long the post-exit drain waits without receiving a line.
 const DRAIN_QUIET: Duration = Duration::from_secs(2);
 
-/// Environment that could redirect a Docker command away from the endpoint
-/// it is bound to.
-const DOCKER_AMBIENT_ENV: &[&str] = &[
-    "DOCKER_CONTEXT",
-    "DOCKER_TLS_VERIFY",
-    "DOCKER_CERT_PATH",
-    "BUILDX_BUILDER",
-];
-
-/// A `docker` command bound to `endpoint`: `--host` plus a matching
-/// `DOCKER_HOST` (which CLI plugins such as buildx also read), with every
-/// ambient context/TLS/builder selector removed. The one place awman binds
-/// a source-matched Docker command, for probes, inspection and builds alike.
-pub(crate) fn bound_docker_command(endpoint: &str) -> Command {
-    let mut command = Command::new(crate::engine::host_cli::program("docker"));
-    command.args(["--host", endpoint]);
-    for key in DOCKER_AMBIENT_ENV {
-        command.env_remove(key);
-    }
-    command.env("DOCKER_HOST", endpoint);
-    command
-}
-
-/// Source-bound Docker build. Runs the same `build` argv as the Docker
-/// runtime ([`BuildArgv`]), plus an explicit platform and an iidfile.
-pub(crate) struct HostBuildRequest<'a> {
-    pub endpoint: &'a str,
-    pub tag: &'a str,
-    pub dockerfile: &'a Path,
-    pub context: &'a Path,
-    pub platform: &'a OciPlatform,
-    pub build_args: &'a [(String, String)],
-    pub no_cache: bool,
-}
-
 /// How long a source-matched build may run.
 pub(crate) const SOURCE_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
-
-/// Which Docker build path a bound endpoint uses, decided the way the
-/// `docker` CLI decides it: BuildKit through buildx when buildx is
-/// installed, the legacy builder otherwise. awman never downgrades a
-/// buildx-capable CLI to the legacy builder.
-enum DockerBuildPath {
-    /// buildx is installed and the endpoint's `default` builder uses the
-    /// `docker` driver, so its output is stored in that same Engine.
-    BuildKit,
-    /// No buildx: `docker build` uses the legacy builder, as it would for
-    /// the Docker runtime on this host.
-    Legacy,
-}
-
-fn docker_build_path(
-    runner: &dyn HostCommandRunner,
-    endpoint: &str,
-    control: &BuildControl,
-) -> Result<DockerBuildPath, EngineError> {
-    let probe = control.bounded(PROBE_TIMEOUT);
-    let mut version = bound_docker_command(endpoint);
-    version.args(["buildx", "version"]);
-    if !runner.run(version, &probe, &mut |_| {})?.success() {
-        return Ok(DockerBuildPath::Legacy);
-    }
-    let mut inspect = bound_docker_command(endpoint);
-    inspect.args(["buildx", "inspect", "default"]);
-    let mut lines = Vec::new();
-    let status = runner.run(inspect, &probe, &mut |line| lines.push(line.to_string()))?;
-    let driver = lines.iter().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key.trim() == "Driver").then(|| value.trim().to_string())
-    });
-    match (status.success(), driver.as_deref()) {
-        (true, Some("docker")) => Ok(DockerBuildPath::BuildKit),
-        (true, other) => Err(EngineError::Container(format!(
-            "the Docker builder `default` for {endpoint} uses the `{}` driver, which does not \
-             store images in that Engine; awman builds only with the `docker` driver",
-            other.unwrap_or("unknown")
-        ))),
-        (false, _) => Err(EngineError::Container(format!(
-            "`docker buildx inspect default` failed for {endpoint} (exit {}): {}",
-            status.code().unwrap_or(-1),
-            tail(&lines)
-        ))),
-    }
-}
-
-/// Run a source-bound Docker build and return the image ID the build itself
-/// wrote to its iidfile. The caller classifies that ID by inspecting it.
-pub(crate) fn build_local_docker(
-    runner: &dyn HostCommandRunner,
-    request: &HostBuildRequest<'_>,
-    control: &BuildControl,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<Digest, EngineError> {
-    let path = docker_build_path(runner, request.endpoint, control)?;
-    let iid = tempfile::NamedTempFile::new()
-        .map_err(|e| EngineError::Container(format!("create build receipt: {e}")))?;
-    let platform = request.platform.to_string();
-    let argv = BuildArgv {
-        buildx: matches!(path, DockerBuildPath::BuildKit),
-        platform: Some(&platform),
-        iidfile: Some(iid.path()),
-        build_args: request.build_args,
-        ..BuildArgv::new(
-            request.tag,
-            request.dockerfile,
-            request.context,
-            request.no_cache,
-        )
-    };
-    let mut command = bound_docker_command(request.endpoint);
-    command.args(argv.to_args());
-    let status = runner.run(command, control, on_line)?;
-    if !status.success() {
-        return Err(EngineError::ImageBuildExitNonzero {
-            tag: request.tag.into(),
-            exit_code: status.code().unwrap_or(-1),
-        });
-    }
-    let raw = std::fs::read_to_string(iid.path())
-        .map_err(|e| EngineError::Container(format!("read build receipt: {e}")))?;
-    Digest::parse(raw.trim())
-        .map_err(|e| EngineError::Container(format!("invalid Docker build receipt: {e}")))
-}
 
 /// The last few lines of a command's output, for error messages.
 pub(crate) fn tail(lines: &[String]) -> String {
@@ -528,25 +410,6 @@ pub(super) fn cli_remove(
     Ok(())
 }
 
-/// Argv (after the CLI name) for `exec -it` into a running container. Used by
-/// TUI re-attach. Docker and Apple accept the identical argv.
-pub(super) fn cli_exec_args(
-    container_id: &str,
-    working_dir: &str,
-    entrypoint: &[&str],
-    env_vars: &[(&str, &str)],
-) -> Vec<String> {
-    let mut args = vec!["exec".to_string(), "-it".to_string()];
-    args.extend(["-w".to_string(), working_dir.to_string()]);
-    for (k, v) in env_vars {
-        args.push("-e".to_string());
-        args.push(format!("{k}={v}"));
-    }
-    args.push(container_id.to_string());
-    args.extend(entrypoint.iter().map(|s| s.to_string()));
-    args
-}
-
 /// A spawn failure: `NotFound` means the CLI is not installed.
 fn spawn_error(cli: ContainerCli, what: &str, e: std::io::Error) -> EngineError {
     if e.kind() == std::io::ErrorKind::NotFound {
@@ -567,25 +430,6 @@ mod tests {
             bin: "/nonexistent/awman-host-cli-backend-test/cli",
             ..ContainerCli::DOCKER
         }
-    }
-
-    #[test]
-    fn exec_args_shape_is_unchanged() {
-        let args = cli_exec_args("ctr", "/w", &["claude", "--x"], &[("COLUMNS", "80")]);
-        assert_eq!(
-            args,
-            vec![
-                "exec",
-                "-it",
-                "-w",
-                "/w",
-                "-e",
-                "COLUMNS=80",
-                "ctr",
-                "claude",
-                "--x"
-            ]
-        );
     }
 
     #[test]

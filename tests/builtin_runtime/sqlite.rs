@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::binary::{awman, has_builtin_runtime, Scratch};
 
 fn root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }
 
 struct Package {

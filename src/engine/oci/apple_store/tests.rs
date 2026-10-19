@@ -196,7 +196,7 @@ fn inspect_local_reports_index_as_unbound_without_exporting() {
         serde_json::json!([entry("agent:latest", &digest('a'), INDEX)]),
         Save::Nothing,
     );
-    let control = crate::engine::container::host_cli_backend::BuildControl::new(
+    let control = crate::engine::container::BuildControl::new(
         crate::engine::oci::CancelToken::new(),
         Duration::from_secs(1),
     );
@@ -210,7 +210,7 @@ fn inspect_local_rejects_wrong_platform_manifest() {
     let mut listed = entry("agent:latest", &digest('b'), MANIFEST);
     listed["descriptor"]["platform"] = serde_json::json!({"os": "linux", "architecture": "amd64"});
     let fake = Fake::new(serde_json::json!([listed]), Save::Nothing);
-    let control = crate::engine::container::host_cli_backend::BuildControl::new(
+    let control = crate::engine::container::BuildControl::new(
         crate::engine::oci::CancelToken::new(),
         Duration::from_secs(1),
     );
@@ -505,7 +505,7 @@ fn peer_errors_are_classified_and_sanitized() {
     }
     assert!(matches!(
         export_error(Save::Error("internalError", "boom".into())),
-        EngineError::Container(_)
+        EngineError::AppleImageStoreFailed { .. }
     ));
     assert!(matches!(
         export_error(Save::Error("interrupted", "restart".into())),

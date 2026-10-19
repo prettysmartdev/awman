@@ -67,11 +67,46 @@ pub(crate) struct BridgeResult {
     pub output_tail: Arc<OutputTail>,
 }
 
-fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
-    if let Ok(mut guard) = activity.lock() {
-        *guard = Some(Instant::now());
+/// Output-liveness state shared between whatever reads a runtime's bytes and
+/// its [`StuckDetector`]. Byte-stream-agnostic: a PTY reader thread, a piped
+/// child reader, an attach socket reader and the builtin event loop all feed
+/// it the same way, by calling [`OutputActivity::touch`] per chunk.
+#[derive(Clone, Default)]
+pub(crate) struct OutputActivity {
+    last: SharedActivity,
+    first_byte: Arc<AtomicBool>,
+}
+
+impl OutputActivity {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
-    first_byte.store(true, Ordering::Release);
+
+    #[cfg(test)]
+    fn with_state(last: Option<Instant>, first_byte: bool) -> Self {
+        Self {
+            last: Arc::new(Mutex::new(last)),
+            first_byte: Arc::new(AtomicBool::new(first_byte)),
+        }
+    }
+
+    /// Record that a chunk of output arrived now.
+    pub(crate) fn touch(&self) {
+        if let Ok(mut guard) = self.last.lock() {
+            *guard = Some(Instant::now());
+        }
+        self.first_byte.store(true, Ordering::Release);
+    }
+}
+
+/// Timing knobs and the grace-expiry callback for one [`StuckDetector`].
+pub(crate) struct StuckConfig {
+    pub grace_timeout: Duration,
+    pub stuck_timeout: Duration,
+    /// See [`BridgeConfig::container_start_delay`].
+    pub container_start_delay: Duration,
+    /// See [`BridgeConfig::cancel_on_grace_expired`].
+    pub cancel_on_grace_expired: Option<CancelFn>,
 }
 
 /// Spawn the stuck detector task. Returns the broadcast sender (caller
@@ -100,76 +135,84 @@ fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
 ///   2. *Stuck* — once `first_byte` flips to `true`, the detector
 ///      switches to the regular Stuck/Unstuck loop driven by the last
 ///      activity timestamp and `stuck_timeout`. Grace is discarded.
-pub(crate) fn spawn_stuck_detector(
-    activity: SharedActivity,
-    first_byte: Arc<AtomicBool>,
-    grace_timeout: Duration,
-    stuck_timeout: Duration,
-    container_start_delay: Duration,
-    cancel_on_grace_expired: Option<CancelFn>,
-) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
-    let (stuck_tx, _) = tokio::sync::broadcast::channel(16);
-    let stuck_tx = Arc::new(stuck_tx);
-    let weak = Arc::downgrade(&stuck_tx);
-    tokio::spawn(async move {
-        // Phase 0: optional start-delay window. The reader threads keep
-        // updating activity / first_byte during this sleep; we discard
-        // those updates at the end of the window so only post-delay bytes
-        // count.
-        if !container_start_delay.is_zero() {
-            tokio::time::sleep(container_start_delay).await;
-            if weak.upgrade().is_none() {
-                return;
-            }
-            first_byte.store(false, Ordering::Release);
-            if let Ok(mut guard) = activity.lock() {
-                *guard = None;
-            }
-        }
+pub(crate) struct StuckDetector;
 
-        let mut is_stuck = false;
-        let grace_start = Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let tx = match weak.upgrade() {
-                Some(tx) => tx,
-                None => break,
-            };
-
-            if !first_byte.load(Ordering::Acquire) {
-                // Grace phase — measure from end of the start-delay window.
-                if grace_start.elapsed() >= grace_timeout {
-                    let _ = tx.send(StuckEvent::StartupGraceExpired);
-                    if let Some(cb) = &cancel_on_grace_expired {
-                        cb();
-                    }
-                    break;
+impl StuckDetector {
+    pub(crate) fn spawn(
+        config: StuckConfig,
+        output: &OutputActivity,
+    ) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
+        let StuckConfig {
+            grace_timeout,
+            stuck_timeout,
+            container_start_delay,
+            cancel_on_grace_expired,
+        } = config;
+        let activity = Arc::clone(&output.last);
+        let first_byte = Arc::clone(&output.first_byte);
+        let (stuck_tx, _) = tokio::sync::broadcast::channel(16);
+        let stuck_tx = Arc::new(stuck_tx);
+        let weak = Arc::downgrade(&stuck_tx);
+        tokio::spawn(async move {
+            // Phase 0: optional start-delay window. The reader threads keep
+            // updating activity / first_byte during this sleep; we discard
+            // those updates at the end of the window so only post-delay bytes
+            // count.
+            if !container_start_delay.is_zero() {
+                tokio::time::sleep(container_start_delay).await;
+                if weak.upgrade().is_none() {
+                    return;
                 }
-                continue;
+                first_byte.store(false, Ordering::Release);
+                if let Ok(mut guard) = activity.lock() {
+                    *guard = None;
+                }
             }
 
-            // Stuck phase — measure from the most recent byte.
-            let elapsed = {
-                let guard = match activity.lock() {
-                    Ok(g) => g,
-                    Err(_) => break,
+            let mut is_stuck = false;
+            let grace_start = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let tx = match weak.upgrade() {
+                    Some(tx) => tx,
+                    None => break,
                 };
-                match *guard {
-                    Some(t) => t.elapsed(),
-                    None => grace_start.elapsed(),
+
+                if !first_byte.load(Ordering::Acquire) {
+                    // Grace phase — measure from end of the start-delay window.
+                    if grace_start.elapsed() >= grace_timeout {
+                        let _ = tx.send(StuckEvent::StartupGraceExpired);
+                        if let Some(cb) = &cancel_on_grace_expired {
+                            cb();
+                        }
+                        break;
+                    }
+                    continue;
                 }
-            };
-            let now_stuck = elapsed >= stuck_timeout;
-            if now_stuck && !is_stuck {
-                is_stuck = true;
-                let _ = tx.send(StuckEvent::Stuck);
-            } else if !now_stuck && is_stuck {
-                is_stuck = false;
-                let _ = tx.send(StuckEvent::Unstuck);
+
+                // Stuck phase — measure from the most recent byte.
+                let elapsed = {
+                    let guard = match activity.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    match *guard {
+                        Some(t) => t.elapsed(),
+                        None => grace_start.elapsed(),
+                    }
+                };
+                let now_stuck = elapsed >= stuck_timeout;
+                if now_stuck && !is_stuck {
+                    is_stuck = true;
+                    let _ = tx.send(StuckEvent::Stuck);
+                } else if !now_stuck && is_stuck {
+                    is_stuck = false;
+                    let _ = tx.send(StuckEvent::Unstuck);
+                }
             }
-        }
-    });
-    stuck_tx
+        });
+        stuck_tx
+    }
 }
 
 /// Bridge a PTY master to the `AgentIo` channels.
@@ -197,8 +240,7 @@ pub(crate) fn bridge_pty(
         .take_writer()
         .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
 
-    let activity: SharedActivity = Arc::new(Mutex::new(None));
-    let first_byte = Arc::new(AtomicBool::new(false));
+    let output = OutputActivity::new();
 
     // Reader thread: PTY → stdout channel (activity tracked).
     //
@@ -209,8 +251,7 @@ pub(crate) fn bridge_pty(
     // tail is fed unconditionally (even after the sink dies) so a failure log
     // always reflects what the container really printed.
     let stdout_tx = io.stdout;
-    let act = Arc::clone(&activity);
-    let fb = Arc::clone(&first_byte);
+    let act = output.clone();
     // A writer handle, so a caller can wait for this thread to finish.
     let tail = config.output_tail.writer();
     let broadcast = config.output_broadcast.clone();
@@ -222,7 +263,7 @@ pub(crate) fn bridge_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    update_activity(&act, &fb);
+                    act.touch();
                     tail.push_bytes(&buf[..n]);
                     if let Some(tx) = &broadcast {
                         // Copy only when someone is attached; a lagged client
@@ -275,13 +316,14 @@ pub(crate) fn bridge_pty(
         });
     }
 
-    let stuck_tx = spawn_stuck_detector(
-        activity,
-        first_byte,
-        config.grace_timeout,
-        config.stuck_timeout,
-        config.container_start_delay,
-        config.cancel_on_grace_expired,
+    let stuck_tx = StuckDetector::spawn(
+        StuckConfig {
+            grace_timeout: config.grace_timeout,
+            stuck_timeout: config.stuck_timeout,
+            container_start_delay: config.container_start_delay,
+            cancel_on_grace_expired: config.cancel_on_grace_expired,
+        },
+        &output,
     );
 
     Ok((
@@ -307,8 +349,7 @@ pub(crate) fn bridge_piped(
     child: &mut std::process::Child,
     config: BridgeConfig,
 ) -> BridgeResult {
-    let activity: SharedActivity = Arc::new(Mutex::new(None));
-    let first_byte = Arc::new(AtomicBool::new(false));
+    let output = OutputActivity::new();
 
     // stdout reader thread.
     //
@@ -318,8 +359,7 @@ pub(crate) fn bridge_piped(
     // the container actually produces.
     if let Some(child_stdout) = child.stdout.take() {
         let stdout_tx = io.stdout;
-        let act = Arc::clone(&activity);
-        let fb = Arc::clone(&first_byte);
+        let act = output.clone();
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
@@ -332,7 +372,7 @@ pub(crate) fn bridge_piped(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        update_activity(&act, &fb);
+                        act.touch();
                         tail.push_bytes(&buf[..n]);
                         if let Some(tx) = &broadcast {
                             if tx.receiver_count() > 0 {
@@ -352,8 +392,7 @@ pub(crate) fn bridge_piped(
     // Feeds the same tail as stdout so the buffer holds combined output.
     if let Some(child_stderr) = child.stderr.take() {
         let stderr_tx = io.stderr;
-        let act = Arc::clone(&activity);
-        let fb = Arc::clone(&first_byte);
+        let act = output.clone();
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
@@ -366,7 +405,7 @@ pub(crate) fn bridge_piped(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        update_activity(&act, &fb);
+                        act.touch();
                         tail.push_bytes(&buf[..n]);
                         if let Some(tx) = &broadcast {
                             if tx.receiver_count() > 0 {
@@ -400,13 +439,14 @@ pub(crate) fn bridge_piped(
         });
     }
 
-    let stuck_tx = spawn_stuck_detector(
-        activity,
-        first_byte,
-        config.grace_timeout,
-        config.stuck_timeout,
-        config.container_start_delay,
-        config.cancel_on_grace_expired,
+    let stuck_tx = StuckDetector::spawn(
+        StuckConfig {
+            grace_timeout: config.grace_timeout,
+            stuck_timeout: config.stuck_timeout,
+            container_start_delay: config.container_start_delay,
+            cancel_on_grace_expired: config.cancel_on_grace_expired,
+        },
+        &output,
     );
 
     BridgeResult {
@@ -549,20 +589,20 @@ mod tests {
         let _ = result;
     }
 
-    /// Production `spawn_stuck_detector` must terminate once its only
+    /// Production `StuckDetector::spawn` must terminate once its only
     /// `Arc<Sender>` is dropped, even if the timeout hasn't elapsed.
     /// Without this the task leaks for the lifetime of the process.
     #[tokio::test]
-    async fn spawn_stuck_detector_exits_when_arc_dropped() {
-        let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
-        let first_byte = Arc::new(AtomicBool::new(true));
-        let tx = spawn_stuck_detector(
-            activity,
-            first_byte,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            Duration::ZERO,
-            None,
+    async fn stuck_detector_exits_when_arc_dropped() {
+        let output = OutputActivity::with_state(Some(Instant::now()), true);
+        let tx = StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+            },
+            &output,
         );
         // Hold a weak reference so we can observe the task dropping the Arc.
         let weak = Arc::downgrade(&tx);
@@ -575,29 +615,29 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("spawn_stuck_detector did not exit within 2.5s of its Arc being dropped");
+        panic!("StuckDetector::spawn did not exit within 2.5s of its Arc being dropped");
     }
 
     /// Grace phase: when no byte ever arrives and `grace_timeout` elapses,
     /// the detector publishes `StartupGraceExpired` and invokes the cancel
     /// callback.
     #[tokio::test]
-    async fn spawn_stuck_detector_emits_startup_grace_expired() {
-        let activity: SharedActivity = Arc::new(Mutex::new(None));
-        let first_byte = Arc::new(AtomicBool::new(false));
+    async fn stuck_detector_emits_startup_grace_expired() {
+        let output = OutputActivity::with_state(None, false);
         let cancel_called = Arc::new(AtomicBool::new(false));
         let cancel_clone = Arc::clone(&cancel_called);
         let cancel: CancelFn = Arc::new(move || {
             cancel_clone.store(true, Ordering::Release);
         });
 
-        let tx = spawn_stuck_detector(
-            activity,
-            first_byte,
-            Duration::from_millis(50),
-            Duration::from_secs(30),
-            Duration::ZERO,
-            Some(cancel),
+        let tx = StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_millis(50),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: Some(cancel),
+            },
+            &output,
         );
         let mut rx = tx.subscribe();
 
@@ -618,19 +658,19 @@ mod tests {
     /// Stuck phase: once `first_byte` flips true, the detector ignores grace
     /// and emits `Stuck` based on `stuck_timeout` measured from last activity.
     #[tokio::test]
-    async fn spawn_stuck_detector_switches_to_stuck_phase_after_first_byte() {
-        let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
-        let first_byte = Arc::new(AtomicBool::new(true));
+    async fn stuck_detector_switches_to_stuck_phase_after_first_byte() {
+        let output = OutputActivity::with_state(Some(Instant::now()), true);
 
         // Set grace to something we'd notice if it incorrectly fired
         // (anything > stuck_timeout would work).
-        let tx = spawn_stuck_detector(
-            activity,
-            first_byte,
-            Duration::from_secs(30),
-            Duration::from_millis(50),
-            Duration::ZERO,
-            None,
+        let tx = StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_millis(50),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+            },
+            &output,
         );
         let mut rx = tx.subscribe();
 
@@ -649,22 +689,21 @@ mod tests {
     /// bytes flip `first_byte` to true, but the detector must wipe it at
     /// the end of the delay window and re-enter the grace phase.
     #[tokio::test]
-    async fn spawn_stuck_detector_start_delay_discards_pre_delay_first_byte() {
-        let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
-        // Pretend the runtime already printed something during the delay.
-        let first_byte = Arc::new(AtomicBool::new(true));
+    async fn stuck_detector_start_delay_discards_pre_delay_first_byte() {
+        let output = OutputActivity::with_state(Some(Instant::now()), true);
 
         // Start delay 150ms, grace 100ms. If the delay correctly discarded
         // the pre-delay first_byte, the detector should re-enter grace and
         // (since no real first byte ever arrives) publish
         // StartupGraceExpired roughly 150ms + ~grace later.
-        let tx = spawn_stuck_detector(
-            activity,
-            Arc::clone(&first_byte),
-            Duration::from_millis(100),
-            Duration::from_secs(30),
-            Duration::from_millis(150),
-            None,
+        let tx = StuckDetector::spawn(
+            StuckConfig {
+                grace_timeout: Duration::from_millis(100),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::from_millis(150),
+                cancel_on_grace_expired: None,
+            },
+            &output,
         );
         let mut rx = tx.subscribe();
 

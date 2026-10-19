@@ -35,8 +35,7 @@ use awman::data::config::image_source::ImageSourceSpec;
 use awman::data::oci_identity::OciPlatform;
 use awman::engine::oci::DiskSpace;
 use awman::engine::oci::{
-    cached_image_config, AcquireLimits, AcquirePolicy, AcquireRequest, CachingAcquirer,
-    ImageAcquirer,
+    AcquireLimits, AcquirePolicy, AcquireRequest, CachingAcquirer, ImageAcquirer, OciCache,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -188,7 +187,9 @@ fn archive_import_persists_identity_and_cached_only_reuse_needs_no_source() {
         .unwrap();
     assert_eq!(imported.identity.source.as_str(), "archive");
     assert_eq!(imported.identity.reference, "awman-fixture:latest");
-    let config = cached_image_config(&state, &imported.archive)
+    let config = OciCache::open(&state)
+        .unwrap()
+        .image_config(&imported.archive)
         .unwrap()
         .expect("validated config summary is recorded");
     assert_eq!(config.user.as_deref(), Some("1000:1000"));
