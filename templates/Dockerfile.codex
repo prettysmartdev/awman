@@ -34,26 +34,42 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Install agent binary ──────────────────────────────────────────────────────
+# ── Install agent package ─────────────────────────────────────────────────────
 # Codex CLI is installed via OpenAI's official installer, which fetches the
-# correct prebuilt binary for the current architecture. The installer drops the
-# binary under the invoking user's ~/.local/bin; copy it into /usr/local/bin so
-# it is on PATH for every user (including the runtime `awman` user below).
+# prebuilt package for the current architecture. Codex is a *package*, not a
+# lone binary: bin/codex locates codex-package.json beside it and uses the
+# bundled codex-resources/ (bwrap, voice) and codex-path/ (rg). Copying the
+# bare binary out of the package breaks that lookup ("local Codex package is
+# missing"), so the package stays intact and PATH gets symlinks into it.
 #
-# The installer also unpacks a `codex-code-mode-host` helper (required for
-# Codex's Code Mode tool execution) into its release directory, but upstream's
-# install.sh only symlinks it into ~/.local/bin on macOS — on Linux it stays
-# un-linked, so Code Mode fails closed with "host executable was not found"
-# even though the binary was downloaded. Install it from the release
-# directory explicitly so Code Mode works from this Linux-based image too.
+# Where it goes: a fixed, root-owned /opt/codex — outside every $HOME. At
+# runtime awman mounts the host's ~/.codex over /home/awman/.codex, which
+# would hide (or, for a host-created `current` symlink, dangle) anything
+# installed under the default $CODEX_HOME/packages. CODEX_HOME and
+# CODEX_INSTALL_DIR are set for the installer only; the image's runtime
+# CODEX_HOME stays the default ($HOME/.codex), where config and auth live.
+# Root ownership also means a codex running as `awman` can never rewrite the
+# installed package.
+#
+# The installer runs non-interactively (no "start Codex now?" prompt) with its
+# bin dir already on PATH, so it leaves shell profiles alone. Saving the script
+# first keeps `--retry` meaningful and the pipefail semantics simple.
+#
+# codex-code-mode-host (Code Mode's tool-execution helper) is only linked onto
+# PATH by upstream on macOS; link it here too so Code Mode works on Linux.
 RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
-        https://chatgpt.com/codex/install.sh | sh \
-    && codex_bin="$(command -v codex || true)" \
-    && [ -n "$codex_bin" ] || codex_bin="$HOME/.local/bin/codex" \
-    && install -m 0755 "$codex_bin" /usr/local/bin/codex \
-    && install -m 0755 \
-        "$HOME/.codex/packages/standalone/current/bin/codex-code-mode-host" \
-        /usr/local/bin/codex-code-mode-host
+        https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
+    && CODEX_HOME=/opt/codex \
+       CODEX_INSTALL_DIR=/opt/codex/bin \
+       CODEX_NON_INTERACTIVE=1 \
+       PATH="/opt/codex/bin:$PATH" \
+       sh /tmp/codex-install.sh \
+    && rm -f /tmp/codex-install.sh \
+    && codex_pkg=/opt/codex/packages/standalone/current \
+    && test -f "$codex_pkg/codex-package.json" \
+    && ln -sfn "$codex_pkg/bin/codex" /usr/local/bin/codex \
+    && ln -sfn "$codex_pkg/bin/codex-code-mode-host" /usr/local/bin/codex-code-mode-host \
+    && chmod -R a+rX /opt/codex
 
 # ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -72,6 +88,13 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
+# The resolved codex must still sit inside its package (bin/codex beside
+# codex-package.json and the bundled rg), and `codex --version` proves the
+# runtime user can execute it through the root-owned /opt/codex tree.
 RUN test -x "$(command -v codex)" \
     && test -x "$(command -v bwrap)" \
-    && test -x "$(command -v codex-code-mode-host)"
+    && test -x "$(command -v codex-code-mode-host)" \
+    && codex_pkg="$(dirname "$(dirname "$(readlink -f "$(command -v codex)")")")" \
+    && test -f "$codex_pkg/codex-package.json" \
+    && test -x "$codex_pkg/codex-path/rg" \
+    && codex --version

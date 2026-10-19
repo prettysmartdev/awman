@@ -136,6 +136,7 @@ fn agent_argv(
     options: &ResolvedContainerOptions,
 ) -> Result<Vec<String>, EngineError> {
     if options.acp {
+        argv.extend(options.agent_flags.iter().cloned());
         return Ok(argv);
     }
     if let Some(flag) = &options.non_interactive_flag {
@@ -176,6 +177,7 @@ fn agent_argv(
     for (flag, path) in &options.agent_add_dirs {
         argv.extend([flag.clone(), guest_path(path)?]);
     }
+    argv.extend(options.agent_flags.iter().cloned());
     if options.interactive {
         if let Some(prompt) = &options.seeded_prompt {
             if let Some(flag) = &options.interactive_seed_flag {
@@ -817,6 +819,27 @@ mod compat_tests {
         let mut acp = options;
         acp.acp = true;
         assert_eq!(agent_argv(base.clone(), &acp).unwrap(), base);
+    }
+
+    #[test]
+    fn appends_agent_flags_before_the_prompt_and_after_acp_entrypoint() {
+        let options = ResolvedContainerOptions {
+            interactive: true,
+            model: Some(ModelFlagForm::Argument("gpt-5".into())),
+            agent_flags: vec!["--no-daemon".into()],
+            seeded_prompt: Some("task".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_argv(vec!["codex".into()], &options).unwrap(),
+            vec!["codex", "--model", "gpt-5", "--no-daemon", "task"]
+        );
+        let mut acp = options;
+        acp.acp = true;
+        assert_eq!(
+            agent_argv(vec!["cline".into(), "--acp".into()], &acp).unwrap(),
+            vec!["cline", "--acp", "--no-daemon"]
+        );
     }
 
     #[test]

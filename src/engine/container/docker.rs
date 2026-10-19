@@ -1049,8 +1049,11 @@ pub(super) fn build_run_argv(
     // delivered over the JSON-RPC 2.0 channel (`session/*`), never as argv. Any
     // stdio-mode flag or positional appended past the entrypoint would be handed
     // to the agent as raw argv and corrupt the launch (e.g. `cline --acp task`,
-    // `cline --acp task --yolo`). So emit nothing after the entrypoint for ACP.
+    // `cline --acp task --yolo`). So emit nothing after the entrypoint for ACP
+    // except the user's own `agentFlags`, which they configured for exactly
+    // this agent and launch.
     if options.acp {
+        args.extend(options.agent_flags.iter().cloned());
         return args;
     }
 
@@ -1109,6 +1112,10 @@ pub(super) fn build_run_argv(
         args.push(flag.clone());
         args.push(container_path.display().to_string());
     }
+
+    // User-configured extra agent args (`agentFlags` / `--agent-flag`): after
+    // every awman-generated flag, before the seeded prompt positional.
+    args.extend(options.agent_flags.iter().cloned());
 
     // Interactive + seeded prompt: deliver the prompt so the agent receives it
     // as its initial task. Most agents take it as the final positional arg;
@@ -1769,6 +1776,70 @@ mod tests {
             &["cline".to_string(), "--acp".to_string()],
             "ACP argv must end exactly at the entrypoint, with no stdio flags \
              (task/--yolo/prompt) appended; argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_agent_flags_follow_awman_flags_and_precede_the_prompt() {
+        use crate::engine::container::options::{Entrypoint, ModelFlagForm};
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Entrypoint(Entrypoint::new(["codex"])),
+            ContainerOption::Interactive(true),
+            ContainerOption::AgentModeFlags(vec![
+                "--dangerously-bypass-approvals-and-sandbox".into()
+            ]),
+            ContainerOption::Model {
+                flag: ModelFlagForm::Argument("gpt-5".into()),
+            },
+            ContainerOption::AgentFlags(vec![
+                "--no-daemon".into(),
+                "--config".into(),
+                "a=b".into(),
+            ]),
+            ContainerOption::SeededPrompt("do the task".into()),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
+        assert_eq!(
+            &argv[img_pos + 1..],
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-5",
+                "--no-daemon",
+                "--config",
+                "a=b",
+                "do the task",
+            ]
+            .map(String::from),
+        );
+    }
+
+    #[test]
+    fn build_run_argv_acp_keeps_only_agent_flags_after_the_entrypoint() {
+        use crate::engine::container::options::Entrypoint;
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Entrypoint(Entrypoint::new(["cline", "--acp"])),
+            ContainerOption::Acp(true),
+            ContainerOption::AgentModeFlags(vec!["--yolo".into()]),
+            ContainerOption::AgentFlags(vec!["--verbose".into()]),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
+        assert_eq!(
+            &argv[img_pos + 1..],
+            &["cline", "--acp", "--verbose"].map(String::from),
         );
     }
 

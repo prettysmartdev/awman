@@ -950,6 +950,17 @@ impl ExecWorkflowCommand {
             )),
             system_prompt,
             context_overlays,
+            // From the invoking session, not the worktree `session` (see
+            // `workflow_agent_flags`). `--agent-flag` reaches the leader only
+            // when it is the selected agent (`--agent`, else config).
+            agent_flags: Some(
+                super::factory::workflow_agent_flags(
+                    &self.session,
+                    self.flags.agent.clone(),
+                    self.flags.agent_flags.clone(),
+                )
+                .agent_flags(agent.as_str()),
+            ),
             ..Default::default()
         };
         let resolved_credentials = self

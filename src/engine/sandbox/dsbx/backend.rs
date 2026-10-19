@@ -406,8 +406,8 @@ fn push_workspace_positional(argv: &mut Vec<String>, options: &ResolvedSandboxOp
 
 /// Agent args appended after the `--` delimiter, mirroring the argv the
 /// container path builds after the entrypoint: non-interactive
-/// subcommand/flag, mode flags (yolo/auto/plan), model flag, then the seeded
-/// prompt (a bare positional would be parsed by sbx as a workspace PATH).
+/// subcommand/flag, mode flags (yolo/auto/plan), model flag, user `agentFlags`,
+/// then the seeded prompt (a bare positional would be parsed by sbx as a workspace PATH).
 /// Only `kind: agent` kits take agent args — awman owns their entrypoint,
 /// and sbx forwards everything after `--` to it. `kind: mixin` kits launch
 /// through Docker's built-in template (no argv channel): their dynamic
@@ -437,6 +437,7 @@ fn agent_args(agent: &str, options: &ResolvedSandboxOptions) -> Vec<String> {
             ModelFlagForm::Shorthand(s) => args.push(s.clone()),
         }
     }
+    args.extend(options.agent_flags.iter().cloned());
     if let Some(prompt) = &options.seeded_prompt {
         args.push(prompt.clone());
     }
@@ -1224,6 +1225,33 @@ mod tests {
                 "--yolo",
                 "--model",
                 "gpt-5",
+                "fix it"
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_flags_appended_after_model_and_before_prompt_for_agent_kits() {
+        use crate::engine::container::options::ModelFlagForm;
+        let o = opts(vec![
+            SandboxOption::AgentId("crush".into()),
+            SandboxOption::Interactive(true),
+            SandboxOption::Model {
+                flag: ModelFlagForm::Argument("gpt-5".into()),
+            },
+            SandboxOption::AgentFlags(vec!["--debug".into()]),
+            SandboxOption::SeededPrompt("fix it".into()),
+        ]);
+        let argv = run_argv("awman-h-crush", "crush", &o);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "awman-h-crush",
+                "--",
+                "--model",
+                "gpt-5",
+                "--debug",
                 "fix it"
             ]
         );

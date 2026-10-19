@@ -24,6 +24,8 @@ pub struct ExecPromptCommandFlags {
     pub model: Option<String>,
     pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
+    /// `--agent-flag` values; `None` lets config `agentFlags` apply.
+    pub agent_flags: Option<Vec<String>>,
     pub issue_source: crate::engine::issue::IssueSourceFlags,
 }
 
@@ -114,6 +116,10 @@ impl ExecPromptCommand {
                     &ctx.path(),
                 )?,
                 overlay: ctx.flags.strs("overlay").to_vec(),
+                agent_flags: crate::command::dispatch::parse_agent_flags(
+                    ctx.flags.strs("agent-flag"),
+                    &ctx.path(),
+                )?,
                 issue_source: crate::engine::issue::IssueSourceFlags {
                     issue: ctx.flags.string("issue"),
                 },
@@ -324,6 +330,7 @@ impl Command for ExecPromptCommand {
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
+            agent_flags: self.flags.agent_flags.clone(),
             // ACP sends its initial turn after the initialize/session-new
             // handshake; stdio retains the existing seeded-launch behavior.
             initial_prompt: (launch_decision != LaunchModeDecision::Acp)

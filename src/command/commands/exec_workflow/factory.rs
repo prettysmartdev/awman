@@ -6,6 +6,7 @@
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
 use super::*;
+use crate::data::config::effective::EffectiveConfig;
 
 // ─── AgentFrontendProxy ──────────────────────────────────────────────────
 //
@@ -100,6 +101,33 @@ pub(crate) struct CommandLayerFactory {
     pub(crate) task_workspace: Option<PathBuf>,
     /// Fixed by workflow pre-flight before any step can launch.
     pub(crate) launch_modes: Arc<HashMap<String, crate::data::config::repo::LaunchMode>>,
+    /// Resolves each step's `agentFlags`; see [`workflow_agent_flags`].
+    pub(crate) agent_flags: EffectiveConfig,
+}
+
+/// The `agentFlags` resolver for every agent a workflow run launches.
+///
+/// Built from the *invoking* session, never the re-rooted worktree session:
+/// that one re-reads `.awman/config.json` from the worktree checkout (which
+/// lacks uncommitted or post-branch edits) and opens with an empty env
+/// snapshot (so a relocated global config is missed). `--agent-flag` targets
+/// `target_agent` — the workflow's default agent — falling back to the
+/// invoking session's configured agent when `None`.
+pub(crate) fn workflow_agent_flags(
+    invoking: &Session,
+    target_agent: Option<String>,
+    cli: Option<Vec<String>>,
+) -> EffectiveConfig {
+    EffectiveConfig::new(
+        crate::data::config::FlagConfig {
+            agent: target_agent,
+            agent_flags: cli,
+            ..Default::default()
+        },
+        invoking.env().clone(),
+        invoking.repo_config().clone(),
+        invoking.global_config().clone(),
+    )
 }
 
 /// A workflow launch must never wait indefinitely for a host credential
@@ -242,6 +270,9 @@ impl AgentExecutionFactory for CommandLayerFactory {
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
+            // Always `Some`: resolved here from the invoking session so the
+            // engine never falls back to the worktree session's config.
+            agent_flags: Some(self.agent_flags.agent_flags(runtime.step_agent.as_str())),
             env_passthrough: if collected.env_passthrough.is_empty() {
                 None
             } else {

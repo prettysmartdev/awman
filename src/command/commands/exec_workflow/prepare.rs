@@ -307,6 +307,16 @@ pub(crate) async fn execute_prepared(
 
     let flags_arc = Arc::new(flags.clone());
 
+    // `agentFlags` come from the invoking session, captured before it is
+    // swapped for the worktree session below. `--agent-flag` targets the
+    // workflow's default agent: the workflow `agent` field, else `--agent`,
+    // else config — the agent a step runs when it names none.
+    let workflow_agent_flags = super::factory::workflow_agent_flags(
+        &original_session,
+        workflow.agent.clone().or_else(|| flags.agent.clone()),
+        flags.agent_flags.clone(),
+    );
+
     // 8. Build the session for the engine.
     // When a worktree is active, re-root the session at the worktree so
     // that `build_options` mounts the worktree checkout, not the main repo.
@@ -409,6 +419,7 @@ pub(crate) async fn execute_prepared(
             squad_identity: squad_identity.cloned(),
             task_workspace: task_workspace.map(Path::to_path_buf),
             launch_modes: Arc::new(launch_modes),
+            agent_flags: workflow_agent_flags,
         };
         let mut engine = match WorkflowEngine::resume(
             &session,

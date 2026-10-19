@@ -332,6 +332,7 @@ async fn set_pty_active_called_true_then_false_around_engine() {
         model: None,
         launch_mode: None,
         overlay: vec![],
+        agent_flags: None,
         max_concurrent: None,
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
@@ -443,6 +444,7 @@ fn exec_workflow_flags_worktree_defaults_to_false() {
         model: None,
         launch_mode: None,
         overlay: vec![],
+        agent_flags: None,
         max_concurrent: None,
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
@@ -450,6 +452,80 @@ fn exec_workflow_flags_worktree_defaults_to_false() {
     };
     assert!(!flags.worktree);
     assert!(!flags.yolo);
+}
+
+/// A session rooted at `<tmp>/<name>` whose repo config is `repo_json` (or
+/// none), with the global config isolated under `<tmp>/config-home`.
+fn agent_flags_session(tmp: &Path, name: &str, repo_json: Option<&str>) -> Session {
+    let root = tmp.join(name);
+    std::fs::create_dir_all(root.join(".awman")).unwrap();
+    if let Some(json) = repo_json {
+        std::fs::write(root.join(".awman").join("config.json"), json).unwrap();
+    }
+    Session::for_tests_isolated(&root, &tmp.join("config-home"))
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| v.to_string()).collect()
+}
+
+#[test]
+fn workflow_agent_flags_resolve_config_per_step_agent() {
+    use super::factory::workflow_agent_flags;
+    let tmp = tempfile::tempdir().unwrap();
+    let invoking = agent_flags_session(
+        tmp.path(),
+        "repo",
+        Some(r#"{"agent": "claude", "agentFlags": {"codex": ["--no-daemon"]}}"#),
+    );
+    let resolver = workflow_agent_flags(&invoking, None, None);
+    // Generated / per-step agents each get their own entry.
+    assert_eq!(resolver.agent_flags("codex"), strings(&["--no-daemon"]));
+    assert!(resolver.agent_flags("claude").is_empty());
+}
+
+/// A worktree checkout may lack the repo config (uncommitted edit, "use last
+/// commit", or an older resumed worktree). `agentFlags` must still come from
+/// the invoking session.
+#[test]
+fn workflow_agent_flags_come_from_the_invoking_session_not_the_worktree() {
+    use super::factory::workflow_agent_flags;
+    let tmp = tempfile::tempdir().unwrap();
+    let invoking = agent_flags_session(
+        tmp.path(),
+        "repo",
+        Some(r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#),
+    );
+    let worktree = agent_flags_session(tmp.path(), "worktree", None);
+    assert!(worktree.effective_config().agent_flags("codex").is_empty());
+
+    let resolver = workflow_agent_flags(&invoking, None, None);
+    assert_eq!(resolver.agent_flags("codex"), strings(&["--no-daemon"]));
+}
+
+#[test]
+fn workflow_agent_flags_cli_targets_the_workflow_default_agent() {
+    use super::factory::workflow_agent_flags;
+    let tmp = tempfile::tempdir().unwrap();
+    let invoking = agent_flags_session(
+        tmp.path(),
+        "repo",
+        Some(r#"{"agent": "claude", "agentFlags": {"claude": ["--verbose"]}}"#),
+    );
+    // Workflow `agent = "codex"` overrides the configured claude.
+    let resolver = workflow_agent_flags(
+        &invoking,
+        Some("codex".into()),
+        Some(strings(&["--search"])),
+    );
+    assert_eq!(resolver.agent_flags("codex"), strings(&["--search"]));
+    // A step naming another agent keeps its configured entry.
+    assert_eq!(resolver.agent_flags("claude"), strings(&["--verbose"]));
+
+    // No workflow agent / --agent: the CLI list targets the configured agent.
+    let resolver = workflow_agent_flags(&invoking, None, Some(strings(&["--search"])));
+    assert_eq!(resolver.agent_flags("claude"), strings(&["--search"]));
+    assert!(resolver.agent_flags("codex").is_empty());
 }
 
 #[test]
@@ -470,6 +546,7 @@ fn exec_workflow_flags_yolo_implies_worktree_in_dispatch() {
         model: None,
         launch_mode: None,
         overlay: vec![],
+        agent_flags: None,
         max_concurrent: None,
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
@@ -986,6 +1063,7 @@ fn make_dynamic_flags(
         model: model.map(|s| s.to_string()),
         launch_mode: None,
         overlay: vec![],
+        agent_flags: None,
         max_concurrent: None,
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic,
@@ -2831,4 +2909,380 @@ fn discover_previous_dynamic_run_finds_both_halves() {
     assert_eq!(found.workflow.title.as_deref(), Some("saved"));
     assert_eq!(found.workflow_path, toml_path);
     assert_eq!(found.state.work_item, Some(12));
+}
+
+// ─── agentFlags through a real workflow run ──────────────────────────────
+
+/// A container-class runtime that records the agent argv of every launch the
+/// workflow makes, then refuses it — so a test sees exactly what each step
+/// would have run without needing a container daemon.
+struct RecordingRuntime {
+    caps: crate::engine::agent_runtime::Capabilities,
+    launches: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingRuntime {
+    fn new() -> Self {
+        Self {
+            caps: crate::engine::container::ContainerRuntime::docker()
+                .capabilities()
+                .clone(),
+            launches: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl crate::engine::agent_runtime::AgentRuntimeEngine for RecordingRuntime {
+    fn runtime_name(&self) -> &'static str {
+        "recording"
+    }
+    fn display_name(&self) -> &'static str {
+        "Recording"
+    }
+    fn capabilities(&self) -> &crate::engine::agent_runtime::Capabilities {
+        &self.caps
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn build(
+        &self,
+        options: crate::engine::agent_runtime::ResolvedAgentOptions,
+    ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+        let crate::engine::agent_runtime::ResolvedAgentOptions::Container(o) = options else {
+            panic!("expected container options");
+        };
+        let mut argv = o.entrypoint.map(|e| e.0).unwrap_or_default();
+        argv.extend(o.agent_flags);
+        self.launches.lock().unwrap().push(argv);
+        Err(EngineError::Other("recorded".into()))
+    }
+    fn list_running(
+        &self,
+        _: &Session,
+    ) -> Result<Vec<crate::engine::agent_runtime::AgentHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+    fn list_running_all(
+        &self,
+    ) -> Result<Vec<crate::engine::agent_runtime::AgentHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+    fn stats(
+        &self,
+        _: &crate::engine::agent_runtime::AgentHandle,
+    ) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
+        Err(EngineError::Other("recording runtime".into()))
+    }
+    fn stop(&self, _: &crate::engine::agent_runtime::AgentHandle) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn attach(
+        &self,
+        _: &crate::engine::agent_runtime::AgentHandle,
+    ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+        Err(EngineError::Other("recording runtime".into()))
+    }
+    fn list_running_with_name_prefix(
+        &self,
+        _: &str,
+    ) -> Result<Vec<crate::engine::agent_runtime::AgentHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+    fn host_cli(&self) -> Option<&'static str> {
+        None
+    }
+    fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Option<Vec<String>> {
+        None
+    }
+    fn ready_agent(
+        &self,
+        _: &str,
+        _: crate::engine::agent_runtime::ReadyAgentOptions,
+        _: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
+        Ok(true)
+    }
+    fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
+        Ok(None)
+    }
+    fn build_image(
+        &self,
+        _: &str,
+        _: &Path,
+        _: &Path,
+        _: bool,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn import_image(
+        &self,
+        _: &crate::engine::agent_runtime::ImageImportRequest,
+        _: &mut dyn UserMessageSink,
+    ) -> Result<crate::engine::agent_runtime::ImportedImage, EngineError> {
+        Err(EngineError::Other("recording runtime".into()))
+    }
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+/// A committed repo at `<tmp>/repo` holding `workflow_toml`, plus an
+/// **uncommitted** repo config carrying `agentFlags` for codex and claude, so
+/// a worktree cut from the last commit does not contain it.
+fn agent_flags_workflow_repo(tmp: &Path, workflow_toml: &str) -> (PathBuf, PathBuf) {
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(repo.join(".awman")).unwrap();
+    git_in(&repo, &["init"]);
+    git_in(&repo, &["config", "user.email", "t@t.t"]);
+    git_in(&repo, &["config", "user.name", "t"]);
+    for agent in ["codex", "claude"] {
+        std::fs::write(
+            repo.join(".awman").join(format!("Dockerfile.{agent}")),
+            "FROM scratch\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(repo.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+    let wf = repo.join("wf.toml");
+    std::fs::write(&wf, workflow_toml).unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-m", "init"]);
+    std::fs::write(
+        repo.join(".awman").join("config.json"),
+        r#"{"agentFlags": {"codex": ["--no-daemon"], "claude": ["--verbose"]}}"#,
+    )
+    .unwrap();
+    (repo, wf)
+}
+
+const CODEX_STEP: &str = "[[steps]]\nname = \"s\"\nagent = \"codex\"\nprompt = \"go\"\n";
+const CLAUDE_STEP: &str = "[[steps]]\nname = \"s\"\nagent = \"claude\"\nprompt = \"go\"\n";
+
+/// Run `workflow_toml` through `exec workflow` against the recording runtime
+/// and return the agent argv of every launch. The first launch is refused, so
+/// a run records exactly one step.
+async fn run_recorded_workflow(
+    tmp: &Path,
+    workflow_toml: &str,
+    worktree: bool,
+    agent_flags: Option<Vec<String>>,
+) -> Vec<Vec<String>> {
+    let (repo, wf) = agent_flags_workflow_repo(tmp, workflow_toml);
+    let runtime = Arc::new(RecordingRuntime::new());
+    let mut engines = Engines::for_tests(&tmp.join("home"));
+    engines.runtime = runtime.clone();
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime.clone(),
+    ));
+    engines.workflow_state_store = Arc::new(crate::data::WorkflowStateStore::at_git_root(&repo));
+
+    let flags = ExecWorkflowCommandFlags {
+        workflow: Some(wf),
+        work_item: None,
+        non_interactive: true,
+        plan: false,
+        allow_docker: false,
+        worktree,
+        yolo: false,
+        auto: false,
+        agent: None,
+        model: None,
+        launch_mode: None,
+        overlay: vec![],
+        agent_flags,
+        max_concurrent: None,
+        issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
+        dynamic: false,
+        leader: None,
+    };
+    let session = Session::for_tests_isolated(&repo, &tmp.join("config-home"));
+    let cmd = ExecWorkflowCommand::new(flags, engines, session);
+    let _ = cmd
+        .run_with_frontend(Box::new(FakeExecWorkflowFrontend::new()))
+        .await;
+    let launches = runtime.launches.lock().unwrap().clone();
+    launches
+}
+
+fn launch_for<'a>(launches: &'a [Vec<String>], agent: &str) -> &'a [String] {
+    launches
+        .iter()
+        .find(|argv| argv.first().map(String::as_str) == Some(agent))
+        .unwrap_or_else(|| panic!("no {agent} launch recorded; got {launches:?}"))
+}
+
+#[tokio::test]
+async fn workflow_steps_get_their_own_agents_configured_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launches = run_recorded_workflow(tmp.path(), CODEX_STEP, false, None).await;
+    assert_eq!(
+        launch_for(&launches, "codex"),
+        &["codex", "exec", "--no-daemon"].map(String::from)
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let launches = run_recorded_workflow(tmp.path(), CLAUDE_STEP, false, None).await;
+    assert_eq!(
+        launch_for(&launches, "claude"),
+        &["claude", "--print", "--verbose"].map(String::from)
+    );
+}
+
+/// The regression this guards: the worktree is cut from the last commit,
+/// which does not contain the repo config, yet the step still gets the flags.
+#[tokio::test]
+async fn worktree_workflow_steps_still_get_configured_flags() {
+    // Worktrees are created under the process `$HOME/.awman/worktrees`, which
+    // only `make test` (AWMAN_TEST_ISOLATION, throwaway HOME) makes safe.
+    if !crate::data::config::env::Env::from_process().test_isolation() {
+        eprintln!("skipped: creates a worktree under $HOME; run via `make test`");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let launches = run_recorded_workflow(tmp.path(), CODEX_STEP, true, None).await;
+    assert_eq!(
+        launch_for(&launches, "codex"),
+        &["codex", "exec", "--no-daemon"].map(String::from)
+    );
+}
+
+#[tokio::test]
+async fn workflow_cli_agent_flag_reaches_steps_of_the_workflow_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The workflow names codex as its agent; the step names none.
+    let toml = "agent = \"codex\"\n\n[[steps]]\nname = \"s\"\nprompt = \"go\"\n";
+    let launches =
+        run_recorded_workflow(tmp.path(), toml, false, Some(vec!["--search".into()])).await;
+    assert_eq!(
+        launch_for(&launches, "codex"),
+        &["codex", "exec", "--search"].map(String::from)
+    );
+}
+
+#[tokio::test]
+async fn workflow_cli_agent_flag_skips_steps_naming_another_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The workflow's agent is codex, but this step overrides it with claude.
+    let toml =
+        "agent = \"codex\"\n\n[[steps]]\nname = \"s\"\nagent = \"claude\"\nprompt = \"go\"\n";
+    let launches =
+        run_recorded_workflow(tmp.path(), toml, false, Some(vec!["--search".into()])).await;
+    assert_eq!(
+        launch_for(&launches, "claude"),
+        &["claude", "--print", "--verbose"].map(String::from)
+    );
+}
+
+/// Drive the dynamic leader launch directly (the full `--dynamic` path needs a
+/// real image builder before it reaches the leader). The leader runs on a
+/// worktree session whose checkout lacks the repo config; the flags must come
+/// from the invoking session.
+async fn record_leader_launch(
+    tmp: &Path,
+    agent: Option<&str>,
+    agent_flags: Option<Vec<String>>,
+) -> Vec<Vec<String>> {
+    let invoking = agent_flags_session(
+        tmp,
+        "repo",
+        Some(r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#),
+    );
+    let worktree = agent_flags_session(tmp, "worktree", None);
+
+    let runtime = Arc::new(RecordingRuntime::new());
+    let mut engines = Engines::for_tests(&tmp.join("home"));
+    engines.runtime = runtime.clone();
+    engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+        engines.overlay_engine.clone(),
+        runtime.clone(),
+    ));
+    let flags = ExecWorkflowCommandFlags {
+        workflow: None,
+        work_item: Some("1".into()),
+        non_interactive: true,
+        plan: false,
+        allow_docker: false,
+        worktree: true,
+        yolo: true,
+        auto: false,
+        agent: agent.map(str::to_string),
+        model: None,
+        launch_mode: None,
+        overlay: vec![],
+        agent_flags,
+        max_concurrent: None,
+        issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
+        dynamic: true,
+        leader: Some("codex::gpt-5".into()),
+    };
+    let cmd = ExecWorkflowCommand::new(flags, engines, invoking);
+    let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
+        Arc::new(Mutex::new(Box::new(FakeExecWorkflowFrontend::new())));
+    let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = cmd
+        .drive_leader_agent(
+            shared,
+            &worktree,
+            &AgentName::new("codex").unwrap(),
+            Some("gpt-5"),
+            "design a workflow",
+            worktree.git_root(),
+            Vec::new(),
+            None,
+            "leader",
+            &mut rx,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "the recording runtime refuses every launch"
+    );
+    let launches = runtime.launches.lock().unwrap().clone();
+    launches
+}
+
+#[tokio::test]
+async fn dynamic_leader_gets_configured_agent_flags_from_the_invoking_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launches = record_leader_launch(tmp.path(), None, None).await;
+    assert_eq!(
+        launch_for(&launches, "codex"),
+        &["codex", "exec", "--no-daemon"].map(String::from)
+    );
+}
+
+#[tokio::test]
+async fn dynamic_leader_gets_cli_agent_flag_when_it_is_the_selected_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launches =
+        record_leader_launch(tmp.path(), Some("codex"), Some(vec!["--search".into()])).await;
+    assert_eq!(
+        launch_for(&launches, "codex"),
+        &["codex", "exec", "--search"].map(String::from)
+    );
+}
+
+#[tokio::test]
+async fn dynamic_leader_keeps_config_when_cli_targets_another_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launches =
+        record_leader_launch(tmp.path(), Some("claude"), Some(vec!["--search".into()])).await;
+    assert_eq!(
+        launch_for(&launches, "codex"),
+        &["codex", "exec", "--no-daemon"].map(String::from)
+    );
 }

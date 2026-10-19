@@ -1053,6 +1053,26 @@ pub(crate) fn parse_launch_mode(
     }
 }
 
+/// Typed `--agent-flag` values: `None` when the flag was not passed (so config
+/// `agentFlags` applies), otherwise the list in order. Empty entries are
+/// rejected with the same rule config uses.
+pub(crate) fn parse_agent_flags(
+    raw: &[String],
+    command: &[&str],
+) -> Result<Option<Vec<String>>, CommandError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    crate::data::config::repo::validate_agent_flag_values("--agent-flag", raw).map_err(|e| {
+        CommandError::InvalidFlagValue {
+            command: command.iter().map(|part| (*part).to_string()).collect(),
+            flag: "agent-flag".into(),
+            reason: e.to_string(),
+        }
+    })?;
+    Ok(Some(raw.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2297,5 +2317,32 @@ mod tests {
             "a failed required image stage must exit non-zero on every runtime, \
              not only builtin"
         );
+    }
+
+    #[test]
+    fn parse_agent_flags_absent_is_none_so_config_applies() {
+        assert_eq!(parse_agent_flags(&[], &["chat"]).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_agent_flags_keeps_values_in_order() {
+        let raw = vec![
+            "--no-daemon".to_string(),
+            "--config".to_string(),
+            "a=b".to_string(),
+        ];
+        assert_eq!(parse_agent_flags(&raw, &["chat"]).unwrap(), Some(raw));
+    }
+
+    #[test]
+    fn parse_agent_flags_rejects_an_empty_entry() {
+        let raw = vec!["--no-daemon".to_string(), String::new()];
+        match parse_agent_flags(&raw, &["exec", "prompt"]).unwrap_err() {
+            CommandError::InvalidFlagValue { command, flag, .. } => {
+                assert_eq!(command, vec!["exec", "prompt"]);
+                assert_eq!(flag, "agent-flag");
+            }
+            other => panic!("expected InvalidFlagValue, got {other:?}"),
+        }
     }
 }

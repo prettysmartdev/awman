@@ -1052,6 +1052,7 @@ fn squad_workflow_flags(
         // uses, so every step container combines them with the standing
         // global/repo/env sources under the existing precedence rules.
         overlay: overlays.to_vec(),
+        agent_flags: None,
         max_concurrent: None,
         issue_source: Default::default(),
         dynamic: false,

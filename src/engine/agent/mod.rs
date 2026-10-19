@@ -72,6 +72,19 @@ pub struct AgentRunOptions {
     pub system_prompt: Option<String>,
     /// Resolved context-directory overlays for this run.
     pub context_overlays: Vec<ContextOverlay>,
+    /// `--agent-flag` values the command has scoped to this agent. `Some`
+    /// replaces the configured `agentFlags` entry; `None` resolves it from the
+    /// session (see [`resolve_agent_flags`]).
+    pub agent_flags: Option<Vec<String>>,
+}
+
+/// Extra user arguments appended to `agent`'s launch command: the run's
+/// explicit `--agent-flag` list, else the session's effective `agentFlags`.
+fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptions) -> Vec<String> {
+    match &run.agent_flags {
+        Some(values) => values.clone(),
+        None => session.effective_config().agent_flags(agent.as_str()),
+    }
 }
 
 #[derive(Clone)]
@@ -334,6 +347,12 @@ impl AgentEngine {
         let mode_flags = matrix.mode_flags(run);
         if !mode_flags.is_empty() {
             options.push(ContainerOption::AgentModeFlags(mode_flags));
+        }
+
+        // User-configured extra agent args (`agentFlags` / `--agent-flag`).
+        let agent_flags = resolve_agent_flags(session, agent, run);
+        if !agent_flags.is_empty() {
+            options.push(ContainerOption::AgentFlags(agent_flags));
         }
 
         // Initial prompt. In interactive mode most agents receive it as a
@@ -603,6 +622,27 @@ impl AgentEngine {
                             agent = agent.as_str(),
                         )));
                     }
+                }
+            }
+        }
+
+        // User-configured extra agent args. Only `kind: agent` kits have an
+        // argv channel; a mixin kit's launch command belongs to Docker's
+        // built-in template, so the flags are warned about, not dropped.
+        let agent_flags = resolve_agent_flags(session, agent, run);
+        if !agent_flags.is_empty() {
+            match matrix.sbx_kit_kind {
+                agent_matrix::SbxKitKind::Agent => {
+                    options.push(SandboxOption::AgentFlags(agent_flags));
+                }
+                agent_matrix::SbxKitKind::Mixin => {
+                    options.push(SandboxOption::UnsupportedNote(format!(
+                        "agentFlags ({}) cannot be delivered to '{agent}' under the sandbox \
+                         runtime (the built-in template owns the launch command); continuing \
+                         without them",
+                        agent_flags.join(" "),
+                        agent = agent.as_str(),
+                    )));
                 }
             }
         }
@@ -2709,5 +2749,129 @@ mod tests {
         } else {
             panic!("expected Sandbox variant");
         }
+    }
+
+    // ─── agentFlags ──────────────────────────────────────────────────────────
+
+    /// A docker-backed engine over a session whose repo config is `repo_json`,
+    /// with the global config isolated in a temp dir.
+    fn engine_with_repo_config(
+        tmp: &std::path::Path,
+        repo_json: &str,
+    ) -> (AgentEngine, crate::data::session::Session) {
+        let root = tmp.join("repo");
+        let awman_dir = root.join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("config.json"), repo_json).unwrap();
+        let session =
+            crate::data::session::Session::for_tests_isolated(&root, &tmp.join("config-home"));
+        let overlay = OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.join("home")),
+        );
+        let runtime = crate::engine::container::ContainerRuntime::docker();
+        (
+            AgentEngine::new(Arc::new(overlay), Arc::new(runtime)),
+            session,
+        )
+    }
+
+    fn container_agent_flags(opts: &[ContainerOption]) -> Vec<String> {
+        opts.iter()
+            .filter_map(|o| match o {
+                ContainerOption::AgentFlags(v) => Some(v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn build_options_emits_configured_agent_flags_for_that_agent_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let codex = AgentName::new("codex").unwrap();
+        let claude = AgentName::new("claude").unwrap();
+
+        let opts = engine
+            .build_options(&session, &codex, &AgentRunOptions::default())
+            .unwrap();
+        assert_eq!(container_agent_flags(&opts), vec!["--no-daemon"]);
+
+        let opts = engine
+            .build_options(&session, &claude, &AgentRunOptions::default())
+            .unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, ContainerOption::AgentFlags(_))),
+            "claude has no agentFlags entry; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_cli_agent_flags_replace_configured_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let codex = AgentName::new("codex").unwrap();
+        let run = AgentRunOptions {
+            agent_flags: Some(vec!["--search".into()]),
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &codex, &run).unwrap();
+        assert_eq!(container_agent_flags(&opts), vec!["--search"]);
+    }
+
+    #[test]
+    fn build_options_empty_cli_agent_flags_emit_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let codex = AgentName::new("codex").unwrap();
+        let run = AgentRunOptions {
+            agent_flags: Some(vec![]),
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &codex, &run).unwrap();
+        assert!(container_agent_flags(&opts).is_empty());
+    }
+
+    #[test]
+    fn build_sandbox_options_agent_kit_gets_agent_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"crush": ["--debug"]}}"#);
+        let crush = AgentName::new("crush").unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &crush, &AgentRunOptions::default())
+            .unwrap();
+        assert!(
+            opts.iter().any(
+                |o| matches!(o, SandboxOption::AgentFlags(v) if v == &vec!["--debug".to_string()])
+            ),
+            "crush (kind: agent) must get its agentFlags; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_mixin_agent_flags_become_unsupported_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) =
+            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+        let codex = AgentName::new("codex").unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &codex, &AgentRunOptions::default())
+            .unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("--no-daemon") && n.contains("codex")
+            )),
+            "codex (mixin) agentFlags must surface as a note; got {opts:?}"
+        );
+        assert!(!opts
+            .iter()
+            .any(|o| matches!(o, SandboxOption::AgentFlags(_))));
     }
 }

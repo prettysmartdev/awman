@@ -1189,6 +1189,31 @@ mod tests {
         assert_eq!(v, vec!["/a".to_string(), "/b".to_string()]);
     }
 
+    /// `--agent-flag` values start with `-`, so they are passed in the
+    /// `--agent-flag=<value>` form; every agent-run command accepts it.
+    #[test]
+    fn flag_strings_reads_hyphen_leading_agent_flag_values() {
+        for (path, extra) in [
+            (vec!["chat"], vec![]),
+            (vec!["exec", "prompt"], vec!["hi"]),
+            (vec!["exec", "workflow"], vec!["wf.toml"]),
+        ] {
+            // Flags before the positional: `exec prompt`'s trailing prompt
+            // absorbs everything after it.
+            let mut argv = vec!["awman"];
+            argv.extend(path.iter().copied());
+            argv.extend(["--agent-flag=--no-daemon", "--agent-flag=--config=a=b"]);
+            argv.extend(extra);
+            let m = CommandCatalogue::get()
+                .build_clap_command()
+                .try_get_matches_from(&argv)
+                .unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            let frontend = CliFrontend::new(m);
+            let v = frontend.flag_strings(&path, "agent-flag").unwrap();
+            assert_eq!(v, vec!["--no-daemon", "--config=a=b"], "{path:?}");
+        }
+    }
+
     #[test]
     fn flag_strings_returns_empty_when_flag_absent() {
         let cmd = CommandCatalogue::get().build_clap_command();

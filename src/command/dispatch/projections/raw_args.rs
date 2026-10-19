@@ -635,6 +635,19 @@ mod tests {
         assert_eq!(p.flag_path("workflow"), Some(PathBuf::from("build.toml")));
     }
 
+    /// The API / TUI command box parse `--agent-flag=<value>` exactly as clap
+    /// does, hyphen-leading values included.
+    #[test]
+    fn agent_flag_inline_values_may_start_with_a_hyphen() {
+        let p = cat()
+            .parse_raw_args(
+                &["chat"],
+                &argv(&["--agent-flag=--no-daemon", "--agent-flag=-v"]),
+            )
+            .unwrap();
+        assert_eq!(p.flag_strings("agent-flag"), vec!["--no-daemon", "-v"]);
+    }
+
     /// Clap rejects positionals a command never declared; the raw-args
     /// projection must agree (WI-0097 parity) rather than silently dropping
     /// them. `exec workflow` declares exactly one positional.

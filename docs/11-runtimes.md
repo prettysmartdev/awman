@@ -594,8 +594,9 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 | `--model` | applied (settings file) | applied (settings/config file) | **not deliverable** — warned; use the `/model` slash command in-session |
 | `--plan` / `--auto` / `--yolo` | applied (`permissions.defaultMode`) | **not deliverable** — warned | **not deliverable** — warned |
 | `--non-interactive` | **not deliverable** — warned; the prompt is still piped to the agent's interactive entrypoint | same | same |
+| `agentFlags` / `--agent-flag` | **not deliverable** — warned | **not deliverable** — warned | **not deliverable** — warned |
 
-`kind: agent` kits (`antigravity`, `crush`, `maki`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, and the non-interactive subcommand as launch arguments, exactly like the container runtimes. (`antigravity` rejects `--model` on every runtime — it has no model flag.)
+`kind: agent` kits (`antigravity`, `crush`, `maki`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, `agentFlags`, and the non-interactive subcommand as launch arguments, exactly like the container runtimes. (`antigravity` rejects `--model` on every runtime — it has no model flag.)
 
 **Port mappings:** if a workflow binds a port inside the sandbox, that port mapping is lost when the sandbox stops. Port-based workflows must keep the sandbox running continuously.
 

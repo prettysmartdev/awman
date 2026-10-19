@@ -4,7 +4,7 @@
 //! preserved for forward and backward compatibility — users upgrading from a
 //! prior release must continue to read their existing files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -282,6 +282,36 @@ pub(crate) fn validate_agent_name_key(field_path: &str, key: &str) -> Result<(),
     Ok(())
 }
 
+/// Extra arguments appended to an agent's launch command, keyed by agent name
+/// (`agentFlags` in repo and global config).
+pub type AgentFlagsConfig = BTreeMap<String, Vec<String>>;
+
+/// Layer 0 validator for `agentFlags`: every key must be a valid agent name and
+/// every value a non-empty argument. Shared by repo and global config.
+pub(crate) fn validate_agent_flags(map: &AgentFlagsConfig) -> Result<(), DataError> {
+    for (agent, values) in map {
+        crate::data::session::AgentName::new(agent).map_err(|_| {
+            DataError::Other(format!(
+                "agentFlags key {agent:?} is not a valid agent name: only ASCII \
+                 alphanumerics, '-', and '_' are allowed, length 1..=64"
+            ))
+        })?;
+        validate_agent_flag_values(&format!("agentFlags.{agent}"), values)?;
+    }
+    Ok(())
+}
+
+/// Reject empty or whitespace-only entries in an agent-flag list. `source`
+/// names where the list came from (e.g. `agentFlags.codex`, `--agent-flag`).
+pub fn validate_agent_flag_values(source: &str, values: &[String]) -> Result<(), DataError> {
+    if values.iter().any(|v| v.trim().is_empty()) {
+        return Err(DataError::Other(format!(
+            "{source} contains an empty entry; each entry must be a non-empty argument"
+        )));
+    }
+    Ok(())
+}
+
 /// Layer 0 validator for `dynamicWorkflows.defaultLeader`. Enforces the same
 /// `agent::model` syntax as `LeaderSpec::parse` (two non-empty components) plus
 /// no leading/trailing whitespace in either component and an `AgentName`-valid
@@ -404,6 +434,10 @@ pub struct RepoConfig {
     pub auth_refresh: Option<AuthRefreshConfig>,
     #[serde(rename = "launchMode", skip_serializing_if = "Option::is_none")]
     pub launch_mode: Option<LaunchMode>,
+    /// Extra arguments appended to the agent command, keyed by agent name.
+    /// A repo entry replaces the global entry for the same agent.
+    #[serde(rename = "agentFlags", skip_serializing_if = "Option::is_none")]
+    pub agent_flags: Option<AgentFlagsConfig>,
     /// Per-repo settings for the builtin microVM runtime, merged over the
     /// global `builtin` block field by field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -443,6 +477,9 @@ impl RepoConfig {
         }
         if let Some(auth_refresh) = &cfg.auth_refresh {
             validate_auth_refresh(auth_refresh)?;
+        }
+        if let Some(agent_flags) = &cfg.agent_flags {
+            validate_agent_flags(agent_flags)?;
         }
         Ok(cfg)
     }
@@ -1041,6 +1078,55 @@ mod tests {
 
         let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(cfg.max_concurrent_agents, Some(4));
+    }
+
+    fn write_repo_config(json: &str) -> tempfile::TempDir {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join(REPO_CONFIG_FILENAME), json).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn load_parses_agent_flags_and_round_trips() {
+        let tmp = write_repo_config(
+            r#"{"agentFlags": {"codex": ["--no-daemon", "--config", "a=b"], "claude": []}}"#,
+        );
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        let flags = cfg.agent_flags.as_ref().unwrap();
+        assert_eq!(flags["codex"], vec!["--no-daemon", "--config", "a=b"]);
+        assert!(flags["claude"].is_empty());
+
+        cfg.save(tmp.path()).unwrap();
+        assert_eq!(RepoConfig::load(tmp.path()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn load_rejects_agent_flags_with_invalid_agent_name() {
+        let tmp = write_repo_config(r#"{"agentFlags": {"../codex": ["--no-daemon"]}}"#);
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid agent name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_agent_flags_with_empty_entry() {
+        let tmp = write_repo_config(r#"{"agentFlags": {"codex": [""]}}"#);
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("agentFlags.codex contains an empty entry"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_agent_flags_that_are_not_a_map_of_lists() {
+        let tmp = write_repo_config(r#"{"agentFlags": ["--no-daemon"]}"#);
+        assert!(RepoConfig::load(tmp.path()).is_err());
     }
 
     #[test]

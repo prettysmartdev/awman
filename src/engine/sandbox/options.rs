@@ -68,6 +68,10 @@ pub enum SandboxOption {
     /// after the `--` delimiter; mixin kits launch through Docker's
     /// built-in template and use [`SandboxOption::PermissionMode`] instead.
     AgentModeFlags(Vec<String>),
+    /// User-configured extra agent arguments (`agentFlags` / `--agent-flag`).
+    /// Like [`SandboxOption::AgentModeFlags`], only deliverable to `kind: agent`
+    /// kits; appended after the model flag and before the seeded prompt.
+    AgentFlags(Vec<String>),
     /// Requested permission mode (`"plan"` / `"auto"` / `"yolo"`) for mixin
     /// kits whose apply script can render a native settings equivalent
     /// (claude's `permissions.defaultMode`). Written to `session.json`.
@@ -115,6 +119,9 @@ pub struct ResolvedSandboxOptions {
     /// Literal mode-flag argv strings; appended after `--` for `kind: agent`
     /// kits only.
     pub mode_flags: Vec<String>,
+    /// User-configured extra agent args; appended after `--` for
+    /// `kind: agent` kits only.
+    pub agent_flags: Vec<String>,
     /// Permission mode for mixins with a native settings equivalent; lands
     /// in `session.json`.
     pub permission_mode: Option<String>,
@@ -173,6 +180,7 @@ impl ResolvedSandboxOptions {
             SandboxOption::AllowedTools(v) => self.allowed_tools.extend(v),
             SandboxOption::Model { flag } => self.model = Some(flag),
             SandboxOption::AgentModeFlags(v) => self.mode_flags.extend(v),
+            SandboxOption::AgentFlags(v) => self.agent_flags.extend(v),
             SandboxOption::PermissionMode(v) => self.permission_mode = Some(v),
             SandboxOption::KeepAfterExit => self.keep_after_exit = true,
             SandboxOption::UnsupportedNote(v) => self.unsupported_notes.push(v),

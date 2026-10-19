@@ -113,6 +113,31 @@ impl EffectiveConfig {
         Vec::new()
     }
 
+    /// Effective extra arguments for `agent`'s launch command
+    /// (flag > repo entry > global entry > none).
+    ///
+    /// Each level replaces the lower ones for that agent, so an empty repo
+    /// entry turns off a global one. `--agent-flag` targets the agent this
+    /// invocation selects ([`Self::agent`]), so it applies only when `agent` is
+    /// that one; other agents (e.g. a workflow step that names its own) fall
+    /// through to config.
+    pub fn agent_flags(&self, agent: &str) -> Vec<String> {
+        if let Some(values) = self.flags.agent_flags.as_ref() {
+            if self.agent().as_deref() == Some(agent) {
+                return values.clone();
+            }
+        }
+        [
+            self.repo.agent_flags.as_ref(),
+            self.global.agent_flags.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|map| map.get(agent))
+        .cloned()
+        .unwrap_or_default()
+    }
+
     /// Effective scrollback line count for the container terminal.
     pub fn scrollback_lines(&self) -> usize {
         if let Some(n) = self.flags.terminal_scrollback_lines {
@@ -353,7 +378,9 @@ mod tests {
     use crate::data::config::env::{
         EnvSnapshot, AWMAN_API_KEY, AWMAN_REMOTE_ADDR, AWMAN_REMOTE_SESSION,
     };
-    use crate::data::config::repo::{AgentAuthMode, ApiConfig, AuthRefreshConfig, RemoteConfig};
+    use crate::data::config::repo::{
+        AgentAuthMode, AgentFlagsConfig, ApiConfig, AuthRefreshConfig, RemoteConfig,
+    };
     use std::time::Duration;
 
     fn make_effective(
@@ -589,6 +616,111 @@ mod tests {
             GlobalConfig::default(),
         );
         assert!(ec.yolo_disallowed_tools().is_empty());
+    }
+
+    // ─── agent_flags ──────────────────────────────────────────────────────────
+
+    fn agent_flags_map(entries: &[(&str, &[&str])]) -> Option<AgentFlagsConfig> {
+        Some(
+            entries
+                .iter()
+                .map(|(agent, values)| {
+                    (
+                        agent.to_string(),
+                        values.iter().map(|v| v.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn agent_flags_empty_when_all_unset() {
+        let ec = EffectiveConfig::default();
+        assert!(ec.agent_flags("codex").is_empty());
+    }
+
+    #[test]
+    fn agent_flags_global_entry_used_when_repo_has_none() {
+        let global = GlobalConfig {
+            agent_flags: agent_flags_map(&[("codex", &["--no-daemon"])]),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert_eq!(ec.agent_flags("codex"), strings(&["--no-daemon"]));
+        assert!(ec.agent_flags("claude").is_empty());
+    }
+
+    #[test]
+    fn agent_flags_repo_entry_replaces_global_entry_per_agent() {
+        let repo = RepoConfig {
+            agent_flags: agent_flags_map(&[
+                ("codex", &["--no-daemon", "--config", "x=y"]),
+                ("claude", &[]),
+            ]),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            agent_flags: agent_flags_map(&[
+                ("codex", &["--no-daemon"]),
+                ("claude", &["--verbose"]),
+                ("gemini", &["--debug"]),
+            ]),
+            ..Default::default()
+        };
+        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
+        assert_eq!(
+            ec.agent_flags("codex"),
+            strings(&["--no-daemon", "--config", "x=y"])
+        );
+        // An empty repo entry turns the global one off.
+        assert!(ec.agent_flags("claude").is_empty());
+        // Agents the repo does not mention keep their global entry.
+        assert_eq!(ec.agent_flags("gemini"), strings(&["--debug"]));
+    }
+
+    #[test]
+    fn agent_flags_cli_replaces_config_for_the_selected_agent_only() {
+        let flags = FlagConfig {
+            agent: Some("codex".into()),
+            agent_flags: Some(strings(&["--search"])),
+            ..Default::default()
+        };
+        let repo = RepoConfig {
+            agent_flags: agent_flags_map(&[
+                ("codex", &["--no-daemon"]),
+                ("claude", &["--verbose"]),
+            ]),
+            ..Default::default()
+        };
+        let ec = make_effective(flags, EnvSnapshot::empty(), repo, GlobalConfig::default());
+        assert_eq!(ec.agent_flags("codex"), strings(&["--search"]));
+        // A different agent (e.g. a workflow step override) keeps its config.
+        assert_eq!(ec.agent_flags("claude"), strings(&["--verbose"]));
+    }
+
+    #[test]
+    fn agent_flags_cli_targets_the_config_selected_agent_without_agent_flag() {
+        let flags = FlagConfig {
+            agent_flags: Some(strings(&["--search"])),
+            ..Default::default()
+        };
+        let repo = RepoConfig {
+            agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let ec = make_effective(flags, EnvSnapshot::empty(), repo, GlobalConfig::default());
+        assert_eq!(ec.agent_flags("codex"), strings(&["--search"]));
+        assert!(ec.agent_flags("claude").is_empty());
     }
 
     // ─── remote_default_addr ──────────────────────────────────────────────────

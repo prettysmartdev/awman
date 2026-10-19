@@ -25,6 +25,8 @@ pub struct ChatCommandFlags {
     pub model: Option<String>,
     pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
+    /// `--agent-flag` values; `None` lets config `agentFlags` apply.
+    pub agent_flags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +75,10 @@ impl ChatCommand {
                     &ctx.path(),
                 )?,
                 overlay: ctx.flags.strs("overlay").to_vec(),
+                agent_flags: crate::command::dispatch::parse_agent_flags(
+                    ctx.flags.strs("agent-flag"),
+                    &ctx.path(),
+                )?,
             },
             ctx.engines.clone(),
             ctx.session.clone(),
@@ -268,6 +274,7 @@ impl Command for ChatCommand {
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
+            agent_flags: self.flags.agent_flags.clone(),
             env_passthrough: if collected.env_passthrough.is_empty() {
                 None
             } else {

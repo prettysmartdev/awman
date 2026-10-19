@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::config::repo::{
-    validate_auth_refresh, ApiConfig, AuthRefreshConfig, RemoteConfig, SquadConfig,
+    validate_agent_flags, validate_auth_refresh, AgentFlagsConfig, ApiConfig, AuthRefreshConfig,
+    RemoteConfig, SquadConfig,
 };
 use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::error::DataError;
@@ -70,6 +71,9 @@ pub struct GlobalConfig {
     pub launch_mode_fallback: Option<LaunchModeFallback>,
     #[serde(rename = "authRefresh", skip_serializing_if = "Option::is_none")]
     pub auth_refresh: Option<AuthRefreshConfig>,
+    /// Extra arguments appended to the agent command, keyed by agent name.
+    #[serde(rename = "agentFlags", skip_serializing_if = "Option::is_none")]
+    pub agent_flags: Option<AgentFlagsConfig>,
     /// Settings for the builtin microVM runtime (`runtime: "builtin"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<BuiltinRuntimeConfig>,
@@ -167,6 +171,9 @@ impl GlobalConfig {
         }
         if let Some(auth_refresh) = &cfg.auth_refresh {
             validate_auth_refresh(auth_refresh)?;
+        }
+        if let Some(agent_flags) = &cfg.agent_flags {
+            validate_agent_flags(agent_flags)?;
         }
         Ok(cfg)
     }
@@ -275,6 +282,10 @@ mod tests {
             max_concurrent_agents: Some(4),
             launch_mode_fallback: None,
             auth_refresh: None,
+            agent_flags: Some(std::collections::BTreeMap::from([(
+                "codex".to_string(),
+                vec!["--no-daemon".to_string()],
+            )])),
         };
 
         original.save_with(&env).unwrap();
@@ -296,6 +307,56 @@ mod tests {
         assert!(
             err.to_string().contains("maxConcurrentAgents must be >= 1"),
             "error must explain the >= 1 requirement, got: {err}"
+        );
+    }
+
+    fn write_global(env: &EnvSnapshot, json: &str) {
+        let path = GlobalConfig::path_with(env).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, json).unwrap();
+    }
+
+    #[test]
+    fn load_parses_agent_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        write_global(
+            &env,
+            r#"{"agentFlags": {"codex": ["--no-daemon"], "claude": []}}"#,
+        );
+
+        let cfg = GlobalConfig::load_with(&env).unwrap();
+        let flags = cfg.agent_flags.unwrap();
+        assert_eq!(flags["codex"], vec!["--no-daemon".to_string()]);
+        assert!(flags["claude"].is_empty());
+    }
+
+    #[test]
+    fn load_rejects_agent_flags_with_invalid_agent_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        write_global(&env, r#"{"agentFlags": {"co dex": ["--no-daemon"]}}"#);
+
+        let err = GlobalConfig::load_with(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid agent name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_agent_flags_with_empty_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        write_global(&env, r#"{"agentFlags": {"codex": ["--no-daemon", " "]}}"#);
+
+        let err = GlobalConfig::load_with(&env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("agentFlags.codex contains an empty entry"),
+            "got: {err}"
         );
     }
 

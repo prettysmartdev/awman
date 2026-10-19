@@ -46,6 +46,9 @@ pub struct FlagConfig {
     pub work_item: Option<u32>,
     /// `--max-concurrent <N>`: cap on concurrently-running workflow steps.
     pub max_concurrent_agents: Option<usize>,
+    /// `--agent-flag <ARG>` (repeatable): extra arguments for the agent this
+    /// invocation launches. Replaces that agent's `agentFlags` config entry.
+    pub agent_flags: Option<Vec<String>>,
 }
 
 impl FlagConfig {

@@ -182,6 +182,10 @@ pub enum ContainerOption {
     /// Per-agent mode flags (yolo, auto, plan) — emitted as literal argv
     /// strings after the entrypoint in `build_run_argv`.
     AgentModeFlags(Vec<String>),
+    /// User-configured extra agent arguments (`agentFlags` / `--agent-flag`) —
+    /// appended after every awman-generated agent flag and before the seeded
+    /// prompt.
+    AgentFlags(Vec<String>),
     /// The flag name to use when emitting disallowed tools (e.g. `--disallowedTools`).
     DisallowedToolsFlag(String),
     /// The flag name to use when emitting allowed tools (e.g. `--allowedTools`).
@@ -453,6 +457,8 @@ pub struct ResolvedContainerOptions {
     /// one `--label key=value` each (after the hardcoded `awman=true`).
     pub labels: Vec<(String, String)>,
     pub agent_mode_flags: Vec<String>,
+    /// From `ContainerOption::AgentFlags`.
+    pub agent_flags: Vec<String>,
     pub disallowed_tools_flag: Option<String>,
     pub allowed_tools_flag: Option<String>,
     pub remove_on_exit: bool,
@@ -536,6 +542,7 @@ impl ResolvedContainerOptions {
             ContainerOption::DockerfileUser(v) => self.dockerfile_user = Some(v),
             ContainerOption::Label { key, value } => self.labels.push((key, value)),
             ContainerOption::AgentModeFlags(v) => self.agent_mode_flags.extend(v),
+            ContainerOption::AgentFlags(v) => self.agent_flags.extend(v),
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,

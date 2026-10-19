@@ -49,6 +49,10 @@ pub struct AgentMatrix {
     pub interactive_entrypoint: Vec<&'static str>,
     /// Print/non-interactive entrypoint suffix (e.g. `--print` for Claude).
     pub non_interactive_flag: Option<&'static str>,
+    /// Flags appended to the entrypoint only for an interactive (non-`-n`)
+    /// launch — for options the agent's non-interactive mode rejects (codex
+    /// `--no-daemon`, which `codex exec` refuses). Not used for ACP launches.
+    pub interactive_only_flags: &'static [&'static str],
     /// Whether plan mode is supported and which flag to emit.
     pub plan_flag: Option<&'static [&'static str]>,
     /// Yolo flag (e.g. `--dangerously-skip-permissions`). `None` means yolo
@@ -319,6 +323,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "claude",
             interactive_entrypoint: vec!["claude"],
             non_interactive_flag: Some("--print"),
+            interactive_only_flags: &[],
             plan_flag: Some(&["--permission-mode", "plan"]),
             yolo_flag: Some("--dangerously-skip-permissions"),
             auto_flag: Some(&["--permission-mode", "auto"]),
@@ -347,6 +352,14 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "codex",
             interactive_entrypoint: vec!["codex"],
             non_interactive_flag: Some("exec"),
+            // Recent Codex runs its interactive TUI on a shared background
+            // "app-server daemon" installed under `$CODEX_HOME/packages`. A
+            // throwaway container has no use for one, the image has none, and
+            // the host `~/.codex` mounted over `$CODEX_HOME` must not receive a
+            // container-installed daemon or its pid records. Without the flag
+            // the TUI exits 1 ("daemon executable not found"). `codex exec`
+            // never uses the daemon and rejects the flag, so interactive only.
+            interactive_only_flags: &["--no-daemon"],
             plan_flag: Some(&["--approval-mode", "plan"]),
             // `--full-auto` is exec-only (and deprecated); the global flag
             // below is accepted by both interactive `codex` and `codex exec`.
@@ -382,6 +395,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "opencode",
             interactive_entrypoint: vec!["opencode"],
             non_interactive_flag: Some("run"),
+            interactive_only_flags: &[],
             plan_flag: None,
             yolo_flag: None,
             auto_flag: None,
@@ -413,6 +427,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "maki",
             interactive_entrypoint: vec!["maki"],
             non_interactive_flag: None,
+            interactive_only_flags: &[],
             plan_flag: None,
             yolo_flag: Some("--yolo"),
             auto_flag: None,
@@ -441,6 +456,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "gemini",
             interactive_entrypoint: vec!["gemini"],
             non_interactive_flag: None,
+            interactive_only_flags: &[],
             plan_flag: Some(&["--approval-mode=plan"]),
             yolo_flag: Some("--yolo"),
             auto_flag: Some(&["--approval-mode=auto_edit"]),
@@ -475,6 +491,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "copilot",
             interactive_entrypoint: vec!["copilot", "-i"],
             non_interactive_flag: None,
+            interactive_only_flags: &[],
             plan_flag: Some(&["--plan"]),
             yolo_flag: Some("--autopilot"),
             auto_flag: None,
@@ -509,6 +526,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "crush",
             interactive_entrypoint: vec!["crush"],
             non_interactive_flag: Some("run"),
+            interactive_only_flags: &[],
             plan_flag: None,
             yolo_flag: Some("--yolo"),
             auto_flag: None,
@@ -537,6 +555,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "cline",
             interactive_entrypoint: vec!["cline"],
             non_interactive_flag: Some("task"),
+            interactive_only_flags: &[],
             plan_flag: Some(&["--plan"]),
             yolo_flag: Some("--yolo"),
             auto_flag: Some(&["--auto-approve-all"]),
@@ -578,6 +597,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             agent: "antigravity",
             interactive_entrypoint: vec!["agy"],
             non_interactive_flag: Some("--print"),
+            interactive_only_flags: &[],
             plan_flag: None,
             yolo_flag: Some("--dangerously-skip-permissions"),
             auto_flag: None,
@@ -632,6 +652,8 @@ pub fn entrypoint_for(matrix: &AgentMatrix, non_interactive: bool) -> Entrypoint
             // because the seeded prompt is positional.
             parts.push(flag.to_string());
         }
+    } else {
+        parts.extend(matrix.interactive_only_flags.iter().map(|s| s.to_string()));
     }
     Entrypoint(parts)
 }
@@ -805,6 +827,33 @@ mod tests {
             msg.contains("does not support a model flag"),
             "error must say 'does not support a model flag'; got: {msg}"
         );
+    }
+
+    /// Interactive codex runs without the app-server daemon; `codex exec`
+    /// rejects `--no-daemon`, so the non-interactive launch must not carry it.
+    #[test]
+    fn codex_no_daemon_is_interactive_only() {
+        let m = matrix_for("codex").unwrap();
+        assert_eq!(entrypoint_for(&m, false).0, vec!["codex", "--no-daemon"]);
+        assert_eq!(entrypoint_for(&m, true).0, vec!["codex", "exec"]);
+    }
+
+    #[test]
+    fn only_codex_declares_interactive_only_flags() {
+        for agent in SUPPORTED_AGENTS {
+            let m = matrix_for(agent).unwrap();
+            if *agent != "codex" {
+                assert!(m.interactive_only_flags.is_empty(), "{agent}");
+                assert_eq!(
+                    entrypoint_for(&m, false).0,
+                    m.interactive_entrypoint
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                    "{agent}"
+                );
+            }
+        }
     }
 
     #[test]

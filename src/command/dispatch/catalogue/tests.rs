@@ -917,6 +917,7 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "agent",
             "model",
             "overlay",
+            "agent-flag",
             "issue",
             "dynamic",
             "leader",

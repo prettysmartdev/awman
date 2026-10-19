@@ -22,6 +22,9 @@ Created by `awman init`; commit it so the whole team shares the same setup.
   "agentStuckTimeout": 60,
   "maxConcurrentAgents": 3,
   "overlays": ["env(ANTHROPIC_API_KEY)", "dir(/data/fixtures:/mnt/fixtures:ro)"],
+  "agentFlags": {
+    "codex": ["--config", "model_reasoning_effort=high"]
+  },
   "workItems": {
     "dir": "docs/work-items",
     "template": "docs/work-items/0000-template.md"
@@ -53,6 +56,10 @@ Applies to every project on the machine unless a repo overrides it.
   "overlays": ["skill(*)", "env(ANTHROPIC_API_KEY)"],
   "agentStuckTimeout": 30,
   "maxConcurrentAgents": 2,
+  "agentFlags": {
+    "codex": ["--config", "model_reasoning_effort=high"],
+    "claude": ["--verbose"]
+  },
   "workers": 2,
   "api": {
     "workDirs": ["/home/user/my-project"],
@@ -187,7 +194,7 @@ fallback to the regular mode.
 
 Two wrinkles:
 
-- **List fields replace, they don't merge.** A repo `yoloDisallowedTools` list completely replaces the global one — even an empty list. To inherit the global list, omit the field from the repo config.
+- **List fields replace, they don't merge.** A repo `yoloDisallowedTools` list completely replaces the global one — even an empty list. To inherit the global list, omit the field from the repo config. `agentFlags` follows the same rule per agent: a repo `agentFlags.codex` list replaces the global `agentFlags.codex` list, `--agent-flag` replaces both, and agents a level doesn't mention fall through to the next one.
 - **Overlays are additive.** `overlays` entries from global config, repo config, `AWMAN_OVERLAYS`, and `--overlay` flags are all merged. See [Overlays](08-overlays.md).
 
 ---
@@ -331,6 +338,35 @@ awman config set yoloDisallowedTools ""                # set an empty list
 ```
 
 An empty repo list actively overrides a non-empty global list. To stop overriding, remove the field from the repo config file. See [Permission modes](03-agent-sessions.md#permission-modes).
+
+### Pass extra flags to an agent
+
+To pass an agent a flag awman doesn't add on its own (for example, one a new agent release needs before awman knows about it), add it under `agentFlags`, keyed by agent name, in either config file:
+
+```json
+{
+  "agentFlags": {
+    "codex": ["--config", "model_reasoning_effort=high"],
+    "claude": []
+  }
+}
+```
+
+awman appends each agent's list to the command it launches, after the flags awman adds itself (mode, model, tools, system prompt) and before the initial prompt. With `--yolo`, the printed command for an interactive codex session looks like:
+
+```
+codex --no-daemon --dangerously-bypass-approvals-and-sandbox --config model_reasoning_effort=high "<prompt>"
+```
+
+The list applies to every launch of that agent, interactive and non-interactive (`codex exec`, `claude --print`). So pick flags both modes accept, or set them per run with `--agent-flag`. awman already runs interactive Codex with `--no-daemon`; don't add it here, because `codex exec` rejects it.
+
+- **One entry per argument.** A flag that takes a value is two entries (`["--config", "key=value"]`) or one entry in its `=` form (`["--config=key=value"]`). Entries are passed exactly as written; there is no shell parsing.
+- **Repo replaces global, per agent.** In the example, the repo's `"claude": []` turns off a global `claude` entry for this repo; agents the repo doesn't list keep their global entries.
+- **For one run, use `--agent-flag`.** `awman chat --agent-flag=--search` replaces the configured list for the agent that command launches. See [`--agent-flag`](03-agent-sessions.md#--agent-flag-arg).
+- **Workflows:** every step gets the entry for the agent that step runs, including steps a dynamic workflow's leader generates, and the leader itself. Runs in a worktree (`--worktree`, `--yolo`, `--auto`, `--dynamic`) read `agentFlags` from the repository you launched from, so an `agentFlags` edit you haven't committed still applies.
+- **Docker Sandboxes runtime:** only agents with an argv channel (`kind: agent` kits) receive the flags; for the others awman prints a warning and launches without them.
+
+`agentFlags` is edited in the config file; it is not settable via `config set`.
 
 ### Control credential injection (`auth` mode)
 
@@ -483,6 +519,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`) |
 | `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 | `authRefresh` | object | (unset) | Live credential-refresh settings for Claude — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
+| `agentFlags` | object (agent → string array) | (unset) | Extra arguments appended to that agent's command; each entry replaces the global entry for the same agent — see [Pass extra flags to an agent](#pass-extra-flags-to-an-agent) | no (edit file) |
 
 ### Global config fields (`$HOME/.awman/config.json`)
 
@@ -506,6 +543,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `squad` | object | (unset) | Global squad daemon settings; see [Squad daemon configuration](#squad-daemon-configuration) | no (edit file) |
 | `launchModeFallback` | `"stdio"` \| `"error"` | `"error"` | What to do when a requested ACP launch uses an agent without ACP support | no (edit file) |
 | `authRefresh` | object | (unset) | Machine-wide default live credential-refresh settings for Claude (unless a repo overrides a field) — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
+| `agentFlags` | object (agent → string array) | (unset) | Machine-wide extra arguments appended to that agent's command (unless a repo sets an entry for the same agent) — see [Pass extra flags to an agent](#pass-extra-flags-to-an-agent) | no (edit file) |
 
 ### `awman config` subcommands
 

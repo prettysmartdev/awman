@@ -159,7 +159,7 @@ pub(super) const REMOTE_EXEC_PROMPT_FLAGS: [FlagSpec; REMOTE_EXEC_PROMPT_TOTAL] 
 /// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
 /// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
 /// exclusive.
-pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
+pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -252,6 +252,18 @@ pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
         long: "overlay",
         short: None,
         help: "Mount a host directory into the agent container. Repeatable.",
+        kind: FlagKind::VecString,
+        default: FlagDefault::EmptyVec,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "agent-flag",
+        short: None,
+        help: "Extra argument appended to the agent command (e.g. --agent-flag=--verbose). \
+               Repeatable; replaces the agent's agentFlags config entry.",
         kind: FlagKind::VecString,
         default: FlagDefault::EmptyVec,
         frontends: FrontendVisibility::All,
@@ -373,7 +385,7 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 4] = [
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 15] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 16] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
     &EXEC_WORKFLOW_WORKTREE_FLAG,
@@ -430,7 +442,8 @@ pub(super) const EXEC_WORKFLOW_BASE: [FlagSpec; AGENT_RUN_FLAGS_NO_WORKTREE.len(
 /// The base agent-run flags that precede `--worktree` in `exec workflow`:
 /// `--non-interactive`, `--plan`, `--allow-docker`, `--launch-mode`.
 const AGENT_RUN_BEFORE_WORKTREE: &[FlagSpec] = EXEC_WORKFLOW_BASE.split_at(4).0;
-/// The rest of them: `--yolo`, `--auto`, `--agent`, `--model`, `--overlay`.
+/// The rest of them: `--yolo`, `--auto`, `--agent`, `--model`, `--overlay`,
+/// `--agent-flag`.
 const AGENT_RUN_AFTER_WORKTREE: &[FlagSpec] = EXEC_WORKFLOW_BASE.split_at(4).1;
 
 /// Concatenate flag arrays in order.

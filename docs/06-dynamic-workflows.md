@@ -341,6 +341,9 @@ All flag errors are surfaced before any container work begins.
 | `--work-item <N>` | Required with `--dynamic`; the work item number to pass to the leader |
 | `--leader <agent::model>` | Override the agent container and model used for the leader step |
 | `--model <NAME>` | Default model for the generated workflow's steps; also used as the leader model if `--leader` is not set |
+| `--agent-flag=<ARG>` | Extra argument for the selected agent (`--agent`, else config): the leader when it runs that agent, and generated steps that use the workflow's default agent. Other agents keep their configured [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) |
+
+The leader and every generated step also get their agent's configured `agentFlags`. These are read from the repository you launched from, not the worktree, so an `agentFlags` entry you haven't committed still reaches the leader.
 
 Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(workflow)`. Passing any of these explicitly has no effect (they are already active).
 

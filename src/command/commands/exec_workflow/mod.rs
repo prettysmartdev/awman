@@ -53,6 +53,9 @@ pub struct ExecWorkflowCommandFlags {
     pub model: Option<String>,
     pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
+    /// `--agent-flag` values for the workflow's default agent; `None` lets
+    /// config `agentFlags` apply.
+    pub agent_flags: Option<Vec<String>>,
     pub max_concurrent: Option<usize>,
     pub issue_source: crate::engine::issue::IssueSourceFlags,
     /// When true, a leader agent designs and runs a workflow for the work item.
@@ -359,6 +362,10 @@ impl ExecWorkflowCommand {
                 &ctx.path(),
             )?,
             overlay: ctx.flags.strs("overlay").to_vec(),
+            agent_flags: crate::command::dispatch::parse_agent_flags(
+                ctx.flags.strs("agent-flag"),
+                &ctx.path(),
+            )?,
             max_concurrent: ctx.flags.usize("max-concurrent"),
             issue_source: crate::engine::issue::IssueSourceFlags {
                 issue: ctx.flags.string("issue"),

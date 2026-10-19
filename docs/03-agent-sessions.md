@@ -190,6 +190,8 @@ This overrides the `agent` field in your repo config for this run only — no co
 
 If the agent image does not yet exist, awman offers to download the template and build both the project base image (if needed) and the agent image before launching.
 
+Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases otherwise try to start a background server that the container doesn't have, and exit with `daemon executable not found`. If an older Codex image rejects the flag, rebuild it with `awman ready --build --no-cache` (without `--no-cache`, Docker reuses the cached layer holding the old Codex). Non-interactive runs (`codex exec`) don't get the flag, because they reject it.
+
 Passing an unknown agent name exits immediately with a list of valid options:
 
 ```
@@ -277,6 +279,19 @@ awman exec workflow path/to/workflow.toml --overlay "env(GITHUB_TOKEN),ssh(),ski
 
 See [Overlays](08-overlays.md) for the full reference including config-based overlays, the `AWMAN_OVERLAYS` env var, and conflict resolution rules.
 See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for security considerations.
+
+### `--agent-flag <ARG>`
+
+Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`.
+
+Because the value usually starts with `-`, write it in the `--agent-flag=<value>` form:
+
+```sh
+awman chat --agent codex --agent-flag=--search
+awman exec prompt --agent-flag=--config --agent-flag=key=value "fix the build"
+```
+
+`--agent-flag` replaces the [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) config entry for the agent the command launches; it does not add to it. In `exec workflow` it applies to the workflow's default agent (the workflow's `agent` field, else `--agent`, else config); steps that name a different agent keep that agent's configured `agentFlags`. With `--dynamic`, it also reaches the leader when the leader's agent is the selected one (`--agent`, else config).
 
 ### `--allow-docker`
 
