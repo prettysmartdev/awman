@@ -140,8 +140,16 @@ pub fn is_retryable(err: &EngineError) -> bool {
 
 /// Network errors that describe a certificate or TLS identity problem are
 /// final: the peer will present the same certificate again.
+///
+/// Paths, URLs and quoted references are skipped: a random staging name
+/// such as `acq-P6TlSt` must not read as a TLS failure.
 fn is_final_network_failure(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
+    let lower = message
+        .split_whitespace()
+        .filter(|token| !token.contains(['/', '\\']) && !token.starts_with('\''))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
     [
         "certificate",
         "tls",
@@ -434,6 +442,13 @@ mod tests {
         )));
         assert!(!is_retryable(&EngineError::Network(
             "HTTP client setup failed: bad".into()
+        )));
+        // A needle inside a path or reference is not a TLS failure.
+        assert!(is_retryable(&EngineError::Network(
+            "Docker Engine at unix:///tmp/tls/docker.sock disconnected while exporting \
+             'tls-proxy:latest': transfer into /tmp/acq-P6TlSt/archive.tar failed after \
+             700 bytes: end of file before message length reached"
+                .into()
         )));
         assert!(!is_retryable(&EngineError::Auth("denied".into())));
         assert!(!is_retryable(&EngineError::Config("bad".into())));
