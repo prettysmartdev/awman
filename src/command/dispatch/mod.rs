@@ -2104,7 +2104,7 @@ mod tests {
     }
 
     /// `docker-sbx-experimental` is platform-gated in `SandboxRuntime::dsbx`
-    /// (linux and x86_64 macos both refuse with `BackendUnsupportedOnPlatform`
+    /// (linux refuses with `BackendUnsupportedOnPlatform`
     /// — see `engine::sandbox::runtime`'s own `dsbx_errors_on_*` tests, which
     /// use the same branch-on-`cfg!` pattern). `Engines::build`/`for_daemon`
     /// only assemble a sandbox-tier bundle on the platforms where the backend
@@ -2115,7 +2115,7 @@ mod tests {
         let session = session_at(root.path());
         let config = config_with_runtime(Some("docker-sbx-experimental"));
 
-        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        if cfg!(target_os = "linux") {
             match Engines::build(&config, &session) {
                 Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
                     assert_eq!(backend, "docker-sbx-experimental")

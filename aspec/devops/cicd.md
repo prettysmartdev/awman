@@ -19,7 +19,7 @@ runners don't have:
 | `builtin-build` | Linux ARM64 (`ubuntu-24.04-arm`, hosted) | Fetches and verifies the payload, builds the `builtin-runtime` feature, inspects dynamic dependencies, and runs `make test-builtin` — on a hosted runner with no KVM, so `builtin_hw_*` tests SKIP. A build/hermetic gate, not proof of guest execution. Runs on every push/PR (the only builtin job that does). |
 | `builtin-hardware` | self-hosted `macOS/ARM64/hypervisor` (the released platform; WI 0124 re-adds `linux/arm64/kvm` and `linux/x64/kvm`) | Opt-in real-guest matrix (`AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1`): checks hardware prerequisites first and **fails** (never skips) if they're missing, builds a disposable fixture image, then runs `make test-builtin` for real — same-executable worker boot, image import, execution. `make test-builtin` builds the guest drivers explicitly and ad-hoc signs awman and the drivers with the hypervisor entitlement (`tools/macos-sign-test-artifacts.sh`) between building and running. Only on `workflow_dispatch` or the nightly `schedule`. |
 | `native-typed-provider` | same self-hosted macOS runner | Clean-checkout gate: `tools/native-builtin-ci.sh <triple>` builds and boots the typed provider from a fresh isolated `CARGO_HOME`/target dir, then `tools/oci-runtime-spike/sqlite-resolution/checks.sh auto` reruns the SQLite resolution checks on that target. Uploads SQLite and native-payload evidence as artifacts. Only on `workflow_dispatch` or `schedule`. |
-| `existing-backend-unsupported-targets` | Windows x86_64 (hosted), Intel Mac (self-hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise refusal a `builtin-experimental` selection reports there (the runtime is released for Apple Silicon only). Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |
+| `existing-backend-unsupported-targets` | Windows x86_64 (hosted) | Builds the default backends with the `builtin-runtime` feature **disabled** and asserts the precise refusal a `builtin-experimental` selection reports there (the runtime is released for Apple Silicon only). Runs on `pull_request` too (no native prerequisite beyond the target toolchain). |
 
 Workspace builds select the root library, `awman-cli`, and `awman-host-shims`;
 only `awman-cli` has a binary target, named `awman`. Workspace tests include
@@ -58,7 +58,7 @@ or temporary files.
 Triggered on tag pushes matching `v[0-9]+.[0-9]+.[0-9]+`.
 
 - `build` builds the ordinary (non-builtin) release binary for each ordinary
-  target (Linux x86_64, Linux arm64, macOS x86_64, Windows x86_64) and records
+  target (Linux x86_64, Linux arm64, Windows x86_64) and records
   size/startup/RSS measurements and a dependency/`.msbver`/helper-extraction
   scan of the optimized artifact.
 - `release-macos-builtin` builds the Apple Silicon asset **with** the

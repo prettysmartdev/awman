@@ -103,8 +103,8 @@ mod tests {
 
     #[test]
     fn sandbox_runtime_capabilities_match_expected() {
-        // SandboxRuntime::dsbx() errors on Linux and Intel-Mac — those platforms
-        // verify the guard error instead.
+        // SandboxRuntime::dsbx() errors on Linux — that platform
+        // verifies the guard error instead.
         use crate::engine::sandbox::SandboxRuntime;
         match SandboxRuntime::dsbx() {
             Ok(rt) => {

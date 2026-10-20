@@ -14,7 +14,7 @@ awman is organized as a **four-layer architecture** to ensure clean separation b
 Language: Rust
 Frameworks: Ratatui
 Guidance:
-- The `awman` CLI should compile to a single, statically linked binary for macOS, Linux, and Windows.
+- The `awman` CLI should compile to a single, statically linked binary for macOS (Apple Silicon only; Intel Macs are not supported), Linux (x86_64 and arm64), and Windows (x86_64).
 - Every function of the CLI should be accessible either in "interactive" mode (i.e. running `awman` with no arguments launches a TUI to interact with its features) or "command" mode, where `awman` is run with one or more arguments, executes a single function, and then exits, printing its output to stdout and stderr.
 - Idiomatic, async Rust code
 - Small, easily understood modules and crates

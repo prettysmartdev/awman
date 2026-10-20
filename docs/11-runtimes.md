@@ -73,9 +73,9 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 | Host | Status |
 |---|---|
 | macOS on Apple Silicon | Supported (experimental). Needs the `awman-macos-arm64` release binary or a source build (see below). |
-| Linux (x86_64 or arm64), macOS on Intel, Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
+| Linux (x86_64 or arm64), Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
 
-The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux, Intel macOS and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
+The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
 ### Enabling it
 
@@ -391,7 +391,6 @@ This runtime is **experimental**. The `-experimental` suffix in the config strin
 |---|---|
 | macOS arm64 (Apple Silicon) | Supported |
 | Windows x86_64 | Supported |
-| macOS x86_64 (Intel) | Not supported — sbx requires Apple Silicon on macOS |
 | Linux x86_64 | Blocked — a confirmed virtiofs bug (docker/sbx-releases#51, open as of June 2026) prevents agents from creating files in the workspace. Configuring this runtime on Linux returns a clear error. |
 
 ### What Docker Sandboxes is
@@ -585,7 +584,7 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 
 ### Known limitations
 
-**Platform:** macOS arm64 and Windows x86_64 only. Linux is blocked until docker/sbx-releases#51 is fixed upstream. Intel Macs are not supported.
+**Platform:** macOS arm64 and Windows x86_64 only. Linux is blocked until docker/sbx-releases#51 is fixed upstream.
 
 **Networking:** all traffic goes through an HTTP/HTTPS proxy. Raw TCP, UDP, and ICMP are blocked. This means SSH-based git remotes, database connections, and other raw-socket protocols do not work inside the VM by default. Agents that need npm, pip, or curl to reach the internet will work; agents that need to SSH into a server will not.
 
@@ -624,7 +623,7 @@ awman: sbx ls failed — run 'sbx login' to authenticate Docker Sandboxes
 ```
 Run `sbx login` and re-run `awman ready`.
 
-**Linux or Intel Mac:**
+**Linux:**
 ```
 awman: docker-sbx-experimental is not supported on this platform
 ```

@@ -492,7 +492,7 @@ mod tests {
         };
         let res = detect(&cfg);
         // dsbx is only supported on macOS arm64 and Windows.
-        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        if cfg!(target_os = "linux") {
             match res {
                 Err(EngineError::BackendUnsupportedOnPlatform { .. }) => {}
                 Err(e) => panic!("expected BackendUnsupportedOnPlatform, got: {e:?}"),
@@ -715,9 +715,9 @@ mod tests {
         assert!(rt1.container_runtime().is_some());
         assert!(rt1.sandbox_runtime().is_none());
 
-        // Step 2: sbx → SandboxRuntime (or BackendUnsupportedOnPlatform on Linux/x86)
+        // Step 2: sbx → SandboxRuntime (or BackendUnsupportedOnPlatform on Linux)
         let rt2 = detect(&sbx_cfg);
-        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        if cfg!(target_os = "linux") {
             assert!(matches!(
                 rt2,
                 Err(EngineError::BackendUnsupportedOnPlatform { .. })

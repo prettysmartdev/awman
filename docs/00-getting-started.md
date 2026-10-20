@@ -85,7 +85,7 @@ That's it — you have an isolated agent working in your repo.
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
-Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
+Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-arm64`, `awman-windows-amd64.exe`. Intel Macs are not supported.
 
 The **experimental builtin microVM runtime** (macOS on Apple Silicon only in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set --global runtime builtin-experimental`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere. To build and import in one command instead, point the image source at a local store and enable the builder:
 

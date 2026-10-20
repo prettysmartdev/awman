@@ -48,7 +48,6 @@ To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.12.0`
 |----------|-------|
 | Linux (x86_64) | `awman-linux-amd64` |
 | Linux (ARM64) | `awman-linux-arm64` |
-| macOS (Intel) | `awman-macos-amd64` |
 | macOS (Apple Silicon) | `awman-macos-arm64` |
 | Windows (x86_64) | `awman-windows-amd64.exe` |
 
