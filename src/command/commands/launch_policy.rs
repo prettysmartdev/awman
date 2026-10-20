@@ -81,10 +81,7 @@ impl<'a> LaunchPolicy<'a> {
         if let Some(name) = flag.as_deref() {
             return AgentName::new(name).map_err(CommandError::from);
         }
-        if let Some(name) = self.session.default_agent() {
-            return Ok(name.clone());
-        }
-        AgentName::new("claude").map_err(CommandError::from)
+        Ok(self.session.configured_agent())
     }
 
     /// Apply the ACP support and fallback policy after normal agent resolution.
@@ -281,8 +278,9 @@ impl<'a> LaunchPolicy<'a> {
         Ok((overlays, prompt))
     }
 
-    /// Emit deprecation warnings for legacy `envPassthrough` config fields.
-    pub fn warn_legacy_config(&self, sink: &mut dyn UserMessageSink) {
+    /// Emit launch-time configuration warnings: deprecated `envPassthrough`
+    /// fields and `agentFlags` entries awman already manages.
+    pub fn warn_config(&self, sink: &mut dyn UserMessageSink) {
         let ec = self.session.effective_config();
         if ec.repo().legacy_env_passthrough.is_some() {
             sink.write_message(UserMessage {
@@ -295,6 +293,33 @@ impl<'a> LaunchPolicy<'a> {
                 level: MessageLevel::Warning,
                 text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
             });
+        }
+        self.warn_redundant_agent_flags(&ec, sink);
+    }
+
+    /// Warn once per agent and flag when `agentFlags` (or `--agent-flag`)
+    /// names a flag awman already passes on that agent's interactive
+    /// launches (codex `--no-daemon`). The engine drops the duplicate on
+    /// those launches; a non-interactive launch keeps it as configured, and
+    /// the agent may reject it there (`codex exec` refuses `--no-daemon`).
+    fn warn_redundant_agent_flags(&self, ec: &EffectiveConfig, sink: &mut dyn UserMessageSink) {
+        for agent in crate::engine::agent::agent_matrix::SUPPORTED_AGENTS {
+            let Ok(matrix) = matrix_for(agent) else {
+                continue;
+            };
+            let configured = ec.agent_flags(agent);
+            for flag in matrix.interactive_only_flags {
+                if configured.iter().any(|c| c == flag) {
+                    sink.write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "agentFlags for {agent} includes `{flag}`, which awman already passes \
+                             on interactive {agent} launches; it is not added twice there, and \
+                             non-interactive runs may reject it. Remove it from agentFlags."
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -389,7 +414,7 @@ mod launch_mode_tests {
 }
 
 #[cfg(test)]
-mod warn_legacy_config_tests {
+mod warn_config_tests {
     use super::*;
     use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
     use crate::data::message::{MessageLevel, RecordingMessageSink};
@@ -418,7 +443,7 @@ mod warn_legacy_config_tests {
         let session = open_session(git_tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_legacy_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&mut sink);
 
         let warnings: Vec<_> = sink
             .queued()
@@ -433,6 +458,39 @@ mod warn_legacy_config_tests {
         assert!(
             text.contains(".awman/config.json"),
             "warning must mention .awman/config.json to identify the source file; got: {text}"
+        );
+    }
+
+    /// An `agentFlags` entry awman already manages warns once, naming the
+    /// agent and the flag; an unrelated entry does not.
+    #[test]
+    fn an_agent_flag_awman_already_passes_triggers_one_warning() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let awman_dir = git_tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("config.json"),
+            r#"{"agentFlags": {"codex": ["--no-daemon", "--search"], "claude": ["--verbose"]}}"#,
+        )
+        .unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        let session = open_session(git_tmp.path(), env);
+
+        let mut sink = RecordingMessageSink::new();
+        LaunchPolicy::for_session(&session).warn_config(&mut sink);
+        let warnings: Vec<_> = sink
+            .queued()
+            .iter()
+            .filter(|m| m.level == MessageLevel::Warning)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].text.contains("codex"), "{}", warnings[0].text);
+        assert!(
+            warnings[0].text.contains("--no-daemon"),
+            "{}",
+            warnings[0].text
         );
     }
 
@@ -453,7 +511,7 @@ mod warn_legacy_config_tests {
         let session = open_session(git_tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_legacy_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&mut sink);
 
         let warnings: Vec<_> = sink
             .queued()
@@ -478,7 +536,7 @@ mod warn_legacy_config_tests {
         let session = open_session(tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_legacy_config(&mut sink);
+        LaunchPolicy::for_session(&session).warn_config(&mut sink);
 
         assert!(
             sink.queued().is_empty(),

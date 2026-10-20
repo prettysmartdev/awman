@@ -166,9 +166,24 @@ impl AgentImagePreparer {
         data_home: PathBuf,
         context: ImageBuildContext,
     ) -> Self {
+        Self::with_inputs(
+            ImageSources::from_resolved(&resolved),
+            resolved.builder_enabled,
+            runtime,
+            data_home,
+            context,
+        )
+    }
+    fn with_inputs(
+        image_sources: ImageSources,
+        builder_enabled: bool,
+        runtime: Arc<dyn AgentRuntimeEngine>,
+        data_home: PathBuf,
+        context: ImageBuildContext,
+    ) -> Self {
         Self {
-            image_sources: ImageSources::from_resolved(&resolved),
-            builder_enabled: resolved.builder_enabled,
+            image_sources,
+            builder_enabled,
             image_importer: Arc::new(bridge::RuntimeImageImporter(runtime.clone())),
             runtime,
             context,
@@ -183,6 +198,17 @@ impl AgentImagePreparer {
             warned_tags: HashSet::new(),
             cancel: crate::engine::oci::CancelToken::new(),
         }
+    }
+    /// A preparer for a runtime that builds its own images (Docker, Apple
+    /// Containers). It owns only the Dockerfile-path rule and the build
+    /// bookkeeping; it has no image sources and no builder, because builtin
+    /// configuration does not apply to that runtime and is never read.
+    pub fn for_building_runtime(
+        runtime: Arc<dyn AgentRuntimeEngine>,
+        data_home: PathBuf,
+        context: ImageBuildContext,
+    ) -> Self {
+        Self::with_inputs(ImageSources::default(), false, runtime, data_home, context)
     }
     #[cfg(test)]
     pub(crate) fn replace_sources(&mut self, sources: ImageSources) {
@@ -242,6 +268,10 @@ impl AgentImagePreparer {
                     .get(tag)
                     .or(self.image_sources.default.as_ref())
                     .map(|spec| (spec.kind(), spec.reference_or(tag)));
+                // The same acquisition env the backend pulls with
+                // (`BuiltinBackend` import, `Env::for_image_acquisition`): source
+                // resolution and the pull must see one Docker endpoint, proxy and
+                // credential set, so neither reads the session snapshot alone.
                 let env = Env::for_image_acquisition(&self.image_sources.registries);
                 let resolved = ImageSourceResolver::new(&self.image_sources, &env)
                     .with_builder_enabled(self.builder_enabled)
@@ -317,13 +347,20 @@ impl AgentImagePreparer {
         }
     }
 
+    /// Whether a source is configured for the default agent image (the
+    /// `builtin.images` entry, else `builtin.imageSource`).
+    pub(crate) fn default_image_has_source(&self) -> bool {
+        let tag = crate::data::image_tags::agent_image_tag(
+            &self.context.git_root,
+            &self.context.default_agent,
+        );
+        self.image_sources.default.is_some() || self.image_sources.images.contains_key(&tag)
+    }
     pub(crate) fn can_rebuild_default(&mut self) -> bool {
         let agent = self.context.default_agent.clone();
         let tag = crate::data::image_tags::agent_image_tag(&self.context.git_root, &agent);
         let plan = self.plan(&tag, &agent);
-        let configured =
-            self.image_sources.default.is_some() || self.image_sources.images.contains_key(&tag);
-        configured && !matches!(plan.selection, BuilderSelection::Disabled)
+        self.default_image_has_source() && !matches!(plan.selection, BuilderSelection::Disabled)
     }
 
     /// Check all outputs before the first write, using the same cached plans

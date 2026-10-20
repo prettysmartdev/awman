@@ -27,12 +27,14 @@ impl AgentImagePreparer {
             // Enabled builders must not run an older installation after a
             // failed import or a source change. Hold the source/reference
             // lease until the runtime verifies its installed provenance.
-            if self.builder_enabled && self.runtime.image_exists(&tag)? {
+            if !matches!(plan.selection, BuilderSelection::Disabled)
+                && self.runtime.image_exists(&tag)?
+            {
                 if plan.error.is_some() || plan.pinned_default.is_some() {
                     return Err(EngineError::BuiltinImageNeedsPreparation { image: tag });
                 }
                 if let Some(source) = &plan.source {
-                    let pending = self.pending_import(source, &tag).await?;
+                    let pending = self.pending_import(source, &tag, frontend).await?;
                     let check = ImageImportRequest {
                         tag: tag.clone(),
                         source: source.source.clone(),
@@ -218,7 +220,7 @@ impl AgentImagePreparer {
                 // refresh flags, even if an earlier build left a receipt.
                 None
             } else {
-                match self.pending_import(&frozen, &tag).await {
+                match self.pending_import(&frozen, &tag, frontend).await {
                     Ok(prepared) => Some(prepared),
                     Err(error) => {
                         let text = error.to_string();
@@ -245,7 +247,10 @@ impl AgentImagePreparer {
             .as_ref()
             .is_some_and(|p| p.pending_key.is_some());
 
-        if policy == BuildPolicy::ImportOnly {
+        // Preflight and squad prepare every step agent on every run; an image
+        // already installed is verified against its source (normally a cache
+        // hit), which is not worth a line each time.
+        if policy == BuildPolicy::ImportOnly && !self.runtime.image_exists(&tag).unwrap_or(false) {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
                 text: format!(
@@ -373,13 +378,14 @@ impl AgentImagePreparer {
         &self,
         source: &ResolvedImageSource,
         tag: &str,
+        frontend: &mut (impl ImagePreparationSink + ?Sized),
     ) -> Result<BuildPreparation, EngineError> {
         let Some(store) = &source.store_key else {
             return Ok(BuildPreparation::import_only(StepStatus::Skipped, None));
         };
         let reference = AgentImagePreparer::normalize_build_reference(&source.reference);
         let lease = self
-            .build_lock(store.clone(), reference.clone())
+            .build_lock(store.clone(), reference.clone(), frontend)
             .await
             .map_err(EngineError::Other)?;
         let key = PendingBuildKey {

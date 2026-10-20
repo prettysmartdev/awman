@@ -1444,10 +1444,10 @@ mod tests {
         use crate::data::config::image_source::{
             ImageSourceKind, ImageSourceSpec, RegistryAuthSource, RegistryHostConfig,
         };
+        use crate::data::fs::hash::sha256_hex;
         use crate::data::oci_identity::OciPlatform;
         use crate::engine::error::EngineError;
         use crate::engine::oci::archive::tests::{arm64, config_json, gzip, layer_tar, limits, L};
-        use crate::engine::oci::verify::sha256_hex;
         use crate::engine::oci::verify::tests::FixedDisk;
         use crate::engine::oci::{
             AcquirePolicy, AcquireRequest, ArchiveFormat, CachingAcquirer, ImageAcquirer,

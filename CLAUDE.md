@@ -33,7 +33,7 @@ make test     # run all tests
 
 ## Architecture Constraints
 
-- Single statically-linked binary for macOS, Linux, Windows
+- Single statically-linked binary for macOS (Apple Silicon only), Linux, Windows
 - Two execution modes: interactive (TUI via Ratatui) and command (single invocation, stdout/stderr output)
 - Interacts only with the active Git repo and the local Docker daemon
 - Prefer simplicity over cleverness — readable by an intermediate Rust developer

@@ -73,9 +73,9 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 | Host | Status |
 |---|---|
 | macOS on Apple Silicon | Supported (experimental). Needs the `awman-macos-arm64` release binary or a source build (see below). |
-| Linux (x86_64 or arm64), macOS on Intel, Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
+| Linux (x86_64 or arm64), Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
 
-The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux, Intel macOS and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
+The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
 ### Enabling it
 
@@ -233,15 +233,15 @@ With `{ "type": "apple-local" }`, `awman ready` asks the Apple Containers servic
 
 ### What `awman ready` does under `builtin-experimental`
 
-- The base project image is reported as **skipped** (it is only an input to your external build). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
+- With the builder disabled, the base project image is reported as **skipped** (it is only an input to your external build). With the builder enabled and a compatible local source, it is built in that source store first (see [Building from a local image source](#building-from-a-local-image-source)). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
 - One rule decides whether an image is acquired, for every command that prepares images: it is re-acquired when the configured source differs from the one the installed image came from, or when a successful build is waiting to be imported; otherwise the installed or cached copy is reused. `awman ready` and API session setup may also build (when `builtin.builder.enabled` is true and the image's source is a compatible local one) and API session setup builds only when the image is missing; workflow preflight and squad are import-only and never start a build. The `Dockerfile` path used for builds and hints is the repo's configured one.
 - With the builtin builder enabled, chat and prompt launches check the installed image's recorded source and any pending build receipt without contacting a source or builder. If the source differs or the installed content does not match the pending build, run `awman ready` before launching. An older installation without recorded source details also needs one `ready` run to establish them.
 - With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
-- With the builder disabled (the default), `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged. With the builder enabled, `--build` schedules the usual builds and `--no-cache` applies to any build that runs.
+- With the builder disabled (the default), `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged. With the builder enabled, `--build` schedules the usual builds, and `--no-cache` applies to any build that runs and still re-acquires the image from its source.
 - `awman ready --build` also imports the image of **every other agent** that has a `.awman/Dockerfile.<agent>` (one **Import agent image: \<agent\>** row each), so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` imports only the default agent and lists any other agents whose images are missing.
-- Other agents use their own `builtin.images` entry when there is one, otherwise `builtin.imageSource`. A `builtin.imageSource` that names a single image — an `archive`, or any source with an explicit `reference` — holds only one agent's image, so for other agents `ready` skips it with a warning instead of importing the wrong image. Give each of those agents its own `builtin.images` entry (for example one archive per agent).
+- Other agents use their own `builtin.images` entry when there is one, otherwise `builtin.imageSource`. A `builtin.imageSource` that names a single image — an `archive`, or any source with an explicit `reference` — holds only one agent's image, so for other agents `ready` skips it with a warning instead of importing the wrong image. Give each of those agents its own `builtin.images` entry (for example one archive per agent). Workflow preflight and squad apply the same rule: a step running another agent fails with that warning's text rather than importing the default agent's image under its tag.
 - When the summary reports agent images that are still missing, its closing hint says what to do for each one: `run "ready --build" to import <agents>.` (or `build <agents>` / `build and import <agents>`, depending on what each image's source allows), and ``configure an image source for <agents> (`builtin.imageSource` or a `builtin.images` entry), then run "ready --build".`` for an agent with no usable source. A digest-pinned local reference or colliding build output instead asks you to configure a writable, distinct reference in `builtin.images` before running `ready --build`. A failed image gets its own hint, for example `fix the <agent> image build, then run "awman ready --build" again.` or `the <agent> image was built but not imported; run "awman ready" again to retry the import.`
-- If a Dockerfile changed after you built, `ready` warns you to rebuild and re-run `awman ready --build`.
+- If the `--refresh` audit changes `Dockerfile.dev` and this session cannot rebuild the default image, `ready` warns: ``Dockerfile changed: rebuild the image in its source store (or enable `builtin.builder.enabled` with a `docker-local` or `apple-local` source), then run `awman ready --build` to re-import it``, or, with no source configured, to rebuild it externally and configure `builtin.imageSource`.
 - Older acquisition-cache references without per-source metadata must be acquired again once. Installed images remain runnable without their source.
 - A transient failure while importing (a dropped connection, a stalled transfer, a 5xx from the registry or daemon) is retried automatically, up to a bounded number of attempts and an overall time limit. Errors that won't be fixed by retrying — bad credentials, a digest or platform mismatch, a rejected archive, an unsupported or blocked source — are reported immediately instead. Ctrl-C cancels acquisition and waits for cleanup. If the final runtime import has already begun, cancellation waits for that commit and may leave a complete cached image. Local filesystem or keychain calls may delay the response.
 - Workflow setup/teardown steps use the imported agent image of the repo's configured agent (default `claude`) unless the workflow or config sets an explicit `baseImage`, which must already be imported. Workflow preflight imports images but never starts a host build, and it re-acquires an image that is installed from a different source than the one now configured. Prepare images with `awman ready` before starting the workflow.
@@ -252,9 +252,9 @@ Set `builtin.builder.enabled` to `true` to let `awman ready` build and then impo
 
 Plain `awman ready` inspects a compatible local source store when normal readiness rules need to know whether an image exists. If no build is needed, an installed image that matches that source is reused without exporting it again. If the builder cannot be reached but that image is already installed and no build is pending, ready warns and continues with the installed image. A successful build forces a fresh import from the same store and reference, even if the acquisition cache contains an older image.
 
-The project base image is built before dependent agent images in the same source store. Build and import have separate result rows; readiness requires both stages for each required image. A build can succeed while import fails, in which case `awman ready` reports failure and can retry the import on a later run. `--no-cache` affects builds when a build is scheduled; by itself it does not schedule one. Use `--build` to request the usual forced builds.
+The project base image is built before dependent agent images in the same source store. Build and import have separate result rows; readiness requires both stages for each required image. A project image built only for a non-default agent's store is optional like that agent's image: if it fails, the row shows the failure, but `ready` still succeeds once every required image is ready. A build can succeed while import fails, in which case `awman ready` reports failure and can retry the import on a later run. `--no-cache` affects builds when a build is scheduled; by itself it does not schedule one, but it does re-acquire the image from its source. Use `--build` to request the usual forced builds.
 
-If a required image stage fails or remains unfinished, `awman ready` reports `awman is not ready.` and exits with status 1, whether or not the builder is enabled. Pending build receipts are stored under the awman data home at `pending-builds/`; per-image build locks are under `locks/image-build/`. Source builds disable BuildKit provenance and SBOM attestations so the exported result has a verifiable single-platform image. Docker `npipe://` endpoints are unsupported for builtin image acquisition or building. A configured source is checked again when an image must be acquired; a cached builtin image is reused only when its identity matches the inspected source.
+If a required image stage fails or remains unfinished, `awman ready` reports `awman is not ready.` and exits with status 1, whether or not the builder is enabled. Pending build receipts are stored under the awman data home at `pending-builds/`; per-image build locks are under `locks/image-build/`. Two awman processes preparing the same store and reference take turns; the one that waits (a `chat` launch during a running `awman ready --build`, for example) prints `Waiting for another awman process to finish with <reference> in <store>…`. Source builds disable BuildKit provenance and SBOM attestations so the exported result has a verifiable single-platform image. Docker `npipe://` endpoints are unsupported for builtin image acquisition or building. A configured source is checked again when an image must be acquired; a cached builtin image is reused only when its identity matches the inspected source.
 
 Docker builds require a local Docker CLI and daemon. If Docker Buildx is installed, its `default` builder must use the `docker` driver; other drivers fail with an actionable error. Apple builds require the Apple Containers CLI/service. The source store is used for building and importing, while agent sessions continue to run only in the builtin microVM.
 
@@ -352,8 +352,12 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 | `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
 | `the builtin runtime refuses to start while <variable> is set …` | An environment override would replace the builtin runtime. Unset the variable named in the error and retry. |
 | `no image source is configured for '<tag>'` | Set `builtin.imageSource` or `builtin.images` (see [Getting an agent image](#getting-an-agent-image)). The message explains why, depending on whether the builder is off, on without a source, or on with a source it cannot build into. |
-| `builtin image <image> is not imported; run `awman ready` to import it`, or `image '<tag>' is not in the builtin image cache (…); run `awman ready` to import it` | Run `awman ready`. |
-| `a builtin sandbox for agent '<name>' already exists; stop or remove it (`awman clean`) or choose another name` | A session with that name is still present; stop it, run `awman clean`, or pick another name. |
+| ``builtin image <image> is not imported; run `awman ready` to import it``, or ``image '<tag>' is not in the builtin image cache (…); run `awman ready` to import it`` | Run `awman ready`. |
+| ``a builtin sandbox for agent '<name>' already exists; stop or remove it (`awman clean`) or choose another name`` | A session with that name is still present; stop it, run `awman clean`, or pick another name. |
+| `the <builder> image builder is unavailable: <detail>` | `builtin.builder.enabled` selected Docker or Apple Containers for this image's source, but it cannot be used (CLI missing, daemon or service stopped). Start it, or disable the builder to import only. This is a build failure; awman does not fall back to an older image. |
+| ``the Docker builder `default` for <endpoint> uses the `<driver>` driver, which does not store images in that Engine …`` | Switch the endpoint's buildx `default` builder to the `docker` driver (`docker buildx use default`), or uninstall buildx to use the legacy builder. |
+| ``<tag>: the build succeeded but the import failed; run `awman ready` again to retry the import`` | The image built, but importing it into the builtin runtime failed (see the import row for why). Fix that and run `awman ready`; it imports the build without rebuilding. |
+| `<tag>: <builder> is unreachable; using the installed image (…)` | The source store could not be inspected, so the installed image was kept. Start the builder to check for and build changes. |
 | `image '<ref>' was not found in the Docker Engine at <endpoint>` | Build it first, or fix `reference`. |
 | `apple-local image source is not supported: Apple Containers <version> … is not a release awman has verified` | Install a supported Apple Containers release (see [Apple Containers store](#apple-containers-store)), or use another source. |
 | `apple-local image source is blocked: the Apple Containers service is not running …` | Run `container system start`, then `awman ready`. |
@@ -387,7 +391,6 @@ This runtime is **experimental**. The `-experimental` suffix in the config strin
 |---|---|
 | macOS arm64 (Apple Silicon) | Supported |
 | Windows x86_64 | Supported |
-| macOS x86_64 (Intel) | Not supported — sbx requires Apple Silicon on macOS |
 | Linux x86_64 | Blocked — a confirmed virtiofs bug (docker/sbx-releases#51, open as of June 2026) prevents agents from creating files in the workspace. Configuring this runtime on Linux returns a clear error. |
 
 ### What Docker Sandboxes is
@@ -581,7 +584,7 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 
 ### Known limitations
 
-**Platform:** macOS arm64 and Windows x86_64 only. Linux is blocked until docker/sbx-releases#51 is fixed upstream. Intel Macs are not supported.
+**Platform:** macOS arm64 and Windows x86_64 only. Linux is blocked until docker/sbx-releases#51 is fixed upstream.
 
 **Networking:** all traffic goes through an HTTP/HTTPS proxy. Raw TCP, UDP, and ICMP are blocked. This means SSH-based git remotes, database connections, and other raw-socket protocols do not work inside the VM by default. Agents that need npm, pip, or curl to reach the internet will work; agents that need to SSH into a server will not.
 
@@ -620,7 +623,7 @@ awman: sbx ls failed — run 'sbx login' to authenticate Docker Sandboxes
 ```
 Run `sbx login` and re-run `awman ready`.
 
-**Linux or Intel Mac:**
+**Linux:**
 ```
 awman: docker-sbx-experimental is not supported on this platform
 ```

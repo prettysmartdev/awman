@@ -25,6 +25,7 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
     kit_declarative: true,
     has_image_store: false,
     image_acquisition: crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+    per_launch_vm_settings: false,
 };
 
 pub struct SandboxRuntime {
@@ -55,23 +56,14 @@ impl SandboxRuntime {
 
     /// Construct with the Docker Sandbox (`sbx`) backend.
     ///
-    /// Platform guards: Docker Sandboxes are not available on Linux, and not
-    /// on Intel Macs. Erroring here (rather than from the first backend
-    /// call) gives the user an actionable platform message up front.
+    /// Platform guard: Docker Sandboxes are not available on Linux. Erroring
+    /// here (rather than from the first backend call) gives the user an actionable platform message up front.
     pub fn dsbx() -> Result<Self, EngineError> {
         if cfg!(target_os = "linux") {
             return Err(EngineError::BackendUnsupportedOnPlatform {
                 backend: "docker-sbx-experimental".into(),
                 platform: "linux — blocked until the Docker Sandboxes virtiofs \
                            file-creation bug (sbx-releases Issue #51) is fixed upstream"
-                    .into(),
-            });
-        }
-        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            return Err(EngineError::BackendUnsupportedOnPlatform {
-                backend: "docker-sbx-experimental".into(),
-                platform: "macos (x86_64) — Docker Sandboxes requires Apple Silicon \
-                           (arm64). Intel Macs are not supported"
                     .into(),
             });
         }
@@ -598,33 +590,6 @@ mod tests {
                 }
                 Err(e) => panic!("expected BackendUnsupportedOnPlatform on linux, got: {e:?}"),
                 Ok(_) => panic!("dsbx() must fail on linux"),
-            }
-        }
-    }
-
-    #[test]
-    fn dsbx_errors_on_x86_64_macos() {
-        if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            match SandboxRuntime::dsbx() {
-                Err(EngineError::BackendUnsupportedOnPlatform { backend, platform }) => {
-                    assert_eq!(backend, "docker-sbx-experimental");
-                    assert!(
-                        platform.contains("macos"),
-                        "platform should mention macos, got: {platform}"
-                    );
-                    assert!(
-                        platform.contains("x86_64"),
-                        "platform should mention x86_64, got: {platform}"
-                    );
-                    assert!(
-                        platform.contains("Apple Silicon"),
-                        "platform should explain the arm64 requirement, got: {platform}"
-                    );
-                }
-                Err(e) => {
-                    panic!("expected BackendUnsupportedOnPlatform on x86_64 macos, got: {e:?}")
-                }
-                Ok(_) => panic!("dsbx() must fail on x86_64 macos"),
             }
         }
     }

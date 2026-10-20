@@ -40,6 +40,7 @@ impl AgentRuntimeEngine for ImportRuntime {
             kit_declarative: false,
             has_image_store: true,
             image_acquisition: crate::engine::agent_runtime::ImageAcquisition::Import,
+            per_launch_vm_settings: true,
         };
         &CAPS
     }
@@ -409,6 +410,15 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                 }
             }
 
+            // The non-interactive subcommand or flag appears exactly once.
+            if let Some(flag) = matrix.non_interactive_flag {
+                let count = argv.iter().filter(|a| a.as_str() == flag).count();
+                assert_eq!(
+                    count,
+                    usize::from(non_interactive),
+                    "{context}: `{flag}` in {argv:?}"
+                );
+            }
             // The seeded initial prompt.
             assert_eq!(argv[0], matrix.interactive_entrypoint[0], "{context}");
             if non_interactive {
@@ -485,6 +495,24 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
                 },
             ),
         ];
+        // User `agentFlags` (WI 0127) land at the same place on every runtime:
+        // after awman's own flags, before a seeded prompt. ACP keeps them too.
+        table.push((
+            "agent-flags+prompt",
+            AgentRunOptions {
+                agent_flags: Some(vec!["--user-a".into(), "value with spaces".into()]),
+                initial_prompt: Some("seeded-prompt-mark".into()),
+                model: model.clone(),
+                ..world.run_options(false)
+            },
+        ));
+        table.push((
+            "agent-flags+non-interactive",
+            AgentRunOptions {
+                agent_flags: Some(vec!["--user-b".into()]),
+                ..world.run_options(true)
+            },
+        ));
         if matrix.plan_flag.is_some() {
             table.push((
                 "plan",
@@ -583,6 +611,23 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
                 let plan = builtin.unwrap_or_else(|e| panic!("{context}: builtin: {e}"));
                 let after_image = &docker[docker.iter().position(|a| *a == image.0).unwrap() + 1..];
                 assert_eq!(after_image, plan.command.argv.as_slice(), "{context}");
+                if let Some(flags) = run.agent_flags.as_ref() {
+                    let argv = &plan.command.argv;
+                    let at = argv
+                        .windows(flags.len())
+                        .position(|w| w == flags.as_slice())
+                        .unwrap_or_else(|| panic!("{context}: agentFlags missing from {argv:?}"));
+                    if run.initial_prompt.is_some()
+                        && !run.non_interactive
+                        && !matches!(run.launch_mode, LaunchMode::Acp)
+                    {
+                        let prompt = argv
+                            .iter()
+                            .rposition(|a| a.contains("seeded-prompt-mark"))
+                            .unwrap_or_else(|| panic!("{context}: no prompt in {argv:?}"));
+                        assert!(at < prompt, "{context}: agentFlags must precede the prompt");
+                    }
+                }
             }
             checked += 1;
         }

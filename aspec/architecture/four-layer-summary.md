@@ -68,8 +68,11 @@
 - Builtin settings scope: one process-wide runtime (state dir, embedded
   runtime, ambient `MSB_*` override check); per-launch settings (network,
   vCPUs, memory) are resolved from each `Session`'s `EffectiveConfig` and
-  carried in `ResolvedContainerOptions`. A repo `builtin.stateDir` that differs
-  from the process's is rejected at launch.
+  carried in `ResolvedContainerOptions` for a runtime with
+  `Capabilities::per_launch_vm_settings`. A repo `builtin.stateDir` that differs
+  from the process's is rejected at launch. Detection resolves only the
+  process-wide part. A worktree session keeps the invoker's `builtin` block,
+  default agent, env and global config (`Session::open_worktree_for`).
 - `AgentImagePreparer` (builtin image preparation) — resolves an image's
   source once and, when `builtin.builder.enabled` and the source is a local
   Docker (Unix socket) or Apple store, may run a source-matched build before
@@ -77,9 +80,10 @@
   through `LocalImageBuilder` (build-time operations only; agent execution
   never leaves the builtin runtime). `BuildPolicy` decides which commands may
   build: `Ready`, `SessionSetup`, `ImportOnly`, `CheckOnly`.
-- Agent-execution release contract: a runtime MUST drop the frontend no later
-  than when `AgentExecution::wait()` resolves, when the `wait()` future is
-  dropped, or when the execution is dropped.
+- Agent-execution release contract: a runtime MUST drop the frontend (and the
+  I/O sinks it handed out) no later than when `AgentExecution::wait()`
+  resolves, when the `wait()` future is dropped, or when the execution is
+  dropped. `agent_runtime::conformance` checks every runtime against it.
 - WorkflowEngine (multi-step DAG execution)
 - GitEngine (repos, worktrees, merges; owns diff summaries)
 - OverlayEngine (container mounts, env vars)
@@ -217,6 +221,13 @@ hand out clones; the runtime drops its clone by the engine release contract.
 process**  
 → Resolve them per launch from the session's `EffectiveConfig`.
 
+❌ **Opening a session with an empty env snapshot in production**  
+→ Pass the process's `EnvSnapshot` (a `SessionManager` carries it); an empty
+snapshot silently ignores a relocated `AWMAN_CONFIG_HOME`.
+
+❌ **Matching on a runtime's name (`runtime_name() == "builtin"`)**  
+→ Branch on `capabilities()`.
+
 ❌ **Frontends have different commands**  
 → All commands come from `CommandCatalogue` (Layer 2)
 
@@ -295,4 +306,4 @@ All three frontends now support `foo` identically — because the logic is in La
 
 ---
 
-**Last Updated**: October 1, 2026
+**Last Updated**: October 19, 2026

@@ -783,7 +783,10 @@ impl Command for ConfigCommand {
                                 crate::data::session::Session::open_at_git_root(
                                     wd,
                                     gr,
-                                    crate::data::session::SessionOpenOptions::default(),
+                                    crate::data::session::SessionOpenOptions {
+                                        env: Some(session.env().clone()),
+                                        ..Default::default()
+                                    },
                                 )
                                 .map_err(CommandError::from)?
                             };

@@ -50,6 +50,27 @@ impl BuildRequest {
             no_cache,
         }
     }
+
+    /// The Docker and Apple runtimes build only ordinary runtime requests:
+    /// their CLI defaults decide the endpoint and platform. A source-bound
+    /// target or build arguments would be silently lost there, so they are
+    /// refused instead; source-bound builds go through
+    /// `HostLocalImageBuilder`.
+    pub fn require_runtime_build(&self) -> Result<(), crate::engine::error::EngineError> {
+        if self.target != BuildTarget::Runtime {
+            return Err(crate::engine::error::EngineError::Config(format!(
+                "a runtime image build cannot target {}; source-bound builds go through the \
+                 builtin runtime's image builder",
+                self.target.describe()
+            )));
+        }
+        if !self.build_args.is_empty() {
+            return Err(crate::engine::error::EngineError::Config(
+                "a runtime image build does not take build arguments".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -68,5 +89,19 @@ mod tests {
         assert_eq!(request.context, Path::new("/context"));
         assert!(request.no_cache);
         assert!(request.build_args.is_empty());
+    }
+
+    #[test]
+    fn runtime_backends_refuse_what_they_cannot_honour() {
+        let runtime = BuildRequest::runtime("i:t", Path::new("/D"), Path::new("/c"), false);
+        assert!(runtime.require_runtime_build().is_ok());
+        let mut bound = runtime.clone();
+        bound.target = BuildTarget::Docker {
+            endpoint: "unix:///d.sock".into(),
+        };
+        assert!(bound.require_runtime_build().is_err());
+        let mut with_args = runtime;
+        with_args.build_args.push(("A".into(), "1".into()));
+        assert!(with_args.require_runtime_build().is_err());
     }
 }

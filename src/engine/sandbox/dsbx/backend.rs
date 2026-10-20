@@ -710,92 +710,69 @@ impl ExecutionBackend for DSbxExecution {
     }
 }
 
+/// dsbx for the cross-runtime frontend-release check
+/// (`agent_runtime::conformance`).
+#[cfg(all(test, unix))]
+pub(crate) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
+    tests::conformance_launcher()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
 
-    struct DropProbeFrontend(Arc<AtomicBool>);
-
-    impl Drop for DropProbeFrontend {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    impl crate::data::message::UserMessageSink for DropProbeFrontend {
-        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    #[async_trait::async_trait]
-    impl AgentFrontend for DropProbeFrontend {
-        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
-        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
-        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-            unreachable!()
-        }
-    }
-
+    /// dsbx over a plain child process (its `sbx run` stands in): a prompt
+    /// agent exits at once; a long-running one is killed on `finish`.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn dsbx_releases_frontend_on_normal_and_dropped_wait() {
-        for drop_wait in [false, true] {
-            let child = std::process::Command::new("sleep")
-                .arg(if drop_wait { "30" } else { "0.01" })
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            let released = Arc::new(AtomicBool::new(false));
-            let backend = DSbxExecution {
-                child: Some(child),
-                pty_child: None,
-                pty_master: None,
-                stdin_injector: None,
-                sandbox_name: format!("awman-dsbx-release-test-{pid}"),
-                started_at: Utc::now(),
-                output: Arc::new(std::sync::Mutex::new(io_bridge::OutputCapture::default())),
-                sink: Some(Box::new(DropProbeFrontend(released.clone()))),
-                wait_sink: None,
-            };
-            let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
-            let mut execution = AgentExecution::new(
-                AgentHandle {
-                    id: pid.to_string(),
-                    name: format!("awman-dsbx-release-test-{pid}"),
-                    image_tag: "test".into(),
-                    started_at: Utc::now(),
-                },
-                Box::new(backend),
-                Arc::new(stuck_tx),
-                None,
-            );
-            if drop_wait {
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(20), execution.wait())
-                        .await
-                        .is_err()
-                );
-                assert!(
-                    released.load(Ordering::SeqCst),
-                    "frontend was not released when wait was dropped"
-                );
-                let status = std::process::Command::new("sh")
-                    .args(["-c", &format!("kill -9 {pid}")])
-                    .status()
+    pub(super) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
+        let running: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finishing = running.clone();
+        crate::engine::agent_runtime::conformance::Launcher {
+            name: "dsbx",
+            launch: Box::new(move |frontend, long| {
+                let child = std::process::Command::new("sleep")
+                    .arg(if long { "30" } else { "0.01" })
+                    .spawn()
                     .unwrap();
-                assert!(status.success());
-            } else {
-                execution.wait().await.unwrap();
-            }
-            assert!(
-                released.load(Ordering::SeqCst),
-                "frontend retained after wait future ended"
-            );
+                let pid = child.id();
+                if long {
+                    running.lock().unwrap().push(pid);
+                }
+                let backend = DSbxExecution {
+                    child: Some(child),
+                    pty_child: None,
+                    pty_master: None,
+                    stdin_injector: None,
+                    sandbox_name: format!("awman-dsbx-conformance-{pid}"),
+                    started_at: Utc::now(),
+                    output: Arc::new(std::sync::Mutex::new(io_bridge::OutputCapture::default())),
+                    sink: Some(frontend),
+                    wait_sink: None,
+                };
+                let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
+                AgentExecution::new(
+                    AgentHandle {
+                        id: pid.to_string(),
+                        name: format!("awman-dsbx-conformance-{pid}"),
+                        image_tag: "test".into(),
+                        started_at: Utc::now(),
+                    },
+                    Box::new(backend),
+                    Arc::new(stuck_tx),
+                    None,
+                )
+            }),
+            finish: Box::new(move || {
+                for pid in finishing.lock().unwrap().drain(..) {
+                    let _ = std::process::Command::new("sh")
+                        .args(["-c", &format!("kill -9 {pid}")])
+                        .status();
+                }
+            }),
         }
     }
+
     use crate::engine::sandbox::naming::worktree_hash;
     use crate::engine::sandbox::options::SandboxOption;
 

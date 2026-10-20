@@ -103,7 +103,10 @@ pub enum EngineError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
-    #[error("container runtime '{binary}' not found on PATH; install Docker and retry")]
+    #[error(
+        "container runtime '{binary}' not found on PATH; {}",
+        container_runtime_install_hint(binary)
+    )]
     ContainerRuntimeUnavailable { binary: String },
 
     #[error("failed to download Dockerfile for agent '{agent}': {message}")]
@@ -454,6 +457,20 @@ impl std::fmt::Display for ToolRestriction {
     }
 }
 
+/// What to install when a container CLI is missing: the runtime that binary
+/// belongs to, not always Docker.
+fn container_runtime_install_hint(binary: &str) -> &'static str {
+    let name = std::path::Path::new(binary)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(binary);
+    match name {
+        "container" => "install Apple Containers and retry",
+        "docker" | "docker.exe" => "install Docker and retry",
+        _ => "install it and retry",
+    }
+}
+
 impl EngineError {
     /// The process exit code for this failure, per the classes in
     /// `aspec/uxui/cli.md`: 3 only when a Docker or Apple Containers CLI
@@ -779,6 +796,22 @@ mod user_text_tests {
             EngineError::Container(s("daemon down")).to_string(),
             "container backend error: daemon down"
         );
+    }
+
+    /// A missing CLI names the runtime it belongs to: Apple Containers for
+    /// `container`, Docker for `docker`.
+    #[test]
+    fn a_missing_container_cli_names_its_own_runtime() {
+        let missing = |binary: &str| {
+            EngineError::ContainerRuntimeUnavailable {
+                binary: binary.into(),
+            }
+            .to_string()
+        };
+        assert!(missing("docker").ends_with("install Docker and retry"));
+        assert!(missing("/usr/local/bin/container").ends_with("install Apple Containers and retry"));
+        assert!(!missing("container").contains("Docker"));
+        assert!(missing("sbx").ends_with("install it and retry"));
     }
 
     #[test]

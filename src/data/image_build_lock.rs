@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
 use crate::data::fs::hash::sha256_hex;
-use crate::data::fs::private_files::{create_private_dir, lock_private_exclusive};
+use crate::data::fs::private_files::{
+    create_private_dir, lock_private_exclusive, lock_private_timeout, LockMode,
+};
 
 /// Subdirectory of the awman data home that holds the build locks.
 pub const IMAGE_BUILD_LOCK_SUBDIR: &str = "locks/image-build";
@@ -95,6 +97,28 @@ impl ImageBuildLockStore {
             _file: file,
         })
     }
+
+    /// Take the lock only if it is free right now: `Ok(None)` means another
+    /// holder has it, so a caller can say it is waiting before [`Self::lock`].
+    pub fn try_lock(
+        &self,
+        store: &BuildStoreKey,
+        reference: &str,
+    ) -> Result<Option<ImageBuildLease>, DataError> {
+        create_private_dir(&self.root)?;
+        let path = self.lock_path(store, reference);
+        Ok(lock_private_timeout(
+            &path,
+            LockMode::Exclusive,
+            std::time::Duration::ZERO,
+            || Ok(()),
+        )?
+        .map(|file| ImageBuildLease {
+            store: store.clone(),
+            reference: reference.to_string(),
+            _file: file,
+        }))
+    }
 }
 
 /// A held build lock. Released when dropped, including on error and
@@ -124,9 +148,12 @@ mod tests {
 
     #[test]
     fn a_second_lease_waits_and_can_cancel_without_stealing_the_lock() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let locks = ImageBuildLockStore::new(dir.path());
         let store = BuildStoreKey::AppleLocal;
         let first = locks.lock(&store, "agent:latest", || Ok(())).unwrap();
@@ -151,5 +178,25 @@ mod tests {
         assert!(locks
             .lock(&BuildStoreKey::AppleLocal, "agent:latest", || Ok(()))
             .is_ok());
+    }
+
+    #[test]
+    fn try_lock_reports_a_held_lock_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let locks = ImageBuildLockStore::new(dir.path());
+        let store = BuildStoreKey::AppleLocal;
+        let held = locks
+            .try_lock(&store, "agent:latest")
+            .unwrap()
+            .expect("free");
+        assert!(locks.try_lock(&store, "agent:latest").unwrap().is_none());
+        assert!(locks.try_lock(&store, "other:latest").unwrap().is_some());
+        drop(held);
+        assert!(locks.try_lock(&store, "agent:latest").unwrap().is_some());
     }
 }

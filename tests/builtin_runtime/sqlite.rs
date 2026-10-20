@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::binary::{awman, has_builtin_runtime, Scratch};
+use crate::binary::{awman, builtin_selectable, Scratch};
 
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
@@ -223,9 +223,9 @@ fn applied_migrations(db: &Path) -> i64 {
 
 #[test]
 fn builtin_sqlite_sdk_catalog_migrates_twice_and_preserves_rusqlite_writes_after_a_crash() {
-    if !has_builtin_runtime() {
+    if !builtin_selectable() {
         eprintln!(
-            "SKIP: builtin_sqlite catalog round trip: awman was built without the builtin runtime"
+            "SKIP: builtin_sqlite catalog round trip: awman lacks the builtin runtime or this host is unreleased"
         );
         return;
     }
@@ -303,6 +303,12 @@ fn builtin_sqlite_sdk_catalog_migrates_twice_and_preserves_rusqlite_writes_after
 #[test]
 fn builtin_sqlite_genuine_bidirectional_transactions_and_locking() {
     use sqlx::Connection as _;
+    if !builtin_selectable() {
+        eprintln!(
+            "SKIP: builtin_sqlite bidirectional: awman lacks the builtin runtime or this host is unreleased"
+        );
+        return;
+    }
     let state = short_state();
     let state_dir = state.path().join("s");
     let scratch = Scratch::new();
@@ -423,9 +429,9 @@ fn builtin_sqlite_genuine_bidirectional_transactions_and_locking() {
 
 #[test]
 fn builtin_sqlite_an_unversioned_foreign_catalog_is_refused_not_adopted_or_migrated() {
-    if !has_builtin_runtime() {
+    if !builtin_selectable() {
         eprintln!(
-            "SKIP: builtin_sqlite foreign catalog: awman was built without the builtin runtime"
+            "SKIP: builtin_sqlite foreign catalog: awman lacks the builtin runtime or this host is unreleased"
         );
         return;
     }

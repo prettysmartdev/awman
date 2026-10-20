@@ -45,6 +45,11 @@ struct Execution {
     /// never reach the agent as EOF.
     injectable: bool,
     cancel: ExecCancelHandle,
+    /// Tells the event task the frontend is gone (dropped wait or dropped
+    /// execution), so it drops the frontend's stdout/stderr senders at once
+    /// instead of holding them until the guest exits. It keeps watching for
+    /// the exit, which drives attach and owner teardown.
+    io_release: Arc<tokio::sync::Notify>,
     _leases: Vec<crate::engine::credential_refresh::CredentialLease>,
 }
 pub struct CleanupTarget {
@@ -67,7 +72,9 @@ impl ExecutionBackend for Execution {
     fn frontend_for_wait(&mut self) -> Option<FrontendWaitGuard> {
         let frontend = self.frontend.take()?;
         let tasks = self.tasks.clone();
+        let io_release = self.io_release.clone();
         Some(FrontendWaitGuard::from_shared(frontend, move || {
+            io_release.notify_one();
             // The event task owns the attach server and must reach guest exit
             // cleanup. Only the input and resize pumps belong in this list.
             for task in tasks {
@@ -97,6 +104,7 @@ impl ExecutionBackend for Execution {
 
 impl Drop for Execution {
     fn drop(&mut self) {
+        self.io_release.notify_one();
         for task in &self.tasks {
             task.abort();
         }
@@ -113,7 +121,10 @@ struct CancelTarget {
     id: String,
     token: String,
     remove: bool,
-    finished: Arc<AtomicBool>,
+    /// Set by whichever of the event task (agent exited) and the grace timer
+    /// (agent ignored the interrupt) reaches cleanup first; the other skips
+    /// it, so `finish_owned` never runs twice concurrently.
+    cleanup_claimed: Arc<AtomicBool>,
 }
 
 /// One grace timer shared by user cancellation, dropped waits and the stuck detector.
@@ -146,7 +157,7 @@ impl ExecCancelHandle {
             let grace = self.grace;
             self.runtime.spawn(async move {
                 tokio::time::sleep(grace).await;
-                if target.finished.load(Ordering::Acquire) {
+                if target.cleanup_claimed.swap(true, Ordering::AcqRel) {
                     return;
                 }
                 let _ = control.send(Control::Kill);
@@ -215,13 +226,13 @@ impl ExecBridge {
         let resize_abort = resize_task.abort_handle();
         let tail = Arc::new(OutputTail::with_default_capacity());
         let output_activity = OutputActivity::new();
-        let finished = Arc::new(AtomicBool::new(false));
+        let cleanup_claimed = Arc::new(AtomicBool::new(false));
         let owner = cleanup.as_ref().map(|target| CancelTarget {
             driver: target.driver.clone(),
             id: handle.id.clone(),
             token: target.owner.clone(),
             remove: target.remove_on_exit,
-            finished: finished.clone(),
+            cleanup_claimed: cleanup_claimed.clone(),
         });
         let cancel = ExecCancelHandle::new(control.clone(), owner.clone(), CANCEL_GRACE);
         let stuck_cancel = cancel.clone();
@@ -248,19 +259,34 @@ impl ExecBridge {
         });
         let frontend = Arc::new(Mutex::new(frontend));
         let frontend_weak = Arc::downgrade(&frontend);
+        let io_release = Arc::new(tokio::sync::Notify::new());
+        let released = io_release.clone();
+        let mut sinks = Some((io.stdout, io.stderr));
         let event_task = tokio::spawn(async move {
             let mut events = session.events;
             let outcome = loop {
-                match events.recv().await {
+                let event = tokio::select! {
+                    biased;
+                    _ = released.notified(), if sinks.is_some() => {
+                        sinks = None;
+                        continue;
+                    }
+                    event = events.recv() => event,
+                };
+                match event {
                     Ok(ExecEvent::Stdout(bytes)) => {
                         output_tail.push_bytes(&bytes);
                         output_activity.touch();
-                        let _ = io.stdout.send(bytes);
+                        if let Some((stdout, _)) = &sinks {
+                            let _ = stdout.send(bytes);
+                        }
                     }
                     Ok(ExecEvent::Stderr(bytes)) => {
                         output_tail.push_bytes(&bytes);
                         output_activity.touch();
-                        let _ = io.stderr.send(bytes);
+                        if let Some((_, stderr)) = &sinks {
+                            let _ = stderr.send(bytes);
+                        }
                     }
                     Ok(ExecEvent::Exited(code)) => {
                         if let Some(frontend) = frontend_weak.upgrade() {
@@ -300,6 +326,7 @@ impl ExecBridge {
                     }
                 }
             };
+            drop(sinks);
             drop(frontend_weak);
             input_task.abort();
             resize_task.abort();
@@ -308,7 +335,8 @@ impl ExecBridge {
             if let Some(server) = server {
                 server.finish();
             }
-            if let Some(target) = cleanup {
+            if let Some(target) = cleanup.filter(|_| !cleanup_claimed.swap(true, Ordering::AcqRel))
+            {
                 let _ = tokio::task::spawn_blocking(move || {
                     target.driver.finish_owned(
                         &id,
@@ -319,7 +347,6 @@ impl ExecBridge {
                 })
                 .await;
             }
-            finished.store(true, Ordering::Release);
             let _ = done_tx.send(outcome);
         });
         // Dropping the JoinHandle detaches the event task. It must outlive a
@@ -335,6 +362,7 @@ impl ExecBridge {
                 tasks,
                 injectable: persistent_stdin,
                 cancel,
+                io_release,
                 _leases: leases,
             }),
             stuck,
@@ -507,6 +535,13 @@ async fn client(
     }
 }
 
+/// The builtin runtime for the cross-runtime frontend-release check
+/// (`agent_runtime::conformance`).
+#[cfg(test)]
+pub(crate) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
+    tests::conformance_launcher()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +550,56 @@ mod tests {
     impl ExecControl for RecordingControl {
         fn send(&self, command: Control) -> Result<(), EngineError> {
             self.0.send(command).map_err(|_| failed())
+        }
+    }
+
+    /// The builtin exec bridge over a fake guest exec stream: a prompt agent
+    /// has already exited; a long-running one exits on `finish`.
+    pub(super) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
+        type Guest = (
+            tokio::sync::broadcast::Sender<ExecEvent>,
+            tokio::sync::mpsc::UnboundedReceiver<Control>,
+        );
+        let running: Arc<Mutex<Vec<Guest>>> = Arc::new(Mutex::new(Vec::new()));
+        let finishing = running.clone();
+        crate::engine::agent_runtime::conformance::Launcher {
+            name: "builtin",
+            launch: Box::new(move |mut frontend, long| {
+                let (broadcast, events) = tokio::sync::broadcast::channel(16);
+                let (commands, received) = tokio::sync::mpsc::unbounded_channel();
+                if long {
+                    running.lock().unwrap().push((broadcast.clone(), received));
+                } else {
+                    let _ = broadcast.send(ExecEvent::Exited(0));
+                }
+                let io = frontend.take_io();
+                ExecBridge::new(ExecBridgeOptions {
+                    handle: AgentHandle {
+                        id: "conformance".into(),
+                        name: "conformance".into(),
+                        image_tag: "test".into(),
+                        started_at: chrono::Utc::now(),
+                    },
+                    session: ExecSession {
+                        events,
+                        broadcast,
+                        control: Arc::new(RecordingControl(commands)),
+                    },
+                    cleanup: None,
+                    attach_path: None,
+                    persistent_stdin: false,
+                    seeded_prompt: None,
+                    leases: Vec::new(),
+                    io,
+                })
+                .run(frontend)
+                .unwrap()
+            }),
+            finish: Box::new(move || {
+                for (guest, _) in finishing.lock().unwrap().drain(..) {
+                    let _ = guest.send(ExecEvent::Exited(0));
+                }
+            }),
         }
     }
 
@@ -798,7 +883,7 @@ mod tests {
         let (broadcast, events) = tokio::sync::broadcast::channel(16);
         let _keepalive = broadcast.clone();
         let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        let (frontend, peer) = crate::engine::container::builtin::testing::frontend(None);
+        let (frontend, mut peer) = crate::engine::container::builtin::testing::frontend(None);
         let mut execution = {
             let mut frontend = Box::new(SlowDropFrontend(frontend));
             let io = frontend.take_io();
@@ -830,6 +915,15 @@ mod tests {
                 .is_err()
         );
         assert_eq!(Arc::strong_count(&peer.statuses), 1);
+        // The guest is still running (no exit event), yet the frontend's
+        // stdout and stderr senders are already released: both streams end.
+        for stream in [&mut peer.stdout, &mut peer.stderr] {
+            let closed = tokio::time::timeout(Duration::from_secs(2), stream.recv()).await;
+            assert!(
+                matches!(closed, Ok(None)),
+                "I/O sink still held: {closed:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

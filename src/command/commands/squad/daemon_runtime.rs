@@ -88,7 +88,7 @@ impl SquadDaemonHandles {
         let cwd = std::env::current_dir().map_err(|error| {
             CommandError::Other(format!("cannot resolve squad working directory: {error}"))
         })?;
-        let sessions = Arc::new(SessionManager::in_memory());
+        let sessions = Arc::new(SessionManager::in_memory(Env::from_process()));
         let session_id = sessions.open_or_create(cwd, SessionOpenOptions::default())?;
 
         Ok(Self {

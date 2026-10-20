@@ -597,6 +597,20 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// A process exit status with `code`, on any host.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
     #[derive(Default)]
     struct RecordingRunner {
         argv: Mutex<Vec<Vec<String>>>,
@@ -609,7 +623,6 @@ mod tests {
             _control: &BuildControl,
             on_line: &mut dyn FnMut(&str),
         ) -> Result<std::process::ExitStatus, EngineError> {
-            use std::os::unix::process::ExitStatusExt;
             let args: Vec<String> = command
                 .get_args()
                 .map(|arg| arg.to_string_lossy().to_string())
@@ -624,7 +637,7 @@ mod tests {
                 on_line(r#"[["driver-type","io.containerd.snapshotter.v1"]]"#);
             }
             self.argv.lock().unwrap().push(args);
-            Ok(std::process::ExitStatus::from_raw(0))
+            Ok(exit_status(0))
         }
     }
 
@@ -653,6 +666,27 @@ mod tests {
             .all(|args| args[0..2] == ["--host", "unix:///run/explicit.sock"]));
     }
 
+    /// An ambient Docker context, TLS setting or buildx builder cannot
+    /// redirect a bound build: each is removed from the command's env and
+    /// `DOCKER_HOST` is pinned to the endpoint, alongside `--host`.
+    #[test]
+    fn bound_docker_command_strips_ambient_redirects_and_pins_the_endpoint() {
+        let command = HostLocalImageBuilder::bound_docker_command("unix:///run/explicit.sock");
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        for key in DOCKER_AMBIENT_ENV {
+            assert_eq!(envs.get(*key), Some(&None), "{key} must be removed");
+        }
+        assert_eq!(
+            envs.get("DOCKER_HOST"),
+            Some(&Some(std::ffi::OsString::from("unix:///run/explicit.sock")))
+        );
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["--host", "unix:///run/explicit.sock"]);
+    }
+
     fn host_platform() -> OciPlatform {
         OciPlatform::host_linux()
     }
@@ -671,6 +705,77 @@ mod tests {
 
     fn digest(c: char) -> String {
         format!("sha256:{}", c.to_string().repeat(64))
+    }
+
+    /// A Docker that reports one image ID for the build and holds a different
+    /// image under that ID's inspection (another process retagged or rebuilt
+    /// in between). Every other call succeeds; buildx is absent.
+    struct RetaggingRunner;
+
+    impl HostCommandRunner for RetaggingRunner {
+        fn run(
+            &self,
+            command: Command,
+            _control: &BuildControl,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<std::process::ExitStatus, EngineError> {
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect();
+            if args.iter().any(|a| a == "buildx") {
+                return Ok(exit_status(1));
+            }
+            if args.iter().any(|a| a == "build") {
+                let at = args.iter().position(|a| a == "--iidfile").unwrap();
+                std::fs::write(&args[at + 1], digest('b')).unwrap();
+            } else if args.iter().any(|a| a == "inspect") {
+                on_line(&format!(
+                    r#"{{"Id":"{}","Os":"linux","Architecture":"{}"}}"#,
+                    digest('c'),
+                    OciPlatform::host_linux().architecture
+                ));
+            } else if args.iter().any(|a| a == "--format") {
+                on_line(r#"[["driver-type","io.containerd.snapshotter.v1"]]"#);
+            }
+            Ok(exit_status(0))
+        }
+    }
+
+    /// The build's own image ID is what gets classified, and an image under
+    /// it that is not that ID is refused (`BuiltImageChanged`) rather than
+    /// imported as the new build.
+    #[test]
+    fn a_retag_between_build_and_inspection_is_refused() {
+        let builder = HostLocalImageBuilder::with_runner(Arc::new(RetaggingRunner));
+        let tmp = tempfile::tempdir().unwrap();
+        let request = BuildRequest {
+            target: BuildTarget::Docker {
+                endpoint: "unix:///run/explicit.sock".into(),
+            },
+            reference: "agent:latest".into(),
+            dockerfile: tmp.path().join("Dockerfile"),
+            context: tmp.path().to_path_buf(),
+            platform: OciPlatform::host_linux(),
+            build_args: Vec::new(),
+            no_cache: false,
+        };
+        let result = builder.build(
+            &request,
+            &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
+            &mut |_| {},
+        );
+        match result {
+            Err(EngineError::ImageBuilder(BuilderFailure::BuiltImageChanged {
+                image_id,
+                reference,
+                ..
+            })) => {
+                assert_eq!(image_id, digest('b'));
+                assert_eq!(reference, "agent:latest");
+            }
+            other => panic!("expected BuiltImageChanged, got {other:?}"),
+        }
     }
 
     // ── classify_docker_inspect ──────────────────────────────────────────

@@ -437,15 +437,16 @@ impl SessionSetup {
             non_interactive: true,
             env_passthrough: None,
         };
-        let (resolved_builtin, data_home) = match session_guard
-            .effective_config()
-            .builtin_settings()
-            .and_then(|resolved| {
-                crate::data::config::global::GlobalConfig::data_home_with(
-                    session_guard.effective_config().env(),
-                )
-                .map(|data_home| (resolved, data_home))
-            }) {
+        let (resolved_builtin, data_home) = match ReadyEngine::builtin_inputs(
+            &session_guard,
+            container_runtime.as_ref(),
+        )
+        .and_then(|resolved| {
+            crate::data::config::global::GlobalConfig::data_home_with(
+                session_guard.effective_config().env(),
+            )
+            .map(|data_home| (resolved, data_home))
+        }) {
             Ok(resolved) => resolved,
             Err(e) => {
                 drop(session_guard);
@@ -675,7 +676,9 @@ mod tests {
             "sess-clone-fail".to_string(),
             plan,
             test_engines(),
-            Arc::new(SessionManager::in_memory()),
+            Arc::new(SessionManager::in_memory(
+                crate::data::config::env::EnvSnapshot::empty(),
+            )),
             Arc::clone(&setup_state),
             Arc::clone(&store),
             paths.clone(),
@@ -864,7 +867,9 @@ mod tests {
             "sess-local-not-ready".to_string(),
             plan,
             test_engines(),
-            Arc::new(SessionManager::in_memory()),
+            Arc::new(SessionManager::in_memory(
+                crate::data::config::env::EnvSnapshot::empty(),
+            )),
             Arc::clone(&setup_state),
             Arc::clone(&store),
             paths.clone(),

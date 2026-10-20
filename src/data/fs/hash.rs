@@ -36,12 +36,19 @@ pub fn sanitize_name_for_filename(name: &str) -> String {
 }
 
 /// Compute the SHA-256 hash of `data`, returned as a lowercase hex string.
-pub fn sha256_hex(data: &str) -> String {
+///
+/// Accepts text (`&str`, `&String`) and raw bytes (`&[u8]`, `&Vec<u8>`) alike,
+/// so the stores (filename hashes) and the OCI image layer (blob digests)
+/// share one implementation.
+pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(data.as_ref());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -94,6 +101,15 @@ mod tests {
         assert_eq!(
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_hashes_text_and_bytes_identically() {
+        assert_eq!(sha256_hex("abc"), sha256_hex(b"abc"));
+        assert_eq!(
+            sha256_hex(String::from("abc")),
+            sha256_hex(vec![b'a', b'b', b'c'])
         );
     }
 }

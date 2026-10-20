@@ -3,7 +3,15 @@
 Title: User-configurable extra agent flags (`agentFlags` / `--agent-flag`)
 Issue: n/a (newer Codex releases fail to start in a container without `--no-daemon`)
 
-Status: Implemented
+Status: Completed 2026-10-19. Implemented in 61a04b39; it survived the WI 0126 merge
+(fe980408). A 2026-10-19 review added: de-duplication of an `agentFlags` entry
+awman already manages, with a launch warning; a `remote exec` warning instead of
+silently dropping `--agent-flag`; worktree sessions that keep the invoker's
+default agent, so `--agent-flag` targets the agent a step actually runs; one-sentence
+help text; and an `agentFlags` case in the Docker/Apple vs builtin argv parity
+test. It also found and fixed an older bug: the non-interactive subcommand was
+emitted twice (`codex exec exec`), so "after the non-interactive subcommand"
+below is now what actually runs.
 
 ## Summary:
 
@@ -16,8 +24,8 @@ Status: Implemented
 - Follow-up finding: `codex exec` *rejects* `--no-daemon`, so an `agentFlags`
   codex entry (which reaches every launch) breaks non-interactive runs.
   Interactive Codex's TUI starts through an app-server daemon that the image
-  never ships. The image copies the bare binary out of its package, and the
-  host `~/.codex` mounted over `$CODEX_HOME` hides or replaces
+  never ships. Codex looks for it under `$CODEX_HOME/packages`, and the host
+  `~/.codex` mounted over `$CODEX_HOME` hides or replaces
   `packages/app-server-daemon`. So awman now passes `--no-daemon` itself, on
   interactive codex launches only, through the agent matrix's new
   `interactive_only_flags`. `agentFlags` remains the general escape hatch,
@@ -35,6 +43,9 @@ add `"agentFlags": {"codex": ["--no-daemon"]}` to my global or repo
 So I can:
 keep using the latest Codex in awman containers without waiting for an awman
 release that knows about the flag.
+
+(Superseded for `--no-daemon` itself: awman now passes it on interactive codex
+launches, and a configured entry for it is dropped there with a warning.)
 
 ### User Story 2:
 As a: user
@@ -117,7 +128,11 @@ try a flag for one run without editing config.
   containing spaces stays a single argument.
 - `remote exec prompt` / `remote exec workflow` accept the flag (derived flag
   set) but, like `--model` and `--overlay`, don't forward it to the remote
-  host.
+  host. They warn that it was not forwarded.
+- An `agentFlags` entry equal to a flag awman's entrypoint already carries for
+  that launch (codex `--no-daemon`, interactive) is dropped from that launch,
+  and `LaunchPolicy::warn_config` warns once per agent and flag. A
+  non-interactive launch keeps it as configured.
 
 ## Test Considerations:
 

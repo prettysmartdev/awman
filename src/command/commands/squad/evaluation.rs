@@ -533,8 +533,11 @@ impl LocalTaskEvaluator {
         // configured after the workspace was scaffolded, fail validation. The
         // leader's own image is built first so it starts as soon as it can.
         //
-        // `ensure_agent_image*` is an `image_exists` fast path, so a pool whose
-        // images are already built adds nothing but a runtime query per agent.
+        // On a building runtime `ensure_agent_image*` is an `image_exists` fast
+        // path. On an importing runtime (builtin) every pool agent goes through
+        // provenance-checked acquisition, which for an installed image from an
+        // unchanged source is a cache hit; an image from a different source is
+        // re-acquired. It never builds (`BuildPolicy::ImportOnly`).
         let mut pool_agents = vec![agent.as_str().to_string()];
         if let Some(map) = request.agents_to_models.as_ref() {
             let mut names: Vec<&String> = map.keys().collect();

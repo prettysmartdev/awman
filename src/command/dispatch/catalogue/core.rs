@@ -136,8 +136,8 @@ pub(super) const READY: CommandSpec = CommandSpec {
         FlagSpec {
             long: "no-cache",
             short: None,
-            help: "Skip the build cache when an image build runs. Has no effect unless a \
-                   build is scheduled (by --build, an audit change, or a missing image).",
+            help: "Skip the build cache when a build is scheduled, and on the builtin runtime \
+                   also force a fresh image import.",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,

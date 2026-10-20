@@ -26,3 +26,20 @@ pub struct ResolvedBuiltinConfig {
     /// Whether source-matched local image building is enabled for this session.
     pub builder_enabled: bool,
 }
+
+/// The process-wide part of the builtin configuration: what opening the one
+/// builtin runtime needs, independent of any session's launches or images.
+///
+/// Resolving it never validates per-session settings (network narrowing,
+/// vCPUs, memory, image sources), so a repo whose `builtin` block is invalid
+/// fails that repo's launches only, never runtime detection for the whole
+/// process (a TUI or API server started in that repo).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinProcessConfig {
+    /// Process-wide private state root.
+    pub state_dir: PathBuf,
+    /// Ambient `MSB_*` overrides captured by the effective environment.
+    pub ambient_overrides: Vec<&'static str>,
+    /// Test isolation is active without an explicit opt-in to the real runtime.
+    pub test_isolation: bool,
+}

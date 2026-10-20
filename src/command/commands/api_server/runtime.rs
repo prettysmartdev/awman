@@ -129,7 +129,7 @@ impl ApiServerRuntime {
         // from a previous server lifetime. This ensures session continuity across
         // server restarts.
         tracing::info!("Restoring active sessions from previous server lifetime");
-        let sessions = Arc::new(SessionManager::in_memory());
+        let sessions = Arc::new(SessionManager::in_memory(config.env.clone()));
         if let Ok(records) = store.list_sessions_by_status(Some("active")) {
             for rec in records {
                 let workdir_path = std::path::PathBuf::from(&rec.workdir);
@@ -142,7 +142,10 @@ impl ApiServerRuntime {
                 match Session::open_or_workdir_fallback(
                     workdir_path,
                     &resolver,
-                    SessionOpenOptions::default(),
+                    SessionOpenOptions {
+                        env: Some(config.env.clone()),
+                        ..Default::default()
+                    },
                 ) {
                     Ok(mut session) => {
                         if rec.session_type == "remote" {
@@ -407,7 +410,9 @@ mod tests {
         let lifecycle = ApiSessionLifecycle::new(
             Arc::clone(&store),
             Engines::for_tests(tmp),
-            Arc::new(SessionManager::in_memory()),
+            Arc::new(SessionManager::in_memory(
+                crate::data::config::env::EnvSnapshot::empty(),
+            )),
             ApiPaths::at_root(tmp),
         );
         (lifecycle, store)

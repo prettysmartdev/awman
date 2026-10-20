@@ -15,7 +15,7 @@ printf '%s  %s\n' bed6f6848e22bb2f83b5f764b2aef0ed393054e803a8e3a8711cb2a39e6b49
 work=$(mktemp -d "$root/build.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 tar xf "$archive" -C "$work"
-(cd "$work/libcap-ng-0.8.3" && ./configure --disable-shared --enable-static --without-python && make -j2)
+(cd "$work/libcap-ng-0.8.3" && ./configure --disable-shared --enable-static --without-python --without-python3 && make -j2)
 mkdir -p "$root/lib" "$root/$triple"
 cp "$work/libcap-ng-0.8.3/src/.libs/libcap-ng.a" "$root/$triple/libcap-ng.a"
 cp "$root/$triple/libcap-ng.a" "$root/lib/libcap-ng.a"

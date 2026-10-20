@@ -74,7 +74,9 @@ pub async fn run(
     initial_tab: InitialTab,
 ) -> ExitCode {
     let catalogue = CommandCatalogue::get();
-    let session_manager = Arc::new(SessionManager::in_memory());
+    let session_manager = Arc::new(SessionManager::in_memory(
+        ctx.session.read().await.env().clone(),
+    ));
     let runtime_handle = tokio::runtime::Handle::current();
 
     // Build the App and decide whether the normal startup auto-spawn runs — it

@@ -39,7 +39,7 @@ impl WorkflowStateStore {
     }
 
     pub fn state_path(&self, work_item: Option<u32>, workflow_name: &str) -> PathBuf {
-        let repo_hash = &sha256_hex(&self.git_root.to_string_lossy())[..8];
+        let repo_hash = &sha256_hex(self.git_root.to_string_lossy().as_bytes())[..8];
         let name = sanitize_name_for_filename(workflow_name);
         let filename = match work_item {
             Some(wi) => format!("{repo_hash}-{wi:04}-{name}.json"),

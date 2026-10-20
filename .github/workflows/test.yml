@@ -297,7 +297,6 @@ jobs:
       matrix:
         include:
           - { name: windows-x86_64, target: x86_64-pc-windows-msvc, runs-on: windows-2025 }
-          - { name: macos-intel, target: x86_64-apple-darwin, runs-on: [self-hosted, macOS, Intel] }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -37,6 +37,9 @@ pub struct RemoteExecWorkflowFlags {
     pub session: Option<String>,
     pub follow: bool,
     pub api_key: Option<String>,
+    /// `--agent-flag` values. Not forwarded: the remote host applies its own
+    /// `agentFlags`, so these only produce a warning.
+    pub agent_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +50,8 @@ pub struct RemoteExecPromptFlags {
     pub session: Option<String>,
     pub follow: bool,
     pub api_key: Option<String>,
+    /// `--agent-flag` values; see [`RemoteExecWorkflowFlags::agent_flags`].
+    pub agent_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +203,7 @@ impl RemoteCommand {
                     session: ctx.flags.string("session"),
                     follow: ctx.flags.bool("follow"),
                     api_key: ctx.flags.string("api-key"),
+                    agent_flags: ctx.flags.strs("agent-flag").to_vec(),
                 })
             }
             ["remote", "exec", "prompt"] => RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
@@ -207,6 +213,7 @@ impl RemoteCommand {
                 session: ctx.flags.string("session"),
                 follow: ctx.flags.bool("follow"),
                 api_key: ctx.flags.string("api-key"),
+                agent_flags: ctx.flags.strs("agent-flag").to_vec(),
             }),
             ["remote", "session", "start"] => {
                 RemoteSubcommand::SessionStart(RemoteSessionStartFlags {
@@ -522,12 +529,29 @@ async fn run_remote_exec(
     })
 }
 
+/// `--agent-flag` is accepted on `remote exec` (the flag set is derived from the
+/// local one) but never forwarded. Say so instead of dropping it silently.
+fn warn_agent_flags_not_forwarded(agent_flags: &[String], frontend: &mut dyn UserMessageSink) {
+    if agent_flags.is_empty() {
+        return;
+    }
+    frontend.write_message(crate::data::message::UserMessage {
+        level: crate::data::message::MessageLevel::Warning,
+        text: format!(
+            "--agent-flag ({}) is not forwarded to the remote host; set agentFlags in the \
+             remote repository's config instead",
+            agent_flags.join(" ")
+        ),
+    });
+}
+
 async fn run_remote_exec_workflow(
     session: &crate::data::session::Session,
     engines: &Engines,
     flags: RemoteExecWorkflowFlags,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteOutcome, CommandError> {
+    warn_agent_flags_not_forwarded(&flags.agent_flags, frontend);
     use crate::command::commands::remote_client::ExecArg;
     let mut extra: Vec<String> = Vec::new();
     if let Some(ref wi) = flags.work_item {
@@ -564,6 +588,7 @@ async fn run_remote_exec_prompt(
     flags: RemoteExecPromptFlags,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteOutcome, CommandError> {
+    warn_agent_flags_not_forwarded(&flags.agent_flags, frontend);
     use crate::command::commands::remote_client::ExecArg;
     let mut extra: Vec<String> = Vec::new();
     if let Some(ref agent) = flags.agent {
@@ -831,6 +856,18 @@ async fn run_session_kill(
 mod tests {
     use super::*;
     use crate::data::session::Session;
+
+    #[test]
+    fn remote_exec_warns_that_agent_flags_are_not_forwarded() {
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        warn_agent_flags_not_forwarded(&[], &mut sink);
+        assert!(sink.queued().is_empty());
+        warn_agent_flags_not_forwarded(&["--search".to_string()], &mut sink);
+        let queued = sink.queued();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].level, crate::data::message::MessageLevel::Warning);
+        assert!(queued[0].text.contains("--search"), "{}", queued[0].text);
+    }
 
     /// `AWMAN_CONFIG_HOME` is pinned at the (empty) fixture dir so the session
     /// cannot fall through to the developer's real `~/.awman/config.json`,

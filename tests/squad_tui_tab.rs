@@ -71,7 +71,9 @@ fn test_runtime_handle() -> tokio::runtime::Handle {
 fn make_app(with_container_runtime: bool) -> App {
     let catalogue = CommandCatalogue::get();
     let engines = make_engines(with_container_runtime);
-    let session_manager = Arc::new(SessionManager::in_memory());
+    let session_manager = Arc::new(SessionManager::in_memory(
+        awman::data::config::env::EnvSnapshot::empty(),
+    ));
     let tab = Tab::new(make_session());
     App::new(
         catalogue,
@@ -88,7 +90,9 @@ fn make_app(with_container_runtime: bool) -> App {
 fn make_squad_only_app() -> App {
     let catalogue = CommandCatalogue::get();
     let engines = make_engines(true);
-    let session_manager = Arc::new(SessionManager::in_memory());
+    let session_manager = Arc::new(SessionManager::in_memory(
+        awman::data::config::env::EnvSnapshot::empty(),
+    ));
     let tab = Tab::new_squad(make_session());
     App::new(
         catalogue,

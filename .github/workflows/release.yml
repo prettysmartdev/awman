@@ -26,10 +26,6 @@ jobs:
             os: ubuntu-24.04-arm
             artifact: awman-linux-arm64
             builtin: false
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: awman-macos-amd64
-            builtin: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: awman-windows-amd64.exe
@@ -60,7 +56,7 @@ jobs:
           fi
 
       - name: Record release size and startup measurements
-        if: runner.os != 'Windows' && matrix.target != 'x86_64-apple-darwin'
+        if: runner.os != 'Windows'
         run: bash tools/measure-release-artifact.sh "target/${{ matrix.target }}/release/awman" "${{ matrix.target }}" "release-measurements/${{ matrix.target }}" --host-only
 
       - name: Inspect release dependencies and extracted helpers
@@ -176,7 +172,7 @@ jobs:
       - name: Collect binaries
         run: |
           mkdir -p release
-          find artifacts -type f \( -name 'awman-linux-amd64' -o -name 'awman-linux-arm64' -o -name 'awman-macos-amd64' -o -name 'awman-macos-arm64' -o -name 'awman-windows-amd64.exe' \) -exec cp {} release/ \;
+          find artifacts -type f \( -name 'awman-linux-amd64' -o -name 'awman-linux-arm64' -o -name 'awman-macos-arm64' -o -name 'awman-windows-amd64.exe' \) -exec cp {} release/ \;
           ls -la release/
 
       - name: Extract tag version

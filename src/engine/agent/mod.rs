@@ -19,7 +19,6 @@ use crate::engine::auth::{AgentCredentials, CredentialDelivery, RefreshableCrede
 use crate::engine::container::options::{
     ContainerOption, EnvLiteral, EnvVar, ImageRef, PlanMode, YoloMode,
 };
-use crate::engine::container::runtime::BUILTIN_RUNTIME_NAME;
 use crate::engine::error::EngineError;
 use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, OverlayRequest};
 use crate::engine::sandbox::options::SandboxOption;
@@ -158,7 +157,10 @@ impl AgentEngine {
                 config.builtin_settings()?,
                 self.runtime.clone(),
                 crate::data::config::global::GlobalConfig::data_home_with(config.env())?,
-                ImageBuildContext::for_session(session, agent.as_str()),
+                // Default agent = the configured one, as `ready` and preflight
+                // use it, so a single-image default source is refused for
+                // any other agent here too.
+                ImageBuildContext::for_session(session, session.configured_agent().as_str()),
             );
             preparer
                 .prepare(
@@ -260,7 +262,8 @@ impl AgentEngine {
     }
 
     /// This session's builtin launch settings (default vCPUs and memory,
-    /// network policy) when the engine's runtime is the builtin one, resolved
+    /// network policy) when the engine's runtime sizes and confines each
+    /// launch from them (`Capabilities::per_launch_vm_settings`), resolved
     /// from the session's own `EffectiveConfig` for every launch; `None` for
     /// every other runtime, which has no use for them and must not fail on a
     /// `builtin` block it never reads.
@@ -268,11 +271,11 @@ impl AgentEngine {
     /// `build_options` carries the value as `ContainerOption::BuiltinLaunch`.
     /// Background setup/teardown launches pass it in their
     /// `BackgroundLaunchRequest`.
-    pub fn builtin_launch_settings(
+    pub(crate) fn builtin_launch_settings(
         &self,
         session: &Session,
     ) -> Result<Option<BuiltinLaunchSettings>, EngineError> {
-        if self.runtime.runtime_name() != BUILTIN_RUNTIME_NAME {
+        if !self.runtime.capabilities().per_launch_vm_settings {
             return Ok(None);
         }
         Ok(Some(session.effective_config().builtin_launch_settings()?))
@@ -379,8 +382,16 @@ impl AgentEngine {
             options.push(ContainerOption::AgentModeFlags(mode_flags));
         }
 
-        // User-configured extra agent args (`agentFlags` / `--agent-flag`).
-        let agent_flags = resolve_agent_flags(session, agent, run);
+        // User-configured extra agent args (`agentFlags` / `--agent-flag`). One
+        // that the entrypoint already carries for this launch (codex
+        // `--no-daemon` on an interactive launch) is dropped, not doubled; the
+        // command layer warns about it (`LaunchPolicy::warn_config`). An ACP
+        // entrypoint carries none of them.
+        let mut agent_flags = resolve_agent_flags(session, agent, run);
+        if !acp {
+            let managed = agent_matrix::entrypoint_managed_flags(&matrix, run.non_interactive);
+            agent_flags.retain(|flag| !managed.contains(&flag.as_str()));
+        }
         if !agent_flags.is_empty() {
             options.push(ContainerOption::AgentFlags(agent_flags));
         }
@@ -404,14 +415,6 @@ impl AgentEngine {
             options.push(ContainerOption::Model { flag });
         }
 
-        // Non-interactive: also surface as a discrete option so backends that
-        // need to know can react (display purposes etc.). The actual
-        // entrypoint already encoded it.
-        if run.non_interactive {
-            if let Some(flag) = matrix.non_interactive_flag {
-                options.push(ContainerOption::NonInteractivePrintFlag(flag.to_string()));
-            }
-        }
         // Env passthrough.
         let env_pass = run.env_passthrough.as_deref().unwrap_or(&[]);
         for name in env_pass {
@@ -1080,6 +1083,18 @@ mod tests {
         );
     }
 
+    /// How many times `token` appears in the resolved entrypoint.
+    fn non_interactive_tokens(opts: &[ContainerOption], token: &str) -> usize {
+        opts.iter()
+            .filter_map(|o| match o {
+                ContainerOption::Entrypoint(ep) => {
+                    Some(ep.0.iter().filter(|t| *t == token).count())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     fn make_agent_engine(home: &std::path::Path) -> (AgentEngine, crate::data::session::Session) {
         let session_tmp = tempfile::tempdir().unwrap();
         // We only use session_tmp as session root; home is for auth paths.
@@ -1242,13 +1257,9 @@ mod tests {
             ..Default::default()
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
-        let has_flag = opts
-            .iter()
-            .any(|o| matches!(o, ContainerOption::NonInteractivePrintFlag(f) if f == "--print"));
-        assert!(
-            has_flag,
-            "NonInteractivePrintFlag --print must be present for claude"
-        );
+        // The entrypoint carries the non-interactive form, exactly once; no
+        // other option repeats it (it used to be emitted twice).
+        assert_eq!(non_interactive_tokens(&opts, "--print"), 1, "claude");
     }
 
     #[test]
@@ -1261,13 +1272,9 @@ mod tests {
             ..Default::default()
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
-        let has_flag = opts
-            .iter()
-            .any(|o| matches!(o, ContainerOption::NonInteractivePrintFlag(f) if f == "run"));
-        assert!(
-            has_flag,
-            "NonInteractivePrintFlag 'run' must be present for crush"
-        );
+        // The entrypoint carries the non-interactive form, exactly once; no
+        // other option repeats it (it used to be emitted twice).
+        assert_eq!(non_interactive_tokens(&opts, "run"), 1, "crush");
     }
 
     #[test]
@@ -1364,14 +1371,7 @@ mod tests {
             "entrypoint must contain --print for non_interactive antigravity; got {entrypoint:?}"
         );
 
-        // NonInteractivePrintFlag must also be set.
-        let has_print_flag = opts
-            .iter()
-            .any(|o| matches!(o, ContainerOption::NonInteractivePrintFlag(f) if f == "--print"));
-        assert!(
-            has_print_flag,
-            "NonInteractivePrintFlag(--print) must be present for non_interactive antigravity"
-        );
+        assert_eq!(non_interactive_tokens(&opts, "--print"), 1);
 
         // AgentModeFlags must contain --dangerously-skip-permissions.
         let mode_flags: Vec<String> = opts
@@ -1451,12 +1451,7 @@ mod tests {
             ..Default::default()
         };
         let opts = engine.build_options(&session, &agent, &run).unwrap();
-        assert!(
-            !opts
-                .iter()
-                .any(|o| matches!(o, ContainerOption::NonInteractivePrintFlag(_))),
-            "NonInteractivePrintFlag must be absent when non_interactive=false"
-        );
+        assert_eq!(non_interactive_tokens(&opts, "--print"), 0);
     }
 
     // ── ensure_available tests ───────────────────────────────────────────────
@@ -2544,6 +2539,7 @@ mod tests {
                     has_image_store: false,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
+                    per_launch_vm_settings: false,
                 },
                 name: "fake-sbx",
             }
@@ -2558,17 +2554,21 @@ mod tests {
                     has_image_store: true,
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
+                    per_launch_vm_settings: false,
                 },
                 name: "fake-container",
             }
         }
 
-        /// A container-tier runtime reporting the builtin backend's name.
+        /// A container-tier runtime with the builtin backend's per-launch
+        /// VM settings capability.
         fn builtin() -> Self {
-            Self {
-                name: BUILTIN_RUNTIME_NAME,
+            let mut runtime = Self {
+                name: crate::engine::container::runtime::BUILTIN_RUNTIME_NAME,
                 ..Self::container()
-            }
+            };
+            runtime.caps.per_launch_vm_settings = true;
+            runtime
         }
     }
 
@@ -3005,14 +3005,14 @@ mod tests {
     fn build_options_emits_configured_agent_flags_for_that_agent_only() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
+            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--search"]}}"#);
         let codex = AgentName::new("codex").unwrap();
         let claude = AgentName::new("claude").unwrap();
 
         let opts = engine
             .build_options(&session, &codex, &AgentRunOptions::default())
             .unwrap();
-        assert_eq!(container_agent_flags(&opts), vec!["--no-daemon"]);
+        assert_eq!(container_agent_flags(&opts), vec!["--search"]);
 
         let opts = engine
             .build_options(&session, &claude, &AgentRunOptions::default())
@@ -3022,6 +3022,35 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, ContainerOption::AgentFlags(_))),
             "claude has no agentFlags entry; got {opts:?}"
+        );
+    }
+
+    /// awman passes codex `--no-daemon` itself on interactive launches. A user
+    /// entry for it is dropped there (not doubled), and kept as configured on a
+    /// non-interactive launch, where the entrypoint does not carry it.
+    #[test]
+    fn build_options_drops_an_agent_flag_the_entrypoint_already_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = engine_with_repo_config(
+            tmp.path(),
+            r#"{"agentFlags": {"codex": ["--no-daemon", "--search"]}}"#,
+        );
+        let codex = AgentName::new("codex").unwrap();
+        let interactive = engine
+            .build_options(&session, &codex, &AgentRunOptions::default())
+            .unwrap();
+        assert_eq!(non_interactive_tokens(&interactive, "--no-daemon"), 1);
+        assert_eq!(container_agent_flags(&interactive), vec!["--search"]);
+
+        let run = AgentRunOptions {
+            non_interactive: true,
+            ..Default::default()
+        };
+        let batch = engine.build_options(&session, &codex, &run).unwrap();
+        assert_eq!(non_interactive_tokens(&batch, "--no-daemon"), 0);
+        assert_eq!(
+            container_agent_flags(&batch),
+            vec!["--no-daemon", "--search"]
         );
     }
 

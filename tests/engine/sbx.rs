@@ -62,16 +62,16 @@ impl UserMessageSink for VecSink {
 // ─── Platform guard: BackendUnsupportedOnPlatform on Linux ────────────────────
 
 #[test]
-fn dsbx_returns_unsupported_on_linux_and_x86_macos() {
+fn dsbx_returns_unsupported_on_linux() {
     // This test is always active — it verifies the platform guard fires correctly.
-    if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    if cfg!(target_os = "linux") {
         match SandboxRuntime::dsbx() {
             Err(EngineError::BackendUnsupportedOnPlatform { backend, platform }) => {
                 assert_eq!(backend, "docker-sbx-experimental");
                 assert!(!platform.is_empty());
             }
             Err(e) => panic!("expected BackendUnsupportedOnPlatform, got: {e:?}"),
-            Ok(_) => panic!("expected platform error on Linux / x86 macOS"),
+            Ok(_) => panic!("expected platform error on Linux"),
         }
     }
 }
@@ -214,7 +214,7 @@ fn sandbox_name_encodes_both_hash_and_agent() {
 // ─── Runtime detection (host-side, always runs) ───────────────────────────────
 
 /// `AgentRuntimeEngine::detect` with `"docker-sbx-experimental"` returns
-/// `BackendUnsupportedOnPlatform` on Linux and x86_64 macOS.
+/// `BackendUnsupportedOnPlatform` on Linux.
 #[test]
 fn detect_sbx_unsupported_platform() {
     use awman::engine::agent_runtime;
@@ -225,7 +225,7 @@ fn detect_sbx_unsupported_platform() {
     };
     let result = agent_runtime::detect(&cfg);
 
-    if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    if cfg!(target_os = "linux") {
         match result {
             Err(EngineError::BackendUnsupportedOnPlatform { backend, .. }) => {
                 assert_eq!(backend, "docker-sbx-experimental");

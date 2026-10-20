@@ -21,6 +21,7 @@ mod awman_binary;
 mod acquisition;
 mod apple_store;
 mod binary;
+mod builder_native;
 mod fixture_inventory;
 mod frontends;
 mod gate;

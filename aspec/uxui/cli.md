@@ -79,7 +79,7 @@ Exit codes are classes of outcome, not per-command codes:
 | 0 | Success. |
 | 1 | Runtime failure inside a lower layer (engine, data, transport). |
 | 2 | Invalid usage: bad flag value, missing required input, a conflict, or required interactive input unavailable in a non-interactive context. |
-| 3 | Container runtime unavailable. |
+| 3 | The Docker or Apple Containers backend is missing or failing (`ContainerRuntimeUnavailable`, `Container`). Builtin runtime and image-builder failures are class 1. |
 | 4 | A referenced resource (file, work item, template) does not exist. |
 | 130 | Aborted by the user (Esc in the TUI, Ctrl-C on the CLI). |
 
@@ -174,8 +174,14 @@ block may only narrow the global one — a stricter mode, a subset of the
 global `allow` list, a subset of the global `hostPorts` — never widen it, since
 repo config ships with the checkout and may be untrusted. Network, `vcpus`
 and `memoryMib` are resolved per session at every launch, so a repo's values
-apply wherever an agent for that repo runs (CLI, a TUI tab, an API session or a
-squad task). The state directory is resolved in this order: the
+apply wherever an agent for that repo runs (CLI, a TUI tab, an API session, a
+squad task, or a workflow worktree). A workflow worktree is cut from a commit, so
+its session takes the invoking checkout's repo `builtin` block and default
+`agent`, not the committed ones, and every session gets the global config the
+invoking process loaded (honouring `AWMAN_CONFIG_HOME`). An invalid or widening
+repo block fails that repo's launches only: runtime detection resolves only the
+process-wide settings, and runtimes other than builtin never read the block.
+The state directory is resolved in this order: the
 `AWMAN_BUILTIN_STATE_DIR` environment variable, then `builtin.stateDir` (repo
 over global), then `<data home>/builtin`. It is effectively process-wide: a
 repo `builtin.stateDir` that resolves to a different directory than the
@@ -216,7 +222,9 @@ image; it never forces a rebuild. Workflow preflight (static and dynamic) and
 squad image checks remain import-only: they never build or probe a builder, and
 they re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`
-would have accepted. The builtin backend does not silently choose another
+would have accepted. Like `ready`, they refuse to import a default source that
+names a single image (an archive or a fixed reference) for any agent other than
+the configured default one. The builtin backend does not silently choose another
 source or change the selected execution runtime.
 
 An agent that lacks an allowed/disallowed-tools flag is rejected with a

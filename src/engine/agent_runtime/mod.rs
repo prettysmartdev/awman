@@ -31,6 +31,8 @@ use crate::engine::sandbox::SandboxRuntime;
 
 pub mod background;
 pub mod capabilities;
+#[cfg(test)]
+pub(crate) mod conformance;
 pub mod execution;
 pub mod frontend;
 pub mod output_tail;
@@ -411,7 +413,10 @@ pub fn detect_effective(config: &EffectiveConfig) -> Result<DetectedRuntime, Eng
             Ok(DetectedRuntime::Sandbox(Arc::new(SandboxRuntime::dsbx()?)))
         }
         RuntimeSelection::BuiltinExperimental => {
-            let resolved = config.builtin_settings()?;
+            // Process-wide settings only: a repo whose per-launch `builtin`
+            // settings are invalid (e.g. a widening network block) fails its
+            // own launches, not runtime detection for the whole process.
+            let resolved = config.builtin_process_settings()?;
             let settings = BuiltinRuntimeSettings::resolve(&resolved);
             Ok(DetectedRuntime::Container(Arc::new(
                 ContainerRuntime::builtin(settings)?,
@@ -487,7 +492,7 @@ mod tests {
         };
         let res = detect(&cfg);
         // dsbx is only supported on macOS arm64 and Windows.
-        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        if cfg!(target_os = "linux") {
             match res {
                 Err(EngineError::BackendUnsupportedOnPlatform { .. }) => {}
                 Err(e) => panic!("expected BackendUnsupportedOnPlatform, got: {e:?}"),
@@ -593,6 +598,43 @@ mod tests {
         }
     }
 
+    /// A repo whose per-launch `builtin` settings are invalid (here a network
+    /// block that widens the global one) fails its own launches only. Runtime
+    /// detection, which a TUI or API server started in that repo runs once
+    /// for the whole process, must not refuse on it.
+    #[test]
+    fn detect_builtin_ignores_a_repos_invalid_launch_settings() {
+        use crate::data::config::{FlagConfig, RepoConfig};
+        let config = EffectiveConfig::new(
+            FlagConfig::default(),
+            crate::data::config::env::EnvSnapshot::empty(),
+            RepoConfig {
+                builtin: Some(
+                    serde_json::from_str(r#"{"network":{"mode":"public"},"vcpus":0}"#).unwrap(),
+                ),
+                ..Default::default()
+            },
+            GlobalConfig {
+                runtime: Some("builtin-experimental".into()),
+                builtin: Some(serde_json::from_str(r#"{"network":{"mode":"none"}}"#).unwrap()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            config.builtin_settings().is_err(),
+            "the launch settings are invalid"
+        );
+        match detect_effective(&config) {
+            Ok(rt) => assert_eq!(rt.engine().runtime_name(), "builtin"),
+            Err(
+                EngineError::BuiltinRuntimeUnavailable { .. }
+                | EngineError::BuiltinTargetUnreleased { .. }
+                | EngineError::AmbientRuntimeOverride { .. },
+            ) => {}
+            Err(e) => panic!("detection must not validate per-launch settings, got: {e:?}"),
+        }
+    }
+
     #[test]
     fn build_runtimes_do_not_import_images() {
         use crate::data::config::image_source::ImageSourceSpec;
@@ -673,9 +715,9 @@ mod tests {
         assert!(rt1.container_runtime().is_some());
         assert!(rt1.sandbox_runtime().is_none());
 
-        // Step 2: sbx → SandboxRuntime (or BackendUnsupportedOnPlatform on Linux/x86)
+        // Step 2: sbx → SandboxRuntime (or BackendUnsupportedOnPlatform on Linux)
         let rt2 = detect(&sbx_cfg);
-        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        if cfg!(target_os = "linux") {
             assert!(matches!(
                 rt2,
                 Err(EngineError::BackendUnsupportedOnPlatform { .. })

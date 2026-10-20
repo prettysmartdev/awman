@@ -31,7 +31,7 @@ fn target(
             id: id.into(),
             token: token.into(),
             remove,
-            finished: finished.clone(),
+            cleanup_claimed: finished.clone(),
         },
         finished,
     )
@@ -61,6 +61,26 @@ async fn an_agent_that_ignores_interrupt_is_killed_and_removed_after_the_grace()
     assert_eq!(driver.is_stopped(&id), None, "removed");
 }
 
+/// When the grace timer cleans up first, it claims cleanup: the exit path that
+/// follows (the agent dying of the kill) sees the claim and does not run
+/// `finish_owned` a second time, concurrently.
+#[tokio::test]
+async fn the_grace_timer_claims_cleanup_so_the_exit_path_skips_it() {
+    let driver = FakeDriver::new();
+    let id = sandbox(&driver, "awman-claimed", "a/1");
+    let (control, _log) = recorder();
+    let (owner, claimed) = target(&driver, &id, "a/1", true);
+    ExecCancelHandle::new(control, Some(owner), Duration::from_millis(50))
+        .cancel()
+        .unwrap();
+    settle("kill after the grace", || driver.finished().len() == 1).await;
+    assert!(
+        claimed.swap(true, Ordering::AcqRel),
+        "the exit path must find cleanup already claimed"
+    );
+    assert_eq!(driver.finished().len(), 1);
+}
+
 #[tokio::test]
 async fn keep_is_honoured_when_a_cancel_has_to_kill() {
     let driver = FakeDriver::new();
@@ -85,6 +105,7 @@ async fn no_kill_when_the_exit_path_finishes_inside_the_grace() {
         .cancel()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
+    // The exit path claims cleanup first.
     finished.store(true, Ordering::Release);
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(*log.lock().unwrap(), [Sent::Interrupt]);

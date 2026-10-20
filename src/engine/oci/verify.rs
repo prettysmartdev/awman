@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
+use crate::data::fs::hash::sha256_hex;
 use crate::data::oci_identity::Digest;
 use crate::engine::error::EngineError;
 
@@ -22,11 +23,6 @@ pub(super) const CHUNK: usize = 64 * 1024;
 
 /// How often (in bytes written) a sink re-checks free space.
 const DISK_CHECK_INTERVAL: u64 = 16 * 1024 * 1024;
-
-/// Hex SHA-256 of `bytes`.
-pub(super) fn sha256_hex(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
-}
 
 /// `sha256:<hex>` digest of `bytes`.
 pub(super) fn sha256_digest(bytes: &[u8]) -> Digest {

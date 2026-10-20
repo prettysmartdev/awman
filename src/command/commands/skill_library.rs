@@ -698,6 +698,7 @@ mod tests {
     /// A symlink planted at `.library/<slug>` must never be treated as a
     /// managed clone: `pull_latest` hard-resets, and following the link would
     /// destroy a repository awman does not own (WI-0103 remediation).
+    #[cfg(unix)]
     #[test]
     fn pull_into_symlinked_library_path_errors_and_leaves_target_untouched() {
         let upstream = Upstream::new(&[("skills/foo/SKILL.md", "# foo")]);

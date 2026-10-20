@@ -280,7 +280,12 @@ impl Command for ReadyCommand {
             text: "Checking agent image…".into(),
         });
 
-        let resolved_builtin = session.effective_config().builtin_settings()?;
+        let runtime = self
+            .engines
+            .require_container_runtime()
+            .map_err(CommandError::from)?
+            .clone();
+        let resolved_builtin = ReadyEngine::builtin_inputs(&session, runtime.as_ref())?;
         let mut engine = ReadyEngine::new(
             resolved_builtin,
             crate::data::config::global::GlobalConfig::data_home_with(
@@ -289,10 +294,7 @@ impl Command for ReadyCommand {
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),
-            self.engines
-                .require_container_runtime()
-                .map_err(CommandError::from)?
-                .clone(),
+            runtime,
             self.engines.agent_engine.clone(),
             options,
         );
@@ -447,6 +449,7 @@ mod compat_tests {
                 store: "docker unix:///var/run/docker.sock".into(),
                 tag: "awman-repo:latest".into(),
                 build: StepStatus::Done,
+                optional: false,
             });
         let mut result = image_result(StepStatus::Done, StepStatus::Done);
         result

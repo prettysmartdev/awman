@@ -34,12 +34,33 @@ impl BuildPreparation {
 }
 
 impl AgentImagePreparer {
+    /// Take the cross-process build lock on `reference` in `store`. When
+    /// another awman process holds it (e.g. a running `awman ready --build`),
+    /// say so before waiting rather than block silently.
     pub(super) async fn build_lock(
         &self,
         store: BuildStoreKey,
         reference: String,
+        frontend: &mut (impl crate::data::message::UserMessageSink + ?Sized),
     ) -> Result<ImageBuildLease, String> {
         let locks = self.build_locks.clone();
+        let (try_locks, try_store, try_reference) =
+            (locks.clone(), store.clone(), reference.clone());
+        if let Some(lease) = self
+            .blocking(move || try_locks.try_lock(&try_store, &try_reference))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(lease);
+        }
+        frontend.write_message(crate::data::message::UserMessage {
+            level: crate::data::message::MessageLevel::Info,
+            text: format!(
+                "Waiting for another awman process to finish with {reference} in {}…",
+                store.describe()
+            ),
+        });
         let cancel = self.cancel.clone();
         self.blocking(move || {
             locks.lock(&store, &reference, || {
@@ -176,9 +197,15 @@ impl AgentImagePreparer {
         // Leases first, base before agent in every process, held through
         // the import and the receipt update: no other awman process can
         // rebuild or retag either reference between inspection and import.
-        let mut leases = vec![self.build_lock(store.clone(), project_ref.clone()).await?];
+        let mut leases = vec![
+            self.build_lock(store.clone(), project_ref.clone(), frontend)
+                .await?,
+        ];
         if agent_ref != project_ref {
-            leases.push(self.build_lock(store.clone(), agent_ref.clone()).await?);
+            leases.push(
+                self.build_lock(store.clone(), agent_ref.clone(), frontend)
+                    .await?,
+            );
         }
         let pending = self.load_receipt(&key).await?;
         if !policy.force_build() {
@@ -215,11 +242,17 @@ impl AgentImagePreparer {
                         level: MessageLevel::Warning,
                         text: warning.to_string(),
                     });
-                    return Ok(BuildPreparation::import_only(
-                        StepStatus::Warn(note),
-                        Some(warning),
-                    ));
+                    // Keep the store/reference leases through the import, as
+                    // every other path does: another awman process must not
+                    // rebuild or retag the reference meanwhile.
+                    let mut prepared =
+                        BuildPreparation::import_only(StepStatus::Warn(note), Some(warning));
+                    prepared._leases = leases;
+                    return Ok(prepared);
                 }
+                // The build row is a `StepStatus`, whose failure is display
+                // text by design (Layer 0 result data); the typed error's
+                // `Display` is that text, so every frontend shows the same.
                 Err(e) => return Err(e.to_string()),
                 // Importable as the builder-disabled path imports it; the
                 // store cannot vouch for one platform manifest.
@@ -356,6 +389,7 @@ impl AgentImagePreparer {
                     store: store.describe(),
                     tag: project_tag.clone(),
                     build: status,
+                    optional: agent != self.context.default_agent,
                 });
                 if let Err(e) = result {
                     let message = e.to_string();

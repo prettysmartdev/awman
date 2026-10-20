@@ -48,6 +48,10 @@ pub struct ApiServeConfig {
     /// `None` means TLS is disabled (plain HTTP); only set when the user
     /// explicitly passed `--dangerously-skip-tls`.
     pub tls_material: Option<TlsMaterial>,
+    /// The environment of the invocation that started the server. Every API
+    /// session inherits it, so a relocated `AWMAN_CONFIG_HOME` (and the global
+    /// builtin network policy in it) applies to API sessions too.
+    pub env: crate::data::config::env::EnvSnapshot,
 }
 
 /// The one-time disclosure of a freshly minted API key.
@@ -441,6 +445,7 @@ async fn run_start(
         workdirs,
         dangerously_skip_auth: flags.dangerously_skip_auth,
         tls_material,
+        env: session.env().clone(),
     };
 
     let runtime = ApiServerRuntime::bootstrap(config, engines.clone())?;

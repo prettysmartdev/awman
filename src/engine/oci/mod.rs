@@ -1061,7 +1061,7 @@ mod tests {
                 };
                 let cache = OciCache::open(dir.path()).unwrap();
                 let refs = cache.root().join("refs");
-                let canonical = refs.join(format!("{}.json", sha256_hex(&key.canonical_key())));
+                let canonical = refs.join(format!("{}.json", sha256_hex(key.canonical_key())));
                 let legacy_key = format!(
                     "v1\ndocker-store\n{}\n{}\n{}",
                     key.locator, key.reference, key.platform

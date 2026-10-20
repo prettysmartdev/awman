@@ -429,6 +429,7 @@ impl ContainerBackend for DockerBackend {
         request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
+        request.require_runtime_build()?;
         let tag = request.reference.as_str();
         let dockerfile = request.dockerfile.as_path();
         let context = request.context.as_path();
@@ -1681,7 +1682,6 @@ mod tests {
             ContainerOption::Image(ImageRef::new("img:latest")),
             ContainerOption::Entrypoint(Entrypoint::new(["cline", "--acp"])),
             ContainerOption::Acp(true),
-            ContainerOption::NonInteractivePrintFlag("task".into()),
             ContainerOption::AgentModeFlags(vec!["--yolo".into()]),
             ContainerOption::SeededPrompt("do the task".into()),
         ]);

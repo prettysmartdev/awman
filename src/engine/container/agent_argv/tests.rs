@@ -42,7 +42,6 @@ fn maps_agent_flags_without_splitting_values() {
 fn emits_every_field_in_the_fixed_order() {
     let options = ResolvedContainerOptions {
         interactive: true,
-        non_interactive_flag: Some("exec".into()),
         agent_mode_flags: vec!["--yolo".into()],
         disallowed_tools: vec!["Write".into(), "Bash".into()],
         disallowed_tools_flag: Some("--deny".into()),
@@ -59,7 +58,6 @@ fn emits_every_field_in_the_fixed_order() {
     assert_eq!(
         tail(&options),
         vec![
-            "exec",
             "--yolo",
             "--deny",
             "Write,Bash",
@@ -83,7 +81,6 @@ fn acp_tail_is_empty() {
     let options = ResolvedContainerOptions {
         acp: true,
         interactive: true,
-        non_interactive_flag: Some("exec".into()),
         agent_mode_flags: vec!["--yolo".into()],
         seeded_prompt: Some("go".into()),
         ..Default::default()

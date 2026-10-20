@@ -1,9 +1,15 @@
 //! `SessionManager` — concurrency-safe collection of `Session` values.
 //!
-//! The CLI uses `SessionManager::in_memory()` and creates exactly one session
-//! per invocation. The TUI uses `SessionManager::in_memory()` and creates one
+//! The CLI uses `SessionManager::in_memory(..)` and creates exactly one session
+//! per invocation. The TUI uses `SessionManager::in_memory(..)` and creates one
 //! session per tab. The API server uses `SessionManager::with_persistence(...)`
 //! and one session per API session.
+//!
+//! Every manager is built with the owning process's environment snapshot, and
+//! a session it opens without an explicit `env` inherits it. An empty snapshot
+//! would make `GlobalConfig` ignore a relocated `AWMAN_CONFIG_HOME` and fall
+//! back to defaults, which for the builtin runtime means a public network
+//! instead of the user's global policy.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,6 +17,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::RwLock;
 
+use crate::data::config::env::EnvSnapshot;
 use crate::data::error::DataError;
 use crate::data::session::{GitRootResolver, Session, SessionId, SessionOpenOptions};
 
@@ -95,23 +102,43 @@ pub struct SessionManager {
     // ownership boundary instead of maintaining a second API-only map.
     sessions: Arc<StdRwLock<HashMap<String, ManagedSession>>>,
     store: Option<Arc<dyn SessionStore>>,
+    /// The owning process's environment: the default for every session this
+    /// manager opens.
+    env: EnvSnapshot,
 }
 
 impl SessionManager {
-    /// Construct an in-memory manager with no persistence backend.
-    pub fn in_memory() -> Self {
+    /// Construct an in-memory manager with no persistence backend. `env` is
+    /// the owning process's environment snapshot (`EnvSnapshot::empty()` only
+    /// in tests).
+    pub fn in_memory(env: EnvSnapshot) -> Self {
         Self {
             sessions: Arc::new(StdRwLock::new(HashMap::new())),
             store: None,
+            env,
         }
     }
 
     /// Construct a manager backed by the supplied `SessionStore`.
-    pub fn with_persistence(store: Arc<dyn SessionStore>) -> Self {
+    pub fn with_persistence(store: Arc<dyn SessionStore>, env: EnvSnapshot) -> Self {
         Self {
             sessions: Arc::new(StdRwLock::new(HashMap::new())),
             store: Some(store),
+            env,
         }
+    }
+
+    /// The environment snapshot sessions opened here inherit.
+    pub fn env(&self) -> &EnvSnapshot {
+        &self.env
+    }
+
+    /// Fill in the manager's environment when the caller supplied none.
+    fn with_env(&self, mut opts: SessionOpenOptions) -> SessionOpenOptions {
+        if opts.env.is_none() {
+            opts.env = Some(self.env.clone());
+        }
+        opts
     }
 
     /// Insert a fully-constructed session, returning its id.
@@ -161,7 +188,7 @@ impl SessionManager {
             });
         }
         let resolver = DirectoryGitRootResolver;
-        let session = Session::open_or_workdir_fallback(dir, &resolver, opts)?;
+        let session = Session::open_or_workdir_fallback(dir, &resolver, self.with_env(opts))?;
         self.create(session)
     }
 
@@ -181,7 +208,7 @@ impl SessionManager {
             });
         }
         let resolver = DirectoryGitRootResolver;
-        let session = Session::open_or_workdir_fallback(dir, &resolver, opts)?;
+        let session = Session::open_or_workdir_fallback(dir, &resolver, self.with_env(opts))?;
         let key = key.unwrap_or_else(|| session.id().to_string());
         self.insert_with_key(key, session)
     }
@@ -271,12 +298,6 @@ impl SessionManager {
     }
 }
 
-impl Default for SessionManager {
-    fn default() -> Self {
-        Self::in_memory()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_get_happy_path() {
         let env = TestEnv::new();
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         let session = env.make_session();
         let expected_id = session.id();
 
@@ -321,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_created_sessions() {
         let env = TestEnv::new();
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
 
         let s1 = env.make_session();
         let s2 = env.make_session();
@@ -340,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn update_mutates_session_and_is_visible_in_get() {
         let env = TestEnv::new();
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         let session = env.make_session();
         let id = manager.create(session).unwrap();
 
@@ -358,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn remove_happy_path_then_get_returns_not_found() {
         let env = TestEnv::new();
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         let session = env.make_session();
         let id = manager.create(session).unwrap();
 
@@ -370,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_nonexistent_returns_session_not_found() {
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         let fake_id = SessionId::new();
         let err = manager.remove(&fake_id).unwrap_err();
         assert!(
@@ -381,14 +402,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_nonexistent_returns_session_not_found() {
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         let fake_id = SessionId::new();
         assert!(manager.get(&fake_id).is_none());
     }
 
     #[tokio::test]
     async fn in_memory_is_empty_initially() {
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         assert!(manager.is_empty().await);
         assert_eq!(manager.len().await, 0);
     }
@@ -403,7 +424,7 @@ mod tests {
         std::fs::create_dir_all(&git_child).unwrap();
         std::fs::create_dir_all(&work_dir).unwrap();
         let missing = root.path().join("missing");
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
 
         let git_id = manager
             .open_or_create(git_child.clone(), SessionOpenOptions::default())
@@ -436,7 +457,10 @@ mod tests {
     async fn with_persistence_calls_store_on_create() {
         let env = TestEnv::new();
         let store = Arc::new(InMemorySessionStore::new());
-        let manager = SessionManager::with_persistence(Arc::clone(&store) as Arc<dyn SessionStore>);
+        let manager = SessionManager::with_persistence(
+            Arc::clone(&store) as Arc<dyn SessionStore>,
+            crate::data::config::env::EnvSnapshot::empty(),
+        );
         assert!(manager.has_persistence());
 
         let session = env.make_session();
@@ -451,7 +475,10 @@ mod tests {
     async fn with_persistence_calls_store_on_update() {
         let env = TestEnv::new();
         let store = Arc::new(InMemorySessionStore::new());
-        let manager = SessionManager::with_persistence(Arc::clone(&store) as Arc<dyn SessionStore>);
+        let manager = SessionManager::with_persistence(
+            Arc::clone(&store) as Arc<dyn SessionStore>,
+            crate::data::config::env::EnvSnapshot::empty(),
+        );
 
         let session = env.make_session();
         let id = manager.create(session).unwrap();
@@ -471,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_has_no_persistence_flag() {
-        let manager = SessionManager::in_memory();
+        let manager = SessionManager::in_memory(crate::data::config::env::EnvSnapshot::empty());
         assert!(!manager.has_persistence());
     }
 
@@ -481,7 +508,9 @@ mod tests {
     async fn concurrent_create_produces_n_distinct_sessions() {
         let git_tmp = tempfile::tempdir().unwrap();
         let home_tmp = tempfile::tempdir().unwrap();
-        let manager = Arc::new(SessionManager::in_memory());
+        let manager = Arc::new(SessionManager::in_memory(
+            crate::data::config::env::EnvSnapshot::empty(),
+        ));
 
         const N: usize = 10;
         let mut handles = Vec::with_capacity(N);
@@ -551,7 +580,10 @@ mod tests {
         {
             let raw = Arc::new(SqliteSessionStore::open(db_tmp.path()).unwrap());
             let adapter: Arc<dyn SessionStore> = Arc::new(SqliteStoreAdapter(Arc::clone(&raw)));
-            let manager = SessionManager::with_persistence(adapter);
+            let manager = SessionManager::with_persistence(
+                adapter,
+                crate::data::config::env::EnvSnapshot::empty(),
+            );
 
             for _ in 0..3 {
                 let session = Session::for_tests_isolated(git_tmp.path(), home_tmp.path());

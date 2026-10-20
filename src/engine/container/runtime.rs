@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
+use crate::data::config::resolved_builtin::BuiltinProcessConfig;
 use crate::data::oci_identity::ImageIdentity;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
@@ -48,6 +48,7 @@ pub(super) static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     kit_declarative: false,
     has_image_store: true,
     image_acquisition: ImageAcquisition::Build,
+    per_launch_vm_settings: false,
 };
 
 /// The process-wide part of the builtin microVM backend's settings: one
@@ -74,9 +75,9 @@ pub struct BuiltinRuntimeSettings {
 }
 
 impl BuiltinRuntimeSettings {
-    /// Select the process-owned fields from Layer 0's fully resolved config.
-    /// All merging, defaults and validation have already happened there.
-    pub fn resolve(resolved: &ResolvedBuiltinConfig) -> Self {
+    /// Select the process-owned fields Layer 0 resolved. All merging and
+    /// defaults have already happened there.
+    pub fn resolve(resolved: &BuiltinProcessConfig) -> Self {
         Self {
             state_dir: resolved.state_dir.clone(),
             ambient_overrides: resolved.ambient_overrides.clone(),
@@ -524,7 +525,7 @@ mod tests {
                 },
             )
         };
-        let resolved = layered("{}", "{}").builtin_settings().unwrap();
+        let resolved = layered("{}", "{}").builtin_process_settings().unwrap();
         let settings = BuiltinRuntimeSettings::resolve(&resolved);
         assert_eq!(
             settings,

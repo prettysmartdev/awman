@@ -42,6 +42,7 @@ static CAPABILITIES: Capabilities = Capabilities {
     kit_declarative: false,
     has_image_store: true,
     image_acquisition: ImageAcquisition::Import,
+    per_launch_vm_settings: true,
 };
 pub struct BuiltinBackend {
     pub driver: Arc<dyn SandboxDriver>,

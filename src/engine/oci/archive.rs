@@ -1710,7 +1710,7 @@ pub(crate) mod tests {
             self
         }
         pub(crate) fn blob(self, data: &[u8]) -> (Self, String) {
-            let hex = crate::engine::oci::verify::sha256_hex(data);
+            let hex = crate::data::fs::hash::sha256_hex(data);
             (self.file(&format!("blobs/sha256/{hex}"), data), hex)
         }
         pub(crate) fn finish(self) -> Vec<u8> {
@@ -1724,10 +1724,7 @@ pub(crate) mod tests {
         let mut descs = Vec::new();
         let mut diff_ids = Vec::new();
         for l in layers {
-            diff_ids.push(format!(
-                "sha256:{}",
-                crate::engine::oci::verify::sha256_hex(l)
-            ));
+            diff_ids.push(format!("sha256:{}", crate::data::fs::hash::sha256_hex(l)));
             let gz = gzip(l);
             let (o, hex) = outer.blob(&gz);
             outer = o;
@@ -1767,13 +1764,10 @@ pub(crate) mod tests {
             let p = format!("layer{i}/layer.tar");
             outer = outer.file(&p, l);
             paths.push(p);
-            diff_ids.push(format!(
-                "sha256:{}",
-                crate::engine::oci::verify::sha256_hex(l)
-            ));
+            diff_ids.push(format!("sha256:{}", crate::data::fs::hash::sha256_hex(l)));
         }
         let config = config_json(platform, &diff_ids);
-        let config_name = format!("{}.json", crate::engine::oci::verify::sha256_hex(&config));
+        let config_name = format!("{}.json", crate::data::fs::hash::sha256_hex(&config));
         outer = outer.file(&config_name, &config);
         let manifest = serde_json::to_vec(&serde_json::json!([
             {"Config": config_name, "RepoTags": ["awman-x-claude:latest"], "Layers": paths}
@@ -2048,7 +2042,7 @@ pub(crate) mod tests {
     #[test]
     fn legacy_save_identity_depends_on_content_not_entry_names() {
         let build = |layer: Vec<u8>| {
-            let diff = format!("sha256:{}", crate::engine::oci::verify::sha256_hex(&layer));
+            let diff = format!("sha256:{}", crate::data::fs::hash::sha256_hex(&layer));
             let config = config_json(&arm64(), &[diff]);
             Outer::new()
                 .file("l/layer.tar", &layer)
@@ -2069,9 +2063,9 @@ pub(crate) mod tests {
     fn modern_save_manifest_digest_must_match_config_and_layers() {
         let l1 = base_layer();
         let l2 = layer_tar(&[L::File("other", b"x", 0o644)]);
-        let diff = format!("sha256:{}", crate::engine::oci::verify::sha256_hex(&l1));
+        let diff = format!("sha256:{}", crate::data::fs::hash::sha256_hex(&l1));
         let config = config_json(&arm64(), &[diff]);
-        let hex = crate::engine::oci::verify::sha256_hex;
+        let hex = crate::data::fs::hash::sha256_hex;
         let (l1_hex, l2_hex, config_hex) = (hex(&l1), hex(&l2), hex(&config));
         let manifest_with = |layer_hex: &str| {
             serde_json::to_vec(&serde_json::json!({
@@ -2126,7 +2120,7 @@ pub(crate) mod tests {
     #[test]
     fn legacy_save_archive_symlinked_layers_are_followed() {
         let layer = base_layer();
-        let diff = format!("sha256:{}", crate::engine::oci::verify::sha256_hex(&layer));
+        let diff = format!("sha256:{}", crate::data::fs::hash::sha256_hex(&layer));
         let config = config_json(&arm64(), &[diff.clone(), diff]);
         let bytes = Outer::new()
             .file("a/layer.tar", &layer)
@@ -2149,14 +2143,14 @@ pub(crate) mod tests {
             &arm64(),
             &[format!(
                 "sha256:{}",
-                crate::engine::oci::verify::sha256_hex(&one)
+                crate::data::fs::hash::sha256_hex(&one)
             )],
         );
         let c2 = config_json(
             &arm64(),
             &[format!(
                 "sha256:{}",
-                crate::engine::oci::verify::sha256_hex(&two)
+                crate::data::fs::hash::sha256_hex(&two)
             )],
         );
         let bytes = Outer::new()

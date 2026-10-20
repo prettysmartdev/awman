@@ -665,6 +665,20 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
 }
 
 /// Build the entrypoint with optional non-interactive shape.
+/// The flags [`entrypoint_for`] itself adds for this launch shape, beyond the
+/// bare entrypoint and the non-interactive form. A user `agentFlags` entry
+/// naming one of them is dropped from that launch rather than passed twice.
+pub fn entrypoint_managed_flags(
+    matrix: &AgentMatrix,
+    non_interactive: bool,
+) -> &'static [&'static str] {
+    if non_interactive {
+        &[]
+    } else {
+        matrix.interactive_only_flags
+    }
+}
+
 pub fn entrypoint_for(matrix: &AgentMatrix, non_interactive: bool) -> Entrypoint {
     let mut parts: Vec<String> = matrix
         .interactive_entrypoint
@@ -679,9 +693,12 @@ pub fn entrypoint_for(matrix: &AgentMatrix, non_interactive: bool) -> Entrypoint
             // because the seeded prompt is positional.
             parts.push(flag.to_string());
         }
-    } else {
-        parts.extend(matrix.interactive_only_flags.iter().map(|s| s.to_string()));
     }
+    parts.extend(
+        entrypoint_managed_flags(matrix, non_interactive)
+            .iter()
+            .map(|s| s.to_string()),
+    );
     Entrypoint(parts)
 }
 

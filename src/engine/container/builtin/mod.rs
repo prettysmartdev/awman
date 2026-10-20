@@ -31,6 +31,8 @@ mod embedded;
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod exec_bridge;
 #[cfg(all(test, unix))]
+pub(super) use exec_bridge::conformance_launcher;
+#[cfg(all(test, unix))]
 mod fake;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]

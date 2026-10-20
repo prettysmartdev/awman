@@ -265,8 +265,7 @@ impl ExecWorkflowCommand {
         frontend: Box<dyn ExecWorkflowCommandFrontend>,
     ) -> Result<ExecWorkflowOutcome, CommandError> {
         let mut frontend = SharedWorkflowFrontend::new(frontend);
-        frontend
-            .with(|frontend| LaunchPolicy::for_session(&self.session).warn_legacy_config(frontend));
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         // ── Effective (implied) flags: --dynamic forces --yolo, --worktree,
         //    and context(workflow) (WI-0092 §4). Computed once so all
@@ -371,12 +370,11 @@ impl ExecWorkflowCommand {
             .git_engine
             .resolve_root(&worktree_path)
             .map_err(CommandError::from)?;
-        let leader_session = Session::open_at_git_root(
-            worktree_path.clone(),
-            leader_git_root,
-            crate::data::session::SessionOpenOptions::default(),
-        )
-        .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?;
+        // The base session's builtin block, default agent, env and global
+        // config carry over: the worktree checkout lacks uncommitted edits.
+        let leader_session =
+            Session::open_worktree_for(worktree_path.clone(), leader_git_root, &self.session)
+                .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?;
 
         let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
 

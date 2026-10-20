@@ -164,7 +164,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
         ("AWMAN_CONFIG_HOME", dir.as_str()),
         ("AWMAN_TEST_ISOLATION", "1"),
     ]));
-    let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_settings().unwrap());
+    let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_process_settings().unwrap());
     let isolated = std::env::var("AWMAN_TEST_ISOLATION").is_ok();
     if isolated {
         assert!(
@@ -184,7 +184,7 @@ fn builtin_test_gate_is_off_by_default_in_resolved_settings() {
         ("AWMAN_CONFIG_HOME", dir.as_str()),
         ("AWMAN_TEST_BUILTIN", "1"),
     ]));
-    let resolved = BuiltinRuntimeSettings::resolve(&gated.builtin_settings().unwrap());
+    let resolved = BuiltinRuntimeSettings::resolve(&gated.builtin_process_settings().unwrap());
     assert!(
         !resolved.test_isolation,
         "AWMAN_TEST_BUILTIN=1 opts back in"
@@ -200,7 +200,7 @@ fn builtin_ambient_msb_variables_reach_the_settings_and_block_detection() {
         ("MSB_PATH", "/somewhere/else/msb"),
         ("MSB_LIBKRUNFW_PATH", "/somewhere/else/libkrunfw"),
     ]));
-    let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_settings().unwrap());
+    let resolved = BuiltinRuntimeSettings::resolve(&config.builtin_process_settings().unwrap());
     assert_eq!(
         resolved.ambient_overrides,
         vec!["MSB_PATH", "MSB_LIBKRUNFW_PATH"]

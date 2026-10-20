@@ -13,7 +13,8 @@ use std::sync::Arc;
 use super::Engines;
 use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, HOME};
 use crate::data::ready_summary::ReadyImageAction;
-use crate::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
+use crate::data::session::{AgentName, Session, SessionOpenOptions};
+use crate::data::session_manager::SessionManager;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::agent_runtime::DetectedRuntime;
 use crate::engine::auth::AgentCredentials;
@@ -58,25 +59,40 @@ impl Host {
         }
     }
 
-    /// A TUI tab opened on `root` (`App::add_tab` → `Session::open`).
-    fn tui_tab(&self, root: &Path) -> Session {
-        Session::open(
-            root.to_path_buf(),
-            &StaticGitRootResolver::new(root),
-            self.options(),
-        )
-        .unwrap()
+    /// The process's session manager, built (as the TUI and the API server
+    /// build theirs) from the process environment.
+    fn manager(&self) -> SessionManager {
+        SessionManager::in_memory(self.env())
     }
 
-    /// An API session on `root` (`ApiServerRuntime` →
-    /// `Session::open_or_workdir_fallback`).
+    /// A TUI tab opened on `root`, exactly as `App::add_tab` opens one: through
+    /// the process's `SessionManager` with default options, so the env comes
+    /// from the manager and not from the test.
+    fn tui_tab(&self, root: &Path) -> Session {
+        let manager = self.manager();
+        let id = manager
+            .open_or_create(root.to_path_buf(), SessionOpenOptions::default())
+            .unwrap();
+        let session = manager.get(&id).unwrap();
+        let session = session.try_read().unwrap().clone();
+        session
+    }
+
+    /// An API session on `root`, as API session setup opens one
+    /// (`open_or_create_with_key` with default options).
     fn api_session(&self, root: &Path) -> Session {
-        Session::open_or_workdir_fallback(
-            root.to_path_buf(),
-            &StaticGitRootResolver::new(root),
-            self.options(),
-        )
-        .unwrap()
+        let session = self
+            .manager()
+            .open_or_create_with_key(None, root.to_path_buf(), SessionOpenOptions::default())
+            .unwrap();
+        let session = session.try_read().unwrap().clone();
+        session
+    }
+
+    /// A worktree session opened for `invoker`, as `exec workflow` and the
+    /// dynamic leader open theirs.
+    fn worktree(&self, checkout: &Path, invoker: &Session) -> Session {
+        Session::open_worktree_for(checkout.to_path_buf(), checkout.to_path_buf(), invoker).unwrap()
     }
 
     /// A squad task's session (`SquadEvaluation::open_session` →
@@ -341,7 +357,7 @@ fn a_tui_tab_and_an_api_session_each_honour_their_own_builder_flag() {
     let engines = engines(&fake, &tab);
     let ready = |session: &Session| {
         crate::engine::ready::ReadyEngine::new(
-            session.effective_config().builtin_settings().unwrap(),
+            Some(session.effective_config().builtin_settings().unwrap()),
             crate::data::config::global::GlobalConfig::data_home_with(
                 session.effective_config().env(),
             )
@@ -540,4 +556,82 @@ async fn shared_engines_preparation_obeys_each_sessions_builder_flag() {
         }
     }
     assert_eq!(imported.imports.lock().unwrap().len(), 4);
+}
+
+/// A TUI tab or API session opened with default options gets the process's
+/// environment from its `SessionManager`, so a global network policy under a
+/// relocated `AWMAN_CONFIG_HOME` still confines it. An empty env would read
+/// `~/.awman` instead and fall back to the `public` default.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_opened_with_default_options_keep_a_relocated_global_policy() {
+    let host = Host::new(r#"{"network":{"mode":"none"}}"#);
+    let plain = repo(None);
+    let fake = FakeBuiltin::new();
+    let tab = host.tui_tab(plain.path());
+    let engines = engines(&fake, &tab);
+    for session in [tab, host.api_session(plain.path())] {
+        assert_eq!(
+            session.env().get(AWMAN_CONFIG_HOME),
+            host.env().get(AWMAN_CONFIG_HOME)
+        );
+        let vm = launch(&fake, &engines, &session).await;
+        assert!(
+            !vm.network_enabled,
+            "the global `none` policy must survive a default-options open"
+        );
+    }
+
+    // What the regression looked like: an empty env misses the relocated
+    // global file entirely.
+    let empty = Session::open_at_git_root(
+        plain.path().to_path_buf(),
+        plain.path().to_path_buf(),
+        SessionOpenOptions {
+            env: Some(EnvSnapshot::empty()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(empty.global_config().builtin.is_none());
+}
+
+/// A worktree checkout is cut from the last commit, so its config can lack
+/// the invoker's uncommitted `builtin` block. The worktree session keeps the
+/// invoker's narrowing (and default agent), not the checkout's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_session_keeps_the_invokers_uncommitted_narrowing() {
+    let host = Host::new(GLOBAL);
+    let invoking = repo(Some(REPO_B));
+    std::fs::write(
+        invoking.path().join(".awman/config.json"),
+        format!(r#"{{"agent":"codex","builtin":{REPO_B}}}"#),
+    )
+    .unwrap();
+    // The checkout's committed config: no builtin block, a different agent.
+    let checkout = repo(None);
+    std::fs::create_dir_all(checkout.path().join(".awman")).unwrap();
+    std::fs::write(
+        checkout.path().join(".awman/config.json"),
+        r#"{"agent":"claude"}"#,
+    )
+    .unwrap();
+    let fake = FakeBuiltin::new();
+    let invoker = host.tui_tab(invoking.path());
+    let engines = engines(&fake, &invoker);
+    let worktree = host.worktree(checkout.path(), &invoker);
+
+    assert_eq!(worktree.git_root(), checkout.path());
+    assert_eq!(worktree.default_agent().map(|a| a.as_str()), Some("codex"));
+    assert_eq!(
+        worktree.effective_config().agent().as_deref(),
+        Some("codex")
+    );
+    assert_eq!(expected(&worktree), expected(&invoker));
+    for vm in [
+        launch(&fake, &engines, &worktree).await,
+        launch_background(&fake, &engines, &worktree),
+    ] {
+        assert!(!vm.network_enabled, "repo B's `none` must carry over");
+        assert_eq!(vm.vcpus, 3);
+    }
 }

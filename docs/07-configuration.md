@@ -358,12 +358,13 @@ awman appends each agent's list to the command it launches, after the flags awma
 codex --no-daemon --dangerously-bypass-approvals-and-sandbox --config model_reasoning_effort=high "<prompt>"
 ```
 
-The list applies to every launch of that agent, interactive and non-interactive (`codex exec`, `claude --print`). So pick flags both modes accept, or set them per run with `--agent-flag`. awman already runs interactive Codex with `--no-daemon`; don't add it here, because `codex exec` rejects it.
+The list applies to every launch of that agent, interactive and non-interactive (`codex exec`, `claude --print`). So pick flags both modes accept, or set them per run with `--agent-flag`. awman already runs interactive Codex with `--no-daemon`, so don't add it here: awman drops it from interactive launches rather than pass it twice, warns at launch, and `codex exec` rejects it.
 
 - **One entry per argument.** A flag that takes a value is two entries (`["--config", "key=value"]`) or one entry in its `=` form (`["--config=key=value"]`). Entries are passed exactly as written; there is no shell parsing.
 - **Repo replaces global, per agent.** In the example, the repo's `"claude": []` turns off a global `claude` entry for this repo; agents the repo doesn't list keep their global entries.
 - **For one run, use `--agent-flag`.** `awman chat --agent-flag=--search` replaces the configured list for the agent that command launches. See [`--agent-flag`](03-agent-sessions.md#--agent-flag-arg).
-- **Workflows:** every step gets the entry for the agent that step runs, including steps a dynamic workflow's leader generates, and the leader itself. Runs in a worktree (`--worktree`, `--yolo`, `--auto`, `--dynamic`) read `agentFlags` from the repository you launched from, so an `agentFlags` edit you haven't committed still applies.
+- **Workflows:** every step gets the entry for the agent that step runs, including steps a dynamic workflow's leader generates, and the leader itself. Runs in a worktree (`--worktree`, `--yolo`, `--auto`, `--dynamic`) read `agentFlags` and the repo's default `agent` from the repository you launched from, so an edit you haven't committed still applies.
+- **Remote runs:** `remote exec prompt` and `remote exec workflow` accept `--agent-flag` but don't forward it; awman warns, and the remote host uses its own `agentFlags`.
 - **Docker Sandboxes runtime:** only agents with an argv channel (`kind: agent` kits) receive the flags; for the others awman prints a warning and launches without them.
 
 `agentFlags` is edited in the config file; it is not settable via `config set`.
@@ -429,7 +430,7 @@ An unrecognized value (e.g. a typo) is a fatal error — awman never falls back 
 
 ### Builtin runtime settings
 
-The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected. `network`, `vcpus`, `memoryMib`, `registries`, the image sources and `builder.enabled` are resolved for each session from that session's own repo, so the TUI, the API and squad each honour the repo a session runs in, even when several repos share one awman process.
+The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected. `network`, `vcpus`, `memoryMib`, `registries`, the image sources and `builder.enabled` are resolved for each session from that session's own repo, so the TUI, the API and squad each honour the repo a session runs in, even when several repos share one awman process. A workflow worktree keeps the `builtin` block of the checkout you launched from, so a narrowing you haven't committed still applies. An invalid repo block (for example one that widens the global `network`) fails that repo's launches only; it doesn't stop a TUI or API server started in that repo, and other runtimes never read it.
 
 `builtin.stateDir` is the exception: the state directory is process-wide. If a repo's `builtin.stateDir` resolves to a different directory than the one the awman process uses, the launch is refused with an error naming both paths (`this repository's builtin.stateDir resolves to <repo path>, but this awman process uses the builtin state directory <process path>`). Remove the repo's `stateDir` or set it to the process's path. `AWMAN_BUILTIN_STATE_DIR` outranks every config layer, so it never causes this mismatch.
 
@@ -454,6 +455,18 @@ The optional `builtin` object is read only when `runtime` is `builtin-experiment
       "mode": "public",
       "hostPorts": [8765]
     }
+  }
+}
+```
+
+To build with Apple Containers instead of Docker, use an `apple-local` source:
+
+```json
+{
+  "runtime": "builtin-experimental",
+  "builtin": {
+    "builder": { "enabled": true },
+    "imageSource": { "type": "apple-local" }
   }
 }
 ```

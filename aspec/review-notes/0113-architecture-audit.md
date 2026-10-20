@@ -20,7 +20,7 @@ Findings: 1 Critical, 11 High, 28 Medium, 14 Low (54 total). The two largest rec
 | Spirit / consistency | WEAK | 6 |
 | Simplification | — | 6 |
 
-Baseline metrics are in `0113-architecture-audit-metrics.md`; the 29 hidden warnings are listed in `0113-architecture-audit-hidden-warnings.txt`. This report is the "what"; the fixes are specified in work items `aspec/work-items/0113-architecture-audit-critical-and-high.md` and `aspec/work-items/0114-architecture-audit-medium-and-low.md`.
+Baseline metrics are in `0113-architecture-audit-metrics.md`; the 29 hidden warnings are listed in `0113-architecture-audit-hidden-warnings.txt`. This report is the "what"; the fixes are specified in work items `aspec/work-items/completed/0113-architecture-audit-critical-and-high.md` and `aspec/work-items/completed/0114-architecture-audit-medium-and-low.md`.
 
 ---
 

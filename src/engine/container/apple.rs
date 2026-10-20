@@ -394,6 +394,7 @@ impl ContainerBackend for AppleBackend {
         request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
+        request.require_runtime_build()?;
         let tag = request.reference.as_str();
         let dockerfile = request.dockerfile.as_path();
         let context = request.context.as_path();

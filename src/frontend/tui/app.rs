@@ -1294,7 +1294,9 @@ mod tests {
     fn make_app() -> App {
         let catalogue = CommandCatalogue::get();
         let engines = Engines::for_tests(std::path::Path::new("/tmp"));
-        let session_manager = Arc::new(SessionManager::in_memory());
+        let session_manager = Arc::new(SessionManager::in_memory(
+            crate::data::config::env::EnvSnapshot::empty(),
+        ));
         let session = make_test_session();
         let tab = Tab::new(session);
         App::new(
