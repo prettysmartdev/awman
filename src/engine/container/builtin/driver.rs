@@ -13,6 +13,10 @@ pub struct SandboxSpec {
     pub mount_owner: Option<(u32, u32)>,
     pub vcpus: u8,
     pub memory_mib: u32,
+    /// Size of the writable root disk (everything outside the mounts).
+    pub root_disk_mib: u32,
+    /// How much the guest may add to each mount beyond its existing contents.
+    pub mount_quota_mib: u32,
     /// Compiled network policy. The driver applies all of it or refuses to
     /// create the VM; it never falls back to the SDK's defaults.
     pub network: NetworkPlan,
@@ -34,6 +38,18 @@ impl SandboxSpec {
                 self.memory_mib,
                 crate::data::config::builtin_runtime::MIN_MEMORY_MIB
             )));
+        }
+        if self.root_disk_mib < crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB {
+            return Err(EngineError::Config(format!(
+                "builtin VM root disk {} MiB is below the {} MiB minimum",
+                self.root_disk_mib,
+                crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB
+            )));
+        }
+        if self.mount_quota_mib == 0 {
+            return Err(EngineError::Config(
+                "builtin mount quota must be at least 1 MiB".into(),
+            ));
         }
         for mount in &self.mounts {
             let metadata =
@@ -165,6 +181,8 @@ mod spec_tests {
             mount_owner: None,
             vcpus: 1,
             memory_mib: 256,
+            root_disk_mib: 512,
+            mount_quota_mib: 64,
             network: NetworkPlan::default(),
         }
     }
@@ -222,6 +240,12 @@ mod spec_tests {
         let mut small = spec(Vec::new());
         small.memory_mib = 127;
         assert!(small.check().is_err());
+        let mut tiny_disk = spec(Vec::new());
+        tiny_disk.root_disk_mib = 255;
+        assert!(tiny_disk.check().is_err());
+        let mut no_quota = spec(Vec::new());
+        no_quota.mount_quota_mib = 0;
+        assert!(no_quota.check().is_err());
         assert!(spec(Vec::new()).check().is_ok());
     }
 }

@@ -745,12 +745,17 @@ impl App {
                 }
             }
 
+            // The old container's exit goes first: the engine reports it
+            // before launching the next step, and after a yolo expiry both
+            // can land in one tick. Handling it after the next step's
+            // GroupStarted / pty reset would re-suppress auto-open and leave
+            // the new container's window hidden until Ctrl-M.
+            tab.poll_container_exit();
             // Maintain container_slots before draining output (a Launched
             // event may carry the channels the drain reads) and before
             // aggregating stuck/yolo (drain_stuck_events reads slot flags).
             tab.drain_container_slot_events();
             tab.drain_container_output();
-            tab.poll_container_exit();
             tab.poll_command_completion();
             tab.drain_stuck_events();
             // Restart the git poll task if the worktree path changed.
@@ -1597,6 +1602,84 @@ mod tests {
             }
             _ => panic!("expected WorkflowYoloCountdown for the focused slot"),
         }
+    }
+
+    /// After a yolo expiry the engine reports the old container's exit and
+    /// queues the next parallel group within milliseconds, so both can land
+    /// in one tick. The exit must not re-suppress auto-open for the group.
+    #[test]
+    fn exit_and_group_start_in_one_tick_still_open_the_window() {
+        use crate::frontend::tui::tabs::{
+            ContainerSlotEvent, ContainerSlotIo, ContainerWindowState,
+        };
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-leader".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.container_rendered = true;
+
+        *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        {
+            let mut q = tab.shared.container_slot_events.lock().unwrap();
+            q.push_back(ContainerSlotEvent::GroupStarted);
+            q.push_back(ContainerSlotEvent::Launched {
+                step_name: "build".into(),
+                agent: "claude".into(),
+                model: None,
+                io: Some(ContainerSlotIo {
+                    stdout_rx: rx,
+                    stdin_tx: tokio::sync::mpsc::unbounded_channel().0,
+                    resize_tx: tokio::sync::mpsc::unbounded_channel().0,
+                }),
+            });
+        }
+        tx.send(b"building...".to_vec()).unwrap();
+
+        app.tick_all_tabs();
+        tx.send(b"more".to_vec()).unwrap();
+        app.tick_all_tabs();
+
+        let tab = app.active_tab_mut();
+        assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
+        assert!(!tab.suppress_container_auto_open);
+    }
+
+    /// Sequential variant: the exit and the next step's pty reset land in
+    /// one tick, and the new step's output opens the window before any
+    /// container name arrives.
+    #[test]
+    fn exit_and_pty_reset_in_one_tick_still_open_the_window() {
+        use crate::frontend::tui::tabs::ContainerWindowState;
+        use std::sync::atomic::Ordering;
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.start_container("claude".into(), "awman-step1".into(), 80, 24);
+        tab.container_window_state = ContainerWindowState::Maximized;
+        tab.container_rendered = true;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.focused_slot_mut().unwrap().container_stdout_rx = Some(rx);
+
+        *tab.shared.container_exit_shared.lock().unwrap() = Some(137);
+        tab.shared.pty_reset_flag.store(true, Ordering::Relaxed);
+        tx.send(b"step 2 output".to_vec()).unwrap();
+
+        app.tick_all_tabs();
+
+        let tab = app.active_tab_mut();
+        assert_eq!(tab.container_window_state, ContainerWindowState::Maximized);
+        assert!(!tab.suppress_container_auto_open);
+        assert!(
+            tab.focused_slot()
+                .unwrap()
+                .vt100_parser
+                .screen()
+                .contents()
+                .contains("step 2 output"),
+            "the new step's output survives the reset"
+        );
     }
 
     #[test]

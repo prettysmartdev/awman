@@ -997,11 +997,7 @@ impl ExecWorkflowCommand {
         });
         shared.lock().unwrap().set_pty_active(true);
 
-        let proxy = AgentFrontendProxy {
-            frontend: shared.clone(),
-            acp: false,
-            io: None,
-        };
+        let proxy = AgentFrontendProxy::new(shared.clone(), false);
         let mut execution = match instance.run_with_frontend(Box::new(proxy)) {
             Ok(e) => e,
             Err(e) => {

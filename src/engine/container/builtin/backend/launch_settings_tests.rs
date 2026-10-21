@@ -14,15 +14,20 @@ fn narrowed(vcpus: u8, memory_mib: u32, network: &str) -> BuiltinLaunchSettings 
         memory_mib,
         network: BuiltinNetworkConfig::resolve(None, Some(&repo)).unwrap(),
         repo_state_dir: None,
+        ..BuiltinLaunchSettings::default()
     }
 }
 
 fn allowlist() -> BuiltinLaunchSettings {
-    narrowed(
-        1,
-        512,
-        r#"{"mode":"allowlist","allow":["api.example.com"]}"#,
-    )
+    BuiltinLaunchSettings {
+        root_disk_mib: 1024,
+        mount_quota_mib: 256,
+        ..narrowed(
+            1,
+            512,
+            r#"{"mode":"allowlist","allow":["api.example.com"]}"#,
+        )
+    }
 }
 
 fn offline() -> BuiltinLaunchSettings {
@@ -45,6 +50,15 @@ fn plan_sizes_and_confines_each_launch_by_its_own_settings() {
     let plan_b = rig.backend.plan(with_launch("awman-b", &b)).unwrap();
     assert_eq!((plan_a.spec.vcpus, plan_a.spec.memory_mib), (1, 512));
     assert_eq!((plan_b.spec.vcpus, plan_b.spec.memory_mib), (3, 1024));
+    assert_eq!(
+        (plan_a.spec.root_disk_mib, plan_a.spec.mount_quota_mib),
+        (1024, 256)
+    );
+    assert_eq!(
+        (plan_b.spec.root_disk_mib, plan_b.spec.mount_quota_mib),
+        (30720, 30720),
+        "unset disk settings fall back to the runtime defaults"
+    );
     assert_eq!(
         plan_a.spec.network.policy_json(),
         network::compile(&a.network).policy_json()
@@ -88,6 +102,10 @@ fn start_background_sizes_and_confines_each_launch_by_its_own_settings() {
         assert_eq!(
             (spec.vcpus, spec.memory_mib),
             (launch.vcpus, launch.memory_mib)
+        );
+        assert_eq!(
+            (spec.root_disk_mib, spec.mount_quota_mib),
+            (launch.root_disk_mib, launch.mount_quota_mib)
         );
         assert_eq!(
             spec.network.policy_json(),

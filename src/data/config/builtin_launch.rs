@@ -12,7 +12,9 @@
 use std::path::PathBuf;
 
 use crate::data::config::builtin_network::BuiltinNetworkSettings;
-use crate::data::config::builtin_runtime::{DEFAULT_MEMORY_MIB, DEFAULT_VCPUS};
+use crate::data::config::builtin_runtime::{
+    DEFAULT_MEMORY_MIB, DEFAULT_MOUNT_QUOTA_MIB, DEFAULT_ROOT_DISK_MIB, DEFAULT_VCPUS,
+};
 
 /// The builtin settings one launch is sized and confined by, already layered
 /// (repo over global) and validated. Built by
@@ -23,6 +25,10 @@ pub struct BuiltinLaunchSettings {
     pub vcpus: u8,
     /// Default guest memory in MiB; a launch's own memory limit overrides it.
     pub memory_mib: u32,
+    /// Writable root disk in MiB.
+    pub root_disk_mib: u32,
+    /// Guest-write budget per host mount in MiB.
+    pub mount_quota_mib: u32,
     /// Guest network policy: the global block narrowed by the repo block.
     pub network: BuiltinNetworkSettings,
     /// The state directory this session resolves to, present only when its
@@ -38,6 +44,8 @@ impl Default for BuiltinLaunchSettings {
         Self {
             vcpus: DEFAULT_VCPUS,
             memory_mib: DEFAULT_MEMORY_MIB,
+            root_disk_mib: DEFAULT_ROOT_DISK_MIB,
+            mount_quota_mib: DEFAULT_MOUNT_QUOTA_MIB,
             network: BuiltinNetworkSettings::default(),
             repo_state_dir: None,
         }
@@ -52,6 +60,10 @@ mod tests {
     fn default_is_the_documented_defaults_with_no_repo_state_dir() {
         let settings = BuiltinLaunchSettings::default();
         assert_eq!((settings.vcpus, settings.memory_mib), (2, 4096));
+        assert_eq!(
+            (settings.root_disk_mib, settings.mount_quota_mib),
+            (30720, 30720)
+        );
         assert_eq!(settings.network, BuiltinNetworkSettings::default());
         assert_eq!(settings.repo_state_dir, None);
     }

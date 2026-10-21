@@ -134,6 +134,9 @@ impl Tab {
                     info.container_name = container_name;
                     info.latest_stats = None;
                 }
+                // A fresh container is running — same as the sequential
+                // name pickup in `App::refresh_tabs_from_sessions`.
+                self.suppress_container_auto_open = false;
             }
             ContainerSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
             ContainerSlotEvent::Stuck { step_name } => {
@@ -214,6 +217,19 @@ impl Tab {
             self.suppress_container_auto_open = false;
         }
 
+        let received_any = self.drain_slot_bytes();
+        if received_any
+            && !self.suppress_container_auto_open
+            && self.container_window_state == ContainerWindowState::Hidden
+        {
+            self.container_window_state = ContainerWindowState::Maximized;
+        }
+    }
+
+    /// Feed every slot's pending PTY bytes into its parser. Touches neither
+    /// `pty_reset_flag` nor the window state, so the exit path can flush a
+    /// dead container's tail without consuming the next step's reset.
+    pub(super) fn drain_slot_bytes(&mut self) -> bool {
         let mut received_any = false;
         for slot in &mut self.container_slots {
             let Some(rx) = slot.container_stdout_rx.as_mut() else {
@@ -232,12 +248,7 @@ impl Tab {
                 received_any = true;
             }
         }
-        if received_any
-            && !self.suppress_container_auto_open
-            && self.container_window_state == ContainerWindowState::Hidden
-        {
-            self.container_window_state = ContainerWindowState::Maximized;
-        }
+        received_any
     }
 
     fn slot_mut(&mut self, step_name: &str) -> Option<&mut ContainerSlot> {

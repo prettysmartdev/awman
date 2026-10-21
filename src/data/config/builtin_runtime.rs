@@ -22,6 +22,21 @@ pub const DEFAULT_MEMORY_MIB: u32 = 4096;
 /// to config values and to per-launch memory limits.
 pub const MIN_MEMORY_MIB: u32 = 128;
 
+/// Writable root disk per agent VM, in MiB, when none is configured: the space
+/// the guest has for everything outside its mounts (`/`, `$HOME`, installed
+/// packages). Generous because the disk file is sparse: it only takes host
+/// space as the guest writes. The runtime's own default is 4 GiB.
+pub const DEFAULT_ROOT_DISK_MIB: u32 = 30 * 1024;
+
+/// Smallest writable root disk, in MiB, the runtime accepts.
+pub const MIN_ROOT_DISK_MIB: u32 = 256;
+
+/// How much, in MiB, the guest may add to each host mount (the workspace
+/// included) beyond what it already held, when none is configured. Bounds how
+/// far an agent can fill the host disk through a mount; generous so build
+/// output in the workspace fits. The runtime's own default is 4 GiB.
+pub const DEFAULT_MOUNT_QUOTA_MIB: u32 = 30 * 1024;
+
 /// Subdirectory of the awman data home that holds the builtin runtime's
 /// private state when `stateDir` is not configured.
 pub const DEFAULT_STATE_SUBDIR: &str = "builtin";
@@ -43,6 +58,14 @@ pub struct BuiltinRuntimeConfig {
     /// [`MIN_MEMORY_MIB`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
+    /// Writable root disk in MiB. Default [`DEFAULT_ROOT_DISK_MIB`], at least
+    /// [`MIN_ROOT_DISK_MIB`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_disk_mib: Option<u32>,
+    /// Guest-write budget per host mount in MiB. Default
+    /// [`DEFAULT_MOUNT_QUOTA_MIB`], at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_quota_mib: Option<u32>,
     /// Where `awman ready` acquires images that are not cached yet. No
     /// default: its absence is an error with guidance, never an implicit
     /// registry or daemon lookup.
@@ -174,6 +197,8 @@ impl BuiltinRuntimeConfig {
             state_dir: self.state_dir.clone().or_else(|| base.state_dir.clone()),
             vcpus: self.vcpus.or(base.vcpus),
             memory_mib: self.memory_mib.or(base.memory_mib),
+            root_disk_mib: self.root_disk_mib.or(base.root_disk_mib),
+            mount_quota_mib: self.mount_quota_mib.or(base.mount_quota_mib),
             image_source: self
                 .image_source
                 .clone()
@@ -207,8 +232,19 @@ impl BuiltinRuntimeConfig {
         self.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB)
     }
 
+    /// Configured root disk, or [`DEFAULT_ROOT_DISK_MIB`].
+    pub fn root_disk_mib_or_default(&self) -> u32 {
+        self.root_disk_mib.unwrap_or(DEFAULT_ROOT_DISK_MIB)
+    }
+
+    /// Configured per-mount quota, or [`DEFAULT_MOUNT_QUOTA_MIB`].
+    pub fn mount_quota_mib_or_default(&self) -> u32 {
+        self.mount_quota_mib.unwrap_or(DEFAULT_MOUNT_QUOTA_MIB)
+    }
+
     /// Reject values that cannot be honoured: zero vCPUs, memory below
-    /// [`MIN_MEMORY_MIB`], or an image source that fails
+    /// [`MIN_MEMORY_MIB`], a root disk below [`MIN_ROOT_DISK_MIB`], a zero
+    /// mount quota, or an image source that fails
     /// [`ImageSourceSpec::validate`].
     ///
     /// The network block is not checked here: `EffectiveConfig::builtin_network`
@@ -220,8 +256,9 @@ impl BuiltinRuntimeConfig {
         self.validate_image_sources()
     }
 
-    /// Reject zero vCPUs and memory below [`MIN_MEMORY_MIB`]: the per-launch
-    /// sizing checks.
+    /// Reject zero vCPUs, memory below [`MIN_MEMORY_MIB`], a root disk below
+    /// [`MIN_ROOT_DISK_MIB`] and a zero mount quota: the per-launch sizing
+    /// checks.
     pub fn validate_resources(&self) -> Result<(), String> {
         if self.vcpus == Some(0) {
             return Err("builtin.vcpus must be at least 1".into());
@@ -230,6 +267,14 @@ impl BuiltinRuntimeConfig {
             return Err(format!(
                 "builtin.memoryMib must be at least {MIN_MEMORY_MIB}"
             ));
+        }
+        if self.root_disk_mib.is_some_and(|m| m < MIN_ROOT_DISK_MIB) {
+            return Err(format!(
+                "builtin.rootDiskMib must be at least {MIN_ROOT_DISK_MIB}"
+            ));
+        }
+        if self.mount_quota_mib == Some(0) {
+            return Err("builtin.mountQuotaMib must be at least 1".into());
         }
         Ok(())
     }
@@ -375,6 +420,25 @@ mod tests {
         }
         .validate()
         .is_err());
+        assert!(BuiltinRuntimeConfig {
+            root_disk_mib: Some(MIN_ROOT_DISK_MIB - 1),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(BuiltinRuntimeConfig {
+            mount_quota_mib: Some(0),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(BuiltinRuntimeConfig {
+            root_disk_mib: Some(MIN_ROOT_DISK_MIB),
+            mount_quota_mib: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
         assert!(BuiltinRuntimeConfig {
             images: BTreeMap::from([(
                 "t".to_string(),

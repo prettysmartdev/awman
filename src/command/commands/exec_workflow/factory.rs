@@ -18,13 +18,30 @@ use crate::data::config::effective::EffectiveConfig;
 // impl on `self.frontend`.
 
 pub(crate) struct AgentFrontendProxy {
-    pub(crate) frontend: SharedWorkflowFrontend,
-    pub(crate) acp: bool,
+    frontend: SharedWorkflowFrontend,
+    acp: bool,
     /// Each workflow container must receive the I/O sink paired with its own
     /// `Running { container_name }` callback. Keeping the taken I/O on this
     /// per-container proxy prevents parallel workflow steps from consuming a
     /// different step's per-container log file.
-    pub(crate) io: Option<crate::engine::agent_runtime::frontend::AgentIo>,
+    io: Option<crate::engine::agent_runtime::frontend::AgentIo>,
+    /// Whether this container's I/O has been taken from the frontend, by
+    /// either path. Runtimes differ in order: Docker and Apple report
+    /// `Running` before `take_io`, the builtin runtime takes its I/O first.
+    /// A second take would make the TUI build fresh channels and move the
+    /// keyboard onto them while the agent still reads the first set.
+    io_taken: bool,
+}
+
+impl AgentFrontendProxy {
+    pub(crate) fn new(frontend: SharedWorkflowFrontend, acp: bool) -> Self {
+        Self {
+            frontend,
+            acp,
+            io: None,
+            io_taken: false,
+        }
+    }
 }
 
 #[async_trait]
@@ -38,8 +55,9 @@ impl AgentFrontend for AgentFrontendProxy {
         // the `Running` report and the matching `take_io`.
         let mut frontend = self.frontend.lock().unwrap();
         frontend.report_status(status);
-        if is_running {
+        if is_running && !self.io_taken {
             self.io = Some(frontend.take_io());
+            self.io_taken = true;
         }
     }
 
@@ -53,6 +71,7 @@ impl AgentFrontend for AgentFrontendProxy {
             .io
             .take()
             .unwrap_or_else(|| self.frontend.with(|frontend| frontend.take_io()));
+        self.io_taken = true;
         if self.acp {
             // ACP framing is line-delimited JSON, never a PTY stream.
             io.initial_size = None;
@@ -361,11 +380,10 @@ impl AgentExecutionFactory for CommandLayerFactory {
             None => resolved,
         };
         let instance = self.engines.runtime.build(resolved)?;
-        let proxy = AgentFrontendProxy {
-            frontend: self.shared.clone(),
-            acp: run_opts.launch_mode == crate::data::config::repo::LaunchMode::Acp,
-            io: None,
-        };
+        let proxy = AgentFrontendProxy::new(
+            self.shared.clone(),
+            run_opts.launch_mode == crate::data::config::repo::LaunchMode::Acp,
+        );
         instance.run_with_frontend(Box::new(proxy))
     }
 

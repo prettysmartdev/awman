@@ -48,6 +48,9 @@ pub(crate) struct FakeExecWorkflowFrontend {
     /// can observe them after the fake has been boxed into the shared
     /// handle (F-36).
     phase_fixing: SharedPhaseFixingCalls,
+    /// How many times `take_io` was called. Shared so a test can read it after
+    /// the fake has been boxed into the shared handle.
+    take_io_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeExecWorkflowFrontend {
@@ -64,6 +67,7 @@ impl FakeExecWorkflowFrontend {
             resume_response: WorkflowResumeDecision::Fresh,
             resume_prompts: Vec::new(),
             phase_fixing: Arc::new(Mutex::new(Vec::new())),
+            take_io_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -101,6 +105,8 @@ impl AgentFrontend for FakeExecWorkflowFrontend {
     fn report_status(&mut self, _status: AgentStatus) {}
     fn report_progress(&mut self, _progress: AgentProgress) {}
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
+        self.take_io_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -267,6 +273,42 @@ impl ExecWorkflowCommandFrontend for FakeExecWorkflowFrontend {
         _reason: &str,
     ) -> Result<(), CommandError> {
         Ok(())
+    }
+}
+
+// ─── AgentFrontendProxy ──────────────────────────────────────────────────
+
+/// A workflow container takes its I/O from the frontend exactly once,
+/// whichever order its runtime calls `report_status(Running)` and `take_io`
+/// in. Docker and Apple report `Running` first; the builtin runtime takes its
+/// I/O first. A second take made the TUI build fresh channels and move the
+/// keyboard onto them while the agent kept reading the first set, so no
+/// keystroke reached any workflow agent on the builtin runtime.
+#[test]
+fn the_agent_proxy_takes_a_containers_io_once_in_either_runtime_order() {
+    use super::factory::AgentFrontendProxy;
+    use crate::engine::agent_runtime::frontend::AgentFrontend;
+    use std::sync::atomic::Ordering;
+
+    let running = || AgentStatus::Running {
+        container_name: "awman-test".into(),
+    };
+    for running_first in [true, false] {
+        let fake = FakeExecWorkflowFrontend::new();
+        let calls = fake.take_io_calls.clone();
+        let mut proxy = AgentFrontendProxy::new(SharedWorkflowFrontend::new(Box::new(fake)), false);
+        if running_first {
+            proxy.report_status(running());
+            let _io = proxy.take_io();
+        } else {
+            let _io = proxy.take_io();
+            proxy.report_status(running());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "running_first={running_first}: the container's I/O must be taken once"
+        );
     }
 }
 

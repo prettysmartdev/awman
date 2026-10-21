@@ -362,6 +362,8 @@ impl EffectiveConfig {
         Ok(BuiltinLaunchSettings {
             vcpus: builtin.vcpus_or_default(),
             memory_mib: builtin.memory_mib_or_default(),
+            root_disk_mib: builtin.root_disk_mib_or_default(),
+            mount_quota_mib: builtin.mount_quota_mib_or_default(),
             network,
             repo_state_dir,
         })
@@ -1877,13 +1879,17 @@ mod tests {
     #[test]
     fn builtin_launch_settings_take_repo_resources_and_narrowed_network() {
         let settings = builtin_layers(
-            r#"{"vcpus":4,"memoryMib":8192,"network":{"hostPorts":[8765]}}"#,
-            Some(r#"{"vcpus":1,"network":{"mode":"allowlist","allow":["api.example.com"]}}"#),
+            r#"{"vcpus":4,"memoryMib":8192,"rootDiskMib":8192,"mountQuotaMib":1024,"network":{"hostPorts":[8765]}}"#,
+            Some(r#"{"vcpus":1,"mountQuotaMib":512,"network":{"mode":"allowlist","allow":["api.example.com"]}}"#),
             EnvSnapshot::empty(),
         )
         .builtin_launch_settings()
         .unwrap();
         assert_eq!((settings.vcpus, settings.memory_mib), (1, 8192));
+        assert_eq!(
+            (settings.root_disk_mib, settings.mount_quota_mib),
+            (8192, 512)
+        );
         assert_eq!(
             settings.network.mode,
             crate::data::config::NetworkMode::Allowlist
@@ -1910,7 +1916,12 @@ mod tests {
                 other => panic!("a widening repo block must fail closed: {other:?}"),
             }
         }
-        for repo in [r#"{"vcpus":0}"#, r#"{"memoryMib":64}"#] {
+        for repo in [
+            r#"{"vcpus":0}"#,
+            r#"{"memoryMib":64}"#,
+            r#"{"rootDiskMib":64}"#,
+            r#"{"mountQuotaMib":0}"#,
+        ] {
             assert!(matches!(
                 builtin_layers("{}", Some(repo), EnvSnapshot::empty()).builtin_launch_settings(),
                 Err(DataError::BuiltinConfig(_))

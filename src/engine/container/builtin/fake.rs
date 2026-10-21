@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct LaunchedVm {
     pub vcpus: u8,
     pub memory_mib: u32,
+    pub root_disk_mib: u32,
+    pub mount_quota_mib: u32,
     pub network_enabled: bool,
     pub network_policy: serde_json::Value,
 }
@@ -26,6 +28,8 @@ impl From<SandboxSpec> for LaunchedVm {
         Self {
             vcpus: spec.vcpus,
             memory_mib: spec.memory_mib,
+            root_disk_mib: spec.root_disk_mib,
+            mount_quota_mib: spec.mount_quota_mib,
             network_enabled: spec.network.enabled,
             network_policy: spec.network.policy_json(),
         }

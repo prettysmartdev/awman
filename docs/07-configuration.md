@@ -430,7 +430,7 @@ An unrecognized value (e.g. a typo) is a fatal error — awman never falls back 
 
 ### Builtin runtime settings
 
-The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected. `network`, `vcpus`, `memoryMib`, `registries`, the image sources and `builder.enabled` are resolved for each session from that session's own repo, so the TUI, the API and squad each honour the repo a session runs in, even when several repos share one awman process. A workflow worktree keeps the `builtin` block of the checkout you launched from, so a narrowing you haven't committed still applies. An invalid repo block (for example one that widens the global `network`) fails that repo's launches only; it doesn't stop a TUI or API server started in that repo, and other runtimes never read it.
+The optional `builtin` object is read only when `runtime` is `builtin-experimental` (the settings object keeps the name `builtin`). It can appear in both the global and the repo config; repo values win per field, and the `images` and `registries` maps merge per key. Unknown keys are rejected. `network`, `vcpus`, `memoryMib`, `rootDiskMib`, `mountQuotaMib`, `registries`, the image sources and `builder.enabled` are resolved for each session from that session's own repo, so the TUI, the API and squad each honour the repo a session runs in, even when several repos share one awman process. A workflow worktree keeps the `builtin` block of the checkout you launched from, so a narrowing you haven't committed still applies. An invalid repo block (for example one that widens the global `network`) fails that repo's launches only; it doesn't stop a TUI or API server started in that repo, and other runtimes never read it.
 
 `builtin.stateDir` is the exception: the state directory is process-wide. If a repo's `builtin.stateDir` resolves to a different directory than the one the awman process uses, the launch is refused with an error naming both paths (`this repository's builtin.stateDir resolves to <repo path>, but this awman process uses the builtin state directory <process path>`). Remove the repo's `stateDir` or set it to the process's path. `AWMAN_BUILTIN_STATE_DIR` outranks every config layer, so it never causes this mismatch.
 
@@ -476,6 +476,8 @@ To build with Apple Containers instead of Docker, use an `apple-local` source:
 | `builtin.stateDir` | absolute path | `<data home>/builtin` (`~/.awman/builtin`) | Private state root for imported images, catalog, control sockets and VM/session state; mode `0700`, no symlinks, keep it short. Process-wide: one state directory serves every builtin session in the awman process, so a repo value that resolves to a different directory is rejected (see below). `AWMAN_BUILTIN_STATE_DIR` overrides it |
 | `builtin.vcpus` | integer 1–255 | `2` | Whole vCPUs per session VM |
 | `builtin.memoryMib` | integer ≥ 128 | `4096` | Guest memory in MiB |
+| `builtin.rootDiskMib` | integer ≥ 256 | `30720` | Writable root disk in MiB (everything outside the mounts); sparse, so it only uses host space as the agent writes |
+| `builtin.mountQuotaMib` | integer ≥ 1 | `30720` | MiB the agent may add to each host mount, the workspace included, beyond what it already held |
 | `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-local`, `archive`, or `apple-local` (macOS) |
 | `builtin.builder.enabled` | boolean | `false` | Opt in to local source-matched Docker or Apple Containers builds during `awman ready`, and when a `chat` or `exec prompt` launch finds its agent image missing, under `builtin-experimental`; see [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). Repository value overrides global. |
 | `builtin.images` | object (image tag → source) | `{}` | Per-image source; wins over `imageSource` for that tag |
@@ -484,7 +486,7 @@ To build with Apple Containers instead of Docker, use an `apple-local` source:
 
 Every source object, its fields, the registry settings, and the supported `apple-local` (Apple Containers) releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to provide one instead of guessing.
 
-`builtin.vcpus`, `builtin.memoryMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
+`builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`, and `builtin.stateDir` can be set with `awman config set`. The four object-valued keys appear read-only in `awman config show` and must be edited in the JSON file. A `builtin` block that fails validation (zero vCPUs or memory, a root disk under 256 MiB, a zero mount quota, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 
 `builtin.network` layers global and repo config the same way: a repo block may only narrow what the global block allows (a stricter `mode`, a subset of the global `allow` list, a subset of the global `hostPorts`) — never widen it, since repo config ships with the checkout and may be untrusted. This effective policy applies to every builtin launch in that repo, including TUI, API, and squad sessions. `nameservers` and `trustHostCas` are read from the global config only. A block that widens the ceiling, mixes `allow`/`hostPorts` with an incompatible `mode`, or names an IP/CIDR/`localhost` in `allow` is a validation error naming the offending key.
 
@@ -531,7 +533,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
 | `dynamicWorkflows.defaultLeader` | string (`agent::model`) | (unset) | Default leader agent/model for `exec workflow --dynamic`; overridden by `--leader` | yes, as `dynamicWorkflows.defaultLeader` |
 | `dynamicWorkflows.guidance` | string array | (unset → no guidance block) | Project-specific instructions injected into the leader prompt as a bullet list — see [Dynamic Workflows](06-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per entry as `dynamicWorkflows.guidance.<index>` (empty value removes) |
-| `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`) |
+| `builtin` | object | (unset) | Repo overrides for the builtin runtime block, merged over the global one per field — see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`) |
 | `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 | `authRefresh` | object | (unset) | Live credential-refresh settings for Claude — see [Control credential refresh](#control-credential-refresh-authrefresh) | no (edit file) |
 | `agentFlags` | object (agent → string array) | (unset) | Extra arguments appended to that agent's command; each entry replaces the global entry for the same agent — see [Pass extra flags to an agent](#pass-extra-flags-to-an-agent) | no (edit file) |
@@ -543,7 +545,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `default_agent` | string | (unset) | Agent used when no repo agent is configured | yes |
 | `terminal_scrollback_lines` | integer | 10000 | Default scrollback for all repos | yes |
 | `runtime` | string | `docker` | Container runtime: `docker`, `apple-containers`, `docker-sbx-experimental`, `builtin-experimental` (Apple Silicon only) | yes |
-| `builtin` | object | (unset) | Builtin microVM runtime settings; see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`); edit the rest in the file |
+| `builtin` | object | (unset) | Builtin microVM runtime settings; see [Builtin runtime settings](#builtin-runtime-settings) | scalars only (`builtin.stateDir`, `builtin.vcpus`, `builtin.memoryMib`, `builtin.rootDiskMib`, `builtin.mountQuotaMib`); edit the rest in the file |
 | `yoloDisallowedTools` | string array | `[]` | Machine-wide yolo tool denylist (unless a repo overrides it) | yes |
 | `overlays` | string array | `[]` | Overlay specs applied to every project; additive with other sources | yes |
 | `agentStuckTimeout` | integer (seconds) | 30 | Default agent-stuck timeout | yes |
@@ -585,6 +587,8 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `builtin.stateDir` | repo or global |
 | `builtin.vcpus` | repo or global |
 | `builtin.memoryMib` | repo or global |
+| `builtin.rootDiskMib` | repo or global |
+| `builtin.mountQuotaMib` | repo or global |
 | `builtin.imageSource`, `builtin.images`, `builtin.registries`, `builtin.network` | repo or global; shown read-only, edit the JSON |
 | `default_agent` | global only |
 | `api` | global only |

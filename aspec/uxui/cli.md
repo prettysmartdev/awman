@@ -166,14 +166,16 @@ an unknown runtime whose error names `builtin-experimental`. `config set`
 rejects unknown runtime values, and commands that need no runtime keep
 working with an invalid stored value so it can be repaired. The builtin block is stored in global or repository config and
 repo values merge over global values. Its supported keys are `stateDir`,
-`vcpus` (default 2), `memoryMib` (default 4096, minimum 128), `imageSource`,
+`vcpus` (default 2), `memoryMib` (default 4096, minimum 128), `rootDiskMib`
+(writable root disk, default 30720, minimum 256), `mountQuotaMib` (MiB the
+guest may add to each host mount, default 30720, minimum 1), `imageSource`,
 per-image `images`, per-host `registries`, and `network` (guest network
 policy: `mode` `public`/`allowlist`/`none`, default `public`; `allow`;
 `hostPorts`; global-only `nameservers`/`trustHostCas`). A repo `network`
 block may only narrow the global one — a stricter mode, a subset of the
 global `allow` list, a subset of the global `hostPorts` — never widen it, since
-repo config ships with the checkout and may be untrusted. Network, `vcpus`
-and `memoryMib` are resolved per session at every launch, so a repo's values
+repo config ships with the checkout and may be untrusted. Network, `vcpus`,
+`memoryMib`, `rootDiskMib` and `mountQuotaMib` are resolved per session at every launch, so a repo's values
 apply wherever an agent for that repo runs (CLI, a TUI tab, an API session, a
 squad task, or a workflow worktree). A workflow worktree is cut from a commit, so
 its session takes the invoking checkout's repo `builtin` block and default

@@ -145,6 +145,18 @@ pub const CONFIG_FIELDS: &[ConfigFieldSpec] = &[
         Some("memory in MiB, at least 128"),
     ),
     f(
+        "builtin.rootDiskMib",
+        FieldScope::Both,
+        ConfigFieldKind::Number,
+        Some("writable root disk in MiB, at least 256 (default 30720)"),
+    ),
+    f(
+        "builtin.mountQuotaMib",
+        FieldScope::Both,
+        ConfigFieldKind::Number,
+        Some("MiB the agent may add to each mount, at least 1 (default 30720)"),
+    ),
+    f(
         "builtin.builder.enabled",
         FieldScope::Both,
         ConfigFieldKind::Bool,

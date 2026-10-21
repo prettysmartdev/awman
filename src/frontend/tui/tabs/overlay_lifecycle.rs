@@ -103,7 +103,14 @@ impl Tab {
         };
         // Pull any final bytes into the parser first so the captured
         // scrollback (and `surface_unseen_container_output`) is complete.
-        self.drain_container_output();
+        // Bytes only: the next step may already have set `pty_reset_flag`
+        // (yolo expiry launches it within milliseconds), and consuming it
+        // here would leave auto-open suppressed for the new container. With
+        // a reset pending the channel may already carry the new step's
+        // output, so leave it for the reset that follows this tick.
+        if !self.shared.pty_reset_flag.load(Ordering::Relaxed) {
+            self.drain_slot_bytes();
+        }
         self.close_container_overlay(exit_code);
         // Late bytes still in flight from the dead container must not
         // re-open the window; cleared when the next container launches.

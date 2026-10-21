@@ -248,6 +248,7 @@ impl SandboxDriver for MsbDriver {
                 .image(spec.image)
                 .cpus(spec.vcpus)
                 .memory(spec.memory_mib)
+                .root_disk(spec.root_disk_mib)
                 .pull_policy(microsandbox::sandbox::PullPolicy::Never)
                 .labels(spec.labels)
                 .quiet_logs();
@@ -280,8 +281,9 @@ impl SandboxDriver for MsbDriver {
             };
             for mount in spec.mounts {
                 let owner = spec.mount_owner;
+                let quota = spec.mount_quota_mib;
                 builder = builder.volume(mount.guest, |m| {
-                    let mut m = m.bind(symlink_free_ancestors(&mount.host));
+                    let mut m = m.bind(symlink_free_ancestors(&mount.host)).quota(quota);
                     if mount.read_only {
                         m = m.readonly();
                     }

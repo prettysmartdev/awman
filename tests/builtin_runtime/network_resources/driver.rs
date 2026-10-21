@@ -184,6 +184,7 @@ mod driver {
             memory_mib: vm.memory_mib,
             network,
             repo_state_dir: None,
+            ..BuiltinLaunchSettings::default()
         };
         let runtime = ContainerRuntime::builtin(settings).map_err(|e| e.to_string())?;
         Ok((runtime, launch))

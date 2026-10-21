@@ -208,7 +208,7 @@ impl BuiltinBackend {
             .name
             .as_ref()
             .map(|n| n.0.clone())
-            .unwrap_or_else(|| format!("awman-{}", uuid::Uuid::new_v4().simple()));
+            .unwrap_or_else(crate::engine::container::naming::generate_container_name);
         let leases = crate::engine::credential_refresh::register_container_leases(&options, &name);
         let (vcpus, memory_mib) = resources::resolve(
             options.cpu,
@@ -249,6 +249,8 @@ impl BuiltinBackend {
             mount_owner: image_owner(user.as_deref(), &config.accounts)?,
             vcpus,
             memory_mib,
+            root_disk_mib: launch.root_disk_mib,
+            mount_quota_mib: launch.mount_quota_mib,
             network: network::compile(&launch.network),
         };
         // The entrypoint plus the agent tail Docker and Apple append after the
@@ -596,7 +598,7 @@ impl ContainerBackend for BuiltinBackend {
             overlays,
             ..
         } = *request;
-        let name = format!("awman-background-{}", uuid::Uuid::new_v4().simple());
+        let name = crate::engine::container::naming::generate_container_name();
         let id = naming::sandbox_name_for(&name);
         let mut mounted = mounts(overlays)?;
         let guest = workdir
@@ -630,6 +632,8 @@ impl ContainerBackend for BuiltinBackend {
             mount_owner: image_owner(config.user.as_deref(), &config.accounts)?,
             vcpus: launch.vcpus,
             memory_mib: launch.memory_mib,
+            root_disk_mib: launch.root_disk_mib,
+            mount_quota_mib: launch.mount_quota_mib,
             network: network::compile(&launch.network),
         })?;
         self.background_env

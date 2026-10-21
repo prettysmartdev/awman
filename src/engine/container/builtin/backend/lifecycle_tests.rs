@@ -201,6 +201,8 @@ fn new_spec(name: &str, owner: &str) -> SandboxSpec {
         mount_owner: None,
         vcpus: 1,
         memory_mib: 256,
+        root_disk_mib: 512,
+        mount_quota_mib: 64,
         network: Default::default(),
     }
 }
@@ -940,6 +942,45 @@ fn background_sandbox_env_lives_in_memory_and_exec_runs_as_the_image_user() {
         .backend
         .exec_in_background(&id, "true", "/", None)
         .is_err());
+}
+
+/// The shared `awman-<pid>-<nanos>` shape Docker and Apple fall back to.
+fn assert_shared_name_format(name: &str) {
+    let rest = name
+        .strip_prefix("awman-")
+        .unwrap_or_else(|| panic!("{name}"));
+    let (pid, nanos) = rest.split_once('-').unwrap_or_else(|| panic!("{name}"));
+    assert_eq!(pid, std::process::id().to_string(), "{name}");
+    assert!(
+        !nanos.is_empty() && nanos.bytes().all(|b| b.is_ascii_digit()),
+        "{name}"
+    );
+}
+
+#[test]
+fn unnamed_launches_use_the_same_name_format_as_other_runtimes() {
+    let rig = Rig::new("session-a");
+    let mut unnamed = options("unused");
+    unnamed.name = None;
+    let plan = rig.backend.plan(unnamed).unwrap();
+    assert_shared_name_format(&plan.name);
+    assert_eq!(plan.spec.name, naming::sandbox_name_for(&plan.name));
+    assert_eq!(plan.spec.labels[naming::LABEL_NAME], plan.name);
+
+    let work = tempfile::tempdir_in("/tmp").unwrap();
+    let id = rig
+        .backend
+        .start_background(&background(
+            "agent:latest",
+            work.path(),
+            &HashMap::new(),
+            &[],
+        ))
+        .unwrap();
+    let name = rig.driver.spec(&id).labels[naming::LABEL_NAME].clone();
+    assert_shared_name_format(&name);
+    assert_eq!(id, naming::sandbox_name_for(&name));
+    rig.backend.stop_and_remove(&id).unwrap();
 }
 
 #[test]

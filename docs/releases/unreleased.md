@@ -135,11 +135,14 @@ as aliases for `docker-local` and `apple-local`. See
 
 ## Builtin runtime behaviour
 
-- **Per-session settings.** A repo's `builtin.network`, `vcpus`, `memoryMib`
-  and `registries` apply to every launch for that repo: CLI, each TUI tab, each
+- **Per-session settings.** A repo's `builtin.network`, `vcpus`, `memoryMib`,
+  `rootDiskMib`, `mountQuotaMib` and `registries` apply to every launch for that repo: CLI, each TUI tab, each
   API session, each squad task and each workflow worktree, even when the
   narrowing is not committed yet. A repo `builtin.stateDir` that differs from
   the process's is refused for that repo's launches.
+- **Disk limits.** Agent VMs now get a 30 GiB writable root disk and may add
+  up to 30 GiB to each host mount, the workspace included (both were 4 GiB).
+  Set `builtin.rootDiskMib` and `builtin.mountQuotaMib` to change them.
 - **Relocated global config.** TUI tabs, API sessions and workflow worktrees
   now read the global config from `AWMAN_CONFIG_HOME` when it is set. Before,
   they read `~/.awman` and, when that file was missing, fell back to the
@@ -220,6 +223,17 @@ Suggestions now come from the command catalogue and cover subcommands.
 
 The documented magenta tab colour for a remote (auto-cloned) session never
 appeared. It does now.
+
+### The container window opens after a yolo countdown advances a workflow
+
+When a yolo countdown ended a step and the next step started right away, the
+new container's window and status bars sometimes stayed hidden until you
+pressed Ctrl-M. They now open as soon as the new container prints output.
+
+### Builtin agent containers have short names
+
+Under `builtin-experimental`, agent containers were named with a long random
+hash. They now use the same `awman-<pid>-<number>` form as the other runtimes.
 
 ### A setup step that fails gets the same failure file a teardown step gets
 
