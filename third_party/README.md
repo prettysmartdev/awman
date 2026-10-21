@@ -5,7 +5,7 @@ All sources come from immutable published crates. Their `PATCH.md` files record 
 | Patch | Purpose | Removal path |
 |---|---|---|
 | `sqlx-sqlite-0.9.0` | One-line native SQLite bound backport, upstream `94aafe3a68884d923b0798a767c8d7f6cfda89d2`; silences `time` 0.3.55 deprecation warnings | Compatible SQLx release plus combined-link, store, migration and catalog checks |
-| `msb_krun-0.1.39` | Typed process-lifetime embedded kernel provider | WI 0120 native SDK/runtime API and full boot/release checks |
+| `msb_krun-0.1.39` | Typed process-lifetime embedded kernel provider | WI 0120: adopt upstream `static-krunfw` (msb_krun >= 0.1.40, needs Microsandbox >= 0.7.7) plus full boot/release checks |
 | `microsandbox-filesystem-0.7.2` | Target-aware guest-agent build input | Equivalent upstream build input API |
 | `microsandbox-0.7.2` | Isolated local backend builder that ignores installed Microsandbox config | Pinned upstream isolated builder plus hostile-config and native coexistence checks |
 | `microsandbox-network-0.7.2` | Explicit visible-SNI enforcement without interception; exact DNS binding for suffix rules | Equivalent pinned upstream option plus SDK-boundary and native guest network tests |
