@@ -1109,7 +1109,8 @@ fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
             crate::frontend::tui::dialogs::SquadHistoryState {
                 name: "issue-triage".to_string(),
                 runs: vec![run.clone()],
-                scroll: 0,
+                selected: 0,
+                run_detail: None,
                 from_detail,
             },
         ));
@@ -1137,9 +1138,10 @@ fn the_squad_history_modal_renders_the_run_table_and_its_esc_wording() {
 }
 
 /// The leader verdict's reason gets its own history column right after the
-/// status, and the modal grows wide enough to show a long one in full.
+/// status, but a long one is cut with an ellipsis rather than widening the
+/// column until it pushes Finished and Error off the table.
 #[test]
-fn the_squad_history_modal_shows_the_verdict_reason_in_full() {
+fn the_squad_history_modal_clips_a_long_reason_and_keeps_every_column() {
     use crate::data::fs::task_store::{Run, RunStatus};
     let reason =
         "no new issues were opened against the repository since the previous evaluation ran";
@@ -1161,27 +1163,114 @@ fn the_squad_history_modal_shows_the_verdict_reason_in_full() {
     app.active_dialog = Some(Dialog::SquadTaskHistory(
         crate::frontend::tui::dialogs::SquadHistoryState {
             name: "issue-triage".to_string(),
-            runs: vec![run],
-            scroll: 0,
+            runs: vec![run.clone()],
+            selected: 0,
+            run_detail: None,
             from_detail: false,
         },
     ));
 
-    let text = buffer_text(&render_app(&mut app, 220, 30));
+    for width in [100, 220] {
+        let text = buffer_text(&render_app(&mut app, width, 30));
+        assert!(
+            !text.contains(reason) && text.contains("no new issues were opened"),
+            "width {width}: the table shows the reason's start, not all of it: {text}"
+        );
+        assert!(
+            text.contains('\u{2026}'),
+            "width {width}: a clipped reason ends in an ellipsis: {text}"
+        );
+        let header = text
+            .lines()
+            .find(|line| line.contains("Started"))
+            .expect("the history table header");
+        let status_at = header.find("Status").unwrap();
+        let reason_at = header.find("Reason").expect("a Reason column");
+        let finished_at = header.find("Finished").expect("a Finished column");
+        let error_at = header.find("Error").expect("an Error column");
+        assert!(
+            status_at < reason_at && reason_at < finished_at && finished_at < error_at,
+            "width {width}: every column stays on the table, in order: {header}"
+        );
+    }
+}
+
+/// The run detail Enter opens shows the whole reason and error — the text the
+/// table can only show clipped — and offers to scroll when it overflows.
+#[test]
+fn the_squad_run_detail_modal_shows_the_full_reason_and_error() {
+    use crate::data::fs::task_store::{Run, RunStatus};
+    let reason =
+        "no new issues were opened against the repository since the previous evaluation ran";
+    let error = (0..40)
+        .map(|i| format!("line {i} of the failure"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let run = Run {
+        id: "run-7".into(),
+        task_id: "issue-triage".into(),
+        status: RunStatus::Failed,
+        workflow_path: None,
+        workflow_state_path: None,
+        session_id: None,
+        started_at: chrono::Utc::now(),
+        finished_at: Some(chrono::Utc::now()),
+        error: Some(error),
+        reason: Some(reason.into()),
+        unmet_env: Vec::new(),
+    };
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    app.active_dialog = Some(Dialog::SquadTaskHistory(
+        crate::frontend::tui::dialogs::SquadHistoryState {
+            name: "issue-triage".to_string(),
+            runs: vec![run.clone()],
+            selected: 0,
+            run_detail: Some(crate::frontend::tui::dialogs::SquadRunDetailState {
+                run,
+                scroll: 0,
+                max_scroll: std::cell::Cell::new(0),
+            }),
+            from_detail: false,
+        },
+    ));
+
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(
+        text.contains("run run-7"),
+        "the detail titles itself with the run: {text}"
+    );
     assert!(
         text.contains(reason),
-        "a wide terminal must show the whole reason: {text}"
+        "the detail shows the whole reason: {text}"
     );
-    let header = text
-        .lines()
-        .find(|line| line.contains("Started"))
-        .expect("the history table header");
-    let status_at = header.find("Status").unwrap();
-    let reason_at = header.find("Reason").expect("a Reason column");
-    let error_at = header.find("Error").unwrap();
+    assert!(text.contains("line 0 of the failure"), "{text}");
     assert!(
-        status_at < reason_at && reason_at < error_at,
-        "Reason sits after Status and before Error: {header}"
+        !text.contains("line 39 of the failure"),
+        "an error longer than the modal starts at its top: {text}"
+    );
+    assert!(
+        text.contains("scroll") && text.contains("esc back to history"),
+        "an overflowing detail says it scrolls and how to leave: {text}"
+    );
+
+    let max_scroll = match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => {
+            state.run_detail.as_ref().unwrap().max_scroll.get()
+        }
+        _ => unreachable!(),
+    };
+    assert!(
+        max_scroll > 0,
+        "the renderer publishes how far the text scrolls"
+    );
+    if let Some(Dialog::SquadTaskHistory(state)) = &mut app.active_dialog {
+        state.run_detail.as_mut().unwrap().scroll = max_scroll;
+    }
+    let text = buffer_text(&render_app(&mut app, 120, 30));
+    assert!(
+        text.contains("line 39 of the failure"),
+        "scrolled to the end, the last line of the error is visible: {text}"
     );
 }
 
@@ -1220,7 +1309,8 @@ fn the_squad_modals_keep_their_key_hint_row_on_a_short_terminal() {
         crate::frontend::tui::dialogs::SquadHistoryState {
             name: "issue-triage".to_string(),
             runs: Vec::new(),
-            scroll: 0,
+            selected: 0,
+            run_detail: None,
             from_detail: true,
         },
     ));
@@ -1247,7 +1337,8 @@ fn the_squad_history_modal_says_so_when_a_task_has_never_run() {
         crate::frontend::tui::dialogs::SquadHistoryState {
             name: "issue-triage".to_string(),
             runs: Vec::new(),
-            scroll: 0,
+            selected: 0,
+            run_detail: None,
             from_detail: false,
         },
     ));
@@ -1568,7 +1659,7 @@ fn workflow_context_footer_shows_host_path_with_cwd_or_worktree_and_squad() {
         assert!(row.contains("[Ctrl-Shift-C copy]"), "{row}");
         assert!(row.ends_with("squad ●"), "{row}");
         if worktree.is_some() {
-            assert!(row.contains("Using worktree: /worktrees/current"), "{row}");
+            assert!(row.contains("Worktree: /worktrees/current"), "{row}");
         } else {
             assert!(row.contains("CWD:"), "{row}");
         }
@@ -1585,7 +1676,7 @@ fn workflow_context_footer_preserves_hint_and_squad_on_narrow_screens() {
     );
     for width in [80, 100, 120] {
         let row = bottom_row(&render_app(&mut app, width, 24));
-        assert!(row.contains("Using worktree: /work"), "{row}");
+        assert!(row.contains("Worktree: /work"), "{row}");
         assert!(row.contains("Context:"), "{row}");
         assert!(row.contains("[Ctrl-Shift-C copy]"), "{row}");
         assert!(row.contains('…'), "{row}");
@@ -1611,7 +1702,7 @@ fn workflow_context_footer_yields_to_the_full_directory_and_squad_indicator() {
             .as_deref()
             .unwrap_or(app.active_tab().session.working_dir());
         let label = if worktree.is_some() {
-            "  Using worktree: "
+            "  Worktree: "
         } else {
             "  CWD: "
         };

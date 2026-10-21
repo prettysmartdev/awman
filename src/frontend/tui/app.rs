@@ -1041,10 +1041,18 @@ impl App {
                 (&mut self.active_dialog, polled)
             {
                 if selected == history.name {
+                    // An open run detail follows its run by id, so a run that
+                    // finishes while it is up shows its final status. A run
+                    // pruned from the history keeps its last copy.
+                    if let Some(detail) = history.run_detail.as_mut() {
+                        if let Some(run) = runs.iter().find(|r| r.id == detail.run.id) {
+                            detail.run = run.clone();
+                        }
+                    }
                     history.runs = runs;
                     // A shrinking history (older runs pruned) must not leave
-                    // the table scrolled past its end.
-                    history.scroll = history.scroll.min(history.runs.len().saturating_sub(1));
+                    // the selection past its end.
+                    history.selected = history.selected.min(history.runs.len().saturating_sub(1));
                 }
             }
         }

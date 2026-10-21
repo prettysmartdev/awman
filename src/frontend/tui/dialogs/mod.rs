@@ -311,16 +311,32 @@ pub struct SquadDetailState {
 }
 
 /// State for the squad run-history modal. `name` is the task whose runs are
-/// shown, and the identity `tick_all_tabs` refreshes `runs` against; `scroll`
-/// offsets the run table. `from_detail` records where the modal was opened
-/// from: Esc reopens the detail modal only when the user came from it, and
-/// simply closes when the modal was opened straight from the card grid.
+/// shown, and the identity `tick_all_tabs` refreshes `runs` against;
+/// `selected` is the highlighted row, moved with the arrow keys (the table
+/// scrolls to keep it in view). `from_detail` records where the modal was
+/// opened from: Esc reopens the detail modal only when the user came from it,
+/// and simply closes when the modal was opened straight from the card grid.
+/// `run_detail` is the per-run modal Enter opens over the table; while it is
+/// up, the arrow keys scroll it and Esc returns to the table.
 #[derive(Debug, Clone)]
 pub struct SquadHistoryState {
     pub name: String,
     pub runs: Vec<crate::data::fs::task_store::Run>,
-    pub scroll: usize,
+    pub selected: usize,
     pub from_detail: bool,
+    pub run_detail: Option<SquadRunDetailState>,
+}
+
+/// State for the per-run detail modal stacked over the run history: the run
+/// itself (refreshed by id while the history stays live) and how far its
+/// reason/error text is scrolled. `max_scroll` is written by the renderer —
+/// the only place the wrapped line count is known — so the scroll keys stop
+/// at the last line instead of running on into blank space.
+#[derive(Debug, Clone)]
+pub struct SquadRunDetailState {
+    pub run: crate::data::fs::task_store::Run,
+    pub scroll: usize,
+    pub max_scroll: std::cell::Cell<usize>,
 }
 
 pub struct ConfigShowState {

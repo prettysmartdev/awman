@@ -688,11 +688,19 @@ The table lists each run's start time, outcome (`running`, `not triggered`,
 its verdict (why the task did or didn't trigger — kept even when the run later
 fails or is canceled; `—` when it gave none or the
 run never reached a verdict), finish time, and error, plus an `Unmet env`
-column when any run in the history started with an unmet `env()` name. The
-modal widens to fit a long reason or error, up to the terminal's width. `awman
-squad show` prints the same `Reason` column. **↑ / ↓** and **PgUp / PgDn** scroll it. A task that has never run says
-so instead of showing an empty table. Like the detail modal, the history keeps
-refreshing from the daemon while it is open.
+column when any run in the history started with an unmet `env()` name. A long
+reason or error is cut short with `…` so every column stays on screen. `awman
+squad show` prints the same `Reason` column. **↑ / ↓** and **PgUp / PgDn** move
+the highlighted row. A task that has never run says so instead of showing an
+empty table. Like the detail modal, the history keeps refreshing from the daemon
+while it is open.
+
+**Enter** opens the highlighted run's detail on top of the table: its start
+and finish times, outcome, any unmet `env()` names, and the full reason and
+error text, wrapped to fit. When the text is longer than the modal, **↑ / ↓**
+and **PgUp / PgDn** scroll it. **Esc** goes back to the table with the same run
+still highlighted. A run that is still in progress updates in place when it
+finishes.
 
 If one of these actions fails — the daemon rejects it, or it cannot reach the
 daemon at all — the reason is shown in red in the hint bar directly above the

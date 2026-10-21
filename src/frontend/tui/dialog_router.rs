@@ -95,7 +95,28 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
             app.command_dialog_active = false;
         }
 
+        // Enter on a run-history row opens that run's detail over the table,
+        // so a reason or error too long for its column can be read in full.
+        Some(Dialog::SquadTaskHistory(_)) => open_squad_run_detail(app),
+
         _ => {}
+    }
+}
+
+/// Open the detail modal for the run-history row that is selected. A no-op
+/// when the history is empty or a run's detail is already open.
+fn open_squad_run_detail(app: &mut App) {
+    if let Some(Dialog::SquadTaskHistory(state)) = &mut app.active_dialog {
+        if state.run_detail.is_some() {
+            return;
+        }
+        if let Some(run) = state.runs.get(state.selected) {
+            state.run_detail = Some(dialogs::SquadRunDetailState {
+                run: run.clone(),
+                scroll: 0,
+                max_scroll: std::cell::Cell::new(0),
+            });
+        }
     }
 }
 
@@ -385,13 +406,18 @@ pub(super) fn handle_dialog_scroll(app: &mut App, direction: i32) {
             }
         }
         Some(Dialog::SquadTaskHistory(state)) => {
-            if direction < 0 {
-                state.scroll = state.scroll.saturating_sub(step);
+            // With a run's detail open the keys scroll its text; otherwise
+            // they move the table's selection, which never leaves the table.
+            if let Some(detail) = state.run_detail.as_mut() {
+                if direction < 0 {
+                    detail.scroll = detail.scroll.saturating_sub(step);
+                } else {
+                    detail.scroll = (detail.scroll + step).min(detail.max_scroll.get());
+                }
+            } else if direction < 0 {
+                state.selected = state.selected.saturating_sub(step);
             } else {
-                // Never scroll the last run off the top: the final row stays
-                // reachable, and an over-long press cannot leave the table
-                // blank.
-                state.scroll = (state.scroll + step).min(state.runs.len().saturating_sub(1));
+                state.selected = (state.selected + step).min(state.runs.len().saturating_sub(1));
             }
         }
         Some(Dialog::ConfigShow(state)) => {
@@ -680,8 +706,9 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         }
 
         // ── Non-interactive / fallback dialogs ─────────────────────
-        // The history modal is read-only: the arrow/page keys scroll it via
-        // `handle_dialog_scroll` and Esc leaves it. Per-task actions stay in
+        // The history modal is read-only: the arrow/page keys move through it
+        // via `handle_dialog_scroll`, Enter opens a run's detail and Esc
+        // leaves it. Per-task actions stay in
         // the detail modal, so no char key is silently overloaded here.
         Some(Dialog::SquadTaskHistory(_))
         | Some(Dialog::Loading { .. })

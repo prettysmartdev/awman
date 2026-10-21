@@ -1,6 +1,6 @@
 //! SDK operations run on a host control thread. VMM execution occurs exclusively
 //! in the same-executable child dispatched by worker.rs.
-use super::{driver::*, naming, paths::BuiltinPaths};
+use super::{cpu, driver::*, naming, paths::BuiltinPaths};
 use crate::engine::{agent_runtime::execution::AgentStats, error::EngineError};
 use microsandbox::{
     backend::{Backend, LocalBackend},
@@ -18,6 +18,9 @@ pub struct MsbDriver {
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     local: Arc<LocalBackend>,
     active: Arc<Mutex<std::collections::HashMap<String, Sandbox>>>,
+    /// The last vCPU-time reading per sandbox, so each stats call measures
+    /// usage since the previous one (see `cpu`).
+    cpu: Arc<Mutex<std::collections::HashMap<String, cpu::CpuState>>>,
 }
 fn failure(operation: &str) -> EngineError {
     // SDK errors can include serialized configuration or user command/env.
@@ -127,6 +130,7 @@ impl MsbDriver {
             shutdown: Mutex::new(Some(shutdown)),
             local,
             active: Arc::new(Mutex::new(Default::default())),
+            cpu: Arc::new(Mutex::new(Default::default())),
         }))
     }
     fn call<T: Send + 'static>(
@@ -161,6 +165,18 @@ fn isolated_backend(paths: &BuiltinPaths) -> LocalBackend {
         .registry_hosts(Default::default())
         .ca_certs(None)
         .build_lazy_isolated()
+}
+/// How long a stats call with no earlier reading waits for the runtime's next
+/// metrics sample (published once a second), and how often it looks.
+const CPU_SAMPLE_WAIT: Duration = Duration::from_millis(1500);
+const CPU_SAMPLE_POLL: Duration = Duration::from_millis(250);
+
+fn cpu_reading(metrics: &microsandbox::SandboxMetrics) -> cpu::CpuReading {
+    cpu::CpuReading {
+        vcpu_time_ns: metrics.vcpu_time_ns,
+        sampled_at: metrics.timestamp,
+        uptime: metrics.uptime,
+    }
 }
 fn summary(handle: &microsandbox::sandbox::SandboxHandle) -> Result<SandboxSummary, EngineError> {
     let config = handle.config().map_err(|_| failure("catalog read"))?;
@@ -455,6 +471,7 @@ impl SandboxDriver for MsbDriver {
     fn stats(&self, id: &str) -> Result<AgentStats, EngineError> {
         let backend = self.backend();
         let id = id.to_string();
+        let cpu = self.cpu.clone();
         self.call(async move {
             let handle = backend
                 .sandboxes()
@@ -462,10 +479,46 @@ impl SandboxDriver for MsbDriver {
                 .await
                 .map_err(|_| failure("lookup"))?;
             let info = summary(&handle)?;
-            let stats = handle.metrics().await.map_err(|_| failure("metrics"))?;
+            let mut stats = handle.metrics().await.map_err(|_| failure("metrics"))?;
+            let kept = cpu.lock().ok().and_then(|kept| kept.get(&id).copied());
+            let percent = match cpu::step(kept.as_ref(), cpu_reading(&stats)) {
+                cpu::CpuStep::Known(state) => Some(state),
+                // Nothing to measure against yet: wait for the runtime's next
+                // sample (it publishes one a second) and measure between them.
+                cpu::CpuStep::AwaitNewerSample => {
+                    let baseline = cpu_reading(&stats);
+                    let deadline = tokio::time::Instant::now() + CPU_SAMPLE_WAIT;
+                    loop {
+                        tokio::time::sleep(CPU_SAMPLE_POLL).await;
+                        let Ok(newer) = handle.metrics().await else {
+                            break None;
+                        };
+                        let reading = cpu_reading(&newer);
+                        if reading.sampled_at != baseline.sampled_at {
+                            stats = newer;
+                            break cpu::percent_between(&baseline, &reading)
+                                .map(|percent| cpu::CpuState { reading, percent });
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                    }
+                }
+            };
+            let cpu_percent = match percent {
+                Some(state) => {
+                    if let Ok(mut kept) = cpu.lock() {
+                        kept.insert(id, state);
+                    }
+                    state.percent
+                }
+                // No second sample arrived in time: the runtime's own figure
+                // is the best there is.
+                None => f64::from(stats.cpu_percent),
+            };
             Ok(AgentStats {
                 name: info.handle.name,
-                cpu_percent: f64::from(stats.cpu_percent),
+                cpu_percent,
                 memory_mb: stats.memory_bytes as f64 / 1048576.0,
             })
         })

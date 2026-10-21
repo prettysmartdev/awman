@@ -286,7 +286,7 @@ pub type SharedContainerExitCode = Arc<Mutex<Option<i32>>>;
 /// Shared active-worktree path. Set by the worktree-lifecycle frontend on
 /// `report_worktree_created` and cleared on the post-workflow report
 /// (kept/discarded). The renderer reads this so the bottom-bar context
-/// line can show "Using worktree: <path>" while a workflow runs in a
+/// line can show "Worktree: <path>" while a workflow runs in a
 /// worktree even though the tab's session is rooted at the main repo.
 pub type SharedActiveWorktreePath = Arc<Mutex<Option<std::path::PathBuf>>>;
 

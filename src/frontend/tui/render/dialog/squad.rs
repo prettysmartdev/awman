@@ -349,7 +349,7 @@ pub(crate) fn render_squad_history(
             body,
         );
     } else {
-        render_squad_run_history(&state.runs, state.scroll, body, frame);
+        render_squad_run_history(&state.runs, state.selected, body, frame);
     }
 
     let back = if state.from_detail {
@@ -357,9 +357,97 @@ pub(crate) fn render_squad_history(
     } else {
         "esc close"
     };
+    let hint_text = if state.runs.is_empty() {
+        back.to_string()
+    } else {
+        format!("\u{2191}/\u{2193} select \u{b7} enter details \u{b7} {back}")
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!("\u{2191}/\u{2193} scroll \u{b7} {back}"),
+            hint_text,
+            Style::default().fg(Color::DarkGray),
+        )),
+        hint,
+    );
+
+    if let Some(detail) = &state.run_detail {
+        render_squad_run_detail(detail, area, frame);
+    }
+}
+
+/// Render one run's detail over the history table (Enter on a row): its
+/// timestamps and status, then the full reason and error, word-wrapped and
+/// scrollable — the text the table can only show truncated.
+fn render_squad_run_detail(state: &dialogs::SquadRunDetailState, area: Rect, frame: &mut Frame) {
+    const CHROME: u16 = 4;
+    let run = &state.run;
+    let width = 100u16.min(area.width.saturating_sub(6).max(40));
+    let text_w = width.saturating_sub(CHROME) as usize;
+
+    let mut lines: Vec<Line<'static>> = squad_history_headers(false)
+        .into_iter()
+        .zip(squad_history_cells(run, false))
+        .filter(|(label, _)| matches!(*label, "Started" | "Status" | "Finished"))
+        .map(|(label, value)| squad_field_line(label, &value))
+        .collect();
+    if !run.unmet_env.is_empty() {
+        lines.push(squad_field_line("Unmet env", &run.unmet_env.join(", ")));
+    }
+    for (label, text) in [("Reason", &run.reason), ("Error", &run.error)] {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{label}:"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        let body = text.as_deref().filter(|t| !t.trim().is_empty());
+        match body {
+            Some(text) => lines.extend(
+                text.lines()
+                    .flat_map(|line| wrap_display_width(line, text_w.saturating_sub(2).max(1)))
+                    .map(|line| Line::from(format!("  {line}"))),
+            ),
+            None => lines.push(Line::from(Span::styled(
+                "  \u{2014}",
+                Style::default().fg(Color::DarkGray),
+            ))),
+        }
+    }
+
+    // `+ 2`: a blank separator row and the key-hint row under the text.
+    let max_height = area.height.saturating_sub(4).clamp(8, 40);
+    let height = (lines.len().min(u16::MAX as usize) as u16)
+        .saturating_add(2 + CHROME)
+        .min(max_height);
+    let dialog_area = dialogs::centered_fixed(width, height, area);
+    let title = format!("run {}", run.id);
+    let inner = dialogs::render_dialog_frame(&title, Color::Cyan, dialog_area, frame);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let (body, hint) = squad_body_and_hint_rows(inner, 1);
+    let body = Rect {
+        height: body.height.saturating_sub(1),
+        ..body
+    };
+
+    // The renderer is the only place that knows how many rows the wrapped
+    // text fills, so it publishes the scroll limit for the key handler.
+    let max_scroll = lines.len().saturating_sub(body.height as usize);
+    state.max_scroll.set(max_scroll);
+    let scroll = state.scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        body,
+    );
+
+    let hint_text = if max_scroll > 0 {
+        "\u{2191}/\u{2193} scroll \u{b7} esc back to history"
+    } else {
+        "esc back to history"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            hint_text,
             Style::default().fg(Color::DarkGray),
         )),
         hint,
@@ -464,6 +552,31 @@ fn wrap_display_width(text: &str, width: usize) -> Vec<String> {
 /// status label. Every other column is free text sized from its content.
 const SQUAD_HISTORY_TIME_W: u16 = 17;
 const SQUAD_HISTORY_STATUS_W: u16 = 14;
+/// The widest a free-text column (reason, error, unmet env) grows. Longer
+/// text is cut with an ellipsis; the run detail modal (Enter) shows it whole.
+const SQUAD_HISTORY_TEXT_MAX_W: usize = 36;
+
+/// A history cell's text on one line, cut to `max` display cells with a
+/// trailing ellipsis when it is longer.
+fn squad_history_clip(text: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if unicode_width::UnicodeWidthStr::width(one_line.as_str()) <= max {
+        return one_line;
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in one_line.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > max.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
+}
 
 /// Whether the history shows the "Unmet env" column.
 ///
@@ -503,15 +616,24 @@ fn squad_history_cells(run: &crate::data::fs::task_store::Run, show_unmet: bool)
     let mut cells = vec![
         run.started_at.format("%Y-%m-%d %H:%M").to_string(),
         status.to_string(),
-        run.reason.clone().unwrap_or_else(|| "\u{2014}".to_string()),
+        run.reason
+            .as_deref()
+            .map(|reason| squad_history_clip(reason, SQUAD_HISTORY_TEXT_MAX_W))
+            .unwrap_or_else(|| "\u{2014}".to_string()),
         finished,
-        run.error.clone().unwrap_or_default(),
+        squad_history_clip(
+            run.error.as_deref().unwrap_or_default(),
+            SQUAD_HISTORY_TEXT_MAX_W,
+        ),
     ];
     if show_unmet {
         cells.push(if run.unmet_env.is_empty() {
             "\u{2014}".to_string()
         } else {
-            format!("\u{26a0} {}", run.unmet_env.join(", "))
+            squad_history_clip(
+                &format!("\u{26a0} {}", run.unmet_env.join(", ")),
+                SQUAD_HISTORY_TEXT_MAX_W,
+            )
         });
     }
     cells
@@ -550,11 +672,11 @@ fn squad_run_history_width(runs: &[crate::data::fs::task_store::Run]) -> u16 {
         .fold(gaps, |total, want| total.saturating_add(*want))
 }
 
-/// The run-history table (Started | Status | Reason | Finished | Error),
-/// scrolled by `scroll` rows.
+/// The run-history table (Started | Status | Reason | Finished | Error) with
+/// the `selected` run highlighted; the table scrolls to keep it in view.
 fn render_squad_run_history(
     runs: &[crate::data::fs::task_store::Run],
-    scroll: usize,
+    selected: usize,
     area: Rect,
     frame: &mut Frame,
 ) {
@@ -569,7 +691,6 @@ fn render_squad_run_history(
     );
     let rows: Vec<Row> = runs
         .iter()
-        .skip(scroll)
         .map(|r| {
             Row::new(
                 squad_history_cells(r, show_unmet)
@@ -589,6 +710,9 @@ fn render_squad_run_history(
             _ => Constraint::Fill(want.max(1)),
         })
         .collect();
-    let table = Table::new(rows, widths).header(header);
-    frame.render_widget(table, area);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut table_state = ratatui::widgets::TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, area, &mut table_state);
 }

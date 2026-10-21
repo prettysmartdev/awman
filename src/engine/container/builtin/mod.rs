@@ -9,10 +9,10 @@ use crate::engine::error::EngineError;
 
 // Gating follows the actual runtime boundary. Only the modules that call the
 // Microsandbox SDK or embed the verified payload (`embedded`, `msb_driver`)
-// need `awman_builtin`. Planning, paths, naming, resources, network policy,
-// the catalog marker, attach framing and the fake-driver lifecycle are plain
-// Unix code, so their tests run in the default hermetic tier without payloads
-// or the VM SDK. A default build has no production caller for them.
+// need `awman_builtin`. Planning, paths, naming, resources, CPU accounting,
+// network policy, the catalog marker, attach framing and the fake-driver
+// lifecycle are plain Unix code, so their tests run in the default hermetic
+// tier without payloads or the VM SDK. A default build has no production caller for them.
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod backend;
@@ -22,6 +22,9 @@ mod blocking;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod catalog;
+#[cfg(unix)]
+#[cfg_attr(not(awman_builtin), allow(dead_code))]
+mod cpu;
 #[cfg(unix)]
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod driver;

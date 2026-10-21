@@ -64,6 +64,13 @@ pub(super) fn handle(app: &mut App, action: Action) {
             // Esc in the run-history modal walks back exactly one step: to the
             // detail modal when that is where `h` was pressed, and to the card
             // grid when the history was opened from the grid itself.
+            // A run's detail open over the table closes first, back to the
+            // table with the same row still selected.
+            if let Some(Dialog::SquadTaskHistory(state)) = &mut app.active_dialog {
+                if state.run_detail.take().is_some() {
+                    return;
+                }
+            }
             if let Some(Dialog::SquadTaskHistory(state)) = &app.active_dialog {
                 let (name, from_detail) = (state.name.clone(), state.from_detail);
                 if !(from_detail && reopen_squad_detail(app, &name)) {

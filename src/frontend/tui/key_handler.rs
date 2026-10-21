@@ -539,8 +539,9 @@ pub(super) fn open_squad_history(app: &mut App, name: &str, from_detail: bool) {
     app.active_dialog = Some(Dialog::SquadTaskHistory(dialogs::SquadHistoryState {
         name: name.to_string(),
         runs,
-        scroll: 0,
+        selected: 0,
         from_detail,
+        run_detail: None,
     }));
 }
 

@@ -79,7 +79,7 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         if matches!(decision, ExistingWorktreeDecision::Resume) {
             // The lifecycle returns early on Resume without calling
             // report_worktree_created, so publish the path here so the
-            // bottom-bar context line shows "Using worktree" immediately.
+            // bottom-bar context line shows "Worktree" immediately.
             if let Ok(mut guard) = self.active_worktree_path.lock() {
                 *guard = Some(path.to_path_buf());
             }

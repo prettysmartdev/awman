@@ -1764,10 +1764,10 @@ fn squad_detail_modal_h_opens_history_and_esc_returns_to_the_detail_modal() {
     }
 }
 
-/// The history table scrolls with the arrow keys, and cannot be scrolled past
+/// The arrow keys move the history table's selection, which cannot run past
 /// its last run.
 #[test]
-fn squad_history_modal_scrolls_within_its_runs() {
+fn squad_history_modal_selection_stays_within_its_runs() {
     let mut app = make_app();
     push_squad_tab(&mut app);
     set_squad_tasks(&mut app, &["task-a"]);
@@ -1776,7 +1776,7 @@ fn squad_history_modal_scrolls_within_its_runs() {
     press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
     press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
     match &app.active_dialog {
-        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(state.scroll, 1),
+        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(state.selected, 1),
         _ => panic!("the history modal must stay open while scrolling"),
     }
 
@@ -1784,17 +1784,85 @@ fn squad_history_modal_scrolls_within_its_runs() {
         press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
     }
     match &app.active_dialog {
-        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(
-            state.scroll, 2,
-            "scrolling must stop at the last run rather than emptying the table"
-        ),
+        Some(Dialog::SquadTaskHistory(state)) => {
+            assert_eq!(state.selected, 2, "the selection must stop at the last run")
+        }
         _ => panic!("the history modal must stay open while scrolling"),
     }
 
     press_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
     match &app.active_dialog {
-        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(state.scroll, 1),
+        Some(Dialog::SquadTaskHistory(state)) => assert_eq!(state.selected, 1),
         _ => panic!("the history modal must stay open while scrolling"),
+    }
+}
+
+/// Enter on a history row opens that run's detail over the table; the arrow
+/// keys then scroll the detail instead of moving the selection, and Esc goes
+/// back to the table with the same row still selected.
+#[test]
+fn squad_history_enter_opens_the_selected_runs_detail_and_esc_returns_to_the_table() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a"]);
+    set_squad_runs(&mut app, "task-a", 3);
+
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => {
+            let detail = state.run_detail.as_ref().expect("Enter opens the detail");
+            assert_eq!(detail.run.id, "run-1", "the detail is the selected run's");
+            assert_eq!(detail.scroll, 0);
+        }
+        _ => panic!("the history modal must stay up under its run detail"),
+    }
+
+    // Stand in for the renderer, which publishes how far the text can scroll.
+    if let Some(Dialog::SquadTaskHistory(state)) = &app.active_dialog {
+        state.run_detail.as_ref().unwrap().max_scroll.set(3);
+    }
+    for _ in 0..10 {
+        press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    }
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => {
+            assert_eq!(
+                state.selected, 1,
+                "the arrows scroll the detail, not the table"
+            );
+            assert_eq!(
+                state.run_detail.as_ref().unwrap().scroll,
+                3,
+                "the detail stops scrolling at its last line"
+            );
+        }
+        _ => panic!("the history modal must stay up while its detail scrolls"),
+    }
+
+    press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => {
+            assert!(state.run_detail.is_none(), "Esc closes the detail first");
+            assert_eq!(state.selected, 1, "the same row stays selected");
+        }
+        _ => panic!("Esc in a run's detail must return to the history table"),
+    }
+}
+
+/// Enter on a task that has never run has no row to open, so it is a no-op.
+#[test]
+fn squad_history_enter_on_an_empty_history_opens_nothing() {
+    let mut app = make_app();
+    push_squad_tab(&mut app);
+    set_squad_tasks(&mut app, &["task-a"]);
+
+    press_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    match &app.active_dialog {
+        Some(Dialog::SquadTaskHistory(state)) => assert!(state.run_detail.is_none()),
+        _ => panic!("Enter on an empty history must leave the modal as it was"),
     }
 }
 

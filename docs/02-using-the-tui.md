@@ -200,7 +200,7 @@ or short-flag cluster (e.g. `ready -ab`) is reported as `unknown flag: -ab`.
 When a suggestion shows a file path (worktree or working directory), long paths are automatically truncated in the middle to fit the display:
 
 ```
-Using Worktree: /home/user/my…/worktree-branch
+Worktree: /home/user/my…/worktree-branch
 ```
 
 ### Context display
@@ -214,7 +214,7 @@ CWD: /home/user/myproject
 If a worktree is active for the session, it shows the worktree path:
 
 ```
-Using Worktree: /home/user/myproject-worktree
+Worktree: /home/user/myproject-worktree
 ```
 
 If you type an unrecognised command, awman suggests the closest known one —

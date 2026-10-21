@@ -181,9 +181,9 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
         .and_then(|path| path.clone());
     let (directory_label, directory_path, directory_color) =
         if let Some(worktree) = active_worktree.as_deref() {
-            ("  Using worktree: ", worktree, Color::Blue)
+            ("  Worktree: ", worktree, Color::Blue)
         } else if working_dir != tab.session.git_root() {
-            ("  Using worktree: ", working_dir, Color::Blue)
+            ("  Worktree: ", working_dir, Color::Blue)
         } else {
             ("  CWD: ", working_dir, Color::DarkGray)
         };
