@@ -13,8 +13,9 @@ Use this skill when the user asks to "prepare for release vX.Y.Z", "bump the ver
 2. Identify what changed since the last release (git log, new work items, new features)
 3. Update all version numbers
 4. Update documentation to reflect new features
-5. Write release notes
-6. Write a blog post
+5. Review and refresh the status-dashboard tips
+6. Write release notes
+7. Write a blog post
 
 Do **not** run `make release` or push any tags. Stop before the release script.
 
@@ -100,7 +101,30 @@ awman <command>
 
 ---
 
-## Step 6: Write release notes
+## Step 6: Review and refresh the tips
+
+The status dashboard shows one random tip from `TIPS` in `src/command/commands/status_tips.rs`. If that file has moved (for example to `src/command/commands/agents/tips.rs`), find it with `grep -rn "pub const TIPS" src`. Tips are a cheap way for users to discover features, so review the whole list every release:
+
+1. **Remove or fix stale tips.** Check each tip against the current command surface (`docs/14-command-reference.md`), TUI keybindings (`docs/02-using-the-tui.md`), and the other numbered docs. Pay particular attention to keybindings, defaults (intervals, timeouts, ports), supported agents and runtimes, and anything renamed or removed since the last release.
+2. **Add tips for what's new.** Each user-visible feature, command, flag or keybinding in this release (from Step 1) should get at least one tip if a user could benefit from discovering it. Put each tip in the matching topic group in the list.
+3. **Keep the list comprehensive.** Every top-level command, and the main TUI keys, should be covered by at least one tip.
+4. **Follow the tip style:**
+   - One sentence describing what the user can do, not how it works internally.
+   - Wrap commands, flags and paths in backticks, starting with `awman` (for example `` `awman clean --dry-run` ``).
+   - 100 characters or fewer.
+   - No duplicates.
+   - Follow the squad wording rules in Step 3.
+5. **Run the tips tests:**
+
+```bash
+cargo test --lib tips
+```
+
+The tests check every `` `awman …` `` command and flag a tip names against the `CommandCatalogue`, and reject duplicates and tips over 100 characters. A failure means a tip is stale: fix the tip, never the test.
+
+---
+
+## Step 7: Write release notes
 
 Create `docs/releases/vX.Y.Z.md`:
 
@@ -125,7 +149,7 @@ Keep it factual and brief. No marketing language. Focus on what a developer usin
 
 ---
 
-## Step 7: Write a blog post
+## Step 8: Write a blog post
 
 Create `docs/blog/NNNN-slug.md` where NNNN is the next number after the last post.
 
@@ -171,6 +195,7 @@ Before finishing, verify:
 - [ ] `README.md` reflects new commands/features
 - [ ] `docs/00-getting-started.md` covers new workflow steps
 - [ ] relevant numbered doc(s) under `docs/` document new subcommands/config fields (check, don't assume)
+- [ ] Status-dashboard tips reviewed: stale tips fixed, new features covered, `cargo test --lib tips` passes
 - [ ] `docs/releases/vX.Y.Z.md` created
 - [ ] `docs/blog/NNNN-slug.md` created
 - [ ] Release script NOT run (user does that separately)

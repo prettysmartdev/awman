@@ -822,7 +822,9 @@ impl SshClient {
                 .map_err(|e| MicrosandboxError::Terminal(format!("resolve tty path: {e}")))?;
             let tty_input = open_nonblocking_terminal_input(&tty_input_path)
                 .map_err(|e| MicrosandboxError::Terminal(format!("open tty input: {e}")))?;
-            let stdin_async = tokio::io::unix::AsyncFd::new(tty_input)
+            // SAFETY: `tty_input` is an owned `File`, so its fd stays open and
+            // unchanged for as long as the `AsyncFd` owns it.
+            let stdin_async = unsafe { tokio::io::unix::AsyncFd::register(tty_input) }
                 .map_err(|e| MicrosandboxError::Terminal(format!("async tty input: {e}")))?;
             let mut stdout = tokio::io::stdout();
             let mut sigwinch =

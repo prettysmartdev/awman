@@ -46,11 +46,56 @@ fn image_stem(git_root: &Path) -> String {
     if let Some(slug) = squad_task_slug(git_root) {
         return format!("squad-{slug}");
     }
-    git_root
+    let folder = git_root
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("repo")
-        .to_string()
+        .unwrap_or("repo");
+    let stem = sanitize_image_name(folder);
+    if stem.is_empty() {
+        "repo".to_string()
+    } else {
+        stem
+    }
+}
+
+/// Coerce a folder name into a valid OCI repository name component
+/// (`[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`). Docker and Apple containers both
+/// reject anything else — e.g. `MeshCore` must become `meshcore`.
+///
+/// Uppercase is lowered; any other disallowed character becomes `-`. A run
+/// of separators is kept when it is already valid (`.`, `_`, `__`, or only
+/// hyphens) and collapsed to a single `-` otherwise. Leading and trailing
+/// separators are dropped, so the result may be empty.
+fn sanitize_image_name(name: &str) -> String {
+    let is_sep = |c: char| matches!(c, '.' | '_' | '-');
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || is_sep(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let mut out = String::with_capacity(mapped.len());
+    let mut sep_run = String::new();
+    for c in mapped.chars() {
+        if is_sep(c) {
+            sep_run.push(c);
+            continue;
+        }
+        if !sep_run.is_empty() && !out.is_empty() {
+            let valid =
+                matches!(sep_run.as_str(), "." | "_" | "__") || sep_run.chars().all(|s| s == '-');
+            out.push_str(if valid { &sep_run } else { "-" });
+        }
+        sep_run.clear();
+        out.push(c);
+    }
+    out
 }
 
 /// The task slug when `git_root` is a squad task workspace — a path ending in
@@ -127,6 +172,44 @@ mod tests {
                 "{p:?} must not be treated as a squad workspace: {tag}"
             );
         }
+    }
+
+    #[test]
+    fn image_tags_are_lowercased() {
+        let p = PathBuf::from("/Users/me/MeshCore");
+        assert_eq!(project_image_tag(&p), "awman-meshcore:latest");
+        assert_eq!(
+            agent_image_tag(&p, "claude"),
+            "awman-meshcore-claude:latest"
+        );
+    }
+
+    #[test]
+    fn sanitize_image_name_produces_valid_components() {
+        let cases = [
+            ("myproj", "myproj"),
+            ("MeshCore", "meshcore"),
+            ("my_proj", "my_proj"),
+            ("my__proj", "my__proj"),
+            ("my.proj", "my.proj"),
+            ("my--proj", "my--proj"),
+            ("My Project", "my-project"),
+            ("a._b", "a-b"),
+            ("a___b", "a-b"),
+            ("a..b", "a-b"),
+            ("_.hidden-", "hidden"),
+            ("café", "caf"),
+            ("日本", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sanitize_image_name(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn unsanitizable_folder_falls_back_to_repo() {
+        let p = PathBuf::from("/tmp/日本");
+        assert_eq!(project_image_tag(&p), "awman-repo:latest");
     }
 
     #[test]

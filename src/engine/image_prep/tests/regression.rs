@@ -95,6 +95,40 @@ async fn builder_builds_base_then_agent_on_a_missing_image() {
     );
 }
 
+/// Apple Containers stores build output as an index, so the post-build
+/// inspection of the project base reports `Unbound`. That is the store's
+/// normal shape, not a base that changed after its build.
+#[tokio::test]
+async fn builder_accepts_an_unbound_base_image_after_its_build() {
+    let platform = crate::data::oci_identity::OciPlatform::host_linux();
+    let runtime = Arc::new(FakeImportRuntime::new(false));
+    let local_builder = Arc::new(FakeLocalBuilder::new());
+    let (mut engine, mut frontend, tmp, _locks, _receipts) = builder_engine(
+        runtime.clone(),
+        false,
+        false,
+        ImageSources::default(),
+        local_builder.clone(),
+    );
+    let socket = tmp.path().join("docker.sock");
+    engine.preparer.image_sources = local_docker_sources(&socket);
+    let project_tag = crate::data::image_tags::project_image_tag(tmp.path());
+    let agent_tag = crate::data::image_tags::agent_image_tag(tmp.path(), "claude");
+    local_builder.script_inspect(&agent_tag, Ok(SourceImage::Absent));
+    local_builder.script_inspect(&project_tag, Ok(SourceImage::Absent));
+    local_builder.script_build(&project_tag, Ok(built_identity('a', platform.clone())));
+    local_builder.script_inspect(&project_tag, Ok(SourceImage::Unbound));
+    local_builder.script_build(&agent_tag, Ok(built_identity('b', platform)));
+
+    step_through_image_phases(&mut engine, &mut frontend).await;
+
+    let summary = engine.summary();
+    assert_eq!(summary.base_image_results.len(), 1);
+    assert_eq!(summary.base_image_results[0].build, StepStatus::Done);
+    assert_eq!(summary.image_results[0].build, StepStatus::Done);
+    assert!(summary.is_ready());
+}
+
 /// `--build` rebuilds even an already-installed image, in its source
 /// store, and the import is still refreshed with the exact content the
 /// build produced.

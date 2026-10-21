@@ -100,6 +100,10 @@ pub struct AgentEngine {
     /// builds options for (F-38). `None` — the default — disables leases, the
     /// same behaviour the absent process-global monitor used to produce.
     lease_factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
+    /// A recording builder for daemon-free launch tests; production builds
+    /// with the host builder.
+    #[cfg(test)]
+    local_builder: Option<Arc<dyn crate::engine::image_prep::builder::LocalImageBuilder>>,
 }
 
 impl AgentEngine {
@@ -109,6 +113,8 @@ impl AgentEngine {
             runtime,
             prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
             lease_factory: None,
+            #[cfg(test)]
+            local_builder: None,
         }
     }
 
@@ -123,12 +129,42 @@ impl AgentEngine {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_local_builder(
+        mut self,
+        builder: Arc<dyn crate::engine::image_prep::builder::LocalImageBuilder>,
+    ) -> Self {
+        self.local_builder = Some(builder);
+        self
+    }
+
     /// The runtime this engine prepares agents on. Callers that only need to
     /// ask whether an image exists take a cheap clone rather than a second
     /// handle of their own (F-40b replaced `container_runtime_arc`, which
     /// forced them to name the container tier).
     pub fn runtime(&self) -> &Arc<dyn AgentRuntimeEngine> {
         &self.runtime
+    }
+
+    /// [`Self::ensure_available`] with the session's own layered config and
+    /// the runtime's image probe — what every launch command must use. The
+    /// builtin runtime's image source and builder setting come from that
+    /// config, so passing anything else misreports a configured source.
+    pub async fn ensure_available_for_session(
+        &self,
+        session: &Session,
+        agent: &AgentName,
+        frontend: &mut dyn AgentImageFrontend,
+    ) -> Result<(), EngineError> {
+        let runtime = Arc::clone(&self.runtime);
+        self.ensure_available(
+            session,
+            agent,
+            &session.effective_config(),
+            frontend,
+            move |tag: &str| runtime.image_exists(tag).unwrap_or(false),
+        )
+        .await
     }
 
     /// Ensure the agent's Dockerfile and image are available locally. Reports
@@ -149,12 +185,15 @@ impl AgentEngine {
         if self.runtime.capabilities().image_acquisition
             == crate::engine::agent_runtime::ImageAcquisition::Import
         {
+            use crate::data::ready_image::ReadyImagePlan;
             use crate::engine::image_prep::{
                 AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext,
             };
             let tag = agent_image_tag(session.git_root(), agent.as_str());
+            let resolved = config.builtin_settings()?;
+            let builder_enabled = resolved.builder_enabled;
             let mut preparer = AgentImagePreparer::new(
-                config.builtin_settings()?,
+                resolved,
                 self.runtime.clone(),
                 crate::data::config::global::GlobalConfig::data_home_with(config.env())?,
                 // Default agent = the configured one, as `ready` and preflight
@@ -162,17 +201,45 @@ impl AgentEngine {
                 // any other agent here too.
                 ImageBuildContext::for_session(session, session.configured_agent().as_str()),
             );
-            preparer
+            // With the builder on, a launch whose image is missing prepares
+            // it as the building runtimes do: build into the source store
+            // only when it lacks the image, then import (API session setup's
+            // policy). An installed image keeps `CheckOnly`'s provenance
+            // check, and without a usable source `CheckOnly` reports the
+            // typed configuration error.
+            #[cfg(test)]
+            if let Some(builder) = &self.local_builder {
+                preparer = preparer.with_local_builder(builder.clone());
+            }
+            let missing = builder_enabled && !self.runtime.image_exists(&tag)?;
+            let policy = match missing.then(|| preparer.missing_image_plan(&tag, agent.as_str())) {
+                Some(ReadyImagePlan::BuildAndImport | ReadyImagePlan::Import) => {
+                    BuildPolicy::SessionSetup
+                }
+                _ => BuildPolicy::CheckOnly,
+            };
+            let result = preparer
                 .prepare(
                     &AgentImageRequest {
                         tag: &tag,
                         agent: agent.as_str(),
-                        policy: BuildPolicy::CheckOnly,
+                        policy,
                     },
                     frontend,
                 )
                 .await?;
-            return Ok(());
+            return match (result.build, result.import) {
+                (StepStatus::Failed(error), _) => Err(EngineError::Other(format!(
+                    "failed to build image for agent '{agent}' ({tag}): {error}"
+                ))),
+                (_, StepStatus::Failed(error)) => Err(EngineError::Other(format!(
+                    "failed to import image for agent '{agent}' ({tag}): {error}"
+                ))),
+                (_, StepStatus::Warn(reason)) => Err(EngineError::Other(format!(
+                    "cannot import image for agent '{agent}' ({tag}): {reason}"
+                ))),
+                _ => Ok(()),
+            };
         }
 
         // Check for the project base image. If absent, fail with a structured
@@ -1509,6 +1576,153 @@ mod tests {
             self.container_call_count += 1;
             Box::new(FakeRuntimeFrontend)
         }
+    }
+
+    /// A builtin launch session for `chat --agent codex` in a repo with no
+    /// `.awman/config.json`: the global config alone sets the source and
+    /// builder. The agent Dockerfile is present so no test downloads it.
+    fn builtin_launch_fixture(global: &str) -> (tempfile::TempDir, tempfile::TempDir, Session) {
+        let config_home = tempfile::tempdir().unwrap();
+        std::fs::write(config_home.path().join("config.json"), global).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        std::fs::create_dir_all(repo.path().join(".awman")).unwrap();
+        std::fs::write(
+            repo.path().join(".awman/Dockerfile.codex"),
+            "FROM scratch\n",
+        )
+        .unwrap();
+        let session = Session::for_tests_isolated(repo.path(), config_home.path());
+        (config_home, repo, session)
+    }
+
+    /// Regression: `chat`/`exec prompt` passed a default config, so a global
+    /// `apple-local` source with the builder on was reported as "no image
+    /// source is configured ... its builder is off". With the builder on, a
+    /// missing image is now built into the source store and imported, as the
+    /// building runtimes build it — base image first, then the agent.
+    #[tokio::test]
+    async fn ensure_available_builds_and_imports_a_missing_image_when_the_builder_is_on() {
+        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
+        use crate::engine::ready::tests::{built_identity, script_missing_image_build};
+        let (config_home, repo, session) = builtin_launch_fixture(
+            r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}"#,
+        );
+        let tag = agent_image_tag(repo.path(), "codex");
+        let base = project_image_tag(repo.path());
+        let platform = crate::data::oci_identity::OciPlatform::host_linux();
+        let builder = Arc::new(FakeLocalBuilder::new());
+        script_missing_image_build(
+            &builder,
+            &base,
+            &tag,
+            built_identity('a', platform.clone()),
+            built_identity('b', platform),
+        );
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        let (engine, _) = make_agent_engine_on(config_home.path(), runtime.clone());
+        let engine = engine.with_local_builder(builder.clone());
+
+        engine
+            .ensure_available_for_session(
+                &session,
+                &AgentName::new("codex").unwrap(),
+                &mut FakeAgentFrontend::new(),
+            )
+            .await
+            .unwrap();
+
+        let built: Vec<_> = builder
+            .build_calls()
+            .into_iter()
+            .map(|b| b.reference)
+            .collect();
+        assert_eq!(built, vec![base, tag.clone()]);
+        let imports = runtime.imports.lock().unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].tag, tag);
+    }
+
+    /// The builder-off and no-source cases keep the check-only launch: no
+    /// builder call, no import, and the typed error naming the next step.
+    #[tokio::test]
+    async fn ensure_available_stays_check_only_without_a_buildable_source() {
+        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
+        for (global, unconfigured) in [
+            (
+                r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":false}}}"#,
+                false,
+            ),
+            (r#"{"builtin":{"builder":{"enabled":true}}}"#, true),
+        ] {
+            let (config_home, _repo, session) = builtin_launch_fixture(global);
+            let builder = Arc::new(FakeLocalBuilder::new());
+            let runtime = Arc::new(FakeImportRuntime::new(false));
+            let (engine, _) = make_agent_engine_on(config_home.path(), runtime.clone());
+            let engine = engine.with_local_builder(builder.clone());
+
+            let error = engine
+                .ensure_available_for_session(
+                    &session,
+                    &AgentName::new("codex").unwrap(),
+                    &mut FakeAgentFrontend::new(),
+                )
+                .await
+                .unwrap_err();
+
+            if unconfigured {
+                assert!(
+                    matches!(error, EngineError::ImageSourceUnconfigured { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("awman ready --build"), "{error}");
+            } else {
+                assert!(
+                    matches!(error, EngineError::BuiltinImageNotImported { .. }),
+                    "{error}"
+                );
+            }
+            assert!(builder.build_calls().is_empty(), "{global}");
+            assert_eq!(builder.inspect_count(), 0, "{global}");
+            assert!(runtime.imports.lock().unwrap().is_empty(), "{global}");
+        }
+    }
+
+    /// A failed build fails the launch with the build's own reason, and
+    /// nothing is imported.
+    #[tokio::test]
+    async fn ensure_available_fails_the_launch_when_the_build_fails() {
+        use crate::engine::oci::SourceImage;
+        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
+        let (config_home, repo, session) = builtin_launch_fixture(
+            r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}"#,
+        );
+        let tag = agent_image_tag(repo.path(), "codex");
+        let base = project_image_tag(repo.path());
+        let builder = Arc::new(FakeLocalBuilder::new());
+        builder.script_inspect(&tag, Ok(SourceImage::Absent));
+        builder.script_inspect(&base, Ok(SourceImage::Absent));
+        builder.script_build(&base, Err("Dockerfile.dev: step 3 failed".into()));
+        let runtime = Arc::new(FakeImportRuntime::new(false));
+        let (engine, _) = make_agent_engine_on(config_home.path(), runtime.clone());
+        let engine = engine.with_local_builder(builder.clone());
+
+        let error = engine
+            .ensure_available_for_session(
+                &session,
+                &AgentName::new("codex").unwrap(),
+                &mut FakeAgentFrontend::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("failed to build image for agent 'codex'"),
+            "{error}"
+        );
+        assert!(error.contains("step 3 failed"), "{error}");
+        assert!(runtime.imports.lock().unwrap().is_empty());
     }
 
     // Scenario 1: project image absent → returns AgentRequiresProjectImage error.

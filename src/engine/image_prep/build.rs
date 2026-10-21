@@ -371,6 +371,11 @@ impl AgentImagePreparer {
                         .await
                     {
                         Ok(SourceImage::Present(current)) if current == receipt => Ok(receipt),
+                        // Stores that keep build output as an index (Apple
+                        // Containers) cannot vouch for one manifest without
+                        // exporting; the builder already bound the receipt
+                        // to the manifest its build reported.
+                        Ok(SourceImage::Unbound) => Ok(receipt),
                         Ok(_) => Err(EngineError::ImageBuilder(
                             crate::engine::error::BuilderFailure::BaseImageChanged {
                                 tag: project_tag.clone(),

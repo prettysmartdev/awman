@@ -218,7 +218,10 @@ that image's resolved source, then imports from that same source. Registry,
 archive, remote Docker, and unconfigured sources do not select a builder.
 Incompatible requested builds warn and retain normal source import behavior.
 API session setup may also build, when the compatible source store lacks the
-image; it never forces a rebuild. Workflow preflight (static and dynamic) and
+image; it never forces a rebuild. `chat` and `exec prompt` prepare an agent image
+that is not installed the same way, as the Docker and Apple runtimes build a
+missing image at launch; an installed image is only checked against its
+recorded source, and with the builder disabled a launch never acquires. Workflow preflight (static and dynamic) and
 squad image checks remain import-only: they never build or probe a builder, and
 they re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`

@@ -126,8 +126,10 @@ the flag but does not forward it, and now says so. See
 With `builtin.builder.enabled: true` and a `docker-local` or `apple-local`
 image source, `awman ready` builds the Dockerfiles in that local store and
 imports the result, in one command. Other sources warn once per image and keep
-importing. API session setup builds a missing image the same way; workflow
-preflight and squad never build. `docker-store` and `apple-store` still work
+importing. API session setup, `chat` and `exec prompt` build a missing image the same
+way, as the Docker and Apple runtimes do, so `awman chat --agent codex` works
+without running `ready` for that agent first. Workflow preflight and squad
+never build. `docker-store` and `apple-store` still work
 as aliases for `docker-local` and `apple-local`. See
 [Runtimes](../11-runtimes.md).
 

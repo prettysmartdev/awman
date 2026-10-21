@@ -148,9 +148,11 @@ image. Image identity records reference, platform, content digests, and source
 kind. With `builtin.builder.enabled`, a command whose `BuildPolicy` allows it
 may build through the local Docker Engine (Unix socket) or Apple Containers
 store selected by that image's resolved source, then import from that same
-source. `ready` (`Ready`) and API session setup (`SessionSetup`, only when the
-compatible source store lacks the image) may build; workflow preflight, dynamic
-workflow and squad evaluation (`ImportOnly`) and the agent availability check
+source. `ready` (`Ready`), API session setup, and the agent availability check behind
+`chat`/`exec prompt` for an image that is not installed (`SessionSetup`, only
+when the compatible source store lacks the image) may build; workflow
+preflight, dynamic workflow and squad evaluation (`ImportOnly`) and the
+availability check for an installed image or with the builder disabled
 (`CheckOnly`) never do. Other sources retain their normal import behavior and
 never select a substitute builder. Build and import remain separate stages;
 successful build alone is not readiness. Source acquisition is not required

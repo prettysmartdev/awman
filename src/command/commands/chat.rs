@@ -416,15 +416,10 @@ pub(crate) async fn ensure_agent_setup(
     agent: &AgentName,
     frontend: &mut Box<dyn ChatCommandFrontend>,
 ) -> Result<(), CommandError> {
-    use crate::data::config::effective::EffectiveConfig;
-    let config = EffectiveConfig::default();
     let mut adapter =
         crate::command::commands::agent_setup::AgentFrontendAdapter::new(frontend.as_mut());
-    let runtime = std::sync::Arc::clone(agent_engine.runtime());
     agent_engine
-        .ensure_available(session, agent, &config, &mut adapter, move |tag: &str| {
-            runtime.image_exists(tag).unwrap_or(false)
-        })
+        .ensure_available_for_session(session, agent, &mut adapter)
         .await
         .map_err(CommandError::from)
 }

@@ -477,7 +477,7 @@ To build with Apple Containers instead of Docker, use an `apple-local` source:
 | `builtin.vcpus` | integer 1–255 | `2` | Whole vCPUs per session VM |
 | `builtin.memoryMib` | integer ≥ 128 | `4096` | Guest memory in MiB |
 | `builtin.imageSource` | object | unset | Default image source: an object whose `type` is `registry`, `docker-local`, `archive`, or `apple-local` (macOS) |
-| `builtin.builder.enabled` | boolean | `false` | Opt in to local source-matched Docker or Apple Containers builds during `awman ready` under `builtin-experimental`; see [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). Repository value overrides global. |
+| `builtin.builder.enabled` | boolean | `false` | Opt in to local source-matched Docker or Apple Containers builds during `awman ready`, and when a `chat` or `exec prompt` launch finds its agent image missing, under `builtin-experimental`; see [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). Repository value overrides global. |
 | `builtin.images` | object (image tag → source) | `{}` | Per-image source; wins over `imageSource` for that tag |
 | `builtin.registries` | object (`host[:port]` → settings) | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
 | `builtin.network` | object | `{"mode":"public"}` | Guest network policy: `mode` (`public`/`allowlist`/`none`), `allow` (allowlist names), `hostPorts` (host loopback ports the guest may reach), `nameservers` and `trustHostCas` (global config only) — see [Runtimes: Network](11-runtimes.md#network) |
