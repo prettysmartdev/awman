@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Uses pristine published migration crates from SOURCE_ROOT (as protocol compat).
+# No VM, guest agent, host agent, credentials or hardware required.
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+scratch=$(mktemp -d /tmp/awman-catalog-compat.XXXXXX)
+trap 'rm -r -- "$scratch"' EXIT
+if [ $# -gt 0 ]; then
+    source_root=$(cd "$1" && pwd)
+else
+    source_root="$scratch/sources"
+    mkdir "$source_root"
+    for version in 0.7.2 0.7.8; do
+        case "$version" in
+            0.7.2) expected=9ded9890da64f3157aefc2352190328252c7ea1b667954570779ed4b14738c61;;
+            0.7.8) expected=9658914aca55bb0d87283aa02e7487a5c11f5d67db035c5d29f80163e5c7b51d;;
+        esac
+        archive="$source_root/migration-$version.crate"
+        curl -fsSL --retry 3 "https://static.crates.io/crates/microsandbox-migration/microsandbox-migration-$version.crate" -o "$archive"
+        printf '%s  %s\n' "$expected" "$archive" | shasum -a 256 -c -
+        tar xf "$archive" -C "$source_root"
+    done
+fi
+export AWMAN_CATALOG_FIXTURE="$scratch/catalog.db"
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$repo/target}
+for version in 0.7.2 0.7.8; do
+    mkdir "$scratch/$version"
+    cp "$repo/tools/test-fixtures/msb-catalog-compat.rs" "$scratch/$version/main.rs"
+    cp "$repo/Cargo.lock" "$scratch/$version/Cargo.lock"
+    cat > "$scratch/$version/Cargo.toml" <<EOF
+[package]
+name = "awman-catalog-compat"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[[bin]]
+name = "awman-catalog-compat"
+path = "main.rs"
+[dependencies]
+microsandbox-migration = { path = "$source_root/microsandbox-migration-$version" }
+sea-orm = { version = "2.0.0", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+[patch.crates-io]
+sqlx-sqlite = { path = "$repo/third_party/sqlx-sqlite-0.9.0" }
+EOF
+    if [ "$version" = 0.7.8 ]; then
+        printf 'microsandbox-types = { path = "%s/third_party/microsandbox-types-0.7.8" }\n' "$repo" >> "$scratch/$version/Cargo.toml"
+    fi
+done
+for step in '0.7.2 write-old' '0.7.8 upgrade-new' '0.7.2 refuse-old' '0.7.8 verify-new'; do
+    read -r version phase <<< "$step"
+    cargo run --quiet --manifest-path "$scratch/$version/Cargo.toml" -- "$phase"
+done

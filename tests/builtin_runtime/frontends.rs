@@ -573,15 +573,15 @@ fn builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest() {
 
 /// Two genuine awman builds share one project and builtin state: the older
 /// build (runtime spelled `builtin`) imports and runs, the newer build
-/// (`builtin-experimental`) reuses that state, the older build still runs
-/// after the newer one wrote to it, and replacing the executable file while
-/// an agent runs from it does not disturb that agent.
+/// (`builtin-experimental`) reuses that state, and the older build
+/// explicitly refuses the upgraded catalog without damaging it. Binary
+/// replacement is exercised independently below.
 ///
 /// `AWMAN_TEST_BUILTIN_OLD_ARTIFACT` names the older, entitlement-signed
 /// build; without it the test is BLOCKED (REQUIRE_HW fails it).
 #[test]
-fn builtin_hw_actual_awman_old_new_upgrade_and_binary_replacement() {
-    const TEST: &str = "builtin_hw_actual_awman_old_new_upgrade_and_binary_replacement";
+fn builtin_hw_actual_awman_old_new_forward_upgrade_and_old_reader_refusal() {
+    const TEST: &str = "builtin_hw_actual_awman_old_new_forward_upgrade_and_old_reader_refusal";
     let Some((binary, archive)) = gate(TEST) else {
         return;
     };
@@ -625,7 +625,30 @@ fn builtin_hw_actual_awman_old_new_upgrade_and_binary_replacement() {
     // 3. Old build again, after the new build wrote the state.
     p.switch(&old, "builtin");
     let (code, out) = run(&p, "old again exit=0");
-    assert_eq!(code, Some(0), "old build after new: {out}");
+    assert_ne!(
+        code,
+        Some(0),
+        "0.7.2 must refuse the upgraded 0.7.8 catalog: {out}"
+    );
+    assert!(out.contains("database schema is newer"), "{out}");
+    p.switch(&binary, "builtin-experimental");
+    let (code, out) = run(&p, "new after refusal exit=0");
+    assert_eq!(code, Some(0), "catalog survives old-reader refusal: {out}");
+    p.assert_no_helper();
+    eprintln!("PASS: {TEST}");
+}
+
+/// Executable replacement has its own project and gate; downgrade refusal
+/// cannot prevent this independent hardware scenario from running.
+#[test]
+fn builtin_hw_actual_awman_binary_replacement() {
+    const TEST: &str = "builtin_hw_actual_awman_binary_replacement";
+    let Some((binary, archive)) = gate(TEST) else {
+        return;
+    };
+    let mut p = Project::new(&binary, &archive, "awman-repl.");
+    let ready = run_bounded(p.cmd(&["ready", "--json"]), Duration::from_secs(300));
+    assert!(ready.status.success(), "{}", text(&ready));
     // 4. Replace the executable file while an agent runs from it: copy the new
     //    build to a private path, start a slow agent from that path, then
     //    atomically replace the file (as an installer or package manager does).
@@ -651,7 +674,7 @@ fn builtin_hw_actual_awman_old_new_upgrade_and_binary_replacement() {
     }
     assert!(p.live_vms() > 0, "the slow agent never started");
     let staged = p.temp.path().join("installed-awman.new");
-    std::fs::copy(&old, &staged).unwrap();
+    std::fs::copy(&binary, &staged).unwrap();
     std::fs::rename(&staged, &installed).unwrap();
     let finished = child.wait_with_output().unwrap();
     assert_eq!(

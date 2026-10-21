@@ -8,6 +8,8 @@ New to awman? Skim [Concepts](01-concepts.md) after this for the mental model be
 
 ## Prerequisites
 
+The current source tree's builtin runtime upgrade is awaiting Apple Silicon payload and guest verification. Source builds currently omit it; use another runtime or a previously verified release. See [runtime availability](11-runtimes.md#builtin-microvm-experimental).
+
 - **Git** — your project must be in a Git repository
 - **A container runtime** — Docker (all platforms, daemon running), Apple Containers (macOS 26+), Docker Sandboxes (`sbx` CLI, macOS arm64 / Windows), or the experimental builtin microVM runtime (macOS on Apple Silicon only; included in the `awman-macos-arm64` release — see [Runtimes](11-runtimes.md#builtin-microvm-experimental))
 - **An account with a supported agent** — Claude Code, OpenAI Codex, OpenCode, Maki, Google Gemini, GitHub Copilot CLI, Crush, Cline, or Google Antigravity

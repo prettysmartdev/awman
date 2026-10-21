@@ -88,6 +88,11 @@ fn main() {
         (64 * 1024..=64 * 1024 * 1024).contains(&size),
         "{target} kernel size outside bounds"
     );
+    // The static-krunfw accessor reports this size; the VMM needs whole pages.
+    assert!(
+        size.is_multiple_of(64 * 1024),
+        "{target} kernel size must be a 64 KiB multiple"
+    );
     let kernel = checked_bytes(&kernel_path, field(record, "kernel_sha256"), size, &hint);
     assert_eq!(kernel.len() as u64, size, "kernel size mismatch");
     let metadata = payload_root.join(&target).join("kernel.meta");
@@ -119,15 +124,6 @@ fn main() {
         agent.starts_with(b"\x7fELF") && machine == wanted,
         "agent architecture mismatch for {target}"
     );
-    if target.ends_with("linux-gnu") {
-        let native = root.join("third_party/native/libcap-ng/lib/libcap-ng.a");
-        assert!(
-            native.is_file(),
-            "{} missing; run third_party/native/libcap-ng/build.sh",
-            native.display()
-        );
-        println!("cargo:rerun-if-changed={}", native.display());
-    }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let source = format!("#[repr(align(65536))] pub struct AlignedKernel(pub [u8; {size}]);\n#[used] pub static KERNEL: AlignedKernel = AlignedKernel(*include_bytes!({:?}));\npub const GUEST_ADDRESS: u64 = {};\npub const ENTRY_ADDRESS: u64 = {};\npub const KERNEL_SHA256: &str = {:?};\n", fs::canonicalize(&kernel_path).expect("kernel path").to_string_lossy(), integer(record, "guest_address"), integer(record, "entry_address"), field(record, "kernel_sha256"));
     fs::write(out.join("msb_kernel.rs"), source).expect("write kernel table");

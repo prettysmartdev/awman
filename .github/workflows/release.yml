@@ -44,7 +44,6 @@ jobs:
         if: matrix.builtin
         run: |
           bash tools/msb-payloads/fetch.sh ${{ matrix.target }}
-          if [ "${{ runner.os }}" = Linux ]; then bash third_party/native/libcap-ng/build.sh ${{ matrix.target }}; fi
 
       - name: Build release binary
         shell: bash

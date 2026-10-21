@@ -1,17 +1,11 @@
 use clap::{Parser, Subcommand};
 use microsandbox_cli::{commands, machine_cmd};
 
-#[path = "../../../strict-embed/probe/src/firmware.rs"]
-mod firmware;
 mod sqlite;
 
-#[used]
-#[cfg_attr(target_os = "macos", link_section = "__TEXT,__msbver")]
-#[cfg_attr(target_os = "linux", link_section = ".msbver")]
-static MSB_VERSION: [u8; 5] = *b"0.7.2";
 
 #[derive(Parser)]
-#[command(version = "0.7.2")]
+#[command(version = "0.7.8")]
 struct Arguments {
     #[command(subcommand)]
     command: Operation,
@@ -27,7 +21,7 @@ enum Operation {
 }
 
 fn main() -> anyhow::Result<()> {
-    std::hint::black_box(&MSB_VERSION);
+    awman_host_shims::prepare_builtin_worker().map_err(anyhow::Error::msg)?;
     let executable = std::env::current_exe()?;
     std::env::set_var("MSB_PATH", &executable);
     std::env::set_var("MSB_LIBKRUNFW_PATH", &executable);

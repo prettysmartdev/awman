@@ -34,7 +34,6 @@ export CARGO_HOME=$(mktemp -d "$runner_temp/awman-cargo-home.XXXXXX")
 export CARGO_TARGET_DIR=$(mktemp -d "$runner_temp/awman-target.XXXXXX")
 bash tools/msb-payloads/fetch.sh "$target"
 bash tools/msb-payloads/verify.sh "$target"
-if [ "$(uname -s)" = Linux ]; then bash third_party/native/libcap-ng/build.sh "$target"; fi
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 export AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1
 export AWMAN_TEST_BUILTIN_NETWORK=1 AWMAN_TEST_BUILTIN_PRESSURE=1

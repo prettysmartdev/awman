@@ -138,3 +138,19 @@ Published `sqlx-sqlite-0.9.0.crate` SHA256:
 The checked-in patch targets its Cargo-normalized manifest; upstream's source
 manifest contains the same dependency stanza. `Cargo.toml.orig` remains the
 unmodified provenance copy, not the manifest used for building.
+
+## Current 0.7.8 compatibility gate
+
+The live `checks.sh auto` command now uses the four 0.7.8 patches and the production
+static provider from awman-host-shims. It does not depend on a deleted production
+msb_krun tree. Its historical 0.7.2 reader downloads and patches its own SHA-pinned
+0.1.39 source in the output directory; only that historical reader requires libcap-ng.
+The current provider has no dynamic-library fallback. Earlier results below remain
+historical and do not establish acceptance of the new dependency set.
+
+Before the native-artifact checks, `tools/test-msb-catalog-compat.sh` runs the real
+published 27-to-29 migrations, both strict_sni values and labels, invalid-row refusal,
+and the old schema-ahead predicate against the resulting catalog. It can also take a
+directory of pristine migration crate sources to avoid fetching them. Compatibility
+is forward upgrade followed by explicit old-reader refusal and preserved data.
+A successful downgrade is not expected. No guest or host agent is run by these checks.

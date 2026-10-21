@@ -405,6 +405,22 @@ mod driver {
         let tag = a.tag.as_str();
         let name = |n: &str| format!("awman-hw-{n}");
         match a.scenario.as_str() {
+            "kernel-repeat" => {
+                // Each completed fake workload tears down its worker/VM before
+                // the next launch, using the same runtime and sandbox name.
+                for round in 0..3 {
+                    let mut o = options(tag, &name("kernel-repeat"));
+                    o.entrypoint = sh(&format!(
+                        "uname -r; printf 'round-{round}\\n'; exit {}",
+                        if round == 1 { 37 } else { 0 }
+                    ));
+                    let (exec, peer) = launch(runtime, o, None)?;
+                    let outcome = finish(exec, peer).await?;
+                    record(&a.work, &format!("kernel-repeat-{round}"), &outcome);
+                    let left = runtime.list_running_all().map_err(|e| e.to_string())?;
+                    println!("ROUND_REMAINING\t{}", left.len());
+                }
+            }
             // Image defaults: no entrypoint/cwd/env supplied, so USER, WORKDIR,
             // HOME, ENV, ENTRYPOINT and CMD all come from the imported image.
             "image-defaults" => {

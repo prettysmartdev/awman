@@ -395,3 +395,106 @@ scripts pass `bash -n`. [Notes](0121-evidence/raw/unsigned-policy/notes.md) and
 [command exits](0121-evidence/raw/unsigned-policy/command-exits.tsv) preserve
 scope and validation details. Earlier feature/native results remain historical;
 no new native execution or full-diff approval is inferred.
+
+## WI 0120 adoption record (2026-10-21)
+
+[WI 0120](../work-items/0120-upstream-embedded-kernel-support.md) replaced the
+vendored `msb_krun` patch with upstream `static-krunfw` and moved Microsandbox
+from 0.7.2 to 0.7.8. **The WI 0123 PASS rows above are evidence for the previous
+0.7.2 / `msb_krun 0.1.39` build. They are not re-earned by this change.** The
+adopted build has only the Linux aarch64 evidence listed here; every native gate
+below is BLOCKED or deferred.
+
+**Awman revision and diff: BLOCKED.** This workspace's `.git` points to an
+unavailable host worktree, so no `git diff`, `status` or clean-checkout run was
+possible. Hashes below were taken from files with `sha256sum` and versions from
+`Cargo.toml`.
+
+### Upstream references and route decision
+
+| Item | Value |
+|---|---|
+| Route | **Track A**: published `msb_krun =0.1.41` with `static-krunfw`; awman defines `krunfw_get_kernel`. Track B (typed provider) not pursued: the accessor suffices for copying consumers; x86_64 is refused pending private-memory boot integration in WI 0124. |
+| libkrun | `b35c7e118d7a1e48c8fad103b258e64ff5c49147` (`msb_krun 0.1.41`, crate SHA-256 `d96bbf2bc289bfe0c1365e65b24ecb0a49ad59f5ec3078d91a34aa739572cf75`) |
+| `static-krunfw` | libkrun PR #144, commit `84ca483a9511a9dddb1c411d7cdc8cc76dec8bc6` (merged 2026-09-24; in `msb_krun` 0.1.40 and 0.1.41) |
+| Microsandbox | tag `v0.7.8`, `7b7b9dc89e9a1c77801918f7833c3381d1754579`; pins `msb_krun =0.1.41`. Baseline was `v0.7.2` `60d4dc8a436fb9365491567ec21d073e924e3c6d` |
+| libkrunfw (release submodule) | `21f169f7e94798c8916315f8ac6f5999d5b88566` (Linux 6.12.111); 0.7.2 used `cf4c22b9f05c680928e6d96a9d198f5845573a87` |
+| Release assets | `v0.7.8` assets re-hashed locally; `agentd-aarch64` SHA-256 `1bfc94d1e3974082010cdc16bf9df86f9654d52ac284efe4b439fbc678f426f3` |
+
+### Carried patches after the bump
+
+| Tree | Published crate SHA-256 | `upstream.diff` SHA-256 |
+|---|---|---|
+| `microsandbox-0.7.8` | `d4e2876d9ac789a99f9c7641be568ee8996d78eeebd19aa524aa2662273b3e44` | `196167178dc241f18d15aa55ed0abb76e67565a181dbf6e3a319afa46c441e42` |
+| `microsandbox-filesystem-0.7.8` | `e890749fd6c87b7966865a4f7a0add888926adce222fdd4525eb64e047fee30b` | `b87c1e5f67fe0b9b3044bc43ff332601233280012bd35ea4145b6b75b9feab61` |
+| `microsandbox-network-0.7.8` | `9bfc80d59e60d46b44d19c60e3e9abe5c1b3b41c92cad739f661b752376902c2` | `5dbe1bbd4ee65adb2a518ded77e6737c87225dab1d4ad76a39b8c4538c17a665` |
+| `microsandbox-types-0.7.8` | `74af7e859dcfb714bf612e7e27ad682aaedc946be419ace40e661d7e6ae74ba6` | `f0db5e8555259e07288a97a45a4d3dcb66a561a98cd4c1229bbd26b0f4b0fa41` |
+| `sqlx-sqlite-0.9.0` (unchanged) | n/a | `22a7e9a2e4f9dbf588a514e5305dfd6f21377107bb7600c348660606d664031f` |
+
+None of the four Microsandbox behaviors landed upstream at `v0.7.8`, so all were
+rebased. The 0.7.2 trees were deleted.
+
+### Patch-removal result
+
+- `third_party/msb_krun-0.1.39/` is **deleted** and `msb_krun` is gone from
+  `[patch.crates-io]`. Its old diff fails two `vm.rs` hunks against published 0.1.41
+  (log: `integrate-bump-old-krun-patch.log` in the workflow context directory, not in this repository).
+- `cargo tree --locked -e features --features builtin-runtime -i msb_krun`: one
+  `msb_krun v0.1.41` node with `static-krunfw` enabled by both `builtin-runtime` features.
+  Without the feature the crate is absent from the graph. No Microsandbox 0.7.2 or
+  `msb_krun` 0.1.39 nodes remain in the lockfile.
+- Linux aarch64 `target/debug/awman` has `krunfw_get_kernel` as a `T` symbol, not in
+  `.dynsym`, and zero `libloading` symbols. Plain `--release` keeps the name; `strip` and fat
+  LTO drop the name with unchanged behavior (the callback is bound at link time).
+  `awman __awman-builtin-info` runs in each build and reports kernel SHA-256
+  `cf6cb036c7b40923588950cc8f80750617114243730668d6859216de4d52ee39`,
+  `msb_version 0.7.8` and libkrun `b35c7e1…`.
+- Linux aarch64 payload re-pinned and verified by the native extractor: kernel
+  24,576,000 bytes, load/entry `0x80000000`, byte-identical to the independent route-spike
+  extraction. Darwin aarch64 and Linux x86_64 are **unverified** (cannot be extracted on
+  this host); the older Darwin provenance file is historical only.
+- Executed here (aarch64 Linux, no `/dev/kvm`): `cargo build --locked --workspace` with
+  and without `builtin-runtime`; `make test` (exit 0; 40 `test result` lines, 0 failed,
+  4 ignored); `cargo test -p awman-host-shims --features builtin-runtime --lib` 9/9;
+  clippy `-D warnings` for the shim crate; `cargo fmt --all --check`.
+
+### Gates not run (not passes)
+
+| Gate | Status |
+|---|---|
+| Apple Silicon hardware boot of the adopted build (WI 0123 hermetic/feature/hardware tiers, `make test-builtin`) | **BLOCKED**: no Apple Silicon host |
+| Ad-hoc-signed optimized artifact boot and scans (`tools/release-artifact-check.sh`, `tools/measure-release-artifact.sh`), including Mach-O export-trie / `strip -x` behavior of `krunfw_get_kernel` and `current_exe()` matching | **BLOCKED / pending** (needs macOS) |
+| Strict fixture (image/mount/config assertions, exit status, same-executable worker identity, minimal-PATH/offline run) | **BLOCKED / pending** |
+| Darwin and Linux x86_64 payload verification | **Pending**: needs native hosts |
+| Linux ARM64 and x86_64 KVM boots | **Deferred to WI 0124** (`/dev/kvm` absent) |
+| Native guest network, hostile-config and installed-runtime coexistence for the rebased patches | **BLOCKED** (needs native hosts; host-side tests only) |
+| `make test-builtin`, `tools/test-builtin-network.sh` | Host-side tier passed in the tests step (90 network tests, including three strict_sni tests); hardware functions skipped/blocked, no guest PASS |
+
+### SQLite gate repair
+
+The fix step ported the live SQLite probe to 0.7.8/0.1.41, the four current patch trees and the production static shim. The historical 0.7.2 reader now downloads and patches its own pinned registry crate. Current catalog compatibility requires forward migration and explicit old-reader refusal.
+The WI 0121 spike scripts under `tools/oci-runtime-spike/strict-embed/` that mention
+0.1.39 download the published crate into their own output directory and remain
+historical evidence.
+
+### Upstream submission
+
+Nothing was submitted. No fork, branch, push or PR exists. An optional libkrun documentation
+fix (Mach-O misalignment of the `static mut` example; heap-copy alternative; hypervisor
+entitlement) is drafted locally in
+[0120-evidence/upstream-libkrun-docs.md](0120-evidence/upstream-libkrun-docs.md).
+
+### Tests-step evidence and current release limits
+
+The tests step ran `make test-builtin` (exit 0, host-only tests; hardware skipped),
+`tools/test-builtin-network.sh` (90 host-side tests including strict_sni), all nine
+feature/target graph checks, static-link checks, release/fat-LTO/stripped metadata
+checks and published 0.7.2/0.7.8 protocol compatibility tests. Raw logs are in the
+shared workflow context (`tests-make-test-builtin.log`, `tests-static-release.log`,
+`tests-protocol-compat.log`). These results do not re-earn previous hardware PASS rows.
+
+**Release blocker:** the adopted Darwin payload is unverified. No Apple Silicon
+build/sign/strip/re-sign/boot or strict-fixture pass exists; the release job remains
+blocked. The x86_64 provider additionally refuses its direct-mapping consumer until
+WI 0124 integrates private-memory boot and isolation coverage. Linux KVM gates are
+still deferred. The fix log records new checks separately; none are hardware passes.

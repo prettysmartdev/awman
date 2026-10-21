@@ -51,13 +51,13 @@ else grep -q '__msbver' "$output/sections.txt" || { echo "Mac __msbver section m
 fi
 mkdir -p "$output/home" "$output/tmp" "$output/state"
 env -i PATH=/usr/bin:/bin HOME="$output/home" TMPDIR="$output/tmp" "$artifact" --version > "$output/version.stdout" 2> "$output/version.stderr"
-env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$artifact" __awman-builtin-info > "$output/provider-info.json" 2> "$output/provider-info.stderr"
-for expected in '"msb_version"[[:space:]]*:[[:space:]]*"0\.7\.2"' \
-  '"worker_protocol"[[:space:]]*:[[:space:]]*"0\.7\.2/18/awman-1"' \
+env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$artifact" __awman-builtin-kernel-check > "$output/provider-info.json" 2> "$output/provider-info.stderr"
+for expected in '"msb_version"[[:space:]]*:[[:space:]]*"0\.7\.8"' \
+  '"worker_protocol"[[:space:]]*:[[:space:]]*"0\.7\.8/18/awman-1"' \
   '"embedded_kernel"[[:space:]]*:[[:space:]]*true' \
   '"embedded_guest_agent"[[:space:]]*:[[:space:]]*true' \
   '"host_helpers"[[:space:]]*:[[:space:]]*false' \
-  '"libkrun_commit"[[:space:]]*:[[:space:]]*"2bd0f84ad0956f3032e0490d3b8512b6851eca12"'; do
+  '"libkrun_commit"[[:space:]]*:[[:space:]]*"b35c7e118d7a1e48c8fad103b258e64ff5c49147"'; do
   grep -Eq "$expected" "$output/provider-info.json" || { echo "provider metadata mismatch: $expected" >&2; exit 1; }
 done
 manifest="$root/third_party/msb-payloads/manifest.toml"

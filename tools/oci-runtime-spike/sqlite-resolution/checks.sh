@@ -6,6 +6,8 @@ root=$(cd "$scripts/../../.." && pwd -P)
 previous=${1:?Usage: bash checks.sh STRICT_BUILD_DIR|auto [MICROSANDBOX_CHECKOUT] [FIXTURE_OCI_TAR]}
 microsandbox=${2:-}
 fixture=${3:-${SQLITE_SPIKE_FIXTURE_OCI_TAR:-}}
+# Hermetic real 27 -> 29 migration/refusal gate precedes native artifact work.
+bash "$root/tools/test-msb-catalog-compat.sh"
 output_base=${SQLITE_SPIKE_OUTPUT_DIR:-/tmp}
 mkdir -p "$output_base"
 output=$(mktemp -d "$output_base/awsq.XXXXXX")
@@ -19,10 +21,10 @@ previous=$(cd "$previous" && pwd -P)
 if [ -z "$microsandbox" ]; then
     microsandbox="$output/microsandbox"
     git clone --filter=blob:none https://github.com/superradcompany/microsandbox.git "$microsandbox"
-    git -C "$microsandbox" checkout --detach 60d4dc8a436fb9365491567ec21d073e924e3c6d
+    git -C "$microsandbox" checkout --detach 7b7b9dc89e9a1c77801918f7833c3381d1754579
 fi
 microsandbox=$(cd "$microsandbox" && pwd -P)
-test "$(git -C "$microsandbox" rev-parse HEAD)" = 60d4dc8a436fb9365491567ec21d073e924e3c6d
+test "$(git -C "$microsandbox" rev-parse HEAD)" = 7b7b9dc89e9a1c77801918f7833c3381d1754579
 if [ -z "$fixture" ]; then
     fixture_dir="$output/fixtures"
     fixture_arch=amd64
@@ -55,37 +57,34 @@ test -f "$MSB_EMBED_ARTIFACTS_DIR/agentd" || export MSB_EMBED_ARTIFACTS_DIR="$pr
 test -f "$SPIKE_KERNEL"
 test -f "$SPIKE_KERNEL_METADATA"
 test -f "$MSB_EMBED_ARTIFACTS_DIR/agentd"
-test -f "$previous/msb_krun-0.1.39/Cargo.toml"
-if [ "$(uname -s)" = Linux ]; then
-    native=${SQLITE_SPIKE_NATIVE_LIB_DIR:-$previous/static-lib}
-    test -f "$native/libcap-ng.a"
-    export LIBRARY_PATH="$native${LIBRARY_PATH:+:$LIBRARY_PATH}"
-fi
 
 curl --fail --location --retry 3 --max-time 300 \
     https://static.crates.io/crates/sqlx-sqlite/sqlx-sqlite-0.9.0.crate -o "$output/sqlx-sqlite.crate"
 printf '%s  %s\n' 488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c "$output/sqlx-sqlite.crate" | shasum -a 256 -c -
 tar xf "$output/sqlx-sqlite.crate" -C "$output"
-patch -d "$output/sqlx-sqlite-0.9.0" -p1 < "$scripts/sqlx-sqlite-0.38.patch" > "$output/results/patch.log"
+patch -d "$output/sqlx-sqlite-0.9.0" -p1 < "$root/third_party/sqlx-sqlite-0.9.0/upstream.diff" > "$output/results/patch.log"
 
 # The probe links awman itself, so it must resolve awman's own dependency
 # graph: the carried patches from awman's Cargo.toml (WI 0120 inventory) apply
 # here too, because [patch] sections do not cross workspaces. The pinned
-# upstream checkout above is the provenance check for the published 0.7.2
+# upstream checkout above is the provenance check for the published 0.7.8
 # crates the registry supplies.
 third_party="$root/third_party"
 base=(--manifest-path "$scripts/probe/Cargo.toml"
-    --config "patch.crates-io.msb_krun.path=\"$third_party/msb_krun-0.1.39\""
-    --config "patch.crates-io.microsandbox.path=\"$third_party/microsandbox-0.7.2\""
-    --config "patch.crates-io.microsandbox-filesystem.path=\"$third_party/microsandbox-filesystem-0.7.2\""
-    --config "patch.crates-io.microsandbox-network.path=\"$third_party/microsandbox-network-0.7.2\""
-    --config "patch.crates-io.microsandbox-types.path=\"$third_party/microsandbox-types-0.7.2\"")
+    --config "patch.crates-io.microsandbox.path=\"$third_party/microsandbox-0.7.8\""
+    --config "patch.crates-io.microsandbox-filesystem.path=\"$third_party/microsandbox-filesystem-0.7.8\""
+    --config "patch.crates-io.microsandbox-network.path=\"$third_party/microsandbox-network-0.7.8\""
+    --config "patch.crates-io.microsandbox-types.path=\"$third_party/microsandbox-types-0.7.8\"")
 if cargo metadata "${base[@]}" --format-version 1 > "$output/unpatched.json" 2> "$output/results/unpatched.stderr"; then
     printf 'Unexpected: unpatched graph resolves; investigate newer dependencies.\n' >&2
     exit 1
 fi
 grep -q 'links to the native library `sqlite3`' "$output/results/unpatched.stderr"
-patched=("${base[@]}" --config "patch.crates-io.sqlx-sqlite.path=\"$output/sqlx-sqlite-0.9.0\"")
+# Reconstruct the carried patch as an independent check, then link the owned
+# path so repeat runs reuse the same Cargo source identity.
+diff -ru --exclude=LICENSE-APACHE --exclude=LICENSE-MIT --exclude=PATCH.md --exclude=upstream.diff \
+    "$output/sqlx-sqlite-0.9.0" "$third_party/sqlx-sqlite-0.9.0" > "$output/results/sqlx-reconstruction.diff"
+patched=("${base[@]}" --config "patch.crates-io.sqlx-sqlite.path=\"$third_party/sqlx-sqlite-0.9.0\"")
 printf 'Building the combined awman + strict Microsandbox probe.\n'
 cargo build --locked "${patched[@]}" > "$output/results/build.log" 2>&1 || {
     tail -60 "$output/results/build.log"
@@ -116,12 +115,18 @@ run() {
 run "$new" sqlite-check > "$output/results/sqlite-check.log" 2>&1
 cargo test --locked "${patched[@]}" --test awman_stores > "$output/results/awman-stores.log" 2>&1
 run "$old" image load -i "$fixture" -t awman-spike/sqlite:latest > "$output/results/catalog-old-load.log" 2>&1
-run "$old" image inspect awman-spike/sqlite:latest > "$output/results/catalog-old-inspect.json"
-run "$new" image inspect awman-spike/sqlite:latest > "$output/results/catalog-new-inspect.json"
+run "$old" image inspect --format json awman-spike/sqlite:latest > "$output/results/catalog-old-inspect.json"
+run "$new" image inspect --format json awman-spike/sqlite:latest > "$output/results/catalog-new-inspect.json"
 cmp "$output/results/catalog-old-inspect.json" "$output/results/catalog-new-inspect.json"
 run "$new" image load -i "$fixture" -t awman-spike/sqlite-new:latest > "$output/results/catalog-new-load.log" 2>&1
-run "$old" image inspect awman-spike/sqlite-new:latest > "$output/results/catalog-old-reopen.json"
-printf 'PASS old catalog read by new binary; new image registration read by old binary\n' > "$output/results/catalog-roundtrip.log"
+if run "$old" image inspect --format json awman-spike/sqlite-new:latest > "$output/results/catalog-old-reopen.json" 2> "$output/results/catalog-old-refusal.log"; then
+    echo 'FAIL: old SDK accepted a schema-ahead catalog' >&2; exit 1
+fi
+grep -q 'database schema is newer' "$output/results/catalog-old-refusal.log"
+run "$new" image inspect --format json awman-spike/sqlite:latest > "$output/results/catalog-new-after-refusal.json"
+cmp "$output/results/catalog-new-inspect.json" "$output/results/catalog-new-after-refusal.json"
+run "$new" image inspect --format json awman-spike/sqlite-new:latest > "$output/results/catalog-new-reopen.json"
+printf 'PASS old catalog read by new binary; old reader refuses upgraded catalog; both images survive refusal\n' > "$output/results/catalog-roundtrip.log"
 cat "$output/results/sqlite-check.log" "$output/results/catalog-roundtrip.log"
 grep 'test result:' "$output/results/awman-stores.log"
 tar czf "$output/results.tar.gz" -C "$output" results

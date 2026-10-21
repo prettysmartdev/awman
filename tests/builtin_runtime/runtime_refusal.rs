@@ -271,3 +271,37 @@ fn builtin_selection_parses_and_round_trips() {
     );
     assert!(RuntimeSelection::valid_values().contains("builtin-experimental"));
 }
+
+#[test]
+fn adopted_sdk_ambient_override_set_and_conflict_precedence_are_preserved() {
+    use awman::data::config::env::AMBIENT_MSB_OVERRIDES;
+    let expected = [
+        "MSB_PATH",
+        "MSB_LIBKRUNFW_PATH",
+        "MSB_AGENTD_PATH",
+        "MSB_HOME",
+        "MSB_BACKEND",
+        "MSB_CONFIG_PATH",
+        "MSB_PROFILE",
+        "MSB_CACHE_DIR",
+        "MSB_SANDBOXES_DIR",
+        "MSB_VOLUMES_DIR",
+        "MSB_SNAPSHOTS_DIR",
+        "MSB_LOGS_DIR",
+        "MSB_SECRETS_DIR",
+    ];
+    assert_eq!(AMBIENT_MSB_OVERRIDES, expected);
+    // Conflicting selectors in reverse order still use the refusal order,
+    // including empty values, before any runtime state is created.
+    let env = EnvSnapshot::with_overrides(expected.iter().rev().map(|name| (*name, "")));
+    assert_eq!(env.ambient_msb_overrides(), expected);
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut s = settings(&state);
+    s.ambient_overrides = env.ambient_msb_overrides();
+    assert!(matches!(
+        open(s),
+        Err(EngineError::AmbientRuntimeOverride { variable }) if variable == "MSB_PATH"
+    ));
+    assert!(!state.exists());
+}

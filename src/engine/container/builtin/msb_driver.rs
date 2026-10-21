@@ -86,7 +86,7 @@ impl MsbDriver {
         // This pinned SDK entrypoint starts with GlobalConfig::default() and
         // never loads installed msb config or resolves paths from HOME/XDG.
         // All state roots below are owned by awman and remain explicit.
-        let local = isolated_backend(&paths);
+        let local = isolated_backend(&paths)?;
         let resolved = microsandbox::setup::resolve_runtime(local.config())
             .map_err(|_| failure("embedded resolution"))?;
         if resolved.msb_path != executable
@@ -153,7 +153,7 @@ impl MsbDriver {
     }
 }
 
-fn isolated_backend(paths: &BuiltinPaths) -> LocalBackend {
+fn isolated_backend(paths: &BuiltinPaths) -> Result<LocalBackend, EngineError> {
     LocalBackend::builder()
         .home(&paths.home)
         .cache_dir(paths.home.join("cache"))
@@ -165,6 +165,9 @@ fn isolated_backend(paths: &BuiltinPaths) -> LocalBackend {
         .registry_hosts(Default::default())
         .ca_certs(None)
         .build_lazy_isolated()
+        .map_err(|_| EngineError::BuiltinRuntimeUnavailable {
+            reason: "isolated SDK configuration rejected".into(),
+        })
 }
 /// How long a stats call with no earlier reading waits for the runtime's next
 /// metrics sample (published once a second), and how often it looks.
@@ -745,6 +748,67 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn sdk_network_config_spec_roundtrips_defaults_and_explicit_strict_sni() {
+        use microsandbox::sandbox::NetworkSpec;
+        use microsandbox_network::config::NetworkConfig;
+
+        let defaults = NetworkConfig::default();
+        let legacy: NetworkConfig = serde_json::from_str("{}").unwrap();
+        assert!(defaults.strict && legacy.strict);
+        assert!(!defaults.strict_sni && !legacy.strict_sni);
+        let legacy_spec: NetworkSpec = serde_json::from_str("{}").unwrap();
+        assert!(legacy_spec.strict);
+        assert!(!legacy_spec.strict_sni);
+        for strict in [false, true] {
+            for strict_sni in [false, true] {
+                let original = NetworkConfig {
+                    strict,
+                    strict_sni,
+                    ..Default::default()
+                };
+                let spec: NetworkSpec =
+                    serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+                assert_eq!((spec.strict, spec.strict_sni), (strict, strict_sni));
+                let restored: NetworkConfig =
+                    serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+                assert_eq!((restored.strict, restored.strict_sni), (strict, strict_sni));
+                // Exercise the SDK builder's actual config -> spec conversion too.
+                let config = Sandbox::builder("strict-sni-roundtrip")
+                    .image("example.com/fixture:latest")
+                    .network(|net| net.strict(strict).strict_sni(strict_sni))
+                    .build()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (config.spec.network.strict, config.spec.network.strict_sni),
+                    (strict, strict_sni)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_sdk_constructor_ignores_explicit_config_and_keeps_builder_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("hostile.json");
+        std::fs::write(&file, b"{ malformed user configuration").unwrap();
+        assert!(LocalBackend::builder()
+            .config_path(&file)
+            .build_lazy()
+            .is_err());
+        let local = LocalBackend::builder()
+            .config_path(&file)
+            .home(directory.path().join("builder-home"))
+            .default_cpus(3)
+            .default_memory_mib(1024)
+            .build_lazy_isolated()
+            .unwrap();
+        assert_eq!(local.config().home(), directory.path().join("builder-home"));
+        assert_eq!(local.config().sandbox_defaults.cpus, 3);
+        assert_eq!(local.config().sandbox_defaults.memory_mib, 1024);
+    }
+
     #[test]
     fn sdk_hostname_dns_binding_cannot_authorize_udp_or_quic() {
         use crate::data::config::builtin_network::{
@@ -856,6 +920,10 @@ mod tests {
             };
             let config = builder.build().await.unwrap();
             let net = &config.spec.network;
+            // These 0.7.8 additions would require an executing launch probe.
+            assert!(!net.http.deny_response);
+            assert!(net.tcp_accept_queue_size.is_none());
+            assert!(config.spec.runtime.guest_clock.is_none());
             assert_eq!(net.enabled, plan.enabled);
             assert_eq!(net.strict, plan.strict);
             assert_eq!(net.strict_sni, plan.strict);
@@ -893,7 +961,7 @@ mod tests {
             let paths = BuiltinPaths {
                 home: home.join("awman-state"),
             };
-            let local = isolated_backend(&paths);
+            let local = isolated_backend(&paths).unwrap();
             let config = local.config();
             assert_eq!(config.home(), paths.home);
             assert_eq!(config.cache_dir(), paths.home.join("cache"));
@@ -908,7 +976,7 @@ mod tests {
             // A malformed installed document must not stop this constructor
             // either; the ambient SDK constructor would fail here.
             std::fs::write(&ambient, b"{ hostile config").unwrap();
-            let again = isolated_backend(&paths);
+            let again = isolated_backend(&paths).unwrap();
             assert_eq!(again.config().home(), paths.home);
             assert!(again.config().paths.agentd.is_none());
             return;

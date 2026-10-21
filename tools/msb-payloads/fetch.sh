@@ -12,6 +12,7 @@ if [ "$(uname -s)" != "$os" ] || [ "$(uname -m | sed 's/^arm64$/aarch64/')" != "
     echo "native $target host required to extract firmware" >&2; exit 2
 fi
 manifest="$root/third_party/msb-payloads/manifest.toml"
+version=$(awk -F'"' '/^version =/ {print $2; exit}' "$manifest")
 field() { awk -v section="[targets.\"$target\"]" -v key="$1" '$0 == section {inside=1;next} /^\[/ {inside=0} inside && $1 == key {gsub(/"/, "", $3); print $3; exit}' "$manifest"; }
 hash_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 archive=$(field archive); archive_hash=$(field archive_sha256)
@@ -20,20 +21,20 @@ dest="$root/third_party/msb-payloads/$target"
 mkdir -p "$dest" "$root/third_party/msb-payloads/$arch"
 download="$dest/$archive"
 if [ ! -f "$download" ]; then
-    curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v0.7.2/$archive" -o "$download"
+    curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v$version/$archive" -o "$download"
 fi
 actual_archive_hash=$(hash_file "$download")
-[ "$actual_archive_hash" = "$archive_hash" ] || { echo "archive hash mismatch: $actual_archive_hash" >&2; exit 3; }
+[ "$actual_archive_hash" = "$archive_hash" ] || { echo "archive hash mismatch: $actual_archive_hash; remove stale cache $download and rerun" >&2; exit 3; }
 tar xf "$download" -C "$dest" "$firmware"
 cc_bin=${CC:-cc}
 "$cc_bin" -Wall -Wextra -Werror "$root/tools/msb-payloads/extract-kernel.c" -o "$dest/extract-kernel" ${link_flags[@]+"${link_flags[@]}"}
 "$dest/extract-kernel" "$dest/$firmware" "$dest/kernel.bin" > "$dest/kernel.meta"
 agent_path="$root/third_party/msb-payloads/$arch/agentd"
 if [ ! -f "$agent_path" ]; then
-    curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v0.7.2/$agent" -o "$agent_path"
+    curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v$version/$agent" -o "$agent_path"
 fi
 actual_agent_hash=$(hash_file "$agent_path")
-[ "$actual_agent_hash" = "$agent_hash" ] || { echo "agent hash mismatch: $actual_agent_hash" >&2; exit 3; }
+[ "$actual_agent_hash" = "$agent_hash" ] || { echo "agent hash mismatch: $actual_agent_hash; remove stale cache $agent_path and rerun" >&2; exit 3; }
 actual_kernel_hash=$(hash_file "$dest/kernel.bin")
 source_revision=$(awk -F'"' '/^microsandbox_revision =/ {print $2; exit}' "$manifest")
 libkrun_revision=$(awk -F'"' '/^libkrun_revision =/ {print $2; exit}' "$manifest")

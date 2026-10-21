@@ -662,7 +662,8 @@ echo "PASS guest-survives-inner-oom"
         ],
     );
     assert_eq!(run.exit("inner"), Some(0), "{}", run.raw);
-    // The embedded guest agent (upstream microsandbox agentd 0.7.2) reports
+    // Re-confirm natively after the agentd 0.7.8 bump. The guest agent
+    // previously observed with agentd 0.7.2 reports
     // every signal death as -1 and does not carry the signal number, so the
     // builtin runtime cannot report Docker's 137. The in-guest shell above
     // proves the kill is SIGKILL from the OOM killer; here the contract is

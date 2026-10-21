@@ -3,6 +3,13 @@ members = [".", "crates/awman-cli", "crates/awman-host-shims"]
 default-members = [".", "crates/awman-cli", "crates/awman-host-shims"]
 resolver = "2"
 
+# Each integration test links the awman library (and, with builtin-runtime,
+# the VM stack). Full debug info and incremental copies exhaust small runners.
+# Keep the normal unoptimized test behavior, including debug assertions.
+[profile.test]
+debug = 0
+incremental = false
+
 [workspace.package]
 version = "0.12.0"
 
@@ -71,12 +78,12 @@ wiremock = "0.6"
 # Built-in runtime SDK pins. These exact versions must match `MSB_VERSION` in
 # `src/data/builtin_runtime.rs` and the vendored crates under `third_party/`;
 # a unit test there checks this table.
-microsandbox = { version = "=0.7.2", default-features = false, features = ["local", "net"] }
-microsandbox-cli = { version = "=0.7.2", default-features = false, features = ["net", "embed-binaries"] }
-microsandbox-image = { version = "=0.7.2" }
-microsandbox-network = { version = "=0.7.2", default-features = false, features = ["engine"] }
+microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
+microsandbox-cli = { version = "=0.7.8", default-features = false, features = ["net", "embed-binaries"] }
+microsandbox-image = { version = "=0.7.8" }
+microsandbox-network = { version = "=0.7.8", default-features = false, features = ["engine"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
-msb_krun = { version = "=0.1.39" }
+msb_krun = { version = "=0.1.41" }
 
 [package]
 name = "awman"
@@ -96,7 +103,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
+builtin-runtime = ["dep:microsandbox", "dep:microsandbox-cli", "dep:microsandbox-image", "dep:microsandbox-network", "dep:sqlx", "dep:msb_krun", "msb_krun/static-krunfw", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -159,11 +166,10 @@ msb_krun = { workspace = true, optional = true }
 
 [patch.crates-io]
 sqlx-sqlite = { path = "third_party/sqlx-sqlite-0.9.0" }
-msb_krun = { path = "third_party/msb_krun-0.1.39" }
-microsandbox-filesystem = { path = "third_party/microsandbox-filesystem-0.7.2" }
-microsandbox = { path = "third_party/microsandbox-0.7.2" }
-microsandbox-network = { path = "third_party/microsandbox-network-0.7.2" }
-microsandbox-types = { path = "third_party/microsandbox-types-0.7.2" }
+microsandbox-filesystem = { path = "third_party/microsandbox-filesystem-0.7.8" }
+microsandbox = { path = "third_party/microsandbox-0.7.8" }
+microsandbox-network = { path = "third_party/microsandbox-network-0.7.8" }
+microsandbox-types = { path = "third_party/microsandbox-types-0.7.8" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs", "poll", "user"] }

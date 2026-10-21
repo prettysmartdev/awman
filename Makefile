@@ -38,7 +38,6 @@ sign-macos:
 
 payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
-	@case "$$(uname -s)" in Linux) bash third_party/native/libcap-ng/build.sh "$$(rustc -vV | sed -n 's/^host: //p')";; esac
 
 # Explicit verification entrypoints; native hardware targets fail closed when
 # KVM/HVF or the fixture is absent. `TARGET` is a Rust target triple.
@@ -63,11 +62,12 @@ install: build
 # tests build, run and remove images and containers in your own daemon.
 # `test-full` (the CI Docker job) opts into Docker; `test` and `test-fast`
 # never touch it.
+# Keep Cargo's build progress visible; only libtest's per-test output is quiet.
 test:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
 
 test-fast:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet -- --skip real_git --skip real_network --skip builtin_hw
+	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_git --skip real_network --skip builtin_hw
 
 # Only the targets that exercise the builtin runtime: every test executable links the
 # whole embedded VM stack (hundreds of MB each in debug), so building all of them
@@ -86,7 +86,7 @@ test-builtin:
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/test-builtin-network.sh
 
 test-full:
-	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh --quiet
+	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
 
 architecture-lint:
 	@bash tools/architecture-lint.sh

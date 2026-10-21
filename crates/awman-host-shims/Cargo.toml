@@ -7,7 +7,9 @@ publish = false
 
 [features]
 default = []
-builtin-runtime = ["dep:clap", "dep:microsandbox-cli", "dep:msb_krun"]
+# `static-krunfw` makes msb_krun call `kernel::krunfw_get_kernel` instead of
+# loading a firmware library. The feature unifies onto every msb_krun consumer.
+builtin-runtime = ["dep:clap", "dep:microsandbox-cli", "dep:msb_krun", "msb_krun/static-krunfw"]
 
 [dependencies]
 # Only Layer 0 runtime constants are imported from this library.

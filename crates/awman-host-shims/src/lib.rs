@@ -6,6 +6,14 @@
 mod worker;
 pub use worker::dispatch_worker;
 
+/// Prepare the static provider and retain SDK version metadata for an embedding
+/// worker. Must run before entering the VM. Unsupported consumers fail closed.
+#[cfg(awman_builtin)]
+pub fn prepare_builtin_worker() -> Result<(), String> {
+    version::retain();
+    kernel::prepare()
+}
+
 #[cfg(awman_builtin)]
 mod kernel;
 #[cfg(awman_builtin)]

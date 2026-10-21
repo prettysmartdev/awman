@@ -9,7 +9,7 @@ macro_rules! define_builtin_runtime_version {
     };
 }
 
-define_builtin_runtime_version!("0.7.2");
+define_builtin_runtime_version!("0.7.8");
 
 /// Encode the SDK metadata version in the fixed-width executable link section.
 pub const fn version_bytes(version: &str) -> [u8; 5] {
@@ -28,7 +28,7 @@ pub const fn version_bytes(version: &str) -> [u8; 5] {
 }
 
 /// libkrun revision pinned by the Microsandbox runtime payload.
-pub const LIBKRUN_COMMIT: &str = "2bd0f84ad0956f3032e0490d3b8512b6851eca12";
+pub const LIBKRUN_COMMIT: &str = "b35c7e118d7a1e48c8fad103b258e64ff5c49147";
 
 #[cfg(test)]
 mod tests {
@@ -37,7 +37,7 @@ mod tests {
     #[test]
     fn builtin_worker_constants_share_the_pinned_runtime_version() {
         assert_eq!(WORKER_PROTOCOL, format!("{MSB_VERSION}/18/awman-1"));
-        assert_eq!(LIBKRUN_COMMIT, "2bd0f84ad0956f3032e0490d3b8512b6851eca12");
+        assert_eq!(LIBKRUN_COMMIT, "b35c7e118d7a1e48c8fad103b258e64ff5c49147");
     }
 
     /// SDK crates whose exact pin must equal [`MSB_VERSION`].
@@ -168,18 +168,43 @@ mod tests {
             .and_then(|p| p.get("crates-io"))
             .and_then(toml::Value::as_table)
             .expect("root Cargo.toml has no [patch.crates-io]");
-        for dependency in ["microsandbox", "microsandbox-network", "msb_krun"] {
-            let version = pinned_version(deps, dependency).trim_start_matches('=');
-            let path = patches
-                .get(dependency)
-                .and_then(|p| p.get("path"))
-                .and_then(toml::Value::as_str)
-                .unwrap_or_else(|| panic!("[patch.crates-io] is missing {dependency}"));
+        let lock: toml::Value = toml::from_str(include_str!("../../Cargo.lock")).unwrap();
+        for (dependency, patch) in patches {
+            let path = patch["path"]
+                .as_str()
+                .expect("repository-relative patch path");
+            let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(path)
+                .join("Cargo.toml");
+            let manifest: toml::Value =
+                toml::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+            let version = manifest["package"]["version"].as_str().unwrap();
+            let packages: Vec<_> = lock["package"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["name"].as_str() == Some(dependency))
+                .collect();
             assert_eq!(
-                path,
-                format!("third_party/{dependency}-{version}"),
-                "vendored patch for {dependency} does not match its pin"
+                packages.len(),
+                1,
+                "{dependency}: patch must resolve exactly once"
             );
+            assert_eq!(
+                packages[0]["version"].as_str(),
+                Some(version),
+                "{dependency}: unused patch version"
+            );
+            assert!(
+                packages[0].get("source").is_none(),
+                "{dependency}: patch fell off"
+            );
+            if deps.contains_key(dependency) {
+                assert_eq!(
+                    pinned_version(deps, dependency).trim_start_matches('='),
+                    version
+                );
+            }
         }
     }
 

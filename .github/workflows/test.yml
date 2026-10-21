@@ -160,7 +160,6 @@ jobs:
       - name: Prepare checked inputs
         run: |
           bash tools/msb-payloads/fetch.sh ${{ matrix.target }}
-          if [ "${{ runner.os }}" = Linux ]; then bash third_party/native/libcap-ng/build.sh ${{ matrix.target }}; fi
       - name: "Build builtin runtime (2 jobs: each test binary links the whole VM stack)"
         env:
           CARGO_BUILD_JOBS: "2"
@@ -221,7 +220,6 @@ jobs:
         run: |
           bash tools/msb-payloads/fetch.sh "${{ matrix.target }}"
           bash tools/msb-payloads/verify.sh "${{ matrix.target }}"
-          if [ "$(uname -s)" = Linux ]; then bash third_party/native/libcap-ng/build.sh "${{ matrix.target }}"; fi
       - name: Produce the fixture base image (docker-save layout, uncompressed layers)
         shell: bash
         run: |
@@ -285,7 +283,6 @@ jobs:
           path: |
             third_party/msb-payloads/${{ matrix.target }}/kernel.meta
             third_party/msb-payloads/${{ matrix.target }}/provenance.txt
-            third_party/native/libcap-ng/${{ matrix.target }}/libcap-ng.a
           if-no-files-found: ignore
 
   existing-backend-unsupported-targets:

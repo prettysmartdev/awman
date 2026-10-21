@@ -11,7 +11,9 @@ pub fn dispatch_worker(
     let worker = is_worker_invocation(&arguments);
     let info = arguments.first().map(std::ffi::OsString::as_os_str)
         == Some(std::ffi::OsStr::new("__awman-builtin-info"));
-    if !worker && !info {
+    let kernel_check = arguments.first().map(std::ffi::OsString::as_os_str)
+        == Some(std::ffi::OsStr::new("__awman-builtin-kernel-check"));
+    if !worker && !info && !kernel_check {
         return false;
     }
     // The binary supplies OS strings so non-UTF-8 overrides cannot disappear
@@ -31,7 +33,13 @@ pub fn dispatch_worker(
     #[cfg(awman_builtin)]
     {
         version::retain();
-        if info {
+        if kernel_check {
+            if let Err(reason) = kernel::smoke_check() {
+                eprintln!("awman: {reason}");
+                std::process::exit(70);
+            }
+        }
+        if info || kernel_check {
             println!(
                 "{}",
                 serde_json::json!({
@@ -89,7 +97,7 @@ fn enter(arguments: Vec<std::ffi::OsString>) -> ! {
         );
         std::process::exit(64);
     }
-    if let Err(error) = kernel::register() {
+    if let Err(error) = kernel::prepare() {
         eprintln!("awman: {error}");
         std::process::exit(70);
     }
@@ -277,6 +285,38 @@ mod tests {
         assert!(descriptors(Some(96), Some(97), Some(99), Some(98)).sdk_slots());
         assert!(!descriptors(Some(97), Some(96), Some(99), None).sdk_slots());
         assert!(!descriptors(Some(3), Some(4), Some(5), None).sdk_slots());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_rejects_extra_links_and_world_write() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let lock = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let fd = lock.as_file().as_raw_fd();
+        for mode in [0o600, 0o640, 0o644] {
+            std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(descriptor_role(fd, FdRole::Lock), "SDK lock mode {mode:o}");
+        }
+        for mode in [0o602, 0o620, 0o666] {
+            std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                !descriptor_role(fd, FdRole::Lock),
+                "writable by others: {mode:o}"
+            );
+        }
+        std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let alias = directory.path().join("alias");
+        std::fs::hard_link(lock.path(), &alias).unwrap();
+        assert!(!descriptor_role(fd, FdRole::Lock));
+        std::fs::remove_file(alias).unwrap();
+        assert!(descriptor_role(fd, FdRole::Lock));
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open(lock.path())
+            .unwrap();
+        assert!(!descriptor_role(write_only.as_raw_fd(), FdRole::Lock));
     }
 
     #[cfg(unix)]

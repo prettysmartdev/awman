@@ -14,7 +14,7 @@ bash "$root/tools/msb-payloads/verify.sh" "$target"
 payload="$root/third_party/msb-payloads/$target"
 if [[ "$target" == *linux* ]]; then
   native="$root/third_party/native/libcap-ng/$target"
-  test -f "$native/libcap-ng.a" || { echo "BLOCKED: build pinned static cap-ng first" >&2; exit 2; }
+  test -f "$native/libcap-ng.a" || bash "$root/third_party/native/libcap-ng/build.sh" "$target"
 else native=; fi
 lock="$root/tools/oci-runtime-spike/strict-embed/full-probe/Cargo.lock"
 sed -n '/^name = "libsqlite3-sys"$/,/^$/p' "$lock" | grep -q '^version = "0.37.0"$' || { echo "old probe lock no longer pins libsqlite3-sys 0.37.0" >&2; exit 1; }
@@ -26,14 +26,30 @@ cp "$root/third_party/msb-payloads/$agent_arch/agentd" "$output/artifacts/agentd
 export SPIKE_KERNEL="$payload/kernel.bin"
 export SPIKE_KERNEL_METADATA="$payload/kernel.meta"
 export MSB_EMBED_ARTIFACTS_DIR="$output/artifacts"
-if [ -n "$native" ]; then export LIBRARY_PATH="$native${LIBRARY_PATH:+:$LIBRARY_PATH}"; fi
-export CARGO_TARGET_DIR="$output/cargo-target"
-cargo build --locked --manifest-path "$root/tools/oci-runtime-spike/strict-embed/full-probe/Cargo.toml" \
-  --target "$target" > "$output/build.log" 2>&1 || { tail -80 "$output/build.log" >&2; exit 1; }
-cp "$CARGO_TARGET_DIR/$target/debug/awman-msb-full-embed-probe" "$output/runtime/awman-probe"
+if [ -n "$native" ]; then
+  export LIBRARY_PATH="$native${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  export LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH="$native"
+fi
+# Historical, self-contained provider; never reads a deleted production patch.
+curl -fsSL --retry 3 https://static.crates.io/crates/msb_krun/msb_krun-0.1.39.crate -o "$output/krun.crate"
+expected=$(sed -n '/^name = "msb_krun"$/,/^$/s/^checksum = "\([^"]*\)"/\1/p' "$lock")
+printf '%s  %s\n' "$expected" "$output/krun.crate" | shasum -a 256 -c -
+tar xf "$output/krun.crate" -C "$output"
+patch -d "$output/msb_krun-0.1.39" -p1 < "$root/tools/oci-runtime-spike/strict-embed/embedded-loader.patch"
+# The historical reader must not use the current patched guest-agent root.
+unset MSB_EMBED_ARTIFACTS_ROOT
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$output/cargo-target}"
+# Update only the disposable lock for this historical path patch.
+cp -R "$root/tools/oci-runtime-spike/strict-embed" "$output/strict-embed"
+historical_manifest="$output/strict-embed/full-probe/Cargo.toml"
+cargo metadata --format-version 1 --manifest-path "$historical_manifest" \
+  --config "patch.crates-io.msb_krun.path=\"$output/msb_krun-0.1.39\"" > "$output/metadata.json"
+cargo build --locked --manifest-path "$historical_manifest" \
+  --config "patch.crates-io.msb_krun.path=\"$output/msb_krun-0.1.39\"" \
+  > "$output/build.log" 2>&1 || { tail -80 "$output/build.log" >&2; exit 1; }
+cp "$CARGO_TARGET_DIR/debug/awman-msb-full-embed-probe" "$output/runtime/awman-probe"
 cp "$SPIKE_KERNEL" "$output/kernel.bin"
 cp "$SPIKE_KERNEL_METADATA" "$output/kernel.metadata"
-cp -a "$root/third_party/msb_krun-0.1.39" "$output/msb_krun-0.1.39"
 if [ -n "$native" ]; then cp "$native/libcap-ng.a" "$output/static-lib/libcap-ng.a"; fi
 if command -v sha256sum >/dev/null; then sha256sum "$output/runtime/awman-probe" "$output/kernel.bin" "$output/kernel.metadata" "$output/artifacts/agentd"; else shasum -a 256 "$output/runtime/awman-probe" "$output/kernel.bin" "$output/kernel.metadata" "$output/artifacts/agentd"; fi > "$output/inputs.sha256"
 printf 'PASS rebuilt genuine old-probe binary (sqlite native binding 0.37.0): %s\n' "$output/runtime/awman-probe"

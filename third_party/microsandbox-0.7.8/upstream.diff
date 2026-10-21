@@ -1,0 +1,55 @@
+--- a/lib/backend/local/mod.rs
++++ b/lib/backend/local/mod.rs
+@@ -489,6 +489,27 @@
+             None,
+         ))
+     }
++
++    /// Build a lazy local backend from built-in defaults and this builder only.
++    ///
++    /// Never reads the user configuration file, `MSB_CONFIG_PATH`, or the
++    /// machine-wide managed configuration. SDK-registered runtime paths and the
++    /// `MSB_PATH`/`MSB_LIBKRUNFW_PATH`/`MSB_AGENTD_PATH` overrides are still
++    /// layered by `prepare_for_local_backend`, so embedders that must ignore the
++    /// environment refuse those variables before calling this.
++    pub fn build_lazy_isolated(self) -> MicrosandboxResult<LocalBackend> {
++        let config = BackendConfig::new(
++            GlobalConfigPatch::from_present_fields(GlobalConfig::default()),
++            GlobalConfigPatch::new(),
++        )
++        .prepare_for_local_backend(self.config)?;
++
++        Ok(LocalBackend::from_backend_config(
++            config,
++            BackendSelectionSource::Programmatic,
++            None,
++        ))
++    }
+ }
+ 
+ impl MigrationLock {
+@@ -767,6 +788,24 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn isolated_builder_ignores_hostile_user_and_managed_files() {
++        let temp = tempfile::tempdir().unwrap();
++        let user = temp.path().join("user.json");
++        let managed = temp.path().join("managed.json");
++        std::fs::write(&user, "{}").unwrap();
++        std::fs::write(&managed, "{hostile managed JSON").unwrap();
++        let builder = || super::LocalBackendBuilder::default()
++            .home(temp.path().join("home"))
++            .config_path(&user)
++            .managed_config_path(&managed);
++        assert!(builder().build_lazy().is_err());
++        assert!(builder().build_lazy_isolated().is_ok());
++        std::fs::write(&managed, "{}").unwrap();
++        std::fs::write(&user, "{hostile user JSON").unwrap();
++        assert!(builder().build_lazy().is_err());
++        assert!(builder().build_lazy_isolated().is_ok());
++    }
+     use microsandbox_types::snapshot::Manifest;
+     use microsandbox_types::{
+         CpuPlacement, MemoryPlacement, NumaPlacement, PlacementProfile, SandboxResourcesPatch,

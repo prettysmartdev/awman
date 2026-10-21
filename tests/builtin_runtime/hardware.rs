@@ -358,3 +358,38 @@ fn builtin_hw_a_second_client_can_reattach_while_the_launcher_lives() {
         "the agent's own exit code, after a detach that never killed it"
     );
 }
+
+#[test]
+fn builtin_hw_pinned_kernel_repeated_launches_and_failed_workload_shut_down_cleanly() {
+    let Some(run) = scenario("builtin_hw_kernel_repeat", "kernel-repeat") else {
+        return;
+    };
+    // Validate the artifact under test against the adopted, verified payload.
+    let info = crate::binary::builtin_info().expect("builtin artifact");
+    assert_eq!(info["msb_version"], "0.7.8");
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .join("third_party/msb-payloads/manifest.toml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let target = crate::binary::host_triple();
+    assert_eq!(
+        manifest["targets"][target]["status"].as_str(),
+        Some("verified")
+    );
+    assert_eq!(
+        info["kernel_sha256"].as_str(),
+        manifest["targets"][target]["kernel_sha256"].as_str()
+    );
+    for round in 0..3 {
+        let stdout = run.guest_stdout(&format!("kernel-repeat-{round}"));
+        let lines: Vec<_> = stdout.lines().collect();
+        assert!(lines[0].starts_with("6.12.111"), "{stdout:?}");
+        assert_eq!(lines[1], format!("round-{round}"));
+    }
+    assert_eq!(run.facts["EXIT"], ["0", "37", "0"]);
+    assert_eq!(run.facts["ROUND_REMAINING"], ["0", "0", "0"], "{}", run.raw);
+}

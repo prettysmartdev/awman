@@ -252,8 +252,8 @@ fn builtin_sqlite_sdk_catalog_migrates_twice_and_preserves_rusqlite_writes_after
     assert!(first_tables.len() > 5, "{first_tables:?}");
     let migrations = applied_migrations(&db);
     assert_eq!(
-        migrations, 27,
-        "the supported SDK catalog has 27 migrations"
+        migrations, 29,
+        "the supported SDK catalog has 29 migrations"
     );
 
     // rusqlite (awman's stack, same native library) commits a cross-driver transaction.
@@ -315,7 +315,7 @@ fn builtin_sqlite_genuine_bidirectional_transactions_and_locking() {
     config_home(&scratch);
     status_until_listed(&scratch, &state_dir).unwrap();
     let db = state_dir.join("db/msb.db");
-    assert_eq!(applied_migrations(&db), 27);
+    assert_eq!(applied_migrations(&db), 29);
     let mut native = rusqlite::Connection::open(&db).unwrap();
     native.busy_timeout(Duration::from_millis(100)).unwrap();
     native.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE awman_driver_transactions (id INTEGER PRIMARY KEY, value BLOB NOT NULL);").unwrap();
@@ -424,7 +424,7 @@ fn builtin_sqlite_genuine_bidirectional_transactions_and_locking() {
             .unwrap(),
         "ok"
     );
-    assert_eq!(applied_migrations(&db), 27);
+    assert_eq!(applied_migrations(&db), 29);
 }
 
 #[test]

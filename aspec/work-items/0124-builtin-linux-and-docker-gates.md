@@ -69,7 +69,7 @@ secrets, redact evidence, and never dump ambient credentials.
 
 1. **Payloads:** verify the `x86_64-unknown-linux-gnu` payload natively (it is
    still `unverified`); re-verify `aarch64-unknown-linux-gnu` from a clean
-   checkout. Build with the Linux `libcap-ng` native input.
+   checkout. Build with the pinned Linux payload (0.1.41 uses pure Rust `caps`; no libcap-ng input).
 2. **Enable Linux:** lift WI 0123's platform gate for Linux arm64/x86_64 only
    after packages 3–8 pass on that architecture. Add the `builtin-runtime`
    feature to the matching Linux release assets and update the docs WI 0123

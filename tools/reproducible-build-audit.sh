@@ -18,15 +18,26 @@ git ls-files --stage .cargo/config.toml Cargo.toml Cargo.lock build.rs rust-tool
 for f in .cargo/config.toml Cargo.toml Cargo.lock build.rs rust-toolchain.toml \
   crates/awman-cli/Cargo.toml crates/awman-cli/build.rs \
   crates/awman-host-shims/Cargo.toml crates/awman-host-shims/build.rs \
-  third_party/msb-payloads/manifest.toml third_party/msb_krun-0.1.39/Cargo.toml \
-  third_party/microsandbox-filesystem-0.7.2/Cargo.toml \
+  third_party/msb-payloads/manifest.toml \
+  third_party/microsandbox-0.7.8/Cargo.toml \
+  third_party/microsandbox-0.7.8/upstream.diff \
+  third_party/microsandbox-0.7.8/PATCH.md \
+  third_party/microsandbox-network-0.7.8/Cargo.toml \
+  third_party/microsandbox-network-0.7.8/upstream.diff \
+  third_party/microsandbox-network-0.7.8/PATCH.md \
+  third_party/microsandbox-types-0.7.8/Cargo.toml \
+  third_party/microsandbox-types-0.7.8/upstream.diff \
+  third_party/microsandbox-types-0.7.8/PATCH.md \
+  third_party/microsandbox-filesystem-0.7.8/Cargo.toml \
+  third_party/microsandbox-filesystem-0.7.8/upstream.diff \
+  third_party/microsandbox-filesystem-0.7.8/PATCH.md \
   third_party/sqlx-sqlite-0.9.0/Cargo.toml third_party/sqlx-sqlite-0.9.0/PATCH.md \
-  third_party/sqlx-sqlite-0.9.0/upstream.diff third_party/native/libcap-ng/build.sh \
+  third_party/sqlx-sqlite-0.9.0/upstream.diff \
   tools/msb-payloads/fetch.sh tools/msb-payloads/verify.sh tools/msb-payloads/extract-kernel.c \
   .github/workflows/test.yml .github/workflows/release.yml; do
   git ls-files --error-unmatch "$f" >/dev/null || { echo "required build input is not tracked: $f" >&2; exit 1; }
 done
-if grep -nE '(/tmp/|/private/tmp/|/Users/[^/]+/\.cargo|\.cargo/registry/src)' \
+if grep -rnE '(/tmp/|/private/tmp/|/Users/[^/]+/\.cargo|\.cargo/registry/src)' \
   Cargo.toml Cargo.lock build.rs .cargo/config.toml .github/workflows \
   crates/awman-cli/Cargo.toml crates/awman-cli/build.rs \
   crates/awman-host-shims/Cargo.toml crates/awman-host-shims/build.rs; then
@@ -38,5 +49,17 @@ if command -v sha256sum >/dev/null; then hasher=(sha256sum); else hasher=(shasum
   crates/awman-cli/Cargo.toml crates/awman-cli/build.rs \
   crates/awman-host-shims/Cargo.toml crates/awman-host-shims/build.rs \
   third_party/msb-payloads/manifest.toml \
+  third_party/microsandbox-0.7.8/Cargo.toml \
+  third_party/microsandbox-0.7.8/upstream.diff \
+  third_party/microsandbox-0.7.8/PATCH.md \
+  third_party/microsandbox-network-0.7.8/Cargo.toml \
+  third_party/microsandbox-network-0.7.8/upstream.diff \
+  third_party/microsandbox-network-0.7.8/PATCH.md \
+  third_party/microsandbox-types-0.7.8/Cargo.toml \
+  third_party/microsandbox-types-0.7.8/upstream.diff \
+  third_party/microsandbox-types-0.7.8/PATCH.md \
+  third_party/microsandbox-filesystem-0.7.8/Cargo.toml \
+  third_party/microsandbox-filesystem-0.7.8/upstream.diff \
+  third_party/microsandbox-filesystem-0.7.8/PATCH.md \
   > "$out/input-sha256.txt"
 printf 'PASS reproducible build input audit at %s\n' "$out"

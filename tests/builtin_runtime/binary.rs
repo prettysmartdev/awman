@@ -163,6 +163,58 @@ fn skip_without_runtime(test: &str) -> bool {
     true
 }
 
+#[test]
+fn builtin_static_krunfw_callback_is_linked_without_dynamic_export() {
+    if skip_without_runtime("static-krunfw callback symbol") {
+        return;
+    }
+    let mut command = Command::new("nm");
+    if cfg!(target_os = "macos") {
+        command.arg("-gU");
+    } else {
+        command.args(["-g", "--defined-only"]);
+    }
+    let symbols = match command.arg(awman()).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("SKIP: callback symbol check requires nm");
+            return;
+        }
+        Err(error) => panic!("nm: {error}"),
+    };
+    assert!(symbols.status.success(), "{symbols:?}");
+    assert!(
+        !String::from_utf8_lossy(&symbols.stdout)
+            .lines()
+            .any(
+                |line| line.split_whitespace().last().is_some_and(|symbol| symbol
+                    .starts_with("capng_")
+                    || symbol.starts_with("_capng_"))
+            ),
+        "obsolete libcap-ng must not be linked"
+    );
+    let name = if cfg!(target_os = "macos") {
+        "_krunfw_get_kernel"
+    } else {
+        "krunfw_get_kernel"
+    };
+    assert!(
+        String::from_utf8_lossy(&symbols.stdout)
+            .lines()
+            .any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.ends_with(&["T", name])
+            }),
+        "callback must be defined in the unstripped non-LTO test binary: {symbols:?}"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let dynamic = Command::new("nm").arg("-D").arg(awman()).output().unwrap();
+        assert!(dynamic.status.success(), "{dynamic:?}");
+        assert!(!String::from_utf8_lossy(&dynamic.stdout).contains("krunfw_get_kernel"));
+    }
+}
+
 // ─── worker dispatch, version, refusals (run in every build) ────────────────
 
 #[test]
@@ -453,8 +505,8 @@ fn builtin_info_reports_the_strict_embedded_contract() {
         skip_without_runtime("info contract");
         return;
     };
-    assert_eq!(info["msb_version"], "0.7.2");
-    assert_eq!(info["worker_protocol"], "0.7.2/18/awman-1");
+    assert_eq!(info["msb_version"], "0.7.8");
+    assert_eq!(info["worker_protocol"], "0.7.8/18/awman-1");
     assert_eq!(info["embedded_kernel"], true);
     assert_eq!(info["embedded_guest_agent"], true);
     assert_eq!(info["host_helpers"], false, "no helper executables");
@@ -464,7 +516,7 @@ fn builtin_info_reports_the_strict_embedded_contract() {
     assert_eq!(info["target_arch"], std::env::consts::ARCH);
     assert_eq!(
         info["libkrun_commit"],
-        "2bd0f84ad0956f3032e0490d3b8512b6851eca12"
+        "b35c7e118d7a1e48c8fad103b258e64ff5c49147"
     );
 
     // The kernel hash is the one the checksum-verified build input pins.
@@ -648,7 +700,7 @@ fn builtin_binary_carries_the_msb_version_section_the_sdk_reads_without_executin
     #[cfg(target_os = "linux")]
     assert_eq!(
         elf_section(&bytes, ".msbver").as_deref(),
-        Some(&b"0.7.2"[..]),
+        Some(&b"0.7.8"[..]),
         "{} lost its .msbver section (LTO/strip must retain it)",
         binary.display()
     );
@@ -664,7 +716,7 @@ fn builtin_binary_carries_the_msb_version_section_the_sdk_reads_without_executin
             .unwrap()
             .map(|version| version.to_string())
             .as_deref(),
-        Some("0.7.2"),
+        Some("0.7.8"),
         "SDK could not read the version section in {}",
         binary.display()
     );
@@ -684,13 +736,13 @@ fn builtin_final_artifact_retains_worker_provider() {
         .expect("AWMAN_TEST_BUILTIN_ARTIFACT must name the final optimized/stripped artifact");
     assert!(path.is_file(), "final artifact must exist");
     let output = Command::new(&path)
-        .arg("__awman-builtin-info")
+        .arg("__awman-builtin-kernel-check")
         .env_clear()
         .output()
         .expect("run exact final artifact");
     assert!(
         output.status.success(),
-        "final artifact private info failed"
+        "final artifact kernel callback check failed"
     );
     let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(info["embedded_kernel"], true);
@@ -699,7 +751,7 @@ fn builtin_final_artifact_retains_worker_provider() {
     #[cfg(target_os = "linux")]
     assert_eq!(
         elf_section(&bytes, ".msbver").as_deref(),
-        Some(&b"0.7.2"[..])
+        Some(&b"0.7.8"[..])
     );
     #[cfg(target_os = "macos")]
     assert!(bytes.windows(8).any(|w| w == b"__msbver"));
@@ -709,7 +761,7 @@ fn builtin_final_artifact_retains_worker_provider() {
             .unwrap()
             .map(|version| version.to_string())
             .as_deref(),
-        Some("0.7.2")
+        Some("0.7.8")
     );
 }
 
