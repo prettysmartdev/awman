@@ -41,6 +41,7 @@ impl AgentRuntimeEngine for ImportRuntime {
             has_image_store: true,
             image_acquisition: crate::engine::agent_runtime::ImageAcquisition::Import,
             per_launch_vm_settings: true,
+            reports_resource_stats: true,
         };
         &CAPS
     }

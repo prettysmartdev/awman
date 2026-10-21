@@ -10,6 +10,7 @@
 //! `ExecWorkflow`, `Api` — which require additional Q&A,
 //! reporting, or container-frontend hooks.
 
+pub(crate) mod agents;
 pub(crate) mod helpers;
 pub(crate) mod render;
 

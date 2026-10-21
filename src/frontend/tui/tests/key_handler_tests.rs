@@ -456,7 +456,7 @@ fn backspace_blocked_while_running() {
 fn submit_command_blocked_while_running() {
     use crate::frontend::tui::tabs::ExecutionPhase;
     let mut app = make_app();
-    app.command_input.set_text("status");
+    app.command_input.set_text("ready");
     app.tabs[app.active_tab].execution_phase = ExecutionPhase::Running {
         command: "chat".into(),
     };

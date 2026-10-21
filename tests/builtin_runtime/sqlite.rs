@@ -142,7 +142,7 @@ pub(crate) fn config_home(scratch: &Scratch) -> PathBuf {
     home
 }
 
-/// `awman status` under the opt-in gate: constructs the builtin runtime (which
+/// `awman agents status --watch` under the opt-in gate: constructs the builtin runtime (which
 /// opens and migrates the SDK catalog through SQLx) and lists agents. It keeps
 /// refreshing, so it is killed once the listing appeared - exactly like a crash.
 pub(crate) fn status_until_listed(scratch: &Scratch, state: &Path) -> Result<String, String> {
@@ -152,7 +152,7 @@ pub(crate) fn status_until_listed(scratch: &Scratch, state: &Path) -> Result<Str
         .command(&awman(), Some("/usr/bin:/bin"))
         .env("AWMAN_TEST_BUILTIN", "1")
         .env("AWMAN_BUILTIN_STATE_DIR", state)
-        .arg("status")
+        .args(["agents", "status", "--watch"])
         .current_dir(&repo)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -182,7 +182,7 @@ pub(crate) fn status_until_listed(scratch: &Scratch, state: &Path) -> Result<Str
             Ok(line) => {
                 seen.push_str(&line);
                 seen.push('\n');
-                if line.contains("No code agents running") {
+                if line.contains("No agents running") {
                     break Ok(seen.clone());
                 }
             }

@@ -165,7 +165,7 @@ fn stderr_from_brief_run(args: &[&str], env_key: &str, env_val: &str) -> String 
 /// deprecation check (lines 37-39 of `main.rs`) before any blocking I/O.
 #[test]
 fn deprecated_amux_api_key_emits_deprecation_warning() {
-    let stderr = stderr_from_brief_run(&["status"], "AMUX_API_KEY", "legacy-test-value");
+    let stderr = stderr_from_brief_run(&["config", "show"], "AMUX_API_KEY", "legacy-test-value");
 
     assert!(
         stderr.contains("AMUX_API_KEY"),
@@ -184,7 +184,11 @@ fn deprecated_amux_api_key_emits_deprecation_warning() {
 /// `AMUX_CONFIG_HOME` must also produce a deprecation warning.
 #[test]
 fn deprecated_amux_config_home_emits_deprecation_warning() {
-    let stderr = stderr_from_brief_run(&["status"], "AMUX_CONFIG_HOME", "/tmp/legacy-amux-test");
+    let stderr = stderr_from_brief_run(
+        &["config", "show"],
+        "AMUX_CONFIG_HOME",
+        "/tmp/legacy-amux-test",
+    );
 
     assert!(
         stderr.contains("AMUX_CONFIG_HOME"),
@@ -200,7 +204,7 @@ fn deprecated_amux_config_home_emits_deprecation_warning() {
 /// warning — only old `AMUX_*` names trigger warnings.
 #[test]
 fn awman_api_key_does_not_trigger_deprecation_warning() {
-    let stderr = stderr_from_brief_run(&["status"], "AWMAN_API_KEY", "valid-new-key");
+    let stderr = stderr_from_brief_run(&["config", "show"], "AWMAN_API_KEY", "valid-new-key");
 
     assert!(
         !stderr.contains("AWMAN_API_KEY is deprecated"),

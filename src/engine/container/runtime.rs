@@ -17,7 +17,7 @@ use crate::data::config::resolved_builtin::BuiltinProcessConfig;
 use crate::data::oci_identity::ImageIdentity;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
-    AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, ImageAcquisition,
+    AgentDetail, AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, ImageAcquisition,
     ImageImportRequest, ImportedImage, ReadyAgentOptions, ResolvedAgentOptions,
 };
 use crate::engine::container::apple::AppleBackend;
@@ -49,6 +49,7 @@ pub(super) static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     has_image_store: true,
     image_acquisition: ImageAcquisition::Build,
     per_launch_vm_settings: false,
+    reports_resource_stats: true,
 };
 
 /// The process-wide part of the builtin microVM backend's settings: one
@@ -110,14 +111,26 @@ impl ContainerRuntime {
         }
     }
 
-    /// Construct with the builtin microVM backend. Errors — never panics —
-    /// when awman was built without the runtime, on an unsupported target,
-    /// when an ambient `MSB_*` override is set, or when the state directory
-    /// cannot be secured.
+    /// Construct with the builtin microVM backend. Transient startup
+    /// unavailability retains the selected runtime and retries on observation.
+    /// Unsupported targets, ambient overrides and invalid configuration fail.
     pub fn builtin(settings: BuiltinRuntimeSettings) -> Result<Self, EngineError> {
-        Ok(Self {
-            backend: crate::engine::container::builtin::open(settings)?,
-        })
+        Self::open_builtin(Box::new(move || {
+            crate::engine::container::builtin::open(settings.clone())
+        }))
+    }
+
+    pub(super) fn open_builtin(
+        open: Box<super::deferred::OpenBackend>,
+    ) -> Result<Self, EngineError> {
+        let backend = match open() {
+            Ok(backend) => backend,
+            Err(EngineError::BuiltinRuntimeUnavailable { .. }) => {
+                Arc::new(super::deferred::DeferredBackend::new(open))
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Self { backend })
     }
 
     /// Wrap an already-constructed backend. Test-only: lets hermetic tests run
@@ -332,6 +345,14 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         ContainerRuntime::stats(self, handle)
+    }
+
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        ContainerRuntime::list_stopped(self)
+    }
+
+    fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
+        self.backend.inspect(handle)
     }
 
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
@@ -581,5 +602,36 @@ mod tests {
             Err(e) => panic!("expected AmbientRuntimeOverride, got {e:?}"),
             Ok(_) => panic!("expected an error"),
         }
+    }
+}
+
+#[cfg(test)]
+mod inspect_default_tests {
+    use super::*;
+    use crate::engine::agent_runtime::AgentRuntimeEngine;
+    use crate::engine::container::test_support::holding_runtime;
+
+    fn handle() -> AgentHandle {
+        AgentHandle {
+            id: "id1".into(),
+            name: "awman-x".into(),
+            image_tag: "img".into(),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn container_runtime_inspect_detects_missing_agent() {
+        let rt = holding_runtime(Default::default());
+        let err = AgentRuntimeEngine::inspect(rt.as_ref(), &handle()).unwrap_err();
+        assert!(err.to_string().contains("no longer exists"));
+    }
+
+    #[test]
+    fn container_runtime_list_stopped_forwards_to_the_backend() {
+        let rt = holding_runtime(Default::default());
+        assert!(AgentRuntimeEngine::list_stopped(rt.as_ref())
+            .unwrap()
+            .is_empty());
     }
 }

@@ -629,30 +629,50 @@ Once enabled, your global skills appear as slash commands. See [Overlays](08-ove
 ## Monitoring running agents
 
 ```sh
-awman status          # one-shot snapshot
-awman status --watch  # auto-refreshing dashboard (every 3 seconds)
+awman agents status             # one-shot snapshot
+awman agents status --watch     # refresh the dashboard every 2 seconds
+awman agents list               # list running agents
+awman agents detail <id>        # inspect one agent
+awman agents kill <id>          # confirm before stopping and removing
+awman agents attach <id>        # attach to an agent's terminal
 ```
 
-`status` works outside the TUI. It shows every active code agent container with CPU usage, memory, project path, and runtime.
+`agents status` shows a snapshot of running agents from the CLI or TUI. Add
+`--watch` to keep refreshing the dashboard; in the TUI, press **Esc** to stop
+the watch. `--json` emits a JSON snapshot and cannot be combined with
+`--watch`.
 
+`agents list` accepts the aliases `ps` and `ls`. Use `--all` to include
+stopped agents that remain eligible for cleanup, `--no-trunc` to show full
+IDs, names and image names, and `--json` for structured output. The `-q` / `--quiet`
+flag prints only agent IDs and cannot be combined with `--json`; this is useful
+for scripts that remove every listed agent:
+
+```sh
+awman agents ls -q | xargs -n1 awman agents rm -y
 ```
-CODE AGENTS
-┌────────────────────────────┬────────┬───────┬─────────┐
-│ Project                    │ Agent  │ CPU   │ Memory  │
-├────────────────────────────┼────────┼───────┼─────────┤
-│ /home/user/myproject       │ claude │ 5.23% │ 210MiB  │
-└────────────────────────────┴────────┴───────┴─────────┘
-```
 
-If awman is launched outside of any Git repository, `status --watch` runs automatically instead of the normal startup.
+`agents detail <id>` (alias: `inspect`) shows identity, lifecycle, resource,
+and runtime information for an agent. Supply its ID, a unique ID prefix, or
+its name; use `--json` for structured output.
 
-The status output includes a source marker for each container. Ordinary user
-sessions are marked `session`; a container launched by the squad daemon is
-marked `squad:<task>`, such as `squad:issue-triage`. This marker identifies
-which task owns the background evaluation or generated workflow. It can appear
-even if you have never enabled squad; it does not indicate a problem with a
-regular session. See [Squad](12-squad.md) for task management and unattended
-execution.
+`agents kill <id>` (alias: `rm`) stops and removes an agent after confirmation.
+Pass `-y` / `--yes` to skip the prompt, as in the scripting example above.
+Use `--json --yes` to emit the kill result as JSON without a prompt.
+`agents attach <id>` connects to the running agent's terminal. Press **Ctrl-C**
+to detach in the CLI or TUI; this closes only your connection and leaves the
+agent running. Apple agents launched by older versions without launcher metadata
+must be restarted before they can be attached. The API exposes
+the `status` snapshot, `list`, `detail`, and `kill` commands; API `kill` calls
+must include `--yes`. `attach` and `status --watch` are available only in the
+CLI and TUI.
+
+Status and list output include a source marker for each agent. Ordinary user
+sessions are marked `session`; an agent launched by the squad daemon is marked
+`squad:<task>`, such as `squad:issue-triage`. This marker identifies which task
+owns the background evaluation or generated workflow. It can appear even if
+you have never enabled squad; it does not indicate a problem with a regular
+session. See [Squad](12-squad.md) for task management and unattended execution.
 
 ---
 

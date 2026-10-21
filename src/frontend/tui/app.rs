@@ -198,6 +198,9 @@ impl App {
     }
 
     pub fn close_active_tab(&mut self) {
+        // A closing tab's dashboard watch or attach session has nowhere left
+        // to draw; end it rather than leave it polling in the background.
+        self.active_tab().shared.command_cancel.cancel();
         if self.tabs.len() <= 1 {
             self.should_quit = true;
             return;
@@ -649,11 +652,14 @@ impl App {
     fn clear_active_tab_for_new_command(&mut self) {
         let tab = self.active_tab_mut();
 
+        // Stop a dashboard watch or attach the previous command left running.
+        tab.shared.command_cancel.cancel();
+
         // Clear previous output so the new command starts with a fresh log.
         if let Ok(mut log) = tab.shared.status_log.lock() {
             log.clear();
         }
-        if let Ok(mut dash) = tab.shared.status_dashboard.lock() {
+        if let Ok(mut dash) = tab.shared.agents_dashboard.lock() {
             *dash = None;
         }
         tab.scroll_offset = 0;
@@ -700,7 +706,7 @@ impl App {
     /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
         self.refresh_tabs_from_sessions();
-        self.refresh_status_context();
+        self.refresh_agents_context();
         self.drain_stats_samples();
         self.request_stats_round();
         self.refresh_yolo_countdown_dialog();
@@ -859,16 +865,13 @@ impl App {
         }
     }
 
-    /// Refresh the TUI context shared with the `status` command.
+    /// Refresh the TUI context shared with `agents status`.
     ///
-    /// Each tab holds a shared slot; the status watch loop reads it on every
-    /// tick so it always sees current container-name and stuck state.
-    fn refresh_status_context(&mut self) {
-        // Refresh the TUI context shared with the status command. Each tab
-        // holds a shared slot; the status watch loop reads it on every tick
-        // so it always sees current container-name and stuck state.
+    /// Each tab holds a shared slot; the `agents status --watch` loop reads it
+    /// on every tick so it always sees current container-name and stuck state.
+    fn refresh_agents_context(&mut self) {
         {
-            use crate::command::commands::status::{StatusCommandTuiContext, TuiTabSnapshot};
+            use crate::command::commands::agents::{AgentsTuiContext, TuiTabSnapshot};
             let snapshots: Vec<TuiTabSnapshot> = self
                 .tabs
                 .iter()
@@ -893,7 +896,7 @@ impl App {
                     }
                 })
                 .collect();
-            let ctx = StatusCommandTuiContext::new(snapshots);
+            let ctx = AgentsTuiContext::new(snapshots);
             for tab in &self.tabs {
                 if let Ok(mut g) = tab.shared.tui_context_shared.lock() {
                     *g = ctx.clone();

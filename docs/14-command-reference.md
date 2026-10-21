@@ -78,15 +78,80 @@ Available via: CLI, TUI
 
 ---
 
-## `awman status`
+## `awman agents`
 
-Show the status of all running code-agent containers.
+Inspect and manage running code agents.
 
 Available via: CLI, TUI
 
+### `awman agents status`
+
+Show the status of running code agents.
+
+Available via: CLI, TUI, API
+
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--watch` | bool | false | — | — | CLI, TUI, API | Continuously refresh the output every 3 seconds. |
+| `--watch` | bool | false | — | `--json` | CLI, TUI | Keep refreshing the dashboard until interrupted. |
+| `--json` | bool | false | — | `--watch` | CLI, TUI, API | Emit JSON output. |
+
+### `awman agents list`
+
+Alias: `ps`, `ls`
+
+List running code agents.
+
+Available via: CLI, TUI, API
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `-a, --all` | bool | false | — | — | CLI, TUI, API | Include stopped agents that are still eligible for cleanup. |
+| `-q, --quiet` | bool | false | — | `--json` | CLI, TUI, API | Print only agent IDs. |
+| `--json` | bool | false | — | `--quiet` | CLI, TUI, API | Emit JSON output. |
+| `--no-trunc` | bool | false | — | — | CLI, TUI, API | Do not truncate IDs, names or image names. |
+
+### `awman agents detail`
+
+Alias: `inspect`
+
+Show details for an agent.
+
+Available via: CLI, TUI, API
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `id` | string | yes | Agent ID, unique ID prefix, or name. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
+
+### `awman agents kill`
+
+Alias: `rm`
+
+Stop and remove a running agent.
+
+Available via: CLI, TUI, API
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `id` | string | yes | Agent ID, unique ID prefix, or name. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
+| `-y, --yes` | bool | false | — | — | CLI, TUI, API | Skip the confirmation prompt (for scripting). |
+
+### `awman agents attach`
+
+Attach to an agent's terminal.
+
+Available via: CLI, TUI
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `id` | string | yes | Agent ID, unique ID prefix, or name. |
 
 ---
 

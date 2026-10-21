@@ -65,7 +65,7 @@ pub enum InitialTab {
 /// TUI presents only a fatal modal (Enter quits) — no startup command runs.
 ///
 /// `initial_tab` selects the opening tab: `Normal` uses `ctx.session`,
-/// behaviour, including the `ready` / `status --watch` startup auto-spawn;
+/// behaviour, including the `ready` / `agents status --watch` startup auto-spawn;
 /// `Squad` opens the singleton squad tab (§2.2) with no auto-spawn.
 pub async fn run(
     _matches: clap::ArgMatches,
@@ -156,7 +156,7 @@ pub async fn run(
         };
     }
 
-    // Auto-spawn startup command: `ready` for git repos, `status --watch`
+    // Auto-spawn startup command: `ready` for git repos, `agents status --watch`
     // for non-git directories. Skipped entirely for the squad tab.
     if run_startup_spawn {
         let startup = app.catalogue.startup_command(&app.active_tab().session);

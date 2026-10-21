@@ -59,7 +59,7 @@ pub enum FrontendAction {
     ResumeSquadTask,
     /// `ready` — what a freshly-opened tab runs over a git repository.
     ReportRepoReadiness,
-    /// `status --watch` — what a freshly-opened tab runs over a directory
+    /// `agents status --watch` — what a freshly-opened tab runs over a directory
     /// that is not a git repository, where there is nothing to make ready.
     WatchStatus,
 }
@@ -104,7 +104,7 @@ impl FrontendAction {
                 bool_flags: &[],
             },
             FrontendAction::WatchStatus => ActionSpec {
-                path: &["status"],
+                path: &["agents", "status"],
                 bool_flags: &["watch"],
             },
         }
@@ -259,7 +259,7 @@ mod tests {
             vec!["ready".to_string()]
         );
 
-        // No git root anywhere: `status --watch`, and the tab still opens.
+        // No git root anywhere: `agents status --watch`, and the tab still opens.
         let plain = Session::open_or_workdir_fallback(
             tmp.path().to_path_buf(),
             &FailingResolver,
@@ -268,7 +268,7 @@ mod tests {
         .expect("fall back to the working directory");
         assert!(!plain.is_git_repo());
         let input = catalogue.startup_command(&plain);
-        assert_eq!(input.path, vec!["status".to_string()]);
+        assert_eq!(input.path, vec!["agents".to_string(), "status".to_string()]);
         assert_eq!(input.flags.get("watch"), Some(&FlagValue::Bool(true)));
     }
 

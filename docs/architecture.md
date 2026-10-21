@@ -176,7 +176,7 @@ src/
       remote.rs           RemoteCommand, RemoteSubcommand, RemoteRunFlags, RemoteSessionStartFlags, RemoteSessionKillFlags, RemoteOutcome
       remote_client.rs    WorkflowStateSource, RemoteApiWorkflowSource, SquadTaskWorkflowSource, RemoteWorkflowPoller
       specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsOutcome
-      status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
+      agents/             AgentsCommandFrontend; status, list, detail, kill, attach commands and shared snapshots
       worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
       api_server/runtime.rs ApiServerRuntime — API daemon bootstrap
       squad/daemon_runtime.rs SquadDaemonHandles — squad daemon bootstrap
@@ -228,7 +228,7 @@ src/
         ready.rs          ReadyCommandFrontend impl
         remote_frontend.rs RemoteCommandFrontend impl
         specs.rs          SpecsCommandFrontend impl
-        status.rs         StatusCommandFrontend impl
+        agents.rs         AgentsCommandFrontend impl
         workflow_frontend.rs   WorkflowFrontend impl
         worktree_lifecycle.rs  WorktreeLifecycleFrontend impl
       pty.rs              PtySession — portable-pty wrapper; PtyEvent; spawn_text_command()
@@ -1694,7 +1694,7 @@ impl CommandCatalogue {
 
 The catalogue covers:
 
-`init`, `ready`, `chat`, `specs` (with `amend`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `api` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
+`init`, `ready`, `chat`, `specs` (with `amend`), `agents` (with `status`, `list`, `detail`, `kill`, `attach`), `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `api` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
 
 ---
 
@@ -1812,7 +1812,7 @@ pub enum CommandOutcome {
     Init(InitOutcome),
     Ready(ReadyOutcome),
     Chat(ChatOutcome),
-    Status(StatusOutcome),
+    Agents(AgentsOutcome),
     Config(ConfigOutcome),
     ExecPrompt(ExecPromptOutcome),
     ExecWorkflow(ExecWorkflowOutcome),
@@ -1858,7 +1858,7 @@ Each awman command is one module under `src/command/commands/` containing:
 | `chat.rs` | `awman chat` | Agent-launching command |
 | `exec_prompt.rs` | `awman exec prompt` | Agent-launching command with inline prompt |
 | `exec_workflow.rs` | `awman exec workflow` | Agent-launching command with full workflow file; `--yolo`/`--auto` imply `--worktree` |
-| `status.rs` | `awman status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
+| `agents/` | `awman agents {status,list,detail,kill,attach}` | Agent status, inspection, lifecycle, and terminal attachment commands |
 | `specs.rs` | `awman specs amend` | Review/amend agent runs; shares `create_new_spec` with `new spec` |
 | `config.rs` | `awman config {show,get,set}` | Config read/write; `config set --global` writes to global config |
 | `api_server.rs` | `awman api {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
@@ -2102,12 +2102,12 @@ All HTTP error variants map to specific `CommandError` variants: timeout → `Re
 
 ---
 
-### `StatusCommand` — TUI tab annotations
+### `AgentsStatusCommand` — TUI tab annotations
 
-`StatusCommand` accepts an optional `StatusCommandTuiContext` populated by the TUI before invocation:
+`AgentsStatusCommand` accepts an optional `AgentsTuiContext` provided by the TUI and refreshed on every collection tick:
 
 ```rust
-pub struct StatusCommandTuiContext {
+pub struct AgentsTuiContext {
     pub tabs: Vec<TuiTabSnapshot>,
 }
 
@@ -2119,7 +2119,7 @@ pub struct TuiTabSnapshot {
 }
 ```
 
-In CLI and API mode the context is `None` and the status output contains no tab annotation columns. In TUI mode the frontend provides the context via `StatusCommandFrontend::tui_context()`.
+In CLI and API mode the context is `None` and the status output contains no tab annotation columns. In TUI mode the frontend provides the context via `AgentsCommandFrontend::tui_context()`.
 
 ---
 
@@ -2232,7 +2232,7 @@ pub struct CliFrontend {
 }
 ```
 
-The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`ConfigCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules (`ApiStartCommandFrontend` and the rest of `per_command/`).
+The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`ConfigCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `AgentsCommandFrontend`) or via richer per-command modules (`ApiStartCommandFrontend` and the rest of `per_command/`).
 
 `CliFrontend::new(matches)` pre-computes `command_path` so it doesn't re-traverse the matches tree on every call.
 

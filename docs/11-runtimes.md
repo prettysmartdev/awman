@@ -55,6 +55,7 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 **Limitations:**
 - macOS only — not available on Linux or Windows. Configuring it on those platforms is an error, not a silent fallback.
 - `--allow-docker` (host Docker socket mount) is not supported under this runtime.
+- Agent attach is available only while the awman process that launched the agent is still running. Once that process exits, the agent terminal cannot be reattached.
 
 **`awman ready` for Apple Containers** builds the same per-agent images used by Docker, using `container build` instead of `docker build`. Images are rebuilt when you run `awman ready --build` or when another normal ready rule schedules a build; `--no-cache` disables build cache for builds that run.
 
@@ -318,10 +319,11 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 ### Session lifecycle
 
 - Each agent session, and each workflow setup/teardown environment, is its own microVM, removed when the session ends.
-- Ctrl-C sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed.
+- Ctrl-C in the launching session sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed. In `awman agents attach`, Ctrl-C detaches only that client.
 - **The awman process that launched a session must keep running.** If it exits, the session's VM stops. Detaching and reattaching works while that process is alive: another client, including a newer compatible awman process, can attach to the same live session and see the same output; detaching only ends that one client's connection, and the guest keeps running. Reattaching after the launching process has exited is not supported. Checkpoint restore is not supported.
 - **A client is never left believing it saw the whole session when it didn't.** If a client reading attached output falls too far behind the live stream, awman ends that connection with an explicit failure — never a later clean exit that would make missed output look like it was delivered. Reconnect (or restart the agent) after seeing this. An attach starts at the current output; it does not replay what was written before the connection was accepted.
-- `awman status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.
+- `awman agents status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.
+- `awman agents detail <id>` includes the builtin VM's configured vCPUs, memory in MiB, and network mode.
 - If you replace the awman binary while a session is running, new operations report `awman was replaced on disk while this session was running; restart awman to use the builtin runtime`. An awman with a different internal protocol version refuses to adopt sandboxes created by another version (`builtin runtime worker protocol mismatch … stop running agents started by an older awman and retry`): stop those agents with the awman that started them first.
 
 ### Parity limits versus Docker and Apple Containers
@@ -371,7 +373,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 | `Docker socket bridge is not supported on the builtin runtime` | You passed `--allow-docker`. Drop the flag; it is not available under `builtin`. |
 | `cannot share <path> into the guest at <path>: only regular files and directories can be mounted; sockets such as the Docker socket are not bridged` | An overlay or mount points at a Unix socket, FIFO, or device node. Only regular files and directories can be shared into the VM. |
 | `builtin exec output lagged; reconnect or restart the agent` | Your attached connection fell too far behind the live output and was closed rather than risk showing a false clean exit. Reconnect, or restart the agent if it isn't responding. |
-| `cannot attach to <name>: no live attach endpoint (...); the launching awman must remain alive, and reattachment after its exit is unsupported` | The awman process that started this session has exited. Start a new session; reattaching to one whose launcher is gone is not supported. |
+| `cannot attach to <name>: its launching awman process has exited; …` or `cannot attach to <name>: no live attach endpoint (...); the launching awman must remain alive, and reattachment after its exit is unsupported` | The awman process that started this session has exited. Start a new session; reattaching to one whose launcher is gone is not supported. |
 | `builtin runtime is busy: another awman process held …` | Retry shortly; another awman is importing an image or updating its catalog. |
 
 See [Cleaning Up](13-cleaning-up.md#builtin-runtime-state) for reclaiming disk space.
@@ -411,7 +413,7 @@ The VM's private Docker daemon supports Docker-in-Docker, so agents that need to
 | Env vars | `-e` flag or env file | Same | Credentials via `sbx secret set` + the credential proxy (not inherited from host shell) |
 | Networking | Host bridge or NAT | Per-container network | All traffic through HTTP/HTTPS proxy; raw TCP/UDP blocked |
 | Startup time | Milliseconds | ~1 second | 2–5 seconds cold (first launch per worktree) + startup script; subsequent restarts are faster |
-| Stats | `docker stats` | `container stats` | Status only — no per-resource CPU/memory metrics |
+| Stats | `docker stats` | `container stats` | Not reported — `agents status` and `agents detail` show no CPU or memory metrics; `agents list` never samples resource metrics |
 | Persistence | Ephemeral (removed on exit) | Ephemeral | **Persistent** — sandbox state survives between sessions |
 
 ### Setup
@@ -500,11 +502,11 @@ sbx rm awman-<hash>-claude   # stops and removes the sandbox, clearing its persi
 **Listing running sandboxes:**
 
 ```sh
-awman status               # shows awman-managed sandboxes across all runtimes
+awman agents status        # shows awman-managed agents on the configured runtime
 sbx ls                     # shows all sandboxes including non-awman ones
 ```
 
-`awman status` includes a source marker for running containers. Regular user
+`awman agents status` includes a source marker for running agents. Regular user
 sessions are marked `session`; containers launched by the squad daemon are
 marked `squad:<task>` (for example, `squad:issue-triage`). The marker is
 informational and may be visible whether or not you use squad.
@@ -589,7 +591,7 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 
 **Networking:** all traffic goes through an HTTP/HTTPS proxy. Raw TCP, UDP, and ICMP are blocked. This means SSH-based git remotes, database connections, and other raw-socket protocols do not work inside the VM by default. Agents that need npm, pip, or curl to reach the internet will work; agents that need to SSH into a server will not.
 
-**No per-resource stats:** `awman status` and the TUI stats panel show sandbox running/stopped state from `sbx ls`, but cannot report per-sandbox CPU or memory usage. The `docker stats`-style live resource view is unavailable for sbx sandboxes.
+**No per-resource stats:** `awman agents status` and the TUI status panel show running sandboxes from `sbx ls`, but cannot report per-sandbox CPU or memory usage. The `docker stats`-style live resource view is unavailable for sbx sandboxes.
 
 **`--allow-docker`:** Docker-in-Docker is always on inside an sbx sandbox (each VM has a private Docker daemon). The `--allow-docker` flag (which mounts the host daemon socket into Docker containers) is a no-op under sbx — it is ignored (noted in the debug log).
 

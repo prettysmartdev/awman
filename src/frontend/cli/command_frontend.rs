@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use clap::ArgMatches;
 
-use crate::command::commands::status::StatusCommandFrontend;
 use crate::command::commands::{
     config::ConfigCommandFrontend,
     new::NewCommandFrontend,
@@ -77,6 +76,8 @@ pub struct CliFrontend {
     pub(crate) container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     pub(crate) squad_attach_cancel: Option<tokio_util::sync::CancellationToken>,
     pub(crate) squad_attach_exit_code: Arc<AtomicI32>,
+    pub(crate) agents_attach_cancel: tokio_util::sync::CancellationToken,
+    pub(crate) agents_watch: Option<super::per_command::agents::WatchScreen>,
 }
 
 #[async_trait::async_trait]
@@ -457,6 +458,8 @@ impl CliFrontend {
             container_stdin_tx: None,
             squad_attach_cancel: None,
             squad_attach_exit_code: Arc::new(AtomicI32::new(0)),
+            agents_watch: None,
+            agents_attach_cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -817,55 +820,6 @@ fn require_multiline_input(prompt: &str) -> Result<String, CommandError> {
 }
 // ApiServerCommandFrontend for CliFrontend is in per_command/api_server.rs
 
-impl StatusCommandFrontend for CliFrontend {
-    /// Watch loop continues until the user presses Ctrl+C.
-    ///
-    /// First invocation spawns a tokio task that awaits a SIGINT and flips a
-    /// process-global atomic; subsequent invocations only read the flag, so
-    /// the loop exits cleanly on the next tick.
-    fn should_continue_watching(&mut self) -> bool {
-        use std::sync::atomic::Ordering;
-        ensure_watch_signal_handler_installed();
-        !WATCH_INTERRUPTED.load(Ordering::Relaxed)
-    }
-
-    /// Clear the screen between watch ticks (ANSI clear + cursor home).
-    fn write_clear_marker(&mut self) {
-        use std::io::Write;
-        let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
-    }
-}
-
-// ─── Watch-loop Ctrl+C handler ───────────────────────────────────────────────
-
-/// Process-global flag flipped to `true` when SIGINT arrives. Only consulted
-/// by `StatusCommandFrontend::should_continue_watching` for the CLI; other
-/// frontends manage their own interrupt semantics.
-static WATCH_INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether the SIGINT-watcher task has been spawned yet (it must be spawned
-/// inside an async runtime, and we only want one instance).
-static WATCH_HANDLER_INSTALLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Install a tokio task that awaits Ctrl+C and flips `WATCH_INTERRUPTED`.
-/// Idempotent — safe to call on every tick.
-fn ensure_watch_signal_handler_installed() {
-    use std::sync::atomic::Ordering;
-    if WATCH_HANDLER_INSTALLED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        // Spawn only succeeds when called inside a tokio runtime, which is
-        // always the case at this point (the StatusCommand body is async).
-        tokio::spawn(async {
-            let _ = tokio::signal::ctrl_c().await;
-            WATCH_INTERRUPTED.store(true, Ordering::SeqCst);
-        });
-    }
-}
-
 /// One optional-field edit prompt (WI 0110): show the current value, accept a
 /// replacement, keep the current value on a blank submission, and accept the
 /// literal `-` as "clear this back to the squad default".
@@ -912,9 +866,11 @@ mod tests {
     #[test]
     fn command_path_from_matches_top_level_subcommand() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let path = command_path_from_matches(&m);
-        assert_eq!(path, vec!["status"]);
+        assert_eq!(path, vec!["agents", "status"]);
     }
 
     #[test]
@@ -999,7 +955,9 @@ mod tests {
     #[test]
     fn flag_bool_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
         // Querying a flag on a different subcommand path returns None.
         let v = frontend.flag_bool(&["init"], "aspec").unwrap();
@@ -1059,8 +1017,8 @@ mod tests {
                 expected: Some(false),
             },
             Case {
-                argv: &["awman", "status", "--watch"],
-                path: &["status"],
+                argv: &["awman", "agents", "status", "--watch"],
+                path: &["agents", "status"],
                 flag: "watch",
                 expected: Some(true),
             },
@@ -1159,7 +1117,9 @@ mod tests {
     #[test]
     fn flag_string_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_string(&["init"], "agent").unwrap();
         assert_eq!(v, None);
@@ -1226,7 +1186,9 @@ mod tests {
     #[test]
     fn flag_strings_wrong_path_returns_empty() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
         assert!(v.is_empty());
@@ -1286,7 +1248,9 @@ mod tests {
     #[test]
     fn flag_u16_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
         assert_eq!(v, None);
@@ -1334,7 +1298,9 @@ mod tests {
     #[test]
     fn argument_wrong_path_returns_none() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
         assert_eq!(v, None);
@@ -1345,7 +1311,9 @@ mod tests {
     #[test]
     fn arguments_wrong_path_returns_empty_vec() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.arguments(&["remote", "run"], "command").unwrap();
         assert!(v.is_empty());

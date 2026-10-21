@@ -17,7 +17,7 @@ use crate::{
     engine::{
         agent_runtime::{
             background::ExecOutput,
-            execution::{AgentInstance, AgentStats},
+            execution::{default_detail, AgentDetail, AgentInstance, AgentOwner, AgentStats},
             Capabilities, ImageAcquisition, ImageImportRequest, ImportedImage,
         },
         container::{
@@ -27,6 +27,7 @@ use crate::{
             options::{OverlayPermission, OverlaySpec, ResolvedContainerOptions},
             runtime::{BuiltinRuntimeSettings, ContainerImageInfo},
         },
+        daemon::supervisor::DaemonSupervisor,
         error::EngineError,
         oci::{default_acquirer, AcquireLimits, AcquirePolicy, AcquireRequest},
     },
@@ -43,6 +44,7 @@ static CAPABILITIES: Capabilities = Capabilities {
     has_image_store: true,
     image_acquisition: ImageAcquisition::Import,
     per_launch_vm_settings: true,
+    reports_resource_stats: true,
 };
 pub struct BuiltinBackend {
     pub driver: Arc<dyn SandboxDriver>,
@@ -243,6 +245,11 @@ impl BuiltinBackend {
             labels: naming::labels(
                 &name,
                 &format!("{}/{}", self.owner, uuid::Uuid::new_v4()),
+                naming::LaunchLabels {
+                    vcpus,
+                    memory_mib,
+                    network_mode: launch.network.mode.as_str(),
+                },
                 &options.labels,
             )?,
             mounts: mounts(&overlays)?,
@@ -424,6 +431,37 @@ impl ContainerBackend for BuiltinBackend {
         // always derived from the name, so this is exact for real handles too.
         self.driver.stats(&naming::sandbox_name_for(&handle.name))
     }
+    fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
+        let summary = self.driver.get(&handle.id)?;
+        naming::check_protocol(&summary.labels)?;
+        let labels = &summary.labels;
+        let label = |key: &str| labels.get(key).cloned().unwrap_or_else(|| "unknown".into());
+        let mut detail = default_detail(
+            CAPABILITIES.reports_resource_stats,
+            &summary.handle,
+            self.stats(&summary.handle),
+        );
+        detail.running = !summary.stopped;
+        detail.owner = labels
+            .get(naming::LABEL_OWNER_PID)
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .map(|pid| AgentOwner {
+                pid,
+                alive: DaemonSupervisor::is_process_alive(pid),
+            });
+        detail.runtime_extras = [
+            ("sandbox", naming::sandbox_name_for(&summary.handle.name)),
+            ("vcpus", label(naming::LABEL_VCPUS)),
+            ("memory_mib", label(naming::LABEL_MEMORY_MIB)),
+            ("network_mode", label(naming::LABEL_NETWORK_MODE)),
+            ("awman_version", label(naming::LABEL_VERSION)),
+            ("worker_protocol", label(naming::LABEL_PROTOCOL)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        Ok(detail)
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         // An explicit, user-initiated stop may target an agent launched by any
         // awman process (as `docker stop` can). The protocol label and the
@@ -433,9 +471,9 @@ impl ContainerBackend for BuiltinBackend {
         let current = self.driver.get(&handle.id)?;
         naming::check_protocol(&current.labels)?;
         if current.handle.started_at != handle.started_at || current.handle.name != handle.name {
-            return Err(EngineError::Other(
-                "builtin handle refers to an older sandbox generation".into(),
-            ));
+            return Err(EngineError::BuiltinAgentReplaced {
+                name: handle.name.clone(),
+            });
         }
         let owner = current
             .labels
@@ -624,6 +662,11 @@ impl ContainerBackend for BuiltinBackend {
             labels: naming::labels(
                 &name,
                 &format!("{}/{}", self.owner, uuid::Uuid::new_v4()),
+                naming::LaunchLabels {
+                    vcpus: launch.vcpus,
+                    memory_mib: launch.memory_mib,
+                    network_mode: launch.network.mode.as_str(),
+                },
                 &[],
             )?,
             mounts: mounted,

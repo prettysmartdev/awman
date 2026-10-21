@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::command::commands::agents::match_reference;
 use crate::command::commands::remote_client::{
     RemoteWorkflowPoller, SquadTaskWorkflowSource, WorkflowStateSource,
 };
@@ -501,17 +502,16 @@ pub fn resolve_attach_target(
     requested: Option<&str>,
 ) -> Result<AttachResolution, CommandError> {
     if let Some(requested) = requested {
-        let matches: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.handle.name == requested
-                    || candidate.handle.id == requested
-                    || candidate.handle.id.starts_with(requested)
-            })
-            .collect();
-        return match matches.as_slice() {
-            [candidate] => Ok(AttachResolution::One((*candidate).clone())),
-            _ => Err(not_in_task(task, requested, &candidates)),
+        // The same matching rules as `awman agents`, over this task's
+        // containers only. An ambiguous prefix is reported like a miss.
+        let handles: Vec<AgentHandle> = candidates.iter().map(|c| c.handle.clone()).collect();
+        let matched = match_reference(&handles, requested)
+            .ok()
+            .flatten()
+            .and_then(|handle| candidates.iter().find(|c| c.handle.id == handle.id));
+        return match matched {
+            Some(candidate) => Ok(AttachResolution::One(candidate.clone())),
+            None => Err(not_in_task(task, requested, &candidates)),
         };
     }
 
@@ -691,6 +691,38 @@ mod tests {
         assert_eq!(candidates[0].label, "build");
     }
 
+    #[test]
+    fn explicit_container_matches_by_exact_id_name_or_unique_prefix() {
+        let candidates = vec![
+            candidate("aaaa1111bbbb2222", "awman-squad-t-one"),
+            candidate("aaaa9999cccc3333", "awman-squad-t-two"),
+        ];
+        let picked =
+            |requested: &str| match resolve_attach_target(candidates.clone(), "t", Some(requested))
+            {
+                Ok(AttachResolution::One(c)) => c.handle.name,
+                other => panic!("{requested}: expected One, got {other:?}"),
+            };
+        assert_eq!(picked("aaaa9999cccc3333"), "awman-squad-t-two");
+        assert_eq!(picked("awman-squad-t-one"), "awman-squad-t-one");
+        assert_eq!(picked("aaaa1"), "awman-squad-t-one");
+        assert_eq!(picked("aaaa9"), "awman-squad-t-two");
+    }
+
+    #[test]
+    fn explicit_container_exact_match_beats_a_prefix_and_ambiguity_is_a_miss() {
+        let candidates = vec![candidate("abc", "awman-x"), candidate("abcdef", "awman-y")];
+        match resolve_attach_target(candidates.clone(), "t", Some("abc")).unwrap() {
+            AttachResolution::One(c) => assert_eq!(c.handle.name, "awman-x"),
+            other => panic!("expected One, got {other:?}"),
+        }
+        // "ab" prefixes both: reported like any container outside the task.
+        let err = resolve_attach_target(candidates, "t", Some("ab")).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a running container"),
+            "{err}"
+        );
+    }
     #[test]
     fn target_resolution_preserves_idle_ambiguous_and_not_in_task_errors() {
         assert!(resolve_attach_target(Vec::new(), "issue-triage", None)

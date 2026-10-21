@@ -184,6 +184,39 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
     false
 }
 
+/// Esc or Ctrl-C while the active tab's agents dashboard is refreshing stops
+/// the watch (cancels the tab's command token) instead of moving focus or
+/// opening the close-tab dialog. The last frame stays on screen.
+fn intercept_agents_watch_stop(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    ctx: FocusContext,
+) -> bool {
+    if !matches!(
+        ctx,
+        FocusContext::CommandBox | FocusContext::ExecutionWindow
+    ) {
+        return false;
+    }
+    let is_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
+    let is_ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    if !(is_esc || is_ctrl_c) {
+        return false;
+    }
+    let tab = app.active_tab();
+    let watching = tab
+        .shared
+        .agents_dashboard
+        .lock()
+        .map(|d| d.as_ref().is_some_and(|d| d.watching))
+        .unwrap_or(false);
+    if !watching || !command_box_locked(app) {
+        return false;
+    }
+    tab.shared.command_cancel.cancel();
+    app.needs_redraw = true;
+    true
+}
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     if keymap::is_workflow_context_copy_key(key) {
         if let Some(path) = app.active_tab().active_workflow_context_path() {
@@ -193,6 +226,9 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     }
     let ctx = focus_context(app);
     if intercept_dialog_keys(app, key) {
+        return;
+    }
+    if intercept_agents_watch_stop(app, key, ctx) {
         return;
     }
 
@@ -332,6 +368,13 @@ pub(super) fn extract_selection_text(sel: &tabs::TextSelection) -> String {
 // ─── PTY forwarding ──────────────────────────────────────────────────────────
 
 fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
+    let attaching = matches!(&app.active_tab().execution_phase,
+        crate::frontend::tui::tabs::ExecutionPhase::Running { command, .. } if command == "agents attach" || command.starts_with("agents attach "));
+    if attaching && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.active_tab().shared.command_cancel.cancel();
+        return;
+    }
     if let Some(bytes) = key_to_bytes(&key) {
         // Keystrokes (incl. Ctrl-C) go only to the focused slot's PTY.
         if let Some(slot) = app.active_tab_mut().focused_slot_mut() {

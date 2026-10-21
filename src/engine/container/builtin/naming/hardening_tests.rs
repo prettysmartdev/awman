@@ -18,15 +18,24 @@ fn every_reserved_label_is_refused_and_caller_labels_survive() {
         LABEL_NAME,
         LABEL_OWNER,
         LABEL_PROTOCOL,
-        "awman.owner.pid",
-        "awman.version",
+        LABEL_OWNER_PID,
+        LABEL_VERSION,
+        LABEL_VCPUS,
+        LABEL_MEMORY_MIB,
+        LABEL_NETWORK_MODE,
     ] {
         assert!(
-            labels("n", "o", &[(key.into(), "x".into())]).is_err(),
+            labels("n", "o", TEST_LAUNCH, &[(key.into(), "x".into())]).is_err(),
             "{key} must be reserved"
         );
     }
-    let ok = labels("awman-x", "tok", &[("awman.session".into(), "s1".into())]).unwrap();
+    let ok = labels(
+        "awman-x",
+        "tok",
+        TEST_LAUNCH,
+        &[("awman.session".into(), "s1".into())],
+    )
+    .unwrap();
     assert_eq!(ok["awman.session"], "s1");
     assert_eq!(ok[LABEL_AWMAN], "true");
     assert_eq!(ok[LABEL_NAME], "awman-x");
@@ -36,7 +45,7 @@ fn every_reserved_label_is_refused_and_caller_labels_survive() {
 
 #[test]
 fn no_label_value_carries_environment_or_secret_material() {
-    let ok = labels("awman-x", "tok", &[]).unwrap();
+    let ok = labels("awman-x", "tok", TEST_LAUNCH, &[]).unwrap();
     let joined: String = ok.iter().map(|(k, v)| format!("{k}={v};")).collect();
     for needle in ["KEY", "TOKEN", "SECRET", "PASSWORD", "HOME="] {
         assert!(!joined.contains(needle), "{needle} in {joined}");
@@ -45,7 +54,7 @@ fn no_label_value_carries_environment_or_secret_material() {
 
 #[test]
 fn a_missing_owner_label_is_not_an_owner() {
-    let mut map = labels("awman-x", "tok", &[]).unwrap();
+    let mut map = labels("awman-x", "tok", TEST_LAUNCH, &[]).unwrap();
     map.remove(LABEL_OWNER);
     assert!(check_owner(&map, "tok").is_err());
     assert!(check_owner(&map, "").is_err());

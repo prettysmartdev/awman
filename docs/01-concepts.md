@@ -81,17 +81,20 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman exec workflow` | Run a workflow file | [05](05-workflows.md) |
 | `awman new spec\|workflow\|skill` | Create artefacts | [03](03-agent-sessions.md), [05](05-workflows.md) |
 | `awman specs amend <N>` | Sync a spec with the implementation | [03](03-agent-sessions.md) |
-| `awman status` | Show running agent containers | [03](03-agent-sessions.md) |
+| `awman agents status` | Show running agents; add `--watch` to refresh continuously | [03](03-agent-sessions.md) |
+| `awman agents list` (`ps`, `ls`) | List agents; `--all` includes stopped agents eligible for cleanup | [03](03-agent-sessions.md) |
+| `awman agents detail` (`inspect`) | Show an agent's identity, lifecycle, resources, and runtime details | [03](03-agent-sessions.md) |
+| `awman agents kill` (`rm`) / `attach` | Stop and remove an agent, or connect to its terminal | [03](03-agent-sessions.md) |
 | `awman config show\|get\|set` | Inspect and edit config | [07](07-configuration.md) |
 | `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-and-remote-mode.md) |
 | `awman remote …` | Client for a remote awman server | [09](09-api-and-remote-mode.md) |
 | `awman squad …` | Your squad of agents, working unattended on the tasks you give them | [12](12-squad.md) |
 | `awman clean` | Reclaim stopped containers, stale workflow data, dangling images | [13](13-cleaning-up.md) |
 
-`awman status` marks ordinary containers as `session`. Containers launched by
-the squad daemon carry a `squad:<task>` source marker, such as
-`squad:issue-triage`, so background evaluations are identifiable even if you
-have never configured squad.
+`awman agents status` and `awman agents list` show each agent's source:
+`session` for agents started directly and `squad:<task>` for agents started by
+the squad daemon, such as `squad:issue-triage`. This makes background
+evaluations identifiable even if you have never configured squad.
 
 ### Key locations
 

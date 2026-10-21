@@ -554,7 +554,7 @@ const ROOT: CommandSpec = CommandSpec {
         &READY,
         &CHAT,
         &SPECS,
-        &STATUS,
+        &AGENTS,
         &CONFIG,
         &EXEC,
         &API_SERVER,
@@ -600,6 +600,7 @@ const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
 // The specs are data, grouped by the subtree they describe. `ROOT` above is
 // what assembles them into the tree, so this file remains the one place the
 // catalogue's shape is visible.
+mod agents;
 mod api;
 mod core;
 mod exec;
@@ -611,6 +612,7 @@ mod squad;
 #[cfg(test)]
 mod tests;
 
+use agents::*;
 use api::*;
 use core::*;
 use exec::*;

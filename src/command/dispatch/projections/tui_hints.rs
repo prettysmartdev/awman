@@ -220,7 +220,7 @@ mod tests {
         let cat = CommandCatalogue::get();
         let comps = cat.tui_completions("");
         let names: Vec<&str> = comps.iter().map(|c| c.completion.as_str()).collect();
-        for expected in &["chat", "exec", "status", "ready", "config"] {
+        for expected in &["chat", "exec", "agents", "ready", "config"] {
             assert!(
                 names.contains(expected),
                 "empty prefix must return all top-level commands; missing '{expected}'"

@@ -18,8 +18,8 @@ use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
-    SharedActiveWorktreePath, SharedContainerExitCode, SharedContainerName, SharedEngineTx,
-    SharedPtyResetFlag, SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender,
+    SharedActiveWorktreePath, SharedAgentsDashboard, SharedContainerExitCode, SharedContainerName,
+    SharedEngineTx, SharedPtyResetFlag, SharedResizeTx, SharedStdinTx, SharedStuckSender,
     SharedTuiContext, SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
     TabSharedState,
 };
@@ -78,13 +78,15 @@ pub struct TuiCommandFrontend {
     /// this when a worktree is created/resumed and clears it on cleanup;
     /// the renderer reads it for the bottom-bar context line.
     pub(crate) active_worktree_path: SharedActiveWorktreePath,
-    /// Shared status dashboard data. The status command writes structured
-    /// container data here; the TUI renderer reads it to display a proper
-    /// `Table` widget.
-    pub(crate) status_dashboard: SharedStatusDashboard,
+    /// The `agents status` dashboard slot. The command writes each frame
+    /// here; the TUI renderer reads it to display a `Table` widget.
+    pub(crate) agents_dashboard: SharedAgentsDashboard,
     /// Live TUI context shared with the event loop. The event loop refreshes
-    /// this on every tick; the status command reads it on each watch iteration.
+    /// this on every tick; `agents status --watch` reads it each iteration.
     pub(crate) tui_context_shared: SharedTuiContext,
+    /// The tab's command-cancel token: ends an `agents status --watch` loop
+    /// or an `agents attach` session (new command, tab closed, Esc).
+    pub(crate) command_cancel: tokio_util::sync::CancellationToken,
     /// Shared queue of parallel-slot lifecycle events (WI-0096). The parallel
     /// workflow callbacks push here; the TUI event loop drains it to maintain
     /// `Tab::container_slots`.
@@ -152,7 +154,7 @@ impl TuiCommandFrontend {
             yolo_state,
             yolo_cancel_flag,
             status_log,
-            status_dashboard,
+            agents_dashboard,
             container_slot_events,
             pty_reset_flag,
             container_name_shared,
@@ -164,6 +166,7 @@ impl TuiCommandFrontend {
             stuck_sender_shared,
             active_worktree_path,
             tui_context_shared,
+            command_cancel,
         } = shared;
         let DialogChannels {
             tx: dialog_tx,
@@ -193,8 +196,9 @@ impl TuiCommandFrontend {
             engine_tx_shared,
             stuck_sender_shared,
             active_worktree_path,
-            status_dashboard,
+            agents_dashboard,
             tui_context_shared,
+            command_cancel,
             container_slot_events,
             squad_attach_session: None,
             squad_attach_reachable: None,

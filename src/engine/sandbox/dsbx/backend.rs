@@ -51,7 +51,7 @@ impl SandboxBackend for DSbxBackend {
     }
 
     fn list_running(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        Ok(list_awman_sandboxes())
+        list_awman_sandboxes()
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
@@ -115,8 +115,8 @@ fn kit_kind_for(agent: &str) -> SbxKitKind {
 // ─── Listing ────────────────────────────────────────────────────────────────
 
 /// All awman-owned sandbox handles from `sbx ls`.
-fn list_awman_sandboxes() -> Vec<AgentHandle> {
-    list_all_sandbox_names()
+fn list_awman_sandboxes() -> Result<Vec<AgentHandle>, EngineError> {
+    Ok(try_list_all_sandbox_names()?
         .into_iter()
         .filter(|n| n.starts_with("awman-"))
         .map(|name| AgentHandle {
@@ -125,25 +125,28 @@ fn list_awman_sandboxes() -> Vec<AgentHandle> {
             name,
             started_at: Utc::now(),
         })
-        .collect()
+        .collect())
 }
 
 /// Every sandbox name `sbx ls` reports (awman-owned or not). Tolerant of both
 /// the `--json` mode and the plain table fallback; returns an empty list when
 /// `sbx` is unavailable or not logged in.
 pub(super) fn list_all_sandbox_names() -> Vec<String> {
+    try_list_all_sandbox_names().unwrap_or_default()
+}
+
+fn try_list_all_sandbox_names() -> Result<Vec<String>, EngineError> {
     if let Ok(out) = SbxCommand::new(["ls", "--json"]).run_quiet() {
         if out.success() {
             let names = parse_ls_json(&out.stdout);
             if !names.is_empty() || out.stdout.trim() == "[]" {
-                return names;
+                return Ok(names);
             }
         }
     }
-    match SbxCommand::new(["ls"]).run_quiet() {
-        Ok(out) if out.success() => parse_ls_table(&out.stdout),
-        _ => Vec::new(),
-    }
+    crate::engine::host_cli::check_collection_cancel()?;
+    let output = SbxCommand::new(["ls"]).run_quiet()?;
+    Ok(parse_ls_table(&output.stdout))
 }
 
 /// Parse `sbx ls --json`. The exact schema is unverified as of June 2026

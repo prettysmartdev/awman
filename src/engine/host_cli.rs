@@ -52,6 +52,124 @@ fn resolves_to_test_fake(name: &str) -> bool {
     canonical(&found).starts_with(canonical(&std::env::temp_dir()))
 }
 
+// Runtime CLI calls in this scope poll the cancellation token and reap their process group.
+thread_local! {
+    static COLLECTION_CANCEL: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn with_collection_cancel<T>(
+    cancel: tokio_util::sync::CancellationToken,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COLLECTION_CANCEL.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    COLLECTION_CANCEL.with(|c| *c.borrow_mut() = Some(cancel));
+    let _reset = Reset;
+    f()
+}
+
+pub fn check_collection_cancel() -> Result<(), crate::engine::error::EngineError> {
+    if COLLECTION_CANCEL.with(|c| c.borrow().as_ref().is_some_and(|c| c.is_cancelled())) {
+        Err(crate::engine::error::EngineError::Other(
+            "collection cancelled".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Bounded output capture without pipe-reader threads that descendants can hold open.
+/// Cancellation kills and reaps the local CLI process group, never the agent.
+pub(crate) fn checked_output(
+    command: &mut std::process::Command,
+    binary: &str,
+) -> Result<std::process::Output, crate::engine::error::EngineError> {
+    use crate::engine::error::EngineError;
+    use std::io::{Read, Seek};
+    check_collection_cancel()?;
+    let mut stdout = tempfile::tempfile().map_err(|e| EngineError::Container(e.to_string()))?;
+    let mut stderr = tempfile::tempfile().map_err(|e| EngineError::Container(e.to_string()))?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(
+            stdout
+                .try_clone()
+                .map_err(|e| EngineError::Container(e.to_string()))?,
+        )
+        .stderr(
+            stderr
+                .try_clone()
+                .map_err(|e| EngineError::Container(e.to_string()))?,
+        );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            EngineError::ContainerRuntimeUnavailable {
+                binary: binary.into(),
+            }
+        } else {
+            EngineError::Container(format!("{binary}: {e}"))
+        }
+    })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        let error = check_collection_cancel().err().or_else(|| {
+            (std::time::Instant::now() >= deadline)
+                .then(|| EngineError::Container(format!("{binary} timed out")))
+        });
+        if let Some(error) = error {
+            #[cfg(unix)]
+            {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(EngineError::Container(e.to_string()));
+            }
+        }
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout
+        .rewind()
+        .and_then(|_| stdout.read_to_end(&mut out))
+        .map_err(|e| EngineError::Container(e.to_string()))?;
+    stderr
+        .rewind()
+        .and_then(|_| stderr.read_to_end(&mut err))
+        .map_err(|e| EngineError::Container(e.to_string()))?;
+    if !status.success() {
+        return Err(EngineError::Container(format!(
+            "{binary}: {}",
+            String::from_utf8_lossy(&err).trim()
+        )));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

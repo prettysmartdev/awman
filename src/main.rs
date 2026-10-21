@@ -195,7 +195,7 @@ mod tests {
     fn subcommand_present_signals_cli_branch() {
         let cmd = CommandCatalogue::get().build_clap_command();
         for argv in [
-            vec!["awman", "status"],
+            vec!["awman", "agents", "status"],
             vec!["awman", "ready"],
             vec!["awman", "chat"],
             vec!["awman", "init"],

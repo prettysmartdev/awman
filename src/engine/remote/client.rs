@@ -514,13 +514,13 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/status"))
+            .and(matchers::path("/v1/agents/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
             .mount(&server)
             .await;
 
         let client = RemoteClient::new(&server.uri(), None).unwrap();
-        let result = client.send_command(&["status"], &[]).await;
+        let result = client.send_command(&["agents", "status"], &[]).await;
         assert!(result.is_ok(), "200 must return Ok: {result:?}");
         let response = result.unwrap();
         assert_eq!(response.status, 200);
@@ -557,7 +557,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/status"))
+            .and(matchers::path("/v1/agents/status"))
             .respond_with(
                 ResponseTemplate::new(500)
                     .set_body_json(serde_json::json!({"error": "internal server error"})),
@@ -566,7 +566,7 @@ mod tests {
             .await;
 
         let client = RemoteClient::new(&server.uri(), None).unwrap();
-        let result = client.send_command(&["status"], &[]).await;
+        let result = client.send_command(&["agents", "status"], &[]).await;
         assert!(
             matches!(
                 result,
@@ -580,7 +580,7 @@ mod tests {
     async fn map_reqwest_error_connection_refused_maps_to_remote_connection_refused() {
         // Port 1 is reserved and should never have anything listening.
         let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
-        let result = client.send_command(&["status"], &[]).await;
+        let result = client.send_command(&["agents", "status"], &[]).await;
         assert!(
             matches!(result, Err(EngineError::RemoteConnectionRefused(_))),
             "connection refused must map to RemoteConnectionRefused, got: {result:?}"

@@ -77,24 +77,35 @@ impl ContainerBackend for DockerBackend {
         // deduplicated by container ID.
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
-            &["ps", "--filter", "label=awman=true", "--format", format],
-            &["ps", "--filter", "name=awman-", "--format", format],
+            &[
+                "ps",
+                "--no-trunc",
+                "--filter",
+                "label=awman=true",
+                "--format",
+                format,
+            ],
+            &[
+                "ps",
+                "--no-trunc",
+                "--filter",
+                "name=awman-",
+                "--format",
+                format,
+            ],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
-            let output = Command::new(crate::engine::host_cli::program("docker"))
-                .args(*args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output();
-            let output = match output {
-                Ok(o) if o.status.success() => o,
-                // Docker missing or query failed: skip this filter, try next.
-                _ => continue,
-            };
+            let output = crate::engine::host_cli::checked_output(
+                Command::new(crate::engine::host_cli::program("docker"))
+                    .args(*args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+                "docker",
+            )?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(4, '\t').collect();
@@ -129,23 +140,35 @@ impl ContainerBackend for DockerBackend {
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
-            &["ps", "--filter", "label=awman=true", "--format", format],
-            &["ps", "--filter", "name=awman-", "--format", format],
+            &[
+                "ps",
+                "--no-trunc",
+                "--filter",
+                "label=awman=true",
+                "--format",
+                format,
+            ],
+            &[
+                "ps",
+                "--no-trunc",
+                "--filter",
+                "name=awman-",
+                "--format",
+                format,
+            ],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
-            let output = Command::new(crate::engine::host_cli::program("docker"))
-                .args(*args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output();
-            let output = match output {
-                Ok(o) if o.status.success() => o,
-                _ => continue,
-            };
+            let output = crate::engine::host_cli::checked_output(
+                Command::new(crate::engine::host_cli::program("docker"))
+                    .args(*args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+                "docker",
+            )?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(4, '\t').collect();
@@ -188,6 +211,7 @@ impl ContainerBackend for DockerBackend {
         let queries: &[&[&str]] = &[
             &[
                 "ps",
+                "--no-trunc",
                 "-a",
                 "--filter",
                 "label=awman=true",
@@ -200,6 +224,7 @@ impl ContainerBackend for DockerBackend {
             ],
             &[
                 "ps",
+                "--no-trunc",
                 "-a",
                 "--filter",
                 "name=awman-",
@@ -216,15 +241,13 @@ impl ContainerBackend for DockerBackend {
         let mut handles: Vec<AgentHandle> = Vec::new();
 
         for args in queries {
-            let output = Command::new(crate::engine::host_cli::program("docker"))
-                .args(*args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output();
-            let output = match output {
-                Ok(o) if o.status.success() => o,
-                _ => continue,
-            };
+            let output = crate::engine::host_cli::checked_output(
+                Command::new(crate::engine::host_cli::program("docker"))
+                    .args(*args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+                "docker",
+            )?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(4, '\t').collect();
@@ -306,26 +329,19 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
-        let output = Command::new(crate::engine::host_cli::program("docker"))
-            .args([
-                "stats",
-                "--no-stream",
-                "--format",
-                "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}",
-                &handle.name,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    EngineError::ContainerRuntimeUnavailable {
-                        binary: "docker".into(),
-                    }
-                } else {
-                    EngineError::Container(format!("docker stats: {e}"))
-                }
-            })?;
+        let output = crate::engine::host_cli::checked_output(
+            Command::new(crate::engine::host_cli::program("docker"))
+                .args([
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}",
+                    &handle.id,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "docker",
+        )?;
         if !output.status.success() {
             return Err(EngineError::Container(format!(
                 "docker stats failed for container {}",
@@ -344,23 +360,20 @@ impl ContainerBackend for DockerBackend {
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
-        let output = Command::new(crate::engine::host_cli::program("docker"))
-            .args([
-                "ps",
-                "--filter",
-                &format!("name={prefix}"),
-                "--format",
-                format,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            // Docker missing or query failed: report nothing found rather than
-            // erroring — the caller treats an empty list as "no such agents".
-            _ => return Ok(Vec::new()),
-        };
+        let output = crate::engine::host_cli::checked_output(
+            Command::new(crate::engine::host_cli::program("docker"))
+                .args([
+                    "ps",
+                    "--no-trunc",
+                    "--filter",
+                    &format!("name={prefix}"),
+                    "--format",
+                    format,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "docker",
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut handles: Vec<AgentHandle> = Vec::new();
         for line in stdout.lines() {
@@ -412,8 +425,7 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        crate::engine::container::process::stop_and_remove(ContainerCli::DOCKER.bin, &handle.name);
-        Ok(())
+        host_cli_backend::cli_stop_checked(ContainerCli::DOCKER, &handle.id)
     }
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
@@ -686,6 +698,7 @@ fn spawn_pty_bridged_attach(
         stdin_injector: Some(bridge.stdin_injector),
         child_pid,
         started_at,
+        output_tail: bridge.output_tail.clone(),
     };
     Ok(AgentExecution::new(
         handle,
@@ -734,6 +747,7 @@ fn spawn_piped_attach(
         stdin_injector: None,
         child_pid,
         started_at,
+        output_tail: bridge.output_tail.clone(),
     };
     Ok(AgentExecution::new(
         handle,
@@ -755,6 +769,29 @@ struct AttachExecution {
     /// PID of the local `docker attach` client, captured at spawn.
     child_pid: Option<u32>,
     started_at: chrono::DateTime<chrono::Utc>,
+    output_tail: std::sync::Arc<crate::engine::agent_runtime::OutputTail>,
+}
+
+impl AttachExecution {
+    fn check_establishment(&self, exit_code: i32) -> Result<(), EngineError> {
+        if exit_code != 0 {
+            self.output_tail
+                .wait_for_writers(std::time::Duration::from_secs(1));
+            let output = self.output_tail.snapshot_text();
+            if output.lines().any(|line| {
+                let line = line.to_ascii_lowercase();
+                line.contains("error response from daemon:")
+                    || line.contains("no such container")
+                    || line.starts_with("cannot connect to the docker daemon")
+            }) {
+                return Err(EngineError::Container(format!(
+                    "docker attach failed: {}",
+                    output.trim()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ExecutionBackend for AttachExecution {
@@ -765,6 +802,7 @@ impl ExecutionBackend for AttachExecution {
                 .map_err(|e| EngineError::Container(format!("wait docker attach (pty): {e}")))?;
             self.pty_master = None;
             let exit_code = status.exit_code().try_into().unwrap_or(-1);
+            self.check_establishment(exit_code)?;
             return Ok(AgentExitInfo {
                 exit_code,
                 signal: None,
@@ -784,6 +822,7 @@ impl ExecutionBackend for AttachExecution {
         clear_stdio_nonblocking();
 
         let exit_code = status.code().unwrap_or(-1);
+        self.check_establishment(exit_code)?;
         #[cfg(unix)]
         let signal = {
             use std::os::unix::process::ExitStatusExt;

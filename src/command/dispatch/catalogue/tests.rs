@@ -173,9 +173,69 @@ fn plan_and_yolo_are_mutually_exclusive_on_chat() {
 fn every_top_level_command_is_present() {
     let cat = CommandCatalogue::get();
     for name in [
-        "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
+        "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "remote", "new",
     ] {
         assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
+    }
+}
+
+#[test]
+fn agents_has_exactly_the_five_supported_leaves() {
+    let agents = CommandCatalogue::get().lookup(&["agents"]).unwrap();
+    let mut leaves: Vec<_> = agents.subcommands.iter().map(|spec| spec.name).collect();
+    leaves.sort_unstable();
+    assert_eq!(leaves, ["attach", "detail", "kill", "list", "status"]);
+}
+
+#[test]
+fn agent_short_flags_have_unique_meanings_across_catalogue() {
+    fn walk(spec: &'static CommandSpec, path: Vec<&'static str>, found: &mut Vec<(char, String)>) {
+        for flag in spec.flags {
+            if let Some(short) = flag.short {
+                found.push((short, format!("{} --{}", path.join(" "), flag.long)));
+            }
+        }
+        for child in spec.subcommands {
+            let mut child_path = path.clone();
+            child_path.push(child.name);
+            walk(child, child_path, found);
+        }
+    }
+    let mut flags = Vec::new();
+    walk(CommandCatalogue::get().root(), Vec::new(), &mut flags);
+    for short in ['a', 'q', 'y'] {
+        let meanings: Vec<_> = flags
+            .iter()
+            .filter(|(candidate, _)| *candidate == short)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(!meanings.is_empty(), "-{short} must be assigned");
+        if short != 'y' {
+            assert_eq!(
+                meanings.len(),
+                1,
+                "-{short} must have one catalogue meaning"
+            );
+        } else {
+            assert!(
+                meanings.iter().all(|name| name.ends_with("--yes")),
+                "-y is reserved for --yes: {meanings:?}"
+            );
+            for (_, path_flag) in flags.iter().filter(|(candidate, _)| *candidate == short) {
+                let path = path_flag.rsplit_once(" --").unwrap().0;
+                let leaf = CommandCatalogue::get()
+                    .lookup(&path.split_whitespace().collect::<Vec<_>>())
+                    .unwrap();
+                assert!(
+                    [
+                        "Skip the confirmation prompt (for scripting).",
+                        "Do not prompt for confirmation.",
+                    ]
+                    .contains(&leaf.find_flag("yes").unwrap().help),
+                    "-y consistently means skip confirmation"
+                );
+            }
+        }
     }
 }
 
@@ -353,7 +413,7 @@ const FLAG_TABLE: &[FlagCheck] = &[
         is_optional: true,
     },
     FlagCheck {
-        path: &["status"],
+        path: &["agents", "status"],
         flag: "watch",
         is_bool: true,
         is_optional: true,
@@ -563,7 +623,7 @@ fn config_commands_do_not_require_runtime() {
         &["chat"][..],
         &["ready"],
         &["init"],
-        &["status"],
+        &["agents", "status"],
         &["exec", "workflow"],
         &[],
     ] {
@@ -924,4 +984,47 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "max-concurrent",
         ]
     );
+}
+
+#[test]
+fn agents_sibling_names_and_aliases_are_unique_and_root_status_is_absent() {
+    let cat = CommandCatalogue::get();
+    let agents = cat.lookup(&["agents"]).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for leaf in agents.subcommands {
+        for name in std::iter::once(leaf.name).chain(leaf.aliases.iter().copied()) {
+            assert!(seen.insert(name), "duplicate agents sibling: {name}");
+        }
+    }
+    for child in cat.root().subcommands {
+        assert_ne!(child.name, "status");
+        assert!(!child.aliases.contains(&"status"));
+    }
+}
+
+#[test]
+fn agents_docs_describe_current_scope_and_detach_controls() {
+    let runtimes = include_str!("../../../../docs/11-runtimes.md");
+    assert!(runtimes.contains("on the configured runtime"));
+    assert!(!runtimes.contains("agents across all runtimes"));
+    assert!(!runtimes.contains("show sandbox running/stopped state"));
+    assert!(runtimes.contains("agents list\x60 never samples resource metrics"));
+    let sessions = include_str!("../../../../docs/03-agent-sessions.md");
+    assert!(sessions.contains("Press **Ctrl-C**"));
+    assert!(sessions.contains("--json --yes"));
+    let list = CommandCatalogue::get().lookup(&["agents", "list"]).unwrap();
+    assert_eq!(
+        list.flags
+            .iter()
+            .find(|flag| flag.long == "no-trunc")
+            .unwrap()
+            .help,
+        "Do not truncate IDs, names or image names."
+    );
+    let api = include_str!("../../../../docs/09-api-and-remote-mode.md");
+    assert!(api.contains("across the configured runtime, independent of the selected"));
+    assert!(api.contains("one \x60StdoutLine\x60 event"));
+    let architecture = include_str!("../../../../docs/architecture.md");
+    assert!(!architecture.contains("status.rs           StatusCommand"));
+    assert!(architecture.contains("agents/             AgentsCommandFrontend"));
 }

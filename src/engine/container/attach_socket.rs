@@ -104,6 +104,7 @@ impl Drop for AttachSocketGuard {
     fn drop(&mut self) {
         self.task.abort();
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("owner"));
     }
 }
 
@@ -170,6 +171,11 @@ mod unix_impl {
         let listener =
             tokio::net::UnixListener::from_std(listener).map_err(|e| EngineError::io(path, e))?;
 
+        // Same private directory as the socket. A stale PID is checked for liveness by inspect.
+        let owner_path = path.with_extension("owner");
+        std::fs::write(&owner_path, std::process::id().to_string())
+            .map_err(|e| EngineError::io(&owner_path, e))?;
+        let _ = std::fs::set_permissions(&owner_path, std::fs::Permissions::from_mode(0o600));
         let task = tokio::spawn(accept_loop(listener, hooks));
         Ok(AttachSocketGuard {
             path: path.to_path_buf(),

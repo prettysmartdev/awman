@@ -94,6 +94,52 @@ pub fn render_ready_summary(summary: &crate::data::ready_summary::ReadySummary) 
     )
 }
 
+/// A box-drawn table sized by terminal display width, shared by CLI and TUI.
+pub(crate) fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    use unicode_width::UnicodeWidthStr as _;
+    let ncols = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.width()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(ncols) {
+            widths[i] = widths[i].max(cell.width());
+        }
+    }
+    let mut out = String::new();
+    out.push('┌');
+    for (i, w) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(w + 2));
+        out.push(if i + 1 < ncols { '┬' } else { '┐' });
+    }
+    out.push('\n');
+    out.push('│');
+    for (h, w) in headers.iter().zip(widths.iter()) {
+        let pad = w.saturating_sub(h.width());
+        out.push_str(&format!(" {h}{} │", " ".repeat(pad)));
+    }
+    out.push('\n');
+    out.push('├');
+    for (i, w) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(w + 2));
+        out.push(if i + 1 < ncols { '┼' } else { '┤' });
+    }
+    out.push('\n');
+    for row in rows {
+        out.push('│');
+        for (cell, w) in row.iter().zip(widths.iter()) {
+            let pad = w.saturating_sub(cell.width());
+            out.push_str(&format!(" {cell}{} │", " ".repeat(pad)));
+        }
+        out.push('\n');
+    }
+    out.push('└');
+    for (i, w) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(w + 2));
+        out.push(if i + 1 < ncols { '┴' } else { '┘' });
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

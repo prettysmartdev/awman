@@ -136,7 +136,7 @@ mod tests {
             .map(|c| c.get_name().to_string())
             .collect();
         for n in [
-            "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
+            "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "remote", "new",
         ] {
             assert!(
                 names.iter().any(|x| x == n),
@@ -159,6 +159,36 @@ mod tests {
             .unwrap();
         let aliases: Vec<_> = workflow.get_all_aliases().map(|s| s.to_string()).collect();
         assert!(aliases.iter().any(|a| a == "wf"));
+    }
+
+    #[test]
+    fn agents_aliases_resolve_to_canonical_leaf_names() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        for (argv, expected) in [
+            (&["awman", "agents", "ps"][..], "list"),
+            (&["awman", "agents", "ls"][..], "list"),
+            (&["awman", "agents", "rm", "agent-id"][..], "kill"),
+            (&["awman", "agents", "inspect", "agent-id"][..], "detail"),
+        ] {
+            let matches = cmd.clone().try_get_matches_from(argv).unwrap();
+            let (_, agents) = matches.subcommand().unwrap();
+            let (leaf, _) = agents.subcommand().unwrap();
+            assert_eq!(leaf, expected, "{argv:?} should resolve to {expected}");
+        }
+    }
+
+    #[test]
+    fn agents_json_conflicts_are_enforced_by_clap() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        for argv in [
+            ["awman", "agents", "status", "--json", "--watch"].as_slice(),
+            ["awman", "agents", "list", "--json", "--quiet"].as_slice(),
+        ] {
+            assert!(
+                cmd.clone().try_get_matches_from(argv).is_err(),
+                "{argv:?} must conflict"
+            );
+        }
     }
 
     // Recursively verify that every long flag in the clap projection matches a

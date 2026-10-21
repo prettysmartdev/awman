@@ -19,7 +19,13 @@ The TUI runs `awman ready` automatically on the first tab. This checks that your
 
 **Outside a Git repository:**
 
-If the working directory is not inside a Git repository, the TUI runs `awman status --watch` instead, streaming a live status view. This is useful for monitoring an API server or checking the state of remote sessions. Most agent commands require a Git repo — navigate to one and open a new tab with **Ctrl+T**. You can also use **Ctrl+T** to open a non-Git directory: awman keeps that directory as the tab's working directory and starts the same live status view there.
+If the working directory is not inside a Git repository, the TUI runs
+`awman agents status --watch` instead, streaming a live status view. Press
+**Esc** to stop watching. This is useful for monitoring agents while away from
+a project repository. Most agent commands require a Git repo — navigate to one
+and open a new tab with **Ctrl+T**. You can also use **Ctrl+T** to open a
+non-Git directory: awman keeps that directory as the tab's working directory
+and starts the same live status view there.
 
 In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
 
@@ -159,7 +165,7 @@ When the command box is empty and the tab is idle (no command running), you'll s
 As you type, matching command completions appear in the suggestion row below the command box:
 
 ```
-> chat · init · status
+> chat · init · agents
 ```
 
 When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** to cycle through suggestions and fill them into the input. Every command available in `awman` is also available in the TUI command box. Both `--flag value` and `--flag=value` forms are accepted. For example:
@@ -611,7 +617,7 @@ Press **Ctrl+T** to open a new tab. Each tab has its own working directory, exec
 
 The directory chosen in the New Tab dialog does not have to be a Git
 repository. For a non-Git directory, awman uses that directory as the tab's
-working directory and starts `status --watch`; Git-backed tabs start `ready`.
+working directory and starts `agents status --watch`; Git-backed tabs start `ready`.
 
 If the tab cannot be opened — the path is not a directory, or its
 `.awman/config.json` (or your global config) fails to parse — no tab is

@@ -64,7 +64,7 @@ impl BuiltinPaths {
     }
 
     /// Serialises image imports, which can take minutes, without blocking
-    /// catalog readers such as `awman status`.
+    /// catalog readers such as `awman agents status`.
     #[cfg(test)]
     pub fn import_lock(&self) -> Result<File, EngineError> {
         self.state().import_lock().map_err(state_error)

@@ -15,7 +15,7 @@ fn cat() -> &'static CommandCatalogue {
 fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
-        "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
+        "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "remote", "new",
     ] {
         assert!(
             names.contains(expected),

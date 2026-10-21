@@ -38,8 +38,8 @@ fn catalogue_has_specs_command() {
 }
 
 #[test]
-fn catalogue_has_status_command() {
-    assert!(top_level_names().contains(&"status"));
+fn catalogue_has_agents_command() {
+    assert!(top_level_names().contains(&"agents"));
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn new_skill_has_global_flag() {
 #[test]
 fn status_has_watch_flag() {
     let cat = CommandCatalogue::get();
-    let status = cat.lookup(&["status"]).unwrap();
+    let status = cat.lookup(&["agents", "status"]).unwrap();
     assert!(status.find_flag("watch").is_some());
 }
 

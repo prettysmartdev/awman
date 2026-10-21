@@ -196,7 +196,7 @@ fn new_spec(name: &str, owner: &str) -> SandboxSpec {
     SandboxSpec {
         name: naming::sandbox_name_for(name),
         image: "agent:latest".into(),
-        labels: naming::labels(name, owner, &[]).unwrap(),
+        labels: naming::labels(name, owner, naming::TEST_LAUNCH, &[]).unwrap(),
         mounts: Vec::new(),
         mount_owner: None,
         vcpus: 1,
@@ -1307,4 +1307,122 @@ async fn attach_bind_failure_after_exec_cleans_up_created_sandbox_and_image_leas
     );
     assert!(rig.backend.paths.image_lease("agent:latest", true).is_ok());
     std::fs::remove_file(attach).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inspect_reads_owner_version_and_sizing_from_labels() {
+    let rig = Rig::new("session-a");
+    let (id, _execution, _peer) = launch(&rig, &rig.backend, "awman-inspect").await;
+    let handle = rig.backend.list_running_all().unwrap().remove(0);
+    assert_eq!(handle.id, id);
+
+    let detail = rig.backend.inspect(&handle).unwrap();
+    assert!(detail.running);
+    assert_eq!(detail.name, "awman-inspect");
+    assert_eq!(
+        detail.owner,
+        Some(crate::engine::agent_runtime::AgentOwner {
+            pid: std::process::id(),
+            alive: true,
+        })
+    );
+    let extras = &detail.runtime_extras;
+    // The defaults a session with no `builtin` block launches with.
+    assert_eq!(extras["vcpus"], "2");
+    assert_eq!(extras["memory_mib"], "4096");
+    assert_eq!(
+        extras["network_mode"],
+        default_launch().network.mode.as_str()
+    );
+    assert_eq!(extras["awman_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(extras["worker_protocol"], naming::PROTOCOL);
+    assert_eq!(extras["sandbox"], naming::sandbox_name_for("awman-inspect"));
+    // Sorted by key: the display order every frontend gets.
+    let keys: Vec<&str> = extras.keys().map(String::as_str).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(keys, sorted);
+    // The builtin runtime reports stats, so the common fields are filled.
+    assert!(detail.cpu_percent.is_some() && detail.memory_mb.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inspect_reports_a_dead_owner_pid() {
+    let rig = Rig::new("session-a");
+    // A pid that was alive a moment ago and has been reaped.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+
+    let mut spec = new_spec("awman-orphan", "someone/else");
+    spec.labels
+        .insert(naming::LABEL_OWNER_PID.into(), dead_pid.to_string());
+    rig.driver.create(spec).unwrap();
+    let handle = rig.backend.list_running_all().unwrap().remove(0);
+    let detail = rig.backend.inspect(&handle).unwrap();
+    assert_eq!(
+        detail.owner,
+        Some(crate::engine::agent_runtime::AgentOwner {
+            pid: dead_pid,
+            alive: false,
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inspect_of_a_sandbox_from_an_older_awman_says_unknown() {
+    let rig = Rig::new("session-a");
+    let mut spec = new_spec("awman-legacy", "someone/else");
+    for key in [
+        naming::LABEL_VCPUS,
+        naming::LABEL_MEMORY_MIB,
+        naming::LABEL_NETWORK_MODE,
+        naming::LABEL_OWNER_PID,
+    ] {
+        spec.labels.remove(key);
+    }
+    rig.driver.create(spec).unwrap();
+    let handle = rig.backend.list_running_all().unwrap().remove(0);
+    let detail = rig.backend.inspect(&handle).unwrap();
+    assert_eq!(detail.owner, None);
+    for key in ["vcpus", "memory_mib", "network_mode"] {
+        assert_eq!(detail.runtime_extras[key], "unknown", "{key}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inspect_refuses_a_worker_protocol_mismatch() {
+    let rig = Rig::new("session-a");
+    let mut spec = new_spec("awman-old", "someone/else");
+    spec.labels
+        .insert(naming::LABEL_PROTOCOL.into(), "0.6.0/1/old".into());
+    rig.driver.create(spec).unwrap();
+    let handle = rig.backend.list_running_all().unwrap().remove(0);
+    assert!(matches!(
+        rig.backend.inspect(&handle),
+        Err(EngineError::WorkerProtocolMismatch { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inspect_of_a_removed_sandbox_is_an_error() {
+    let rig = Rig::new("session-a");
+    let (_id, _execution, _peer) = launch(&rig, &rig.backend, "awman-gone").await;
+    let mut handle = rig.backend.list_running_all().unwrap().remove(0);
+    handle.id = "no-such-sandbox".into();
+    assert!(rig.backend.inspect(&handle).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_reused_name_is_the_typed_generation_mismatch() {
+    let rig = Rig::new("session-a");
+    let other = rig.second_session("session-b");
+    let (b_id, _b_exec, _b_peer) = launch(&rig, &other, "awman-b").await;
+    let mut stale = other.list_running_all().unwrap().remove(0);
+    stale.started_at -= chrono::Duration::seconds(5);
+    match rig.backend.stop(&stale) {
+        Err(EngineError::BuiltinAgentReplaced { name }) => assert_eq!(name, "awman-b"),
+        other => panic!("expected BuiltinAgentReplaced, got {other:?}"),
+    }
+    assert_eq!(rig.driver.is_stopped(&b_id), Some(false));
 }

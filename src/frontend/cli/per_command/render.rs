@@ -28,8 +28,8 @@ use crate::command::commands::remote::{
     RemoteExecOutcome, RemoteOutcome, RemoteSessionKillOutcome, RemoteSessionStartOutcome,
 };
 use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
-use crate::command::commands::status::{StatusContainerRow, StatusOutcome};
 use crate::command::CommandOutcome;
+use crate::frontend::render_helpers::format_table;
 
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ use crate::command::CommandOutcome;
 pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
     match outcome {
         CommandOutcome::Empty => None,
-        CommandOutcome::Status(o) => Some(render_status(o)),
+        CommandOutcome::Agents(o) => super::agents::render_agents(o, json),
         CommandOutcome::Chat(o) => render_chat(o),
         CommandOutcome::Init(o) => render_init(o),
         CommandOutcome::Ready(o) => render_ready(o),
@@ -64,101 +64,6 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
 
 fn render_clean(_o: &crate::command::commands::clean::CleanOutcome) -> Option<String> {
     None
-}
-
-// ─── status ──────────────────────────────────────────────────────────────────
-
-pub fn render_status(o: &StatusOutcome) -> String {
-    let mut out = String::new();
-    out.push_str("AWMAN STATUS DASHBOARD\n\n");
-
-    out.push_str("CODE AGENTS\n");
-    if o.containers.is_empty() {
-        out.push_str("  No code agents running.\n");
-        out.push_str("  To start one: awman exec workflow <file>  or  awman chat\n");
-    } else {
-        let headers = [
-            "●",
-            "Container",
-            "ID",
-            "Image",
-            "CPU%",
-            "Mem MB",
-            "Started",
-            "Source",
-        ];
-        let rows: Vec<Vec<String>> = o.containers.iter().map(render_container_row).collect();
-        out.push_str(&format_table(&headers, &rows));
-    }
-
-    out.push_str(&format!("\nTip: {}\n", o.tip));
-    out
-}
-
-fn render_container_row(c: &StatusContainerRow) -> Vec<String> {
-    let indicator = if c.stuck { "🟡" } else { "🟢" };
-    let cpu = c
-        .cpu_percent
-        .map(|v| format!("{v:>5.1}"))
-        .unwrap_or_else(|| "  -  ".to_string());
-    let mem = c
-        .memory_mb
-        .map(|v| format!("{v:>6.1}"))
-        .unwrap_or_else(|| "   -  ".to_string());
-    vec![
-        indicator.to_string(),
-        c.name.clone(),
-        c.id.chars().take(12).collect(),
-        c.image.clone(),
-        cpu,
-        mem,
-        c.started_at.clone(),
-        c.source_label().unwrap_or_else(|| "session".to_string()),
-    ]
-}
-
-pub(crate) fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let ncols = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate().take(ncols) {
-            widths[i] = widths[i].max(cell.chars().count());
-        }
-    }
-    let mut out = String::new();
-    out.push('┌');
-    for (i, w) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(w + 2));
-        out.push(if i + 1 < ncols { '┬' } else { '┐' });
-    }
-    out.push('\n');
-    out.push('│');
-    for (h, w) in headers.iter().zip(widths.iter()) {
-        let pad = w.saturating_sub(h.chars().count());
-        out.push_str(&format!(" {h}{} │", " ".repeat(pad)));
-    }
-    out.push('\n');
-    out.push('├');
-    for (i, w) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(w + 2));
-        out.push(if i + 1 < ncols { '┼' } else { '┤' });
-    }
-    out.push('\n');
-    for row in rows {
-        out.push('│');
-        for (cell, w) in row.iter().zip(widths.iter()) {
-            let pad = w.saturating_sub(cell.chars().count());
-            out.push_str(&format!(" {cell}{} │", " ".repeat(pad)));
-        }
-        out.push('\n');
-    }
-    out.push('└');
-    for (i, w) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(w + 2));
-        out.push(if i + 1 < ncols { '┴' } else { '┘' });
-    }
-    out.push('\n');
-    out
 }
 
 // ─── chat / exec prompt / exec workflow ──────────────────────────────────────
@@ -434,88 +339,11 @@ fn render_specs_amend(o: &SpecsAmendOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::commands::status::{ContainerKind, ContainerSource, StatusOutcome};
     use crate::data::step_status::StepStatus;
 
     #[test]
     fn render_empty_returns_none() {
         assert!(render(&CommandOutcome::Empty, false).is_none());
-    }
-
-    #[test]
-    fn render_status_empty_state_message() {
-        let o = StatusOutcome {
-            containers: vec![],
-            watched: false,
-            tip: "test tip".into(),
-        };
-        let s = render_status(&o);
-        assert!(s.contains("AWMAN STATUS DASHBOARD"));
-        assert!(s.contains("No code agents running"));
-        assert!(s.contains("Tip: test tip"));
-    }
-
-    #[test]
-    fn render_status_with_one_agent_container() {
-        let o = StatusOutcome {
-            containers: vec![StatusContainerRow {
-                id: "abc1234567890".into(),
-                name: "awman-1".into(),
-                image: "awman/dev:latest".into(),
-                started_at: "2025-01-01T00:00:00Z".into(),
-                kind: ContainerKind::Agent,
-                source: ContainerSource::Session,
-                tab_number: None,
-                stuck: false,
-                command_label: None,
-                cpu_percent: None,
-                memory_mb: None,
-            }],
-            watched: false,
-            tip: "test tip".into(),
-        };
-        let s = render_status(&o);
-        assert!(s.contains("CODE AGENTS"), "{s}");
-        assert!(s.contains("awman-1"), "{s}");
-    }
-
-    #[test]
-    fn render_status_marks_squad_container_and_leaves_session_row_plain() {
-        let o = StatusOutcome {
-            containers: vec![
-                StatusContainerRow {
-                    id: "abc1234567890".into(),
-                    name: "awman-1-2".into(),
-                    image: "awman/dev:latest".into(),
-                    started_at: "2025-01-01T00:00:00Z".into(),
-                    kind: ContainerKind::Agent,
-                    source: ContainerSource::Session,
-                    tab_number: None,
-                    stuck: false,
-                    command_label: None,
-                    cpu_percent: None,
-                    memory_mb: None,
-                },
-                StatusContainerRow {
-                    id: "def1234567890".into(),
-                    name: "awman-squad-issue-triage-12ab34cd".into(),
-                    image: "awman/dev:latest".into(),
-                    started_at: "2025-01-01T00:00:00Z".into(),
-                    kind: ContainerKind::Agent,
-                    source: ContainerSource::Squad("issue-triage".into()),
-                    tab_number: None,
-                    stuck: false,
-                    command_label: None,
-                    cpu_percent: None,
-                    memory_mb: None,
-                },
-            ],
-            watched: false,
-            tip: "test tip".into(),
-        };
-        let s = render_status(&o);
-        assert!(s.contains("squad:issue-triage"), "{s}");
-        assert!(s.contains("session"), "{s}");
     }
 
     #[test]
@@ -1161,21 +989,5 @@ mod tests {
             remote_addr: "localhost:9876".into(),
         });
         assert!(s.contains("localhost:9876"), "remote_addr must appear: {s}");
-    }
-
-    // ── render_status (tip flows from outcome) ───────────────────────────────
-
-    #[test]
-    fn render_status_displays_outcome_tip_verbatim() {
-        let o = StatusOutcome {
-            containers: vec![],
-            watched: false,
-            tip: "this is the unique tip text".into(),
-        };
-        let s = render_status(&o);
-        assert!(
-            s.contains("Tip: this is the unique tip text"),
-            "renderer must print the outcome tip verbatim: {s}"
-        );
     }
 }

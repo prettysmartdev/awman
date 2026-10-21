@@ -112,6 +112,12 @@ fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
     let allowed = cat.api_allowed_commands();
 
     let expected = [
+        // agents status/list/detail/kill are API-reachable (kill requires yes).
+        // PTY-bound attach is excluded.
+        ("agents", "status"),
+        ("agents", "list"),
+        ("agents", "detail"),
+        ("agents", "kill"),
         ("exec", "prompt"),
         ("exec", "workflow"),
         ("squad", "start"),
@@ -203,13 +209,19 @@ fn catalogue_validate_for_frontend_accepts_exec_prompt_for_api() {
 #[test]
 fn catalogue_cli_and_tui_frontends_allow_all_commands() {
     let cat = CommandCatalogue::get();
-    for cmd in &["chat", "ready", "init", "status", "config"] {
+    for cmd in &[
+        &["chat"][..],
+        &["ready"][..],
+        &["init"][..],
+        &["agents", "status"][..],
+        &["config"][..],
+    ] {
         assert!(
-            cat.validate_for_frontend(FrontendKind::Cli, &[cmd]).is_ok(),
+            cat.lookup(cmd).is_some() && cat.validate_for_frontend(FrontendKind::Cli, cmd).is_ok(),
             "CLI must allow {cmd:?}"
         );
         assert!(
-            cat.validate_for_frontend(FrontendKind::Tui, &[cmd]).is_ok(),
+            cat.validate_for_frontend(FrontendKind::Tui, cmd).is_ok(),
             "TUI must allow {cmd:?}"
         );
     }
@@ -304,7 +316,7 @@ async fn real_network_api_rejects_init_with_400() {
 }
 
 #[tokio::test]
-async fn real_network_api_rejects_status_with_400() {
+async fn real_network_api_accepts_agents_status_and_rejects_attach() {
     let tmp = tempfile::tempdir().unwrap();
     let state = make_app_state(tmp.path(), AuthMode::Disabled);
     let Some((addr, server)) = spawn_router(state).await else {
@@ -313,12 +325,17 @@ async fn real_network_api_rejects_status_with_400() {
     };
     let client = reqwest::Client::new();
 
-    let (status, body) = post_command(&client, addr, "status", Some("any-session")).await;
+    let (status, body) = post_command(&client, addr, "agents attach", Some("any-session")).await;
     assert_eq!(
         status, 400,
-        "\"status\" must be rejected with 400; body={body}"
+        "agents attach must be rejected with 400; body={body}"
     );
 
+    let (status, body) = post_command(&client, addr, "agents status", Some("any-session")).await;
+    assert_ne!(
+        status, 400,
+        "agents status must pass command restrictions: {body}"
+    );
     server.abort();
 }
 
@@ -1863,4 +1880,70 @@ mod remote_session_start_wait_tests {
             "failure path must emit at least one Error-level message"
         );
     }
+}
+
+#[test]
+fn agents_api_frontend_emits_the_cli_json_shapes() {
+    use awman::command::commands::agents::{
+        AgentSnapshot, AgentState, AgentsCommandFrontend, AgentsDetailOutcome, AgentsKillOutcome,
+        AgentsListOutcome, AgentsOverview,
+    };
+    use awman::engine::agent_runtime::{execution::default_detail, AgentStats};
+    use awman::frontend::api::command_frontend::ApiDispatchFrontend;
+    let bus = EventBus::new(16);
+    let mut rx = bus.subscribe();
+    let mut frontend = ApiDispatchFrontend::new("agents list", &[], bus.sender());
+    let runtime = awman::engine::container::ContainerRuntime::docker();
+    let overview = AgentsOverview::unavailable(&runtime, "offline".into(), "tip");
+    let handle = awman::data::session::AgentHandle {
+        id: "abcdefghijklmnop".into(),
+        name: "awman-example".into(),
+        image_tag: "image:latest".into(),
+        started_at: chrono::Utc::now(),
+    };
+    let snapshot = AgentSnapshot::from_handle(&handle, AgentState::Running, chrono::Utc::now());
+    let list = AgentsListOutcome {
+        agents: vec![snapshot.clone()],
+        include_stopped: false,
+        quiet: false,
+        no_trunc: false,
+    };
+    let detail = AgentsDetailOutcome {
+        snapshot,
+        detail: default_detail(
+            true,
+            &handle,
+            Ok(AgentStats {
+                name: handle.name.clone(),
+                cpu_percent: 1.0,
+                memory_mb: 2.0,
+            }),
+        ),
+    };
+    let kill = AgentsKillOutcome {
+        id: handle.id,
+        short_id: "abcdefghijkl".into(),
+        name: handle.name,
+        removed: true,
+    };
+    frontend.render_overview(&overview, false);
+    frontend.show_list(&list);
+    frontend.show_detail(&detail);
+    frontend.show_kill_result(&kill);
+    for expected in [
+        serde_json::to_value(&overview).unwrap(),
+        serde_json::to_value(&list.agents).unwrap(),
+        serde_json::to_value(&detail.detail).unwrap(),
+        serde_json::to_value(&kill).unwrap(),
+    ] {
+        let event = rx.try_recv().expect("an API payload must be emitted");
+        let EventPayload::StdoutLine(json) = event.payload else {
+            panic!("expected JSON stdout event");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            expected
+        );
+    }
+    assert!(rx.try_recv().is_err());
 }

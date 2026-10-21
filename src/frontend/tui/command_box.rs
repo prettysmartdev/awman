@@ -64,8 +64,8 @@ mod tests {
 
     #[test]
     fn parse_input_valid_command_returns_ok() {
-        let parsed = parse_input("status").unwrap();
-        assert_eq!(parsed.path, vec!["status"]);
+        let parsed = parse_input("agents status").unwrap();
+        assert_eq!(parsed.path, vec!["agents", "status"]);
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn parse_input_unknown_flag_returns_error() {
-        let err = parse_input("status --bogus-flag").unwrap_err();
+        let err = parse_input("agents status --bogus-flag").unwrap_err();
         assert!(matches!(err, CommandError::UnknownFlag { .. }));
     }
 
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn format_parse_error_unknown_flag_shows_flag_name() {
         let err = CommandError::UnknownFlag {
-            command: vec!["status".to_string()],
+            command: vec!["agents".to_string(), "status".to_string()],
             flag: "bogus".to_string(),
         };
         let msg = format_parse_error(&err);

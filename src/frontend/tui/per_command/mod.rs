@@ -7,6 +7,7 @@
 mod acp_frontend;
 mod agent_auth;
 mod agent_setup;
+mod agents;
 mod api_server;
 mod chat;
 mod clean;
@@ -21,7 +22,6 @@ mod ready;
 mod remote_frontend;
 mod specs;
 mod squad;
-mod status;
 mod workflow_frontend;
 mod worktree_lifecycle;
 

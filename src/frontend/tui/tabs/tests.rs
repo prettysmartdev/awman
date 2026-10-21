@@ -1616,3 +1616,53 @@ fn new_command_drops_workflow_context_and_ignores_late_reports() {
     *old_frontend_path.lock().unwrap() = Some("/host/context/late-report".into());
     assert!(shared.workflow_context_path.lock().unwrap().is_none());
 }
+
+#[test]
+fn new_command_cancels_previous_agents_watch_token() {
+    let mut shared = super::TabSharedState::new();
+    let old = shared.command_cancel.clone();
+    shared.reset_for_new_command();
+    assert!(
+        old.is_cancelled(),
+        "starting a new command cancels an active watch"
+    );
+    assert!(
+        !shared.command_cancel.is_cancelled(),
+        "new command receives a fresh token"
+    );
+}
+
+#[test]
+fn one_shot_agents_status_command_reaches_done() {
+    use crate::command::commands::agents::{
+        AgentTotals, AgentsOutcome, AgentsOverview, AgentsStatusOutcome,
+    };
+    use chrono::Utc;
+    use std::sync::mpsc;
+    let mut tab = make_tab();
+    tab.execution_phase = ExecutionPhase::Running {
+        command: "agents status".into(),
+    };
+    let (tx, rx) = mpsc::channel();
+    tab.command_result_rx = Some(rx);
+    tx.send(Ok(CommandOutcome::Agents(AgentsOutcome::Status(
+        AgentsStatusOutcome {
+            overview: AgentsOverview {
+                runtime: "docker".into(),
+                runtime_display: "Docker".into(),
+                available: true,
+                unavailable_reason: None,
+                agents: vec![],
+                totals: AgentTotals::default(),
+                collected_at: Utc::now(),
+                tip: "tip".into(),
+            },
+            watched: false,
+        },
+    ))))
+    .unwrap();
+    tab.poll_command_completion();
+    assert!(
+        matches!(tab.execution_phase, ExecutionPhase::Done { ref command, exit_code: 0 } if command == "agents status")
+    );
+}

@@ -445,7 +445,7 @@ mod tests {
         let (lifecycle, store) = lifecycle(tmp.path());
         insert_active(&store, "busy");
         store
-            .enqueue_command("running", "busy", "status", "[]", "log")
+            .enqueue_command("running", "busy", "agents status", "[]", "log")
             .unwrap();
         store.claim_next_command("worker").unwrap();
         assert_eq!(

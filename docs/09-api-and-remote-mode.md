@@ -669,6 +669,25 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 | `GET` | `/v1/workflows/:id` | Get the workflow state for a command |
 | `GET` | `/v1/status` | Server health (uptime, active sessions, running commands) |
 
+### Agent commands
+
+Commands submitted through `POST /v1/commands` expose an agent snapshot and
+management operations across the configured runtime, independent of the selected
+session's working directory:
+
+| Subcommand | API availability |
+|------------|------------------|
+| `agents status` | Returns a one-time status snapshot. `--watch` is not available through the API. |
+| `agents list` | Lists agents. |
+| `agents detail <id>` | Returns details for the selected agent. |
+| `agents kill <id>` | Stops and removes the agent; include `--yes` because API requests cannot answer an interactive confirmation. |
+| `agents attach <id>` | Not available through the API. |
+
+For example, set `subcommand` to `agents status` or `agents kill` and pass
+arguments such as the agent ID and `--yes` in the request's `args` array. The
+result is emitted as one `StdoutLine` event containing the same JSON payload as
+the CLI's `--json` output. The same commands are documented in [Monitoring running agents](03-agent-sessions.md#monitoring-running-agents).
+
 ---
 
 ### Sessions

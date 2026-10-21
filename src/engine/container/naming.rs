@@ -22,7 +22,7 @@ pub fn generate_container_name() -> String {
 // squad's background agents are named `awman-squad-<task-slug>-<8 hex>`.
 // The container name — not a label — is the single identity channel every
 // runtime tier honours (Docker `--filter name=`, Apple client-side prefix,
-// sandbox `sbx ls` prefix), so `awman status` and name-based discovery derive
+// sandbox `sbx ls` prefix), so `awman agents status` and name-based discovery derive
 // the squad marker from the name, never from a label (Apple cannot read labels
 // back).
 

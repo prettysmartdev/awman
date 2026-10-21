@@ -6,7 +6,7 @@ fn sandbox(driver: &Arc<FakeDriver>, name: &str, token: &str) -> String {
     let spec = SandboxSpec {
         name: naming::sandbox_name_for(name),
         image: "agent:latest".into(),
-        labels: naming::labels(name, token, &[]).unwrap(),
+        labels: naming::labels(name, token, naming::TEST_LAUNCH, &[]).unwrap(),
         mounts: Vec::new(),
         mount_owner: None,
         vcpus: 1,

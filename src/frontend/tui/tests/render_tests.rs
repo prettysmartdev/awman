@@ -19,6 +19,83 @@ fn render_app(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer
     terminal.backend().buffer().clone()
 }
 
+fn seed_agents_dashboard(app: &App, watching: bool, with_agent: bool) {
+    use crate::command::commands::agents::{
+        AgentSnapshot, AgentSource, AgentState, AgentTotals, AgentsOverview,
+    };
+    use crate::frontend::tui::tabs::AgentsDashboardData;
+    use chrono::{TimeZone, Utc};
+    let agents = if with_agent {
+        vec![AgentSnapshot {
+            id: "1234567890123456".into(),
+            short_id: "123456789012".into(),
+            name: "dashboard-agent".into(),
+            image: "agent-image:latest".into(),
+            state: AgentState::Running,
+            started_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            uptime_secs: 42,
+            source: AgentSource::Session,
+            tab_number: Some(3),
+            command_label: Some("chat".into()),
+            cpu_percent: Some(2.0),
+            memory_mb: Some(64.0),
+        }]
+    } else {
+        vec![]
+    };
+    let totals = AgentTotals {
+        running: agents.len(),
+        stuck: 0,
+        stopped: 0,
+        cpu_percent: Some(2.0),
+        memory_mb: Some(64.0),
+    };
+    *app.active_tab().shared.agents_dashboard.lock().unwrap() = Some(AgentsDashboardData {
+        overview: AgentsOverview {
+            runtime: "docker".into(),
+            runtime_display: "Docker".into(),
+            available: true,
+            unavailable_reason: None,
+            agents,
+            totals,
+            collected_at: Utc.timestamp_opt(1_700_000_042, 0).unwrap(),
+            tip: "Keep it focused.".into(),
+        },
+        watching,
+    });
+}
+
+#[test]
+fn agents_dashboard_testbackend_shows_totals_columns_empty_state_and_mode_footer() {
+    let mut app = make_app();
+    seed_agents_dashboard(&app, true, true);
+    let buf = render_app(&mut app, 120, 30);
+    let text = buffer_text(&buf);
+    assert!(
+        text.contains("Docker · available · 1 running"),
+        "header totals: {text}"
+    );
+    let col_id = text.find("AGENT ID").unwrap();
+    let col_name = text.find("NAME").unwrap();
+    let col_source = text.find("SOURCE").unwrap();
+    let col_tab = text.find("TAB").unwrap();
+    let col_image = text.find("IMAGE").unwrap();
+    assert!(
+        col_id < col_name && col_name < col_source && col_source < col_tab && col_tab < col_image,
+        "dashboard column order: {text}"
+    );
+    assert!(text.contains("Refreshing every 2s · Esc to stop"));
+    assert!(text.contains("Tip: Keep it focused."));
+
+    seed_agents_dashboard(&app, false, false);
+    let empty = buffer_text(&render_app(&mut app, 100, 24));
+    assert!(empty.contains("No agents running on Docker."));
+    assert!(
+        empty.contains("Collected at 22:14:02") || empty.contains("Collected at "),
+        "one-shot footer: {empty}"
+    );
+}
+
 /// True if the buffer contains a green rounded top-left corner ('╭'). The
 /// only green rounded border in an idle app is the git sidebar (idle tabs
 /// are DarkGray), so this uniquely detects a rendered sidebar.

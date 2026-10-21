@@ -50,8 +50,8 @@ mod tests {
     #[test]
     fn format_suggestion_row_multiple_suggestions_separated_by_middots() {
         let result =
-            format_suggestion_row(&["chat".to_string(), "exec".to_string(), "status".to_string()]);
-        assert_eq!(result, "> chat · exec · status");
+            format_suggestion_row(&["chat".to_string(), "exec".to_string(), "ready".to_string()]);
+        assert_eq!(result, "> chat · exec · ready");
     }
 
     // ── hint_for_input ────────────────────────────────────────────────────────
