@@ -103,7 +103,7 @@ impl BuiltinState {
     }
 
     /// Serialises image imports, which can take minutes, without blocking
-    /// catalog readers such as `awman status`.
+    /// catalog readers such as `awman agents status`.
     pub fn import_lock(&self) -> Result<File, DataError> {
         self.import_lock_cancellable(|| Ok(()))
     }

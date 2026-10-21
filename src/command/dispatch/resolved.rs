@@ -618,10 +618,10 @@ mod tests {
     #[test]
     fn a_command_without_the_flag_is_unaffected_by_the_rule() {
         let frontend = FakeCommandFrontend::new().without_input();
-        let flags = resolve(&["status"], &frontend);
+        let flags = resolve(&["agents", "status"], &frontend);
         assert!(
             CommandCatalogue::get()
-                .lookup(&["status"])
+                .lookup(&["agents", "status"])
                 .unwrap()
                 .find_flag("non-interactive")
                 .is_none()
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not declared by this command's CommandSpec")]
     fn a_flag_outside_the_spec_panics() {
-        let flags = resolve(&["status"], &FakeCommandFrontend::new());
+        let flags = resolve(&["agents", "status"], &FakeCommandFrontend::new());
         let _ = flags.bool("not-a-flag");
     }
 }

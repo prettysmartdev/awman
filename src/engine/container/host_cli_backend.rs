@@ -33,27 +33,11 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The error says why: the CLI is missing, the probe timed out, or it exited
 /// non-zero (daemon down, logged out, …).
 pub(super) fn cli_is_available(cli: ContainerCli, probe_args: &[&str]) -> Result<(), EngineError> {
-    let child = Command::new(crate::engine::host_cli::program(cli.bin))
-        .args(probe_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| spawn_error(cli, &probe_args.join(" "), e))?;
-    match wait_with_timeout(child, PROBE_TIMEOUT) {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err(EngineError::Container(format!(
-            "`{} {}` exited with {}",
-            cli.bin,
-            probe_args.join(" "),
-            status.code().unwrap_or(-1)
-        ))),
-        None => Err(EngineError::Container(format!(
-            "`{} {}` did not answer within {}s",
-            cli.bin,
-            probe_args.join(" "),
-            PROBE_TIMEOUT.as_secs()
-        ))),
-    }
+    crate::engine::host_cli::checked_output(
+        Command::new(crate::engine::host_cli::program(cli.bin)).args(probe_args),
+        cli.bin,
+    )
+    .map(|_| ())
 }
 
 /// Whether `tag` exists in the CLI's local image store
@@ -419,6 +403,16 @@ fn spawn_error(cli: ContainerCli, what: &str, e: std::io::Error) -> EngineError 
     } else {
         EngineError::Container(format!("{} {what}: {e}", cli.bin))
     }
+}
+
+/// Explicit user stop: keep immutable identity and propagate failures.
+/// Removal remains the command's separate best-effort operation.
+pub(super) fn cli_stop_checked(cli: ContainerCli, id: &str) -> Result<(), EngineError> {
+    crate::engine::host_cli::checked_output(
+        Command::new(crate::engine::host_cli::program(cli.bin)).args(["stop", id]),
+        cli.bin,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend, AgentsOutcome};
 use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
@@ -29,7 +30,6 @@ use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFronte
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::commands::squad::supervisor::SquadGatewayResolver;
-use crate::command::commands::status::{StatusCommand, StatusCommandFrontend};
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
@@ -488,7 +488,7 @@ pub trait DispatchFrontend:
     + InitCommandFrontend
     + ReadyCommandFrontend
     + ChatCommandFrontend
-    + StatusCommandFrontend
+    + AgentsCommandFrontend
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
@@ -508,7 +508,7 @@ impl<T> DispatchFrontend for T where
         + InitCommandFrontend
         + ReadyCommandFrontend
         + ChatCommandFrontend
-        + StatusCommandFrontend
+        + AgentsCommandFrontend
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
@@ -533,7 +533,7 @@ pub enum CommandOutcome {
     Init(crate::command::commands::init::InitOutcome),
     Ready(crate::command::commands::ready::ReadyOutcome),
     Chat(crate::command::commands::chat::ChatOutcome),
-    Status(crate::command::commands::status::StatusOutcome),
+    Agents(AgentsOutcome),
     Config(crate::command::commands::config::ConfigOutcome),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
@@ -565,6 +565,7 @@ impl CommandOutcome {
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
             Self::SquadAttach(outcome) => outcome.exit_code,
+            Self::Agents(outcome) => outcome.exit_code(),
             // `ReadyOutcome::ready` is `ReadySummary::is_ready()` (WI 0125):
             // a failed required build/import stage must never exit 0, for
             // the CLI's process exit code and the API's command status alike.
@@ -590,7 +591,7 @@ pub enum BuiltCommand {
     Ready(ReadyCommand),
     Chat(ChatCommand),
     Specs(SpecsCommand),
-    Status(StatusCommand),
+    Agents(AgentsCommand),
     Config(ConfigCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
@@ -993,7 +994,7 @@ impl BuiltCommand {
             Ready => ReadyCommandFrontend,
             Chat => ChatCommandFrontend,
             Specs => SpecsCommandFrontend,
-            Status => StatusCommandFrontend,
+            Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
             ExecWorkflow => ExecWorkflowCommandFrontend,
@@ -1271,7 +1272,7 @@ mod tests {
         {
             let mut guard = session.try_write().unwrap();
             let state = guard.state_mut();
-            state.begin_command("status".to_string(), Vec::new());
+            state.begin_command("agents".to_string(), Vec::new());
             state.finish_command(0);
         }
 
@@ -1327,16 +1328,16 @@ mod tests {
     }
 
     #[test]
-    fn build_status_command_with_no_flags() {
+    fn build_agents_status_command_with_no_flags() {
         let dispatch = Dispatch::new(
             FakeCommandFrontend::new(),
             make_session(),
             Engines::for_tests(std::path::Path::new("/tmp")),
         );
-        let built = dispatch.build_command(&["status"]).unwrap();
+        let built = dispatch.build_command(&["agents", "status"]).unwrap();
         match built {
-            BuiltCommand::Status(_) => {}
-            _ => panic!("expected Status"),
+            BuiltCommand::Agents(AgentsCommand::Status(_)) => {}
+            _ => panic!("expected agents status"),
         }
     }
 
@@ -1687,7 +1688,8 @@ mod tests {
 
     #[test]
     fn parse_command_box_input_rejects_unknown_flag() {
-        let result = Dispatch::<FakeCommandFrontend>::parse_command_box_input("status --bogus");
+        let result =
+            Dispatch::<FakeCommandFrontend>::parse_command_box_input("agents status --bogus");
         assert!(
             matches!(result, Err(CommandError::UnknownFlag { .. })),
             "unknown flag must return UnknownFlag, got: {result:?}"
@@ -2152,7 +2154,7 @@ mod tests {
     fn detect_valid_runtime_returns_runtime_and_no_modal_message() {
         let cat = CommandCatalogue::get();
         let cfg = config_with_runtime(Some("docker"));
-        let (detected, modal) = Engines::detect(cat, &cfg, &["status"])
+        let (detected, modal) = Engines::detect(cat, &cfg, &["agents", "status"])
             .expect("a valid runtime must detect successfully");
         assert_eq!(detected.engine().runtime_name(), "docker");
         assert!(
@@ -2168,7 +2170,7 @@ mod tests {
         let cat = CommandCatalogue::get();
         let cfg = config_with_runtime(Some("totally-bogus-runtime"));
         // `DetectedRuntime` is not `Debug`, so match rather than `expect_err`.
-        match Engines::detect(cat, &cfg, &["status"]) {
+        match Engines::detect(cat, &cfg, &["agents", "status"]) {
             Err(EngineError::UnknownRuntime { .. }) => {}
             Err(other) => panic!("expected UnknownRuntime, got {other:?}"),
             Ok(_) => panic!("an unknown runtime must be an error for CLI invocations"),
@@ -2223,9 +2225,9 @@ mod tests {
     fn detect_unavailable_runtime_is_fatal_when_command_requires_runtime() {
         let cat = CommandCatalogue::get();
         let cfg = config_with_runtime(Some("apple-containers"));
-        // `status` requires a runtime → the unavailable runtime is fatal.
-        assert!(cat.requires_runtime(&["status"]));
-        match Engines::detect(cat, &cfg, &["status"]) {
+        // `agents status` requires a runtime → the unavailable runtime is fatal.
+        assert!(cat.requires_runtime(&["agents", "status"]));
+        match Engines::detect(cat, &cfg, &["agents", "status"]) {
             Err(EngineError::UnknownRuntime { .. }) => {
                 panic!("an unavailable (not unknown) runtime must not surface as UnknownRuntime")
             }

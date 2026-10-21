@@ -40,6 +40,8 @@ pub enum EngineError {
     /// ("container runtime unavailable"), which is wrong for them.
     #[error("container backend error: {0}")]
     Container(String),
+    #[error("agent {id} no longer exists")]
+    AgentNotFound { id: String },
 
     #[error("sandbox backend error: {0}")]
     Sandbox(String),
@@ -280,6 +282,11 @@ pub enum EngineError {
     )]
     WorkerProtocolMismatch { expected: String, found: String },
 
+    /// A builtin handle outlived its sandbox: the name was reused by a newer
+    /// launch, so acting on the old handle would hit the replacement.
+    #[error("builtin agent {name} was replaced by a newer sandbox with the same name")]
+    BuiltinAgentReplaced { name: String },
+
     // ── Builtin runtime and builder failures (WI 0126 F1) ─────────────────
     //
     // Typed so every frontend renders the same guidance and the exit code
@@ -478,6 +485,7 @@ impl EngineError {
     /// lives beside `Display` so every frontend reads the same mapping.
     pub fn exit_code(&self) -> u8 {
         match self {
+            EngineError::AgentNotFound { .. } => 4,
             EngineError::Container(_) | EngineError::ContainerRuntimeUnavailable { .. } => 3,
             EngineError::UnknownRuntime { .. } => 2,
             _ => 1,

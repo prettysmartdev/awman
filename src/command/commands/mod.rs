@@ -8,6 +8,7 @@
 
 pub mod agent_auth;
 pub mod agent_setup;
+pub mod agents;
 pub mod api_server;
 pub mod chat;
 pub mod clean;
@@ -37,8 +38,6 @@ pub mod remote;
 pub mod remote_client;
 pub mod skill_library;
 pub mod specs;
-pub mod status;
-pub mod status_tips;
 pub mod worktree_lifecycle;
 
 pub use command_trait::Command;

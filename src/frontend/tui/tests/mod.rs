@@ -161,7 +161,7 @@ fn bare_invocation_has_no_subcommand() {
 fn subcommand_presence_routes_away_from_tui() {
     let cmd = CommandCatalogue::get().build_clap_command();
     for argv in [
-        vec!["awman", "status"],
+        vec!["awman", "agents", "status"],
         vec!["awman", "ready"],
         vec!["awman", "chat"],
     ] {

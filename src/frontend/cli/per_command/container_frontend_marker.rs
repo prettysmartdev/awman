@@ -146,11 +146,16 @@ impl CliFrontend {
         &mut self,
         stdin_writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     ) -> std::thread::JoinHandle<()> {
+        let detach = self
+            .matches
+            .subcommand_matches("agents")
+            .and_then(|m| m.subcommand_matches("attach"))
+            .map(|_| self.agents_attach_cancel.clone());
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.stdin_reader_shutdown = Some(shutdown.clone());
         #[cfg(unix)]
         {
-            std::thread::spawn(move || spawn_unix_stdin_reader(stdin_writer, shutdown))
+            std::thread::spawn(move || spawn_unix_stdin_reader(stdin_writer, shutdown, detach))
         }
         #[cfg(not(unix))]
         {
@@ -166,7 +171,7 @@ impl CliFrontend {
                     match stdin.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if stdin_writer.send(buf[..n].to_vec()).is_err() {
+                            if !forward_attach_input(&stdin_writer, &buf[..n], detach.as_ref()) {
                                 break;
                             }
                         }
@@ -228,6 +233,7 @@ impl CliFrontend {
 fn spawn_unix_stdin_reader(
     stdin_writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    detach: Option<tokio_util::sync::CancellationToken>,
 ) {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::io::Read as _;
@@ -250,7 +256,7 @@ fn spawn_unix_stdin_reader(
             Ok(_) => match stdin_lock.read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => {
-                    if stdin_writer.send(buf[..n].to_vec()).is_err() {
+                    if !forward_attach_input(&stdin_writer, &buf[..n], detach.as_ref()) {
                         return;
                     }
                 }
@@ -353,5 +359,44 @@ impl AgentFrontend for CliInteractiveContainerProxy {
         self.container_io
             .take()
             .expect("CliInteractiveContainerProxy::take_io called but no AgentIo available")
+    }
+}
+
+/// Ctrl-C belongs to the local attach session, including a read containing
+/// other bytes. No byte from that read is sent to the target after detach.
+fn forward_attach_input(
+    writer: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    bytes: &[u8],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    if let Some(cancel) = cancel {
+        if bytes.contains(&3) {
+            cancel.cancel();
+            return false;
+        }
+    }
+    writer.send(bytes.to_vec()).is_ok()
+}
+
+#[cfg(test)]
+mod attach_input_tests {
+    use super::*;
+    #[tokio::test]
+    async fn attach_ctrl_c_detaches_local_live_stub_without_forwarding_sigint() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(forward_attach_input(&tx, b"hello", Some(&cancel)));
+        assert_eq!(rx.recv().await.unwrap(), b"hello");
+        assert!(!forward_attach_input(&tx, &[3], Some(&cancel)));
+        assert!(cancel.is_cancelled());
+        assert!(
+            rx.try_recv().is_err(),
+            "the target must never receive Ctrl-C"
+        );
+        assert!(
+            forward_attach_input(&tx, &[3], None),
+            "chat preserves Ctrl-C"
+        );
+        assert_eq!(rx.recv().await.unwrap(), [3]);
     }
 }

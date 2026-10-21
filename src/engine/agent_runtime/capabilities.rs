@@ -43,6 +43,12 @@ pub struct Capabilities {
     /// Docker, Apple, sandbox, which neither read nor validate a `builtin`
     /// block. Read by `AgentEngine::builtin_launch_settings`.
     pub per_launch_vm_settings: bool,
+    /// Whether `stats()` returns measured per-agent CPU/memory. `false` means
+    /// the runtime answers zeros it did not measure (Docker Sandboxes), so
+    /// callers show "not reported" instead of `0.0%`. Read by
+    /// `execution::default_detail` and by the agents commands that collect
+    /// stats.
+    pub reports_resource_stats: bool,
 }
 
 impl Capabilities {
@@ -88,6 +94,7 @@ mod tests {
         assert!(!caps.kit_declarative, "docker uses local images, not kits");
         assert!(caps.has_image_store, "docker keeps a local image store");
         assert_eq!(caps.image_acquisition, ImageAcquisition::Build);
+        assert!(caps.reports_resource_stats);
         assert!(caps.squad_supported());
     }
 
@@ -119,6 +126,10 @@ mod tests {
                     "sandbox has no local image store to reclaim"
                 );
                 assert_eq!(caps.image_acquisition, ImageAcquisition::Kit);
+                assert!(
+                    !caps.reports_resource_stats,
+                    "sandbox stats are zeros the runtime did not measure"
+                );
                 assert!(!caps.squad_supported());
             }
             Err(_) => {

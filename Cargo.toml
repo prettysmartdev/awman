@@ -170,5 +170,6 @@ nix = { workspace = true, features = ["signal", "process", "fs", "poll", "user"]
 libc = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
 wiremock = { workspace = true }

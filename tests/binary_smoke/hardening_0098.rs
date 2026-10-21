@@ -108,7 +108,7 @@ fn invalid_runtime_config_is_fatal_for_cli_with_exit_2() {
     // pin `AWMAN_CONFIG_HOME` (highest-precedence config-home override) at that
     // same dir: without it, an ambient `AWMAN_CONFIG_HOME`/`XDG_CONFIG_HOME` on
     // the runner would shadow `$HOME/.awman`, the bad-runtime config would be
-    // ignored, and `awman status` would fall through to a real `docker ps` —
+    // ignored, and `awman agents status` would fall through to a real `docker ps` —
     // which blocks indefinitely on a slow/wedged daemon (the CI hang) instead
     // of hitting the fast invalid-runtime fatal this test asserts.
     let awman_dir = repo.path().join(".awman");
@@ -124,7 +124,7 @@ fn invalid_runtime_config_is_fatal_for_cli_with_exit_2() {
         .env("HOME", repo.path())
         .env("AWMAN_CONFIG_HOME", &awman_dir)
         .env_remove("XDG_CONFIG_HOME")
-        .arg("status")
+        .args(["agents", "status"])
         .output()
         .expect("failed to run awman");
 

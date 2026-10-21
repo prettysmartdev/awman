@@ -274,7 +274,8 @@ awman new workflow [--interview]       # create a workflow file
 awman new skill [--interview]          # create a skill file
 awman new skill --pull <repo> | --pull-all     # pull or refresh a published skills library from GitHub
 awman specs amend <nnnn>               # update a spec to match what was built
-awman status [--watch]                 # dashboard of all running agent containers
+awman agents status [--watch]          # dashboard of running agents
+awman agents list | detail <id> | kill <id> | attach <id>
 awman clean [--dry-run] [--yes]        # remove stopped containers, stale images, and completed workflow data
 awman config show                      # view all config values
 awman squad                            # open your squad's TUI tab

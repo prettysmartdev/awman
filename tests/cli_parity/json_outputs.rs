@@ -19,12 +19,12 @@ fn ready_json_flag_exists_in_catalogue() {
 
 #[test]
 fn status_watch_flag_exists_in_catalogue() {
-    // `status` has --watch (not --json); this test confirms the flag shape
+    // `agents status` has --watch; this test confirms the flag shape
     // described in the parity matrix item 13.
-    let cmd = cat().lookup(&["status"]).unwrap();
+    let cmd = cat().lookup(&["agents", "status"]).unwrap();
     assert!(
         cmd.find_flag("watch").is_some(),
-        "`status` must have a --watch flag"
+        "`agents status` must have a --watch flag"
     );
 }
 

@@ -126,7 +126,7 @@ fn is_apple_running(row: &serde_json::Value) -> bool {
 
 /// Check whether the row's name matches awman container patterns.
 fn is_awman_container(name: &str) -> bool {
-    name.starts_with("awman-") || name.contains("nanoclaw")
+    name.starts_with("awman-")
 }
 
 /// Parse the JSON output of `container list --format json` into container
@@ -207,49 +207,38 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-        let output = Command::new(crate::engine::host_cli::program("container"))
-            .args(["list", "--format", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            _ => return Ok(Vec::new()),
-        };
+        let output = crate::engine::host_cli::checked_output(
+            Command::new(crate::engine::host_cli::program("container"))
+                .args(["list", "--format", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "container",
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(parse_apple_list_output(&stdout, None))
     }
 
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        let output = Command::new(crate::engine::host_cli::program("container"))
-            .args(["list", "--format", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            _ => return Ok(Vec::new()),
-        };
+        let output = crate::engine::host_cli::checked_output(
+            Command::new(crate::engine::host_cli::program("container"))
+                .args(["list", "--format", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "container",
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(parse_apple_list_output(&stdout, None))
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let take_sample = |name: &str| -> Result<(u64, u64), EngineError> {
-            let out = Command::new(crate::engine::host_cli::program("container"))
-                .args(["stats", "--no-stream", "--format", "json", name])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        EngineError::ContainerRuntimeUnavailable {
-                            binary: "container".into(),
-                        }
-                    } else {
-                        EngineError::Container(format!("container stats: {e}"))
-                    }
-                })?;
+            let out = crate::engine::host_cli::checked_output(
+                Command::new(crate::engine::host_cli::program("container"))
+                    .args(["stats", "--no-stream", "--format", "json", name])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+                "container",
+            )?;
             if !out.status.success() {
                 return Err(EngineError::Container(format!(
                     "container stats failed for {}",
@@ -306,7 +295,36 @@ impl ContainerBackend for AppleBackend {
         })
     }
 
+    fn inspect(
+        &self,
+        handle: &AgentHandle,
+    ) -> Result<crate::engine::agent_runtime::AgentDetail, EngineError> {
+        let current = self
+            .list_running_all()?
+            .into_iter()
+            .find(|h| h.id == handle.id)
+            .ok_or_else(|| EngineError::AgentNotFound {
+                id: handle.id.clone(),
+            })?;
+        let mut detail = crate::engine::agent_runtime::execution::default_detail(
+            true,
+            &current,
+            self.stats(&current),
+        );
+        detail.owner = launcher_owner(&handle.name);
+        Ok(detail)
+    }
+
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let owner = launcher_owner(&handle.name).ok_or_else(|| EngineError::Container(format!(
+            "cannot attach to {}: launcher identity is unavailable; restart the agent with this version of awman", handle.name
+        )))?;
+        if !owner.alive {
+            return Err(EngineError::Container(format!(
+                "cannot attach to {}: its launching awman process has exited; restart the agent",
+                handle.name
+            )));
+        }
         // Apple's `container` CLI has no `attach` subcommand, so reattach
         // goes through the awman-owned rendezvous instead: the process that
         // launched the container serves its live PTY on a per-container unix
@@ -333,15 +351,13 @@ impl ContainerBackend for AppleBackend {
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
         // Apple has no server-side name filter; list everything and filter by
         // the prefix client-side.
-        let output = Command::new(crate::engine::host_cli::program("container"))
-            .args(["list", "--format", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let output = match output {
-            Ok(o) if o.status.success() => o,
-            _ => return Ok(Vec::new()),
-        };
+        let output = crate::engine::host_cli::checked_output(
+            Command::new(crate::engine::host_cli::program("container"))
+                .args(["list", "--format", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "container",
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         Ok(parse_apple_list_output(&stdout, Some(prefix)))
     }
@@ -367,8 +383,7 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        crate::engine::container::process::stop_and_remove(ContainerCli::APPLE.bin, &handle.name);
-        Ok(())
+        host_cli_backend::cli_stop_checked(ContainerCli::APPLE, &handle.id)
     }
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
@@ -614,6 +629,37 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     .ok()
 }
 
+fn launcher_owner(name: &str) -> Option<crate::engine::agent_runtime::AgentOwner> {
+    crate::engine::container::attach_socket::attach_socket_path(
+        &crate::data::config::env::Env::from_process(),
+        name,
+    )
+    .and_then(|path| std::fs::read_to_string(path.with_extension("owner")).ok())
+    .and_then(|pid| pid.trim().parse::<u32>().ok())
+    .map(|pid| crate::engine::agent_runtime::AgentOwner {
+        pid,
+        alive: owner_is_alive(pid),
+    })
+}
+
+fn owner_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        pid > 0
+            && i32::try_from(pid).ok().is_some_and(|pid| {
+                matches!(
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                    Ok(()) | Err(nix::errno::Errno::EPERM)
+                )
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 #[cfg(test)]
 mod apple_tests {
     use super::*;
@@ -662,7 +708,7 @@ mod apple_tests {
     }
 
     #[test]
-    fn parse_apple_list_handles_nanoclaw_containers() {
+    fn parse_apple_list_rejects_nanoclaw_names_outside_awman_namespace() {
         let json = r#"[{
             "status": "running",
             "configuration": {
@@ -672,8 +718,7 @@ mod apple_tests {
             "startedDate": 1715000000.0
         }]"#;
         let handles = parse_apple_list_output(json, None);
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].name, "nanoclaw-worker-1");
+        assert!(handles.is_empty());
     }
 
     #[test]

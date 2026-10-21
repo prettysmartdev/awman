@@ -11,6 +11,7 @@
 //! interview's evaluation interval is the catalogue's `--interval` default,
 //! not a `"6h"` literal written a third time.
 
+use crate::command::commands::agents::{AgentSnapshot, AgentSource, KillChoice};
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagDefault};
@@ -197,6 +198,31 @@ pub fn squad_task_confirm(
         ],
         Some(SquadConfirmDecision::Dismiss),
     ))
+}
+
+/// `awman agents kill` / `rm`: stop and remove one agent.
+///
+/// When the agent belongs to a squad task or a TUI tab the body says so,
+/// because killing it fails that run. `default_on_dismiss` is `Some(Keep)`:
+/// walking away from a confirmation is a refusal.
+pub fn agents_kill_confirm(agent: &AgentSnapshot) -> Prompt<KillChoice> {
+    let mut body = format!("Stop and remove agent {} ({})?", agent.name, agent.short_id);
+    if let AgentSource::Squad(slug) = &agent.source {
+        body.push_str(&format!(
+            "\nThis agent belongs to squad task `{slug}`; the squad run will fail."
+        ));
+    } else if let Some(tab) = agent.tab_number {
+        body.push_str(&format!("\nThis agent belongs to TUI tab {tab}."));
+    }
+    Prompt::new(
+        "Stop and remove agent",
+        body,
+        vec![
+            Choice::new('y', "stop and remove", KillChoice::Kill),
+            Choice::new('n', "keep running", KillChoice::Keep),
+        ],
+        Some(KillChoice::Keep),
+    )
 }
 
 /// The questions the workflow engine asks after a Workflow Control Board

@@ -7,7 +7,7 @@ use crate::command::commands::squad::commands::{EnvReport, SquadOutcome};
 use crate::command::commands::squad::supervisor::SquadKeySetup;
 use crate::data::fs::task_store::Task;
 
-use super::render::format_table;
+use crate::frontend::render_helpers::format_table;
 
 /// Render a squad outcome through the CLI's common table/JSON conventions.
 pub(crate) fn render_squad(outcome: &SquadOutcome, json: bool) -> Option<String> {

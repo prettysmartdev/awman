@@ -1,11 +1,11 @@
-//! Status-screen tips.
+//! Tips shown in the `awman agents status` footer.
 //!
 //! Reviewed and refreshed before every release (see the `release-prep`
 //! skill). Every `` `awman …` `` command and flag a tip names is checked
 //! against the `CommandCatalogue` by the tests below, so a renamed or removed
 //! command fails the build instead of leaving a stale tip behind.
 
-/// Tips shown at the bottom of the status dashboard, grouped by topic. The tip
+/// Tips shown at the bottom of the agents dashboard, grouped by topic. The tip
 /// displayed on any given invocation is selected by [`select_random_tip`]
 /// using the current unix-second as a seed.
 pub const TIPS: &[&str] = &[
@@ -58,8 +58,13 @@ pub const TIPS: &[&str] = &[
     "The `skill(*)` overlay makes your global awman skills available to the agent.",
     "Overlays from config, `AWMAN_OVERLAYS`, `--overlay` flags and workflow steps all combine.",
     // ── Monitoring and cleanup ───────────────────────────────────────────────
-    "`awman status` shows all running code agents.",
-    "`awman status --watch` keeps the dashboard refreshing. Press Ctrl-C to stop.",
+    "`awman agents status` prints a one-shot summary of every running code agent.",
+    "`awman agents status --watch` keeps the dashboard refreshing. Press Ctrl-C to stop.",
+    "`awman agents ls` (or `ps`) lists running agents; add `-a` to include stopped ones.",
+    "`awman agents ls -q` prints only agent IDs, handy for scripting.",
+    "`awman agents detail <id>` (or `inspect`) shows one agent in depth; an ID prefix works too.",
+    "`awman agents attach <id>` connects to an agent's terminal; detaching never stops the agent.",
+    "`awman agents rm <id>` (or `kill`) stops and removes an agent; `-y` skips the prompt.",
     "`awman clean` removes stopped agents, finished workflow data and dangling images.",
     "`awman clean --dry-run` shows what would be removed without deleting anything.",
     "`awman clean -y` skips the confirmation prompt, which is handy in cron jobs.",
@@ -210,6 +215,35 @@ mod tests {
             .filter_map(|invocation| check_invocation(invocation).err())
             .collect();
         assert!(errors.is_empty(), "stale tips:\n{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn no_tip_names_the_removed_status_command() {
+        for tip in TIPS {
+            for invocation in awman_invocations(tip) {
+                assert!(
+                    invocation != "awman status" && !invocation.starts_with("awman status "),
+                    "stale `awman status` in tip: {tip}"
+                );
+            }
+            assert!(!tip.contains("awman status"), "stale tip: {tip}");
+        }
+    }
+
+    #[test]
+    fn agents_tips_cover_each_subcommand() {
+        for needle in [
+            "agents status",
+            "agents ls",
+            "agents detail",
+            "agents attach",
+            "agents rm",
+        ] {
+            assert!(
+                TIPS.iter().any(|t| t.contains(needle)),
+                "no tip mentions `awman {needle}`"
+            );
+        }
     }
 
     #[test]

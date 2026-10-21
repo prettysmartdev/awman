@@ -80,9 +80,24 @@ fn awman_api_help_exits_zero() {
 }
 
 #[test]
-fn awman_status_help_exits_zero() {
-    let out = run_awman(&["status", "--help"]);
+fn awman_agents_status_help_exits_zero() {
+    let out = run_awman(&["agents", "status", "--help"]);
     assert!(out.status.success());
+}
+
+#[test]
+fn removed_root_status_is_unknown_without_migration_hint() {
+    let out = run_awman(&["status"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand 'status'"),
+        "unexpected status error: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("agents status"),
+        "removed command must not suggest a migration hint: {stderr}"
+    );
 }
 
 #[test]

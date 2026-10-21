@@ -14,6 +14,9 @@ pub(crate) fn awman_bin() -> std::path::PathBuf {
     awman_binary::awman_bin()
 }
 
+mod agents_docker;
+#[cfg(unix)]
+mod agents_review;
 mod antigravity_0083;
 mod clean_command;
 mod cli_subprocess;

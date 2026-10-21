@@ -225,7 +225,7 @@ mod tests {
     fn reference_contains_every_top_level_command() {
         let generated = CommandCatalogue::get().markdown_reference();
         for name in &[
-            "init", "ready", "chat", "specs", "status", "config", "exec", "api", "squad", "remote",
+            "init", "ready", "chat", "specs", "agents", "config", "exec", "api", "squad", "remote",
             "new", "clean",
         ] {
             assert!(

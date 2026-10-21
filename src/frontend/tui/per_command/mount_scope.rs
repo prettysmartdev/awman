@@ -35,7 +35,7 @@ pub(crate) mod tests {
         std::sync::mpsc::Receiver<DialogRequest>,
         std::sync::mpsc::Sender<DialogResponse>,
     ) {
-        crate::frontend::tui::tests::test_command_frontend(&["status"], Default::default())
+        crate::frontend::tui::tests::test_command_frontend(&["ready"], Default::default())
     }
 
     #[test]

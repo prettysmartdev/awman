@@ -764,3 +764,21 @@ fn scroll_on_acp_slot_moves_its_own_offset_not_vt100_scrollback() {
         "vt100 scrollback must remain untouched throughout"
     );
 }
+
+#[test]
+fn agents_attach_ctrl_c_cancels_local_connection_while_chat_receives_sigint() {
+    let mut app = make_app();
+    let mut rx = setup_container_tab(&mut app);
+    app.focus = crate::frontend::tui::app::Focus::ExecutionWindow;
+    app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+        command: "agents attach abc123".into(),
+    };
+    press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(app.active_tab().shared.command_cancel.is_cancelled());
+    assert!(rx.try_recv().is_err());
+    app.active_tab_mut().execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+        command: "chat".into(),
+    };
+    press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(rx.try_recv().unwrap(), [3]);
+}

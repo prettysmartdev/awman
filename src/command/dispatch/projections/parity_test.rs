@@ -158,6 +158,48 @@ fn descend<'a>(m: &'a ArgMatches, path: &[&str]) -> &'a ArgMatches {
     cur
 }
 
+#[test]
+fn agents_kill_prompt_is_a_shared_cli_tui_choice_contract() {
+    use crate::command::commands::agents::{AgentSnapshot, AgentSource, AgentState, KillChoice};
+    use crate::command::prompts::agents_kill_confirm;
+    use chrono::{TimeZone, Utc};
+
+    let snapshot = AgentSnapshot {
+        id: "1234567890123456".into(),
+        short_id: "123456789012".into(),
+        name: "agent-demo".into(),
+        image: "agent:latest".into(),
+        state: AgentState::Running,
+        started_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        uptime_secs: 1,
+        source: AgentSource::Session,
+        tab_number: None,
+        command_label: None,
+        cpu_percent: None,
+        memory_mb: None,
+    };
+    // CLI and TUI both consume this same value, so pin its whole visible
+    // contract and dismiss default here rather than maintaining two copies.
+    let prompt = agents_kill_confirm(&snapshot);
+    assert_eq!(prompt.title, "Stop and remove agent");
+    assert_eq!(
+        prompt.body,
+        "Stop and remove agent agent-demo (123456789012)?"
+    );
+    assert_eq!(
+        prompt
+            .choices
+            .iter()
+            .map(|choice| (choice.key, choice.label.as_str(), choice.value))
+            .collect::<Vec<_>>(),
+        vec![
+            ('y', "stop and remove", KillChoice::Kill),
+            ('n', "keep running", KillChoice::Keep),
+        ]
+    );
+    assert_eq!(prompt.default_on_dismiss, Some(KillChoice::Keep));
+}
+
 /// Full clap parse of `path` + `argv`, returning the (owned) leaf matches.
 fn clap_leaf(cat: &CommandCatalogue, path: &[&str], argv: &[&str]) -> ArgMatches {
     let mut full: Vec<String> = vec!["awman".to_string()];
@@ -833,6 +875,7 @@ fn every_catalogue_command_leaf_is_buildable_by_dispatch() {
     /// Grouping parents. Every leaf command is buildable by Dispatch.
     const NOT_RUNNABLE: &[&[&str]] = &[
         &[],
+        &["agents"],
         &["specs"],
         &["config"],
         &["exec"],

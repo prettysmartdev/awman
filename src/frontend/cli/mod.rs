@@ -263,7 +263,14 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         | CommandError::SessionWorkdirNotAllowed { .. }
         | CommandError::SessionRepoUrlRequired
         | CommandError::SessionRepoUrlEmpty
-        | CommandError::SessionRepoUrlInvalidScheme { .. } => err.to_string(),
+        | CommandError::SessionRepoUrlInvalidScheme { .. }
+        | CommandError::AgentNotFound { .. }
+        | CommandError::AgentNoLongerRunning { .. }
+        | CommandError::AgentNotRunning { .. }
+        | CommandError::AgentReplaced { .. }
+        | CommandError::AgentAmbiguous { .. }
+        | CommandError::AgentReferenceEmpty
+        | CommandError::AgentOwnerGone { .. } => err.to_string(),
     };
     format!("awman: {body}")
 }
@@ -555,7 +562,9 @@ mod tests {
     #[test]
     fn subcommand_present_routes_to_cli() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "status"]).unwrap();
+        let m = cmd
+            .try_get_matches_from(["awman", "agents", "status"])
+            .unwrap();
         // main.rs uses `matches.subcommand_name().is_some()` to pick CLI.
         assert!(m.subcommand_name().is_some());
     }
@@ -579,7 +588,7 @@ mod tests {
             vec!["exec", "workflow"],
             vec!["ready"],
             vec!["chat"],
-            vec!["status"],
+            vec!["agents", "status"],
         ] {
             assert!(
                 !catalogue.is_allowed_for_frontend(FrontendKind::SquadDaemon, &outside),
@@ -598,12 +607,13 @@ mod tests {
     fn the_catalogue_names_the_commands_with_a_bare_tui_form() {
         let catalogue = CommandCatalogue::get();
         assert!(catalogue.opens_tui_when_bare(&["squad"]));
-        for other in ["status", "ready", "init", "clean", "config"] {
+        for other in ["ready", "init", "clean", "config"] {
             assert!(
                 !catalogue.opens_tui_when_bare(&[other]),
                 "{other} has no bare TUI form"
             );
         }
+        assert!(!catalogue.opens_tui_when_bare(&["agents", "status"]));
         // A subcommand of one that does is still a plain CLI command.
         assert!(!catalogue.opens_tui_when_bare(&["squad", "list"]));
         assert!(!catalogue.opens_tui_when_bare(&[]));
@@ -647,15 +657,25 @@ mod tests {
 
     #[test]
     fn format_outcome_status_renders_dashboard_not_json() {
-        use crate::command::commands::status::StatusOutcome;
+        use crate::command::commands::agents::{
+            AgentTotals, AgentsOutcome, AgentsOverview, AgentsStatusOutcome,
+        };
         use crate::command::CommandOutcome;
-        let outcome = CommandOutcome::Status(StatusOutcome {
-            containers: vec![],
+        let outcome = CommandOutcome::Agents(AgentsOutcome::Status(AgentsStatusOutcome {
+            overview: AgentsOverview {
+                runtime: "docker".into(),
+                runtime_display: "Docker".into(),
+                available: true,
+                unavailable_reason: None,
+                agents: vec![],
+                totals: AgentTotals::default(),
+                collected_at: chrono::Utc::now(),
+                tip: "test tip".into(),
+            },
             watched: false,
-            tip: "test tip".into(),
-        });
+        }));
         let s = format_outcome(&outcome, false).expect("status must render text");
-        assert!(s.contains("AWMAN STATUS DASHBOARD"));
+        assert!(s.contains("Docker"));
         assert!(!s.contains('{'), "status must not be rendered as JSON");
     }
 

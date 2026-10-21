@@ -1,5 +1,5 @@
 //! The commands that operate on one repository: `clean`, `init`, `ready`,
-//! `chat`, `specs`, `status`, `config`.
+//! `chat`, `specs`, `config`.
 //!
 //! Split out of `dispatch/catalogue.rs` by WI 0114 F-51. The specs are data;
 //! `ROOT` in `mod.rs` is what assembles them into the tree.
@@ -261,34 +261,6 @@ pub(super) const SPECS_AMEND: CommandSpec = CommandSpec {
     ],
     api_allowed: false,
     build: crate::command::dispatch::build::specs,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-// ── status ───────────────────────────────────────────────────────────────────
-
-pub(super) const STATUS: CommandSpec = CommandSpec {
-    name: "status",
-    aliases: &[],
-    help: "Show the status of all running code-agent containers.",
-    long_help: None,
-    arguments: &[],
-    flags: &[FlagSpec {
-        long: "watch",
-        short: None,
-        help: "Continuously refresh the output every 3 seconds.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    }],
-    api_allowed: false,
-    build: crate::command::dispatch::build::status,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
     requires_runtime: true,

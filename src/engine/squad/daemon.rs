@@ -301,6 +301,7 @@ mod tests {
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
                     per_launch_vm_settings: false,
+                    reports_resource_stats: true,
                 },
             }
         }
@@ -314,6 +315,7 @@ mod tests {
                     image_acquisition:
                         crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
                     per_launch_vm_settings: false,
+                    reports_resource_stats: true,
                 },
             }
         }

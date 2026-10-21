@@ -40,8 +40,8 @@ pub mod output_tail;
 pub use background::{AgentExec, ExecOutput};
 pub use capabilities::{Capabilities, ImageAcquisition};
 pub use execution::{
-    AgentExecution, AgentExitInfo, AgentHandle, AgentHandlePreview, AgentInstance, AgentStats,
-    CancelHandle, StuckEvent,
+    AgentDetail, AgentExecution, AgentExitInfo, AgentHandle, AgentHandlePreview, AgentInstance,
+    AgentOwner, AgentStats, CancelHandle, StuckEvent,
 };
 pub use frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 pub use output_tail::{OutputTail, DEFAULT_OUTPUT_TAIL_LINES};
@@ -162,9 +162,8 @@ pub trait AgentRuntimeEngine: Send + Sync {
         })
     }
 
-    /// Stop a running agent. Semantics vary per runtime:
-    ///   - container: stop + rm
-    ///   - sandbox:   stop (preserve persistent volume)
+    /// Explicitly stop a running agent, reporting runtime failures.
+    /// Call `remove_agent` afterwards to request cleanup of its resources.
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
     /// Attach to an already-running agent this process did not start.
@@ -182,6 +181,41 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// Apple's client-side prefix predicate, sandbox `sbx ls` name filter.
     /// The name prefix is the one identity channel all three tiers share.
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError>;
+
+    /// Stopped agents still present in the runtime (`awman agents ls -a`).
+    /// Default: none. `ContainerRuntime` forwards to its backend (Apple's
+    /// answers empty by design); sandbox-class runtimes keep the default.
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+
+    /// One agent in depth. The default is built from the handle and
+    /// `stats()` (skipped when `reports_resource_stats` is false; a stats
+    /// error becomes `None`), so every runtime works without an override.
+    fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
+        let running = self.list_running_all()?;
+        let current = running.iter().find(|h| h.id == handle.id);
+        let stopped = if current.is_none() {
+            self.list_stopped()?
+        } else {
+            Vec::new()
+        };
+        let current = current
+            .or_else(|| stopped.iter().find(|h| h.id == handle.id))
+            .ok_or_else(|| EngineError::AgentNotFound {
+                id: handle.id.clone(),
+            })?;
+        let reports = self.capabilities().reports_resource_stats;
+        let is_running = running.iter().any(|h| h.id == handle.id);
+        let stats = if reports && is_running {
+            self.stats(current)
+        } else {
+            Err(EngineError::Other("resource metrics unavailable".into()))
+        };
+        let mut detail = execution::default_detail(reports, current, stats);
+        detail.running = is_running;
+        Ok(detail)
+    }
 
     /// Whether [`Self::attach`] still reaches an agent after the process that
     /// launched it has exited. Docker: yes (`docker attach`). Apple: no (the

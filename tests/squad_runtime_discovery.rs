@@ -68,6 +68,7 @@ impl AgentRuntimeEngine for NoLabelFakeRuntime {
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
             per_launch_vm_settings: false,
+            reports_resource_stats: true,
         };
         &CAPS
     }

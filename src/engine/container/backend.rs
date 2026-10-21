@@ -14,7 +14,9 @@ use crate::data::message::UserMessageSink;
 use crate::data::oci_identity::ImageIdentity;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::background::ExecOutput;
-use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
+use crate::engine::agent_runtime::execution::{
+    default_detail, AgentDetail, AgentInstance, AgentStats,
+};
 use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
 use crate::engine::container::background::BackgroundLaunchRequest;
 use crate::engine::container::options::ResolvedContainerOptions;
@@ -74,7 +76,35 @@ pub(super) trait ContainerBackend: Send + Sync {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError>;
 
-    /// Stop and remove an agent this process owns.
+    /// One agent in depth. The default is built from the handle and
+    /// `stats()`; backends that record more (builtin labels, docker inspect)
+    /// override it.
+    fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
+        let running = self.list_running_all()?;
+        let current = running.iter().find(|h| h.id == handle.id);
+        let stopped = if current.is_none() {
+            self.list_stopped()?
+        } else {
+            Vec::new()
+        };
+        let current = current
+            .or_else(|| stopped.iter().find(|h| h.id == handle.id))
+            .ok_or_else(|| EngineError::AgentNotFound {
+                id: handle.id.clone(),
+            })?;
+        let reports = self.capabilities().reports_resource_stats;
+        let is_running = running.iter().any(|h| h.id == handle.id);
+        let stats = if reports && is_running {
+            self.stats(current)
+        } else {
+            Err(EngineError::Other("resource metrics unavailable".into()))
+        };
+        let mut detail = default_detail(reports, current, stats);
+        detail.running = is_running;
+        Ok(detail)
+    }
+
+    /// Explicitly stop the resolved agent; propagate failures. Removal is separate.
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
     /// Remove a stopped agent by id or name. Errors when the runtime refuses

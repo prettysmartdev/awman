@@ -8,11 +8,12 @@
 //! `from_input` constructor, so the construction logic itself lives with the
 //! command in `src/command/commands/`, never here.
 //!
-//! A command with several subcommands (`config`, `api`, `squad`, `new`,
+//! A command with several subcommands (`agents`, `config`, `api`, `squad`, `new`,
 //! `remote`, `specs`) registers the *same* function on every leaf: its
 //! `from_input` selects the subcommand from
 //! [`CallerContext::leaf`](crate::command::dispatch::CallerContext::leaf).
 
+use crate::command::commands::agents::AgentsCommand;
 use crate::command::commands::api_server::ApiServerCommand;
 use crate::command::commands::chat::ChatCommand;
 use crate::command::commands::clean::CleanCommand;
@@ -26,7 +27,6 @@ use crate::command::commands::remote::RemoteCommand;
 use crate::command::commands::specs::SpecsCommand;
 use crate::command::commands::squad::attach::SquadAttachCommand;
 use crate::command::commands::squad::commands::SquadCommand;
-use crate::command::commands::status::StatusCommand;
 use crate::command::dispatch::{BuildContext, BuiltCommand};
 use crate::command::error::CommandError;
 
@@ -60,8 +60,8 @@ pub fn specs(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Specs(SpecsCommand::from_input(ctx)?))
 }
 
-pub fn status(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    Ok(BuiltCommand::Status(StatusCommand::from_input(ctx)?))
+pub fn agents(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Agents(AgentsCommand::from_input(ctx)?))
 }
 
 pub fn config(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {

@@ -1,4 +1,4 @@
-//! Execution window rendering: the main output pane (status log or status
+//! Execution window rendering: the main output pane (status log or agents
 //! dashboard), text selection highlighting, and buffer-grid capture for
 //! copy support.
 
@@ -53,10 +53,10 @@ pub(super) fn render_execution_window(app: &mut App, area: Rect, frame: &mut Fra
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Status dashboard takes priority when populated by the status command.
+    // The agents dashboard takes priority once `agents status` has drawn it.
     let has_dashboard = tab
         .shared
-        .status_dashboard
+        .agents_dashboard
         .lock()
         .map(|d| d.is_some())
         .unwrap_or(false);
@@ -69,7 +69,7 @@ pub(super) fn render_execution_window(app: &mut App, area: Rect, frame: &mut Fra
         .unwrap_or(true);
 
     if has_dashboard {
-        render_status_dashboard(tab, inner, frame);
+        render_agents_dashboard(tab, inner, frame);
     } else if matches!(tab.execution_phase, ExecutionPhase::Idle) && log_empty {
         // Three-line welcome stub matching old awman exactly.
         let lines = vec![
@@ -215,160 +215,200 @@ fn render_output_content(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
     frame.render_widget(para, area);
 }
 
-/// Render the status dashboard as a proper ratatui `Table` widget.
-fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
-    let dash = match tab.shared.status_dashboard.lock() {
+/// Render the `agents status` dashboard: the runtime header, a `Table` of
+/// agents (or the empty / unavailable state), a footer, and the run's tip.
+///
+/// The columns are the CLI's `STATUS_COLUMNS` with TAB inserted after
+/// SOURCE, filled from the same Layer 2 cell builders, so the two frontends
+/// agree on content. NAME and IMAGE take the space that is left; every
+/// other column is sized to its content. Table cells truncate rather than
+/// wrap, so a narrow tab never breaks a row across lines. When the rows do
+/// not fit they scroll with the execution window's scroll keys, anchored to
+/// the bottom like the status log.
+fn render_agents_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
+    let dash = match tab.shared.agents_dashboard.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-    let data = match dash.as_ref() {
-        Some(d) => d,
-        None => return,
+    let Some(data) = dash.as_ref() else {
+        return;
     };
+    let overview = &data.overview;
+
+    let header_color = if overview.available {
+        Color::Cyan
+    } else {
+        Color::Red
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+
+    // Header + blank, body, blank + footer + tip.
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", overview.header_line()),
+            Style::default()
+                .fg(header_color)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        chunks[0],
+    );
+
+    // When the runtime is unavailable the header already names it and the
+    // reason, and the body stays empty; a watch keeps retrying, so a daemon
+    // restart shows up on the next tick.
+    let mut scroll_note = None;
+    if overview.available && overview.agents.is_empty() {
+        let lines: Vec<Line> = overview
+            .empty_state_lines()
+            .into_iter()
+            .map(|l| Line::from(Span::styled(format!(" {l}"), dim)))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), chunks[1]);
+    } else if overview.available {
+        scroll_note = render_agents_table(overview, tab.scroll_offset, chunks[1], frame);
+    }
+
+    let mut footer = if data.watching {
+        format!(
+            " Refreshing every {}s · Esc to stop",
+            crate::command::commands::agents::WATCH_INTERVAL.as_secs()
+        )
+    } else {
+        format!(
+            " Collected at {}",
+            overview
+                .collected_at
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+        )
+    };
+    if let Some(note) = scroll_note {
+        footer.push_str(" · ");
+        footer.push_str(&note);
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(footer, dim)),
+            Line::from(Span::styled(format!(" Tip: {}", overview.tip), dim)),
+        ]),
+        chunks[2],
+    );
+}
+
+/// Draw the agents table into `area`, skipping rows per `scroll_offset`
+/// (rows from the bottom, as in the status log). Returns a "rows a–b of n"
+/// note when not every row fits.
+fn render_agents_table(
+    overview: &crate::command::commands::agents::AgentsOverview,
+    scroll_offset: usize,
+    area: Rect,
+    frame: &mut Frame,
+) -> Option<String> {
+    use crate::command::commands::agents::{AgentState, STATUS_COLUMNS};
+
+    // STATUS_COLUMNS is [glyph, AGENT ID, NAME, SOURCE, IMAGE, UPTIME, CPU, MEM];
+    // TAB goes after SOURCE.
+    const TAB_AT: usize = 4;
+    const NAME_AT: usize = 2;
+    const IMAGE_AT: usize = 5;
+
+    let mut headers: Vec<&str> = STATUS_COLUMNS.to_vec();
+    headers.insert(TAB_AT, "TAB");
+    let rows: Vec<(AgentState, Vec<String>)> = overview
+        .agents
+        .iter()
+        .map(|agent| {
+            let mut cells = agent.status_cells();
+            let tab = agent
+                .tab_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into());
+            cells.insert(TAB_AT, tab);
+            (agent.state, cells)
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for (_, cells) in &rows {
+        for (w, cell) in widths.iter_mut().zip(cells) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    let constraints: Vec<Constraint> = widths
+        .iter()
+        .enumerate()
+        .map(|(i, w)| match i {
+            NAME_AT => Constraint::Min((*w).min(16) as u16),
+            IMAGE_AT => Constraint::Fill(1),
+            _ => Constraint::Length(*w as u16),
+        })
+        .collect();
+
+    // One line for the header row.
+    let visible = (area.height as usize).saturating_sub(1);
+    let max_skip = rows.len().saturating_sub(visible);
+    let skip = max_skip.saturating_sub(scroll_offset.min(max_skip));
+    let shown = rows.len().min(visible);
 
     let header_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-
-    // Title + empty line above the table.
-    let title_height: u16 = 2;
-    let tip_height: u16 = 2;
-    let table_area_height = area.height.saturating_sub(title_height + tip_height);
-
-    // Split: title row, table, tip row.
-    let chunks = Layout::vertical([
-        Constraint::Length(title_height),
-        Constraint::Length(table_area_height),
-        Constraint::Length(tip_height),
-    ])
-    .split(area);
-
-    // Title.
-    let title = Paragraph::new(vec![
-        Line::from(Span::styled(
-            " AWMAN STATUS DASHBOARD",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ]);
-    frame.render_widget(title, chunks[0]);
-
-    if data.containers.is_empty() {
-        let empty = Paragraph::new(vec![
-            Line::from(Span::styled(
-                " No code agents running.",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                " To start one:  awman exec workflow <file>  or  awman chat",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]);
-        frame.render_widget(empty, chunks[1]);
-    } else {
-        let header = Row::new(vec![
-            Cell::from(" "),
-            Cell::from("NAME").style(header_style),
-            Cell::from("CPU").style(header_style),
-            Cell::from("MEM").style(header_style),
-            Cell::from("IMAGE").style(header_style),
-            Cell::from("TAB").style(header_style),
-        ])
-        .bottom_margin(0);
-
-        let rows: Vec<Row> = data
-            .containers
+    let header = Row::new(
+        headers
             .iter()
-            .map(|c| {
-                let indicator_style = if c.stuck {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+            .map(|h| Cell::from(*h).style(header_style))
+            .collect::<Vec<_>>(),
+    );
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .skip(skip)
+        .take(visible)
+        .map(|(state, cells)| {
+            let glyph_color = match state {
+                AgentState::Running => Color::Green,
+                AgentState::Stuck => Color::Yellow,
+                AgentState::Stopped => Color::DarkGray,
+            };
+            Row::new(cells.iter().enumerate().map(|(i, cell)| {
+                let c = Cell::from(cell.as_str());
+                if i == 0 {
+                    c.style(
+                        Style::default()
+                            .fg(glyph_color)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                };
-                let indicator = "\u{25cf}";
+                    c
+                }
+            }))
+        })
+        .collect();
 
-                let cpu = c
-                    .cpu_percent
-                    .map(|v| format!("{v:.1}%"))
-                    .unwrap_or_else(|| "-".into());
-                let mem = c
-                    .memory_mb
-                    .map(|v| format!("{v:.0}MB"))
-                    .unwrap_or_else(|| "-".into());
-                let tab_label = c
-                    .tab_number
-                    .map(|t| format!("{t}"))
-                    .unwrap_or_else(|| "-".into());
+    let table = Table::new(table_rows, constraints)
+        .header(header)
+        .column_spacing(2);
+    // A one-column gutter so the glyph does not touch the window border.
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    frame.render_widget(table, inner);
 
-                Row::new(vec![
-                    Cell::from(indicator).style(indicator_style),
-                    Cell::from(c.name.as_str()),
-                    Cell::from(cpu),
-                    Cell::from(mem),
-                    Cell::from(c.image.as_str()),
-                    Cell::from(tab_label),
-                ])
-            })
-            .collect();
-
-        // Column widths: start from header label widths, then expand to the
-        // widest value in each column, then add 2 chars of trailing padding.
-        let pad: usize = 2;
-        let mut w_indicator: usize = 1;
-        let mut w_name: usize = "NAME".len();
-        let mut w_cpu: usize = "CPU".len();
-        let mut w_mem: usize = "MEM".len();
-        let mut w_image: usize = "IMAGE".len();
-        let mut w_tab: usize = "TAB".len();
-        for c in &data.containers {
-            w_indicator = w_indicator.max(1);
-            w_name = w_name.max(c.name.len());
-            let cpu = c
-                .cpu_percent
-                .map(|v| format!("{v:.1}%"))
-                .unwrap_or_else(|| "-".into());
-            w_cpu = w_cpu.max(cpu.len());
-            let mem = c
-                .memory_mb
-                .map(|v| format!("{v:.0}MB"))
-                .unwrap_or_else(|| "-".into());
-            w_mem = w_mem.max(mem.len());
-            w_image = w_image.max(c.image.len());
-            let tab_label = c
-                .tab_number
-                .map(|t| format!("{t}"))
-                .unwrap_or_else(|| "-".into());
-            w_tab = w_tab.max(tab_label.len());
-        }
-        let widths = [
-            Constraint::Length((w_indicator + pad) as u16),
-            Constraint::Length((w_name + pad) as u16),
-            Constraint::Length((w_cpu + pad) as u16),
-            Constraint::Length((w_mem + pad) as u16),
-            Constraint::Length((w_image + pad) as u16),
-            Constraint::Length((w_tab + pad) as u16),
-        ];
-
-        let table = Table::new(rows, widths)
-            .header(header)
-            .row_highlight_style(Style::default());
-        frame.render_widget(table, chunks[1]);
-    }
-
-    // Tip.
-    let tip = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(" Tip: {}", data.tip),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
-    frame.render_widget(tip, chunks[2]);
+    (rows.len() > shown).then(|| {
+        format!(
+            "rows {}–{} of {} (↑/↓ to scroll)",
+            skip + 1,
+            skip + shown,
+            rows.len()
+        )
+    })
 }

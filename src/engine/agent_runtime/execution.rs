@@ -2,9 +2,11 @@
 //! type, plus the unified handle/exit/stats shapes shared by both runtime
 //! tiers (container-class and sandbox-class).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::agent_runtime::output_tail::OutputTail;
@@ -18,6 +20,60 @@ pub struct AgentStats {
     pub name: String,
     pub cpu_percent: f64,
     pub memory_mb: f64,
+}
+
+/// The process that launched an agent, when the runtime records one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentOwner {
+    pub pid: u32,
+    /// Whether the OS still reports `pid` alive at inspection time.
+    pub alive: bool,
+}
+
+/// Everything a runtime can say about one agent. Common fields are typed;
+/// runtime-specific facts go in `runtime_extras` as display-ready
+/// `key → value` pairs so Layer 2 never matches on the runtime type.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AgentDetail {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub started_at: DateTime<Utc>,
+    pub running: bool,
+    /// `None` when `capabilities().reports_resource_stats` is false or the
+    /// stats call failed.
+    pub cpu_percent: Option<f64>,
+    pub memory_mb: Option<f64>,
+    /// `None` on runtimes that record no launching process.
+    pub owner: Option<AgentOwner>,
+    /// Ordered, display-ready extras.
+    pub runtime_extras: BTreeMap<String, String>,
+}
+
+/// Build an [`AgentDetail`] from a handle and a stats result. Shared by the
+/// `AgentRuntimeEngine::inspect` and `ContainerBackend::inspect` defaults.
+/// Stats are dropped when the runtime does not measure them or the call failed.
+pub fn default_detail(
+    reports_resource_stats: bool,
+    handle: &AgentHandle,
+    stats: Result<AgentStats, EngineError>,
+) -> AgentDetail {
+    let stats = if reports_resource_stats {
+        stats.ok()
+    } else {
+        None
+    };
+    AgentDetail {
+        id: handle.id.clone(),
+        name: handle.name.clone(),
+        image: handle.image_tag.clone(),
+        started_at: handle.started_at,
+        running: true,
+        cpu_percent: stats.as_ref().map(|s| s.cpu_percent),
+        memory_mb: stats.map(|s| s.memory_mb),
+        owner: None,
+        runtime_extras: BTreeMap::new(),
+    }
 }
 
 /// Exit information returned when an agent's execution finishes.
@@ -581,5 +637,61 @@ mod tests {
 
         assert_eq!(rx_a.recv().await.unwrap(), StuckEvent::Stuck);
         assert_eq!(rx_b.recv().await.unwrap(), StuckEvent::Stuck);
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    fn handle() -> AgentHandle {
+        AgentHandle {
+            id: "abc".into(),
+            name: "awman-x".into(),
+            image_tag: "img:latest".into(),
+            started_at: chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    fn stats() -> AgentStats {
+        AgentStats {
+            name: "awman-x".into(),
+            cpu_percent: 12.5,
+            memory_mb: 256.0,
+        }
+    }
+
+    #[test]
+    fn default_detail_copies_identity_and_stats() {
+        let h = handle();
+        let d = default_detail(true, &h, Ok(stats()));
+        assert_eq!(
+            (d.id.as_str(), d.name.as_str(), d.image.as_str()),
+            ("abc", "awman-x", "img:latest")
+        );
+        assert_eq!(d.started_at, h.started_at);
+        assert!(d.running);
+        assert_eq!((d.cpu_percent, d.memory_mb), (Some(12.5), Some(256.0)));
+        assert!(d.owner.is_none());
+        assert!(d.runtime_extras.is_empty());
+    }
+
+    #[test]
+    fn default_detail_drops_stats_the_runtime_does_not_measure() {
+        // SBX-style: the stats call "succeeds" with zeros nobody measured.
+        let zeros = AgentStats {
+            cpu_percent: 0.0,
+            memory_mb: 0.0,
+            ..stats()
+        };
+        let d = default_detail(false, &handle(), Ok(zeros));
+        assert_eq!((d.cpu_percent, d.memory_mb), (None, None));
+    }
+
+    #[test]
+    fn default_detail_turns_a_stats_error_into_none() {
+        let d = default_detail(true, &handle(), Err(EngineError::Other("boom".into())));
+        assert_eq!((d.cpu_percent, d.memory_mb), (None, None));
+        assert!(d.running, "a stats failure does not change liveness");
     }
 }

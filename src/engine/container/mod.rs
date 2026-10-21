@@ -16,6 +16,7 @@ mod attach_socket;
 mod backend;
 pub mod background;
 mod builtin;
+mod deferred;
 pub mod display;
 mod docker;
 mod host_cli_backend;

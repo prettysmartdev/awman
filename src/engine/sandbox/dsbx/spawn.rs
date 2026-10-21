@@ -129,6 +129,15 @@ impl SbxCommand {
             Stdio::null()
         });
 
+        // Runtime observation must be bounded and cancellable in status watches.
+        if self.args.first().is_some_and(|arg| arg == "ls") {
+            let output = crate::engine::host_cli::checked_output(&mut cmd, SBX_BIN)?;
+            return Ok(SbxOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code: output.status.code().unwrap_or(-1),
+            });
+        }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 EngineError::Sandbox(

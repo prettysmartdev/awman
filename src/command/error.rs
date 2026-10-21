@@ -198,6 +198,35 @@ pub enum CommandError {
     #[error("workflow file not found: {path}")]
     WorkflowFileNotFound { path: std::path::PathBuf },
 
+    // ── Agents (`awman agents …`) ─────────────────────────────────────────
+    #[error("no agent matches {reference:?}; run `awman agents ls` to see running agents")]
+    AgentNotFound { reference: String },
+
+    #[error("agent {reference:?} is no longer running")]
+    AgentNoLongerRunning { reference: String },
+
+    #[error("agent {reference:?} is stopped, not running; `awman clean` removes stopped agents")]
+    AgentNotRunning { reference: String },
+
+    #[error(
+        "agent {reference:?} was replaced by a newer one with the same name; re-run `awman agents ls`"
+    )]
+    AgentReplaced { reference: String },
+
+    #[error("agent reference {reference:?} is ambiguous; matches: {}", candidates.join(", "))]
+    AgentAmbiguous {
+        reference: String,
+        candidates: Vec<String>,
+    },
+
+    #[error("an agent id, id prefix or name is required")]
+    AgentReferenceEmpty,
+
+    #[error(
+        "cannot attach to {name}: its launching awman process has exited; {runtime} can only attach while that process is running"
+    )]
+    AgentOwnerGone { name: String, runtime: String },
+
     // ── Catch-all ─────────────────────────────────────────────────────────
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
@@ -320,13 +349,19 @@ impl CommandError {
         | CommandError::SessionWorkdirNotAllowed { .. }
         | CommandError::SessionRepoUrlRequired
         | CommandError::SessionRepoUrlEmpty
-        | CommandError::SessionRepoUrlInvalidScheme { .. } => 2,
+        | CommandError::SessionRepoUrlInvalidScheme { .. }
+        | CommandError::AgentAmbiguous { .. }
+        | CommandError::AgentReferenceEmpty => 2,
 
         // Exit 4 — missing referenced resource
         CommandError::WorkItemNotFound { .. }
         | CommandError::SpecTemplateMissing { .. }
         | CommandError::WorkflowFileNotFound { .. }
-        | CommandError::ApiWorkdirNotFound { .. } => 4,
+        | CommandError::ApiWorkdirNotFound { .. }
+        | CommandError::AgentNotFound { .. }
+        | CommandError::AgentNoLongerRunning { .. }
+        | CommandError::AgentNotRunning { .. }
+        | CommandError::AgentReplaced { .. } => 4,
 
         // Engine failures carry their own class (3 only for a missing or
         // failing Docker/Apple Containers backend, 1 otherwise).
@@ -348,6 +383,7 @@ impl CommandError {
         CommandError::NotImplemented(_) => 1,
         CommandError::NotAvailableForFrontend { .. } => 1,
         CommandError::SquadKeyMissing => 1,
+        CommandError::AgentOwnerGone { .. } => 1,
         CommandError::Other(_) => 1,
     }
     }

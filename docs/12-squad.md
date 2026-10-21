@@ -1242,9 +1242,9 @@ bearer token rather than minting a key you would never see.
 
 ## Watching what your squad is running
 
-Containers your squad launches — both the evaluation agent and the workflow it
-generates — are visible in `awman status` like any other agent container,
-marked with an `squad:<task>` source instead of `session`, so you can always
+Agents your squad launches — both the evaluation agent and the workflow it
+generates — are visible in `awman agents status` and `awman agents list`,
+marked with a `squad:<task>` source instead of `session`, so you can always
 tell what your squad is doing versus what you started yourself. See
 [Agent Sessions: Monitoring running agents](03-agent-sessions.md#monitoring-running-agents).
 

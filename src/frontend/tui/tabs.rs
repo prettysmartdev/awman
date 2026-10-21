@@ -239,16 +239,18 @@ pub enum WorkflowStepKind {
 /// renderer reads from it. Mirrors the pattern used by `SharedStatusLog`.
 pub type SharedWorkflowViewState = Arc<Mutex<Option<WorkflowViewState>>>;
 
-/// Snapshot of the status dashboard for TUI table rendering.
+/// The latest `agents status` frame, rendered as a `Table` widget.
 #[derive(Debug, Clone)]
-pub struct StatusDashboardData {
-    pub containers: Vec<crate::command::commands::status::StatusContainerRow>,
-    pub tip: String,
+pub struct AgentsDashboardData {
+    pub overview: crate::command::commands::agents::AgentsOverview,
+    /// True while a `--watch` loop is refreshing this slot; drives the
+    /// footer ("Refreshing every 2s" vs. the collection time).
+    pub watching: bool,
 }
 
-/// Cross-thread shared status dashboard data. The status command writes here;
-/// the TUI renderer reads it to display a proper `Table` widget.
-pub type SharedStatusDashboard = Arc<Mutex<Option<StatusDashboardData>>>;
+/// Cross-thread shared dashboard slot. `agents status` writes here; the TUI
+/// renderer reads it to display a `Table` widget.
+pub type SharedAgentsDashboard = Arc<Mutex<Option<AgentsDashboardData>>>;
 
 /// Cross-thread shared yolo-countdown state. The engine ticks it every 100ms
 /// while a yolo countdown is active; the renderer reads it to display the
@@ -309,9 +311,9 @@ pub type SharedEngineTx =
 /// from it for tab-coloring (stuck indicator).
 pub type SharedStuckSender = Arc<Mutex<Option<Arc<tokio::sync::broadcast::Sender<StuckEvent>>>>>;
 
-/// Shared TUI context for the status command. The event loop refreshes this
-/// on every tick so the status watch loop always sees live tab data.
-pub type SharedTuiContext = Arc<Mutex<crate::command::commands::status::StatusCommandTuiContext>>;
+/// Shared TUI context for `agents status`. The event loop refreshes this on
+/// every tick so the watch loop always sees live tab data.
+pub type SharedTuiContext = Arc<Mutex<crate::command::commands::agents::AgentsTuiContext>>;
 
 #[derive(Debug, Clone)]
 pub struct YoloState {
@@ -643,8 +645,8 @@ pub struct TabSharedState {
     pub yolo_cancel_flag: SharedYoloCancelFlag,
     /// The tab's status log, appended to by `TuiUserMessageSink`.
     pub status_log: SharedStatusLog,
-    /// Structured `status` dashboard rows, rendered as a `Table` widget.
-    pub status_dashboard: SharedStatusDashboard,
+    /// The `agents status` dashboard, rendered as a `Table` widget.
+    pub agents_dashboard: SharedAgentsDashboard,
     /// Queue of container-slot lifecycle events, drained each tick.
     pub container_slot_events: SharedContainerSlotEvents,
     /// Signals the event loop to reset the vt100 parser between steps.
@@ -665,8 +667,12 @@ pub struct TabSharedState {
     pub stuck_sender_shared: SharedStuckSender,
     /// Active worktree path, driving the bottom-bar context line.
     pub active_worktree_path: SharedActiveWorktreePath,
-    /// Live TUI context refreshed each tick for `status --watch`.
+    /// Live TUI context refreshed each tick for `agents status --watch`.
     pub tui_context_shared: SharedTuiContext,
+    /// Cancels the command running in this tab where the command supports
+    /// it (`agents status --watch`, `agents attach`). Cancelled when the tab
+    /// starts another command or closes, or when the user stops a watch.
+    pub command_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl TabSharedState {
@@ -679,7 +685,7 @@ impl TabSharedState {
             yolo_state: Arc::new(Mutex::new(None)),
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
             status_log: Arc::new(Mutex::new(Vec::new())),
-            status_dashboard: Arc::new(Mutex::new(None)),
+            agents_dashboard: Arc::new(Mutex::new(None)),
             container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             pty_reset_flag: Arc::new(AtomicBool::new(false)),
             container_name_shared: Arc::new(Mutex::new(None)),
@@ -691,8 +697,9 @@ impl TabSharedState {
             stuck_sender_shared: Arc::new(Mutex::new(None)),
             active_worktree_path: Arc::new(Mutex::new(None)),
             tui_context_shared: Arc::new(Mutex::new(
-                crate::command::commands::status::StatusCommandTuiContext::default(),
+                crate::command::commands::agents::AgentsTuiContext::default(),
             )),
+            command_cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -709,6 +716,10 @@ impl TabSharedState {
     /// previous command cannot be observed by the new one. The log, workflow
     /// view and dashboard slots persist for the life of the tab.
     pub fn reset_for_new_command(&mut self) {
+        // Stop whatever the previous command left cancellable (a dashboard
+        // watch, an attach) before handing out a fresh token.
+        self.command_cancel.cancel();
+        self.command_cancel = tokio_util::sync::CancellationToken::new();
         self.workflow_context_path = Arc::new(Mutex::new(None));
         self.container_name_shared = Arc::new(Mutex::new(None));
         self.container_title_shared = Arc::new(Mutex::new(None));

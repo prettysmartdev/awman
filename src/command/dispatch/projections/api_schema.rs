@@ -38,6 +38,9 @@ impl CommandCatalogue {
                         .collect::<Vec<_>>(),
                 )
                 .expect("rest route must resolve");
+            if !spec.api_allowed {
+                continue;
+            }
             let mut params = Vec::new();
             for arg in spec.arguments {
                 params.push(json!({
@@ -156,6 +159,39 @@ mod tests {
         assert!(paths.contains_key("/v1/exec/workflow"));
     }
 
+    #[test]
+    fn agents_api_allowlist_excludes_attach_and_schema_hides_watch_parameter() {
+        let cat = CommandCatalogue::get();
+        let schema = cat.openapi_schema();
+        let paths = schema["paths"].as_object().unwrap();
+        assert_eq!(
+            paths
+                .keys()
+                .filter(|path| path.starts_with("/v1/agents/"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "/v1/agents/detail",
+                "/v1/agents/kill",
+                "/v1/agents/list",
+                "/v1/agents/status"
+            ]
+        );
+        for path in ["/v1/agents/status", "/v1/agents/list"] {
+            let params = paths[path]["post"]["parameters"].as_array().unwrap();
+            assert!(!params
+                .iter()
+                .any(|p| p["name"] == "watch" || p["name"] == "attach"));
+        }
+        let allowed = cat.api_allowed_commands();
+        assert!(allowed
+            .iter()
+            .any(|(group, leaf)| *group == "agents" && *leaf == "status"));
+        assert!(!allowed
+            .iter()
+            .any(|(group, leaf)| *group == "agents" && *leaf == "attach"));
+    }
+
     // Walk every leaf command in the catalogue and assert it appears in both
     // the rest_route_table and the openapi_schema paths.
     fn walk_and_verify_api_leaf(
@@ -172,8 +208,9 @@ mod tests {
                 "leaf {:?} missing from rest_route_table (expected path '{route_path}')",
                 path
             );
-            assert!(
+            assert_eq!(
                 schema_paths.contains_key(&route_path),
+                spec.api_allowed,
                 "leaf {:?} missing from openapi_schema (expected path '{route_path}')",
                 path
             );
@@ -214,7 +251,10 @@ mod tests {
             "/v1/ready",
             "/v1/chat",
             "/v1/specs/amend",
-            "/v1/status",
+            "/v1/agents/status",
+            "/v1/agents/list",
+            "/v1/agents/detail",
+            "/v1/agents/kill",
             "/v1/config/show",
             "/v1/config/get",
             "/v1/config/set",

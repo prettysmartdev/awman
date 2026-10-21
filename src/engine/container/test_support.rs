@@ -28,7 +28,8 @@ pub(crate) fn holding_runtime(frontends: HeldFrontends) -> Arc<ContainerRuntime>
     })))
 }
 
-struct HoldingBackend {
+#[derive(Default)]
+pub(super) struct HoldingBackend {
     frontends: HeldFrontends,
 }
 

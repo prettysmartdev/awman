@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn parse_unknown_flag_errors() {
         let cat = CommandCatalogue::get();
-        let err = parse("status --bogus", cat).unwrap_err();
+        let err = parse("agents status --bogus", cat).unwrap_err();
         assert!(matches!(err, CommandError::UnknownFlag { .. }));
     }
 

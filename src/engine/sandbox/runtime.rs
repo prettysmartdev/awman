@@ -26,6 +26,7 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
     has_image_store: false,
     image_acquisition: crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
     per_launch_vm_settings: false,
+    reports_resource_stats: false,
 };
 
 pub struct SandboxRuntime {
@@ -105,24 +106,12 @@ impl AgentRuntimeEngine for SandboxRuntime {
     }
 
     fn is_available(&self) -> bool {
-        // Probes `sbx ls` (per WI 0090): a missing binary and a logged-out
-        // session both make the runtime unusable, and `sbx ls` fails for both.
-        use std::process::Stdio;
-        let child =
+        crate::engine::host_cli::checked_output(
             std::process::Command::new(crate::engine::host_cli::program(self.backend.cli_binary()))
-                .arg("ls")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-        match child {
-            Ok(child) => crate::engine::container::runtime::wait_with_timeout(
-                child,
-                std::time::Duration::from_secs(10),
-            )
-            .map(|s| s.success())
-            .unwrap_or(false),
-            Err(_) => false,
-        }
+                .arg("ls"),
+            self.backend.cli_binary(),
+        )
+        .is_ok()
     }
 
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
@@ -630,5 +619,64 @@ mod tests {
                 rt.display_name()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod inspect_default_tests {
+    use super::*;
+    use crate::engine::agent_runtime::AgentRuntimeEngine;
+
+    struct InspectableBackend(AgentHandle);
+    impl super::SandboxBackend for InspectableBackend {
+        fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn list_running(&self) -> Result<Vec<AgentHandle>, EngineError> {
+            Ok(vec![self.0.clone()])
+        }
+        fn stats(&self, _: &AgentHandle) -> Result<AgentStats, EngineError> {
+            panic!("unsupported stats must not be sampled");
+        }
+        fn name(&self) -> &'static str {
+            "docker-sbx-experimental"
+        }
+        fn cli_binary(&self) -> &'static str {
+            "sbx"
+        }
+    }
+
+    #[test]
+    fn sandbox_probe_observes_collection_cancellation_before_spawning() {
+        let rt = SandboxRuntime::for_tests();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let start = std::time::Instant::now();
+        let available =
+            crate::engine::host_cli::with_collection_cancel(cancel, || rt.is_available());
+        assert!(!available);
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn sandbox_runtime_uses_the_default_inspect_without_stats() {
+        let handle = AgentHandle {
+            id: "sb1".into(),
+            name: "awman-sbx".into(),
+            image_tag: String::new(),
+            started_at: chrono::Utc::now(),
+        };
+        let rt = SandboxRuntime {
+            backend: Arc::new(InspectableBackend(handle.clone())),
+        };
+        assert!(!rt.capabilities().reports_resource_stats);
+        let d = rt.inspect(&handle).unwrap();
+        assert_eq!(d.name, "awman-sbx");
+        assert!(d.running);
+        assert_eq!((d.cpu_percent, d.memory_mb), (None, None));
+        assert!(d.owner.is_none());
+        assert!(d.runtime_extras.is_empty());
+        assert!(rt.list_stopped().unwrap().is_empty());
+        assert!(!rt.reattach_after_owner_exit());
     }
 }

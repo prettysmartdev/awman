@@ -30,6 +30,7 @@ use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend}
 use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
+use crate::command::commands::agents::AgentsCommandFrontend;
 use crate::command::commands::api_server::{
     ApiKeyDisclosure, ApiServerCommandFrontend, ApiServerRuntime,
 };
@@ -43,7 +44,6 @@ use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFronte
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
 use crate::command::commands::specs::SpecsCommandFrontend;
-use crate::command::commands::status::StatusCommandFrontend;
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
     WorktreeLifecycleFrontend, WorktreeMergeMode,
@@ -1078,7 +1078,35 @@ impl ReadyFrontend for ApiDispatchFrontend {
 
 impl RemoteCommandFrontend for ApiDispatchFrontend {}
 
-impl StatusCommandFrontend for ApiDispatchFrontend {}
+impl AgentsCommandFrontend for ApiDispatchFrontend {
+    fn render_overview(
+        &mut self,
+        overview: &crate::command::commands::agents::AgentsOverview,
+        watching: bool,
+    ) {
+        if !watching {
+            self.emit_agents_json(overview);
+        }
+    }
+    fn show_list(&mut self, outcome: &crate::command::commands::agents::AgentsListOutcome) {
+        self.emit_agents_json(&outcome.agents);
+    }
+    fn show_detail(&mut self, outcome: &crate::command::commands::agents::AgentsDetailOutcome) {
+        self.emit_agents_json(&outcome.detail);
+    }
+    fn show_kill_result(&mut self, outcome: &crate::command::commands::agents::AgentsKillOutcome) {
+        self.emit_agents_json(outcome);
+    }
+}
+
+impl ApiDispatchFrontend {
+    /// One stdout event contains the same JSON payload as the CLI.
+    fn emit_agents_json(&self, value: &impl serde::Serialize) {
+        self.event_bus.emit(EventPayload::StdoutLine(
+            serde_json::to_string(value).expect("agent outcomes are JSON serializable"),
+        ));
+    }
+}
 
 impl ConfigCommandFrontend for ApiDispatchFrontend {
     fn present_config_table(

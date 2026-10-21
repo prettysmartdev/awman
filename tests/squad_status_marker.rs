@@ -1,6 +1,6 @@
-//! WI 0101 — `awman status` renders the `squad:<task>` source marker.
+//! WI 0101 — `awman agents status` renders the `squad:<task>` source marker.
 //!
-//! The primary test drives the real `StatusCommand` end-to-end against a fake
+//! The primary test drives the real `AgentsStatusCommand` end-to-end against a fake
 //! `AgentRuntimeEngine` (no live Docker/Apple daemon needed) whose
 //! `list_running_all()` returns one squad-launched container and one plain
 //! session container, proving the marker is additive (the session row renders
@@ -14,14 +14,15 @@
 
 use std::sync::Arc;
 
-use awman::command::commands::status::{
-    ContainerKind, ContainerSource, StatusCommand, StatusCommandFlags, StatusCommandFrontend,
-    StatusOutcome,
+#[path = "helpers/mod.rs"]
+mod helpers;
+
+use awman::command::commands::agents::{
+    AgentSource, AgentState, AgentsStatusCommand, AgentsStatusFlags, AgentsStatusOutcome,
 };
 use awman::command::commands::Command;
 use awman::command::dispatch::Engines;
 use awman::data::fs::{ApiPaths, AuthPathResolver};
-use awman::data::message::{UserMessage, UserMessageSink};
 use awman::data::session::{AgentHandle, Session};
 use awman::data::WorkflowStateStore;
 use awman::engine::agent::AgentEngine;
@@ -80,6 +81,7 @@ impl AgentRuntimeEngine for FakeRuntime {
             has_image_store: false,
             image_acquisition: awman::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
             per_launch_vm_settings: false,
+            reports_resource_stats: true,
         };
         &CAPS
     }
@@ -96,7 +98,7 @@ impl AgentRuntimeEngine for FakeRuntime {
         Ok(self.handles.clone())
     }
     fn stats(&self, _handle: &AgentHandle) -> Result<AgentStats, EngineError> {
-        // `StatusCommand` treats a stats failure as best-effort (`.ok()`), so
+        // `AgentsStatusCommand` treats a stats failure as best-effort (`.ok()`), so
         // returning an error here (rather than panicking) exercises exactly
         // the path a real backend takes for a container it can't inspect.
         Err(EngineError::NotImplemented(
@@ -148,30 +150,17 @@ fn engines_with(runtime: Arc<dyn AgentRuntimeEngine>) -> Engines {
     }
 }
 
-// ─── A minimal frontend capturing the outcome ─────────────────────────────────
+// ─── Run the snapshot through the real command ────────────────────────────────
 
-#[derive(Default)]
-struct CapturingFrontend {
-    queue: Vec<UserMessage>,
-}
-
-impl UserMessageSink for CapturingFrontend {
-    fn write_message(&mut self, msg: UserMessage) {
-        self.queue.push(msg);
-    }
-    fn replay_queued(&mut self) {
-        self.queue.clear();
-    }
-}
-
-impl StatusCommandFrontend for CapturingFrontend {}
-
-async fn run_status(runtime: Arc<dyn AgentRuntimeEngine>) -> StatusOutcome {
-    let engines = engines_with(runtime);
-    let cmd = StatusCommand::new(StatusCommandFlags { watch: false }, engines);
-    cmd.run_with_frontend(Box::new(CapturingFrontend::default()))
+async fn run_status(runtime: Arc<dyn AgentRuntimeEngine>) -> AgentsStatusOutcome {
+    let matches = awman::command::dispatch::catalogue::CommandCatalogue::get()
+        .build_clap_command()
+        .try_get_matches_from(["awman", "agents", "status"])
+        .unwrap();
+    let cmd = AgentsStatusCommand::new(AgentsStatusFlags::default(), runtime);
+    cmd.run_with_frontend(Box::new(awman::frontend::cli::CliFrontend::new(matches)))
         .await
-        .expect("status command must succeed")
+        .expect("agents status command must succeed")
 }
 
 #[tokio::test]
@@ -182,65 +171,94 @@ async fn status_marks_squad_container_and_leaves_session_container_unmarked() {
     });
 
     let outcome = run_status(runtime).await;
-    assert_eq!(outcome.containers.len(), 2);
+    assert_eq!(outcome.overview.agents.len(), 2);
 
     let squad_row = outcome
-        .containers
+        .overview
+        .agents
         .iter()
         .find(|c| c.name == squad_name)
         .expect("squad container row must be present");
     assert_eq!(
         squad_row.source,
-        ContainerSource::Squad("issue-triage".to_string())
+        AgentSource::Squad("issue-triage".to_string())
     );
-    assert_eq!(
-        squad_row.source_label().as_deref(),
-        Some("squad:issue-triage")
-    );
-    assert_eq!(squad_row.kind, ContainerKind::Agent);
+    assert_eq!(squad_row.source_cell(), "squad:issue-triage");
+    assert_eq!(squad_row.state, AgentState::Running);
 
     let session_row = outcome
-        .containers
+        .overview
+        .agents
         .iter()
         .find(|c| c.name == "awman-1234-5678")
         .expect("session container row must be present");
     assert_eq!(
         session_row.source,
-        ContainerSource::Session,
-        "a plain session container must render exactly as today — unmarked"
+        AgentSource::Session,
+        "a plain session container must render exactly as today — unmarked as squad"
     );
-    assert_eq!(session_row.source_label(), None);
+    assert_eq!(session_row.source_cell(), "session");
 }
 
 #[tokio::test]
 async fn status_renders_squad_marker_in_the_dashboard_text() {
-    // Exercise the default `write_status_dashboard` text path too (used by
-    // the API/fallback frontend), not just the structured `StatusOutcome`.
-    #[derive(Clone, Default)]
-    struct TextCapturingFrontend {
-        lines: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-    impl UserMessageSink for TextCapturingFrontend {
-        fn write_message(&mut self, msg: UserMessage) {
-            self.lines.lock().unwrap().push(msg.text);
-        }
-        fn replay_queued(&mut self) {}
-    }
-    impl StatusCommandFrontend for TextCapturingFrontend {}
+    // Exercise the real TUI frontend and dashboard renderer, since status
+    // rendering now belongs to frontends rather than a Layer 2 default.
+    use awman::command::dispatch::catalogue::CommandCatalogue;
+    use awman::data::config::env::EnvSnapshot;
+    use awman::data::session_manager::SessionManager;
+    use awman::engine::agent_runtime::frontend::AgentIo;
+    use awman::frontend::tui::app::App;
+    use awman::frontend::tui::command_frontend::{DialogChannels, TuiCommandFrontend};
+    use awman::frontend::tui::tabs::Tab;
 
     let squad_name = generate_squad_container_name("nightly-audit");
     let runtime = Arc::new(FakeRuntime {
         handles: vec![handle(&squad_name)],
     });
-    let engines = engines_with(runtime);
-    let cmd = StatusCommand::new(StatusCommandFlags { watch: false }, engines);
-    let frontend = TextCapturingFrontend::default();
-    let captured = frontend.lines.clone();
-    // `write_status_dashboard`'s default body runs inline during
-    // `run_with_frontend`; capture it by driving the real command and
-    // inspecting what it queued through `write_message`.
-    let _ = cmd.run_with_frontend(Box::new(frontend)).await;
-    let combined = captured.lock().unwrap().join("\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let session = helpers::session_at(tmp.path());
+    let tab = Tab::new(session);
+    let shared = tab.shared();
+    let (dialog_tx, _dialog_rx) = std::sync::mpsc::channel();
+    let (_response_tx, response_rx) = std::sync::mpsc::channel();
+    let (stdout, _stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stderr, _stderr_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let catalogue = CommandCatalogue::get();
+    let parsed = awman::command::dispatch::parsed_input::parse("agents status", catalogue).unwrap();
+    let frontend = TuiCommandFrontend::new(
+        parsed,
+        DialogChannels::new(dialog_tx, response_rx),
+        AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        },
+        shared,
+    );
+    let cmd = AgentsStatusCommand::new(AgentsStatusFlags::default(), runtime.clone());
+    cmd.run_with_frontend(Box::new(frontend)).await.unwrap();
+    let mut app = App::new(
+        catalogue,
+        engines_with(runtime),
+        Arc::new(SessionManager::in_memory(EnvSnapshot::empty())),
+        tab,
+        tokio::runtime::Handle::current(),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| awman::frontend::tui::render::render_frame(&mut app, frame))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let combined = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
     assert!(
         combined.contains("squad:nightly-audit"),
         "dashboard text must contain the squad marker: {combined}"
@@ -253,7 +271,7 @@ async fn status_renders_squad_marker_in_the_dashboard_text() {
 // prove the same marker survives a round trip through a *real* backend's
 // `list_running_all()`: each tier plants one squad-named container and one
 // plain session-named container with a raw CLI call, then asserts `awman
-// status` marks exactly the first. Skips cleanly when the backend or the
+// agents status` marks exactly the first. Skips cleanly when the backend or the
 // image is unavailable.
 
 use std::process::{Command as OsCommand, Stdio};
@@ -286,7 +304,7 @@ fn remove_container(cli: &str, name: &str) {
 }
 
 /// Plant one squad container and one session container on a live backend and
-/// assert `awman status` marks exactly the squad one.
+/// assert `awman agents status` marks exactly the squad one.
 async fn assert_status_marks_squad_on(cli: &str, runtime: Arc<ContainerRuntime>) {
     let suffix = unique_suffix();
     let slug = format!("audit-{suffix}");
@@ -310,31 +328,34 @@ async fn assert_status_marks_squad_on(cli: &str, runtime: Arc<ContainerRuntime>)
     remove_container(cli, &session_name);
 
     let squad_row = outcome
-        .containers
+        .overview
+        .agents
         .iter()
         .find(|c| c.name == squad_name)
-        .unwrap_or_else(|| panic!("`awman status` must list the squad container {squad_name}"));
+        .unwrap_or_else(|| {
+            panic!("`awman agents status` must list the squad container {squad_name}")
+        });
     assert_eq!(
         squad_row.source,
-        ContainerSource::Squad(slug.clone()),
+        AgentSource::Squad(slug.clone()),
         "a squad-launched container must render as squad:{slug}"
     );
-    assert_eq!(
-        squad_row.source_label().as_deref(),
-        Some(&*format!("squad:{slug}"))
-    );
+    assert_eq!(squad_row.source_cell(), format!("squad:{slug}"));
 
     let session_row = outcome
-        .containers
+        .overview
+        .agents
         .iter()
         .find(|c| c.name == session_name)
-        .unwrap_or_else(|| panic!("`awman status` must list the session container {session_name}"));
+        .unwrap_or_else(|| {
+            panic!("`awman agents status` must list the session container {session_name}")
+        });
     assert_eq!(
         session_row.source,
-        ContainerSource::Session,
+        AgentSource::Session,
         "a user session's container must render exactly as it does today"
     );
-    assert_eq!(session_row.source_label(), None);
+    assert_eq!(session_row.source_cell(), "session");
 }
 
 // ─── Docker tier (skip cleanly if unavailable) ──────────────────────────────
