@@ -19,22 +19,32 @@ archive=$(field archive); archive_hash=$(field archive_sha256)
 firmware=$(field firmware); agent=$(field agent); agent_hash=$(field agent_sha256)
 dest="$root/third_party/msb-payloads/$target"
 mkdir -p "$dest" "$root/third_party/msb-payloads/$arch"
+# Downloads are cached and pinned by the manifest. A cached file whose hash no
+# longer matches (e.g. left over from a previously pinned version) is discarded
+# and fetched again; a fresh download that still mismatches is an error.
+fetch_pinned() {
+    local name=$1 path=$2 expected=$3 actual
+    if [ -f "$path" ] && [ "$(hash_file "$path")" != "$expected" ]; then
+        echo "discarding stale cached $name: $path" >&2
+        rm -f "$path"
+    fi
+    if [ ! -f "$path" ]; then
+        curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v$version/$name" -o "$path.part"
+        mv "$path.part" "$path"
+    fi
+    actual=$(hash_file "$path")
+    [ "$actual" = "$expected" ] || { echo "$name hash mismatch: $actual (expected $expected)" >&2; exit 3; }
+}
 download="$dest/$archive"
-if [ ! -f "$download" ]; then
-    curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v$version/$archive" -o "$download"
-fi
-actual_archive_hash=$(hash_file "$download")
-[ "$actual_archive_hash" = "$archive_hash" ] || { echo "archive hash mismatch: $actual_archive_hash; remove stale cache $download and rerun" >&2; exit 3; }
+fetch_pinned "$archive" "$download" "$archive_hash"
+actual_archive_hash=$archive_hash
 tar xf "$download" -C "$dest" "$firmware"
 cc_bin=${CC:-cc}
 "$cc_bin" -Wall -Wextra -Werror "$root/tools/msb-payloads/extract-kernel.c" -o "$dest/extract-kernel" ${link_flags[@]+"${link_flags[@]}"}
 "$dest/extract-kernel" "$dest/$firmware" "$dest/kernel.bin" > "$dest/kernel.meta"
 agent_path="$root/third_party/msb-payloads/$arch/agentd"
-if [ ! -f "$agent_path" ]; then
-    curl -fsSL --retry 3 "https://github.com/superradcompany/microsandbox/releases/download/v$version/$agent" -o "$agent_path"
-fi
-actual_agent_hash=$(hash_file "$agent_path")
-[ "$actual_agent_hash" = "$agent_hash" ] || { echo "agent hash mismatch: $actual_agent_hash; remove stale cache $agent_path and rerun" >&2; exit 3; }
+fetch_pinned "$agent" "$agent_path" "$agent_hash"
+actual_agent_hash=$agent_hash
 actual_kernel_hash=$(hash_file "$dest/kernel.bin")
 source_revision=$(awk -F'"' '/^microsandbox_revision =/ {print $2; exit}' "$manifest")
 libkrun_revision=$(awk -F'"' '/^libkrun_revision =/ {print $2; exit}' "$manifest")
@@ -57,7 +67,9 @@ EOF
 cat "$dest/provenance.txt"
 cat "$dest/kernel.meta"
 if [ "$(field status)" != verified ]; then
-    echo "Payload evidence was recorded. Review compatibility and evidence on this native target, update the manifest hashes/metadata and set status=verified only after matching verification." >&2
-    exit 3
+    # Exit 4 (not 3) so `make payloads-verify` can tell "recorded, awaiting
+    # verification" apart from a download or hash failure.
+    echo "Payload evidence was recorded. Run \`make payloads-verify\` on this native host to run the required gates and mark the payload verified." >&2
+    exit 4
 fi
 bash "$root/tools/msb-payloads/verify.sh" "$target"

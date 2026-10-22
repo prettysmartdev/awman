@@ -9,7 +9,7 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
-.PHONY: all build sign-macos install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
+.PHONY: all build sign-macos install test test-fast test-full test-builtin payloads payloads-verify clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
 
 all: build
 
@@ -38,6 +38,13 @@ sign-macos:
 
 payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
+
+# Native, one-time promotion of a new payload pin: fetches the payload, writes
+# a candidate verified record, runs the hardware/clean-checkout/release-artifact
+# gates, and keeps the record only if all pass. Needs a clean checkout, HVF or
+# KVM, and a running Docker or Apple Containers engine for the guest fixtures.
+payloads-verify:
+	bash tools/msb-payloads/payloads-verify.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 
 # Explicit verification entrypoints; native hardware targets fail closed when
 # KVM/HVF or the fixture is absent. `TARGET` is a Rust target triple.
