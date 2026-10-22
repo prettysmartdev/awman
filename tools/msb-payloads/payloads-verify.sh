@@ -15,10 +15,11 @@
 #   4. Optimized release build, signed on macOS, traced through
 #      tools/release-artifact-check.sh with the offline fixture session.
 #
-# Fixtures: AWMAN_TEST_BUILTIN_BASE_TAR (docker-archive) and
-# AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE (oci-archive) are used when set;
-# otherwise both are made from alpine:3.22 with a pinned skopeo image under
-# Docker, or Apple Containers when Docker is not running.
+# Fixtures: AWMAN_TEST_BUILTIN_BASE_TAR (docker-archive alpine base) and
+# AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE (the promoted fixture built from it by
+# tools/oci-runtime-spike/fixture) are used when set; otherwise the base comes
+# from a pinned skopeo image under Docker, or Apple Containers when Docker is
+# not running, and the fixture is built from it.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
 target=${1:?usage: payloads-verify.sh TARGET_TRIPLE}
@@ -85,29 +86,28 @@ git --no-pager diff -- "$manifest"
 bash tools/msb-payloads/verify.sh "$target"
 
 step "Prepare guest fixtures"
-# The same disposable alpine fixtures CI makes, in the two layouts the gates
-# import. skopeo runs from a digest-pinned image under the local container
-# engine (Docker preferred, else Apple Containers), with only an empty
-# output directory mounted.
+# The gates boot the promoted fixture image, which
+# tools/oci-runtime-spike/fixture builds from a docker-save alpine base (a
+# plain alpine archive is not a valid fixture). skopeo makes that base from a
+# digest-pinned image under the local container engine (Docker preferred,
+# else Apple Containers), with only an empty output directory mounted.
 skopeo_image=quay.io/skopeo/stable:v1.22.3-immutable@sha256:c0ee1f4edca5c01cb8d5611124f92f3cc47196ecab68aee5d0f90834e00574d5
 base_tar=${AWMAN_TEST_BUILTIN_BASE_TAR:-}
 fixture=${AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE:-}
-if [ -z "$base_tar" ] || [ -z "$fixture" ]; then
+mkdir "$work/fixtures"
+if [ -z "$base_tar" ]; then
     if docker info >/dev/null 2>&1; then engine=(docker run --rm --user "$(id -u):$(id -g)")
     elif container system status >/dev/null 2>&1; then engine=(container run --rm)
-    else blocked "start Docker or Apple Containers to build the guest fixtures (or set AWMAN_TEST_BUILTIN_BASE_TAR and AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE)"
+    else blocked "start Docker or Apple Containers to build the guest fixture base (or set AWMAN_TEST_BUILTIN_BASE_TAR)"
     fi
     echo "using ${engine[0]} to run skopeo"
-    mkdir "$work/fixtures"
-    run_skopeo() { "${engine[@]}" --volume "$work/fixtures:/out" "$skopeo_image" "$@"; }
-fi
-if [ -z "$base_tar" ]; then
-    run_skopeo copy --override-os linux --format v2s2 docker://docker.io/library/alpine:3.22 docker-archive:/out/base.tar
+    "${engine[@]}" --volume "$work/fixtures:/out" "$skopeo_image" \
+        copy --override-os linux --format v2s2 docker://docker.io/library/alpine:3.22 docker-archive:/out/base.tar
     base_tar=$work/fixtures/base.tar
 fi
 if [ -z "$fixture" ]; then
-    run_skopeo copy --override-os linux --format oci docker://docker.io/library/alpine:3.22 oci-archive:/out/fixture.tar
-    fixture=$work/fixtures/fixture.tar
+    cargo run --locked --quiet --manifest-path tools/oci-runtime-spike/fixture/Cargo.toml -- "$base_tar" "$work/fixtures"
+    fixture=$work/fixtures/fixture-oci.tar
 fi
 [ -f "$base_tar" ] && [ -f "$fixture" ] || blocked "guest fixture archives missing"
 export AWMAN_TEST_BUILTIN_BASE_TAR=$base_tar AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE=$fixture
