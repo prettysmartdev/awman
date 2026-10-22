@@ -14,16 +14,18 @@ awman also gains a set of "built in" skills. They are hosted in the GH repo and 
 
 **Decisions (confirmed with the maintainer):**
 
-1. **Image definition: install steps plus an escape hatch.** A custom agent's TOML declares `[image] install = [...]` (plus optional `needs_node`, `apt` and `binary`). awman renders these into one hardened Dockerfile wrapper (root install → strict shell → `awman` user → `/workspace` → smoke test) and writes it to `.awman/Dockerfile.<name>`. Setting `image.dockerfile = "<file>"` uses a hand-written Dockerfile instead. The same TOML also feeds the Docker Sandboxes (sbx) kit.
-2. **First-party agents stay a Rust table but share one struct.** `AgentMatrix` (all `&'static`) becomes an owned `AgentDefinition`. The first-party table builds `AgentDefinition` values in Rust, and custom TOML files deserialize into a Layer 0 file schema that converts into the same `AgentDefinition`. Every consumer (option builders, overlays, sbx, launch policy) reads `AgentDefinition` and does not care where it came from. First-party-only strategies (Claude settings sanitising, keychain credentials, host ping) can't be selected from TOML.
-3. **Repo-scoped definitions need confirmation once per content hash.** Global definitions (`~/.awman/agents/`) are trusted. A repo-scoped definition (`.awman/agents/`) must be reviewed and approved once per content hash before awman builds or launches it. The approval is recorded in `~/.awman/trusted-agents.json`. A host-path deny-list applies in every scope.
+1. **Image definition: install steps plus an escape hatch.** A custom agent's TOML declares `[image] install = [...]` (plus optional `needs_node`, `apt` and `binary`). awman renders these into one hardened Dockerfile wrapper (root install → strict shell → `awman` user → `/workspace` → smoke test) and writes it to `.awman/Dockerfile.<name>`. Setting `image.dockerfile = "<file>"` uses a hand-written Dockerfile instead.
+2. **First-party agents stay a Rust table but share one struct.** `AgentMatrix` (all `&'static`) becomes an owned `AgentDefinition`. The first-party table builds `AgentDefinition` values in Rust, and custom TOML files deserialize into a Layer 0 file schema that converts into the same `AgentDefinition`. Every consumer (option builders, overlays, sbx, launch policy) reads `AgentDefinition` and does not care where it came from. First-party-only strategies (Claude settings sanitising, keychain credentials) can't be selected from TOML. A custom agent's host ping is optional and comes only from its own `[ping]` table (§1, §6).
+3. **Repo-scoped definitions need confirmation once per content hash.** Global definitions (`~/.awman/agents/`) are trusted, unless they declare a host `[ping]` (see the defaults below). A repo-scoped definition (`.awman/agents/`) must be reviewed and approved once per content hash before awman builds or launches it. The approval is recorded in `~/.awman/trusted-agents.json`. A host-path deny-list applies in every scope.
 4. **The builtin skills library lives in the awman repo and is cloned sparse and shallow.** Skills live under `skills/` in `prettysmartdev/awman`. `awman new skill --pull builtin` maps to that repo and subdir. The skill-library clone path learns a sparse, shallow mode so only `skills/` is fetched; a full clone is about 300 MB because of `third_party/`.
+5. **Container-class runtimes only.** Custom agents run on Docker, Apple Containers and builtin-experimental, which all consume the rendered Dockerfile. Docker Sandboxes (`docker-sbx-experimental`) support for custom agents is deferred; the design is kept in the [appendix](#appendix-deferred-docker-sandboxes-support-for-custom-agents).
 
 **Defaults chosen in this work item (not separately confirmed; change them during review if needed):**
 
 - **First-party names are reserved.** A custom file named after a first-party agent (`claude.toml`) is ignored with a warning and never shadows the built-in. If repo and global scope both define the same name, **repo wins**.
 - **crush and maki are removed outright**, with no compatibility shim. They ship as example definitions (`awman new agent crush --from crush`). A config naming `crush`/`maki` with no definition fails with an error that names that command.
-- **Custom agents are never run on the host.** The `awman ready` host ping (the one sanctioned host-side agent execution, `src/engine/ready/host_agent.rs`) is always **skipped** for custom agents.
+- **The host ping is opt-in per definition.** The `awman ready` host ping (the one sanctioned host-side agent execution, `src/engine/ready/host_agent.rs`) runs for a custom agent only when its TOML declares `[ping] command = [...]`. Without that table, `ready` **skips** the host check. A custom agent is never run on the host in any other way, and the credential refresh monitor never pings custom agents.
+- **A definition with a host ping always needs approval, in any scope.** Global definitions without `[ping]` stay trusted as in decision 3. A definition that declares `[ping]`, whether repo or global, is approved once per content hash, and the approval prompt shows the exact host command.
 - **A small `awman new agent <name>` scaffold command** is added (`--global`, `--from <example>`) so that creating a definition by hand has a CLI path that matches `awman new skill`.
 
 
@@ -103,6 +105,9 @@ flag = "--append-system-prompt"   # required for append-file / append-inline / r
 [acp]                             # optional; presence ⇒ supports_acp = true
 command = ["pi", "--acp"]
 
+[ping]                            # optional; absent ⇒ `awman ready` skips the host check for this agent
+command = ["pi", "-p"]            # argv run ON THE HOST by `awman ready`; awman appends one fixed greeting as the last argument
+
 [settings]                        # optional
 host_dir = ".pi"                  # relative to $HOME; mounted rw at <container_home>/.pi when it exists on the host
 skills_dir = ".pi/agent/skills"   # relative to container $HOME; absent ⇒ skills overlay skipped with the existing warning
@@ -118,11 +123,6 @@ install = [                       # required unless `dockerfile` is set; one RUN
 ]
 binary = "pi"                     # optional; smoke-tested binary, default = run.command[0]
 # dockerfile = "pi.Dockerfile"    # escape hatch; relative to this TOML's directory; excludes needs_node/apt/install
-
-[sandbox]                         # optional; presence ⇒ the docker-sbx-experimental runtime is supported
-install = ["for i in 1 2 3 4 5; do npm i -g @mariozechner/pi-coding-agent && break; sleep 3; done"]  # default = image.install
-allowed_domains = ["api.anthropic.com", "registry.npmjs.org"]   # required when [sandbox] is present
-proxy_env = ["ANTHROPIC_API_KEY"] # optional; must map to a known sbx service (engine::auth::service_for_credential)
 ```
 
 **Validation rules** live in one function, `AgentDefinitionFile::validate`, which returns every violation rather than only the first:
@@ -131,16 +131,16 @@ proxy_env = ["ANTHROPIC_API_KEY"] # optional; must map to a known sbx service (e
 |---|---|
 | `schema` | Must be `1`. A higher value fails with `"<path>: schema N requires a newer awman (this build supports 1)"`. |
 | argv tokens (`run.command`, flags, `acp.command`) | Must be non-empty, contain no NUL or newline characters, and not exceed 1024 bytes. `run.command[0]` must be a bare binary name or an absolute container path, with no `/` other than as an absolute prefix. Nothing is ever passed through a shell. |
+| `ping.command` | Optional. When present it must be non-empty and follows the argv token rules. `command[0]` must be a bare binary name (resolved on the host `PATH`) or an absolute host path; relative paths such as `./pi` or `bin/pi` are rejected, because the ping runs in a temporary directory and must never pick up a repo-planted file. At most 16 tokens. |
 | `system_prompt` | Each delivery requires the keys shown above, and unrelated keys are rejected. |
 | `run.env` keys | Must be POSIX env names. `HOME`, `PATH`, `USER`, `AWMAN_*` and `LD_*` are rejected. |
 | `auth.env` | Must be POSIX env names. `AWMAN_*` and `SSH_AUTH_SOCK` are rejected. |
 | `settings.host_dir` | Must be relative and normalised: no `..`, no leading `/`, not empty and not `.`. It must not be on or under the **deny-list**: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.config/gcloud`, `.kube`, `.docker`, `.awman`, `.netrc`, `.git-credentials`, `.config/gh`, `.password-store`, `.local/share/keyrings`, `Library/Keychains`. |
 | `settings.skills_dir` | Must be relative with no `..`. |
-| `image.install` / `sandbox.install` entries | Must be non-empty, single-line (no `\n`) and at most 4096 bytes. Multi-step installs use multiple entries, because heredoc `RUN` would require BuildKit, which the Apple and builtin builders do not guarantee. |
+| `image.install` entries | Must be non-empty, single-line (no `\n`) and at most 4096 bytes. Multi-step installs use multiple entries, because heredoc `RUN` would require BuildKit, which the Apple and builtin builders do not guarantee. |
 | `image.apt` | Each entry must match `^[a-z0-9][a-z0-9+.-]*$`. |
 | `image.dockerfile` | Must be a relative path inside the TOML's own directory (no `..`, no symlink escaping it). It is mutually exclusive with `install`, `apt` and `needs_node`. If neither `install` nor `dockerfile` is set, the file is invalid. |
-| `sandbox.allowed_domains` | Must be hostnames only (no scheme or path). |
-| `sandbox.proxy_env` | Each entry must resolve through `service_for_credential`. |
+| `sandbox` | Not accepted in schema 1. A top-level `[sandbox]` table fails with `"<path>: custom agents do not support Docker Sandboxes yet; remove [sandbox] and use docker, apple or builtin-experimental"` rather than the generic unknown-field error, and the key stays reserved for the deferred design. |
 
 ### 2. One shared type: `AgentDefinition`
 
@@ -152,7 +152,7 @@ src/data/fs/agent_dirs.rs             // Layer 0: AgentDirs { repo_dir(), global
 src/data/fs/agent_trust.rs            // Layer 0: TrustStore read/write (~/.awman/trusted-agents.json)
 src/engine/agent/definition.rs        // AgentDefinition + the enums (moved out of agent_matrix.rs), validate_run/mode_flags/entrypoint helpers
 src/engine/agent/first_party.rs       // the Rust table: FIRST_PARTY_AGENTS + first_party(name) -> Option<AgentDefinition>
-src/engine/agent/custom.rs            // AgentDefinitionFile -> AgentDefinition conversion; Dockerfile + sbx kit rendering
+src/engine/agent/custom.rs            // AgentDefinitionFile -> AgentDefinition conversion; Dockerfile rendering
 src/engine/agent/registry.rs          // AgentRegistry: resolve(name, git_root) -> ResolvedAgent; list(git_root)
 ```
 
@@ -178,7 +178,7 @@ src/engine/agent/registry.rs          // AgentRegistry: resolve(name, git_root) 
       UserDockerfile { path: PathBuf },         // custom escape hatch
   }
   ```
-- New `sandbox: Option<SandboxSpec>` for custom agents only. First-party agents keep their embedded kit templates; `SbxKitKind` stays as it is.
+- First-party agents keep their embedded sbx kit templates; `SbxKitKind` stays as it is. There is no custom sandbox field (§4).
 - The `agent` field is renamed `name: String`.
 
 **Fields that TOML can't set.** `AgentDefinitionFile → AgentDefinition` hardcodes these for every custom agent, which keeps the first-party special cases out of reach of untrusted input:
@@ -187,14 +187,11 @@ src/engine/agent/registry.rs          // AgentRegistry: resolve(name, git_root) 
 |---|---|
 | `settings_mount` | `Direct(host_dir)` or `None`, never `Claude` or `Antigravity` |
 | `credential_source` | `None` |
-| `ping_argv` | empty; `HostAgentPinger` treats `origin: Custom` as "skip" (§6) |
 | `supports_stdin_injection` | `false` |
-| `sbx_kit_kind` | `Agent` |
-| `sandbox_permission_mode_supported` | `false` |
-| `sandbox_auth_env_vars` | empty; matches today's `kind: agent` kits, which do not take part in launch-time auto-auth |
-| `sandbox_model_note`, `deprecation_note` | `None` |
+| sandbox fields (`sbx_kit_kind`, `sandbox_permission_mode_supported`, `sandbox_auth_env_vars`, `sandbox_model_note`) | neutral defaults (`Agent`, `false`, empty, `None`). They are never read, because custom agents are refused under sandbox-class runtimes before any sbx code runs (§4). |
+| `deprecation_note` | `None` |
 
-**`ping_argv` is no longer universal.** It becomes `Option<Vec<String>>`, and `AgentDefinition::ping_command` returns `Option<(String, Vec<String>)>`. Remove the `.expect("every agent declares a ping binary")`.
+**`ping_argv` is no longer universal.** It becomes `Option<Vec<String>>`: `Some` for every first-party agent (unchanged values), and `ping.command` or `None` for a custom agent. `AgentDefinition::ping_command` returns `Option<(String, Vec<String>)>`. Remove the `.expect("every agent declares a ping binary")`. Custom pings get no cheapest-model pinning; a definition that wants one puts the model flag in `ping.command`.
 
 **Lookups:**
 
@@ -215,7 +212,7 @@ impl AgentRegistry {
 - Every other current `matrix_for` caller moves to `AgentRegistry::resolve` with the session's git root. Today these are `AgentEngine::build_options_with_credentials` / `build_sandbox_options` (`agent/mod.rs:371, 656`), `launch_policy.rs` (100, 126, 249), `workflow_preflight.rs:61`, `overlay/skills.rs:41`, `overlay/agent_settings.rs:61`, `sandbox/options.rs:138`, `sandbox/dsbx/backend.rs:110, 428`, `sandbox/dsbx/auth.rs:35` and `ready/host_agent.rs:158`. Inside `AgentEngine`, resolve **once** at the top of each option builder and pass `&AgentDefinition` to the helpers. Don't re-resolve per helper, because a file edited mid-launch must not produce a mixed definition.
 - The unknown-agent error becomes `EngineError::UnknownAgent { name, first_party: Vec<String>, custom: Vec<String> }` and renders as:
   `unknown agent 'foo'; first-party: claude, codex, …; custom: pi (repo); define one with: awman new agent foo`
-  If the name is `crush` or `maki`, a dedicated line is appended: `'crush' is no longer built in — recreate it with: awman new agent crush --from crush`.
+  If the name is `crush` or `maki`, a dedicated line is appended: `'crush' is no longer built in — recreate it with: awman new agent crush --from crush`. When the active runtime is sandbox-class, it adds: `(custom agents run on docker, apple or builtin-experimental; Docker Sandboxes support is not available for them yet)`.
 - `SUPPORTED_AGENTS` is renamed `FIRST_PARTY_AGENTS` and loses `crush` and `maki`. The test loops over it in `matrix_tests.rs`, `agent_settings.rs`, `sandbox/options.rs` and `launch_policy.rs:306` keep working against the 7 first-party entries.
 - The `self.agent != "claude"` check in `validate_tool_restrictions` stays name-based. That is safe because first-party names are reserved, but it gets a comment saying so.
 
@@ -265,15 +262,14 @@ The call sites to switch are `agent/mod.rs:262` (`ensure_available`), `image_pre
 
 **Every runtime works without runtime-specific code.** Docker, Apple Containers and builtin-experimental (via `AgentImagePreparer` and its builder or import sources) all consume a Dockerfile path plus `agent_image_tag`, so custom agents need nothing new from them. The Layer 1 `BuildPolicy` rules in `security.md` apply unchanged.
 
-**Docker Sandboxes (sbx).**
+**Docker Sandboxes (sbx): not supported for custom agents.**
 
-- First-party agents keep their embedded `sbx-kit.<agent>.yaml` / `sbx-apply.<agent>.sh`.
-- Custom agents with `[sandbox]` get a `kind: agent` kit built **as a `serde_yaml` value**, not by string substitution, so a user string can't inject YAML. The kit uses base `docker/sandbox-templates:shell-docker`, entrypoint `run.command`, `commands.install` from `sandbox.install` (each entry gets the same `description`) and `network.allowedDomains`. `credentials.sources` / `environment.proxyManaged` come from `proxy_env` via `service_for_credential`.
-- The startup script is a single generic `templates/sbx-apply.custom.sh`. This is today's `sbx-apply.crush.sh` with the agent name replaced by `$AWMAN_AGENT_NAME`; the crush and maki scripts are already generic.
-- A custom agent **without** `[sandbox]` under the sbx runtime fails at `DSbxKitEmitter::emit_for_agent` with `agent 'pi' does not declare [sandbox] support in <path>; add a [sandbox] table or use another runtime`.
-- `DSbxKitEmitter::emit_for_agent` takes `&AgentDefinition` instead of `&str`.
+- First-party agents keep their embedded `sbx-kit.<agent>.yaml` / `sbx-apply.<agent>.sh`, and the sbx code path is unchanged for them. `DSbxKitEmitter::emit_for_agent` keeps taking the agent name.
+- A custom agent under a sandbox-class runtime is refused with `EngineError::CustomAgentRuntimeUnsupported { name, runtime }`, which renders as `custom agent 'pi' runs only on container runtimes (docker, apple, builtin-experimental); 'docker-sbx-experimental' is not supported for custom agents yet`. It maps to the same exit class as other unsupported-runtime errors in `aspec/uxui/cli.md`.
+- **Enforcement point:** one check in `AgentEngine`, at the top of the option builders, on the same `runtime.capabilities()` branch that already chooses the sandbox paradigm (F-40b). The check runs before any kit emission, Dockerfile render or image work. `ready`, `chat`, `exec prompt`, `exec workflow` (during `workflow_preflight`, per agent) and squad all reach it, so none of them has its own copy. `awman ready` under sbx reports it as a failed step.
+- The trust check runs first, so an untrusted definition still gets the trust error rather than the runtime error.
 
-**Removed files:** `templates/Dockerfile.crush`, `Dockerfile.maki`, `sbx-kit.crush.yaml`, `sbx-kit.maki.yaml`, `sbx-apply.crush.sh` and `sbx-apply.maki.sh`, along with their arms in `src/data/templates/mod.rs`. Older awman binaries that try to download `Dockerfile.crush` from `main` get a 404 and fall back to their bundled copy, so removing the upstream file doesn't break them.
+**Removed files:** `templates/Dockerfile.crush`, `Dockerfile.maki`, `sbx-kit.crush.yaml`, `sbx-kit.maki.yaml`, `sbx-apply.crush.sh` and `sbx-apply.maki.sh`, along with their arms in `src/data/templates/mod.rs`. Older awman binaries that try to download `Dockerfile.crush` from `main` get a 404 and fall back to their bundled copy, so removing the upstream file doesn't break them. Removing the crush/maki kits means **crush and maki lose sbx support** until the deferred design lands; this is accepted for now (see §8 and the appendix).
 
 ### 5. Launch-time behaviour for custom agents
 
@@ -286,28 +282,46 @@ The call sites to switch are `agent/mod.rs:262` (`ensure_available`), `image_pre
 
 ### 6. Security
 
-- **Host execution:** `HostAgentPinger::ping_command` returns `None` for `AgentOrigin::Custom`. In `ReadyPhase::CheckingLocalAgent`, `None` reports `StepStatus::Skipped("custom agents are never run on the host")` and `summary.local_agent = Skipped`. Update the module doc in `host_agent.rs` and the `SECURITY EXCEPTION` comment in `ready/phases.rs` to say that the exception covers first-party agents only. `CredentialRefreshMonitor` never registers custom agents, because `refreshable_spec_for` is `None` for them.
+- **Host execution:**
+  - `HostAgentPinger::ping_command` takes the resolved `&AgentDefinition` and returns `AgentDefinition::ping_command(greeting)`. Remove the pre-F-32 `<name> --print <greeting>` catch-all: an unknown name now fails with `UnknownAgent` at resolve time, before `ready` reaches the ping, so no argv is ever invented for an agent.
+  - In `ReadyPhase::CheckingLocalAgent`, `None` reports `StepStatus::Skipped("no [ping] command in <path>; host check skipped")`, sets `summary.local_agent = Skipped`, and spawns nothing.
+  - A custom `Some` ping runs through the same sanctioned path as first-party pings, with the same constraints: argv only (no shell), the prompt is one entry from the hardcoded `GREETINGS` table appended as the last argument, and the process runs in a fresh empty `0700` temporary directory outside the repository. `run.env`, `auth.env` and every other TOML field are **not** applied to the host process.
+  - Results are reported exactly as for a first-party agent (not installed, not authenticated, ok).
+  - The ping runs only from `awman ready`. `CredentialRefreshMonitor` never registers custom agents, because `refreshable_spec_for` is `None` for them.
+  - Update the module doc in `host_agent.rs` and the `SECURITY EXCEPTION` comment in `ready/phases.rs`: the exception covers first-party pings and the `[ping]` command of an **approved** custom definition, nothing else.
 - **Trust store (`src/data/fs/agent_trust.rs`):** `~/.awman/trusted-agents.json` is written atomically with mode `0600`:
   ```json
-  { "version": 1, "entries": [ { "git_root": "/abs/canonical/repo", "name": "pi", "sha256": "…", "approved_at": "RFC3339" } ] }
+  { "version": 1, "entries": [
+    { "scope": "repo", "git_root": "/abs/canonical/repo", "name": "pi", "sha256": "…", "approved_at": "RFC3339" },
+    { "scope": "global", "path": "/abs/canonical/.awman/agents/pi.toml", "name": "pi", "sha256": "…", "approved_at": "RFC3339" }
+  ] }
   ```
-  - Only **repo-scope** definitions are checked. Global ones are user-authored and outside any cloned repo.
-  - The key is `(canonical git_root, name, sha256)`. Any edit to the TOML, or to its escape-hatch Dockerfile, requires a new approval, and the old entry for that `(git_root, name)` is replaced.
+  - **Repo-scope** definitions are always checked.
+  - **Global-scope** definitions are checked only when they declare `[ping]`, because that is the one field that runs on the host. A global definition without `[ping]` is user-authored, outside any cloned repo, and needs no approval.
+  - The repo key is `(canonical git_root, name, sha256)`. The global key is `(canonical path, sha256)`, approved once for every repo.
+  - Any edit to the TOML (including its `[ping]`), or to its escape-hatch Dockerfile, changes the hash and requires a new approval. The old entry for the same repo/name or global path is replaced.
 - **Enforcement points:**
-  - **Engine (fail-closed):** `AgentRegistry::resolve` returns `EngineError::AgentDefinitionUntrusted { name, path, sha256 }` for an unapproved repo definition. Commands that only *list* agents call `AgentRegistry::list`, which doesn't enforce trust. This guarantees that no build, launch, kit emission or Dockerfile render happens for an untrusted definition, however the request arrives (CLI, TUI, API, squad daemon, workflows).
+  - **Engine (fail-closed):** `AgentRegistry::resolve` returns `EngineError::AgentDefinitionUntrusted { name, path, sha256 }` for an unapproved definition that needs approval (any repo definition, or a global one with `[ping]`). Commands that only *list* agents call `AgentRegistry::list`, which doesn't enforce trust. This guarantees that no build, launch, kit emission or Dockerfile render happens for an untrusted definition, however the request arrives (CLI, TUI, API, squad daemon, workflows).
   - **Command layer (prompt):** a new `launch_policy::ensure_agent_trusted(frontend, …)` runs before the resolve in `ready`, `chat`, `exec prompt`, `exec workflow` (once per distinct agent across all steps, during `workflow_preflight`) and `new agent`. On a CLI or TUI with a user present, it shows a review summary and asks for confirmation through the existing confirmation dialog trait. On a yes, it writes the trust entry and continues. On a no, it exits with code 1 and the message `agent definition 'pi' was not approved`.
   - **Non-interactive contexts** (the API, the squad daemon, `-n` with no TTY, `--yes`-less headless) never prompt. They fail with `agent definition 'pi' (<path>) has not been approved for this repo; run 'awman ready --agent pi' interactively to review it`. `--yes` does **not** imply trust: approving code that runs builds must be an explicit, per-definition act.
 - **Review summary contents** (one renderer, shared by CLI and TUI, in the command-layer outcome type):
+  - **The host command, first and set apart**, when `[ping]` is present:
+    ```
+    ⚠ `awman ready` will run this command ON YOUR HOST (not in a container):
+        pi -p '<greeting>'
+      from an empty temporary directory outside the repo, where <greeting> is one of
+      awman's built-in greetings (e.g. 'Hello'). Check that this is the agent you expect.
+    ```
+    The argv is rendered shell-quoted, token by token, exactly as it will be passed (it is never run through a shell). When `command[0]` is a bare name, the line below it shows the path it resolves to on the host `PATH` right now, or "not found on PATH". When `[ping]` is absent, the summary says "no host command: `awman ready` will skip the host check".
   - display name, scope and path
   - homepage
-  - each `image.install` / `sandbox.install` step verbatim, or the escape-hatch Dockerfile path and line count
+  - each `image.install` step verbatim, or the escape-hatch Dockerfile path and line count
   - `settings.host_dir`, flagged ⚠ when it is another first-party agent's settings dir (e.g. `.claude`, `.codex`)
   - `auth.env` names (never values)
   - `run.env` keys
-  - `sandbox.allowed_domains`
-- **`awman new agent` auto-approves** the content it writes, since the user ran it. Later edits need re-approval as usual.
-- **Nothing executes on the host.** Install steps run only inside the image build (the same trust boundary as `Dockerfile.dev` and today's agent Dockerfiles). No TOML field is ever evaluated by a host shell, and all argv fields are passed as argv.
-- Add a short "Custom agent definitions" section to `aspec/architecture/security.md` stating: custom agents never run on the host; repo-scope definitions need per-hash approval; host-path deny-list; and argv-only semantics. This is the only spec edit, and it belongs to the implementation, not to this planning step.
+- **`awman new agent` auto-approves** the content it writes, since the user ran it. When that content has a `[ping]` (for example `--from crush`), its success output prints the same host-command block as the review summary, so the user still sees what will run on their host. Later edits need re-approval as usual.
+- **The only host execution is the approved `[ping]`.** Install steps run only inside the image build (the same trust boundary as `Dockerfile.dev` and today's agent Dockerfiles). No TOML field is ever evaluated by a host shell, and all argv fields, `ping.command` included, are passed as argv.
+- Add a short "Custom agent definitions" section to `aspec/architecture/security.md` stating: a custom agent runs on the host only through its optional, approved `[ping]` command during `awman ready`; repo-scope definitions, and global ones with `[ping]`, need per-hash approval that shows the host command; host-path deny-list; and argv-only semantics. This is the only spec edit, and it belongs to the implementation, not to this planning step.
 
 ### 7. CLI and catalogue changes
 
@@ -325,15 +339,16 @@ The call sites to switch are `agent/mod.rs:262` (`ensure_available`), `image_pre
   - On success it prints the path and the next step, `awman ready --agent <name>`. It writes the trust entry for repo scope.
   - Update `docs/14-command-reference.md` from the markdown projection (`COMMITTED_REFERENCE`).
 - **Tips (`agents/tips.rs`):** add one tip for `` `awman new agent <name>` `` and one for `` `awman new skill --pull builtin` ``. These are covered by the catalogue tip tests and must stay ≤100 chars.
-- **`awman ready`** adds a step `AgentDefinition` (custom only): "loaded from <scope>:<path>", trusted ✓ / not approved ✗. It also prints the `skipped` warnings from discovery.
+- **`awman ready`** adds a step `AgentDefinition` (custom only): "loaded from <scope>:<path>", trusted ✓ / not approved ✗ / approval not needed. It also prints the `skipped` warnings from discovery. The existing local-agent step reports `Skipped` with "no [ping] command in <path>" when the definition has no `[ping]`.
 
 ### 8. crush / maki migration
 
-- Remove both from `FIRST_PARTY_AGENTS`, the first-party table, the templates and every per-agent test fixture that names them. Tests that used crush/maki as the representative `kind: agent`, `Unsupported`-delivery or no-settings agent (for example `dsbx/backend.rs:1019–1361`, `agent/mod.rs:1333, 2074, 2226, 3305`, `dsbx/kit.rs:298–561` and `dsbx/auth.rs:597, 703`) are re-pointed to `cline`/`antigravity` where a first-party agent with the same property exists. Otherwise they are rewritten against a **custom fixture definition** built from the crush example, which doubles as coverage that custom agents behave like the agents they replaced.
+- Remove both from `FIRST_PARTY_AGENTS`, the first-party table, the templates and every per-agent test fixture that names them. Tests that used crush/maki as the representative `kind: agent`, `Unsupported`-delivery or no-settings agent (for example `dsbx/backend.rs:1019–1361`, `agent/mod.rs:1333, 2074, 2226, 3305`, `dsbx/kit.rs:298–561` and `dsbx/auth.rs:597, 703`) are re-pointed to `cline`/`antigravity` where a first-party agent with the same property exists. Container-paradigm tests with no first-party equivalent are rewritten against a **custom fixture definition** built from the crush example, which doubles as coverage that custom agents behave like the agents they replaced.
+- **The sbx `kind: agent` path loses its only users.** crush and maki are the only `kind: agent` kits today; every remaining first-party kit is `kind: mixin`. Keep `SbxKitKind::Agent` and its emitter branch, because the deferred design (appendix) reuses them. Its tests (`dsbx/kit.rs`, `dsbx/backend.rs`, `dsbx/auth.rs`) switch to a test-only `AgentDefinition` with `sbx_kit_kind = Agent` and an inline kit template, so the branch stays covered without shipping a crush/maki kit.
 - Example definitions live at `skills/create-custom-agent/examples/crush.toml` and `maki.toml`. These are the single source: `awman new agent --from` embeds them with `include_str!("../../../../skills/create-custom-agent/examples/<x>.toml")`.
-  - `crush.toml` uses **install steps**: `needs_node`, `npm install -g --prefix=/usr/local @charmland/crush`, `non_interactive = "run"`, `yolo = ["--yolo"]`, `delivery = "none"`, `host_dir = ".config/crush"`, `skills_dir = ".config/crush/commands"`, `auth.env` = the provider vars documented today in `docs/03-agent-sessions.md` "Crush authentication", and a `[sandbox]` table carried over from `sbx-kit.crush.yaml`.
-  - `maki.toml` uses the **escape hatch** (`dockerfile = "maki.Dockerfile"`, a copy of today's `Dockerfile.maki` with the trailing awman-user block intact), so the two examples together show both modes. Its fields are `yolo = ["--yolo"]`, no `non_interactive`, `delivery = "none"` and no settings.
-  - A test asserts that each example parses, validates, and converts to an `AgentDefinition` whose launch-relevant fields equal the old matrix entries: entrypoint, non-interactive token, mode flags, model delivery, system prompt delivery, settings and skills mounts. This proves the migration is behaviour-preserving.
+  - `crush.toml` uses **install steps**: `needs_node`, `npm install -g --prefix=/usr/local @charmland/crush`, `non_interactive = "run"`, `yolo = ["--yolo"]`, `delivery = "none"`, `host_dir = ".config/crush"`, `skills_dir = ".config/crush/commands"`, `auth.env` = the provider vars documented today in `docs/03-agent-sessions.md` "Crush authentication", and `[ping] command = ["crush", "run"]` (today's ping argv). It has no `[sandbox]` table; the current `sbx-kit.crush.yaml` values are recorded in the appendix for when sbx support returns.
+  - `maki.toml` uses the **escape hatch** (`dockerfile = "maki.Dockerfile"`, a copy of today's `Dockerfile.maki` with the trailing awman-user block intact), so the two examples together show both modes. Its fields are `yolo = ["--yolo"]`, no `non_interactive`, `delivery = "none"`, `[ping] command = ["maki", "--print"]` (today's ping argv) and no settings.
+  - A test asserts that each example parses, validates, and converts to an `AgentDefinition` whose launch-relevant fields equal the old matrix entries: entrypoint, non-interactive token, mode flags, model delivery, system prompt delivery, settings and skills mounts, and ping argv. This proves the migration is behaviour-preserving.
 - Persisted config/session values naming `crush`/`maki` keep deserializing, because `AgentName` is free-form. They fail only at resolve time, with the migration hint from §2.
 
 ### 9. Builtin skills library and the `create-custom-agent` skill
@@ -382,9 +397,8 @@ skills/
    - skills/commands dir
    - auth env vars
    - ACP support
-   - network domains it needs
 3. **Pick a mode:** install steps (default) or a Dockerfile escape hatch (multi-stage builds, unusual base needs). Include the base-image placeholder rule.
-4. **Write the TOML** using `reference.md` and the closest example.
+4. **Write the TOML** using `reference.md` and the closest example. Leave `[ping]` out unless the user asks for a host check: it is the one command that runs on the user's host, it is optional, and without it `awman ready` simply skips the host check. If the user does want one, use the agent's cheapest one-shot print mode (e.g. `["pi", "-p"]`), and tell the user that the approval prompt will show it.
 5. **Self-validate** against the validation table: stem regex, single-line install steps, deny-listed host dirs, required keys per `delivery`, no shell metacharacter reliance in argv fields, and `schema = 1`.
 6. **Hand off:** tell the user to run `awman ready --agent <name>` on the host. That step reviews and approves the definition and builds the image. They can then run `awman chat --agent <name>`, and move the file to `~/.awman/agents/` to use it in every repo. Never claim the image was built or tested.
 
@@ -407,14 +421,18 @@ skills/
 - **The trust store** sits in `~/.awman`, which is already deny-listed for mounts, so an agent inside a container can't approve its own definition. A repo moved to a new path needs re-approval, because the key uses the canonical root. A corrupt or unreadable trust store is treated as empty (re-prompt) with a warning, never as "all trusted".
 - **Two awman processes approving at once:** writes are atomic (tmp + rename). Last writer wins, which loses at most one approval and causes a re-prompt, never a false trust.
 - **Escape-hatch Dockerfile is a symlink** or resolves outside the TOML's directory: rejected (same rule as `ensure_not_symlinked` in skill libraries). If it is missing, the error names the expected path.
+- **`[ping]` binary not installed on the host:** the local-agent step reports it exactly as a missing first-party host agent does. The container image is unaffected.
+- **`[ping]` added to, or changed in, an already-approved definition:** the hash changes, so the next launch or `ready` re-prompts with the new host command before anything runs. This applies to global definitions too: adding `[ping]` to a previously approval-free global file makes it need approval.
+- **A code agent inside the container writes a repo definition with `[ping]`:** nothing runs until the user approves it on the host, and the approval prompt leads with the host command.
 - **`binary` not on PATH after install:** the smoke-test `RUN` fails the build with Docker's output. The ready step reports `Failed` and includes the install-step list in the hint.
 - **`run.command[0]` differs from `image.binary`** (a wrapper script, for example): allowed. The smoke test checks `binary`, and the entrypoint is used verbatim.
 - **Agent with no non-interactive mode** (no `run.non_interactive`): `-n`/workflow steps keep today's behaviour for maki (the prompt is delivered with no extra token). Document in `docs/15-custom-agents.md` that such agents may not exit on their own in workflows.
 - **`plan` requested but undefined:** `PlanModeUnsupported`, as today. An undefined `yolo`/`auto` is a silent no-op, as today.
 - **`--acp` with no `[acp]` table:** `AcpUnsupported`, as today.
-- **sbx runtime with no `[sandbox]` table:** a clear error at kit emission (§4). Running `awman ready` under sbx for such an agent reports the same thing as a failed step, not a panic.
+- **Custom agent under the sbx runtime:** `CustomAgentRuntimeUnsupported` (§4), before any kit or image work. `awman ready` reports it as a failed step, not a panic. A crush/maki user on sbx gets this error after recreating the agent with `awman new agent`, so the migration hint (§2) also says that sbx is not supported for custom agents yet.
+- **A TOML with `[sandbox]`** (for example written from an older draft of this spec, or by an agent guessing): rejected with the dedicated "do not support Docker Sandboxes yet" message (§1).
 - **Builtin runtime on macOS without a builder enabled:** custom images follow the existing `BuildPolicy` and import rules. With no source store image and the builder disabled, `ensure_available` gives the same "build it with ready" error as for first-party agents.
-- **Windows hosts:** paths in the TOML are relative and joined with `Path`, and container-side paths are always `/`-joined strings. `set_executable` is already a no-op on Windows for the sbx script.
+- **Windows hosts:** paths in the TOML are relative and joined with `Path`, and container-side paths are always `/`-joined strings.
 - **Very large or malicious TOML:** cap the file at 64 KiB before parsing, and reject arrays longer than 64 entries.
 - **`awman new skill --pull builtin` without network:** existing pull error path. With git older than 2.25 (no `sparse-checkout set`), detect the failure and retry once with a plain shallow clone (`--depth 1`, no sparse). That costs more bandwidth but still works, and a warning says why.
 - **A user's own library slug is already `awman`** (e.g. a hand-authored `~/.awman/skills/awman/`): the existing rule "a hand-authored skill takes precedence" applies. Document it.
@@ -432,20 +450,24 @@ skills/
 
 **Unit (Layer 1):**
 - `first_party.rs`: port every existing `agent_matrix.rs` test (ping table, settings/skills mounts, system-prompt delivery, mode flags, static env, sandbox fields) to the owned struct, minus crush/maki. Assert that `FIRST_PARTY_AGENTS` has exactly 7 entries and that every one resolves.
-- `custom.rs`: TOML → `AgentDefinition` for each `delivery`, `seed_prompt` form, `model` form, `[acp]` present or absent, and `[settings]` present or absent. Assert the hardcoded fields (`credential_source`, `ping_argv`, `sbx_kit_kind`, …) are always the custom values.
+- `custom.rs`: TOML → `AgentDefinition` for each `delivery`, `seed_prompt` form, `model` form, and `[acp]`, `[settings]` and `[ping]` present or absent. Assert the hardcoded fields (`credential_source`, `sbx_kit_kind`, …) are always the custom values, and that `ping_argv` is exactly `ping.command` or `None`.
 - **Migration equivalence:** the crush and maki example files convert to definitions whose launch-relevant fields equal the pre-change matrix entries (snapshot the old values into the test as literals).
 - Dockerfile rendering: snapshot of the rendered crush example; the header hash; `needs_node`/`apt` blocks; one `RUN` per install step; the escape-hatch copy with placeholder substitution; the missing-`FROM {{AWMAN_BASE_IMAGE}}` warning.
 - `provision_agent_dockerfile`: every row of the §4 sync table, for both origins.
-- sbx kit: emitted YAML parses, user strings containing `:`, `#`, newlines-in-domain (rejected earlier) and quotes round-trip safely, and there is a `[sandbox]`-missing error.
+- sbx refusal: every option builder returns `CustomAgentRuntimeUnsupported` for a custom definition under a sandbox-class runtime, before any kit emission or Dockerfile render (assert with a recording runtime that nothing was emitted or built); an untrusted definition gets the trust error first; first-party agents under sbx are unaffected.
+- `[sandbox]` in a TOML gives the dedicated "do not support Docker Sandboxes yet" error.
+- The `kind: agent` emitter branch is still covered through the test-only definition.
 - `AgentRegistry::resolve`: precedence, invalid repo file not falling back, `UnknownAgent` listing contents and the crush/maki hint, `AgentDefinitionUntrusted` for an unapproved repo definition, and global definitions never requiring trust.
-- `HostAgentPinger::ping_command` is `None` for custom agents. The ready phase reports `Skipped` and never spawns a process (assert with the existing ping test seam).
+- `HostAgentPinger::ping_command` is `None` for a custom agent without `[ping]`: the ready phase reports `Skipped` with the definition path and never spawns a process (assert with the existing ping test seam). With `[ping]`, the argv is exactly `ping.command` plus one `GREETINGS` entry, it runs in an empty temp directory, and no `run.env`/`auth.env` reaches the host process.
+- `ping.command` validation: bare name and absolute path accepted; `./pi`, `bin/pi`, empty arrays, oversized and NUL/newline tokens rejected.
 - Overlay: a custom `host_dir` mounts at `<container_home>/<host_dir>`, deny-listed dirs are rejected at the overlay layer too, and `auth.env` passthrough is masked and de-duplicated against `env()` overlays.
 - `keychain::credential_source` for a custom name is `None` with no file I/O.
 - Skill library: `resolve_pull_target("builtin")` and `("awman")` map to the sparse slug; the `sparse` default for legacy `.awman.json`; the `clone_repo_sparse` argv; the sparse-failure fallback.
 
 **Unit (Layer 2):**
 - `ensure_agent_trusted`: prompt shown with the full summary, approve writes the entry, decline exits 1, non-interactive fails with the `awman ready` hint, and `--yes` doesn't approve.
-- `new agent`: skeleton vs `--from`, `--global` path, refuses an existing file without `--force`, rejects reserved names, auto-approves repo scope.
+- Review summary: with `[ping]`, the host-command block comes first and shows the shell-quoted argv, the `<greeting>` placeholder and the resolved host path (or "not found on PATH"); without it, the "no host command" line. A global definition with `[ping]` prompts; one without does not.
+- `new agent`: skeleton vs `--from`, `--global` path, refuses an existing file without `--force`, rejects reserved names, auto-approves the written content (repo and, when it has `[ping]`, global), and prints the host-command block for `--from crush`.
 - `config set agent`: per-scope acceptance rules.
 - Catalogue: `init --agent` is a String with no `AGENT_VALUES`, `NEW_AGENT` is registered, the tips reference real commands/flags, and the committed reference regenerated.
 
@@ -454,7 +476,8 @@ skills/
 - `tests/command/dispatch_real_engines.rs`: `chat --agent pi` with a fake runtime produces the expected `ContainerOption`s: entrypoint, mode flags, model, system prompt, settings overlay, auth env.
 - Workflow preflight with a mix of first-party and custom agents, one of them an untrusted repo definition, fails preflight with the untrusted error before any container starts.
 - Squad: `ensure_directory_workspace_project` renders a custom definition, and an untrusted one is refused in the daemon without prompting.
-- sbx: `tests/engine/sbx.rs` kit emission for the crush example equals a stored golden YAML.
+- sbx: `awman ready --agent crush` (custom, from the example) under `docker-sbx-experimental` exits with `CustomAgentRuntimeUnsupported` as a failed ready step, and writes no kit directory.
+- Every container-class runtime (Docker, Apple Containers, builtin-experimental) runs the same custom agent through its existing test harness and gate (Docker-gated, Apple-gated, builtin hardware-gated), so support is claimed only where a runtime's test actually ran.
 
 **End-to-end (CLI binary):**
 - `awman new agent crush --from crush`, then `awman ready --agent crush` (with the Docker-gated test harness, as for existing image tests) builds and smoke-tests the image.
@@ -490,7 +513,7 @@ skills/
   - publishing community agent definitions as a pullable library
   - a configurable model flag *name* (custom agents use `--model` in this work item, as all current agents do)
   - per-definition credential refresh
-  - sbx launch-time auto-auth for custom kits
+  - Docker Sandboxes (`docker-sbx-experimental`) support for custom agents, including sbx launch-time auto-auth for custom kits ([appendix](#appendix-deferred-docker-sandboxes-support-for-custom-agents))
 
 ## Documentation
 
@@ -501,9 +524,9 @@ After implementation is complete, update user-facing documentation in `docs/` to
   - the full TOML reference with the validation table
   - install steps vs escape-hatch Dockerfile
   - how images are rendered and rebuilt, and how to take ownership of a rendered Dockerfile
-  - sbx support via `[sandbox]`
+  - supported runtimes: Docker, Apple Containers and builtin-experimental; Docker Sandboxes is not supported for custom agents yet
   - the approval prompt and trust store
-  - "custom agents are never run on the host"
+  - the optional `[ping]` host check: what runs on the host, that the approval prompt shows it, and that `ready` skips the host check without it
   - `awman new agent`
   - the builtin `create-custom-agent` skill workflow
   - crush/maki migration
@@ -512,7 +535,7 @@ After implementation is complete, update user-facing documentation in `docs/` to
 - **`docs/00-getting-started.md`:** update the supported-agents list and the `--agent` values; mention custom agents in one line.
 - **`docs/07-configuration.md`:** `agent` accepts custom agent names; describe the `~/.awman/agents/` and `.awman/agents/` locations and `~/.awman/trusted-agents.json`.
 - **`docs/08-overlays.md`:** remove the crush/maki "no native injection" mentions (replace them with "agents whose definition uses `delivery = \"none\"`"); document `skill(awman/...)` and `awman new skill --pull builtin`.
-- **`docs/11-runtimes.md`:** remove crush/maki from the kit tables and explain that custom agents get a `kind: agent` kit only when they declare `[sandbox]`.
+- **`docs/11-runtimes.md`:** remove crush/maki from the kit tables, and state that custom agents (including crush and maki) run on Docker, Apple Containers and builtin-experimental but not on Docker Sandboxes yet.
 - **`docs/04-security-and-isolation.md`:** custom definitions, approval and the deny-list.
 - **`docs/14-command-reference.md`:** regenerated.
 - **Never create work-item-specific docs** (e.g., no "WI 0123 implementation guide" in published docs).
@@ -520,3 +543,58 @@ After implementation is complete, update user-facing documentation in `docs/` to
 - **Docs are for end users**, not for developers trying to understand implementation.
 
 See `CLAUDE.md` for more guidance on documentation standards.
+
+
+## Appendix: deferred Docker Sandboxes support for custom agents
+
+Not part of this work item. This records the design that was dropped from scope, so it can be picked up later without redoing the research. The crush/maki kit templates it would replace were last present at commit `f38ad465` (`templates/sbx-kit.crush.yaml`, `sbx-kit.maki.yaml`, `sbx-apply.crush.sh`, `sbx-apply.maki.sh`).
+
+**TOML: a `[sandbox]` table (presence ⇒ `docker-sbx-experimental` is supported).** This is the key that schema 1 reserves and rejects today.
+
+```toml
+[sandbox]
+install = ["for i in 1 2 3 4 5; do npm i -g @mariozechner/pi-coding-agent && break; sleep 3; done"]  # default = image.install
+allowed_domains = ["api.anthropic.com", "registry.npmjs.org"]   # required when [sandbox] is present
+proxy_env = ["ANTHROPIC_API_KEY"] # optional; must map to a known sbx service (engine::auth::service_for_credential)
+```
+
+**Validation:**
+
+| Field | Rule |
+|---|---|
+| `sandbox.install` entries | Same as `image.install`: non-empty, single-line, at most 4096 bytes. |
+| `sandbox.allowed_domains` | Required when `[sandbox]` is present. Hostnames only (no scheme or path). |
+| `sandbox.proxy_env` | Each entry must resolve through `service_for_credential`. |
+
+**Model:** add `sandbox: Option<SandboxSpec>` to `AgentDefinition` (custom agents only; first-party agents keep their embedded kit templates and `SbxKitKind`). `DSbxKitEmitter::emit_for_agent` takes `&AgentDefinition` instead of `&str`. The hardcoded custom values stay: `sbx_kit_kind = Agent`, `sandbox_permission_mode_supported = false`, `sandbox_auth_env_vars` empty (today's `kind: agent` kits do not take part in launch-time auto-auth), `sandbox_model_note = None`.
+
+**Kit rendering (`custom.rs`):**
+
+- Build the `kind: agent` kit **as a `serde_yaml` value**, never by string substitution, so a user string can't inject YAML.
+- Base `docker/sandbox-templates:shell-docker`, `agent.entrypoint.run` = `run.command`, `persistence: persistent`.
+- `commands.install` from `sandbox.install`, each entry with the same `description`.
+- `network.allowedDomains` from `allowed_domains`.
+- `credentials.sources` and `environment.proxyManaged` from `proxy_env` via `service_for_credential`.
+- `commands.startup` runs one generic `templates/sbx-apply.custom.sh`: today's `sbx-apply.crush.sh` with the agent name replaced by `$AWMAN_AGENT_NAME` (the crush and maki scripts were already generic). `set_executable` is a no-op on Windows.
+
+**Runtime behaviour:**
+
+- Replace `CustomAgentRuntimeUnsupported` with a per-definition check: a custom agent **without** `[sandbox]` fails at `DSbxKitEmitter::emit_for_agent` with `agent 'pi' does not declare [sandbox] support in <path>; add a [sandbox] table or use another runtime`, and `awman ready` reports it as a failed step.
+- The `kind: agent` emitter branch kept by this work item is the one these kits use.
+
+**Security and review:**
+
+- The review summary adds each `sandbox.install` step verbatim and `sandbox.allowed_domains`.
+- The content hash already covers the whole TOML, so a `[sandbox]` edit needs re-approval with no extra work.
+
+**Migration:** give `examples/crush.toml` and `maki.toml` `[sandbox]` tables carried over from the old kits: `allowed_domains = ["api.anthropic.com", "registry.npmjs.org"]`, `proxy_env = ["ANTHROPIC_API_KEY"]`, and the retrying npm install (`@charmland/crush` / `maki`) as `sandbox.install`. The migration-equivalence test then also compares the emitted kit with the old templates.
+
+**Tests:**
+
+- Emitted YAML parses. User strings containing `:`, `#` and quotes round-trip safely; newlines in domains are rejected at validation.
+- The `[sandbox]`-missing error.
+- `tests/engine/sbx.rs`: kit emission for the crush example equals a stored golden YAML (the old `sbx-kit.crush.yaml` rendered).
+
+**Docs:** `docs/11-runtimes.md` and `docs/15-custom-agents.md` describe sbx support via `[sandbox]`. The `create-custom-agent` skill's research checklist gains "network domains it needs".
+
+**Still out of scope even then:** sbx launch-time auto-auth for custom kits.
