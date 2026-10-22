@@ -512,8 +512,10 @@ fn builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest() {
         }
     }
     let _daemon = Kill(&mut daemon);
+    // `squad status` succeeds as soon as the pidfile is claimed, before the
+    // daemon publishes its endpoint; `squad list` needs a real round trip.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !run_bounded(p.cmd(&["squad", "status"]), Duration::from_secs(30))
+    while !run_bounded(p.cmd(&["squad", "list"]), Duration::from_secs(30))
         .status
         .success()
     {
