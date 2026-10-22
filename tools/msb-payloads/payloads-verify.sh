@@ -146,9 +146,12 @@ git -C "$work/checkout" -c user.name=awman -c user.email=awman@localhost \
 RUNNER_TEMP=$work bash "$work/checkout/tools/native-builtin-ci.sh" "$target"
 
 step "Gate: optimized, signed artifact traced through an offline session"
-cargo build --locked --release --features builtin-runtime --target "$target" --bin awman
+# Own target dir, like the other gates: the checkout's target/ may hold
+# root-owned files from an earlier `sudo make install`.
+release_target=$work/release-target
+CARGO_TARGET_DIR=$release_target cargo build --locked --release --features builtin-runtime --target "$target" --bin awman
 artifact=$work/awman
-cp "${CARGO_TARGET_DIR:-target}/$target/release/awman" "$artifact"
+cp "$release_target/$target/release/awman" "$artifact"
 if [ "$(uname -s)" = Darwin ]; then bash tools/macos-sign.sh "$artifact"; fi
 bash tools/release-artifact-check.sh "$artifact" "$target" "$work/release-evidence" \
     "$root/tools/release-offline-session.sh" --fixture "$fixture"
