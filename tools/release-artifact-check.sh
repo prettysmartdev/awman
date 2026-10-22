@@ -49,9 +49,18 @@ grep -q 'msb' "$output/strings.txt" || { echo "embedded provider marker not reta
 if [ "$(uname -s)" = Linux ]; then grep -q '\.msbver' "$output/sections.txt" || { echo "Linux .msbver section missing" >&2; exit 1; }
 else grep -q '__msbver' "$output/sections.txt" || { echo "Mac __msbver section missing" >&2; exit 1; }
 fi
-mkdir -p "$output/home" "$output/tmp" "$output/state"
-env -i PATH=/usr/bin:/bin HOME="$output/home" TMPDIR="$output/tmp" "$artifact" --version > "$output/version.stdout" 2> "$output/version.stderr"
-env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$artifact" __awman-builtin-kernel-check > "$output/provider-info.json" 2> "$output/provider-info.stderr"
+mkdir -p "$output/home" "$output/tmp"
+# Output goes to evidence files; on failure, report the step and its stderr
+# instead of letting `set -e` exit silently.
+run_step() {
+  local name=$1 stdout=$2 stderr=$3 status=0; shift 3
+  "$@" > "$stdout" 2> "$stderr" || status=$?
+  [ "$status" = 0 ] || { echo "$name failed (exit $status):" >&2; tail -40 "$stderr" >&2; exit 1; }
+}
+run_step "awman --version" "$output/version.stdout" "$output/version.stderr" \
+  env -i PATH=/usr/bin:/bin HOME="$output/home" TMPDIR="$output/tmp" "$artifact" --version
+run_step "awman __awman-builtin-kernel-check" "$output/provider-info.json" "$output/provider-info.stderr" \
+  env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$artifact" __awman-builtin-kernel-check
 for expected in '"msb_version"[[:space:]]*:[[:space:]]*"0\.7\.8"' \
   '"worker_protocol"[[:space:]]*:[[:space:]]*"0\.7\.8/18/awman-1"' \
   '"embedded_kernel"[[:space:]]*:[[:space:]]*true' \
@@ -63,16 +72,21 @@ done
 manifest="$root/third_party/msb-payloads/manifest.toml"
 kernel_hash=$(awk -v section="[targets.\"$target\"]" '$0 == section {inside=1;next} /^\[/ {inside=0} inside && $1 == "kernel_sha256" {gsub(/"/, "", $3); print $3; exit}' "$manifest")
 grep -Eq '"kernel_sha256"[[:space:]]*:[[:space:]]*"'"$kernel_hash"'"' "$output/provider-info.json" || { echo "provider kernel hash differs from verified manifest" >&2; exit 1; }
-find "$output/home" "$output/state" -type f \( -name msb -o -name agentd -o -name 'libkrunfw*' \) -print > "$output/helper-scan.txt"
+find "$output/home" -type f \( -name msb -o -name agentd -o -name 'libkrunfw*' \) -print > "$output/helper-scan.txt"
 test ! -s "$output/helper-scan.txt" || { cat "$output/helper-scan.txt" >&2; exit 1; }
 if [ "$#" -eq 0 ]; then
   echo "BLOCKED: pass an offline, cached-session isolation wrapper and actual awman session argv" >&2; exit 4
 fi
+# The builtin state dir holds Unix sockets (103-byte path limit on macOS), so
+# it lives under a short physical /tmp path, not the caller's evidence tree
+# (macOS TMPDIR alone is ~50 bytes). It is moved into $output/state at the end.
+state=$(cd "$(mktemp -d /tmp/awman-state.XXXXXX)" && pwd -P)
+printf '%s\n' "$state" > "$output/state-dir.txt"
 case "$(uname -s)" in
  Linux)
   command -v unshare >/dev/null || { echo "BLOCKED: unshare network namespace is required for offline cached execution" >&2; exit 4; }
   unshare --net -- strace -ff -yy -e trace=execve,openat,open,mmap -o "$output/session.trace" \
-    env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$output/state" \
+    env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$state" \
     > "$output/session.stdout" 2> "$output/session.stderr"
   grep -Fq "$artifact" "$output"/session.trace* || { echo "BLOCKED: trace did not observe the exact distributed artifact" >&2; exit 4; }
   ;;
@@ -81,9 +95,9 @@ case "$(uname -s)" in
   if [ "$(id -u)" = 0 ] && command -v fs_usage >/dev/null; then
     # Root: trace every file system call of the session.
     fs_usage -w -f filesys > "$output/session.trace" 2>&1 & trace_pid=$!
-    if sandbox-exec -p '(version 1)(deny network*)(allow default)' env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$output/state" > "$output/session.stdout" 2> "$output/session.stderr"; then status=0; else status=$?; fi
+    if sandbox-exec -p '(version 1)(deny network*)(allow default)' env -i PATH= HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$state" > "$output/session.stdout" 2> "$output/session.stderr"; then status=0; else status=$?; fi
     kill "$trace_pid" 2>/dev/null || true; wait "$trace_pid" 2>/dev/null || true
-    [ "$status" = 0 ] || { tail -40 "$output/session.stderr" >&2; exit "$status"; }
+    [ "$status" = 0 ] || { echo "offline session failed (exit $status):" >&2; tail -40 "$output/session.stdout" "$output/session.stderr" >&2; exit "$status"; }
     grep -Fq "$artifact" "$output/session.trace" || { echo "BLOCKED: Mac trace did not observe the exact distributed artifact" >&2; exit 4; }
   else
     # Without root, enforce instead of observing: the kernel sandbox denies
@@ -110,12 +124,14 @@ case "$(uname -s)" in
   (literal "/usr/bin/security")
   (regex #"/awman-offline\.[^/]+/bin/claude$"))
 SB
-    if sandbox-exec -f "$output/session.sb" env -i PATH=/usr/bin:/bin HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$output/state" > "$output/session.stdout" 2> "$output/session.stderr"; then :; else
-      status=$?; tail -40 "$output/session.stderr" >&2; exit "$status"; fi
+    if sandbox-exec -f "$output/session.sb" env -i PATH=/usr/bin:/bin HOME="$output/home" TMPDIR="$output/tmp" "$@" "$artifact" "$state" > "$output/session.stdout" 2> "$output/session.stderr"; then :; else
+      status=$?; echo "offline session failed (exit $status):" >&2
+      tail -40 "$output/session.stdout" "$output/session.stderr" >&2; exit "$status"; fi
     printf 'mode=kernel-enforced sandbox (no root for fs_usage/dtruss)\nprofile=session.sb\n' > "$output/session.trace"
   fi
   ;;
 esac
-find "$output/home" "$output/state" -type f \( -name msb -o -name agentd -o -name 'libkrunfw*' \) -print > "$output/helper-scan-after-session.txt"
+find "$output/home" "$state" -type f \( -name msb -o -name agentd -o -name 'libkrunfw*' \) -print > "$output/helper-scan-after-session.txt"
 test ! -s "$output/helper-scan-after-session.txt" || { cat "$output/helper-scan-after-session.txt" >&2; exit 1; }
+mv "$state" "$output/state" 2>/dev/null || echo "note: session state left at $state (see state-dir.txt)" >&2
 printf 'PASS artifact inspection and session trace; raw evidence: %s\n' "$output"
