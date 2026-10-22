@@ -1,0 +1,1 @@
+bash tools/msb-payloads/payloads-verify.sh "$(rustc -vV | sed -n 's/^host: //p')"
