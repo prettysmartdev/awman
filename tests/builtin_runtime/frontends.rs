@@ -571,75 +571,8 @@ fn builtin_hw_actual_awman_squad_dispatches_a_leader_into_a_guest() {
     eprintln!("PASS: {TEST}");
 }
 
-/// Two genuine awman builds share one project and builtin state: the older
-/// build (runtime spelled `builtin`) imports and runs, the newer build
-/// (`builtin-experimental`) reuses that state, and the older build
-/// explicitly refuses the upgraded catalog without damaging it. Binary
-/// replacement is exercised independently below.
-///
-/// `AWMAN_TEST_BUILTIN_OLD_ARTIFACT` names the older, entitlement-signed
-/// build; without it the test is BLOCKED (REQUIRE_HW fails it).
-#[test]
-fn builtin_hw_actual_awman_old_new_forward_upgrade_and_old_reader_refusal() {
-    const TEST: &str = "builtin_hw_actual_awman_old_new_forward_upgrade_and_old_reader_refusal";
-    let Some((binary, archive)) = gate(TEST) else {
-        return;
-    };
-    let Some(old) = std::env::var_os("AWMAN_TEST_BUILTIN_OLD_ARTIFACT").map(PathBuf::from) else {
-        eprintln!("BLOCKED: {TEST}: AWMAN_TEST_BUILTIN_OLD_ARTIFACT is not set");
-        assert!(
-            std::env::var("AWMAN_TEST_BUILTIN_REQUIRE_HW").is_err(),
-            "{TEST}: an older awman build is required"
-        );
-        return;
-    };
-    let run = |p: &Project, prompt: &str| {
-        let out = run_bounded(
-            p.cmd(&[
-                "exec",
-                "prompt",
-                "--non-interactive",
-                "--agent",
-                "claude",
-                prompt,
-            ]),
-            Duration::from_secs(180),
-        );
-        (out.status.code(), text(&out))
-    };
-    // 1. Old build: import and run.
-    let mut p = Project::with_runtime(&old, &archive, "awman-upg.", "builtin");
-    let (code, out) = run(&p, "old one exit=0");
-    assert_eq!(code, Some(0), "old build run: {out}");
-    // 2. New build on the old state.
-    p.switch(&binary, "builtin-experimental");
-    let ready = run_bounded(p.cmd(&["ready", "--json"]), Duration::from_secs(300));
-    assert!(
-        ready.status.success(),
-        "new ready on old state: {}",
-        text(&ready)
-    );
-    let (code, out) = run(&p, "new one exit=0");
-    assert_eq!(code, Some(0), "new build on old state: {out}");
-    assert!(out.contains("SYNTHETIC_PROMPT=new one exit=0"), "{out}");
-    // 3. Old build again, after the new build wrote the state.
-    p.switch(&old, "builtin");
-    let (code, out) = run(&p, "old again exit=0");
-    assert_ne!(
-        code,
-        Some(0),
-        "0.7.2 must refuse the upgraded 0.7.8 catalog: {out}"
-    );
-    assert!(out.contains("database schema is newer"), "{out}");
-    p.switch(&binary, "builtin-experimental");
-    let (code, out) = run(&p, "new after refusal exit=0");
-    assert_eq!(code, Some(0), "catalog survives old-reader refusal: {out}");
-    p.assert_no_helper();
-    eprintln!("PASS: {TEST}");
-}
-
-/// Executable replacement has its own project and gate; downgrade refusal
-/// cannot prevent this independent hardware scenario from running.
+/// Replacing the executable file while an agent runs from it does not disturb
+/// that agent.
 #[test]
 fn builtin_hw_actual_awman_binary_replacement() {
     const TEST: &str = "builtin_hw_actual_awman_binary_replacement";

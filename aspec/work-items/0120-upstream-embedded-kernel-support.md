@@ -412,6 +412,6 @@ retained only for the historical 0.7.2 standalone catalog reader. No host agent 
 The live SQLite tool uses 0.7.8 and the production static shim; the old reader is
 self-contained. Compatibility means forward 27-to-29 migration, row preservation
 (including strict_sni and labels) and explicit non-destructive 0.7.2 refusal, not a
-successful downgrade. Executable replacement is now an independent hardware test.
+successful downgrade. The actual-awman old/new build upgrade test was dropped: the builtin runtime has not been released, so no user holds a 0.7.2 catalog. Executable replacement remains an independent hardware test.
 The no-VM artifact diagnostic `__awman-builtin-kernel-check` invokes the actual C
 accessor and checks its pointer, layout and full contents. It does not earn a boot PASS.

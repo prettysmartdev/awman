@@ -47,7 +47,12 @@ if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
     echo "isolated-test: no fixture directory under $tmproot" >&2
     exit 1
 fi
-cleanup() { rm -rf "$run_dir" "${builtin_state:-}"; }
+# Keep the run's exit status: a failure must never reach make as success.
+cleanup() {
+    local status=$?
+    rm -rf "$run_dir" "${builtin_state:-}"
+    exit "$status"
+}
 trap cleanup EXIT
 
 # Resolve cargo's and rustup's homes from the real HOME before replacing it.
@@ -120,4 +125,6 @@ for arg in "$@"; do
             ;;
     esac
 done
-cargo test "${workspace_args[@]}" "$@" < /dev/null
+# macOS ships bash 3.2, where "${empty[@]}" under `set -u` is an unbound
+# variable error; the `+` form expands to nothing instead.
+cargo test ${workspace_args[@]+"${workspace_args[@]}"} "$@" < /dev/null

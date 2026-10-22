@@ -19,7 +19,9 @@
 # AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE (the promoted fixture built from it by
 # tools/oci-runtime-spike/fixture) are used when set; otherwise the base comes
 # from a pinned skopeo image under Docker, or Apple Containers when Docker is
-# not running, and the fixture is built from it.
+# not running, and the fixture is built from it. On macOS the fixture is also
+# loaded into Apple Containers (starting its service if needed) for the
+# Apple-store tests, and removed again on exit.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd -P)
 target=${1:?usage: payloads-verify.sh TARGET_TRIPLE}
@@ -46,7 +48,10 @@ esac
 # out HEAD: uncommitted changes would be tested by some gates and not others.
 [ -z "$(git status --porcelain --untracked-files=all)" ] || blocked "commit or stash local changes first"
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/awman-payloads-verify.XXXXXX")
+# Physical path: macOS TMPDIR is under /var -> /private/var, and the builtin
+# runtime refuses to start when its own executable path differs from the one
+# the SDK resolves, so gate 3's binaries must not live under a symlink.
+work=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/awman-payloads-verify.XXXXXX")" && pwd -P)
 cp "$manifest" "$work/manifest.orig"
 had_provenance=0
 if [ -f "$provenance" ]; then cp "$provenance" "$work/provenance.orig"; had_provenance=1; fi
@@ -58,6 +63,7 @@ cleanup() {
         echo "payloads-verify FAILED: manifest left unverified; evidence kept in $work" >&2
     fi
     if [ -d "$work/checkout" ]; then git worktree remove --force "$work/checkout" || true; fi
+    if [ -n "${loaded_apple_ref:-}" ]; then container image delete "$loaded_apple_ref" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 step() { printf '\n==> %s\n' "$*"; }
@@ -111,6 +117,18 @@ if [ -z "$fixture" ]; then
 fi
 [ -f "$base_tar" ] && [ -f "$fixture" ] || blocked "guest fixture archives missing"
 export AWMAN_TEST_BUILTIN_BASE_TAR=$base_tar AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE=$fixture
+if [ "$(uname -s)" = Darwin ]; then
+    # The Apple-store guest tests import the fixture from a running Apple
+    # Containers service (and stop and restart that service themselves).
+    apple_cli=$(command -v container) || blocked "install Apple Containers (https://github.com/apple/container/releases)"
+    container system status >/dev/null 2>&1 || container system start
+    container image load --input "$fixture"
+    apple_ref=awman-spike/fixture:latest
+    container image inspect "$apple_ref" >/dev/null || blocked "Apple Containers did not load the fixture as $apple_ref"
+    loaded_apple_ref=$apple_ref
+    export AWMAN_TEST_APPLE_CONTAINER=1 AWMAN_TEST_APPLE_CLI=$apple_cli
+    export AWMAN_TEST_APPLE_FIXTURE_REF=$apple_ref AWMAN_TEST_APPLE_IMAGE=$apple_ref
+fi
 export AWMAN_TEST_BUILTIN=1 AWMAN_TEST_BUILTIN_REQUIRE_HW=1
 export AWMAN_TEST_BUILTIN_NETWORK=1 AWMAN_TEST_BUILTIN_PRESSURE=1
 export AWMAN_TEST_BUILTIN_REPORT=$work/builtin-hw-report.tsv
