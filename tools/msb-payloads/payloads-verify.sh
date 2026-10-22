@@ -102,7 +102,7 @@ if [ -z "$base_tar" ] || [ -z "$fixture" ]; then
     run_skopeo() { "${engine[@]}" --volume "$work/fixtures:/out" "$skopeo_image" "$@"; }
 fi
 if [ -z "$base_tar" ]; then
-    run_skopeo copy --override-os linux --format docker docker://docker.io/library/alpine:3.22 docker-archive:/out/base.tar
+    run_skopeo copy --override-os linux --format v2s2 docker://docker.io/library/alpine:3.22 docker-archive:/out/base.tar
     base_tar=$work/fixtures/base.tar
 fi
 if [ -z "$fixture" ]; then
