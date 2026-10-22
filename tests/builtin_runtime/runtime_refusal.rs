@@ -110,7 +110,9 @@ fn builtin_ambient_override_is_refused_before_anything_else() {
 fn builtin_is_unavailable_under_test_isolation_and_creates_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
-    match open(settings(&state)) {
+    // An unavailable builtin runtime still constructs (its open is retried on
+    // use), so the refusal is observed through `availability()`.
+    match open(settings(&state)).and_then(|runtime| runtime.availability()) {
         Err(EngineError::BuiltinRuntimeUnavailable { reason }) => {
             assert!(!reason.is_empty());
             // Only the released target (macOS on Apple Silicon) reaches the

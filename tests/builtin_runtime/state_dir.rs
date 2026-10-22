@@ -53,7 +53,8 @@ fn builtin_state_dir_too_long_for_sockets_is_refused_with_the_limit_and_creates_
             text.contains("103-byte limit"),
             "the limit must be named: {text}"
         );
-        assert!(text.contains("failed to detect agent runtime"), "{text}");
+        // Startup engine errors are printed in the engine's own words.
+        assert!(text.contains("awman: socket path "), "{text}");
         assert!(
             !base.path().join(&component).exists(),
             "no directory may be created for a refused root"

@@ -87,17 +87,7 @@ impl MsbDriver {
         // never loads installed msb config or resolves paths from HOME/XDG.
         // All state roots below are owned by awman and remain explicit.
         let local = isolated_backend(&paths)?;
-        let resolved = microsandbox::setup::resolve_runtime(local.config())
-            .map_err(|_| failure("embedded resolution"))?;
-        if resolved.msb_path != executable
-            || resolved.libkrunfw_path != executable
-            || resolved.origin != microsandbox::setup::RuntimeOrigin::SdkPackage
-            || local.config().paths.agentd.is_some()
-        {
-            return Err(EngineError::BuiltinRuntimeUnavailable {
-                reason: "SDK resolved a non-embedded runtime component".into(),
-            });
-        }
+        check_embedded_resolution(&local, &executable)?;
         let local = Arc::new(local);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let (shutdown, done) = tokio::sync::oneshot::channel();
@@ -153,6 +143,32 @@ impl MsbDriver {
     }
 }
 
+/// The SDK must resolve both runtime components to this executable, from the
+/// process-level setters `EmbeddedRuntime::resolve` registered. In 0.7.8 those
+/// setters feed the isolated config's `paths.msb`/`paths.libkrunfw`, so the
+/// pair reports `RuntimeOrigin::Configuration`. That config has no installed or
+/// managed layer and ambient `MSB_*` overrides are refused earlier, so these
+/// values can only be awman's own registration; check them as well.
+fn check_embedded_resolution(
+    local: &LocalBackend,
+    executable: &std::path::Path,
+) -> Result<(), EngineError> {
+    let resolved = microsandbox::setup::resolve_runtime(local.config())
+        .map_err(|_| failure("embedded resolution"))?;
+    let paths = &local.config().paths;
+    if resolved.msb_path != executable
+        || resolved.libkrunfw_path != executable
+        || resolved.origin != microsandbox::setup::RuntimeOrigin::Configuration
+        || paths.msb.as_deref() != Some(executable)
+        || paths.libkrunfw.as_deref() != Some(executable)
+        || paths.agentd.is_some()
+    {
+        return Err(EngineError::BuiltinRuntimeUnavailable {
+            reason: "SDK resolved a non-embedded runtime component".into(),
+        });
+    }
+    Ok(())
+}
 fn isolated_backend(paths: &BuiltinPaths) -> Result<LocalBackend, EngineError> {
     LocalBackend::builder()
         .home(&paths.home)
@@ -747,6 +763,54 @@ mod tests {
     }
 
     use super::*;
+
+    /// The SDK's runtime setters are set-once per process, so the registration
+    /// runs in a child copy of this test binary.
+    #[test]
+    fn embedded_registration_resolves_to_this_executable_and_nothing_else() {
+        const CHILD: &str = "AWMAN_TEST_EMBEDDED_RESOLUTION_CHILD";
+        const NAME: &str = "engine::container::builtin::msb_driver::tests::embedded_registration_resolves_to_this_executable_and_nothing_else";
+        let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, dir.path());
+            for variable in [
+                "MSB_PATH",
+                "MSB_LIBKRUNFW_PATH",
+                "MSB_AGENTD_PATH",
+                "MSB_HOME",
+            ] {
+                child.env_remove(variable);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("embedded resolution checked"));
+            return;
+        };
+        let executable = dir.join("awman");
+        std::fs::write(&executable, b"").unwrap();
+        microsandbox::config::set_sdk_msb_path(&executable);
+        microsandbox::set_libkrunfw_path(&executable);
+        let local = isolated_backend(&BuiltinPaths {
+            home: dir.join("home"),
+        })
+        .unwrap();
+        check_embedded_resolution(&local, &executable).unwrap();
+        let other = dir.join("other-awman");
+        std::fs::write(&other, b"").unwrap();
+        assert!(matches!(
+            check_embedded_resolution(&local, &other),
+            Err(EngineError::BuiltinRuntimeUnavailable { .. })
+        ));
+        println!("embedded resolution checked");
+    }
 
     #[tokio::test]
     async fn sdk_network_config_spec_roundtrips_defaults_and_explicit_strict_sni() {
