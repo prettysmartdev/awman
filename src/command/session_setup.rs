@@ -825,7 +825,8 @@ mod tests {
 
     /// A local session (no clone/branch stages) whose `ReadyEngine` run
     /// records a failed required image stage (the Docker runtime's base/agent
-    /// image build, with Docker unavailable under test isolation) must reach
+    /// image build: Docker is unavailable under test isolation, and the
+    /// Dockerfiles cannot build when real Docker is opted in) must reach
     /// the `failed` terminal state — never be announced `ready` — and must
     /// keep the (not-ready) summary so clients can show which stage failed.
     #[tokio::test]
@@ -834,11 +835,14 @@ mod tests {
         let workdir = root.path().to_path_buf();
         // Pre-create both Dockerfiles so the run reaches the image-build
         // phases (and the unavailability check) instead of stopping earlier
-        // at a Dockerfile-creation prompt or a network download.
-        std::fs::write(workdir.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        // at a Dockerfile-creation prompt or a network download. The `RUN`
+        // has no shell to run on `scratch`, so the build also fails when a
+        // real Docker daemon is opted in (`AWMAN_TEST_DOCKER`, `make test-full`).
+        const UNBUILDABLE: &str = "FROM scratch\nRUN false\n";
+        std::fs::write(workdir.join("Dockerfile.dev"), UNBUILDABLE).unwrap();
         let awman_dir = workdir.join(".awman");
         std::fs::create_dir_all(&awman_dir).unwrap();
-        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), UNBUILDABLE).unwrap();
 
         let plan = SessionCreatePlan {
             kind: SessionKind::Local,
