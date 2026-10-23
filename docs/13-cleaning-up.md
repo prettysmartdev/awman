@@ -29,7 +29,7 @@ With `runtime` set to `builtin-experimental`, `awman clean` applies to the built
 - **Downloaded archive cache.** Importing an image keeps a validated copy of its archive in `<builtin state dir>/oci-cache/` (`~/.awman/builtin/oci-cache/` by default). It is read only while an image is being acquired: during `awman ready`, or when a launch with `builtin.builder.enabled` prepares a missing agent image. `awman clean` does not remove it. To reclaim the space, delete that directory while no `awman ready` or launch is preparing an image; the next import simply re-acquires the image from its source.
 - **Everything else.** To remove all builtin state (imported images, session disks, the cache), stop or finish every builtin session, then delete the state directory (`builtin.stateDir`, or `AWMAN_BUILTIN_STATE_DIR`). The next `awman ready` re-imports your images. Do not delete it while sessions are running.
 
-Sessions started by an awman with a different internal protocol version are refused rather than adopted or cleaned up (`builtin runtime worker protocol mismatch`); stop them with the awman version that started them first.
+Sessions started by an awman with a different internal protocol version are refused rather than adopted or cleaned up (`builtin runtime worker protocol mismatch`); stop them with the awman version that started them first. If the error names the builtin state directory itself, that whole directory was created by an awman with a different protocol and no command in this version can read it: quit any older awman still running agents from it (builtin sessions end with the awman that launched them), then move or delete the directory, or set `builtin.stateDir` to a new one, and run `awman ready` to re-import your images.
 
 ---
 

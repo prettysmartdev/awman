@@ -42,12 +42,29 @@ fn an_old_protocol_marker_names_both_versions_and_changes_nothing() {
     let marker = paths.home.join("awman-runtime-version");
     std::fs::write(&marker, "0.6.9/17/awman-0").unwrap();
     match paths.check_catalog() {
-        Err(EngineError::WorkerProtocolMismatch { expected, found }) => {
+        Err(error @ EngineError::BuiltinCatalogMismatch { .. }) => {
+            // No agent in a foreign catalog can be stopped by this awman, so
+            // the guidance names the directory to retire instead.
+            let message = error.to_string();
+            assert!(
+                message.contains(&paths.home.display().to_string()),
+                "{message}"
+            );
+            assert!(!message.contains("stop running agents"), "{message}");
+            let EngineError::BuiltinCatalogMismatch {
+                expected,
+                found,
+                state_dir,
+            } = error
+            else {
+                unreachable!()
+            };
             assert_eq!(expected, PROTOCOL);
             assert_eq!(found, "0.6.9/17/awman-0");
+            assert_eq!(state_dir, paths.home);
         }
         other => panic!(
-            "expected WorkerProtocolMismatch, got {:?}",
+            "expected BuiltinCatalogMismatch, got {:?}",
             other.map(|_| ())
         ),
     }

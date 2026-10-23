@@ -282,6 +282,23 @@ pub enum EngineError {
     )]
     WorkerProtocolMismatch { expected: String, found: String },
 
+    /// The whole state directory was created under another protocol, so no
+    /// agent in it can be listed or stopped by this awman. Builtin VMs do not
+    /// outlive the awman that launched them, so recovery is: quit that awman,
+    /// then retire the directory.
+    #[error(
+        "builtin runtime worker protocol mismatch: the builtin state directory {} was \
+         created with protocol {found}, but this awman uses {expected}. Quit any older awman \
+         still running agents from it, then move or delete that directory (or set \
+         builtin.stateDir to a new one) and run `awman ready` to re-import images",
+        state_dir.display()
+    )]
+    BuiltinCatalogMismatch {
+        expected: String,
+        found: String,
+        state_dir: PathBuf,
+    },
+
     /// A builtin handle outlived its sandbox: the name was reused by a newer
     /// launch, so acting on the old handle would hit the replacement.
     #[error("builtin agent {name} was replaced by a newer sandbox with the same name")]

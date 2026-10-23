@@ -12,9 +12,10 @@ impl BuiltinPaths {
     pub fn check_catalog(&self) -> Result<(), EngineError> {
         match self.check_runtime_marker(super::naming::PROTOCOL)? {
             RuntimeMarker::Created | RuntimeMarker::Matches => Ok(()),
-            RuntimeMarker::Mismatch { found } => Err(EngineError::WorkerProtocolMismatch {
+            RuntimeMarker::Mismatch { found } => Err(EngineError::BuiltinCatalogMismatch {
                 expected: super::naming::PROTOCOL.into(),
                 found,
+                state_dir: self.home.clone(),
             }),
         }
     }
@@ -33,7 +34,7 @@ mod tests {
         std::fs::write(&marker, b"future-protocol").unwrap();
         assert!(matches!(
             paths.check_catalog(),
-            Err(EngineError::WorkerProtocolMismatch { .. })
+            Err(EngineError::BuiltinCatalogMismatch { .. })
         ));
         assert_eq!(std::fs::read(&marker).unwrap(), b"future-protocol");
         assert_eq!(std::fs::read_dir(paths.home.join("db")).unwrap().count(), 0);
