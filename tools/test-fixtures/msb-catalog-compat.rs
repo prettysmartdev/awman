@@ -21,7 +21,7 @@ async fn main() {
     };
     let rows = || async {
         db.query_all_raw(stmt(
-            "SELECT config, active_config FROM sandbox ORDER BY id",
+            "SELECT name, config, active_config, status FROM sandbox ORDER BY name",
         ))
         .await
         .unwrap()
@@ -30,6 +30,8 @@ async fn main() {
             (
                 row.try_get_by_index::<String>(0).unwrap(),
                 row.try_get_by_index::<String>(1).unwrap(),
+                row.try_get_by_index::<String>(2).unwrap(),
+                row.try_get_by_index::<String>(3).unwrap(),
             )
         })
         .collect::<Vec<_>>()
@@ -41,7 +43,7 @@ async fn main() {
             for strict_sni in [false, true] {
                 let config = json!({
                     "network": {"mode": "none", "strict": true, "strict_sni": strict_sni},
-                    "labels": {"awman.test": "preserved"}
+                    "labels": {"awman.test": "preserved", "awman.worker.protocol": "0.7.2/18/awman-1"}
                 })
                 .to_string();
                 db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
@@ -71,9 +73,13 @@ async fn main() {
                 .unwrap();
             Migrator::up(&db, None).await.unwrap();
             assert_eq!(count().await, 29);
-            for ((config, active), (old, _)) in rows().await.into_iter().zip(before) {
+            for ((name, config, active, status), (old_name, old_config, _old_active, old_status))
+                in rows().await.into_iter().zip(before)
+            {
+                assert_eq!(name, old_name);
+                assert_eq!(status, old_status);
                 let new: Value = serde_json::from_str(&config).unwrap();
-                let old: Value = serde_json::from_str(&old).unwrap();
+                let old: Value = serde_json::from_str(&old_config).unwrap();
                 assert_eq!(new["network"]["strict"], true);
                 assert_eq!(new["network"]["strict_sni"], old["network"]["strict_sni"]);
                 assert_eq!(new["labels"], old["labels"]);
@@ -102,6 +108,15 @@ async fn main() {
             Migrator::up(&db, None).await.unwrap();
             assert_eq!(count().await, 29);
             assert_eq!(rows().await.len(), 2);
+            for (name, config, active, status) in rows().await {
+                assert_eq!(status, "stopped");
+                let config: Value = serde_json::from_str(&config).unwrap();
+                let active: Value = serde_json::from_str(&active).unwrap();
+                assert_eq!(config["labels"]["awman.test"], "preserved");
+                assert_eq!(config["labels"]["awman.worker.protocol"], "0.7.2/18/awman-1");
+                assert_eq!(config["network"]["strict_sni"], name == "awman-true");
+                assert_eq!(active, config);
+            }
             let integrity = db
                 .query_one_raw(stmt("PRAGMA integrity_check"))
                 .await

@@ -67,6 +67,14 @@ impl ContainerBackend for DeferredBackend {
     fn is_available(&self) -> Result<(), EngineError> {
         self.get()?.is_available()
     }
+    fn take_notices(&self) -> Vec<String> {
+        // Never forces an open: only a backend that already opened has any.
+        let cached = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        cached
+            .as_ref()
+            .map(|backend| backend.take_notices())
+            .unwrap_or_default()
+    }
     fn build(
         &self,
         options: ResolvedContainerOptions,
@@ -210,6 +218,31 @@ mod tests {
             2,
             "cache successful construction"
         );
+    }
+
+    #[test]
+    fn a_notice_from_a_deferred_open_is_returned_once_after_it_opens() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let runtime = super::super::runtime::ContainerRuntime::open_builtin(Box::new(move || {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(EngineError::BuiltinRuntimeUnavailable {
+                    reason: "starting".into(),
+                });
+            }
+            let backend = super::super::test_support::HoldingBackend::default();
+            backend.notices.lock().unwrap().push("upgraded".into());
+            Ok(Arc::new(backend))
+        }))
+        .unwrap();
+        assert!(
+            runtime.take_notices().is_empty(),
+            "draining never forces an open"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(runtime.availability().is_ok());
+        assert_eq!(runtime.take_notices(), vec!["upgraded".to_string()]);
+        assert!(runtime.take_notices().is_empty());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

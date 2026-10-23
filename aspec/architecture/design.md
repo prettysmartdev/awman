@@ -45,7 +45,7 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 - Session and workflow state
 - File I/O and database access
 - Environment variable handling
-- On-disk data contracts (JSON schemas, SQLite migrations)
+- On-disk data contracts (JSON schemas, SQLite migrations, and the in-place upgrade of the builtin runtime's SQLite catalog: allowlisted protocol versions only, backed up to `db.pre-<protocol>` with a manifest first, restored through the `awman-catalog-restore` journal, committed by rewriting the state directory's runtime marker last)
 
 **Constraint**: Imports only from `std`, third-party crates, and `crate::data::*`
 

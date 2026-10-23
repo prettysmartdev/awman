@@ -329,7 +329,44 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 - `awman agents status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.
 - `awman agents detail <id>` includes the builtin VM's configured vCPUs, memory in MiB, and network mode.
 - Live CPU and memory figures (the TUI's container title bar and minimized bars, and `awman agents status`) are measured from the VM itself: CPU is the guest's vCPU time over wall time on the same per-core scale as `docker stats` (100% is one fully busy vCPU, so a 2-vCPU VM tops out at 200%), and memory is what the guest is using. The runtime publishes a new sample once a second, so a one-shot `awman agents status` may take about a second per running session to report CPU.
-- If you replace the awman binary while a session is running, new operations report `awman was replaced on disk while this session was running; restart awman to use the builtin runtime`. An awman with a different internal protocol version refuses to adopt sandboxes created by another version (`builtin runtime worker protocol mismatch … stop running agents started by an older awman and retry`): stop those agents with the awman that started them first. If the state directory itself was created under another protocol, the error names that directory instead, and every builtin command refuses it until it is moved aside or deleted (see [Cleaning up](13-cleaning-up.md)).
+- If you replace the awman binary while a session is running, new operations report `awman was replaced on disk while this session was running; restart awman to use the builtin runtime`. An awman with a different internal protocol version refuses to adopt sandboxes created by another version (`builtin runtime worker protocol mismatch … stop running agents started by an older awman and retry`): stop those agents with the awman that started them first. A state directory created by an older awman is handled differently: it is upgraded in place (see below).
+
+**Upgrading an older state directory.** When the state directory was created by the awman release this awman can upgrade from, it is upgraded in place the first time this awman opens the builtin runtime. Only exact protocol versions are accepted; this release upgrades from `0.7.2/18/awman-1` only, and any other older protocol is refused (see *Catalogs that cannot be upgraded* below). There is nothing to move or delete, and no prompt. The previous catalog is first copied to `db.pre-<protocol>` beside the `db` directory (for example `~/.awman/builtin/db.pre-0.7.2_18_awman-1`), together with a manifest, `awman-catalog-backup.json`, that lets awman check the copy later. Your imported images and the download cache are kept. Leftover sandboxes of the older awman (they have all stopped) are removed, records and files. The CLI prints one line on stderr; the TUI shows the same line in its status bar until you press a key:
+
+```
+upgraded builtin state <state dir> from <old protocol> to <new protocol>; previous catalog saved in <backup>
+```
+
+If the older awman is still running agents from that directory, or is launching one, or importing or removing an image, the upgrade is refused and nothing is changed: `the builtin state directory <dir> was created by an older awman (protocol <old>) that is still running or launching agents, or importing or removing an image, from it; quit that older awman, then retry so this awman can upgrade the directory in place`. Quit that awman and retry. While the upgrade runs, an older awman that is still open cannot start any of those: a launch or image removal fails at once, and an import waits until the upgrade has finished.
+
+If an upgrade is interrupted (a crash, or a failure that could not be undone), the next run resumes it from the backup automatically, after checking the backup against its manifest. If awman cannot prove that is safe (for example the backup has no manifest, or its files do not match it, or `db` was never migrated), it refuses and changes nothing: `cannot upgrade the builtin state directory <dir> from protocol <old>: a catalog backup from an earlier, interrupted upgrade already exists at <backup>, and awman cannot prove it is safe to restore automatically. If db/ still holds your catalog, move the backup aside and retry; if db/ is missing or empty, restore it from the backup first`. To restore `db` from the backup, follow steps 1–3 below, then retry. Do not delete the backup until `db` holds a good catalog.
+
+**Rolling back.** Use the backup with the older awman binary. There is no downgrade path otherwise. With the state directory in place of `~/.awman/builtin`:
+
+1. Quit every awman (old and new) using the state directory.
+2. Keep the upgraded catalog aside and copy (do not move) the backup into place:
+   ```
+   cd ~/.awman/builtin
+   mv db db.after-upgrade
+   cp -Rp db.pre-0.7.2_18_awman-1 db
+   rm db/awman-catalog-backup.json
+   ```
+   The backup's database already contains its write-ahead log, so there are no `-wal` or `-shm` files to bring along.
+3. Write the older protocol back into the marker, exactly and without a trailing newline (the older awman refuses the catalog otherwise):
+   ```
+   printf '%s' '0.7.2/18/awman-1' > awman-runtime-version
+   ```
+4. Run the older awman binary. Its catalog still lists the stopped sandboxes the upgrade removed, but their files are gone: do not resume them, remove them with the older awman.
+
+Once you are happy with the upgrade, delete the `db.pre-*` backup (see [Cleaning up](13-cleaning-up.md)).
+
+**Catalogs that cannot be upgraded.** A catalog with no recorded protocol version, one created by a newer awman, or one created by an older awman whose protocol this release does not list, is never modified, and no downgrade is attempted. Every builtin command then reports:
+
+```
+builtin runtime worker protocol mismatch: the builtin state directory <dir> was created with protocol <found>, but this awman uses <expected>. Quit any older awman still running agents from it, then move or delete that directory (or set builtin.stateDir to a new one) and run `awman ready` to re-import images
+```
+
+For a newer catalog, use the newer awman. Otherwise quit any awman still using the directory, move it aside or delete it (or point `builtin.stateDir` at a new one), and run `awman ready` to re-import your images.
 
 ### Parity limits versus Docker and Apple Containers
 

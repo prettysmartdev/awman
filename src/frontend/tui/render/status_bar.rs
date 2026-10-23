@@ -5,6 +5,22 @@ use super::*;
 pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sidebar_visible: bool) {
     use crate::frontend::tui::tabs::{ContainerWindowState, ExecutionPhase};
 
+    // A runtime notice (an in-place builtin state upgrade, naming the backup)
+    // is shown on every tab, squad included, until the next key press.
+    if let Some(notice) = &app.status_bar.notice {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {notice} "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .style(Style::default().bg(Color::Black)),
+            area,
+        );
+        return;
+    }
+
     let tab = app.active_tab();
     let workflow_active = tab
         .shared

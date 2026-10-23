@@ -137,6 +137,7 @@ fn main_loop(
 
         app.tick_all_tabs();
         app.poll_dialog_requests();
+        app.poll_runtime_notices();
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {

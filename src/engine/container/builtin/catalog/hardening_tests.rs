@@ -16,7 +16,7 @@ fn a_symlinked_version_marker_is_never_followed() {
     let outside = temp.path().join("outside");
     std::fs::write(&outside, PROTOCOL).unwrap();
     symlink(&outside, paths.home.join("awman-runtime-version")).unwrap();
-    assert!(paths.check_catalog().is_err());
+    assert!(paths.prepare_catalog().is_err());
 }
 
 #[test]
@@ -24,7 +24,7 @@ fn concurrent_first_starts_agree_on_one_marker() {
     let (_temp, paths) = paths();
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..6)
-            .map(|_| scope.spawn(|| paths.check_catalog()))
+            .map(|_| scope.spawn(|| paths.prepare_catalog()))
             .collect();
         for handle in handles {
             handle.join().unwrap().unwrap();
@@ -41,7 +41,7 @@ fn an_old_protocol_marker_names_both_versions_and_changes_nothing() {
     let (_temp, paths) = paths();
     let marker = paths.home.join("awman-runtime-version");
     std::fs::write(&marker, "0.6.9/17/awman-0").unwrap();
-    match paths.check_catalog() {
+    match paths.prepare_catalog() {
         Err(error @ EngineError::BuiltinCatalogMismatch { .. }) => {
             // No agent in a foreign catalog can be stopped by this awman, so
             // the guidance names the directory to retire instead.

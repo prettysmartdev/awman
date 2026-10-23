@@ -44,6 +44,9 @@ if grep -Ei 'libsqlite3|libcap-ng|libkrun(fw)?' "$output/dynamic-dependencies.tx
 fi
 strings "$artifact" > "$output/strings.txt"
 version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$root/Cargo.toml" | head -1)
+# Builtin state upgrade policy: needs the full history and tags (a shallow
+# checkout fails).
+bash "$root/tools/release-upgrade-policy.sh" "$root" "$version"
 grep -Fq "$version" "$output/strings.txt" || { echo "embedded awman version $version not retained" >&2; exit 1; }
 grep -q 'msb' "$output/strings.txt" || { echo "embedded provider marker not retained" >&2; exit 1; }
 if [ "$(uname -s)" = Linux ]; then grep -q '\.msbver' "$output/sections.txt" || { echo "Linux .msbver section missing" >&2; exit 1; }

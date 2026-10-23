@@ -30,6 +30,9 @@ pub enum Focus {
 #[derive(Debug, Clone, Default)]
 pub struct StatusBar {
     pub text: String,
+    /// A runtime notice (an in-place builtin state upgrade). While set it
+    /// replaces the hints in the status bar; the next key press clears it.
+    pub notice: Option<String>,
 }
 
 /// The outcome of the pre-event-loop squad tab build (`awman squad`).
@@ -1078,6 +1081,23 @@ impl App {
                     "squad daemon not reachable — workflow overview frozen; attached containers still live"
                         .to_string();
             }
+        }
+    }
+
+    /// Show runtime notices in the status bar (the same one-line text the
+    /// CLI prints on stderr).
+    pub fn show_runtime_notices(&mut self, notices: Vec<String>) {
+        if !notices.is_empty() {
+            self.status_bar.notice = Some(notices.join("; "));
+        }
+    }
+
+    /// Pick up notices from a runtime that opened after startup (a deferred
+    /// builtin backend whose first open was retried by a later command).
+    pub fn poll_runtime_notices(&mut self) {
+        if let Some(runtime) = &self.engines.container_runtime {
+            let notices = runtime.take_notices();
+            self.show_runtime_notices(notices);
         }
     }
 

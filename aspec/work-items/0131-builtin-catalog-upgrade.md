@@ -83,6 +83,26 @@ roll back by returning to the older awman binary and restoring the backup.
      they don't, fall back to a read-only `rusqlite` query of the pre-migration
      `db/msb.db` for `awman.owner.pid` labels, checked with
      `DaemonSupervisor::is_process_alive`, and record the decision here.*
+
+     **Decision (implemented): the lifecycle-lock probe is sufficient, so no fallback was added.**
+     The locks are not under `sandboxes/`. The SDK keeps them at
+     `<state dir>/run/locks/<hash>.lock` (`microsandbox_runtime::ipc::lifecycle_lock_path`,
+     identical in SDK 0.7.2 and 0.7.8; `run_dir()` is `home/run` in both). Evidence from the
+     published 0.7.2 crates (`microsandbox`, `microsandbox-runtime`, `microsandbox-cli`):
+     - the launcher (`runtime/spawn.rs`) takes the lock before touching any endpoint, and dups it
+       into the child as fd 99 (`LIFECYCLE_LOCK_FD`). It also passes `--lifecycle-lock-fd`,
+       because launch contract patch 18 is ≥ 9.
+     - the worker (`machine_cmd::run`, which awman's same-executable worker route calls)
+       adopts that fd as a `SandboxLifecycleGuard`. It stores the guard in
+       `runner::vm::Config::lifecycle_guard` ("process-lifetime ownership"), which `vm::enter`
+       moves into `run` and never drops; `run` only ends with process exit.
+
+     The gate therefore probes every regular file in `run/locks/` with a non-blocking `flock`. It
+     also probes `awman-import.lock`, so an import running from the older awman blocks the
+     upgrade. A lock that can't be taken produces `BuiltinCatalogUpgradeBlocked`. Locks left
+     by crashed workers are free and count as dead. Caveat: git history (the 0.7.2 tag)
+     wasn't readable in the implementation environment. The evidence comes from the
+     published SDK 0.7.2 crates that protocol `0.7.2/18/awman-1` was built against.
   2. **Backup:** `backup_catalog(found)`.
   3. **Migrate:** open the catalog through `isolated_backend(&paths)`, which runs the
      SDK's forward migrations. Opening must not boot or touch any VM.
@@ -129,6 +149,34 @@ roll back by returning to the older awman binary and restoring the backup.
 - **Long-running import lock** (`IMPORT_LOCK`): the upgrade takes only the catalog
   lock, so it doesn't wait for an import. An import already running from an older
   awman makes the liveness gate refuse.
+
+### Review follow-up decisions (implemented)
+- **Backup manifest.** `backup_catalog(from, database, ledger)` folds the staged copy's WAL into
+  its database, records its applied migrations and every file's size in
+  `awman-catalog-backup.json`, and publishes under a name claimed with an exclusive `mkdir`.
+  Recovery restores only a backup whose files match its manifest and whose `from` matches the
+  marker; partial migration is judged against the manifest's migrations, never inferred from an
+  absent database or ledger.
+- **Journalled restore.** `restore_catalog` publishes `awman-catalog-restore` before touching
+  `db/` and removes it once the restored `db/` is durable; a failed second rename puts the
+  displaced `db/` back. While the journal exists the next attempt repeats the restore, even if
+  `db/` is missing or empty, then migrates again.
+- **Reversible retirement.** Each stale sandbox's `sandboxes/<name>` is moved to
+  `.sandboxes.retired/` before the SDK removes it. Rollback (and the start of every attempt) puts
+  them back; they are deleted only after the marker commits.
+- **Fence, not only a probe.** Besides the lifecycle-lock probe, the upgrade takes every existing
+  image lease exclusively and the import lock, both without waiting, and keeps them until it
+  ends. An older awman's launch or image removal then fails at once and its import waits. The
+  lifecycle locks are probed again just before the commit; a VM started meanwhile (for an image
+  with no lease file yet) blocks and rolls back the upgrade. An older awman that is open but idle
+  is otherwise not stopped; operations that take none of these locks are not fenced.
+- **Durability.** Directory fsync errors are reported (only EINVAL/ENOTSUP count as
+  unsupported). A failure after the new marker became visible is not rolled back: the new marker
+  and the migrated catalog stay together, with the backup kept.
+- **Release guard.** `tools/release-upgrade-policy.sh` fails on a shallow checkout, a git error
+  or an unparseable previous protocol, and requires a reason after the release-note phrase.
+  It is skipped only without an earlier release tag or when that release has no
+  `builtin_runtime.rs`. The release job checks out full history and tags.
 
 ## Test Considerations:
 - Layer 0 unit tests: `check_runtime_marker` returns `Upgradable` only for allowlisted

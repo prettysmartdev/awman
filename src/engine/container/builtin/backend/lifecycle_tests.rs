@@ -10,6 +10,8 @@ use crate::engine::container::options::{
 };
 use std::collections::BTreeMap;
 
+mod upgrade_tests;
+
 pub(super) struct Rig {
     _temp: tempfile::TempDir,
     pub driver: Arc<FakeDriver>,
@@ -49,6 +51,7 @@ impl Rig {
             settings: settings(state),
             owner: owner.into(),
             background_env: Default::default(),
+            notices: Default::default(),
         }
     }
 

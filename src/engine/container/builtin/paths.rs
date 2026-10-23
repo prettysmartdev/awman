@@ -19,7 +19,7 @@ pub struct BuiltinPaths {
 }
 
 /// Map a Layer 0 state failure onto the engine's error vocabulary.
-fn state_error(error: DataError) -> EngineError {
+pub(super) fn state_error(error: DataError) -> EngineError {
     match error {
         DataError::BuiltinState(message) => EngineError::Config(message),
         busy @ DataError::BuiltinStateBusy { .. } => EngineError::BuiltinRuntimeUnavailable {
@@ -52,7 +52,7 @@ impl BuiltinPaths {
         }
     }
 
-    fn state(&self) -> BuiltinState {
+    pub(super) fn state(&self) -> BuiltinState {
         BuiltinState::at(&self.home)
     }
 

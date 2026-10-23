@@ -196,6 +196,71 @@ pub(crate) fn status_until_listed(scratch: &Scratch, state: &Path) -> Result<Str
     outcome
 }
 
+fn status_until_listed_with_upgrade_notice(
+    scratch: &Scratch,
+    state: &Path,
+) -> Result<(String, String), String> {
+    let repo = scratch.dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let mut child = scratch
+        .command(&awman(), Some("/usr/bin:/bin"))
+        .env("AWMAN_TEST_BUILTIN", "1")
+        .env("AWMAN_BUILTIN_STATE_DIR", state)
+        .args(["agents", "status", "--watch"])
+        .current_dir(&repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (is_stderr, stream) in [
+        (
+            false,
+            Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        ),
+        (true, Box::new(child.stderr.take().unwrap())),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if tx.send((is_stderr, line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let outcome = loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok((is_stderr, line)) => {
+                let target = if is_stderr { &mut stderr } else { &mut stdout };
+                target.push_str(&line);
+                target.push('\n');
+                let listed = stdout.contains("No agents running");
+                let noticed = stderr
+                    .lines()
+                    .any(|line| line.starts_with("upgraded builtin state "));
+                if listed && noticed {
+                    break Ok((stdout.clone(), stderr.clone()));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(format!("stdout: {stdout}\nstderr: {stderr}"));
+            }
+            Err(_) if Instant::now() > deadline => {
+                break Err(format!("timed out; stdout: {stdout}\nstderr: {stderr}"));
+            }
+            Err(_) => {}
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    outcome
+}
+
 fn tables(db: &Path) -> Vec<String> {
     let connection = rusqlite::Connection::open(db).unwrap();
     let mut statement = connection
@@ -219,6 +284,18 @@ fn applied_migrations(db: &Path) -> i64 {
             r.get(0)
         })
         .unwrap()
+}
+
+fn copy_072_catalog(state_dir: &Path) -> PathBuf {
+    let database = state_dir.join("db/msb.db");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/builtin_runtime/fixtures/msb-catalog-0.7.2.db"),
+        &database,
+    )
+    .unwrap();
+    database
 }
 
 #[test]
@@ -469,4 +546,93 @@ fn builtin_sqlite_an_unversioned_foreign_catalog_is_refused_not_adopted_or_migra
         ["old_layout"],
         "the old catalog is not migrated"
     );
+}
+
+#[test]
+fn builtin_sqlite_072_catalog_is_upgraded_by_prepare_catalog_before_status_lists() {
+    if !builtin_selectable() {
+        eprintln!(
+            "SKIP: builtin_sqlite 0.7.2 upgrade: builtin runtime is unavailable on this host"
+        );
+        return;
+    }
+    let state = short_state();
+    let state_dir = state.path().join("s");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db = copy_072_catalog(&state_dir);
+    let original = std::fs::read(&db).unwrap();
+    let old = "0.7.2/18/awman-1";
+    std::fs::write(state_dir.join("awman-runtime-version"), old).unwrap();
+
+    let scratch = Scratch::new();
+    config_home(&scratch);
+    let (stdout, stderr) = status_until_listed_with_upgrade_notice(&scratch, &state_dir)
+        .expect("the upgraded builtin runtime should list agents and announce the upgrade");
+    assert!(stdout.contains("No agents running"), "{stdout}");
+    assert!(!stderr.contains("unavailable on this host"), "{stderr}");
+
+    let expected = "0.7.8/18/awman-1";
+    assert_eq!(
+        std::fs::read_to_string(state_dir.join("awman-runtime-version")).unwrap(),
+        expected
+    );
+    let backup = state_dir.join("db.pre-0.7.2_18_awman-1/msb.db");
+    assert!(backup.is_file(), "missing backup at {}", backup.display());
+    assert_eq!(std::fs::read(backup).unwrap(), original);
+
+    let notices: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("upgraded builtin state "))
+        .collect();
+    assert_eq!(notices.len(), 1, "expected one upgrade notice: {stderr}");
+    assert!(
+        notices[0].contains(&format!("from {old} to {expected};")),
+        "{stderr}"
+    );
+    assert!(
+        notices[0].contains("previous catalog saved in "),
+        "{stderr}"
+    );
+
+    assert_eq!(applied_migrations(&db), 29);
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    let rows: Vec<(String, String)> = connection
+        .prepare("SELECT name, config FROM sandbox ORDER BY name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for (name, config) in rows {
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(config["labels"]["awman.test"], "preserved");
+        assert_eq!(config["network"]["strict_sni"], name == "awman-true");
+    }
+}
+
+#[test]
+fn builtin_sqlite_newer_catalog_marker_is_refused_without_changes() {
+    if !builtin_selectable() {
+        eprintln!("SKIP: builtin_sqlite newer marker: builtin runtime is unavailable on this host");
+        return;
+    }
+    let state = short_state();
+    let state_dir = state.path().join("s");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db = copy_072_catalog(&state_dir);
+    let original = std::fs::read(&db).unwrap();
+    let newer = "99.0.0/18/awman-1";
+    let marker = state_dir.join("awman-runtime-version");
+    std::fs::write(&marker, newer).unwrap();
+
+    let scratch = Scratch::new();
+    config_home(&scratch);
+    let output =
+        status_until_listed(&scratch, &state_dir).expect_err("a newer marker must be refused");
+    assert!(output.contains("protocol mismatch"), "{output}");
+    assert!(output.contains(newer), "{output}");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), newer);
+    assert_eq!(std::fs::read(db).unwrap(), original);
+    assert!(!state_dir.join("db.pre-99.0.0_18_awman-1").exists());
 }

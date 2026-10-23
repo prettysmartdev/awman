@@ -149,6 +149,27 @@ Keep it factual and brief. No marketing language. Focus on what a developer usin
 
 ---
 
+## Step 7b: Check the builtin state upgrade path
+
+If `WORKER_PROTOCOL` in `src/data/builtin_runtime.rs` differs from the one in the previous release tag, builtin state written by that release can only be upgraded in place if its protocol is listed in `UPGRADABLE_FROM` (same file). Compare:
+
+```bash
+prev=$(git describe --tags --abbrev=0)
+git show "$prev:src/data/builtin_runtime.rs" | grep -nE 'define_builtin_runtime_version!|WORKER_PROTOCOL'
+grep -nE 'define_builtin_runtime_version!|WORKER_PROTOCOL|UPGRADABLE_FROM' src/data/builtin_runtime.rs
+```
+
+If the protocol changed, do one of these (`tools/release-artifact-check.sh` fails otherwise, through `tools/release-upgrade-policy.sh`):
+
+1. Add the previous release's exact protocol string (e.g. `"0.7.2/18/awman-1"`) to `UPGRADABLE_FROM`, or
+2. Add a line to `docs/releases/vX.Y.Z.md` starting with `No in-place builtin state upgrade:` followed by why the old state cannot be migrated.
+
+The check also fails when it cannot determine the previous release's protocol: a shallow checkout, a git error, or a previous `builtin_runtime.rs` it cannot parse. Run it from a full clone with tags (`bash tools/release-upgrade-policy.sh . X.Y.Z`). It is skipped only when there is no earlier release tag, or the earlier release has no `builtin_runtime.rs` at all.
+
+If the protocol did not change, nothing to do.
+
+---
+
 ## Step 8: Write a blog post
 
 Create `docs/blog/NNNN-slug.md` where NNNN is the next number after the last post.
@@ -197,5 +218,6 @@ Before finishing, verify:
 - [ ] relevant numbered doc(s) under `docs/` document new subcommands/config fields (check, don't assume)
 - [ ] Status-dashboard tips reviewed: stale tips fixed, new features covered, `cargo test --lib tips` passes
 - [ ] `docs/releases/vX.Y.Z.md` created
+- [ ] If `WORKER_PROTOCOL` changed: previous protocol added to `UPGRADABLE_FROM`, or release notes have a `No in-place builtin state upgrade:` line
 - [ ] `docs/blog/NNNN-slug.md` created
 - [ ] Release script NOT run (user does that separately)

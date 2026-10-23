@@ -218,6 +218,8 @@ fn intercept_agents_watch_stop(
     true
 }
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    // A runtime notice stays in the status bar until the next key press.
+    app.status_bar.notice = None;
     if keymap::is_workflow_context_copy_key(key) {
         if let Some(path) = app.active_tab().active_workflow_context_path() {
             copy_dialog_text_to_clipboard(app, "Workflow context path", &path.to_string_lossy());

@@ -295,6 +295,209 @@ prompt = "must not run write=/workspace/never.out"
     eprintln!("PASS: {TEST}");
 }
 
+/// The awman that last shipped the protocol this build upgrades from, as built
+/// by `tools/build-previous-builtin-awman.sh` (which `make test-builtin` and
+/// `tools/native-builtin-ci.sh` run, and point `AWMAN_TEST_BUILTIN_PREVIOUS`
+/// at its output directory).
+struct PreviousAwman {
+    binary: PathBuf,
+    protocol: String,
+    /// The global `runtime` value that awman spells the builtin runtime with.
+    runtime: String,
+}
+
+fn previous_awman(test: &str) -> Option<PreviousAwman> {
+    let required = std::env::var("AWMAN_TEST_BUILTIN_REQUIRE_HW").is_ok_and(|v| v == "1");
+    let blocked = |reason: &str| {
+        eprintln!("BLOCKED: {test}: {reason}");
+        assert!(!required, "{test}: {reason}");
+        None
+    };
+    let Some(dir) = std::env::var_os("AWMAN_TEST_BUILTIN_PREVIOUS").map(PathBuf::from) else {
+        return blocked(
+            "AWMAN_TEST_BUILTIN_PREVIOUS is unset; run `make test-builtin`, which builds the previous awman",
+        );
+    };
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let (Some(protocol), Some(runtime)) = (read("protocol"), read("runtime")) else {
+        return blocked(
+            "AWMAN_TEST_BUILTIN_PREVIOUS is not a build-previous-builtin-awman.sh output",
+        );
+    };
+    let binary = dir.join("awman");
+    if let Err(reason) = crate::gate::hypervisor(&binary) {
+        return blocked(&reason);
+    }
+    assert!(
+        awman::data::builtin_runtime::UPGRADABLE_FROM.contains(&protocol.as_str()),
+        "the previous awman's protocol {protocol} is not upgradable by this build"
+    );
+    Some(PreviousAwman {
+        binary,
+        protocol,
+        runtime,
+    })
+}
+
+/// Image references and digests in a builtin catalog.
+fn catalog_images(db: &Path) -> Vec<(String, String)> {
+    let connection =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT image_ref.reference, manifest.digest FROM image_ref
+             JOIN manifest ON manifest.id = image_ref.manifest_id ORDER BY 1, 2",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// Every file under `dir` with its contents (empty when `dir` is absent).
+fn file_tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.map(Result::unwrap) {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(path);
+            } else if entry.file_type().unwrap().is_file() {
+                let contents = std::fs::read(&path).unwrap();
+                files.push((path.strip_prefix(dir).unwrap().to_path_buf(), contents));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The old-to-new transition, with real binaries on both sides: the previous
+/// awman imports the image and runs an agent in a fresh state directory; this
+/// awman then upgrades that directory in place and boots a guest from the
+/// image the previous one imported. The archive is deleted before the upgrade
+/// and the OCI cache and catalog images are compared, so a reimport or
+/// re-acquisition fails the test instead of hiding behind a fresh import.
+#[test]
+fn builtin_hw_actual_awman_boots_after_upgrading_a_072_state_directory() {
+    const TEST: &str = "builtin_hw_actual_awman_boots_after_upgrading_a_072_state_directory";
+    let Some((binary, archive)) = gate(TEST) else {
+        return;
+    };
+    let Some(previous) = previous_awman(TEST) else {
+        return;
+    };
+    // A private copy of the archive, removed once the previous awman has
+    // imported it.
+    let source = tempfile::Builder::new()
+        .prefix("awman-072-archive.")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let own_archive = source.path().join("fixture.tar");
+    std::fs::copy(&archive, &own_archive).unwrap();
+
+    // Project::with_runtime runs `ready` with the previous awman: it imports.
+    let mut project = Project::with_runtime(
+        &previous.binary,
+        &own_archive,
+        "awman-072-upgrade.",
+        &previous.runtime,
+    );
+    let state_dir = project._state.path().join("s");
+    let marker = state_dir.join("awman-runtime-version");
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        previous.protocol,
+        "the previous awman did not create a {} state directory",
+        previous.protocol
+    );
+    let old_run = run_bounded(
+        project.cmd(&[
+            "exec",
+            "prompt",
+            "--non-interactive",
+            "--agent",
+            "claude",
+            "before upgrade exit=0",
+        ]),
+        Duration::from_secs(300),
+    );
+    assert_eq!(old_run.status.code(), Some(0), "{}", text(&old_run));
+    assert_eq!(
+        project.live_vms(),
+        0,
+        "the previous awman left a VM running"
+    );
+
+    let db = state_dir.join("db/msb.db");
+    let images = catalog_images(&db);
+    assert!(!images.is_empty(), "the previous awman imported no image");
+    let oci_cache = file_tree(&state_dir.join("oci-cache"));
+    std::fs::remove_file(&own_archive).unwrap();
+
+    project.switch(&binary, "builtin-experimental");
+    let ready = run_bounded(project.cmd(&["ready", "--json"]), Duration::from_secs(300));
+    assert!(
+        ready.status.success(),
+        "ready after the {} upgrade failed: {}",
+        previous.protocol,
+        text(&ready)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(result["ready"], true, "{result}");
+    assert!(
+        String::from_utf8_lossy(&ready.stderr).contains("upgraded builtin state"),
+        "no upgrade notice: {}",
+        text(&ready)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        awman::data::builtin_runtime::WORKER_PROTOCOL
+    );
+    let backup = state_dir.join(format!("db.pre-{}", previous.protocol.replace('/', "_")));
+    assert!(
+        backup.join("msb.db").is_file(),
+        "the old catalog backup must be retained: {}",
+        backup.display()
+    );
+    assert_eq!(
+        catalog_images(&db),
+        images,
+        "the upgrade changed the images"
+    );
+    assert!(
+        file_tree(&state_dir.join("oci-cache")) == oci_cache,
+        "the image was acquired again after the upgrade"
+    );
+
+    let new_run = run_bounded(
+        project.cmd(&[
+            "exec",
+            "prompt",
+            "--non-interactive",
+            "--agent",
+            "claude",
+            "after upgrade exit=0",
+        ]),
+        Duration::from_secs(300),
+    );
+    assert_eq!(new_run.status.code(), Some(0), "{}", text(&new_run));
+    assert!(
+        text(&new_run).contains("SYNTHETIC_IMAGE=fixture"),
+        "the guest did not boot the retained image: {}",
+        text(&new_run)
+    );
+    assert_eq!(catalog_images(&db), images, "the image was imported again");
+    project.assert_no_helper();
+    eprintln!("PASS: {TEST}");
+}
+
 /// The owning `awman` is killed while its agent runs. The guest does not
 /// outlive the cleanup that follows (`awman clean --yes`), and a fresh run
 /// afterwards works.

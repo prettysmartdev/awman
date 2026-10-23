@@ -110,6 +110,11 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The builtin state upgrade policy compares against the previous
+          # release tag, so it needs the full history and tags.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.0"

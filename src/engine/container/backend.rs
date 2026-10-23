@@ -47,6 +47,13 @@ pub(super) trait ContainerBackend: Send + Sync {
     /// reason it is not (CLI missing, daemon down, hypervisor unavailable, …).
     fn is_available(&self) -> Result<(), EngineError>;
 
+    /// One-line notices from opening this backend (e.g. an in-place builtin
+    /// catalog upgrade), drained once. Layer 2 presents them: stderr in
+    /// command mode, the status area in the TUI.
+    fn take_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     // ─── Agents ─────────────────────────────────────────────────────────────
 
     /// Build an `AgentInstance` from resolved options. The image is NOT
