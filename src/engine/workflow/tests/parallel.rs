@@ -226,6 +226,22 @@ async fn run_to_completion_full_parallel_group_max_concurrent_2() {
     }
 }
 
+/// Wait until the frontend has recorded `expected` launches, then assert
+/// the exact launch order.
+///
+/// `report_parallel_step_launched` runs after the factory bumps its
+/// execution counter, so on a loaded CI runner the record can lag the
+/// counter past a fixed sleep (observed: count 2, launched `["a"]`).
+async fn wait_for_launched(record: &Arc<Mutex<ParallelRecord>>, expected: &[&str]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while record.lock().unwrap().launched.len() < expected.len()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(record.lock().unwrap().launched, expected);
+}
+
 /// Scheduling: with 4 concurrently-ready steps and `max_concurrent = 2`,
 /// exactly 2 start initially; the 3rd starts only when the 1st finishes and
 /// the 4th only when the 2nd finishes.
@@ -261,19 +277,19 @@ async fn parallel_group_launches_respect_max_concurrent_cap() {
         2,
         "max_concurrent=2 must cap the initial launch at 2"
     );
-    assert_eq!(record.lock().unwrap().launched, vec!["a", "b"]);
+    wait_for_launched(&record, &["a", "b"]).await;
 
     // Finishing the 1st frees a slot; the 3rd (c) launches.
     signal_completion(&entries[0].1, 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(execution_count.load(Ordering::Relaxed), 3);
-    assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "c"]);
+    wait_for_launched(&record, &["a", "b", "c"]).await;
 
     // Finishing the 2nd frees the last slot; the 4th (d) launches.
     signal_completion(&entries[1].1, 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(execution_count.load(Ordering::Relaxed), 4);
-    assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "c", "d"]);
+    wait_for_launched(&record, &["a", "b", "c", "d"]).await;
 
     // Drain the rest and confirm completion.
     signal_completion(&entries[2].1, 0);
