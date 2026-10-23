@@ -45,10 +45,18 @@ cargo test --locked --features builtin-runtime --target "$target" --test builtin
 # macOS: Hypervisor.framework needs the entitlement on every process that
 # starts a VM (awman and the guest drivers).
 bash tools/macos-sign-test-artifacts.sh "$CARGO_TARGET_DIR/$target/debug"
+# The old-to-new upgrade test boots the awman that last shipped the protocol
+# this build upgrades from, built from git history (needs a full clone).
+previous_awman=$(bash tools/build-previous-builtin-awman.sh)
+export AWMAN_TEST_BUILTIN_PREVIOUS="$previous_awman"
 test_list=$(cargo test --locked --features builtin-runtime --target "$target" --test builtin_runtime -- --list)
 printf '%s\n' "$test_list"
 printf '%s\n' "$test_list" | grep -Eq '(^|::)builtin_hw_actual_awman_cli_synthetic_agent_exit_37: test$' || {
   echo "FAIL: native CI requires builtin_hw_actual_awman_cli_synthetic_agent_exit_37 to boot actual awman; driver-only coverage cannot pass D-03" >&2
+  exit 1
+}
+printf '%s\n' "$test_list" | grep -Eq '(^|::)builtin_hw_actual_awman_boots_after_upgrading_a_072_state_directory: test$' || {
+  echo "FAIL: native CI requires the old-to-new builtin state upgrade test" >&2
   exit 1
 }
 # Actual entrypoint smoke and optimized-independent metadata/provider checks.

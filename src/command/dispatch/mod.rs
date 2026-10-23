@@ -165,6 +165,11 @@ impl Engines {
             global.clone(),
         );
         let detected = agent_runtime::detect_effective(&effective)?;
+        // Hosts without a startup frontend still record an in-place builtin
+        // state upgrade rather than dropping its notice.
+        for notice in detected.take_notices() {
+            tracing::info!("{notice}");
+        }
         Self::from_detected(detected, session)
     }
 
@@ -189,6 +194,9 @@ impl Engines {
         // `AgentEngine::builtin_launch_settings`, so a task inherits its
         // repo's narrowing.
         let detected = agent_runtime::detect(&global)?;
+        for notice in detected.take_notices() {
+            tracing::info!("{notice}");
+        }
         let runtime = detected.engine();
         let container_runtime = detected.container_runtime();
         let sandbox_runtime = detected.sandbox_runtime();

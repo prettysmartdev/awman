@@ -6,6 +6,12 @@ macro_rules! define_builtin_runtime_version {
         pub const MSB_VERSION: &str = $version;
         /// Protocol tag shared by worker discovery and sandbox ownership.
         pub const WORKER_PROTOCOL: &str = concat!($version, "/18/awman-1");
+        /// Exact older worker protocols whose catalogs this build may upgrade.
+        ///
+        /// Entries are compared as literal strings only: there is no prefix or
+        /// semantic-version comparison, and this list must never include a
+        /// protocol newer than [`WORKER_PROTOCOL`].
+        pub const UPGRADABLE_FROM: &[&str] = &["0.7.2/18/awman-1"];
     };
 }
 

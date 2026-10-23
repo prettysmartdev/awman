@@ -2401,3 +2401,24 @@ fn an_agent_container_window_keeps_the_agent_title() {
     let text = buffer_text(&render_app(&mut app, 120, 30));
     assert!(text.contains("Claude Code (containerized)"), "{text}");
 }
+
+// ─── runtime notices ────────────────────────────────────────────────────────
+
+#[test]
+fn a_runtime_notice_is_rendered_in_the_status_bar_until_a_key_press() {
+    let notice = "upgraded builtin state /s from 0.7.2/18/awman-1 to 0.7.8/18/awman-1; \
+                  previous catalog saved in /s/db.pre-0.7.2_18_awman-1";
+    for squad in [false, true] {
+        let mut app = make_app();
+        app.active_tab_mut().is_squad = squad;
+        app.show_runtime_notices(vec![notice.to_string()]);
+        let text = buffer_text(&render_app(&mut app, 220, 30));
+        assert!(text.contains(notice), "squad={squad}:\n{text}");
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let text = buffer_text(&render_app(&mut app, 220, 30));
+        assert!(!text.contains("upgraded builtin state"), "squad={squad}");
+    }
+    let mut app = make_app();
+    app.show_runtime_notices(Vec::new());
+    assert!(app.status_bar.notice.is_none());
+}

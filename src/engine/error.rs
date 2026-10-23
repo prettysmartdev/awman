@@ -282,6 +282,53 @@ pub enum EngineError {
     )]
     WorkerProtocolMismatch { expected: String, found: String },
 
+    /// The whole state directory was created under another protocol, so no
+    /// agent in it can be listed or stopped by this awman. Builtin VMs do not
+    /// outlive the awman that launched them, so recovery is: quit that awman,
+    /// then retire the directory.
+    #[error(
+        "builtin runtime worker protocol mismatch: the builtin state directory {} was \
+         created with protocol {found}, but this awman uses {expected}. Quit any older awman \
+         still running agents from it, then move or delete that directory (or set \
+         builtin.stateDir to a new one) and run `awman ready` to re-import images",
+        state_dir.display()
+    )]
+    BuiltinCatalogMismatch {
+        expected: String,
+        found: String,
+        state_dir: PathBuf,
+    },
+
+    /// The state directory can be upgraded in place from protocol `found`,
+    /// but a session of the older awman that created it may still be alive
+    /// (it holds a sandbox lifecycle lock, an image lease or the image-import
+    /// lock). Nothing was changed, or the attempt was rolled back.
+    #[error(
+        "the builtin state directory {} was created by an older awman (protocol {found}) \
+         that is still running or launching agents, or importing or removing an image, from \
+         it; quit that older awman, then retry so this awman can upgrade the directory in place",
+        state_dir.display()
+    )]
+    BuiltinCatalogUpgradeBlocked { state_dir: PathBuf, found: String },
+
+    /// An earlier in-place upgrade left a catalog backup behind, and nothing
+    /// proves that restoring it is safe: it may not be a complete awman
+    /// backup, or the catalog was never migrated. The backup may be the only
+    /// good copy of something, so it is never overwritten or removed.
+    #[error(
+        "cannot upgrade the builtin state directory {} from protocol {found}: a catalog backup \
+         from an earlier, interrupted upgrade already exists at {}, and awman cannot prove it is \
+         safe to restore automatically. If db/ still holds your catalog, move the backup aside \
+         and retry; if db/ is missing or empty, restore it from the backup first",
+        state_dir.display(),
+        backup.display()
+    )]
+    BuiltinCatalogBackupExists {
+        state_dir: PathBuf,
+        found: String,
+        backup: PathBuf,
+    },
+
     /// A builtin handle outlived its sandbox: the name was reused by a newer
     /// launch, so acting on the old handle would hit the replacement.
     #[error("builtin agent {name} was replaced by a newer sandbox with the same name")]
@@ -488,6 +535,11 @@ impl EngineError {
             EngineError::AgentNotFound { .. } => 4,
             EngineError::Container(_) | EngineError::ContainerRuntimeUnavailable { .. } => 3,
             EngineError::UnknownRuntime { .. } => 2,
+            // A refused or failed in-place catalog upgrade is an ordinary
+            // engine failure, never "Docker is missing" (3).
+            EngineError::BuiltinCatalogMismatch { .. }
+            | EngineError::BuiltinCatalogUpgradeBlocked { .. }
+            | EngineError::BuiltinCatalogBackupExists { .. } => 1,
             _ => 1,
         }
     }

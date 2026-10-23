@@ -25,12 +25,15 @@ pub(crate) type HeldFrontends = Arc<Mutex<Vec<Box<dyn AgentFrontend>>>>;
 pub(crate) fn holding_runtime(frontends: HeldFrontends) -> Arc<ContainerRuntime> {
     Arc::new(ContainerRuntime::with_backend(Arc::new(HoldingBackend {
         frontends,
+        notices: Default::default(),
     })))
 }
 
 #[derive(Default)]
 pub(super) struct HoldingBackend {
     frontends: HeldFrontends,
+    /// Returned (once) by `take_notices`.
+    pub(super) notices: Mutex<Vec<String>>,
 }
 
 struct HoldingInstance {
@@ -97,6 +100,9 @@ impl AgentInstance for HoldingInstance {
 }
 
 impl ContainerBackend for HoldingBackend {
+    fn take_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notices.lock().unwrap())
+    }
     fn name(&self) -> &'static str {
         "holding-container"
     }

@@ -870,8 +870,19 @@ mod tests {
         }))
         .unwrap();
         drop(execution);
+        // Wait for the fake CLI to record `run` rather than sleeping a fixed
+        // time: under a loaded full-suite run, starting the script can take
+        // longer than any short fixed delay.
+        let read_calls = || std::fs::read_to_string(&log).unwrap_or_default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !read_calls().lines().any(|line| line == "run")
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Then give a wrongful stop/rm the same window the test always allowed.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let calls = read_calls();
         assert!(calls.lines().any(|line| line == "run"), "{calls}");
         assert!(!calls.lines().any(|line| line == "stop"), "{calls}");
         assert!(!calls.lines().any(|line| line == "rm"), "{calls}");

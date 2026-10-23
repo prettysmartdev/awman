@@ -1,5 +1,6 @@
 //! SDK operations run on a host control thread. VMM execution occurs exclusively
 //! in the same-executable child dispatched by worker.rs.
+use super::catalog::{CatalogState, CatalogUpgrade, CatalogUpgraded, LabelledSandbox};
 use super::{cpu, driver::*, naming, paths::BuiltinPaths};
 use crate::engine::{agent_runtime::execution::AgentStats, error::EngineError};
 use microsandbox::{
@@ -9,7 +10,10 @@ use microsandbox::{
 use std::{
     future::Future,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -68,10 +72,12 @@ impl Drop for MsbDriver {
     }
 }
 impl MsbDriver {
+    /// Open the driver, first upgrading an older catalog in place when the
+    /// marker allows it. The second value describes that upgrade, if one ran.
     pub fn open(
         paths: BuiltinPaths,
         ambient_overrides: &[&'static str],
-    ) -> Result<Arc<Self>, EngineError> {
+    ) -> Result<(Arc<Self>, Option<CatalogUpgraded>), EngineError> {
         let ambient_overrides = ambient_overrides.to_vec();
         super::blocking::BlockingOperation::run(move || {
             Self::open_blocking(paths, &ambient_overrides)
@@ -80,24 +86,14 @@ impl MsbDriver {
     fn open_blocking(
         paths: BuiltinPaths,
         ambient_overrides: &[&'static str],
-    ) -> Result<Arc<Self>, EngineError> {
+    ) -> Result<(Arc<Self>, Option<CatalogUpgraded>), EngineError> {
         let executable = super::embedded::EmbeddedRuntime::resolve(ambient_overrides)?;
-        paths.check_catalog()?;
+        let catalog = paths.prepare_catalog()?;
         // This pinned SDK entrypoint starts with GlobalConfig::default() and
         // never loads installed msb config or resolves paths from HOME/XDG.
         // All state roots below are owned by awman and remain explicit.
         let local = isolated_backend(&paths)?;
-        let resolved = microsandbox::setup::resolve_runtime(local.config())
-            .map_err(|_| failure("embedded resolution"))?;
-        if resolved.msb_path != executable
-            || resolved.libkrunfw_path != executable
-            || resolved.origin != microsandbox::setup::RuntimeOrigin::SdkPackage
-            || local.config().paths.agentd.is_some()
-        {
-            return Err(EngineError::BuiltinRuntimeUnavailable {
-                reason: "SDK resolved a non-embedded runtime component".into(),
-            });
-        }
+        check_embedded_resolution(&local, &executable)?;
         let local = Arc::new(local);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let (shutdown, done) = tokio::sync::oneshot::channel();
@@ -125,27 +121,35 @@ impl MsbDriver {
             })
             .map_err(|_| failure("control thread startup"))?;
         let runtime = rx.recv().map_err(|_| failure("control thread startup"))??;
-        Ok(Arc::new(Self {
+        let driver = Arc::new(Self {
             runtime,
             shutdown: Mutex::new(Some(shutdown)),
             local,
             active: Arc::new(Mutex::new(Default::default())),
             cpu: Arc::new(Mutex::new(Default::default())),
-        }))
+        });
+        // The driver's own backend has not opened the database yet. The
+        // upgrade migrates through a separate backend whose connections are
+        // closed before the marker is committed (or `db/` restored), so the
+        // driver only ever opens the committed catalog.
+        let upgraded = match catalog {
+            CatalogState::Ready => None,
+            CatalogState::NeedsUpgrade { .. } => {
+                let upgrade = MsbCatalogUpgrade {
+                    runtime: driver.runtime.clone(),
+                    local: Arc::new(isolated_backend(&paths)?),
+                    opened: AtomicBool::new(false),
+                };
+                paths.upgrade_catalog(&upgrade)?
+            }
+        };
+        Ok((driver, upgraded))
     }
     fn call<T: Send + 'static>(
         &self,
         future: impl Future<Output = Result<T, EngineError>> + Send + 'static,
     ) -> Result<T, EngineError> {
-        let backend = self.backend();
-        let runtime = self.runtime.clone();
-        super::blocking::BlockingOperation::run(move || {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            runtime.spawn(async move {
-                let _ = tx.send(microsandbox::backend::with_backend(backend, future).await);
-            });
-            rx.recv().map_err(|_| failure("control task"))?
-        })
+        run_on(&self.runtime, self.backend(), future)
     }
 
     fn backend(&self) -> Arc<dyn Backend> {
@@ -153,6 +157,142 @@ impl MsbDriver {
     }
 }
 
+/// Run `future` on the control runtime with `backend` as the SDK's backend.
+fn run_on<T: Send + 'static>(
+    runtime: &tokio::runtime::Handle,
+    backend: Arc<dyn Backend>,
+    future: impl Future<Output = Result<T, EngineError>> + Send + 'static,
+) -> Result<T, EngineError> {
+    let runtime = runtime.clone();
+    super::blocking::BlockingOperation::run(move || {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        runtime.spawn(async move {
+            let _ = tx.send(microsandbox::backend::with_backend(backend, future).await);
+        });
+        rx.recv().map_err(|_| failure("control task"))?
+    })
+}
+
+/// The SDK side of the in-place catalog upgrade (`catalog::upgrade_catalog`),
+/// on an isolated backend of its own so every connection it opens can be
+/// closed before the marker is committed or `db/` is restored.
+struct MsbCatalogUpgrade {
+    runtime: tokio::runtime::Handle,
+    local: Arc<LocalBackend>,
+    /// Whether `migrate` opened the database pools that `close` must close.
+    opened: AtomicBool,
+}
+impl MsbCatalogUpgrade {
+    fn call<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = Result<T, EngineError>> + Send + 'static,
+    ) -> Result<T, EngineError> {
+        run_on(&self.runtime, self.local.clone(), future)
+    }
+}
+impl CatalogUpgrade for MsbCatalogUpgrade {
+    fn migrate(&self) -> Result<(), EngineError> {
+        let local = self.local.clone();
+        // Connecting applies the SDK's forward migrations and reconciles
+        // snapshot descriptors; it never starts, stops or connects to a VM.
+        self.call(async move {
+            local
+                .db()
+                .await
+                .map(|_| ())
+                .map_err(|_| failure("catalog migration"))
+        })?;
+        self.opened.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn sandbox_labels(&self) -> Result<Vec<LabelledSandbox>, EngineError> {
+        let backend: Arc<dyn Backend> = self.local.clone();
+        self.call(async move {
+            let mut all = Vec::new();
+            let mut cursor = None;
+            loop {
+                let mut query = microsandbox::sandbox::SandboxListBuilder::default()
+                    .label(naming::LABEL_AWMAN, "true");
+                if let Some(c) = cursor {
+                    query = query.cursor(c);
+                }
+                let page = backend
+                    .sandboxes()
+                    .list(backend.clone(), query)
+                    .await
+                    .map_err(|_| failure("upgrade discovery"))?;
+                for handle in page.sandboxes {
+                    let config = handle
+                        .config()
+                        .map_err(|_| failure("upgrade catalog read"))?;
+                    all.push((handle.name().to_string(), config.spec.labels.clone()));
+                }
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            Ok(all)
+        })
+    }
+    fn retire_stale_sandbox(&self, id: &str) -> Result<(), EngineError> {
+        let backend: Arc<dyn Backend> = self.local.clone();
+        let id = id.to_string();
+        self.call(async move {
+            let handle = backend
+                .sandboxes()
+                .get(backend.clone(), &id)
+                .await
+                .map_err(|_| failure("upgrade lookup"))?;
+            // Deliberately no `naming::check_protocol`: the sandbox is stale
+            // by definition. The SDK refuses to remove one it still sees
+            // running, which fails (and rolls back) the upgrade.
+            handle
+                .remove()
+                .await
+                .map_err(|_| failure("stale sandbox removal"))
+        })
+    }
+    fn close(&self) -> Result<(), EngineError> {
+        if !self.opened.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let local = self.local.clone();
+        self.call(async move {
+            let pools = local.db().await.map_err(|_| failure("catalog close"))?;
+            let read = pools.read().inner().close_by_ref().await;
+            let write = pools.write().inner().close_by_ref().await;
+            read.and(write).map_err(|_| failure("catalog close"))
+        })
+    }
+}
+
+/// The SDK must resolve both runtime components to this executable, from the
+/// process-level setters `EmbeddedRuntime::resolve` registered. In 0.7.8 those
+/// setters feed the isolated config's `paths.msb`/`paths.libkrunfw`, so the
+/// pair reports `RuntimeOrigin::Configuration`. That config has no installed or
+/// managed layer and ambient `MSB_*` overrides are refused earlier, so these
+/// values can only be awman's own registration; check them as well.
+fn check_embedded_resolution(
+    local: &LocalBackend,
+    executable: &std::path::Path,
+) -> Result<(), EngineError> {
+    let resolved = microsandbox::setup::resolve_runtime(local.config())
+        .map_err(|_| failure("embedded resolution"))?;
+    let paths = &local.config().paths;
+    if resolved.msb_path != executable
+        || resolved.libkrunfw_path != executable
+        || resolved.origin != microsandbox::setup::RuntimeOrigin::Configuration
+        || paths.msb.as_deref() != Some(executable)
+        || paths.libkrunfw.as_deref() != Some(executable)
+        || paths.agentd.is_some()
+    {
+        return Err(EngineError::BuiltinRuntimeUnavailable {
+            reason: "SDK resolved a non-embedded runtime component".into(),
+        });
+    }
+    Ok(())
+}
 fn isolated_backend(paths: &BuiltinPaths) -> Result<LocalBackend, EngineError> {
     LocalBackend::builder()
         .home(&paths.home)
@@ -726,6 +866,148 @@ fn symlink_free_ancestors(host: &std::path::Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// The production upgrader, with the pinned SDK, on a catalog written by
+    /// the published 0.7.2 migrations: the committed fixture, or the catalog
+    /// named by `AWMAN_TEST_CATALOG_072` (`tools/test-msb-catalog-compat.sh`
+    /// passes the one it has just written). No VM is booted.
+    #[test]
+    fn sdk_upgrade_of_a_072_catalog_retires_only_stale_awman_sandboxes_and_keeps_images() {
+        use super::naming::{LABEL_AWMAN, LABEL_PROTOCOL, PROTOCOL};
+        const OLD: &str = "0.7.2/18/awman-1";
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths =
+            super::BuiltinPaths::resolve(&temp.path().canonicalize().unwrap().join("s")).unwrap();
+        let db = paths.home.join("db/msb.db");
+        let fixture = std::env::var_os("AWMAN_TEST_CATALOG_072")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/builtin_runtime/fixtures/msb-catalog-0.7.2.db"
+                )
+                .into()
+            });
+        std::fs::copy(&fixture, &db).unwrap();
+        std::fs::write(paths.home.join("awman-runtime-version"), OLD).unwrap();
+        let sandboxes = [
+            ("awman-stale", Some(OLD), true),
+            ("awman-current", Some(PROTOCOL), true),
+            ("foreign", Some(OLD), false),
+        ];
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        for (name, protocol, awman) in sandboxes {
+            let mut config = microsandbox::sandbox::SandboxConfig::default();
+            config.spec.name = name.into();
+            if awman {
+                config.spec.labels.insert(LABEL_AWMAN.into(), "true".into());
+            }
+            if let Some(protocol) = protocol {
+                config
+                    .spec
+                    .labels
+                    .insert(LABEL_PROTOCOL.into(), protocol.into());
+            }
+            let json = serde_json::to_string(&config).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sandbox (name, config, active_config, status) VALUES (?1, ?2, ?2, 'Stopped')",
+                    [name, json.as_str()],
+                )
+                .unwrap();
+            let id = connection.last_insert_rowid();
+            for (key, value) in &config.spec.labels {
+                connection
+                    .execute(
+                        "INSERT INTO sandbox_labels (sandbox_id, key, value) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![id, key, value],
+                    )
+                    .unwrap();
+            }
+            let directory = paths.home.join("sandboxes").join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("upper.ext4"), name).unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO manifest (digest) VALUES ('sha256:old-image');
+                 INSERT INTO image_ref (reference, manifest_id) VALUES ('awman-agent:old', 1);",
+            )
+            .unwrap();
+        drop(connection);
+        let cache = paths.home.join("cache/oci/sentinel");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, b"cached").unwrap();
+        assert_eq!(
+            paths.prepare_catalog().unwrap(),
+            super::CatalogState::NeedsUpgrade { found: OLD.into() }
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let upgrade = super::MsbCatalogUpgrade {
+            runtime: runtime.handle().clone(),
+            local: std::sync::Arc::new(super::isolated_backend(&paths).unwrap()),
+            opened: std::sync::atomic::AtomicBool::new(false),
+        };
+        let upgraded = paths.upgrade_catalog(&upgrade).unwrap().unwrap();
+        assert_eq!(upgraded.retired, 1);
+        assert_eq!(paths.prepare_catalog().unwrap(), super::CatalogState::Ready);
+
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM seaql_migrations"), 29);
+        let names: Vec<String> = connection
+            .prepare("SELECT name FROM sandbox ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // The fixture's own two rows carry no `awman` label, so they are kept.
+        assert_eq!(
+            names,
+            ["awman-current", "awman-false", "awman-true", "foreign"]
+        );
+        // The rows the 0.7.2 migrator wrote keep their labels and `strict_sni`.
+        for name in ["awman-false", "awman-true"] {
+            let config: String = connection
+                .query_row("SELECT config FROM sandbox WHERE name = ?1", [name], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+            assert_eq!(config["labels"]["awman.test"], "preserved", "{name}");
+            assert_eq!(config["labels"][LABEL_PROTOCOL], OLD, "{name}");
+            assert_eq!(
+                config["network"]["strict_sni"],
+                name == "awman-true",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            count("SELECT COUNT(*) FROM image_ref WHERE reference = 'awman-agent:old'"),
+            1,
+            "imported images are kept"
+        );
+        drop(connection);
+        assert!(!paths.home.join("sandboxes/awman-stale").exists());
+        assert!(!paths.home.join(".sandboxes.retired").exists());
+        for kept in ["awman-current", "foreign"] {
+            assert!(paths
+                .home
+                .join("sandboxes")
+                .join(kept)
+                .join("upper.ext4")
+                .exists());
+        }
+        assert_eq!(std::fs::read(&cache).unwrap(), b"cached");
+        let backup = paths
+            .state()
+            .verified_catalog_backup(&upgraded.backup)
+            .unwrap();
+        assert_eq!(backup.migrations.map(|m| m.len()), Some(27));
+        drop(runtime);
+    }
+
     #[cfg(unix)]
     #[test]
     fn bind_sources_resolve_ancestor_symlinks_but_not_the_leaf() {
@@ -747,6 +1029,54 @@ mod tests {
     }
 
     use super::*;
+
+    /// The SDK's runtime setters are set-once per process, so the registration
+    /// runs in a child copy of this test binary.
+    #[test]
+    fn embedded_registration_resolves_to_this_executable_and_nothing_else() {
+        const CHILD: &str = "AWMAN_TEST_EMBEDDED_RESOLUTION_CHILD";
+        const NAME: &str = "engine::container::builtin::msb_driver::tests::embedded_registration_resolves_to_this_executable_and_nothing_else";
+        let Some(dir) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, dir.path());
+            for variable in [
+                "MSB_PATH",
+                "MSB_LIBKRUNFW_PATH",
+                "MSB_AGENTD_PATH",
+                "MSB_HOME",
+            ] {
+                child.env_remove(variable);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("embedded resolution checked"));
+            return;
+        };
+        let executable = dir.join("awman");
+        std::fs::write(&executable, b"").unwrap();
+        microsandbox::config::set_sdk_msb_path(&executable);
+        microsandbox::set_libkrunfw_path(&executable);
+        let local = isolated_backend(&BuiltinPaths {
+            home: dir.join("home"),
+        })
+        .unwrap();
+        check_embedded_resolution(&local, &executable).unwrap();
+        let other = dir.join("other-awman");
+        std::fs::write(&other, b"").unwrap();
+        assert!(matches!(
+            check_embedded_resolution(&local, &other),
+            Err(EngineError::BuiltinRuntimeUnavailable { .. })
+        ));
+        println!("embedded resolution checked");
+    }
 
     #[tokio::test]
     async fn sdk_network_config_spec_roundtrips_defaults_and_explicit_strict_sni() {

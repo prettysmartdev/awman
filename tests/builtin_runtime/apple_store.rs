@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::lifecycle::{awman, gate, install_ready_ping_stub, run_bounded};
+use crate::lifecycle::{apple_service_lock, awman, gate, install_ready_ping_stub, run_bounded};
 
 fn apple_cli() -> PathBuf {
     std::env::var_os("AWMAN_TEST_APPLE_CLI")
@@ -56,6 +56,8 @@ fn builtin_hw_actual_awman_apple_store_import_runs_offline_after_service_stops()
         assert!(!required, "{TEST}: Apple store prerequisites missing");
         return;
     };
+    // Held to the end, outliving `Restart`: this test stops the shared service.
+    let _apple = apple_service_lock();
 
     let temp = tempfile::Builder::new()
         .prefix("awman-apple.")

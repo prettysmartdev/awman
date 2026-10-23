@@ -54,6 +54,8 @@ pub struct BuiltinBackend {
     // Background env is intentionally memory-only; it must never enter the SDK
     // catalog. Setup/teardown operations always belong to their launching client.
     pub background_env: Mutex<HashMap<String, BackgroundState>>,
+    /// Notices from opening the driver, drained by `take_notices`.
+    pub notices: Mutex<Vec<String>>,
 }
 #[derive(Clone, Default)]
 pub struct BackgroundState {
@@ -366,6 +368,9 @@ impl ContainerBackend for BuiltinBackend {
         // failures. SDK doctor only checks the architecture on macOS; it does
         // not verify the executable's signing entitlement or attempt HVF boot.
         self.driver.hypervisor_available()
+    }
+    fn take_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notices.lock().unwrap_or_else(|e| e.into_inner()))
     }
     fn build(
         &self,

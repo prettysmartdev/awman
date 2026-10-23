@@ -101,13 +101,15 @@ pub(super) fn open(
             });
         }
         let paths = paths::BuiltinPaths::resolve(&settings.state_dir)?;
-        let driver = msb_driver::MsbDriver::open(paths.clone(), &settings.ambient_overrides)?;
+        let (driver, upgraded) =
+            msb_driver::MsbDriver::open(paths.clone(), &settings.ambient_overrides)?;
         Ok(Arc::new(backend::BuiltinBackend {
             driver,
             paths,
             settings,
             owner: uuid::Uuid::new_v4().to_string(),
             background_env: std::sync::Mutex::new(Default::default()),
+            notices: std::sync::Mutex::new(upgraded.iter().map(|u| u.notice()).collect()),
         }))
     }
     #[cfg(not(awman_builtin))]

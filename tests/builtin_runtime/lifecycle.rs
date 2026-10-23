@@ -68,6 +68,17 @@ pub(crate) fn run_bounded(mut command: Command, timeout: Duration) -> Output {
     waiter.join().unwrap().expect("wait for awman")
 }
 
+/// Serializes the tests that use the host's one Apple Containers service.
+/// Some of them stop it mid-test (`container system stop`), which breaks any
+/// build or import another test is running against it at the time. Hold the
+/// guard for the whole test, and take it before anything that restarts the
+/// service on drop so the restart happens while the lock is still held.
+pub(crate) fn apple_service_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panicking holder poisons the lock; the next test still needs it.
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn awman(binary: &Path, repo: &Path, home: &Path, bin_dir: &Path) -> Command {
     let mut command = Command::new(binary);
     command

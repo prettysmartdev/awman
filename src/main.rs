@@ -69,6 +69,14 @@ async fn frontend_main() -> Result<ExitCode> {
     for message in outcome.messages() {
         eprintln!("{message}");
     }
+    // Runtime notices are one line each on stderr in command mode; the TUI
+    // shows them in its status area instead, where they stay visible.
+    let notices = outcome.notices().to_vec();
+    if !launch.is_tui() {
+        for notice in &notices {
+            eprintln!("{notice}");
+        }
+    }
 
     let fatal_runtime_error = outcome.fatal_runtime_error;
     let ctx = RuntimeContext::new(outcome.session, outcome.engines);
@@ -80,8 +88,17 @@ async fn frontend_main() -> Result<ExitCode> {
     };
 
     match initial_tab {
-        Some(tab) => Ok(tui::run(matches, ctx, fatal_runtime_error, tab).await),
-        None => Ok(cli::run(matches, ctx).await),
+        Some(tab) => Ok(tui::run(matches, ctx, fatal_runtime_error, tab, notices).await),
+        None => {
+            // A builtin backend whose first open was deferred opens (and may
+            // upgrade) during the command; its notice is printed afterwards.
+            let runtime = ctx.engines.container_runtime.clone();
+            let code = cli::run(matches, ctx).await;
+            for notice in runtime.map(|r| r.take_notices()).unwrap_or_default() {
+                eprintln!("{notice}");
+            }
+            Ok(code)
+        }
     }
 }
 

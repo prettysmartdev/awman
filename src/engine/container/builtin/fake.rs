@@ -61,6 +61,7 @@ impl FakeBuiltin {
             },
             owner: "fake-process".into(),
             background_env: Default::default(),
+            notices: Default::default(),
         };
         Self {
             _temp: temp,

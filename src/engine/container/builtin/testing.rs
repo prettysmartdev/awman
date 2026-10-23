@@ -1,5 +1,6 @@
 //! Hermetic doubles for the builtin backend: an in-memory `SandboxDriver`
 //! and a channel-backed frontend. No VM, hypervisor, SDK or real HOME.
+use super::catalog::{CatalogUpgrade, LabelledSandbox};
 use super::driver::*;
 use super::naming;
 use super::paths::BuiltinPaths;
@@ -56,6 +57,32 @@ pub struct FakeState {
     pub removed_images: Vec<String>,
     pub fail_exec: bool,
     pub hypervisor_error: Option<String>,
+    /// Scripted behaviour and observations for the in-place catalog upgrade.
+    pub upgrade: FakeUpgrade,
+}
+
+/// Test seam for `catalog::upgrade_catalog` over the in-memory driver.
+///
+/// `migrate` stands in for the SDK's forward migrations: it can write files
+/// into `db/` (e.g. a SQLite `msb.db` with extra `seaql_migrations` rows) to
+/// make the catalog look migrated, or fail. `fail_retire` makes retiring that
+/// sandbox fail. `crash_before_commit` panics in `before_commit`: unwinding
+/// skips the rollback, exactly like a process dying before the marker is
+/// committed (call `upgrade_catalog` under `std::panic::catch_unwind`).
+#[derive(Default)]
+pub struct FakeUpgrade {
+    pub migrate: Option<Box<dyn Fn() -> Result<(), EngineError> + Send>>,
+    pub fail_retire: Option<String>,
+    pub crash_before_commit: bool,
+    /// When set, retiring a sandbox deletes `<dir>/<id>` first, as the SDK
+    /// deletes the per-sandbox directory before the row.
+    pub sandboxes_dir: Option<PathBuf>,
+    /// How many times `migrate` ran.
+    pub migrations: usize,
+    /// Ids retired through the protocol-blind removal path, in order.
+    pub retired: Vec<String>,
+    /// How many times `close` ran.
+    pub closes: usize,
 }
 
 struct BootGate {
@@ -362,6 +389,61 @@ impl SandboxDriver for FakeDriver {
         let mut state = self.state.lock().unwrap();
         state.images.remove(tag);
         state.removed_images.push(tag.into());
+        Ok(())
+    }
+}
+
+impl CatalogUpgrade for FakeDriver {
+    fn migrate(&self) -> Result<(), EngineError> {
+        let mut state = self.state.lock().unwrap();
+        state.upgrade.migrations += 1;
+        match &state.upgrade.migrate {
+            Some(migrate) => migrate(),
+            None => Ok(()),
+        }
+    }
+
+    fn sandbox_labels(&self) -> Result<Vec<LabelledSandbox>, EngineError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .sandboxes
+            .iter()
+            .filter(|s| s.spec.labels.get(naming::LABEL_AWMAN).map(String::as_str) == Some("true"))
+            .map(|s| (s.spec.name.clone(), s.spec.labels.clone()))
+            .collect())
+    }
+
+    fn retire_stale_sandbox(&self, id: &str) -> Result<(), EngineError> {
+        let mut state = self.state.lock().unwrap();
+        if state.upgrade.fail_retire.as_deref() == Some(id) {
+            return Err(EngineError::Other("stale sandbox removal failed".into()));
+        }
+        let position = state
+            .sandboxes
+            .iter()
+            .position(|s| s.spec.name == id)
+            .ok_or_else(|| EngineError::Other("no such sandbox".into()))?;
+        if let Some(directory) = &state.upgrade.sandboxes_dir {
+            match std::fs::remove_dir_all(directory.join(id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(EngineError::io(directory.join(id), e)),
+            }
+        }
+        state.sandboxes.remove(position);
+        state.upgrade.retired.push(id.into());
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), EngineError> {
+        self.state.lock().unwrap().upgrade.closes += 1;
+        Ok(())
+    }
+
+    fn before_commit(&self) -> Result<(), EngineError> {
+        if self.state.lock().unwrap().upgrade.crash_before_commit {
+            panic!("simulated crash before the catalog marker is committed");
+        }
         Ok(())
     }
 }

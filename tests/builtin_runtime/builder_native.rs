@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use crate::lifecycle::{awman, install_ready_ping_stub, run_bounded};
+use crate::lifecycle::{apple_service_lock, awman, install_ready_ping_stub, run_bounded};
 
 const MARKER_BASE: &str = "/etc/awman-wi125-base";
 const MARKER_AGENT: &str = "/etc/awman-wi125-agent";
@@ -636,6 +636,9 @@ fn builtin_hw_builder_apple_local_build_import_rebuild_then_runs_without_builder
     let Some(store) = apple_store() else {
         return;
     };
+    // Held to the end, outliving `restart`: this test builds against the
+    // shared service and then stops it.
+    let _apple = apple_service_lock();
     let temp = tempfile::Builder::new()
         .prefix("awba.")
         .tempdir_in("/tmp")

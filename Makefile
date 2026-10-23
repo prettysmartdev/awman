@@ -9,7 +9,7 @@ TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 # smoke tests need the native filesystem's atomic object writes.
 AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
 
-.PHONY: all build sign-macos install test test-fast test-full test-builtin payloads clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
+.PHONY: all build sign-macos install test test-fast test-full test-builtin test-builtin-hw payloads payloads-verify clean release architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
 
 all: build
 
@@ -38,6 +38,13 @@ sign-macos:
 
 payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
+
+# Native, one-time promotion of a new payload pin: fetches the payload, writes
+# a candidate verified record, runs the hardware/clean-checkout/release-artifact
+# gates, and keeps the record only if all pass. Needs a clean checkout, HVF or
+# KVM, and a running Docker or Apple Containers engine for the guest fixtures.
+payloads-verify:
+	bash tools/msb-payloads/payloads-verify.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 
 # Explicit verification entrypoints; native hardware targets fail closed when
 # KVM/HVF or the fixture is absent. `TARGET` is a Rust target triple.
@@ -82,8 +89,23 @@ test-builtin:
 	@# drivers the hardware tests launch from target/debug/examples/ need a build.
 	@cargo build --quiet --features builtin-runtime --example builtin_hw_driver --example builtin_net_driver
 	@bash tools/macos-sign-test-artifacts.sh $(TARGET_DIR)/debug
-	@AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --quiet
+	@# The old-to-new upgrade test also boots the awman that last shipped the
+	@# protocol this build upgrades from. Build it from git history (cached under
+	@# target/previous-builtin/) on hosts that can boot a guest, unless
+	@# AWMAN_TEST_BUILTIN_PREVIOUS already names one.
+	@previous="$${AWMAN_TEST_BUILTIN_PREVIOUS:-}"; \
+	if [ -z "$$previous" ]; then previous=$$(bash tools/build-previous-builtin-awman.sh --if-hypervisor) || exit 1; fi; \
+	if [ -n "$$previous" ]; then export AWMAN_TEST_BUILTIN_PREVIOUS="$$previous"; fi; \
+	AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --quiet
 	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/test-builtin-network.sh
+
+# Everything above with real guests required, on a Mac (Apple Silicon) or a
+# Linux KVM host, with no setup: fetches the payload, makes the guest fixtures
+# with skopeo under Docker or Apple Containers, loads the fixture into Apple
+# Containers on macOS, turns on the network, pressure and measurement suites,
+# then runs the catalog compatibility check. See tools/test-builtin-hw.sh.
+test-builtin-hw:
+	@bash tools/test-builtin-hw.sh
 
 test-full:
 	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet

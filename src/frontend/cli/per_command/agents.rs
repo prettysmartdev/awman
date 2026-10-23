@@ -95,7 +95,7 @@ impl WatchScreen {
         } else {
             None
         };
-        let frame = render_overview(overview, self.tty, max_rows);
+        let frame = render_overview(overview, terminal_width(self.tty), max_rows);
         if self.tty {
             let _ = self.writer.write_all(b"\x1b[H\x1b[J");
         } else if self.frames > 0 {
@@ -158,7 +158,7 @@ impl AgentsCommandFrontend for CliFrontend {
             };
             drop(screen);
             if let Some(overview) = final_snapshot {
-                print!("{}", render_overview(&overview, true, None));
+                print!("{}", render_overview(&overview, terminal_width(true), None));
             }
         }
     }
@@ -174,6 +174,27 @@ impl AgentsCommandFrontend for CliFrontend {
 }
 
 pub(crate) fn render_agents(outcome: &AgentsOutcome, json: bool) -> Option<String> {
+    render_agents_with_width(
+        outcome,
+        json,
+        terminal_width(std::io::stdout().is_terminal()),
+    )
+}
+
+/// `None` preserves complete values for pipes and other non-terminal writers.
+fn terminal_width(tty: bool) -> Option<usize> {
+    tty.then(|| {
+        crossterm::terminal::size()
+            .map(|(width, _)| width as usize)
+            .unwrap_or(80)
+    })
+}
+
+fn render_agents_with_width(
+    outcome: &AgentsOutcome,
+    json: bool,
+    width: Option<usize>,
+) -> Option<String> {
     if let AgentsOutcome::Status(status) = outcome {
         if status.watched {
             return None;
@@ -192,11 +213,7 @@ pub(crate) fn render_agents(outcome: &AgentsOutcome, json: bool) -> Option<Strin
         );
     }
     let rendered = match outcome {
-        AgentsOutcome::Status(status) => Some(render_overview(
-            &status.overview,
-            std::io::stdout().is_terminal(),
-            None,
-        )),
+        AgentsOutcome::Status(status) => Some(render_overview(&status.overview, width, None)),
         AgentsOutcome::List(list) => {
             if list.quiet {
                 if list.agents.is_empty() {
@@ -215,10 +232,10 @@ pub(crate) fn render_agents(outcome: &AgentsOutcome, json: bool) -> Option<Strin
                 .iter()
                 .map(|agent| agent.list_cells(list.no_trunc))
                 .collect();
-            let rows = if list.no_trunc || !std::io::stdout().is_terminal() {
+            let rows = if list.no_trunc {
                 rows
             } else {
-                fit_rows(LIST_COLUMNS, rows, 2, 1)
+                fit_rows(LIST_COLUMNS, rows, 2, 1, width)
             };
             Some(format_table(LIST_COLUMNS, &rows))
         }
@@ -230,7 +247,11 @@ pub(crate) fn render_agents(outcome: &AgentsOutcome, json: bool) -> Option<Strin
     rendered
 }
 
-fn render_overview(overview: &AgentsOverview, color: bool, max_rows: Option<usize>) -> String {
+fn render_overview(
+    overview: &AgentsOverview,
+    width: Option<usize>,
+    max_rows: Option<usize>,
+) -> String {
     let mut out = format!("{}\n\n", overview.header_line());
     if !overview.available {
         out.push_str("Waiting for the runtime to become available.\n");
@@ -247,9 +268,9 @@ fn render_overview(overview: &AgentsOverview, color: bool, max_rows: Option<usiz
             .take(shown)
             .map(AgentSnapshot::status_cells)
             .collect();
-        let rows = fit_rows(STATUS_COLUMNS, rows, 4, 2);
+        let rows = fit_rows(STATUS_COLUMNS, rows, 4, 2, width);
         let mut table = format_table(STATUS_COLUMNS, &rows);
-        if color {
+        if width.is_some() {
             table = table
                 .lines()
                 .enumerate()
@@ -305,13 +326,11 @@ fn fit_rows(
     mut rows: Vec<Vec<String>>,
     image_column: usize,
     name_column: usize,
+    width: Option<usize>,
 ) -> Vec<Vec<String>> {
-    if !std::io::stdout().is_terminal() {
+    let Some(width) = width else {
         return rows;
-    }
-    let width = crossterm::terminal::size()
-        .map(|(width, _)| width as usize)
-        .unwrap_or(80);
+    };
     for column in [image_column, name_column] {
         let widths: Vec<usize> = headers
             .iter()
@@ -429,7 +448,7 @@ mod tests {
             no_trunc: false,
             include_stopped: false,
         });
-        let output = render_agents(&list, false).unwrap();
+        let output = render_agents_with_width(&list, false, None).unwrap();
         assert!(output.contains(name));
         assert!(output.contains(image));
         assert!(!output.contains('…'));
@@ -440,8 +459,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_list_fits_its_width_unless_no_trunc_is_requested() {
+        let name = "awman-very-long-session-name-that-must-survive-piping";
+        let image = "registry.example.invalid/team/a-very-long-agent-image:latest";
+        let mut row = agent(name, "abcdefghijklmn", AgentState::Running);
+        row.image = image.into();
+        for no_trunc in [false, true] {
+            let list = AgentsOutcome::List(AgentsListOutcome {
+                agents: vec![row.clone()],
+                quiet: false,
+                no_trunc,
+                include_stopped: false,
+            });
+            let output = render_agents_with_width(&list, false, Some(100)).unwrap();
+            if no_trunc {
+                assert!(output.contains(name));
+                assert!(output.contains(image));
+                assert!(output.contains("abcdefghijklmn"));
+                assert!(!output.contains('…'));
+            } else {
+                assert!(output.contains('…'));
+                assert!(output.lines().all(|line| line.width() <= 100));
+                assert!(output.contains("abcdefghijkl"));
+            }
+            assert!(!output.ends_with('\n'));
+        }
+    }
+
+    #[test]
     fn status_renderer_snapshots_empty_mixed_stuck_and_squad_source() {
-        let empty = render_overview(&overview(vec![]), false, None);
+        let empty = render_overview(&overview(vec![]), None, None);
         assert_eq!(empty, "Docker · available · 0 running · CPU 12.3% · Mem 512 MB\n\nNo agents running on Docker.\nStart one with `awman chat` or `awman exec workflow <file>`.\n\nTip: Keep agents focused.\n");
 
         let mixed = render_overview(
@@ -453,7 +500,7 @@ mod tests {
                     AgentState::Stopped,
                 ),
             ]),
-            false,
+            None,
             None,
         );
         assert!(mixed.contains("AGENT ID"));
@@ -470,7 +517,7 @@ mod tests {
 
         let stuck = render_overview(
             &overview(vec![agent("alpha", "abcdefghijklmn", AgentState::Stuck)]),
-            false,
+            None,
             None,
         );
         assert!(stuck
@@ -487,7 +534,7 @@ mod tests {
             no_trunc: false,
             include_stopped: false,
         });
-        let text = render_agents(&normal, false).unwrap();
+        let text = render_agents_with_width(&normal, false, None).unwrap();
         assert!(text.contains("AGENT ID") && text.contains("abcdefghijkl"));
         let quiet = AgentsOutcome::List(AgentsListOutcome {
             agents: vec![stopped.clone()],
@@ -496,7 +543,7 @@ mod tests {
             include_stopped: false,
         });
         assert_eq!(
-            render_agents(&quiet, false).as_deref(),
+            render_agents_with_width(&quiet, false, None).as_deref(),
             Some("abcdefghijkl")
         );
         let no_trunc = AgentsOutcome::List(AgentsListOutcome {
@@ -505,7 +552,7 @@ mod tests {
             no_trunc: true,
             include_stopped: false,
         });
-        assert!(render_agents(&no_trunc, false)
+        assert!(render_agents_with_width(&no_trunc, false, None)
             .unwrap()
             .contains("abcdefghijklmn"));
         let all = AgentsOutcome::List(AgentsListOutcome {
@@ -514,7 +561,7 @@ mod tests {
             no_trunc: false,
             include_stopped: true,
         });
-        let all_text = render_agents(&all, false).unwrap();
+        let all_text = render_agents_with_width(&all, false, None).unwrap();
         assert!(all_text.contains("stopped") && all_text.contains("sleeping"));
     }
 
@@ -620,6 +667,24 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn non_tty_watch_preserves_full_values_without_terminal_sequences() {
+        let name = "awman-very-long-session-name-that-must-survive-piping";
+        let image = "registry.example.invalid/team/a-very-long-agent-image:latest";
+        let mut row = agent(name, "abcdefghijklmn", AgentState::Running);
+        row.image = image.into();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(std::future::pending());
+        let mut screen = WatchScreen::new(Box::new(SharedWriter(bytes.clone())), false, task);
+        screen.draw(&overview(vec![row]));
+        drop(screen);
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(name));
+        assert!(output.contains(image));
+        assert!(!output.contains('…'));
+        assert!(!output.contains('\x1b'));
     }
 
     fn assert_watch_screen_balances_terminal_sequences(fail_after_draw: bool) {

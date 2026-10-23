@@ -59,8 +59,12 @@ run() {
     (cd "$repo" && env -i HOME="$home" TMPDIR="$work" PATH="$bin:/usr/bin:/bin" \
         AWMAN_CONFIG_HOME="$home/.awman" AWMAN_TEST_ISOLATION=0 "$artifact" "$@")
 }
-run ready --json > "$work/ready.json"
-grep -q '"ready": true' "$work/ready.json" || { cat "$work/ready.json" >&2; exit 1; }
+# `ready` exits non-zero when not ready, with the reason in its JSON stdout.
+ready_status=0
+run ready --json > "$work/ready.json" || ready_status=$?
+if [ "$ready_status" != 0 ] || ! grep -q '"ready": true' "$work/ready.json"; then
+    echo "awman ready failed (exit $ready_status):" >&2; cat "$work/ready.json" >&2; exit 1
+fi
 
 peak=0
 if [ -n "${AWMAN_GUEST_RSS_OUTPUT:-}" ]; then

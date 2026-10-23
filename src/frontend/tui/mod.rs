@@ -67,11 +67,16 @@ pub enum InitialTab {
 /// `initial_tab` selects the opening tab: `Normal` uses `ctx.session`,
 /// behaviour, including the `ready` / `agents status --watch` startup auto-spawn;
 /// `Squad` opens the singleton squad tab (§2.2) with no auto-spawn.
+///
+/// `notices` are startup runtime notices (an in-place builtin state upgrade);
+/// they are shown in the status area rather than printed, since the TUI owns
+/// the terminal.
 pub async fn run(
     _matches: clap::ArgMatches,
     ctx: RuntimeContext,
     fatal_runtime_error: Option<crate::command::startup::RuntimeStartupFailure>,
     initial_tab: InitialTab,
+    notices: Vec<String>,
 ) -> ExitCode {
     let catalogue = CommandCatalogue::get();
     let session_manager = Arc::new(SessionManager::in_memory(
@@ -141,6 +146,8 @@ pub async fn run(
             }
         },
     };
+
+    app.show_runtime_notices(notices);
 
     if let Some(failure) = fatal_runtime_error {
         app.active_dialog = Some(Dialog::FatalError {

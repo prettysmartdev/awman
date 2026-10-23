@@ -156,6 +156,12 @@ impl ContainerRuntime {
         self.backend.capabilities()
     }
 
+    /// One-line notices from opening the backend (an in-place builtin
+    /// catalog upgrade), each returned once.
+    pub fn take_notices(&self) -> Vec<String> {
+        self.backend.take_notices()
+    }
+
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,

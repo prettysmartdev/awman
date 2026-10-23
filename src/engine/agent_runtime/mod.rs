@@ -374,6 +374,15 @@ impl DetectedRuntime {
             DetectedRuntime::Sandbox(rt) => Some(rt.clone()),
         }
     }
+
+    /// One-line notices from opening the runtime, each returned once. The
+    /// caller presents them (stderr in command mode, the TUI status area).
+    pub fn take_notices(&self) -> Vec<String> {
+        match self {
+            DetectedRuntime::Container(rt) => rt.take_notices(),
+            DetectedRuntime::Sandbox(_) => Vec::new(),
+        }
+    }
 }
 
 /// Every value `GlobalConfig::runtime` accepts, in `RuntimeSelection::ALL`

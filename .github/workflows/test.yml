@@ -198,6 +198,9 @@ jobs:
       AWMAN_TEST_BUILTIN_REPORT: ${{ github.workspace }}/builtin-hw-report.tsv
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The builtin upgrade test builds the previous awman from git history.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.0"
@@ -224,7 +227,7 @@ jobs:
         shell: bash
         run: |
           command -v skopeo >/dev/null || { echo "BLOCKED: skopeo is required to fetch the fixture base image"; exit 1; }
-          skopeo copy --override-os linux --format docker docker://docker.io/library/alpine:3.22 "docker-archive:$RUNNER_TEMP/base.tar"
+          skopeo copy --override-os linux --format v2s2 docker://docker.io/library/alpine:3.22 "docker-archive:$RUNNER_TEMP/base.tar"
           echo "AWMAN_TEST_BUILTIN_BASE_TAR=$RUNNER_TEMP/base.tar" >> "$GITHUB_ENV"
       - name: Build tests, awman and the guest driver
         env:
@@ -248,6 +251,9 @@ jobs:
           - { name: macos-arm64-hvf, target: aarch64-apple-darwin, runs-on: [self-hosted, macOS, ARM64, hypervisor] }
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The builtin upgrade test builds the previous awman from git history.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.0"
@@ -256,8 +262,10 @@ jobs:
         shell: bash
         run: |
           command -v skopeo >/dev/null || { echo "BLOCKED: skopeo is required for the guest fixture"; exit 1; }
-          skopeo copy --override-os linux --format oci docker://docker.io/library/alpine:3.22 "oci-archive:$RUNNER_TEMP/awman-fixture.tar"
-          echo "AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE=$RUNNER_TEMP/awman-fixture.tar" >> "$GITHUB_ENV"
+          # The tests boot the promoted fixture built from this base, not plain alpine.
+          skopeo copy --override-os linux --format v2s2 docker://docker.io/library/alpine:3.22 "docker-archive:$RUNNER_TEMP/base.tar"
+          cargo run --locked --quiet --manifest-path tools/oci-runtime-spike/fixture/Cargo.toml -- "$RUNNER_TEMP/base.tar" "$RUNNER_TEMP"
+          echo "AWMAN_TEST_BUILTIN_FIXTURE_ARCHIVE=$RUNNER_TEMP/fixture-oci.tar" >> "$GITHUB_ENV"
       - name: Build and boot the current provider from this clean checkout
         env:
           CARGO_BUILD_JOBS: "2"

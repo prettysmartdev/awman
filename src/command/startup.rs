@@ -98,6 +98,9 @@ impl Startup {
             EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
             other => anyhow::Error::new(other).context("failed to detect agent runtime"),
         })?;
+        // Opening the runtime may have upgraded the builtin state directory in
+        // place; its notice is presented by the frontend that runs next.
+        let notices = detected.take_notices();
         let engines =
             Engines::from_detected(detected, &session).context("failed to construct engines")?;
 
@@ -106,6 +109,7 @@ impl Startup {
             engines,
             fatal_runtime_error,
             messages,
+            notices,
         ))
     }
 }
@@ -116,6 +120,7 @@ pub struct StartupOutcome {
     pub engines: Engines,
     pub fatal_runtime_error: Option<RuntimeStartupFailure>,
     messages: Vec<String>,
+    notices: Vec<String>,
 }
 
 impl StartupOutcome {
@@ -124,18 +129,27 @@ impl StartupOutcome {
         engines: Engines,
         fatal_runtime_error: Option<RuntimeStartupFailure>,
         messages: Vec<String>,
+        notices: Vec<String>,
     ) -> Self {
         Self {
             session,
             engines,
             fatal_runtime_error,
             messages,
+            notices,
         }
     }
 
     /// Messages collected during startup in the order they must be presented.
     pub fn messages(&self) -> &[String] {
         &self.messages
+    }
+
+    /// One-line runtime notices (an in-place builtin state upgrade) for the
+    /// frontend that runs next: stderr in command mode, the status area in
+    /// the TUI. Never a prompt.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 }
 

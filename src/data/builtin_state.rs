@@ -13,6 +13,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -51,6 +52,8 @@ pub enum RuntimeMarker {
     Created,
     /// The marker holds the expected protocol.
     Matches,
+    /// The marker holds an exact protocol listed in `UPGRADABLE_FROM`.
+    Upgradable { found: String },
     /// The catalog belongs to another protocol; nothing was changed.
     Mismatch { found: String },
 }
@@ -166,6 +169,13 @@ impl BuiltinState {
     /// catalog lock throughout.
     pub fn check_runtime_marker(&self, expected: &str) -> Result<RuntimeMarker, DataError> {
         let _lock = self.lock()?;
+        self.check_runtime_marker_locked(expected)
+    }
+
+    /// [`Self::check_runtime_marker`] for a caller that already holds the
+    /// catalog lock (the in-place upgrade re-reads the marker under the lock
+    /// it keeps for the whole upgrade).
+    pub fn check_runtime_marker_locked(&self, expected: &str) -> Result<RuntimeMarker, DataError> {
         let path = self.home.join(RUNTIME_VERSION_FILE);
         let db = self.home.join("db");
         if !path.exists()
@@ -202,6 +212,8 @@ impl BuiltinState {
                     .map_err(|e| io_err(&path, e))?;
                 if found == expected {
                     Ok(RuntimeMarker::Matches)
+                } else if crate::data::builtin_runtime::UPGRADABLE_FROM.contains(&found.as_str()) {
+                    Ok(RuntimeMarker::Upgradable { found })
                 } else {
                     Ok(RuntimeMarker::Mismatch { found })
                 }
@@ -210,6 +222,14 @@ impl BuiltinState {
         }
     }
 }
+
+mod catalog_backup;
+pub use catalog_backup::{
+    applied_migrations, CatalogBackup, CATALOG_BACKUP_MANIFEST, CATALOG_RESTORE_JOURNAL,
+    RETIRED_SANDBOXES_DIR,
+};
+#[cfg(test)]
+pub(crate) use catalog_backup::{inject_fault, Fault};
 
 /// Canonicalise the longest existing ancestor of `root`'s parent and re-append
 /// the missing components. The final component is kept as given, so a
@@ -310,6 +330,9 @@ impl BuiltinState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod upgrade_tests;
 
 #[cfg(test)]
 mod tests {

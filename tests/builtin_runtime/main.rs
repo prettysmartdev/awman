@@ -31,6 +31,7 @@ mod hardware;
 mod lifecycle;
 mod measure;
 mod network_resources;
+mod release_policy;
 mod runtime_refusal;
 mod sqlite;
 mod state_dir;
