@@ -270,25 +270,23 @@ async fn parallel_group_launches_respect_max_concurrent_cap() {
 
     let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
-    // Only 2 of the 4 steps start initially.
+    // Only 2 of the 4 steps start initially. Each fixed sleep gives an
+    // over-launch time to show up; the wait then tolerates a slow runner
+    // while still asserting the exact count.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        execution_count.load(Ordering::Relaxed),
-        2,
-        "max_concurrent=2 must cap the initial launch at 2"
-    );
+    wait_for_execution_count(&execution_count, 2).await;
     wait_for_launched(&record, &["a", "b"]).await;
 
     // Finishing the 1st frees a slot; the 3rd (c) launches.
     signal_completion(&entries[0].1, 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(execution_count.load(Ordering::Relaxed), 3);
+    wait_for_execution_count(&execution_count, 3).await;
     wait_for_launched(&record, &["a", "b", "c"]).await;
 
     // Finishing the 2nd frees the last slot; the 4th (d) launches.
     signal_completion(&entries[1].1, 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(execution_count.load(Ordering::Relaxed), 4);
+    wait_for_execution_count(&execution_count, 4).await;
     wait_for_launched(&record, &["a", "b", "c", "d"]).await;
 
     // Drain the rest and confirm completion.
@@ -383,16 +381,13 @@ async fn parallel_group_yolo_expiry_launches_queued_step() {
         step_name: "a".to_string(),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The queued step 'c' must launch into the freed slot; the engine
+    // cancels 'a' before launching it.
+    wait_for_execution_count(&execution_count, 3).await;
 
     assert!(
         cancel_a.load(Ordering::Relaxed),
         "yolo expiry must kill slot 'a'"
-    );
-    assert_eq!(
-        execution_count.load(Ordering::Relaxed),
-        3,
-        "the queued step 'c' must launch into the freed slot"
     );
     assert!(
         !cancel_b.load(Ordering::Relaxed),
