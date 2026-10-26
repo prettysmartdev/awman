@@ -376,9 +376,14 @@ async fn chat_custom_pi_dispatches_expected_container_options() {
             .expect("context overlay delivers system prompt");
         assert_eq!(flag, "--instructions");
         assert!(prompt.contains("/awman/context/repo"), "{prompt}");
-        assert!(options.overlays.iter().any(|overlay| overlay.host_path
-            == fixture.home_dir.path().join(".pi")
-            && overlay.container_path == std::path::Path::new("/root/.pi")));
+        // Settings overlays are canonicalized (macOS tempdirs live under
+        // /var -> /private/var), so compare against the canonical path.
+        let pi_dir = fixture.home_dir.path().join(".pi").canonicalize().unwrap();
+        assert!(options
+            .overlays
+            .iter()
+            .any(|overlay| overlay.host_path == pi_dir
+                && overlay.container_path == std::path::Path::new("/root/.pi")));
         assert!(options
             .env_passthrough
             .iter()
