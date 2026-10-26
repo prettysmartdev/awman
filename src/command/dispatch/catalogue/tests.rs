@@ -588,6 +588,7 @@ fn all_expected_subcommands_are_present() {
         (&["new"], "spec"),
         (&["new"], "workflow"),
         (&["new"], "skill"),
+        (&["new"], "agent"),
     ];
     for (parent_path, subcmd_name) in cases {
         let parent = cat
@@ -631,12 +632,13 @@ fn config_commands_do_not_require_runtime() {
     }
 }
 
-/// The `config` subtree is the whole of the runtime-optional surface.
+/// The `config` subtree and `new agent` are the whole of the runtime-optional
+/// surface.
 ///
 /// `requires_runtime` used to be `!matches!(path.first(), Some(&"config"))` —
 /// a command-name fact spelled outside the catalogue. It is a `CommandSpec`
 /// attribute now (F-25 step 4), so this walks every spec in the tree and
-/// asserts the set of `false` ones is exactly the `config` subtree: a new
+/// asserts the set of `false` ones is exactly that list: a new
 /// command that declares `requires_runtime: false` without meaning to fails
 /// here.
 #[test]
@@ -661,7 +663,14 @@ fn only_the_config_subtree_declares_requires_runtime_false() {
     runtime_optional.sort();
     assert_eq!(
         runtime_optional,
-        vec!["config", "config get", "config set", "config show"],
+        vec![
+            "config",
+            "config get",
+            "config set",
+            "config show",
+            // Writes a definition file and never builds.
+            "new agent",
+        ],
     );
 }
 
@@ -1027,4 +1036,94 @@ fn agents_docs_describe_current_scope_and_detach_controls() {
     let architecture = include_str!("../../../../docs/architecture.md");
     assert!(!architecture.contains("status.rs           StatusCommand"));
     assert!(architecture.contains("agents/             AgentsCommandFrontend"));
+}
+
+#[test]
+fn new_agent_is_registered_writes_files_only_and_is_not_api_allowed() {
+    let cat = CommandCatalogue::get();
+    let spec = cat
+        .lookup(&["new", "agent"])
+        .expect("`new agent` is registered");
+    assert!(!spec.api_allowed);
+    assert!(!spec.requires_runtime);
+    assert_eq!(spec.arguments.len(), 1);
+    assert_eq!(spec.arguments[0].name, "name");
+    assert!(!spec.arguments[0].optional);
+    match spec.find_flag("from").expect("--from").kind {
+        FlagKind::Enum(values) => assert_eq!(values, &["crush", "maki"]),
+        other => panic!("--from should be an Enum, got {other:?}"),
+    }
+    assert!(spec.find_flag("global").is_some());
+    assert!(spec.find_flag("force").is_some());
+}
+
+#[test]
+fn init_agent_is_a_string_and_ready_takes_agent() {
+    let cat = CommandCatalogue::get();
+    let init = cat.lookup(&["init"]).unwrap().find_flag("agent").unwrap();
+    assert!(matches!(init.kind, FlagKind::String));
+    let ready = cat.lookup(&["ready"]).unwrap();
+    assert!(matches!(
+        ready.find_flag("agent").expect("ready --agent").kind,
+        FlagKind::OptionalString
+    ));
+}
+
+#[test]
+fn init_agent_help_names_first_party_and_custom_agents_without_a_fixed_value_list() {
+    let init = CommandCatalogue::get()
+        .lookup(&["init"])
+        .unwrap()
+        .find_flag("agent")
+        .unwrap();
+    assert!(matches!(init.kind, FlagKind::String));
+    for name in crate::engine::agent::first_party::FIRST_PARTY_AGENTS {
+        assert!(init.help.contains(name), "init --agent help omits {name}");
+    }
+    assert!(init.help.contains(".awman/agents/"));
+    for src in [
+        include_str!("core.rs"),
+        include_str!("mod.rs"),
+        include_str!("new.rs"),
+        include_str!("../../commands/init.rs"),
+    ] {
+        assert!(!src.contains(concat!("AGENT", "_VALUES")));
+    }
+}
+
+#[test]
+fn new_agent_help_documents_every_flag_and_the_name_rule() {
+    let spec = CommandCatalogue::get().lookup(&["new", "agent"]).unwrap();
+    assert!(!spec.help.is_empty());
+    for flag in ["global", "from", "force"] {
+        assert!(!spec.find_flag(flag).unwrap().help.is_empty(), "{flag}");
+    }
+}
+
+#[test]
+fn agent_tips_name_real_commands_and_stay_short() {
+    use crate::command::commands::agents::tips::TIPS;
+    let tips: Vec<&&str> = TIPS
+        .iter()
+        .filter(|t| t.contains("awman new agent") || t.contains("--pull builtin"))
+        .collect();
+    assert_eq!(tips.len(), 2, "{tips:?}");
+    let cat = CommandCatalogue::get();
+    assert!(cat.lookup(&["new", "agent"]).is_some());
+    assert!(cat
+        .lookup(&["new", "skill"])
+        .unwrap()
+        .find_flag("pull")
+        .is_some());
+    for t in tips {
+        assert!(t.chars().count() <= 100, "{t}");
+    }
+}
+
+#[test]
+fn committed_command_reference_documents_new_agent() {
+    let reference = include_str!("../../../../docs/14-command-reference.md");
+    assert!(reference.contains("awman new agent"));
+    assert!(reference.contains("--from"));
+    assert!(reference.contains("awman ready"));
 }

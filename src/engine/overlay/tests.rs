@@ -354,11 +354,18 @@ fn skill_overlays_returns_single_ro_spec_for_copilot() {
 fn skill_overlays_returns_single_ro_spec_for_crush() {
     let (tmp, skills_canon) = make_home_with_skills();
     let engine = make_engine(tmp.path());
-    let agent = AgentName::new("crush").unwrap();
+    let def = crate::engine::agent::custom::crush_fixture();
 
     let specs = with_awman_config_home(tmp.path(), || {
         engine
-            .skill_overlays(&agent, true, &[], &None, Path::new("/"))
+            .skill_overlays_for(
+                Some(&def),
+                &AgentName::new("crush").unwrap(),
+                true,
+                &[],
+                &None,
+                Path::new("/"),
+            )
             .unwrap()
     });
 
@@ -373,6 +380,53 @@ fn skill_overlays_returns_single_ro_spec_for_crush() {
         "crush container path must contain /.config/crush/commands; got {:?}",
         specs[0].container_path
     );
+}
+
+#[test]
+fn custom_agent_without_skills_directory_gets_no_skills_overlay() {
+    let (tmp, _) = make_home_with_skills();
+    let engine = make_engine(tmp.path());
+    let mut def = crate::engine::agent::custom::crush_fixture();
+    def.skills_mount = None;
+    let specs = with_awman_config_home(tmp.path(), || {
+        engine
+            .skill_overlays_for(
+                Some(&def),
+                &AgentName::new("crush").unwrap(),
+                true,
+                &[],
+                &None,
+                tmp.path(),
+            )
+            .unwrap()
+    });
+    assert!(specs.is_empty());
+}
+
+#[test]
+fn worktree_overlay_fallback_uses_session_definition_root_and_injected_home() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("global");
+    let session = crate::data::session::Session::for_tests_isolated(root.path(), &home);
+    crate::engine::agent::custom::install_crush_fixture(root.path(), session.env());
+    std::fs::create_dir_all(home.join("skills")).unwrap();
+    let worktree = root.path().join("worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let step =
+        crate::data::session::Session::open_worktree_for(worktree.clone(), worktree, &session)
+            .unwrap();
+    let request = OverlayRequest {
+        agent: Some(AgentName::new("crush").unwrap()),
+        include_all_skills: true,
+        container_home: Some("/home/awman".into()),
+        ..Default::default()
+    };
+    let specs = make_engine(root.path())
+        .build_overlays(&step, &request)
+        .unwrap();
+    assert!(specs.iter().any(|spec| spec.host_path
+        == std::fs::canonicalize(home.join("skills")).unwrap()
+        && spec.container_path == Path::new("/home/awman/.config/crush/commands")));
 }
 
 #[test]
@@ -420,10 +474,10 @@ fn skill_overlays_returns_empty_when_skills_dir_does_not_exist() {
 }
 
 #[test]
-fn skill_overlays_returns_empty_for_maki_no_error() {
+fn skill_overlays_returns_empty_for_an_undefined_agent_no_error() {
     let (tmp, _) = make_home_with_skills();
     let engine = make_engine(tmp.path());
-    let agent = AgentName::new("maki").unwrap();
+    let agent = AgentName::new("not-defined").unwrap();
 
     let specs = with_awman_config_home(tmp.path(), || {
         engine
@@ -433,7 +487,7 @@ fn skill_overlays_returns_empty_for_maki_no_error() {
 
     assert!(
         specs.is_empty(),
-        "maki must produce no skills mount; got {specs:?}"
+        "an agent with no definition must produce no skills mount; got {specs:?}"
     );
 }
 
@@ -573,6 +627,7 @@ fn build_overlays_deduplicates_overlapping_host_paths() {
         container_home: None,
         context_overlays: vec![],
         materialize_credentials: false,
+        definition: None,
     };
     let overlays = engine.build_overlays(&session, &request).unwrap();
     // The two entries sharing the same canonicalized host path must collapse.
@@ -1035,6 +1090,7 @@ fn seed_library(home: &Path, slug: &str, subdir: &str, skills: &[&str]) {
             owner: "someone".to_string(),
             repo: slug.to_string(),
             subdir: subdir.to_string(),
+            sparse: false,
         },
     )
     .unwrap();
@@ -1354,6 +1410,7 @@ fn build_overlays_least_permissive_wins_for_same_host_path() {
         container_home: None,
         context_overlays: vec![],
         materialize_credentials: false,
+        definition: None,
     };
 
     let overlays = engine.build_overlays(&session, &request).unwrap();

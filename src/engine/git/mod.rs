@@ -54,6 +54,28 @@ fn run_git_logged(
     Ok(output)
 }
 
+/// How a sparse clone ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseCloneOutcome {
+    /// Shallow, blob-less clone with only the requested subdirectory checked out.
+    Sparse,
+    /// git is older than 2.25; a plain `--depth 1` clone was made instead.
+    FellBackToShallow,
+}
+
+/// Warning shown when a sparse clone falls back to a plain shallow clone.
+pub const SPARSE_FALLBACK_WARNING: &str =
+    "this git does not support sparse checkout (git 2.25 or newer is required); fell back to a plain shallow clone, which downloads more data";
+
+/// Whether a clone failure's stderr indicates git lacks `--sparse` / `sparse-checkout`.
+fn is_sparse_unsupported(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("sparse-checkout")
+        || lower.contains("unknown option")
+        || lower.contains("--sparse")
+        || lower.contains("not a git command")
+}
+
 /// Parsed `git --version` result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitVersion {
@@ -128,6 +150,10 @@ impl GitIdentity {
         self.name.is_some() && self.email.is_some()
     }
 }
+
+/// Runs one git argv in a working directory (the sparse-clone seam).
+type GitRunner<'a> = dyn FnMut(&[&str], &Path) -> Result<std::process::Output, EngineError> + 'a;
+
 impl GitEngine {
     pub fn new() -> Self {
         Self
@@ -448,6 +474,179 @@ impl GitEngine {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
                 "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The argv `clone_repo_sparse` runs: `(clone_args, sparse_checkout_args)`.
+    pub fn sparse_clone_argv(url: &str, dest: &str, subdir: &str) -> (Vec<String>, Vec<String>) {
+        let clone = [
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--sparse",
+            url,
+            dest,
+        ]
+        .map(String::from)
+        .to_vec();
+        let sparse = ["-C", dest, "sparse-checkout", "set", subdir]
+            .map(String::from)
+            .to_vec();
+        (clone, sparse)
+    }
+
+    /// Shallow, blob-less, sparse clone of `url` into `dest`, checking out only
+    /// `subdir`. When git is too old for `--sparse` / `sparse-checkout` (< 2.25),
+    /// retries once as a plain `--depth 1` clone and reports
+    /// [`SparseCloneOutcome::FellBackToShallow`].
+    pub fn clone_repo_sparse(
+        &self,
+        url: &str,
+        dest: &Path,
+        subdir: &str,
+    ) -> Result<SparseCloneOutcome, EngineError> {
+        let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .map_err(|e| EngineError::Git(format!("invoke `git {}`: {e}", args.join(" "))))
+        })?;
+        if outcome == SparseCloneOutcome::FellBackToShallow {
+            tracing::warn!("{SPARSE_FALLBACK_WARNING}");
+        }
+        Ok(outcome)
+    }
+
+    /// Logged variant of [`clone_repo_sparse`](Self::clone_repo_sparse).
+    pub fn clone_repo_sparse_logged(
+        &self,
+        url: &str,
+        dest: &Path,
+        subdir: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<SparseCloneOutcome, EngineError> {
+        let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
+            run_git_logged(args, cwd, &mut *sink)
+        })?;
+        if outcome == SparseCloneOutcome::FellBackToShallow {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: SPARSE_FALLBACK_WARNING.to_string(),
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// Shared clone logic; `run` executes one git argv in a working directory.
+    fn clone_repo_sparse_inner(
+        &self,
+        url: &str,
+        dest: &Path,
+        subdir: &str,
+        run: &mut GitRunner<'_>,
+    ) -> Result<SparseCloneOutcome, EngineError> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
+        }
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| EngineError::Git("clone dest path not UTF-8".into()))?;
+        let cwd = dest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let (clone, sparse) = Self::sparse_clone_argv(url, dest_str, subdir);
+
+        let clone_refs: Vec<&str> = clone.iter().map(String::as_str).collect();
+        let output = run(&clone_refs, &cwd)?;
+        let failed = if output.status.success() {
+            let sparse_refs: Vec<&str> = sparse.iter().map(String::as_str).collect();
+            let output = run(&sparse_refs, &cwd)?;
+            if output.status.success() {
+                return Ok(SparseCloneOutcome::Sparse);
+            }
+            output
+        } else {
+            output
+        };
+        let stderr = String::from_utf8_lossy(&failed.stderr).trim().to_string();
+        if !is_sparse_unsupported(&stderr) {
+            return Err(EngineError::Git(format!("git clone failed: {stderr}")));
+        }
+        if dest.exists() {
+            std::fs::remove_dir_all(dest).map_err(|e| EngineError::io(dest, e))?;
+        }
+        let output = run(&["clone", "--depth", "1", url, dest_str], &cwd)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(SparseCloneOutcome::FellBackToShallow)
+    }
+
+    /// Like [`pull_latest`](Self::pull_latest) but keeps the clone shallow:
+    /// `git fetch --depth 1 origin`, then `reset --hard origin/HEAD`.
+    pub fn pull_latest_shallow(&self, repo_dir: &Path) -> Result<(), EngineError> {
+        self.pull_latest_with(repo_dir, &["fetch", "--depth", "1", "origin"])
+    }
+
+    /// Logged variant of [`pull_latest_shallow`](Self::pull_latest_shallow).
+    pub fn pull_latest_shallow_logged(
+        &self,
+        repo_dir: &Path,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<(), EngineError> {
+        let fetch_args = ["fetch", "--depth", "1", "origin"];
+        let fetch = run_git_logged(&fetch_args, repo_dir, sink)?;
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            return Err(EngineError::Git(format!(
+                "git fetch --depth 1 origin failed: {}",
+                stderr.trim()
+            )));
+        }
+        let reset = run_git_logged(&["reset", "--hard", "origin/HEAD"], repo_dir, sink)?;
+        if !reset.status.success() {
+            let stderr = String::from_utf8_lossy(&reset.stderr);
+            return Err(EngineError::Git(format!(
+                "git reset --hard origin/HEAD failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn pull_latest_with(&self, repo_dir: &Path, fetch_args: &[&str]) -> Result<(), EngineError> {
+        let fetch = Command::new("git")
+            .args(fetch_args)
+            .current_dir(repo_dir)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git {}`: {e}", fetch_args.join(" "))))?;
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            return Err(EngineError::Git(format!(
+                "git {} failed: {}",
+                fetch_args.join(" "),
+                stderr.trim()
+            )));
+        }
+        let reset = Command::new("git")
+            .args(["reset", "--hard", "origin/HEAD"])
+            .current_dir(repo_dir)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git reset --hard origin/HEAD`: {e}")))?;
+        if !reset.status.success() {
+            let stderr = String::from_utf8_lossy(&reset.stderr);
+            return Err(EngineError::Git(format!(
+                "git reset --hard origin/HEAD failed: {}",
                 stderr.trim()
             )));
         }
@@ -1585,5 +1784,111 @@ mod tests {
         let link = tmp.path().join("outside-link");
         symlink(outside.path(), &link).unwrap();
         assert_eq!(count_file_lines(&link), 0);
+    }
+
+    // ─── sparse clone ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sparse_clone_argv_is_shallow_blobless_sparse_then_sets_subdir() {
+        let (clone, sparse) =
+            GitEngine::sparse_clone_argv("https://example.test/o/r.git", "/tmp/dest", "skills");
+        assert_eq!(
+            clone,
+            [
+                "clone",
+                "--depth",
+                "1",
+                "--filter=blob:none",
+                "--sparse",
+                "https://example.test/o/r.git",
+                "/tmp/dest"
+            ]
+        );
+        assert_eq!(
+            sparse,
+            ["-C", "/tmp/dest", "sparse-checkout", "set", "skills"]
+        );
+    }
+
+    /// A failed `git` invocation whose stderr is replaced with `stderr`.
+    fn failed_output(stderr: &str) -> std::process::Output {
+        let mut out = Command::new("git")
+            .arg("--awman-no-such-flag")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        out.stderr = stderr.as_bytes().to_vec();
+        out
+    }
+
+    #[test]
+    fn sparse_clone_falls_back_to_plain_shallow_clone_on_old_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("lib");
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let outcome = GitEngine::new()
+            .clone_repo_sparse_inner("file:///nowhere", &dest, "skills", &mut |args, _cwd| {
+                calls.push(args.iter().map(|a| a.to_string()).collect());
+                if args.contains(&"--sparse") {
+                    // Leave a partial clone behind, like a half-supported git would.
+                    std::fs::create_dir_all(&dest).unwrap();
+                    Ok(failed_output("error: unknown option `sparse'"))
+                } else {
+                    assert!(!dest.exists(), "partial clone must be removed before retry");
+                    Ok(Command::new("git").arg("--version").output().unwrap())
+                }
+            })
+            .unwrap();
+        assert_eq!(outcome, SparseCloneOutcome::FellBackToShallow);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1],
+            [
+                "clone",
+                "--depth",
+                "1",
+                "file:///nowhere",
+                dest.to_str().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn sparse_clone_does_not_retry_on_unrelated_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("lib");
+        let mut count = 0;
+        let err = GitEngine::new()
+            .clone_repo_sparse_inner("file:///nowhere", &dest, "skills", &mut |_args, _cwd| {
+                count += 1;
+                Ok(failed_output(
+                    "fatal: unable to access: could not resolve host",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(count, 1);
+        assert!(err.to_string().contains("could not resolve host"), "{err}");
+    }
+
+    #[test]
+    fn sparse_clone_retries_when_sparse_checkout_set_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("lib");
+        let mut calls = 0;
+        let outcome = GitEngine::new()
+            .clone_repo_sparse_inner("file:///nowhere", &dest, "skills", &mut |args, _cwd| {
+                calls += 1;
+                match calls {
+                    1 => Ok(Command::new("git").arg("--version").output().unwrap()),
+                    2 => {
+                        assert!(args.contains(&"sparse-checkout"));
+                        Ok(failed_output("git: 'sparse-checkout' is not a git command"))
+                    }
+                    _ => Ok(Command::new("git").arg("--version").output().unwrap()),
+                }
+            })
+            .unwrap();
+        assert_eq!(outcome, SparseCloneOutcome::FellBackToShallow);
+        assert_eq!(calls, 3);
     }
 }

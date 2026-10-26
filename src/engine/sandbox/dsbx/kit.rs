@@ -295,32 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn crush_kit_is_agent_with_base_image_and_install() {
-        let spec = emit_spec("crush");
-        assert!(spec.contains("kind: agent"), "crush must be kind: agent");
-        assert!(
-            spec.contains("docker/sandbox-templates:shell-docker"),
-            "must use shell-docker base image"
-        );
-        assert!(spec.contains("install:"), "must have install commands");
-        assert!(
-            spec.contains("crush"),
-            "install must reference the agent name"
-        );
-    }
-
-    #[test]
-    fn maki_kit_is_agent_with_base_image_and_install() {
-        let spec = emit_spec("maki");
-        assert!(spec.contains("kind: agent"), "maki must be kind: agent");
-        assert!(
-            spec.contains("docker/sandbox-templates:shell-docker"),
-            "must use shell-docker base image"
-        );
-        assert!(spec.contains("install:"), "must have install commands");
-    }
-
-    #[test]
     fn cline_kit_is_agent_with_base_image_and_install() {
         let spec = emit_spec("cline");
         assert!(spec.contains("kind: agent"), "cline must be kind: agent");
@@ -347,8 +321,6 @@ mod tests {
             "copilot",
             "opencode",
             "antigravity",
-            "crush",
-            "maki",
             "cline",
         ];
         for agent in &agents {
@@ -399,8 +371,6 @@ mod tests {
             "copilot",
             "opencode",
             "antigravity",
-            "crush",
-            "maki",
             "cline",
         ];
         for agent in &agents {
@@ -492,8 +462,6 @@ mod tests {
             "copilot",
             "opencode",
             "antigravity",
-            "crush",
-            "maki",
             "cline",
         ];
         for agent in &agents {
@@ -522,8 +490,6 @@ mod tests {
             "copilot",
             "opencode",
             "antigravity",
-            "crush",
-            "maki",
             "cline",
         ];
         for agent in &agents {
@@ -557,8 +523,6 @@ mod tests {
             "copilot",
             "opencode",
             "antigravity",
-            "crush",
-            "maki",
             "cline",
         ];
         for agent in &agents {

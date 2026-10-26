@@ -22,6 +22,7 @@ mod acquisition;
 mod apple_store;
 mod binary;
 mod builder_native;
+mod custom_agents;
 mod fixture_inventory;
 mod frontends;
 mod gate;

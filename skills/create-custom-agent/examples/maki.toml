@@ -1,0 +1,17 @@
+schema = 1
+display_name = "Maki"
+
+[run]
+command = ["maki"]
+
+[modes]
+yolo = ["--yolo"]
+
+[system_prompt]
+delivery = "none"
+
+[ping]
+command = ["maki", "--print"]
+
+[image]
+dockerfile = "maki.Dockerfile"

@@ -11,6 +11,7 @@
 //! interview's evaluation interval is the catalogue's `--interval` default,
 //! not a `"6h"` literal written a third time.
 
+use crate::command::commands::agent_trust::{AgentTrustReview, TrustDecision};
 use crate::command::commands::agents::{AgentSnapshot, AgentSource, KillChoice};
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
@@ -198,6 +199,25 @@ pub fn squad_task_confirm(
         ],
         Some(SquadConfirmDecision::Dismiss),
     ))
+}
+
+/// The approval asked before awman builds or launches a custom agent
+/// definition that needs one (any repo definition; a global one with
+/// `[ping]`).
+///
+/// The body is the whole review summary, host command first.
+/// `default_on_dismiss` is `Some(Decline)`: walking away from an approval is
+/// a refusal, never a grant.
+pub fn agent_trust_confirm(review: &AgentTrustReview) -> Prompt<TrustDecision> {
+    Prompt::new(
+        format!("Approve agent definition '{}'?", review.name),
+        review.render(),
+        vec![
+            Choice::new('y', "Approve this definition", TrustDecision::Approve),
+            Choice::new('n', "Do not approve", TrustDecision::Decline),
+        ],
+        Some(TrustDecision::Decline),
+    )
 }
 
 /// `awman agents kill` / `rm`: stop and remove one agent.

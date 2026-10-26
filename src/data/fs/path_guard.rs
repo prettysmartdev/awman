@@ -11,6 +11,20 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::data::error::DataError;
 
+/// Reject a symlink at a managed path, including a dangling symlink.
+/// Missing paths are allowed so create-if-missing callers can use this guard.
+pub fn ensure_not_symlinked(path: &Path) -> Result<(), DataError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(DataError::InvalidPath {
+            path: path.into(),
+            reason: "must not be a symlink".into(),
+        }),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DataError::io(path, e)),
+    }
+}
+
 /// Verify that `resolved` stays under `root`. Both are resolved with
 /// [`canonicalize_lenient`], so the check holds for not-yet-created
 /// directories as well as existing ones.

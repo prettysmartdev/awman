@@ -51,18 +51,6 @@ pub(super) const CLEAN: CommandSpec = CommandSpec {
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
-pub(super) const AGENT_VALUES: &[&str] = &[
-    "claude",
-    "codex",
-    "opencode",
-    "maki",
-    "gemini",
-    "copilot",
-    "crush",
-    "cline",
-    "antigravity",
-];
-
 pub(super) const INIT: CommandSpec = CommandSpec {
     name: "init",
     aliases: &[],
@@ -73,8 +61,11 @@ pub(super) const INIT: CommandSpec = CommandSpec {
         FlagSpec {
             long: "agent",
             short: None,
-            help: "Code agent to install in the Dockerfile.dev container.",
-            kind: FlagKind::Enum(AGENT_VALUES),
+            help:
+                "Code agent to install in the Dockerfile.dev container: claude, codex, opencode, \
+                   gemini, copilot, cline, antigravity, or the name of a custom agent defined in \
+                   .awman/agents/ or ~/.awman/agents/.",
+            kind: FlagKind::String,
             default: FlagDefault::Str("claude"),
             frontends: FrontendVisibility::All,
             conflicts_with: &[],
@@ -176,6 +167,18 @@ pub(super) const READY: CommandSpec = CommandSpec {
             frontends: FrontendVisibility::All,
             conflicts_with: &[],
             implies: &["non-interactive"],
+            optional: true,
+        },
+        FlagSpec {
+            long: "agent",
+            short: None,
+            help: "Agent to check and build (overrides .awman/config.json). Reviews and approves \
+                   a custom agent definition that needs approval.",
+            kind: FlagKind::OptionalString,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
             optional: true,
         },
     ],

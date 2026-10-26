@@ -401,6 +401,7 @@ pub struct Session {
     id: SessionId,
     session_type: SessionType,
     git_root: PathBuf,
+    definition_root: PathBuf,
     /// Whether `git_root` is a real repository root, as the `GitRootResolver`
     /// answered at open time.
     ///
@@ -514,6 +515,8 @@ impl Session {
     ///   none (and so which agent `--agent-flag` targets);
     /// - the env, flags and global config, so a relocated `AWMAN_CONFIG_HOME`
     ///   is honoured exactly as the invoker honoured it.
+    /// - the definition root, so uncommitted agent definitions and their
+    ///   approvals follow every step into the worktree.
     ///
     /// Everything else comes from the worktree checkout.
     pub fn open_worktree_for(
@@ -531,6 +534,7 @@ impl Session {
             },
         )?;
         session.repo_config.builtin = invoker.repo_config.builtin.clone();
+        session.definition_root = invoker.definition_root.clone();
         session.repo_config.agent = invoker.repo_config.agent.clone();
         session.global_config = invoker.global_config.clone();
         session.default_agent = invoker.default_agent.clone();
@@ -571,6 +575,7 @@ impl Session {
             session_type: SessionType::Local {
                 workdir: working_dir,
             },
+            definition_root: git_root.clone(),
             git_root,
             is_git_repo,
             repo_config,
@@ -604,6 +609,11 @@ impl Session {
 
     pub fn git_root(&self) -> &Path {
         &self.git_root
+    }
+
+    /// Repository whose agent definitions and approvals govern this session.
+    pub fn definition_root(&self) -> &Path {
+        &self.definition_root
     }
 
     /// Whether this session is rooted at a real git repository.

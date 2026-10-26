@@ -1,3 +1,4 @@
+{{AWMAN_HEADER}}
 FROM {{AWMAN_BASE_IMAGE}}
 
 # Force root for installation: a base image may have switched to a non-root
@@ -25,20 +26,11 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ENTRYPOINT []
 CMD ["/bin/bash"]
 
-# ── Install agent binary ──────────────────────────────────────────────────────
-# Wipe inherited apt state before updating in case the base left a broken
-# sources.list or stale lock. Then install Node 20 and the agent npm package;
-# nodesource defaults its npm prefix to /usr/local, so the binary lands in
-# /usr/local/bin where the smoke test expects it.
-RUN rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends gnupg \
-    && curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+{{AWMAN_NODE_BLOCK}}
 
-RUN npm install -g --prefix=/usr/local @charmland/crush
+{{AWMAN_APT_BLOCK}}
+
+{{AWMAN_INSTALL_BLOCK}}
 
 # ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -57,4 +49,4 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
-RUN test -x "$(command -v crush)"
+RUN test -x "$(command -v {{AWMAN_BINARY}})"

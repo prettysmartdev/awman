@@ -178,10 +178,15 @@ use crate::frontend::api::serve::error_json;
 /// Map a session-creation validation error to its HTTP status. This is the
 /// ONLY session-creation logic that remains in the frontend — the transport
 /// mapping. An off-allowlist workdir is a 403 (the path exists but the caller
-/// is not permitted to use it); every other validation failure is a 400.
+/// is not permitted to use it), as is an unapproved custom agent definition;
+/// an unknown agent is a 404; every other validation failure is a 400.
 fn session_create_error_status(err: &CommandError) -> StatusCode {
     match err {
         CommandError::SessionWorkdirNotAllowed { .. } => StatusCode::FORBIDDEN,
+        CommandError::Engine(
+            crate::engine::error::EngineError::AgentDefinitionUntrusted { .. }
+            | crate::engine::error::EngineError::UnknownAgent { .. },
+        ) => StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
         _ => StatusCode::BAD_REQUEST,
     }
 }

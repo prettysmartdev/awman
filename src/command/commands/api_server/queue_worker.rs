@@ -35,6 +35,7 @@ impl QueuedCommandResult {
         let mut json = serde_json::json!({ "exit_code": exit_code });
         if let Err(error) = result {
             json["error"] = serde_json::Value::String(error.to_string());
+            json["error_status"] = serde_json::Value::from(error.http_status());
         }
         Self {
             exit_code,

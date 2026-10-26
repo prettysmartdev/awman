@@ -2324,6 +2324,7 @@ mod tests {
                 base_image: StepStatus::Done,
                 agent_image: StepStatus::Done,
                 image_source: None,
+                agent_definition: None,
                 local_agent: StepStatus::Done,
                 audit: StepStatus::Skipped,
                 image_rebuild: StepStatus::Skipped,

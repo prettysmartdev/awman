@@ -79,6 +79,15 @@ pub enum DialogRequest {
         body: String,
         keys: Vec<(char, String)>,
     },
+    /// A keyed confirmation whose body must be read in full before a
+    /// `gated_keys` choice is accepted (the custom-agent trust review). The
+    /// body scrolls; the keys stay visible.
+    Review {
+        title: String,
+        body: String,
+        keys: Vec<(char, String)>,
+        gated_keys: Vec<char>,
+    },
     /// The one-shot squad key disclosure, raised as a [`Dialog::Notice`].
     /// Sent, never awaited: a notice has no answer to give back, and the
     /// command thread must not block on the user dismissing it.
@@ -193,6 +202,7 @@ pub enum Dialog {
         body: String,
         keys: Vec<(char, String)>,
     },
+    Review(ReviewState),
     /// Unrecoverable startup error (e.g. an invalid `runtime:` value in the
     /// global config). The only action is quitting: Enter, Esc, and Ctrl-C
     /// all exit the TUI.
@@ -655,5 +665,48 @@ mod tests {
             output.contains("Esc"),
             "expected 'Esc' in output:\n{output}"
         );
+    }
+}
+
+/// State for [`Dialog::Review`]. `scroll` is the first visible wrapped body
+/// row; the renderer publishes `max_scroll` (it alone knows the wrapped
+/// height). Until the first render `max_scroll` is `usize::MAX`, so a gated
+/// key cannot be accepted before the user has seen anything.
+#[derive(Debug)]
+pub struct ReviewState {
+    pub title: String,
+    pub body: String,
+    pub keys: Vec<(char, String)>,
+    pub gated_keys: Vec<char>,
+    pub scroll: usize,
+    pub max_scroll: std::cell::Cell<usize>,
+}
+
+impl ReviewState {
+    pub fn new(
+        title: String,
+        body: String,
+        keys: Vec<(char, String)>,
+        gated_keys: Vec<char>,
+    ) -> Self {
+        Self {
+            title,
+            body,
+            keys,
+            gated_keys,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(usize::MAX),
+        }
+    }
+
+    /// Whether the end of the body has been on screen.
+    pub fn fully_seen(&self) -> bool {
+        self.scroll >= self.max_scroll.get()
+    }
+
+    /// Whether pressing `c` answers the dialog now.
+    pub fn accepts(&self, c: char) -> bool {
+        self.keys.iter().any(|(ch, _)| *ch == c)
+            && (!self.gated_keys.contains(&c) || self.fully_seen())
     }
 }

@@ -1,0 +1,25 @@
+schema = 1
+display_name = "Crush"
+
+[run]
+command = ["crush"]
+non_interactive = "run"
+
+[modes]
+yolo = ["--yolo"]
+
+[system_prompt]
+delivery = "none"
+
+[ping]
+command = ["crush", "run"]
+
+[settings]
+host_dir = ".config/crush"
+skills_dir = ".config/crush/commands"
+
+# Provider credentials remain opt-in through env(VAR) overlays.
+
+[image]
+needs_node = true
+install = ["npm install -g --prefix=/usr/local @charmland/crush"]

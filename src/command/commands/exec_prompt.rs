@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::launch_policy::{LaunchModeDecision, LaunchPolicy};
+use crate::command::commands::launch_policy::{
+    ensure_agent_trusted, LaunchModeDecision, LaunchPolicy,
+};
 use crate::command::commands::{parse_overlay_list, Command};
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
@@ -190,6 +192,14 @@ impl Command for ExecPromptCommand {
                 return Err(e);
             }
         };
+        // Review/approve a custom definition before anything resolves it.
+        if let Err(e) = ensure_agent_trusted(&session, &agent, frontend.as_mut()) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec prompt: {e}"),
+            });
+            return Err(e);
+        }
         // Resolve ACP policy before overlays or container setup. A direct ACP
         // request is deliberately never eligible for fallback.
         let config = command_effective_config(&session, &self.flags);
@@ -199,11 +209,11 @@ impl Command for ExecPromptCommand {
                 && session.repo_config().agent.is_some()
                 && session.repo_config().launch_mode
                     == Some(crate::data::config::repo::LaunchMode::Acp));
-        let launch_decision = match LaunchPolicy::resolve_launch_mode(&config, &agent, explicit_acp)
-        {
-            Ok(decision) => decision,
-            Err(e) => return Err(CommandError::from(e)),
-        };
+        let launch_decision =
+            match LaunchPolicy::resolve_launch_mode(&session, &config, &agent, explicit_acp) {
+                Ok(decision) => decision,
+                Err(e) => return Err(CommandError::from(e)),
+            };
         if launch_decision == LaunchModeDecision::StdioWithFallbackWarning {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,

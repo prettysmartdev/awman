@@ -1,6 +1,7 @@
 //! Configuration concerns for awman: per-repo config, global config, env-var
 //! reads, typed flag values, and the merged effective view.
 
+pub mod agent_definition;
 pub mod builtin_launch;
 pub mod builtin_network;
 pub mod builtin_runtime;

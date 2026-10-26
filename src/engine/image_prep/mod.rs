@@ -143,6 +143,8 @@ struct ImagePlan {
 }
 
 pub struct AgentImagePreparer {
+    definition_env: crate::data::config::env::EnvSnapshot,
+    definitions: HashMap<String, crate::engine::agent::ResolvedAgent>,
     runtime: Arc<dyn AgentRuntimeEngine>,
     context: ImageBuildContext,
     image_sources: ImageSources,
@@ -182,6 +184,8 @@ impl AgentImagePreparer {
         context: ImageBuildContext,
     ) -> Self {
         Self {
+            definition_env: Env::from_process(),
+            definitions: HashMap::new(),
             image_sources,
             builder_enabled,
             image_importer: Arc::new(bridge::RuntimeImageImporter(runtime.clone())),
@@ -198,6 +202,17 @@ impl AgentImagePreparer {
             warned_tags: HashSet::new(),
             cancel: crate::engine::oci::CancelToken::new(),
         }
+    }
+    pub fn with_definition_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.definition_env = env;
+        self
+    }
+    pub fn with_definition(mut self, def: crate::engine::agent::ResolvedAgent) -> Self {
+        self.set_definition(def);
+        self
+    }
+    pub(crate) fn set_definition(&mut self, def: crate::engine::agent::ResolvedAgent) {
+        self.definitions.insert(def.name.clone(), def);
     }
     /// A preparer for a runtime that builds its own images (Docker, Apple
     /// Containers). It owns only the Dockerfile-path rule and the build

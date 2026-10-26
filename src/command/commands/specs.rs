@@ -708,6 +708,7 @@ mod tests {
         }
     }
 
+    impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeSpecsFrontend {}
     impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeSpecsFrontend {
         fn set_pty_active(&mut self, _active: bool) {}
     }

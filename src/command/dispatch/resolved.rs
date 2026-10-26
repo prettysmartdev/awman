@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn a_supplied_flag_beats_the_catalogue_default() {
         let mut frontend = FakeCommandFrontend::new();
-        frontend.enums.insert("agent".into(), "codex".into());
+        frontend.strings.insert("agent".into(), "codex".into());
         let flags = resolve(&["init"], &frontend);
         assert_eq!(flags.r#enum("agent"), Some("codex"));
         assert!(flags.supplied("agent"));

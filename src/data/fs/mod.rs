@@ -4,6 +4,8 @@
 //! object here. Higher layers consume these types; they never call
 //! `std::fs::*` or `rusqlite::*` directly.
 
+pub mod agent_dirs;
+pub mod agent_trust;
 pub mod api_command_log;
 pub mod api_db;
 pub mod api_paths;
@@ -29,6 +31,7 @@ pub mod squad_verdict;
 pub mod task_store;
 pub mod workflow_dirs;
 
+pub use agent_dirs::{AgentDirs, DefinitionScope};
 pub use api_db::{CommandRecord, SessionRecord, SqliteSessionStore};
 pub use api_paths::ApiPaths;
 pub use auth_paths::{AgentAuthPaths, AuthPathResolver};

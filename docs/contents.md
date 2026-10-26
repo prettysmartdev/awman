@@ -12,7 +12,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 01 | [Concepts](01-concepts.md) | Mental model: containers, agents, modes, overlays |
 | 02 | [Using the TUI](02-using-the-tui.md) | TUI layout, tabs, container window, Workflow Overview, keyboard reference |
 | 03 | [Agent Sessions](03-agent-sessions.md) | `chat`, permission modes (`--plan`/`--auto`/`--yolo`), ACP, work items, skills, agent authentication |
-| 04 | [Security & Isolation](04-security-and-isolation.md) | Worktrees, Docker socket, SSH keys, command transparency |
+| 04 | [Security & Isolation](04-security-and-isolation.md) | Worktrees, Docker socket, SSH keys, custom agent approval, command transparency |
 | 05 | [Workflows](05-workflows.md) | Multi-step workflows, setup/teardown, control board, parallel groups, state persistence |
 | 06 | [Dynamic Workflows](06-dynamic-workflows.md) | `--dynamic` — leader agent designs the workflow, repair loop, `--leader` |
 | 07 | [Configuration](07-configuration.md) | Config files, precedence, runtime selection, builtin runtime settings, every field |
@@ -23,6 +23,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 12 | [squad](12-squad.md) | Your squad of agents: tasks, durable workspaces, the squad tab, attach, guardrails |
 | 13 | [Cleaning Up](13-cleaning-up.md) | `awman clean` — remove containers, workflow files, and dangling images |
 | 14 | [Command Reference](14-command-reference.md) | Every command, subcommand, flag, and argument awman accepts, generated from the source of truth |
+| 15 | [Custom Agents](15-custom-agents.md) | Define your own agents in TOML: locations, reference, images, approval and trust, `awman new agent`, crush/maki migration |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

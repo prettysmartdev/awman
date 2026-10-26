@@ -8,6 +8,7 @@
 
 pub mod agent_auth;
 pub mod agent_setup;
+pub mod agent_trust;
 pub mod agents;
 pub mod api_server;
 pub mod chat;

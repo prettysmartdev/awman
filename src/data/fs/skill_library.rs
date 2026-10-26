@@ -26,6 +26,10 @@ pub struct SkillLibraryMeta {
     pub repo: String,
     #[serde(default = "default_subdir")]
     pub subdir: String,
+    /// The clone is shallow and sparse (only `subdir` is checked out), so
+    /// refreshes must stay shallow too. Legacy files deserialize as `false`.
+    #[serde(default)]
+    pub sparse: bool,
 }
 
 fn default_subdir() -> String {
@@ -202,6 +206,7 @@ mod tests {
             owner: "obra".to_string(),
             repo: "superpowers".to_string(),
             subdir: "custom-skills".to_string(),
+            sparse: false,
         };
 
         write_library_meta(&dir, &meta).expect("write_library_meta must succeed");
@@ -213,6 +218,16 @@ mod tests {
 
         let read_back = read_library_meta(&dir).expect("read_library_meta must succeed");
         assert_eq!(read_back, meta, "metadata must round-trip byte-for-byte");
+
+        let sparse = SkillLibraryMeta {
+            sparse: true,
+            ..meta
+        };
+        write_library_meta(&dir, &sparse).unwrap();
+        assert!(
+            read_library_meta(&dir).unwrap().sparse,
+            "sparse round-trips"
+        );
     }
 
     #[test]
@@ -234,6 +249,10 @@ mod tests {
         assert_eq!(
             meta.subdir, "skills",
             "subdir must default to 'skills' when the key is absent"
+        );
+        assert!(
+            !meta.sparse,
+            "metadata written before sparse clones existed is a full clone"
         );
     }
 

@@ -12,7 +12,8 @@ use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::fs::overlay_paths::OverlayPathResolver;
 use crate::data::fs::skill_library::read_library_meta;
 use crate::data::session::{AgentName, Session};
-use crate::engine::agent::agent_matrix::{matrix_for, SettingsMount};
+use crate::engine::agent::definition::{AgentDefinition, SettingsMount};
+use crate::engine::agent::registry::AgentRegistry;
 use crate::engine::auth::credential::{CredentialFile, CredentialFingerprint};
 use crate::engine::container::options::{OverlayPermission, OverlaySpec};
 use crate::engine::error::EngineError;
@@ -112,6 +113,10 @@ pub struct OverlayRequest {
     /// passthrough/none auth modes must never cause host credentials to be
     /// copied into a mount.
     pub materialize_credentials: bool,
+    /// The definition the option builder already resolved for `agent`, so
+    /// overlays read the same definition as the rest of the launch. When
+    /// `None`, it is resolved here once per request.
+    pub definition: Option<std::sync::Arc<AgentDefinition>>,
 }
 
 /// Resolved directory overlay (after canonicalization + tilde expansion).
@@ -251,6 +256,17 @@ impl OverlayEngine {
             insert_or_merge(&mut by_key, key, resolved);
         }
 
+        // Resolve the agent once for both the settings and the skills
+        // overlays. An agent that does not resolve gets neither (warned
+        // below for skills), exactly as an unknown name always has.
+        let definition = request.definition.clone().or_else(|| {
+            request.agent.as_ref().and_then(|agent| {
+                AgentRegistry::resolve_for_session(session, agent)
+                    .ok()
+                    .map(|resolved| resolved.definition())
+            })
+        });
+
         // 2. Agent settings overlays. Forward the yolo flag so Claude's
         //    settings sanitization can inject the bypass-permissions overlay,
         //    and the request's container_home so settings paths agree with
@@ -258,10 +274,14 @@ impl OverlayEngine {
         if let Some(agent) = &request.agent {
             let (agent_overlays, staged) = self.agent_settings_overlays_with_credentials(
                 agent,
+                definition.as_deref(),
                 request.yolo,
                 session.git_root(),
                 request.container_home.as_deref(),
                 request.materialize_credentials,
+                crate::data::config::global::GlobalConfig::data_home_with(session.env())
+                    .ok()
+                    .as_deref(),
             )?;
             staged_credentials.extend(staged);
             for spec in agent_overlays {
@@ -273,7 +293,9 @@ impl OverlayEngine {
         // 3. Skills overlay (mount ~/.awman/skills/ read-only into agent's native path).
         if request.include_all_skills || !request.named_skills.is_empty() {
             if let Some(agent) = &request.agent {
-                for spec in self.skill_overlays(
+                for spec in self.skill_overlays_for_with_env(
+                    session.env(),
+                    definition.as_deref(),
                     agent,
                     request.include_all_skills,
                     &request.named_skills,
@@ -427,6 +449,20 @@ pub(crate) fn detect_home_from_dockerfile(path: &Path) -> Option<String> {
         }
     }
     result
+}
+
+/// Resolve `agent` for an overlay entry point that was not handed a
+/// definition. The overlay engine holds no `EnvSnapshot`, so this reads the
+/// process environment (which honours `AWMAN_CONFIG_HOME`). `None` when the
+/// agent does not resolve; the caller degrades exactly as for an unknown name.
+fn resolve_definition(
+    agent: &AgentName,
+    git_root: &Path,
+) -> Option<std::sync::Arc<AgentDefinition>> {
+    let env = crate::data::config::env::Env::from_process();
+    AgentRegistry::resolve(&env, agent, Some(git_root))
+        .ok()
+        .map(|resolved| resolved.definition())
 }
 
 /// Detect the container home directory by inspecting `Dockerfile.<agent>`.

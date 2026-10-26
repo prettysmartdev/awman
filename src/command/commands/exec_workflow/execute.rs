@@ -120,6 +120,18 @@ impl Command for ExecWorkflowCommand {
         frontend.with(|frontend| warn_context_workflow_in_phase(&workflow, frontend));
         let _ = deprecation_warned;
 
+        // Custom agent definitions are reviewed once per distinct agent
+        // before anything resolves them (the preflight below included).
+        if let Err(e) = frontend.with(|frontend| {
+            ensure_workflow_agents_approved(&workflow, &self.session, &self.flags, frontend)
+        }) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+
         // ACP compatibility is a workflow-wide pre-flight check.  Do it
         // before mount scope, worktree preparation, image setup, overlays, or
         // the workflow engine so `fallback: error` cannot leave partial work.

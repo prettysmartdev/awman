@@ -399,6 +399,39 @@ pub enum EngineError {
     #[error("{0}")]
     ImageBuilder(BuilderFailure),
 
+    // ── agent definitions (WI 0130) ──────────────────────────────────────
+    /// unknown agent 'foo'; first-party: claude, codex, …; custom: pi (repo);
+    /// define one with: awman new agent foo — followed by one line per note.
+    #[error("{}", render_unknown_agent(name, first_party, custom, notes))]
+    UnknownAgent {
+        name: String,
+        first_party: Vec<String>,
+        /// Pre-rendered `"<name> (<scope>)"` entries.
+        custom: Vec<String>,
+        notes: Vec<String>,
+    },
+
+    /// `<path>: <problem>`, one line per problem.
+    #[error("{}", render_definition_problems(path, problems))]
+    AgentDefinitionInvalid {
+        path: PathBuf,
+        problems: Vec<String>,
+    },
+
+    #[error(
+        "agent definition '{name}' ({}) has not been approved for this repo; run 'awman ready --agent {name}' interactively to review it",
+        path.display()
+    )]
+    AgentDefinitionUntrusted {
+        name: String,
+        path: PathBuf,
+        sha256: String,
+    },
+
+    #[error(
+        "custom agent '{name}' runs only on container runtimes (docker, apple, builtin-experimental); '{runtime}' is not supported for custom agents yet"
+    )]
+    CustomAgentRuntimeUnsupported { name: String, runtime: String },
     #[error("{0}")]
     Other(String),
 }
@@ -495,6 +528,50 @@ pub enum BuilderFailure {
     BaseImageChanged { tag: String },
 }
 
+/// Render [`EngineError::UnknownAgent`].
+fn render_unknown_agent(
+    name: &str,
+    first_party: &[String],
+    custom: &[String],
+    notes: &[String],
+) -> String {
+    let custom = if custom.is_empty() {
+        "(none)".to_string()
+    } else {
+        custom.join(", ")
+    };
+    let mut out = format!(
+        "unknown agent '{name}'; first-party: {}; custom: {custom}; define one with: awman new agent {name}",
+        first_party.join(", ")
+    );
+    for note in notes {
+        out.push('\n');
+        out.push_str(note);
+    }
+    out
+}
+
+/// Render [`EngineError::AgentDefinitionInvalid`].
+fn render_definition_problems(path: &std::path::Path, problems: &[String]) -> String {
+    // Problems quote untrusted keys and paths: never let one reach a terminal raw.
+    use crate::data::config::agent_definition::escape_for_display;
+    let path = escape_for_display(&path.display().to_string());
+    problems
+        .iter()
+        .map(|p| format!("{path}: {}", escape_for_display(p)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl From<crate::data::config::agent_definition::AgentDefinitionInvalid> for EngineError {
+    fn from(e: crate::data::config::agent_definition::AgentDefinitionInvalid) -> Self {
+        EngineError::AgentDefinitionInvalid {
+            path: e.path,
+            problems: e.problems,
+        }
+    }
+}
+
 /// Which tool restriction a [`EngineError::ToolRestrictionFlagMissing`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRestriction {
@@ -528,13 +605,18 @@ fn container_runtime_install_hint(binary: &str) -> &'static str {
 impl EngineError {
     /// The process exit code for this failure, per the classes in
     /// `aspec/uxui/cli.md`: 3 only when a Docker or Apple Containers CLI
-    /// backend is missing or failing, 1 for every other engine failure. It
+    /// backend is missing or failing, 2 for input/runtime refusals, 4 for missing
+    /// agents, and 1 for other engine failures. It
     /// lives beside `Display` so every frontend reads the same mapping.
     pub fn exit_code(&self) -> u8 {
         match self {
-            EngineError::AgentNotFound { .. } => 4,
+            // A referenced agent that does not exist is "resource missing",
+            // the same class as a vanished agent container.
+            EngineError::AgentNotFound { .. } | EngineError::UnknownAgent { .. } => 4,
             EngineError::Container(_) | EngineError::ContainerRuntimeUnavailable { .. } => 3,
-            EngineError::UnknownRuntime { .. } => 2,
+            EngineError::UnknownRuntime { .. }
+            | EngineError::AgentDefinitionUntrusted { .. }
+            | EngineError::CustomAgentRuntimeUnsupported { .. } => 2,
             // A refused or failed in-place catalog upgrade is an ordinary
             // engine failure, never "Docker is missing" (3).
             EngineError::BuiltinCatalogMismatch { .. }
@@ -889,6 +971,27 @@ mod user_text_tests {
             EngineError::AgentRequiresProjectImage { tag: s("p:1") }.to_string(),
             "agent image build requires the project base image first (p:1); run `awman ready \
              --build`"
+        );
+    }
+
+    #[test]
+    fn custom_agent_input_and_runtime_refusals_use_exit_class_two() {
+        assert_eq!(
+            EngineError::AgentDefinitionUntrusted {
+                name: "pi".into(),
+                path: "/repo/.awman/agents/pi.toml".into(),
+                sha256: "hash".into(),
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            EngineError::CustomAgentRuntimeUnsupported {
+                name: "pi".into(),
+                runtime: "docker-sbx-experimental".into(),
+            }
+            .exit_code(),
+            2
         );
     }
 }

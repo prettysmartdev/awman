@@ -114,6 +114,7 @@ pub trait AgentLaunchFrontend:
     + AgentSetupFrontend
     + crate::command::commands::agent_auth::AgentAuthFrontend
     + HasAgentFrontend
+    + crate::command::commands::agent_trust::AgentTrustFrontend
 {
     /// Inform the frontend that host stdio is now owned by a running
     /// container (`true`) or has been released (`false`).

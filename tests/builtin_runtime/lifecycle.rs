@@ -99,12 +99,14 @@ pub(crate) fn install_ready_ping_stub(bin_dir: &Path, agent: &str, log: &Path) {
     fn quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
-    let matrix = awman::engine::agent::agent_matrix::matrix_for(agent).unwrap();
+    let ping_argv = awman::engine::agent::first_party::first_party(agent)
+        .and_then(|d| d.ping_argv)
+        .expect("every first-party agent declares a ping");
     let mut script = format!(
         "#!/bin/sh\nset -eu\ncase \"$PWD\" in */awman-ready-ping-*) ;; *) exit 91;; esac\ntest -z \"$(ls -A .)\"\ntest \"$#\" = {}\n",
-        matrix.ping_argv.len()
+        ping_argv.len()
     );
-    for arg in &matrix.ping_argv[1..] {
+    for arg in &ping_argv[1..] {
         script.push_str(&format!("test \"$1\" = {}\nshift\n", quote(arg)));
     }
     let greetings = awman::engine::ready::GREETINGS
@@ -113,7 +115,7 @@ pub(crate) fn install_ready_ping_stub(bin_dir: &Path, agent: &str, log: &Path) {
         .collect::<Vec<_>>()
         .join("|");
     script.push_str(&format!("case \"$1\" in {greetings}) ;; *) exit 92;; esac\nprintf 'ping\\n' >> {}\nprintf 'synthetic-ready-ping\\n'\n", quote(&log.to_string_lossy())));
-    let path = bin_dir.join(matrix.ping_argv[0]);
+    let path = bin_dir.join(&ping_argv[0]);
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

@@ -1,4 +1,4 @@
-//! `NewCommand` — `new spec`, `new workflow`, `new skill`.
+//! `NewCommand` — `new spec`, `new workflow`, `new skill`, `new agent`.
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -45,10 +45,21 @@ pub struct NewSkillFlags {
 }
 
 #[derive(Debug, Clone)]
+pub struct NewAgentFlags {
+    /// The positional name; becomes the file stem.
+    pub name: String,
+    pub global: bool,
+    /// `--from <example>`; `None` writes the commented skeleton.
+    pub from: Option<String>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum NewSubcommand {
     Spec(NewSpecFlags),
     Workflow(NewWorkflowFlags),
     Skill(NewSkillFlags),
+    Agent(NewAgentFlags),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,12 +98,32 @@ pub struct NewSkillOutcome {
     pub libraries: Vec<PullLibraryOutcome>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NewAgentOutcome {
+    pub name: String,
+    /// The definition's TOML path.
+    pub path: String,
+    pub scope: crate::data::fs::agent_dirs::DefinitionScope,
+    /// `true` when the commented skeleton (not an example) was written.
+    pub skeleton: bool,
+    /// The TOML, plus `maki.Dockerfile` for `--from maki`.
+    pub files_written: Vec<String>,
+    /// Whether the written content was recorded as approved (repo scope
+    /// always; global scope only with `[ping]`; never the unfilled skeleton).
+    pub approved: bool,
+    /// The review summary's host-command block, when the content has `[ping]`.
+    pub host_command_block: Option<String>,
+    /// `awman ready --agent <name>`.
+    pub next_step: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum NewOutcome {
     Spec(NewSpecOutcome),
     Workflow(NewWorkflowOutcome),
     Skill(NewSkillOutcome),
+    Agent(NewAgentOutcome),
 }
 
 /// A single step collected from the user during `new workflow`.
@@ -153,6 +184,9 @@ pub trait NewCommandFrontend:
     fn ask_skill_body(&mut self) -> Result<String, CommandError> {
         Ok(String::new())
     }
+    /// `new agent` finished, for frontends that do not render outcomes
+    /// themselves (the TUI). The CLI renders from the outcome on stdout.
+    fn show_new_agent(&mut self, _outcome: &NewAgentOutcome) {}
 }
 
 // ─── Serde structs for workflow serialization ────────────────────────────────
@@ -267,6 +301,12 @@ impl NewCommand {
                     subdir,
                 })
             }
+            "agent" => NewSubcommand::Agent(NewAgentFlags {
+                name: ctx.args.require("name")?,
+                global: ctx.flags.bool("global"),
+                from: ctx.flags.string("from"),
+                force: ctx.flags.bool("force"),
+            }),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
         Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
@@ -293,6 +333,7 @@ impl Command for NewCommand {
             NewSubcommand::Spec(f) => spec::run(&self, f, frontend.as_mut()).await?,
             NewSubcommand::Workflow(f) => workflow::run(&self, f, frontend.as_mut()).await?,
             NewSubcommand::Skill(f) => skill::run(&self, f, frontend.as_mut()).await?,
+            NewSubcommand::Agent(f) => agent::run(&self, f, frontend.as_mut()).await?,
         };
         frontend.replay_queued();
         Ok(outcome)
@@ -443,6 +484,7 @@ mod tests {
         }
     }
 
+    impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeNewFrontend {}
     impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeNewFrontend {
         fn set_pty_active(&mut self, _active: bool) {}
     }
@@ -778,8 +820,316 @@ mod tests {
             "the host path must never reach the agent: {prompt}"
         );
     }
+
+    /// `awman new agent` (WI 0130).
+    mod new_agent {
+        use super::*;
+        use crate::data::fs::agent_trust::TrustStore;
+
+        struct Fx {
+            root: tempfile::TempDir,
+            home: std::path::PathBuf,
+        }
+        fn fx() -> Fx {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("global");
+            std::fs::create_dir_all(&home).unwrap();
+            Fx { root, home }
+        }
+        async fn run_new(
+            fx: &Fx,
+            name: &str,
+            global: bool,
+            from: Option<&str>,
+            force: bool,
+        ) -> Result<NewAgentOutcome, CommandError> {
+            let session = Session::for_tests_isolated(fx.root.path(), &fx.home);
+            let cmd = NewCommand::new(
+                NewSubcommand::Agent(NewAgentFlags {
+                    name: name.into(),
+                    global,
+                    from: from.map(String::from),
+                    force,
+                }),
+                Engines::for_tests(fx.root.path()),
+                session,
+            );
+            match cmd
+                .run_with_frontend(Box::new(FakeNewFrontend::new("w", "s", "")))
+                .await?
+            {
+                NewOutcome::Agent(o) => Ok(o),
+                other => panic!("{other:?}"),
+            }
+        }
+        fn approved_entries(fx: &Fx) -> usize {
+            TrustStore::load(&fx.home).entries().len()
+        }
+
+        #[tokio::test]
+        async fn skeleton_is_written_unapproved_with_fill_in_hint() {
+            let fx = fx();
+            let out = run_new(&fx, "pi", false, None, false).await.unwrap();
+            let path = fx.root.path().join(".awman/agents/pi.toml");
+            assert_eq!(out.path, path.display().to_string());
+            assert!(out.skeleton && !out.approved && out.host_command_block.is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), SKELETON_FOR_TEST);
+            assert!(out.render().contains("Fill in display_name"));
+            assert!(out.render().contains("awman ready --agent pi"));
+            assert_eq!(approved_entries(&fx), 0);
+        }
+        const SKELETON_FOR_TEST: &str = agent::SKELETON;
+
+        #[tokio::test]
+        async fn from_crush_writes_example_approves_and_prints_host_block() {
+            let fx = fx();
+            let out = run_new(&fx, "crush", false, Some("crush"), false)
+                .await
+                .unwrap();
+            let path = fx.root.path().join(".awman/agents/crush.toml");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                agent::EXAMPLE_CRUSH
+            );
+            assert!(!out.skeleton && out.approved);
+            assert_eq!(out.files_written.len(), 1);
+            let block = out.host_command_block.clone().expect("crush has [ping]");
+            assert!(block.starts_with("⚠ `awman ready` will run this command ON YOUR HOST"));
+            assert!(block.contains("'<greeting>'"));
+            let text = out.render();
+            assert!(text.contains("Next: awman ready --agent crush"));
+            assert!(text.ends_with(&block));
+            assert_eq!(approved_entries(&fx), 1);
+        }
+
+        #[tokio::test]
+        async fn from_maki_writes_both_files() {
+            let fx = fx();
+            let out = run_new(&fx, "maki", false, Some("maki"), false)
+                .await
+                .unwrap();
+            let dir = fx.root.path().join(".awman/agents");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("maki.Dockerfile")).unwrap(),
+                agent::EXAMPLE_MAKI_DOCKERFILE
+            );
+            assert_eq!(out.files_written.len(), 2);
+            assert!(out.approved);
+        }
+
+        #[tokio::test]
+        async fn global_writes_under_config_home_and_and_approves_ping_definitions() {
+            let fx = fx();
+            let out = run_new(&fx, "crush", true, Some("crush"), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                out.path,
+                fx.home.join("agents/crush.toml").display().to_string()
+            );
+            assert!(out.approved, "crush declares [ping]");
+            assert!(!fx.root.path().join(".awman/agents/crush.toml").exists());
+
+            // maki also declares [ping], so global scope approves it too.
+            let before = approved_entries(&fx);
+            let out = run_new(&fx, "maki", true, Some("maki"), false)
+                .await
+                .unwrap();
+            assert!(out.approved);
+            assert_eq!(approved_entries(&fx), before + 1);
+        }
+
+        #[tokio::test]
+        async fn existing_file_needs_force() {
+            let fx = fx();
+            run_new(&fx, "pi", false, None, false).await.unwrap();
+            let path = fx.root.path().join(".awman/agents/pi.toml");
+            std::fs::write(&path, "mine").unwrap();
+            let err = run_new(&fx, "pi", false, None, false).await.unwrap_err();
+            assert!(
+                err.to_string().contains("already exists; pass --force"),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
+            run_new(&fx, "pi", false, None, true).await.unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), agent::SKELETON);
+        }
+
+        #[tokio::test]
+        async fn existing_sibling_dockerfile_also_blocks_without_force() {
+            let fx = fx();
+            let dir = fx.root.path().join(".awman/agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("maki.Dockerfile"), "FROM x").unwrap();
+            let err = run_new(&fx, "maki", false, Some("maki"), false)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("maki.Dockerfile already exists"),
+                "{err}"
+            );
+            assert!(!dir.join("maki.toml").exists());
+        }
+
+        #[tokio::test]
+        async fn reserved_and_malformed_names_are_rejected_before_any_write() {
+            let fx = fx();
+            for name in ["claude", "antigravity", "Bad Name", "-x", "", "a/b"] {
+                let err = run_new(&fx, name, false, None, false).await.unwrap_err();
+                assert!(
+                    matches!(err, CommandError::InvalidArgumentValue { .. }),
+                    "{name}: {err:?}"
+                );
+                assert_eq!(err.exit_code(), 2);
+            }
+            assert!(!fx.root.path().join(".awman/agents").exists());
+        }
+
+        #[tokio::test]
+        async fn unknown_from_value_is_a_flag_error() {
+            let fx = fx();
+            let err = run_new(&fx, "pi", false, Some("cursor"), false)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, CommandError::InvalidFlagValue { .. }),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn shipped_examples_validate() {
+            let dir = tempfile::tempdir().unwrap();
+            for (file, body) in [
+                ("crush.toml", agent::EXAMPLE_CRUSH),
+                ("maki.toml", agent::EXAMPLE_MAKI),
+                ("maki.Dockerfile", agent::EXAMPLE_MAKI_DOCKERFILE),
+            ] {
+                std::fs::write(dir.path().join(file), body).unwrap();
+            }
+            for f in ["crush.toml", "maki.toml"] {
+                crate::data::config::agent_definition::load_agent_definition_with_scope(
+                    &dir.path().join(f),
+                    crate::data::fs::agent_dirs::DefinitionScope::Repo,
+                )
+                .unwrap_or_else(|e| panic!("{f}: {e}"));
+            }
+        }
+
+        /// A definition replaced between publication and approval (say, by a
+        /// running container) is never approved, for either example.
+        #[test]
+        fn approval_is_bound_to_the_bundled_bytes_not_the_file_on_disk() {
+            use crate::data::config::agent_definition::content_hash;
+            use crate::data::fs::agent_dirs::DefinitionScope;
+            for (example, toml, dockerfile) in [
+                ("crush", agent::EXAMPLE_CRUSH, None),
+                (
+                    "maki",
+                    agent::EXAMPLE_MAKI,
+                    Some(agent::EXAMPLE_MAKI_DOCKERFILE),
+                ),
+            ] {
+                let fx = fx();
+                let env = Session::for_tests_isolated(fx.root.path(), &fx.home)
+                    .env()
+                    .clone();
+                let dir = fx.root.path().join(".awman/agents");
+                std::fs::create_dir_all(&dir).unwrap();
+                if let Some(body) = dockerfile {
+                    std::fs::write(dir.join("maki.Dockerfile"), body).unwrap();
+                }
+                let path = dir.join("pi.toml");
+                let expected = content_hash(toml.as_bytes(), dockerfile.map(str::as_bytes));
+                // The substitute is a valid definition with another [ping].
+                let swapped = toml.replacen("[ping]", "[ping]\n# swapped", 1);
+                assert_ne!(swapped, toml, "{example} declares [ping]");
+                std::fs::write(&path, swapped).unwrap();
+                let err = agent::approve_bundled(
+                    &env,
+                    fx.root.path(),
+                    "pi",
+                    DefinitionScope::Repo,
+                    &path,
+                    example,
+                    &expected,
+                )
+                .unwrap_err();
+                assert!(err.to_string().contains("was not approved"), "{err}");
+                assert_eq!(approved_entries(&fx), 0, "{example}");
+                // The unmodified bytes are approved.
+                std::fs::write(&path, toml).unwrap();
+                let (approved, _) = agent::approve_bundled(
+                    &env,
+                    fx.root.path(),
+                    "pi",
+                    DefinitionScope::Repo,
+                    &path,
+                    example,
+                    &expected,
+                )
+                .unwrap();
+                assert!(approved);
+                assert_eq!(approved_entries(&fx), 1, "{example}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn repo_planted_directory_symlinks_are_refused_and_outside_files_untouched() {
+            use std::os::unix::fs::symlink;
+            for planted in [".awman", ".awman/agents"] {
+                let fx = fx();
+                let outside = tempfile::tempdir().unwrap();
+                std::fs::write(outside.path().join("pi.toml"), "outside").unwrap();
+                let link = fx.root.path().join(planted);
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                symlink(outside.path(), &link).unwrap();
+                for force in [false, true] {
+                    let err = run_new(&fx, "pi", false, Some("crush"), force)
+                        .await
+                        .unwrap_err();
+                    assert!(err.to_string().contains("symlink"), "{planted}: {err}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(outside.path().join("pi.toml")).unwrap(),
+                    "outside"
+                );
+                assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+                assert_eq!(approved_entries(&fx), 0);
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn dangling_leaf_symlink_counts_as_existing_and_force_replaces_only_the_link() {
+            use std::os::unix::fs::symlink;
+            let fx = fx();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("created-through-link.toml");
+            let dir = fx.root.path().join(".awman/agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            symlink(&target, dir.join("pi.toml")).unwrap();
+            let err = run_new(&fx, "pi", false, Some("crush"), false)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("already exists"), "{err}");
+            assert!(!target.exists());
+            run_new(&fx, "pi", false, Some("crush"), true)
+                .await
+                .unwrap();
+            assert!(!target.exists(), "--force must not write through the link");
+            let meta = std::fs::symlink_metadata(dir.join("pi.toml")).unwrap();
+            assert!(meta.is_file());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("pi.toml")).unwrap(),
+                agent::EXAMPLE_CRUSH
+            );
+        }
+    }
 }
 
+pub mod agent;
 mod skill;
 mod spec;
 mod workflow;

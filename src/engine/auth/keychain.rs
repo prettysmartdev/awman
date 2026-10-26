@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::data::session::AgentName;
-use crate::engine::agent::agent_matrix::CredentialSource;
+use crate::engine::agent::definition::CredentialSource;
+use crate::engine::agent::first_party::first_party;
 use crate::engine::auth::credential::{
     self, HostCredentialSource, RefreshableCredentialSpec, CLAUDE_KEYCHAIN_SERVICE,
 };
@@ -50,13 +51,14 @@ pub fn agent_keychain_credentials(agent: &AgentName) -> Vec<(String, String)> {
     }
 }
 
-/// This agent's credential scheme, from the one per-agent table
-/// (`agent_matrix`). An agent the matrix does not know has no host credential
+/// This agent's credential scheme, from the first-party table
+/// (`first_party.rs`). Credential schemes are first-party-only facts: any
+/// other name (a custom agent, or an unknown one) has no host credential
 /// awman passes through — which is exactly what the `_ =>` arms these three
-/// functions used to carry said.
+/// functions used to carry said. No file I/O.
 fn credential_source(agent: &AgentName) -> CredentialSource {
-    crate::engine::agent::agent_matrix::matrix_for(agent.as_str())
-        .map(|m| m.credential_source)
+    first_party(agent.as_str())
+        .map(|d| d.credential_source)
         .unwrap_or(CredentialSource::None)
 }
 
@@ -682,6 +684,15 @@ mod tests {
     fn agent_keychain_credentials_for_unknown_agent_is_empty() {
         let agent = AgentName::new("totallymadeup").unwrap();
         assert!(agent_keychain_credentials(&agent).is_empty());
+    }
+
+    #[test]
+    fn custom_credential_source_is_none_and_all_keychain_paths_are_no_io() {
+        let custom = AgentName::new("custom-name").unwrap();
+        assert_eq!(credential_source(&custom), CredentialSource::None);
+        assert!(agent_keychain_credentials(&custom).is_empty());
+        assert!(agent_keychain_files(&custom).is_empty());
+        assert!(refreshable_spec_for(&custom).is_none());
     }
 
     /// WI 0116 §5: the `security -i` stdin builder is a pure string function,

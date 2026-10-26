@@ -12,7 +12,7 @@ use crate::engine::workflow::PhaseStepRef;
 /// Emit the deprecation warning for `agent`, if its vendor has deprecated it.
 ///
 /// The wording is the one per-agent table's
-/// (`AgentMatrix::deprecation_note`, reached through
+/// (`AgentDefinition::deprecation_note`, reached through
 /// `LaunchPolicy::deprecation_warning`). This used to be a third hand-written
 /// copy of the gemini text, alongside `chat`'s and `exec prompt`'s (F-32).
 pub(crate) fn workflow_resume_start_points(
@@ -1017,6 +1017,7 @@ pub(crate) fn collect_single_entry_overlays(
         container_home,
         context_overlays: Vec::new(),
         materialize_credentials: false,
+        definition: None,
     };
     let overlay_specs = engines
         .overlay_engine

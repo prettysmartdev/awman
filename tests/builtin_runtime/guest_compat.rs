@@ -8,14 +8,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use awman::data::fs::auth_paths::AuthPathResolver;
-use awman::engine::agent::agent_matrix::{
-    matrix_for, SettingsMount, SystemPromptMode, SUPPORTED_AGENTS,
-};
+use awman::engine::agent::definition::{SettingsMount, SystemPromptMode};
+use awman::engine::agent::first_party::{first_party, FIRST_PARTY_AGENTS};
 
 use crate::lifecycle::{awman, gate, install_ready_ping_stub, run_bounded};
 
 fn probe(agent: &str) -> String {
-    let matrix = matrix_for(agent).unwrap();
+    let matrix = first_party(agent).unwrap();
     let mut script = String::from(
         r#"#!/bin/sh
 set -eu
@@ -33,7 +32,7 @@ test -d /awman/context/workflow
 printf workflow-write > /awman/context/workflow/writeback
 "#,
     );
-    match matrix.settings_mount {
+    match &matrix.settings_mount {
         SettingsMount::None => script.push_str("test ! -e \"$HOME/.matrix-no-settings\"\n"),
         SettingsMount::Direct(relative) => script.push_str(&format!(
             "grep -q settings-sentinel \"$HOME/{relative}/settings.json\"\nprintf settings-writeback > \"$HOME/{relative}/writeback\"\n"
@@ -45,12 +44,12 @@ printf workflow-write > /awman/context/workflow/writeback
             "grep -q settings-sentinel \"$HOME/.gemini/settings.json\"\n"
         ),
     }
-    if let Some(relative) = matrix.skills_mount {
+    if let Some(relative) = &matrix.skills_mount {
         script.push_str(&format!(
             "grep -q skill-sentinel \"$HOME/{relative}/matrix/SKILL.md\"\n"
         ));
     }
-    match matrix.system_prompt_delivery {
+    match &matrix.system_prompt_delivery {
         SystemPromptMode::Append => script.push_str(
             "found=0\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --append-system-prompt-file ]; then shift; grep -q 'Global Developer Context' \"$1\"; found=1; fi; shift; done\ntest $found = 1\n"
         ),
@@ -83,8 +82,8 @@ fn builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies() {
     let Some((binary, archive)) = gate(TEST) else {
         return;
     };
-    for agent in SUPPORTED_AGENTS {
-        let matrix = matrix_for(agent).unwrap();
+    for agent in FIRST_PARTY_AGENTS {
+        let matrix = first_party(agent).unwrap();
         let temp = tempfile::Builder::new()
             .prefix("aw-matrix.")
             .tempdir_in("/tmp")
@@ -120,7 +119,7 @@ fn builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies() {
         std::fs::write(home.join(".matrix-no-settings"), "host-home-must-not-leak").unwrap();
         std::fs::write(home.join(".awman/skills/matrix/SKILL.md"), "skill-sentinel").unwrap();
         let paths = AuthPathResolver::at_home(&home).resolve(agent);
-        if let SettingsMount::Direct(relative) = matrix.settings_mount {
+        if let SettingsMount::Direct(relative) = &matrix.settings_mount {
             let dir = home.join(relative);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -161,7 +160,7 @@ fn builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies() {
             "docker",
             "container",
             "sbx",
-            matrix.interactive_entrypoint[0],
+            &matrix.interactive_entrypoint[0],
         ] {
             let helper = private_bin.join(name);
             std::fs::write(
@@ -213,7 +212,7 @@ fn builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies() {
                 std::fs::read_to_string(rw.join("writeback")).unwrap(),
                 "writeback"
             );
-            if let SettingsMount::Direct(relative) = matrix.settings_mount {
+            if let SettingsMount::Direct(relative) = &matrix.settings_mount {
                 assert_eq!(
                     std::fs::read_to_string(home.join(relative).join("writeback")).unwrap(),
                     "settings-writeback"
@@ -234,7 +233,7 @@ fn builtin_hw_actual_awman_all_agent_settings_prompt_overlay_strategies() {
 
 #[test]
 fn synthetic_strategy_probes_parse_as_shell_without_running_on_host() {
-    for agent in SUPPORTED_AGENTS {
+    for agent in FIRST_PARTY_AGENTS {
         let output = std::process::Command::new("sh")
             .args(["-n", "-c", &probe(agent)])
             .output()

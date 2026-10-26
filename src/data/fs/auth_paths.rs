@@ -92,6 +92,15 @@ mod tests {
         AuthPathResolver::at_home("/home/testuser")
     }
 
+    /// A custom agent name has no known on-host artefacts (the `_ =>` arm).
+    #[test]
+    fn resolve_custom_agent_name_has_no_paths() {
+        let paths = resolver().resolve("pi");
+        assert_eq!(paths.agent, "pi");
+        assert_eq!(paths.config_file, None);
+        assert_eq!(paths.settings_dir, None);
+    }
+
     #[test]
     fn resolve_claude_has_config_file_and_settings_dir() {
         let r = resolver();

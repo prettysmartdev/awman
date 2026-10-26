@@ -13,10 +13,29 @@ impl AgentImagePreparer {
         use crate::data::message::{MessageLevel, UserMessage};
         let tag = request.tag.to_string();
         let agent = request.agent;
-        let policy = request.policy;
+        let mut policy = request.policy;
         let git_root_buf = self.context.git_root.clone();
         let git_root = git_root_buf.as_path();
         let hint = self.context.hint(agent);
+        let definition = self.definition(agent)?;
+        // First-party downloads retain their existing on-demand behavior.
+        // A custom definition must sync before the cached-image fast path so
+        // ready can rebuild a changed recipe. Configuration failures still
+        // precede all provisioning.
+        self.prevalidate_build_targets(policy);
+        if definition.is_custom()
+            && !matches!(policy, BuildPolicy::CheckOnly | BuildPolicy::ImportOnly)
+            && self.plan(&tag, agent).error.is_none()
+        {
+            let sync = self
+                .provision_agent_dockerfile(frontend, git_root, agent, &hint.agent_dockerfile)
+                .await?;
+            if sync == crate::engine::agent::DockerfileSync::Written
+                && matches!(policy, BuildPolicy::Ready { .. })
+            {
+                policy = policy.audit_rebuild();
+            }
+        }
         self.prevalidate_build_targets(policy);
         let plan = self.plan(&tag, agent);
         let mut image_result = ReadyImageResult::new(agent.to_string(), tag.clone());
@@ -158,7 +177,7 @@ impl AgentImagePreparer {
                         agent,
                         &hint.agent_dockerfile,
                     )
-                    .await;
+                    .await?;
                 }
                 let text = e.to_string();
                 if policy.allows_build() {
@@ -359,7 +378,7 @@ impl AgentImagePreparer {
                             agent,
                             &hint.agent_dockerfile,
                         )
-                        .await;
+                        .await?;
                     }
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Warning,

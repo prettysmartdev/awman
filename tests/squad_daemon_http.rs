@@ -501,6 +501,11 @@ fn assert_carries_no_value(text: &str, what: &str) {
 /// A squad task seeded straight into the daemon's database before it boots, so
 /// its `env()` names are in `required_env` from the daemon's first tick.
 fn seed_task(root: &std::path::Path, name: &str, overlays: &[&str]) {
+    seed_task_for_agent(root, name, overlays, None)
+}
+
+/// [`seed_task`] for a task that names its agent.
+fn seed_task_for_agent(root: &std::path::Path, name: &str, overlays: &[&str], agent: Option<&str>) {
     let db = root.join("data").join("awman.db");
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let store = awman::data::fs::TaskStore::open(&db).unwrap();
@@ -516,7 +521,7 @@ fn seed_task(root: &std::path::Path, name: &str, overlays: &[&str]) {
             overlays: overlays.iter().map(|s| s.to_string()).collect(),
             interval_secs: 3600,
             status: awman::data::fs::TaskStatus::Active,
-            agent: None,
+            agent: agent.map(String::from),
             model: None,
             backoff_until: None,
             created_at: now,
@@ -1456,4 +1461,73 @@ async fn a_slow_keychain_write_does_not_park_the_runtime_during_a_push() {
     ticker.abort();
     // Leave the process-global overlay as this test found it.
     awman::data::config::env::set_daemon_overlay(DaemonEnvMap::new());
+}
+
+/// A custom agent's `auth.env` is required like an `env(NAME)` overlay, but
+/// only for a definition that resolves (here: a global one without `[ping]`,
+/// which needs no approval). An unapproved definition solicits nothing. The
+/// value is held while declared, never echoed, and leaves with its last task.
+#[tokio::test]
+async fn approved_custom_agent_auth_env_is_required_and_collected_with_its_task() {
+    let _env_guard = ENV_LOCK.lock().await;
+    capture_daemon_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let def = |auth: &str, ping: &str| {
+        format!(
+            "schema=1\ndisplay_name='X'\n[run]\ncommand=['x']\n[auth]\nenv=['{auth}']\n{ping}[image]\ninstall=['true']\n"
+        )
+    };
+    std::fs::write(agents.join("pi.toml"), def("PI_API_KEY", "")).unwrap();
+    // A global definition with [ping] needs an approval it does not have.
+    std::fs::write(
+        agents.join("ghost.toml"),
+        def("GHOST_KEY", "[ping]\ncommand=['/bin/echo']\n"),
+    )
+    .unwrap();
+    seed_task_for_agent(tmp.path(), "nightly", &[], Some("pi"));
+    seed_task_for_agent(tmp.path(), "haunted", &[], Some("ghost"));
+    let (handle, base) = start_daemon(tmp.path(), Arc::new(ContainerRuntime::docker())).await;
+
+    let coverage = env_get(&base, None).await;
+    let pi = entry(&coverage, "PI_API_KEY").expect("auth.env of an approved agent is required");
+    assert_eq!(pi["required_by"], serde_json::json!(["nightly"]), "{pi}");
+    assert!(
+        entry(&coverage, "GHOST_KEY").is_none(),
+        "an unapproved definition solicits no secret: {coverage}"
+    );
+
+    let (status, text, body) = env_push(
+        &base,
+        None,
+        serde_json::json!({"vars": {"PI_API_KEY": SECRET, "GHOST_KEY": STRAY_SECRET}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(body["accepted"], serde_json::json!(["PI_API_KEY"]));
+    assert_eq!(body["ignored"], serde_json::json!(["GHOST_KEY"]));
+    assert_carries_no_value(&text, "the POST /v1/daemon/env body");
+    let held = env_get(&base, None).await;
+    assert!(
+        entry(&held, "PI_API_KEY").unwrap()["digest"].is_string(),
+        "{held}"
+    );
+
+    let (status, _) = request(
+        reqwest::Method::POST,
+        &format!("{base}/v1/commands"),
+        None,
+        Some(serde_json::json!({"subcommand": "squad remove", "args": ["nightly"]})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let after = env_get(&base, None).await;
+    assert!(
+        entry(&after, "PI_API_KEY").is_none(),
+        "the name leaves with the last task whose agent declares it: {after}"
+    );
+    assert!(!captured_log().contains(SECRET));
+
+    handle.abort();
 }

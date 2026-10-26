@@ -121,8 +121,6 @@ fn sbx_kit_validate_passes_for_all_agents() {
         "copilot",
         "opencode",
         "antigravity",
-        "crush",
-        "maki",
         "cline",
     ];
     let mut sink = VecSink::default();

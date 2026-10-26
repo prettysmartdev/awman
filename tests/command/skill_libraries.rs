@@ -377,7 +377,20 @@ fn real_git_subdir_is_persisted_and_library_and_single_skill_overlay_mounts_are_
         "skill(custom-library/brainstorming)",
     );
 
-    let session = crate::helpers::session_at(workdir.path());
+    // Overlay discovery uses the Session's injected environment. Point it
+    // at the same private library home used by the pull fixture above.
+    let session = awman::data::session::Session::open_at_git_root(
+        workdir.path().to_path_buf(),
+        workdir.path().to_path_buf(),
+        awman::data::session::SessionOpenOptions {
+            env: Some(awman::data::config::EnvSnapshot::with_overrides([(
+                "AWMAN_CONFIG_HOME",
+                home.path().to_str().unwrap(),
+            )])),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let engine = OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home.path()));
     for (overlay, expected_host, expected_container) in [
         (

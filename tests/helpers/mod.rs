@@ -201,3 +201,5 @@ pub fn wf_step(name: &str, deps: &[&str], prompt: &str) -> WorkflowStep {
         abort_on_failure: false,
     }
 }
+
+pub mod custom_agents;

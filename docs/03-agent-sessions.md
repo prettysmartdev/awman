@@ -1,6 +1,6 @@
 # Agent Sessions
 
-An agent session is a Docker container running your configured AI agent (Claude Code, Codex, OpenCode, Maki, Gemini, Antigravity, GitHub Copilot CLI, Crush, or Cline) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
+An agent session is a Docker container running your configured AI agent (Claude Code, Codex, OpenCode, Gemini, Antigravity, GitHub Copilot CLI, Cline, or any [custom agent](15-custom-agents.md) you define) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
 
 There are two session types: **freeform chat** and **work item implementation**.
 Either type normally uses the standard stdio launch mode. You can also use
@@ -171,7 +171,7 @@ an error, so a one-off request cannot silently change modes. See
 
 ### `--agent <name>`
 
-Override the configured agent for this session. Available agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
+Override the configured agent for this session. Available agents: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, plus any [custom agent](15-custom-agents.md).
 
 ```sh
 # CLI
@@ -180,7 +180,7 @@ awman exec workflow path/to/workflow.toml --agent gemini    # run workflow with 
 awman chat --agent=copilot             # --flag=value form is also accepted
 
 # TUI command box
-chat --agent crush
+chat --agent cline
 exec workflow path/to/workflow.toml --agent=cline
 ```
 
@@ -195,7 +195,7 @@ Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases oth
 Passing an unknown agent name exits immediately with a list of valid options:
 
 ```
-error: unknown agent "foo"; available agents: claude, codex, opencode, maki, gemini, antigravity, copilot, crush, cline
+error: unknown agent 'foo'; first-party: claude, codex, opencode, gemini, copilot, cline, antigravity; custom: (none); define one with: awman new agent foo
 ```
 
 ### `--model <NAME>`
@@ -226,12 +226,10 @@ Per-agent translation and expected `<NAME>` format:
 | `gemini` | `--model <NAME>` | bare model ID (e.g. `gemini-2.0-flash`) |
 | `antigravity` | *(not supported — an error is returned)* | — |
 | `opencode` | `--model <NAME>` | **`provider/model` required** (e.g. `anthropic/claude-3-5-sonnet`) |
-| `maki` | `--model <NAME>` | `provider/model-id` (e.g. `anthropic/claude-opus-4-6`) |
-| `crush` | `--model <NAME>` (on the `run` subcommand) | bare model ID *or* `provider/model` to disambiguate when multiple providers expose the same model name |
 | `cline` | `--model <NAME>` (on the `task` subcommand) | bare model ID; the provider is selected separately via `cline auth -p <provider>` and is not switchable per-invocation |
 | `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `docker-sbx-experimental` runtime (use the `/model` slash command there) |
 
-For agents that support multiple providers (`opencode`, `crush`, `maki`), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
+For agents that support multiple providers (`opencode`, for example), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
 If an agent does not support `--model`, the behaviour varies. For Antigravity, the command exits with an error; configure the model via `~/.gemini/antigravity-cli/settings.json` or the `/model` slash command inside the agent session instead. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
 
@@ -248,11 +246,9 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 | Claude | `--print` |
 | Codex | `exec` subcommand |
 | OpenCode | `run` subcommand |
-| Maki | *(not supported — agent launches in interactive mode)* |
 | Gemini | *(not supported — agent launches in interactive mode)* |
 | Antigravity | `--print` |
 | Copilot | *(not supported — agent launches in interactive mode)* |
-| Crush | `run` subcommand |
 | Cline | `task` subcommand |
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
@@ -327,11 +323,9 @@ Run the agent in read-only mode — it can analyse the codebase and suggest chan
 | `claude` | `--permission-mode plan` |
 | `codex` | `--approval-mode plan` |
 | `opencode` | *(no equivalent — flag omitted)* |
-| `maki` | *(no equivalent — flag omitted)* |
 | `gemini` | `--approval-mode=plan` |
 | `antigravity` | *(no equivalent — flag omitted)* |
 | `copilot` | `--plan` |
-| `crush` | *(no equivalent — flag omitted)* |
 | `cline` | `--plan` (on the `task` subcommand) |
 
 `--plan` can be combined with `--non-interactive`.
@@ -345,11 +339,9 @@ Enable intermediate autonomous operation — the agent auto-approves file edits 
 | `claude` | `--permission-mode auto` |
 | `codex` | `--sandbox workspace-write` |
 | `opencode` | *(no equivalent — flag omitted)* |
-| `maki` | *(no equivalent — flag omitted)* |
 | `gemini` | `--approval-mode=auto_edit` |
 | `antigravity` | *(no equivalent — flag omitted)* |
 | `copilot` | *(no equivalent — flag omitted)* |
-| `crush` | *(no equivalent — flag omitted)* |
 | `cline` | `--auto-approve-all` (auto-approves actions while keeping interactive mode) |
 
 `--auto` applies `yoloDisallowedTools` the same way `--yolo` does. Combined with `exec workflow` it implies `--worktree`, but it does **not** auto-advance stuck steps — that countdown is `--yolo`-only.
@@ -374,11 +366,9 @@ Yolo mode is a good fit when you have a well-specified work item you trust the a
 | `claude` | `--dangerously-skip-permissions` |
 | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | *(no equivalent — flag omitted)* |
-| `maki` | `--yolo` |
 | `gemini` | `--yolo` |
 | `antigravity` | `--dangerously-skip-permissions` |
 | `copilot` | `--autopilot` (copilot's only CLI autonomous mode) |
-| `crush` | `--yolo` (inserted before the `run` subcommand: `crush --yolo run`) |
 | `cline` | `--yolo` (on the `task` subcommand) |
 
 **2. Applies `yoloDisallowedTools`** — see [Disallowed tools](#disallowed-tools) below. Only Claude implements a deny list (`--disallowedTools tool1,tool2,…`); for every other agent the setting is omitted, so a yolo session with those agents runs unrestricted.
@@ -417,8 +407,14 @@ Commands submitted through the API (`POST /v1/commands`) run with `--yolo` appli
 - `yoloDisallowedTools` is a floor the agent can never cross — but only Claude enforces it. A launch that carries an allowed- or disallowed-tools list for an agent with no flag for it is refused on Docker, Apple Containers, the builtin runtime and Docker Sandboxes alike, with `invalid configuration: this agent declares no <allowed|disallowed>-tools flag, so its <allowed|disallowed>-tools list cannot be applied; awman refuses to launch it without the restriction. Remove the <allowed|disallowed>-tools list or use an agent that supports it.`, rather than starting the agent unrestricted.
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
 - Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
-- Copilot and Crush support `--yolo` only — `--auto` has no equivalent for either and is dropped.
+- Copilot supports `--yolo` only — `--auto` has no equivalent and is dropped.
 - Cline's `--auto` keeps interactive mode while auto-approving; its `--yolo` fully skips confirmations and implies non-interactive operation.
+
+---
+
+## Custom agents
+
+Any CLI coding agent that awman does not ship with can be added as a **custom agent**: a small TOML definition in `.awman/agents/` (this repo) or `~/.awman/agents/` (all repos). Once defined and approved, it works with `--agent`, `awman config set agent`, and workflow steps like a built-in agent. Capabilities such as plan, auto and yolo modes, `--model`, and non-interactive mode come from the flags in the definition, and are silently skipped (or rejected, for `--plan`) when the definition does not declare them. See [Custom Agents](15-custom-agents.md) for the full guide, including `awman new agent`.
 
 ---
 
@@ -691,14 +687,12 @@ The token value is never shown in displayed container commands; the mounted `~/.
 | `claude` | OAuth credential read from macOS Keychain (or `~/.claude/.credentials.json`), delivered as a live-refreshed `.credentials.json` file in the staged `~/.claude` mount — never as an env var |
 | `codex` | — |
 | `opencode` | — |
-| `maki` | API key via `env()` overlay |
 | `gemini` | API key via `env()` overlay and/or `~/.gemini/` OAuth directory (auto-mounted) |
 | `antigravity` | API key via `env()` overlay (`ANTIGRAVITY_API_KEY`) and/or `~/.gemini/antigravity-cli/` OAuth directory (auto-mounted) |
 | `copilot` | GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN` or `GH_TOKEN`) |
-| `crush` | Provider API key(s) via `env()` overlay |
 | `cline` | `~/.cline/data/` directory mount (contains `secrets.json` with API keys) — auto-mounted |
 
-Maki, Gemini, Copilot, and Crush authenticate via API keys passed from your host environment using `env()` overlays. Cline uses an auto-mounted directory. See [Gemini authentication](#gemini-authentication) for the full Gemini auth options, and [Copilot authentication](#copilot-authentication), [Crush authentication](#crush-authentication), and [Cline authentication](#cline-authentication) below.
+Gemini and Copilot authenticate via API keys passed from your host environment using `env()` overlays. Cline uses an auto-mounted directory. See [Gemini authentication](#gemini-authentication) for the full Gemini auth options, and [Copilot authentication](#copilot-authentication) and [Cline authentication](#cline-authentication) below.
 
 ### Host settings injection
 
@@ -845,30 +839,15 @@ For GitHub Enterprise users, add `COPILOT_GH_HOST` alongside the token:
 
 ---
 
-## Crush authentication
+## Custom agents and provider API keys
 
-Crush authenticates entirely via provider API keys passed as environment variables — there is no config directory to mount. Add whichever API key(s) match your chosen provider to your overlays config:
+Agents that authenticate with provider API keys — Crush and Maki, for example, now shipped as [custom agent](15-custom-agents.md) examples — receive those keys from your host environment. Either list the variable names under `[auth] env` in the agent's definition, or pass them with `env()` overlays:
 
 ```json
 { "overlays": ["env(ANTHROPIC_API_KEY)"] }
 ```
 
-Supported Crush auth environment variables:
-
-| Variable | Provider |
-|----------|---------|
-| `ANTHROPIC_API_KEY` | Anthropic Claude |
-| `OPENAI_API_KEY` | OpenAI |
-| `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Google Gemini |
-| `GROQ_API_KEY` | Groq |
-| `OPENROUTER_API_KEY` | OpenRouter |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | AWS Bedrock |
-| `AZURE_OPENAI_API_ENDPOINT`, `AZURE_OPENAI_API_KEY` | Azure OpenAI |
-| `VERTEXAI_PROJECT`, `VERTEXAI_LOCATION` | Google Vertex AI |
-
-Only variables present in your host shell are injected — unlisted or unset variables are silently skipped. Values are masked (`***`) in all displayed Docker commands.
-
-Crush's project-local config file (`.crush.json` at the repo root) is automatically available inside the container since the working directory is mounted as `/workspace`. No additional mounts are needed.
+Only variables present in your host shell are injected, and values are masked (`***`) in all displayed Docker commands. See the Crush example (`awman new agent crush --from crush`) and [Migrating from crush and maki](15-custom-agents.md#migrating-from-crush-and-maki).
 
 ---
 
@@ -903,7 +882,7 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 | Flag | Values | Default |
 |------|--------|---------|
-| `--agent` | `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline` | `claude` |
+| `--agent` | `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name | `claude` |
 | `--aspec` | (flag) | off |
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.

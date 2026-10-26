@@ -1,5 +1,44 @@
 # Security
 
+## Custom agent definitions
+
+Repository definitions require approval for their current content hash. Global
+definitions also require approval when they declare `[ping]`. Approval covers the
+TOML and any referenced Dockerfile bytes; worktree sessions use the invoker's
+definition root and trust key. Only the registry constructs a `ResolvedAgent`,
+which rendering, provisioning, image preparation and host ping execution require.
+Review-only `UntrustedAgent` data cannot be passed to these sinks. Engines never
+prompt or grant approval implicitly.
+
+Custom agent definitions never cause host execution except through their optional
+`[ping]`, run by `HostAgentPinger` only during `awman ready` and only after the
+definition is approved for its current hash. The approval prompt shows the exact host
+command and its resolved path; without `[ping]`, `ready` skips the host check.
+
+Custom host pings are argv-only, append one fixed greeting, run in a fresh private
+scratch directory and time out after 60 seconds with the child killed on drop.
+Definition environment fields apply only inside containers. Automatic credential
+refresh remains first-party only. Container install steps use JSON exec-form RUN
+instructions so shell continuations and heredocs cannot consume later Dockerfile
+instructions. Definition strings reject terminal control characters.
+
+Settings mounts reject protected host paths, their descendants and their ancestors,
+using ASCII case-insensitive comparisons on every OS. The mount boundary also
+canonicalizes the source relative to canonical HOME and refuses symlink targets
+outside HOME or overlapping protected paths. Protection is by real location, not
+spelling: the session's actual awman data home (including an XDG or
+`AWMAN_CONFIG_HOME` location, which holds the trust store and global definitions)
+and the canonical target of every protected directory (a relocated `~/.awman` or
+`~/.ssh` symlink) are refused too, as are their ancestors. Approval records use bounded private
+file reads and atomic mode-0600 writes; malformed or unsafe stores grant no trust.
+
+An existing headerless agent Dockerfile is user-owned and may differ from the
+approved definition's recipe. A matching generated header proves only the input
+hash, not the body. The engine exposes a typed preview and warns every time a
+divergent body is used, including a forged header. Remove the header line to take
+ownership, or delete the file to regenerate it. These files are image build inputs
+and need review independently when their contents differ from the approved recipe.
+
 ## Guidance:
 
 - Never directly execute any code assistant on the developer host machine. Every single code agent action should be executed by running a Docker image that has the agent tool installed and passing an entrypoing command to direct the agentic tool.

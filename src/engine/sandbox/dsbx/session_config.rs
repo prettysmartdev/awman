@@ -374,7 +374,7 @@ mod tests {
         // Argv mode flags are `kind: agent` launch args, never session.json
         // fields (the apply script has no use for raw argv strings).
         let v = DSbxSessionConfig::build_value(&resolve(vec![
-            SandboxOption::AgentId("crush".into()),
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::AgentModeFlags(vec!["--yolo".into()]),
         ]));
         let s = serde_json::to_string(&v).unwrap();

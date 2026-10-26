@@ -9,7 +9,13 @@ use crate::data::fs::skill_library::{
 };
 use crate::data::fs::SkillDirs;
 use crate::data::session::AgentName;
-use crate::engine::git::GitEngine;
+use crate::engine::git::{GitEngine, SparseCloneOutcome, SPARSE_FALLBACK_WARNING};
+
+/// Names that select the skill library bundled in the awman repository.
+pub const BUILTIN_LIBRARY_ALIASES: &[&str] = &["builtin", "awman"];
+pub const BUILTIN_LIBRARY_OWNER: &str = "prettysmartdev";
+pub const BUILTIN_LIBRARY_REPO: &str = "awman";
+pub const BUILTIN_LIBRARY_SUBDIR: &str = "skills";
 
 /// The two forms accepted by `new skill --pull`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +24,8 @@ pub enum PullTarget {
     Slug(GithubSlug),
     /// The short name of an already-pulled library.
     ExistingByName(String),
+    /// `builtin` / `awman`: the prettysmartdev/awman `skills/` tree, cloned sparse and shallow.
+    Builtin,
 }
 
 /// Resolve a `--pull` argument without looking at the filesystem.
@@ -27,6 +35,9 @@ pub fn resolve_pull_target(input: &str) -> Result<PullTarget, String> {
     }
 
     let name = input.trim();
+    if BUILTIN_LIBRARY_ALIASES.contains(&name) {
+        return Ok(PullTarget::Builtin);
+    }
     AgentName::new(name).map_err(|error| error.to_string())?;
     Ok(PullTarget::ExistingByName(name.to_string()))
 }
@@ -39,6 +50,10 @@ pub struct PullOutcome {
     pub subdir: String,
     pub skills_found: Vec<String>,
     pub was_update: bool,
+    /// The library is a shallow, sparse clone.
+    pub sparse: bool,
+    /// Set when git was too old for sparse checkout and a plain shallow clone was made.
+    pub sparse_fallback_warning: Option<String>,
 }
 
 /// Clone or refresh one managed skill library.
@@ -51,8 +66,24 @@ pub fn pull_library(
     if let Some(subdir) = subdir_override {
         validate_subdir(subdir)?;
     }
+    let builtin = target == PullTarget::Builtin;
+    if builtin && subdir_override.is_some() {
+        return Err(CommandError::Other(
+            "--subdir cannot be combined with the builtin skill library".to_string(),
+        ));
+    }
 
     let (owner, repo, slug, clone_url) = match target {
+        PullTarget::Builtin => {
+            let clone_url =
+                format!("https://github.com/{BUILTIN_LIBRARY_OWNER}/{BUILTIN_LIBRARY_REPO}.git");
+            (
+                BUILTIN_LIBRARY_OWNER.to_string(),
+                BUILTIN_LIBRARY_REPO.to_string(),
+                BUILTIN_LIBRARY_REPO.to_string(),
+                clone_url,
+            )
+        }
         PullTarget::Slug(slug) => {
             let clone_url = format!("https://github.com/{}/{}.git", slug.owner, slug.repo);
             (slug.owner, slug.repo.clone(), slug.repo, clone_url)
@@ -77,13 +108,28 @@ pub fn pull_library(
     // rejected before `dir.exists()` is ever consulted (that predicate follows
     // symlinks).
     ensure_not_symlinked(&dir, &slug)?;
+    let mut sparse_fallback_warning = None;
     let (meta, was_update) = if !dir.exists() {
-        git_engine.clone_repo(&clone_url, None, &dir)?;
+        let subdir = if builtin {
+            BUILTIN_LIBRARY_SUBDIR
+        } else {
+            subdir_override.unwrap_or("skills")
+        };
+        if builtin {
+            if git_engine.clone_repo_sparse(&clone_url, &dir, subdir)?
+                == SparseCloneOutcome::FellBackToShallow
+            {
+                sparse_fallback_warning = Some(SPARSE_FALLBACK_WARNING.to_string());
+            }
+        } else {
+            git_engine.clone_repo(&clone_url, None, &dir)?;
+        }
         let meta = SkillLibraryMeta {
             source: clone_url,
             owner,
             repo,
-            subdir: subdir_override.unwrap_or("skills").to_string(),
+            subdir: subdir.to_string(),
+            sparse: builtin,
         };
         write_library_meta(&dir, &meta)?;
         (meta, false)
@@ -118,7 +164,11 @@ pub fn pull_library(
                 dir.display()
             )));
         }
-        git_engine.pull_latest(&dir)?;
+        if meta.sparse {
+            git_engine.pull_latest_shallow(&dir)?;
+        } else {
+            git_engine.pull_latest(&dir)?;
+        }
         if let Some(subdir) = subdir_override {
             meta.subdir = subdir.to_string();
         }
@@ -151,6 +201,8 @@ pub fn pull_library(
         subdir: meta.subdir,
         skills_found,
         was_update,
+        sparse: meta.sparse,
+        sparse_fallback_warning,
     })
 }
 
@@ -187,10 +239,7 @@ fn ensure_not_symlinked(dir: &Path, slug: &str) -> Result<(), CommandError> {
         dir.join(".git"),
         dir.join(LIBRARY_META_FILENAME),
     ] {
-        let is_symlink = std::fs::symlink_metadata(&candidate)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false);
-        if is_symlink {
+        if crate::data::fs::path_guard::ensure_not_symlinked(&candidate).is_err() {
             return Err(CommandError::Other(format!(
                 "{} is a symlink, not an awman-managed skill library; remove it manually before pulling '{slug}' here",
                 candidate.display()
@@ -388,6 +437,7 @@ mod tests {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
                 subdir: subdir.to_string(),
+                sparse: false,
             },
         )
         .unwrap();
@@ -450,6 +500,21 @@ mod tests {
     }
 
     // ─── resolve_pull_target ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_pull_target_builtin_and_awman_are_the_builtin_library() {
+        assert_eq!(resolve_pull_target("builtin").unwrap(), PullTarget::Builtin);
+        assert_eq!(resolve_pull_target("awman").unwrap(), PullTarget::Builtin);
+    }
+
+    #[test]
+    fn builtin_pull_rejects_subdir_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = skill_dirs_at(tmp.path());
+        let err =
+            pull_library(&GitEngine::new(), &dirs, PullTarget::Builtin, Some("other")).unwrap_err();
+        assert!(err.to_string().contains("--subdir"), "{err}");
+    }
 
     #[test]
     fn resolve_pull_target_short_name_is_existing_by_name() {
@@ -720,6 +785,7 @@ mod tests {
                 owner: "obra".to_string(),
                 repo: "victim".to_string(),
                 subdir: "skills".to_string(),
+                sparse: false,
             },
         )
         .unwrap();

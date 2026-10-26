@@ -2422,3 +2422,114 @@ fn a_runtime_notice_is_rendered_in_the_status_bar_until_a_key_press() {
     app.show_runtime_notices(Vec::new());
     assert!(app.status_bar.notice.is_none());
 }
+
+// ─── Custom-agent trust review ──────────────────────────────────────────
+
+/// The real trust prompt for a definition whose `[ping]` argv pads the
+/// visible part of the command before the action that actually runs, and
+/// whose install steps fill several screens.
+fn trust_review_dialog() -> Dialog {
+    use crate::command::commands::agent_trust::AgentTrustReview;
+    use crate::data::prompt::Prompt;
+    let mut def = crate::engine::agent::custom::crush_fixture();
+    let pad = "X".repeat(900);
+    def.ping_argv = Some(vec![
+        "/usr/bin/env".into(),
+        format!("PAD1={pad}"),
+        format!("PAD2={pad}"),
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf HIDDEN_HOST_ACTION".into(),
+    ]);
+    let prompt: Prompt<_> =
+        crate::command::prompts::agent_trust_confirm(&AgentTrustReview::from_definition(&def));
+    let gated = vec!['y'];
+    Dialog::Review(crate::frontend::tui::dialogs::ReviewState::new(
+        prompt.title.clone(),
+        format!("{}\n{}", prompt.body, "  install step\n".repeat(60)),
+        prompt
+            .choices
+            .iter()
+            .map(|c| (c.key, c.label.clone()))
+            .collect(),
+        gated,
+    ))
+}
+
+#[test]
+fn trust_review_keeps_choices_visible_and_gates_approval_until_fully_read() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(&mut app, trust_review_dialog());
+
+    // Nothing rendered yet: approval is refused before anything was seen.
+    press_char(&mut app, 'y');
+    assert!(rx.try_recv().is_err());
+
+    let text = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(text.contains("ON YOUR HOST"), "{text}");
+    assert!(!text.contains("HIDDEN_HOST_ACTION"), "{text}");
+    assert!(text.contains("more below"), "{text}");
+    assert!(
+        text.contains("[y] Approve this definition (scroll to the end first)"),
+        "{text}"
+    );
+    assert!(text.contains("[n] Do not approve"), "{text}");
+    press_char(&mut app, 'y');
+    assert!(rx.try_recv().is_err(), "approval before the end is ignored");
+
+    // Scroll through every page; the host action comes into view on the way.
+    let mut saw_action = false;
+    for _ in 0..200 {
+        press_key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        let text = buffer_text(&render_app(&mut app, 80, 24));
+        saw_action |= text.contains("HIDDEN_HOST_ACTION");
+        if text.contains("end of review") {
+            break;
+        }
+    }
+    assert!(saw_action, "the whole argv is reachable by scrolling");
+    let text = buffer_text(&render_app(&mut app, 80, 24));
+    assert!(text.contains("end of review"), "{text}");
+    assert!(text.contains("[y] Approve this definition"), "{text}");
+    assert!(!text.contains("scroll to the end first"), "{text}");
+    press_char(&mut app, 'y');
+    assert!(matches!(rx.try_recv().unwrap(), DialogResponse::Char('y')));
+    assert!(app.active_dialog.is_none());
+}
+
+#[test]
+fn trust_review_decline_is_always_available() {
+    let mut app = make_app();
+    let rx = setup_command_dialog(&mut app, trust_review_dialog());
+    render_app(&mut app, 80, 24);
+    press_char(&mut app, 'n');
+    assert!(matches!(rx.try_recv().unwrap(), DialogResponse::Char('n')));
+}
+
+#[test]
+fn trust_review_and_custom_dialogs_survive_narrow_and_tiny_terminals() {
+    for (w, h) in [(58, 24), (40, 12), (20, 8), (10, 5), (3, 3), (1, 1)] {
+        let mut app = make_app();
+        let rx = setup_command_dialog(&mut app, trust_review_dialog());
+        let text = buffer_text(&render_app(&mut app, w, h));
+        if w >= 40 {
+            assert!(text.contains("[n]"), "{w}x{h}: {text}");
+        }
+        // Too small to show the review: approval stays unavailable.
+        if h <= 8 {
+            press_char(&mut app, 'y');
+            assert!(rx.try_recv().is_err(), "{w}x{h}");
+        }
+        app.active_dialog = Some(Dialog::Custom {
+            title: "Choose".into(),
+            body: "a body line".into(),
+            keys: vec![('y', "Yes".into())],
+        });
+        render_app(&mut app, w, h);
+        app.active_dialog = Some(Dialog::FatalError {
+            title: "Fatal".into(),
+            body: "x".into(),
+        });
+        render_app(&mut app, w, h);
+    }
+}

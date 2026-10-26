@@ -1220,6 +1220,10 @@ impl SpecsCommandFrontend for ApiDispatchFrontend {}
 
 impl NewCommandFrontend for ApiDispatchFrontend {}
 
+/// No person is behind an HTTP request, so a custom definition that needs
+/// approval is refused (`AgentDefinitionUntrusted`), never approved.
+impl crate::command::commands::agent_trust::AgentTrustFrontend for ApiDispatchFrontend {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

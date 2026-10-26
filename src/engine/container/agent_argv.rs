@@ -61,7 +61,7 @@ impl AgentArgv {
             return Ok(Self(argv));
         }
         // The non-interactive sub-command or flag (`exec`, `run`, `--print`) is
-        // already part of the entrypoint (`agent_matrix::entrypoint_for`); it
+        // already part of the entrypoint (`AgentDefinition::entrypoint_for`); it
         // is never repeated here.
         // Per-agent mode flags (yolo, auto, plan) — literal args.
         argv.extend(options.agent_mode_flags.iter().cloned());

@@ -1391,3 +1391,97 @@ fn builtin_inputs_are_resolved_only_for_an_importing_runtime() {
     let imports = FakeImportRuntime::new(true);
     assert!(ReadyEngine::builtin_inputs(&session, &imports).is_err());
 }
+
+#[tokio::test]
+async fn custom_without_ping_skips_the_host_seam() {
+    struct NeverPing;
+    #[async_trait::async_trait]
+    impl ReadyHostPing for NeverPing {
+        async fn ping(&self, _: &crate::engine::agent::ResolvedAgent) -> LocalAgentPingResult {
+            panic!("a definition with no ping must never reach the host seam")
+        }
+    }
+    let (mut engine, mut frontend, _temp) = make_engine_and_frontend(false, false);
+    let mut def = crate::engine::agent::custom::crush_fixture();
+    def.ping_argv = None;
+    engine.definition = Some(crate::engine::agent::ResolvedAgent::for_test(def));
+    engine.phase = ReadyPhase::CheckingLocalAgent;
+    engine = engine.with_host_ping(Arc::new(NeverPing));
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(engine.summary.local_agent, StepStatus::Skipped);
+    assert!(frontend
+        .messages
+        .iter()
+        .any(|m| m.text == "no [ping] command in /fixtures/agents/crush.toml; host check skipped"));
+}
+
+#[tokio::test]
+async fn written_custom_dockerfile_forces_ready_build_with_an_existing_image() {
+    let (mut engine, mut frontend, _temp) = make_engine_and_frontend(false, false);
+    let mut runtime = FakeImportRuntime::new(true);
+    runtime.caps.image_acquisition = crate::engine::agent_runtime::ImageAcquisition::Build;
+    let runtime = Arc::new(runtime);
+    engine.runtime = runtime.clone();
+    engine.options.agent = AgentName::new("crush").unwrap();
+    engine.options.build = false;
+    let def = crate::engine::agent::custom::crush_fixture();
+    engine.definition = Some(crate::engine::agent::ResolvedAgent::for_test(def.clone()));
+    engine.phase = ReadyPhase::BuildingAgentImage;
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(*runtime.builds.lock().unwrap(), 1);
+    let StepStatus::Failed(message) = &engine.summary.agent_image else {
+        panic!("scripted build must fail")
+    };
+    assert!(message.contains("/fixtures/agents/crush.toml"), "{message}");
+    assert!(message.contains("smoke binary 'crush'"), "{message}");
+    assert!(
+        message.contains("npm install -g --prefix=/usr/local @charmland/crush"),
+        "{message}"
+    );
+    engine.phase = ReadyPhase::BuildingAgentImage;
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(
+        *runtime.builds.lock().unwrap(),
+        1,
+        "unchanged recipe keeps the image"
+    );
+    let mut changed = def;
+    if let crate::engine::agent::AgentOrigin::Custom { sha256, .. } = &mut changed.origin {
+        *sha256 = "new-hash".into();
+    }
+    engine.definition = Some(crate::engine::agent::ResolvedAgent::for_test(changed));
+    engine.phase = ReadyPhase::BuildingAgentImage;
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(
+        *runtime.builds.lock().unwrap(),
+        2,
+        "new recipe forces a build"
+    );
+}
+
+#[tokio::test]
+async fn approved_custom_sandbox_ready_fails_without_emitting_a_kit() {
+    let (mut engine, mut frontend, temp) = make_engine_and_frontend(false, false);
+    engine.session = Arc::new(Session::for_tests_isolated(
+        temp.path(),
+        &temp.path().join("global"),
+    ));
+    crate::engine::agent::custom::install_crush_fixture(temp.path(), engine.session.env());
+    let runtime = Arc::new(FakeKitRuntime::new());
+    engine.runtime = runtime.clone();
+    engine.agent_engine = Arc::new(AgentEngine::new(
+        engine.overlay_engine.clone(),
+        runtime.clone(),
+    ));
+    engine.options.agent = AgentName::new("crush").unwrap();
+    let error = engine.step(&mut frontend).await.unwrap_err();
+    assert!(matches!(
+        error,
+        EngineError::CustomAgentRuntimeUnsupported { .. }
+    ));
+    assert!(matches!(engine.summary.agent_image, StepStatus::Failed(_)));
+    assert!(runtime.ready_calls.lock().unwrap().is_empty());
+    assert!(!crate::data::RepoDockerfilePaths::new(temp.path())
+        .agent_dockerfile("crush")
+        .exists());
+}

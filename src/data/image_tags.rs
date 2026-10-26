@@ -136,6 +136,17 @@ mod tests {
         assert_eq!(agent_image_tag(&p, "claude"), "awman-myproj-claude:latest");
     }
 
+    /// Custom agent names (lowercase file stems) tag like any other agent.
+    #[test]
+    fn agent_image_tag_for_a_custom_agent_name() {
+        let p = PathBuf::from("/tmp/myproj");
+        assert_eq!(agent_image_tag(&p, "pi"), "awman-myproj-pi:latest");
+        assert_eq!(
+            agent_image_tag(&p, "my-agent_2"),
+            "awman-myproj-my-agent_2:latest"
+        );
+    }
+
     #[test]
     fn squad_task_workspaces_are_tagged_by_task_slug_not_folder_name() {
         // Every default task workspace is a folder literally named

@@ -143,6 +143,8 @@ skill(lint), skill(review)
 
 Pulled libraries and their skills are read from `~/.awman/skills/.library/<library>/`, using the subdirectory selected when the library was pulled. A named skill that cannot be found is reported before the container launches. Names can contain at most one `/`; `skill(a/b/c)` is rejected with `skill(name) supports at most one '/' (library/skill); got 'a/b/c'`. Each part of the name must be a plain directory name: empty, `.` and `..` parts (as in `skill(superpowers/..)`) are rejected with `skill(name) segments must not be empty, '.' or '..'`.
 
+**awman's builtin skills.** `awman new skill --pull builtin` (or `--pull awman`) pulls the skills that ship with awman, such as `create-custom-agent`, into `~/.awman/skills/.library/awman/` as a shallow, sparse clone of just the `skills/` tree (older Git versions fall back to a plain shallow clone, with a warning). Mount them like any pulled library: `skill(awman)` for all of them, or `skill(awman/create-custom-agent)` for one. `--subdir` cannot be combined with the builtin library. Re-run the same command to refresh it. If you author your own `~/.awman/skills/awman/` directory, it takes precedence over the builtin library for `skill(awman)` and `skill(awman/...)`. See [Custom Agents](15-custom-agents.md#letting-an-agent-write-it-for-you).
+
 ### `context(scope[:permission])`
 
 Grants agent containers access to a persistent context directory on the host and delivers system prompt instructions explaining the context's purpose.
@@ -176,7 +178,7 @@ context(global:rw)     # personal preferences, explicit read-write
 
 **Agent system prompt support:**
 
-Most agents natively support system prompt injection. If your agent does not (e.g. `maki`, `crush`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context overlays in depth](#context-overlays-in-depth) below.
+Most agents natively support system prompt injection. If your agent does not (a custom agent whose definition uses `delivery = "none"`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context overlays in depth](#context-overlays-in-depth) below.
 
 **Note on `rw` vs `ro`:**
 
@@ -664,7 +666,7 @@ Most awman-compatible agents support system prompt injection natively, so the co
 | **copilot** | Env var `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` |
 | **antigravity (agy)** | CLI flag `--add-dir` + auto-reads `AGENTS.md` |
 
-**No native injection** (directory mounted, prompt not auto-delivered — reference it manually): **maki**, **crush**.
+**No native injection** (directory mounted, prompt not auto-delivered — reference it manually): [custom agents](15-custom-agents.md) whose definition uses `delivery = "none"`.
 
 **Degraded support** (replaces the entire system prompt rather than appending; awman prepends a baseline preamble to restore tool guidance, and logs a `warning` at startup): **gemini** (deprecated), **cline**. Prefer `claude` for the smoothest context experience.
 
@@ -897,7 +899,7 @@ If you see this warning for a path that should exist, check:
 
 - Is your agent one that supports system prompt injection? See [Context overlays in depth](#context-overlays-in-depth) for which agents support native injection.
 - For agents that support it (e.g. `claude`), is `context(...)` configured?
-- If your agent doesn't support native injection (e.g. `maki`), the context directory is still mounted; reference it manually in your prompt.
+- If your agent doesn't support native injection (a custom agent whose definition uses `delivery = "none"`), the context directory is still mounted; reference it manually in your prompt.
 
 ### Context files not being updated
 

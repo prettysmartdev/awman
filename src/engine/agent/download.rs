@@ -21,13 +21,22 @@ pub fn dockerfile_url_for(agent: &str) -> String {
 
 /// Write `body` to `dest` atomically (tmp file + rename) so a partial failure
 /// cannot leave a corrupt file behind.
-fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> {
+pub(crate) fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> {
+    use std::io::Write;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent.to_path_buf(), e))?;
     }
-    let tmp = dest.with_extension("tmp");
-    std::fs::write(&tmp, body).map_err(|e| EngineError::io(tmp.clone(), e))?;
-    std::fs::rename(&tmp, dest).map_err(|e| EngineError::io(dest.to_path_buf(), e))?;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // A unique sibling avoids following a repo-planted .tmp symlink and lets
+    // concurrent provisioners publish complete files independently.
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(parent).map_err(|e| EngineError::io(parent, e))?;
+    tmp.write_all(body).map_err(|e| EngineError::io(dest, e))?;
+    tmp.persist(dest)
+        .map_err(|e| EngineError::io(dest, e.error))?;
     Ok(())
 }
 

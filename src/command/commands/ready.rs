@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::launch_policy::LaunchPolicy;
+use crate::command::commands::launch_policy::{ensure_agent_trusted, LaunchPolicy};
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
@@ -21,6 +21,8 @@ pub struct ReadyCommandFlags {
     pub non_interactive: bool,
     pub allow_docker: bool,
     pub json: bool,
+    /// `--agent`; `None` readies the configured agent.
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +33,9 @@ pub struct ReadyOutcome {
     pub agent_image: StepStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_source: Option<StepStatus>,
+    /// The custom-definition step (`None` for a first-party agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition: Option<StepStatus>,
     pub local_agent: StepStatus,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
@@ -67,6 +72,7 @@ impl From<ReadySummary> for ReadyOutcome {
             base_image: s.base_image,
             agent_image: s.agent_image,
             image_source: s.image_source,
+            agent_definition: s.agent_definition,
             local_agent: s.local_agent,
             audit: s.audit,
             image_rebuild: s.image_rebuild,
@@ -177,8 +183,15 @@ impl ReadyOutcome {
     }
 }
 
-pub trait ReadyCommandFrontend: ReadyFrontend + Send {}
-impl<T: ReadyFrontend + Send> ReadyCommandFrontend for T {}
+/// `ready` asks the trust question before resolving a custom agent.
+pub trait ReadyCommandFrontend:
+    ReadyFrontend + crate::command::commands::agent_trust::AgentTrustFrontend + Send
+{
+}
+impl<T: ReadyFrontend + crate::command::commands::agent_trust::AgentTrustFrontend + Send>
+    ReadyCommandFrontend for T
+{
+}
 
 pub struct ReadyCommand {
     flags: ReadyCommandFlags,
@@ -211,6 +224,7 @@ impl ReadyCommand {
                 non_interactive: ctx.flags.bool("non-interactive"),
                 allow_docker: ctx.flags.bool("allow-docker"),
                 json: ctx.flags.bool("json"),
+                agent: ctx.flags.string("agent"),
             },
             ctx.engines.clone(),
             ctx.session.clone(),
@@ -240,8 +254,8 @@ impl Command for ReadyCommand {
         // Resolve the agent from .awman/config.json (or global default), so
         // the per-agent Dockerfile lookup and image-tag computation match
         // whatever the user actually configured. Falls back to "claude" only
-        // when no config sets the default.
-        let agent = match LaunchPolicy::for_session(&session).resolve_agent(&None) {
+        // when no config sets the default. `--agent` wins over both.
+        let agent = match LaunchPolicy::for_session(&session).resolve_agent(&self.flags.agent) {
             Ok(a) => a,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -251,6 +265,15 @@ impl Command for ReadyCommand {
                 return Err(e);
             }
         };
+        // A custom definition that needs approval is reviewed here, before
+        // the engine resolves it (and refuses it, fail-closed, otherwise).
+        if let Err(e) = ensure_agent_trusted(&session, &agent, frontend.as_mut()) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("ready: {e}"),
+            });
+            return Err(e);
+        }
 
         let options = ReadyEngineOptions {
             agent: agent.clone(),
@@ -280,11 +303,11 @@ impl Command for ReadyCommand {
             text: "Checking agent image…".into(),
         });
 
-        let runtime = self
-            .engines
-            .require_container_runtime()
-            .map_err(CommandError::from)?
-            .clone();
+        // The active runtime, whatever its paradigm: ReadyEngine branches on
+        // its capabilities itself (kit-declarative sandboxes emit a kit), and
+        // refuses a custom agent on a runtime that cannot run one as a failed
+        // step, before any kit or image work.
+        let runtime = self.engines.runtime.clone();
         let resolved_builtin = ReadyEngine::builtin_inputs(&session, runtime.as_ref())?;
         let mut engine = ReadyEngine::new(
             resolved_builtin,

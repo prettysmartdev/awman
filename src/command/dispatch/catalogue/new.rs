@@ -1,4 +1,4 @@
-//! `new` — scaffolding a spec, a workflow or a skill.
+//! `new` — scaffolding a spec, a workflow, a skill or a custom agent definition.
 //!
 //! Split out of `dispatch/catalogue.rs` by WI 0114 F-51. The specs are data;
 //! `ROOT` in `mod.rs` is what assembles them into the tree.
@@ -10,7 +10,7 @@ use super::*;
 pub(super) const NEW: CommandSpec = CommandSpec {
     name: "new",
     aliases: &[],
-    help: "Create a new awman artefact (spec, workflow, or skill).",
+    help: "Create a new awman artefact (spec, workflow, skill, or agent definition).",
     long_help: None,
     arguments: &[],
     flags: &[],
@@ -20,7 +20,7 @@ pub(super) const NEW: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
-    subcommands: &[&NEW_SPEC, &NEW_WORKFLOW, &NEW_SKILL],
+    subcommands: &[&NEW_SPEC, &NEW_WORKFLOW, &NEW_SKILL, &NEW_AGENT],
 };
 
 pub(super) const NEW_SPEC: CommandSpec = CommandSpec {
@@ -215,6 +215,66 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
     requires_runtime: true,
+    opens_tui_when_bare: false,
+    subcommands: &[],
+};
+
+/// The examples `new agent --from` can copy (the builtin skill's examples).
+pub(super) const AGENT_EXAMPLE_VALUES: &[&str] = &["crush", "maki"];
+
+pub(super) const NEW_AGENT: CommandSpec = CommandSpec {
+    name: "agent",
+    aliases: &[],
+    help: "Create a custom agent definition in .awman/agents/<name>.toml.",
+    long_help: None,
+    arguments: &[ArgumentSpec {
+        name: "name",
+        help: "Agent name; becomes the file stem (lowercase letters, digits, '-' and '_').",
+        kind: ArgumentKind::String,
+        optional: false,
+    }],
+    flags: &[
+        FlagSpec {
+            long: "global",
+            short: None,
+            help: "Write to ~/.awman/agents/<name>.toml instead of the current repo.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "from",
+            short: None,
+            help: "Copy a shipped example definition instead of the commented skeleton.",
+            kind: FlagKind::Enum(AGENT_EXAMPLE_VALUES),
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "force",
+            short: None,
+            help: "Overwrite an existing definition (and, with --from maki, its Dockerfile).",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    // Writes files only and never builds, so it needs no runtime. Blocked for
+    // the API like the rest of the `new` subtree.
+    api_allowed: false,
+    build: crate::command::dispatch::build::new,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    requires_runtime: false,
     opens_tui_when_bare: false,
     subcommands: &[],
 };

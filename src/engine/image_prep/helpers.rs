@@ -1,31 +1,44 @@
 use super::*;
 impl AgentImagePreparer {
-    /// Make sure the agent Dockerfile an external-build instruction names
-    /// exists, fetching it exactly as the build flow does. Best-effort: a
-    /// failure is reported on the download row and the instruction is still
-    /// shown. awman never builds the image itself here.
+    /// Resolve before image work, including when an old image or Dockerfile remains.
+    pub(super) fn definition(
+        &mut self,
+        agent: &str,
+    ) -> Result<crate::engine::agent::ResolvedAgent, EngineError> {
+        if let Some(def) = self.definitions.get(agent) {
+            return Ok(def.clone());
+        }
+        let name = crate::data::session::AgentName::new(agent)?;
+        let def = crate::engine::agent::AgentRegistry::resolve(
+            &self.definition_env,
+            &name,
+            Some(&self.context.git_root),
+        )?;
+        self.definitions.insert(agent.into(), def.clone());
+        Ok(def)
+    }
+
     pub(super) async fn provision_agent_dockerfile(
         &mut self,
         frontend: &mut (impl ImagePreparationSink + ?Sized),
         git_root: &std::path::Path,
         agent: &str,
-        agent_dockerfile: &std::path::Path,
-    ) {
-        if agent_dockerfile.exists() {
-            return;
-        }
-        let project_tag = crate::data::image_tags::project_image_tag(git_root);
-        let downloaded = crate::engine::agent::download::download_agent_dockerfile(
-            agent,
-            agent_dockerfile,
-            &project_tag,
+        _agent_dockerfile: &std::path::Path,
+    ) -> Result<crate::engine::agent::DockerfilePreview, EngineError> {
+        let def = self.definition(agent)?;
+        let sync = crate::engine::agent::provision_agent_dockerfile(
+            &def,
+            &crate::data::RepoDockerfilePaths::new(git_root),
+            &crate::data::image_tags::project_image_tag(git_root),
         )
-        .await;
-        let status = match downloaded {
-            Ok(()) => StepStatus::Done,
-            Err(e) => StepStatus::Failed(e.to_string()),
-        };
-        frontend.report_step(&ReadyStep::DownloadAgentDockerfile.into(), status);
+        .await?;
+        for warning in &sync.warnings {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: warning.clone(),
+            });
+        }
+        Ok(sync)
     }
 }
 /// One spelling per local image name, using the Docker reference rules both

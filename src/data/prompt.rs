@@ -64,6 +64,7 @@ pub struct Prompt<D> {
     /// |---|---|---|
     /// | `prompts::squad_task_confirm` | `Dismiss` | Walking away from a confirmation is a refusal; Esc must not trigger, cancel or pause anything. |
     /// | `prompts::agents_kill_confirm` | `Keep` | Walking away from a confirmation is a refusal; Esc must not stop an agent. |
+    /// | `prompts::agent_trust_confirm` | `Decline` | Walking away from an approval is a refusal; a dismissal must never trust a definition. |
     /// | `prompts::dockerfile_setup` | `CreateNew` | The only choice that leaves `init` able to finish, it matches every headless profile, and it writes a file the user can replace or delete. |
     ///
     /// Everything else is `None`: `work_item_kind`, `squad_task_workspace`
