@@ -1657,7 +1657,6 @@ fn one_shot_agents_status_command_reaches_done() {
                 collected_at: Utc::now(),
                 tip: "tip".into(),
             },
-            watched: false,
         },
     ))))
     .unwrap();

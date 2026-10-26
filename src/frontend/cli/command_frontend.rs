@@ -361,6 +361,11 @@ impl Drop for RawModeGuard {
 }
 
 impl CliFrontend {
+    /// Whether this invocation is `agents attach`, as the catalogue names it.
+    pub(crate) fn is_agent_attach(&self) -> bool {
+        CommandCatalogue::get().is_agent_attach(&command_path_from_matches(&self.matches))
+    }
+
     /// A yes/no interview step that no profile answers.
     ///
     /// The squad interview's confirmations — keep a non-git path, mount a

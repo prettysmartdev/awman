@@ -32,10 +32,10 @@ pub struct AgentsStatusFlags {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentsStatusOutcome {
-    /// The last overview collected.
+    /// The overview a one-shot run collected. A `--watch` run has no
+    /// outcome: it ends only when cancelled, as `CommandError::Aborted`
+    /// (exit 130), after drawing its own frames.
     pub overview: AgentsOverview,
-    /// True after a `--watch` run, whose frames the frontend already drew.
-    pub watched: bool,
 }
 
 pub struct AgentsStatusCommand {
@@ -75,20 +75,18 @@ impl AgentsStatusCommand {
         let tui = frontend.tui_context();
         let overview = collect_available(self.runtime.as_ref(), tui.as_ref(), STATUS_COLLECT, tip)?;
         frontend.render_overview(&overview, false);
-        Ok(AgentsStatusOutcome {
-            overview,
-            watched: false,
-        })
+        Ok(AgentsStatusOutcome { overview })
     }
 
     /// Render a frame every [`WATCH_INTERVAL`] until the frontend's token is
     /// cancelled. A runtime that goes away shows an "unavailable" frame and
     /// is retried on the next tick, so a daemon restart is picked up live.
+    /// Cancelling is a user abort, so this never returns `Ok`.
     async fn run_watch(
         &self,
         frontend: &mut dyn AgentsCommandFrontend,
         tip: &str,
-    ) -> Result<AgentsOverview, CommandError> {
+    ) -> Result<std::convert::Infallible, CommandError> {
         let cancel = frontend.begin_watch();
         let _cancel_on_drop = cancel.clone().drop_guard();
         while !cancel.is_cancelled() {
@@ -155,11 +153,7 @@ impl Command for AgentsStatusCommand {
         if !self.flags.watch {
             return self.run_once(frontend.as_mut(), tip);
         }
-        let overview = self.run_watch(frontend.as_mut(), tip).await?;
-        Ok(AgentsStatusOutcome {
-            overview,
-            watched: true,
-        })
+        match self.run_watch(frontend.as_mut(), tip).await? {}
     }
 }
 
@@ -227,7 +221,6 @@ mod tests {
         assert!(!log.renders[0].1, "one-shot render is not `watching`");
         assert_eq!(log.begin_watch, 0);
         assert_eq!(log.end_watch, 0);
-        assert!(!outcome.watched);
         assert_eq!(outcome.overview.agents.len(), 2);
     }
 

@@ -147,10 +147,8 @@ impl CliFrontend {
         stdin_writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     ) -> std::thread::JoinHandle<()> {
         let detach = self
-            .matches
-            .subcommand_matches("agents")
-            .and_then(|m| m.subcommand_matches("attach"))
-            .map(|_| self.agents_attach_cancel.clone());
+            .is_agent_attach()
+            .then(|| self.agents_attach_cancel.clone());
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.stdin_reader_shutdown = Some(shutdown.clone());
         #[cfg(unix)]

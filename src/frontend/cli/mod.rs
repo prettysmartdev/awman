@@ -672,7 +672,6 @@ mod tests {
                 collected_at: chrono::Utc::now(),
                 tip: "test tip".into(),
             },
-            watched: false,
         }));
         let s = format_outcome(&outcome, false).expect("status must render text");
         assert!(s.contains("Docker"));

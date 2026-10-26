@@ -211,3 +211,21 @@ pub(super) const AGENTS_ATTACH: CommandSpec = CommandSpec {
     opens_tui_when_bare: false,
     subcommands: &[],
 };
+
+impl CommandCatalogue {
+    /// Whether a command line, split into words (trailing arguments are
+    /// fine), runs `agents attach`. Frontends ask this rather than spelling
+    /// the name: an attached terminal detaches on Ctrl-C instead of
+    /// forwarding it, and the CLI unbinds host stdio when the PTY closes.
+    pub fn is_agent_attach<S: AsRef<str>>(&self, words: &[S]) -> bool {
+        let mut words = words.iter().map(AsRef::as_ref);
+        let (Some(group), Some(leaf)) = (words.next(), words.next()) else {
+            return false;
+        };
+        self.lookup(&[group])
+            .is_some_and(|spec| spec.name == AGENTS.name)
+            && self
+                .lookup(&[group, leaf])
+                .is_some_and(|spec| spec.name == AGENTS_ATTACH.name)
+    }
+}

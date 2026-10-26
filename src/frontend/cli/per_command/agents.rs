@@ -25,7 +25,7 @@ fn install_watch_panic_hook() {
         std::panic::set_hook(Box::new(move |info| {
             if WATCH_SCREEN_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 let mut out = std::io::stdout();
-                let _ = out.write_all(b"\\x1b[?25h\\x1b[?1049l");
+                let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
                 let _ = out.flush();
             }
             previous(info);
@@ -195,11 +195,6 @@ fn render_agents_with_width(
     json: bool,
     width: Option<usize>,
 ) -> Option<String> {
-    if let AgentsOutcome::Status(status) = outcome {
-        if status.watched {
-            return None;
-        }
-    }
     if json {
         return Some(
             match outcome {
@@ -608,7 +603,6 @@ mod tests {
     fn json_output_round_trips_all_serializable_agent_outcomes() {
         let status = AgentsOutcome::Status(AgentsStatusOutcome {
             overview: overview(vec![]),
-            watched: false,
         });
         let list = AgentsOutcome::List(AgentsListOutcome {
             agents: vec![agent("alpha", "abcdefghijklmn", AgentState::Running)],
@@ -645,16 +639,6 @@ mod tests {
                 value
             );
         }
-    }
-
-    #[test]
-    fn watched_status_renderer_returns_nothing() {
-        let outcome = AgentsOutcome::Status(AgentsStatusOutcome {
-            overview: overview(vec![]),
-            watched: true,
-        });
-        assert_eq!(render_agents(&outcome, false), None);
-        assert_eq!(render_agents(&outcome, true), None);
     }
 
     #[derive(Clone)]

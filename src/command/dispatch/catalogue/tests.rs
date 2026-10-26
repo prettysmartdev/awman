@@ -1012,6 +1012,18 @@ fn agents_sibling_names_and_aliases_are_unique_and_root_status_is_absent() {
 }
 
 #[test]
+fn is_agent_attach_matches_only_agents_attach() {
+    let cat = CommandCatalogue::get();
+    assert!(cat.is_agent_attach(&["agents", "attach"]));
+    assert!(cat.is_agent_attach(&["agents", "attach", "abc123"]));
+    assert!(!cat.is_agent_attach(&["agents"]));
+    assert!(!cat.is_agent_attach(&["agents", "status"]));
+    assert!(!cat.is_agent_attach(&["squad", "attach"]));
+    assert!(!cat.is_agent_attach(&["agents", "attachx"]));
+    assert!(!cat.is_agent_attach::<&str>(&[]));
+}
+
+#[test]
 fn agents_docs_describe_current_scope_and_detach_controls() {
     let runtimes = include_str!("../../../../docs/11-runtimes.md");
     assert!(runtimes.contains("on the configured runtime"));

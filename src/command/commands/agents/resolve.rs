@@ -52,11 +52,12 @@ pub fn resolve_agent(
             }
             // Only consulted to give a better error; a listing failure here
             // must not hide the "not found" answer.
-            let stopped = runtime.list_stopped()?;
-            if !matches!(match_reference(&stopped, reference), Ok(None)) {
-                return Err(CommandError::AgentNotRunning {
-                    reference: reference.to_string(),
-                });
+            if let Ok(stopped) = runtime.list_stopped() {
+                if !matches!(match_reference(&stopped, reference), Ok(None)) {
+                    return Err(CommandError::AgentNotRunning {
+                        reference: reference.to_string(),
+                    });
+                }
             }
         }
         ResolveScope::IncludeStopped => {

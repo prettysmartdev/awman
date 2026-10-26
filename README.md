@@ -164,7 +164,7 @@ title = "Implement {{work_item_number}}"
 overlays = ["env(GITHUB_TOKEN)"]
 ```
 
-Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
+Supported agents: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, plus any custom agent you define (see [Custom Agents](docs/15-custom-agents.md); crush and maki ship as examples).
 
 </details>
 

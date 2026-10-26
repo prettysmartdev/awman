@@ -36,13 +36,7 @@ impl ChatCommandFrontend for CliFrontend {}
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for CliFrontend {
     fn set_pty_active(&mut self, active: bool) {
         self.messages.set_pty_active(active);
-        if !active
-            && self
-                .matches
-                .subcommand_matches("agents")
-                .and_then(|m| m.subcommand_matches("attach"))
-                .is_some()
-        {
+        if !active && self.is_agent_attach() {
             self.unbind_container_stdio();
         }
     }

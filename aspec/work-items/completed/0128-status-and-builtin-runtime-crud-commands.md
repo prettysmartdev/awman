@@ -148,7 +148,7 @@ pub struct AgentsOverview {
 
 - One-shot by default: collect once, call `frontend.render_overview(&overview)` once, and return `AgentsStatusOutcome { overview }`.
 - With `--watch`: loop `collect → frontend.render_overview → wait`. The wait is a `tokio::select!` between a 2 s interval tick and a cancellation token that the frontend supplies through `frontend.watch_cancel()`. Ctrl-C must therefore exit immediately rather than after the next sleep. The loop decision depends **only** on `flags.watch` and the cancel token. Remove `should_continue_watching` entirely, so no frontend can turn a one-shot into a watch.
-- The outcome returned after a watch run is marked `watched: true`, and the CLI renderer prints **nothing** for it, because the frontend has already drawn the last frame. This removes the duplicate table on quit.
+- A watch run returns no outcome: cancelling it is a user abort (`CommandError::Aborted`, exit 130), so the CLI renderer prints **nothing** after it, because the frontend has already drawn the last frame. This removes the duplicate table on quit. (As implemented; an earlier draft returned a `watched: true` outcome, which became unreachable.)
 - Content of the overview (shared by all renderers; layout is up to each frontend):
   - Header: the runtime display name, an availability indicator, the agent count broken down by state (`3 running · 1 stuck`), and total CPU and memory.
   - Rows: state glyph, short id, name, source (`session`, `squad:<slug>`, `tab 2`), image, uptime (humanised, e.g. `4m12s`, `2h03m`), CPU %, and memory.
@@ -308,7 +308,7 @@ A single trait across subcommands is preferred to five near-empty ones. Only `st
 - CLI renderers:
   - Snapshot tests of `status` (empty, mixed states, stuck, squad source), `list` (normal, `--quiet`, `--no-trunc`, `--all` with a stopped row), and `detail`.
   - JSON round-trips for each outcome.
-  - Assert that the watched outcome renders **nothing**. This is a regression test for the duplicate table on quit.
+  - Assert that a watch ends in `Aborted` and renders no outcome. This is a regression test for the duplicate table on quit.
 - CLI watch terminal guard: the alternate-screen enter and leave sequences are emitted in pairs, also on the error path. Test this with a writer abstraction rather than real stdout.
 - TUI:
   - `render_agents_dashboard` with a `TestBackend`: header totals, column order matching the CLI, empty state, and the footer text for watch vs one-shot.

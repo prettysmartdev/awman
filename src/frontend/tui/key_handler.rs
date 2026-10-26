@@ -371,7 +371,9 @@ pub(super) fn extract_selection_text(sel: &tabs::TextSelection) -> String {
 
 fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
     let attaching = matches!(&app.active_tab().execution_phase,
-        crate::frontend::tui::tabs::ExecutionPhase::Running { command, .. } if command == "agents attach" || command.starts_with("agents attach "));
+        crate::frontend::tui::tabs::ExecutionPhase::Running { command, .. }
+            if crate::command::dispatch::catalogue::CommandCatalogue::get()
+                .is_agent_attach(&command.split_whitespace().collect::<Vec<_>>()));
     if attaching && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         app.active_tab().shared.command_cancel.cancel();
