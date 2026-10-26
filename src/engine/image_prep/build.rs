@@ -406,7 +406,8 @@ impl AgentImagePreparer {
         }
         let dockerfile = RepoDockerfilePaths::new(git_root).agent_dockerfile(agent);
         self.provision_agent_dockerfile(frontend, git_root, agent, &dockerfile)
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
         if !dockerfile.exists() {
             return Err(format!(
                 "agent Dockerfile {} is unavailable",
@@ -422,10 +423,12 @@ impl AgentImagePreparer {
             build_args: Vec::new(),
             no_cache: policy.no_cache(),
         };
-        let receipt = self
-            .build_source(request, frontend)
-            .await
-            .map_err(|e| e.to_string())?;
+        let receipt = self.build_source(request, frontend).await.map_err(|e| {
+            match self.definitions.get(agent) {
+                Some(def) => crate::engine::agent::custom_build_failure(def, e),
+                None => e.to_string(),
+            }
+        })?;
         // The build succeeded. Anything that stops the import from here on
         // fails the import, not the build.
         let blocked = self

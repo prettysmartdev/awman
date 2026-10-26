@@ -250,6 +250,7 @@ impl crate::command::commands::agent_setup::HasAgentFrontend for FakeExecWorkflo
     }
 }
 
+impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeExecWorkflowFrontend {}
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeExecWorkflowFrontend {
     fn set_pty_active(&mut self, active: bool) {
         self.pty_active_calls.push(active);
@@ -1807,7 +1808,7 @@ fn build_leader_prompt_substitutes_work_item_path() {
 
 #[test]
 fn build_leader_prompt_substitutes_available_agents() {
-    let agents = "  - claude\n  - maki";
+    let agents = "  - claude\n  - cline";
     let prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
         "0042", "/path", agents, None, None,
     );
@@ -1816,7 +1817,7 @@ fn build_leader_prompt_substitutes_available_agents() {
         "leader prompt must list available agents"
     );
     assert!(
-        prompt.contains("maki"),
+        prompt.contains("cline"),
         "leader prompt must list all available agents"
     );
 }
@@ -2075,7 +2076,7 @@ fn resolve_leader_model_with_leader_flag_ignores_flags_model() {
 fn resolve_leader_model_with_model_flag_no_leader_passes_model() {
     // Case (b): --model present, no --leader → model forwarded from flags.
     let tmp = tempfile::tempdir().unwrap();
-    let session = make_session_with_agent(&tmp, "maki");
+    let session = make_session_with_agent(&tmp, "cline");
     let flags = make_dynamic_flags(true, None, Some("0042"), None, false, Some("custom-model"));
     let (_agent, model) = resolve_leader_model(&flags, &session).unwrap();
     assert_eq!(
@@ -2300,13 +2301,13 @@ fn format_available_agents_multiple_agents_are_listed() {
             std::path::PathBuf::from("/r/.awman/Dockerfile.claude"),
         ),
         (
-            "maki".to_string(),
-            std::path::PathBuf::from("/r/.awman/Dockerfile.maki"),
+            "cline".to_string(),
+            std::path::PathBuf::from("/r/.awman/Dockerfile.cline"),
         ),
     ];
     let result = format_available_agents(&agents);
     assert!(result.contains("claude"), "must list claude");
-    assert!(result.contains("maki"), "must list maki");
+    assert!(result.contains("cline"), "must list cline");
 }
 
 // ── format_agents_with_models (WI-0095 §3) ────────────────────────────────
@@ -2554,11 +2555,11 @@ fn resolve_validates_workflow_level_agent_with_dockerfile() {
     let tmp = tempfile::tempdir().unwrap();
     let awman_dir = tmp.path().join(".awman");
     std::fs::create_dir_all(&awman_dir).unwrap();
-    std::fs::write(awman_dir.join("Dockerfile.maki"), "FROM ubuntu\n").unwrap();
+    std::fs::write(awman_dir.join("Dockerfile.cline"), "FROM ubuntu\n").unwrap();
     let session = make_session_simple(&tmp);
     let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
     // Workflow-level agent, steps have no agent.
-    let wf = make_workflow(Some("maki"), &[None]);
+    let wf = make_workflow(Some("cline"), &[None]);
     let result = resolve_and_validate_workflow_agents(&wf, &session, &paths);
     assert!(
         result.is_ok(),

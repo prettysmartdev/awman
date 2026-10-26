@@ -196,6 +196,7 @@ mod tests {
             owner: "someone".to_string(),
             repo: slug.to_string(),
             subdir: "skills".to_string(),
+            sparse: false,
         }
     }
 

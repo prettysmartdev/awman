@@ -387,4 +387,73 @@ impl CommandError {
         CommandError::Other(_) => 1,
     }
     }
+
+    /// The HTTP status class the API reports for this failure (as
+    /// `error_status` in a command's result, and on session creation).
+    ///
+    /// Agent-definition failures carry their own class: an agent nobody
+    /// defined is "not found" (404), and a definition that has not been
+    /// approved is "forbidden" (403) — the API never approves one. Everything
+    /// else follows the exit-code class: invalid usage is 400, a missing
+    /// resource 404, anything else 500.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => 403,
+            CommandError::Engine(EngineError::UnknownAgent { .. }) => 404,
+            CommandError::SessionWorkdirNotAllowed { .. } => 403,
+            _ => match self.exit_code() {
+                2 => 400,
+                4 => 404,
+                _ => 500,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_error_class_tests {
+    use super::*;
+
+    fn untrusted() -> CommandError {
+        CommandError::Engine(EngineError::AgentDefinitionUntrusted {
+            name: "pi".into(),
+            path: "/x/pi.toml".into(),
+            sha256: "ab".into(),
+        })
+    }
+    fn unknown() -> CommandError {
+        CommandError::Engine(EngineError::UnknownAgent {
+            name: "pi".into(),
+            first_party: vec!["claude".into()],
+            custom: vec![],
+            notes: vec![],
+        })
+    }
+
+    #[test]
+    fn untrusted_is_exit_2_and_http_403() {
+        assert_eq!(untrusted().exit_code(), 2);
+        assert_eq!(untrusted().http_status(), 403);
+    }
+
+    #[test]
+    fn unknown_agent_is_exit_4_and_http_404() {
+        assert_eq!(unknown().exit_code(), 4);
+        assert_eq!(unknown().http_status(), 404);
+    }
+
+    #[test]
+    fn other_classes_follow_the_exit_code() {
+        assert_eq!(CommandError::Other("x".into()).http_status(), 500);
+        assert_eq!(CommandError::Aborted.http_status(), 500);
+        assert_eq!(
+            CommandError::InvalidArgumentValue {
+                command: vec![],
+                argument: "a".into(),
+                reason: "r".into()
+            }
+            .http_status(),
+            400
+        );
+    }
 }

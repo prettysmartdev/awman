@@ -89,21 +89,39 @@ fn field_scope(name: &str) -> Option<FieldScope> {
     field_spec(name).map(|spec| spec.scope)
 }
 
-/// Valid agent names for config set agent=<value>. Must stay in sync with
-/// `engine::agent::agent_matrix::SUPPORTED_AGENTS` — the matrix is authoritative;
-/// this list is checked at config-write time so unsupported values are rejected
-/// before they reach the engine.
-const VALID_AGENT_VALUES: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "opencode",
-    "crush",
-    "cline",
-    "copilot",
-    "maki",
-    "antigravity",
-];
+/// The agents a `config set agent` write may name for its scope: a repo
+/// write accepts first-party, repo-custom and global-custom names; a global
+/// write accepts first-party and global-custom names (a repo definition is
+/// unknown in every other repo).
+fn agent_listing_for_scope(
+    session: &crate::data::session::Session,
+    global: bool,
+) -> crate::engine::agent::registry::AgentListing {
+    let root = (!global).then(|| session.definition_root());
+    crate::engine::agent::registry::AgentRegistry::list(session.env(), root)
+}
+
+fn is_agent_field(field: &str) -> bool {
+    matches!(field, "agent" | "default_agent")
+}
+
+/// Reject an `agent` value the scope's listing does not contain.
+fn check_agent_known(
+    value: &str,
+    listing: &crate::engine::agent::registry::AgentListing,
+    global: bool,
+) -> Result<(), String> {
+    if listing.contains(value) {
+        return Ok(());
+    }
+    let scope = if global { "global" } else { "repo" };
+    Err(format!(
+        "'{value}' is not a known agent for {scope} config; valid agents: {}; define one with: \
+         awman new agent {value}{}",
+        listing.names().join(", "),
+        if global { " --global" } else { "" }
+    ))
+}
 
 /// Validate and coerce a string value into the appropriate JSON type for the
 /// given field. Returns the coerced `serde_json::Value` or a user-facing error.
@@ -168,13 +186,9 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
     }
     match field {
         "agent" | "default_agent" => {
-            if !VALID_AGENT_VALUES.contains(&value) {
-                return Err(format!(
-                    "'{}' is not a known agent; valid agents: {}",
-                    value,
-                    VALID_AGENT_VALUES.join(", ")
-                ));
-            }
+            // Shape only here; whether the name is defined depends on the
+            // scope being written (`check_agent_known`).
+            crate::data::session::AgentName::new(value).map_err(|e| e.to_string())?;
             Ok(serde_json::Value::String(value.to_string()))
         }
         "yoloDisallowedTools" | "overlays" | "api.workDirs" => {
@@ -424,9 +438,15 @@ fn config_field_hint(name: &str) -> Option<String> {
         return Some("a single instruction; save an empty value to remove".to_string());
     }
     let hint = field_spec(name)?.hint?;
-    // The two agent fields share one hint whose value set is the catalogue's,
-    // not the table's, so the table carries a placeholder.
-    Some(hint.replace("{agents}", &VALID_AGENT_VALUES.join(", ")))
+    // The two agent fields share one hint whose value set is the registry's,
+    // not the table's, so the table carries a placeholder. Custom names
+    // depend on the scope being edited, so the hint says where they live;
+    // a rejected write lists the scope's exact names.
+    let agents = format!(
+        "{}, or a custom agent defined in .awman/agents/ or ~/.awman/agents/",
+        crate::engine::agent::first_party::FIRST_PARTY_AGENTS.join(", ")
+    );
+    Some(hint.replace("{agents}", &agents))
 }
 
 /// Render an `agentsToModels` model-list JSON value as a comma-separated string
@@ -760,8 +780,18 @@ impl Command for ConfigCommand {
                             // a rejection so the user's input is preserved
                             // and the reason is visible in the dialog. It is
                             // also logged for the post-dialog record.
-                            let result =
-                                validate_and_coerce(&edit.field, &edit.value).and_then(|coerced| {
+                            let result = validate_and_coerce(&edit.field, &edit.value)
+                                .and_then(|coerced| {
+                                    if is_agent_field(&edit.field) {
+                                        check_agent_known(
+                                            &edit.value,
+                                            &agent_listing_for_scope(&session, edit.global),
+                                            edit.global,
+                                        )?;
+                                    }
+                                    Ok(coerced)
+                                })
+                                .and_then(|coerced| {
                                     write_config_field(&session, &edit.field, coerced, edit.global)
                                 });
                             if let Err(reason) = result {
@@ -870,13 +900,20 @@ impl Command for ConfigCommand {
                     }
                 }
                 // Validate and coerce the value per field type.
-                let coerced = validate_and_coerce(&f.field, &f.value).map_err(|reason| {
-                    CommandError::InvalidFlagValue {
-                        command: vec!["config".into(), "set".into()],
-                        flag: f.field.clone(),
-                        reason,
-                    }
-                })?;
+                let invalid = |reason| CommandError::InvalidFlagValue {
+                    command: vec!["config".into(), "set".into()],
+                    flag: f.field.clone(),
+                    reason,
+                };
+                let coerced = validate_and_coerce(&f.field, &f.value).map_err(invalid)?;
+                if is_agent_field(&f.field) {
+                    check_agent_known(
+                        &f.value,
+                        &agent_listing_for_scope(&session, f.global),
+                        f.global,
+                    )
+                    .map_err(invalid)?;
+                }
                 write_config_field(&session, &f.field, coerced, f.global).map_err(|reason| {
                     CommandError::Other(format!("failed to set '{}': {reason}", f.field))
                 })?;
@@ -1226,8 +1263,18 @@ mod tests {
 
     #[test]
     fn validate_and_coerce_agent_invalid() {
-        let err = validate_and_coerce("agent", "notareal").unwrap_err();
+        let listing = crate::engine::agent::registry::AgentListing {
+            first_party: crate::engine::agent::first_party::FIRST_PARTY_AGENTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_and_coerce("agent", "notareal").is_ok());
+        let err = check_agent_known("notareal", &listing, false).unwrap_err();
         assert!(err.contains("not a known agent"));
+        assert!(check_agent_known("claude", &listing, true).is_ok());
+        assert!(validate_and_coerce("agent", "bad name!").is_err());
     }
 
     #[test]
@@ -1865,5 +1912,72 @@ mod edit_loop_tests {
             !crate::data::config::repo::RepoConfig::path(tmp.path()).exists(),
             "nothing must be written when the set fails"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_scope_tests {
+    use super::*;
+    use crate::data::session::Session;
+
+    const DEF: &str =
+        "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['x']\n";
+
+    fn fixture() -> (tempfile::TempDir, Session) {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("global");
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        std::fs::create_dir_all(root.path().join(".awman/agents")).unwrap();
+        std::fs::write(root.path().join(".awman/agents/repoonly.toml"), DEF).unwrap();
+        std::fs::write(home.join("agents/globalonly.toml"), DEF).unwrap();
+        let session = Session::for_tests_isolated(root.path(), &home);
+        (root, session)
+    }
+
+    fn accepts(session: &Session, value: &str, global: bool) -> Result<(), String> {
+        check_agent_known(value, &agent_listing_for_scope(session, global), global)
+    }
+
+    #[test]
+    fn repo_scope_accepts_first_party_repo_and_global_custom() {
+        let (_r, s) = fixture();
+        for v in ["claude", "antigravity", "repoonly", "globalonly"] {
+            assert!(accepts(&s, v, false).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn global_scope_accepts_first_party_and_global_custom_only() {
+        let (_r, s) = fixture();
+        for v in ["codex", "globalonly"] {
+            assert!(accepts(&s, v, true).is_ok(), "{v}");
+        }
+        let err = accepts(&s, "repoonly", true).unwrap_err();
+        assert!(err.contains("not a known agent for global config"), "{err}");
+        assert!(err.ends_with("awman new agent repoonly --global"), "{err}");
+    }
+
+    #[test]
+    fn unknown_name_lists_valid_agents_and_the_new_agent_hint() {
+        let (_r, s) = fixture();
+        let err = accepts(&s, "nope", false).unwrap_err();
+        assert!(err.contains("not a known agent for repo config"));
+        assert!(err.contains("claude") && err.contains("repoonly") && err.contains("globalonly"));
+        assert!(err.ends_with("awman new agent nope"), "{err}");
+    }
+
+    #[test]
+    fn default_agent_field_is_checked_like_agent() {
+        assert!(is_agent_field("agent") && is_agent_field("default_agent"));
+        assert!(!is_agent_field("model"));
+        // Shape check stays in validate_and_coerce.
+        assert!(validate_and_coerce("default_agent", "pi").is_ok());
+        assert!(validate_and_coerce("default_agent", "Bad Name").is_err());
+    }
+
+    #[test]
+    fn removed_agent_values_constant_is_gone() {
+        let src = include_str!("config.rs");
+        assert!(!src.contains(concat!("VALID_AGENT", "_VALUES")));
     }
 }

@@ -245,7 +245,7 @@ If all 3 repair attempts fail, awman surfaces the final error and the path to th
 leader agent failed to produce a valid workflow.toml after 3 repair attempts
 last error: workflow.toml references agents with no Dockerfile in the project:
   - "gemini" (expected .awman/Dockerfile.gemini)
-  Available agents: claude, maki
+  Available agents: claude, codex, opencode, gemini, copilot, cline, antigravity
 file is at: /home/user/.awman/context/workflow/abc123/workflow.toml
 ```
 

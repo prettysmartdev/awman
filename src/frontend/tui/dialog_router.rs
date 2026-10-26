@@ -392,6 +392,13 @@ pub(super) fn handle_dialog_delete(app: &mut App) {
 pub(super) fn handle_dialog_scroll(app: &mut App, direction: i32) {
     let step = direction.unsigned_abs() as usize;
     match &mut app.active_dialog {
+        Some(Dialog::Review(state)) => {
+            if direction < 0 {
+                state.scroll = state.scroll.saturating_sub(step);
+            } else {
+                state.scroll = (state.scroll + step).min(state.max_scroll.get());
+            }
+        }
         Some(Dialog::ListPicker {
             items, selected, ..
         }) => {
@@ -580,6 +587,15 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             app.send_dialog_response(DialogResponse::Char(c));
             app.active_dialog = None;
             app.command_dialog_active = false;
+        }
+        // A gated choice (approve) is ignored until the whole review has
+        // been on screen; the others (decline) are always accepted.
+        Some(Dialog::Review(ref state)) => {
+            if state.accepts(c) {
+                app.send_dialog_response(DialogResponse::Char(c));
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
         }
         Some(Dialog::Custom { ref keys, .. }) => {
             if keys.iter().any(|(ch, _)| *ch == c) {

@@ -1,0 +1,52 @@
+# Custom agent definition skeleton (schema 1).
+# Save as .awman/agents/<name>.toml. The filename stem is the agent name and must match
+# ^[a-z0-9][a-z0-9_-]{0,63}$. See skills/create-custom-agent/reference.md for the full
+# field reference and validation rules. Unknown keys are rejected. Schema 1 does not accept a sandbox table.
+
+schema = 1 # required; higher schemas need a newer awman
+# display_name = "Agent Name" # required; shown in ready/status/TUI
+# description = "Short description" # optional
+# homepage = "https://example.com" # optional
+
+[run]
+command = ["agent"] # required argv entrypoint; no shell
+# non_interactive = "-p" # optional token for -n / exec / workflow
+# interactive_only_flags = [] # optional argv flags for interactive launches only
+# seed_prompt = "positional" # default; or { flag = "--prompt" }
+# model = "space" # space, equals, or unsupported
+# env = { AGENT_TELEMETRY = "0" } # optional literal container environment
+
+[modes]
+# yolo = ["--yolo"]
+# auto = []
+# plan = ["--plan"]
+
+[tools]
+# allowed_flag = "--allowed-tools"
+# disallowed_flag = "--disallowed-tools"
+
+[system_prompt]
+# delivery = "none" # append-file, append-inline, replace, agents-md, env-file, add-dir, none
+# flag = "--append-system-prompt-file" # required by append-file / append-inline / replace / add-dir
+# key = "developer_instructions" # required by append-inline
+# env = "AGENT_SYSTEM_MD" # required by env-file
+
+# [acp] # uncomment the table to enable ACP
+# command = ["agent", "--acp"] # optional; presence enables ACP
+
+# [ping] # uncomment the table to opt into the host check
+# command = ["agent", "-p"] # optional host command run only by awman ready after approval
+
+[settings]
+# host_dir = ".agent" # relative to host $HOME; deny-list applies
+# skills_dir = ".agent/skills" # relative to container $HOME
+
+[auth]
+# env = ["ANTHROPIC_API_KEY"] # optional host environment names to pass through
+
+[image]
+# needs_node = false # optional; Node 20 setup block
+# apt = ["ripgrep"] # optional extra Debian packages
+# install = ["npm install -g agent-package"] # required unless dockerfile is set; one line per RUN
+# binary = "agent" # optional smoke-test binary; defaults to run.command[0]
+# dockerfile = "Agent.Dockerfile" # escape hatch; excludes needs_node / apt / install

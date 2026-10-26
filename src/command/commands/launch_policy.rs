@@ -11,13 +11,19 @@
 //! (flags merged in), not the session's, and `acp_fallback_warning` and
 //! `report_session_end` read nothing from a session at all.
 
+pub use crate::command::commands::agent_trust::{
+    ensure_agent_trusted, ensure_workflow_agents_trusted, AgentTrustFrontend, AgentTrustReview,
+    HostCommandReview, TrustDecision, TrustOutcome,
+};
 use crate::command::error::CommandError;
 use crate::data::config::overlays::{ContextOverlaySpec, ContextScope};
 use crate::data::config::EffectiveConfig;
 use crate::data::fs::ContextDirResolver;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
-use crate::engine::agent::agent_matrix::{matrix_for, SystemPromptMode};
+use crate::engine::agent::definition::SystemPromptMode;
+use crate::engine::agent::first_party::{first_party, FIRST_PARTY_AGENTS};
+use crate::engine::agent::registry::AgentRegistry;
 use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::context_prompt::{ContextPromptBuilder, WorkflowStepInfo};
 use crate::engine::error::EngineError;
@@ -87,6 +93,7 @@ impl<'a> LaunchPolicy<'a> {
     /// Apply the ACP support and fallback policy after normal agent resolution.
     /// Explicit single-agent ACP intent is never downgraded.
     pub fn resolve_launch_mode(
+        session: &Session,
         config: &EffectiveConfig,
         agent: &AgentName,
         explicit_single_agent_acp: bool,
@@ -97,7 +104,7 @@ impl<'a> LaunchPolicy<'a> {
         if config.launch_mode() == LaunchMode::Stdio {
             return Ok(LaunchModeDecision::Stdio);
         }
-        if crate::engine::agent::agent_matrix::matrix_for(agent.as_str())?.supports_acp {
+        if AgentRegistry::resolve_for_session(session, agent)?.supports_acp {
             return Ok(LaunchModeDecision::Acp);
         }
         if explicit_single_agent_acp || config.launch_mode_fallback() == LaunchModeFallback::Error {
@@ -118,17 +125,17 @@ impl<'a> LaunchPolicy<'a> {
     /// The vendor-deprecation warning for `agent`, or `None` when its vendor
     /// still supports it.
     ///
-    /// The note is a per-agent fact and lives in the one per-agent table
-    /// (`AgentMatrix::deprecation_note`, F-32). `chat` and `exec prompt` each
-    /// carried their own `if agent.as_str() == "gemini"` arm with a duplicated
-    /// copy of the text; they now ask here.
+    /// The note is a per-agent fact and lives in the first-party table
+    /// (`AgentDefinition::deprecation_note`, F-32; custom agents carry none).
+    /// `chat` and `exec prompt` each carried their own
+    /// `if agent.as_str() == "gemini"` arm with a duplicated copy of the
+    /// text; they now ask here.
     pub fn deprecation_warning(agent: &AgentName) -> Option<UserMessage> {
-        matrix_for(agent.as_str())
-            .ok()?
+        first_party(agent.as_str())?
             .deprecation_note
             .map(|text| UserMessage {
                 level: MessageLevel::Warning,
-                text: text.to_string(),
+                text,
             })
     }
 
@@ -246,8 +253,8 @@ impl<'a> LaunchPolicy<'a> {
 
         // Surface agent-compatibility warnings now that we know context overlays
         // will be active for this run.
-        if let Ok(matrix) = matrix_for(agent.as_str()) {
-            match &matrix.system_prompt_delivery {
+        if let Ok(def) = AgentRegistry::resolve_for_session(self.session, agent) {
+            match &def.system_prompt_delivery {
                 SystemPromptMode::Replace => {
                     sink.write_message(UserMessage {
                         level: MessageLevel::Warning,
@@ -303,12 +310,12 @@ impl<'a> LaunchPolicy<'a> {
     /// those launches; a non-interactive launch keeps it as configured, and
     /// the agent may reject it there (`codex exec` refuses `--no-daemon`).
     fn warn_redundant_agent_flags(&self, ec: &EffectiveConfig, sink: &mut dyn UserMessageSink) {
-        for agent in crate::engine::agent::agent_matrix::SUPPORTED_AGENTS {
-            let Ok(matrix) = matrix_for(agent) else {
+        for agent in FIRST_PARTY_AGENTS {
+            let Some(def) = first_party(agent) else {
                 continue;
             };
             let configured = ec.agent_flags(agent);
-            for flag in matrix.interactive_only_flags {
+            for flag in &def.interactive_only_flags {
                 if configured.iter().any(|c| c == flag) {
                     sink.write_message(UserMessage {
                         level: MessageLevel::Warning,
@@ -372,12 +379,68 @@ mod launch_mode_tests {
     }
 
     #[test]
+    fn repo_acp_policy_uses_session_env_and_repo_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("global");
+        let session = Session::for_tests_isolated(root.path(), &home);
+        let dir = root.path().join(".awman/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pi.toml");
+        let source =
+            "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['install pi']\n";
+        let name = AgentName::new("pi").unwrap();
+        let approve = || {
+            let untrusted =
+                AgentRegistry::load_untrusted(session.env(), &name, Some(root.path())).unwrap();
+            AgentRegistry::record_approval(
+                session.env(),
+                untrusted.definition(),
+                Some(root.path()),
+            )
+            .unwrap();
+        };
+        std::fs::write(&path, format!("{source}[acp]\ncommand=['pi','--acp']\n")).unwrap();
+        approve();
+        assert_eq!(
+            LaunchPolicy::resolve_launch_mode(
+                &session,
+                &config(LaunchModeFallback::Stdio),
+                &name,
+                false
+            )
+            .unwrap(),
+            LaunchModeDecision::Acp
+        );
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/pi.toml"),
+            format!("{source}[acp]\ncommand=['pi','--acp']\n"),
+        )
+        .unwrap();
+        std::fs::write(&path, source).unwrap();
+        approve();
+        assert_eq!(
+            LaunchPolicy::resolve_launch_mode(
+                &session,
+                &config(LaunchModeFallback::Stdio),
+                &name,
+                false
+            )
+            .unwrap(),
+            LaunchModeDecision::StdioWithFallbackWarning
+        );
+    }
+
+    #[test]
     fn fallback_decision_matrix() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::for_tests(root.path());
         let supported = AgentName::new("cline").unwrap();
         let unsupported = AgentName::new("claude").unwrap();
 
         assert_eq!(
             LaunchPolicy::resolve_launch_mode(
+                &session,
                 &config(LaunchModeFallback::Error),
                 &supported,
                 false
@@ -387,6 +450,7 @@ mod launch_mode_tests {
         );
         assert!(matches!(
             LaunchPolicy::resolve_launch_mode(
+                &session,
                 &config(LaunchModeFallback::Error),
                 &unsupported,
                 false
@@ -395,6 +459,7 @@ mod launch_mode_tests {
         ));
         assert_eq!(
             LaunchPolicy::resolve_launch_mode(
+                &session,
                 &config(LaunchModeFallback::Stdio),
                 &unsupported,
                 false
@@ -404,6 +469,7 @@ mod launch_mode_tests {
         );
         assert!(matches!(
             LaunchPolicy::resolve_launch_mode(
+                &session,
                 &config(LaunchModeFallback::Stdio),
                 &unsupported,
                 true

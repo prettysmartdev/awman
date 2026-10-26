@@ -27,7 +27,7 @@ For the experimental builtin runtime (macOS on Apple Silicon), `awman ready` imp
 
 ## Agents
 
-awman drives nine agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`, and `antigravity`. The repo default is set at init time; override per-command with `--agent`, or change it with `awman config set agent <name>`. Not every agent supports every feature (plan mode, yolo, model override) — see the capability table in [Agent Sessions](03-agent-sessions.md).
+awman drives seven built-in agents: `claude`, `codex`, `opencode`, `gemini`, `copilot`, `cline`, and `antigravity`, plus any [custom agent](15-custom-agents.md) you define. The repo default is set at init time; override per-command with `--agent`, or change it with `awman config set agent <name>`. Not every agent supports every feature (plan mode, yolo, model override) — see the capability table in [Agent Sessions](03-agent-sessions.md).
 
 ## Sessions and modes
 

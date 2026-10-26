@@ -12,7 +12,7 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--agent` | enum: claude, codex, opencode, maki, gemini, copilot, crush, cline, antigravity | `claude` | — | — | CLI, TUI, API | Code agent to install in the Dockerfile.dev container. |
+| `--agent` | string | `claude` | — | — | CLI, TUI, API | Code agent to install in the Dockerfile.dev container: claude, codex, opencode, gemini, copilot, cline, antigravity, or the name of a custom agent defined in .awman/agents/ or ~/.awman/agents/. |
 | `--aspec` | bool | false | — | — | CLI, TUI, API | Download aspec templates to the current project. |
 
 ---
@@ -31,6 +31,7 @@ Available via: CLI, TUI
 | `-n, --non-interactive` | bool | false | — | — | CLI, TUI, API | Run the agent in non-interactive (print) mode instead of interactive mode. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--json` | bool | false | `--non-interactive` | — | CLI, TUI, API | Suppress human output and print structured JSON. Implies --non-interactive. |
+| `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to check and build (overrides .awman/config.json). Reviews and approves a custom agent definition that needs approval. |
 
 ---
 
@@ -634,7 +635,7 @@ Available via: CLI, TUI
 
 ## `awman new`
 
-Create a new awman artefact (spec, workflow, or skill).
+Create a new awman artefact (spec, workflow, skill, or agent definition).
 
 Available via: CLI, TUI
 
@@ -677,6 +678,24 @@ Available via: CLI, TUI
 | `--pull` | string (optional) | — | — | `--pull-all`, `--interview`, `--global` | CLI, TUI, API | Pull (or refresh) a published skills library from GitHub, e.g. github.com/obra/superpowers. |
 | `--pull-all` | bool | false | — | `--pull`, `--subdir`, `--interview`, `--global` | CLI, TUI, API | Refresh every previously-pulled skills library. |
 | `--subdir` | string (optional) | — | — | `--pull-all` | CLI, TUI, API | Subdirectory inside the pulled repo containing skills (default: skills). |
+
+### `awman new agent`
+
+Create a custom agent definition in .awman/agents/<name>.toml.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `name` | string | yes | Agent name; becomes the file stem (lowercase letters, digits, '-' and '_'). |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--global` | bool | false | — | — | CLI, TUI, API | Write to ~/.awman/agents/<name>.toml instead of the current repo. |
+| `--from` | enum: crush, maki | — | — | — | CLI, TUI, API | Copy a shipped example definition instead of the commented skeleton. |
+| `--force` | bool | false | — | — | CLI, TUI, API | Overwrite an existing definition (and, with --from maki, its Dockerfile). |
 
 ---
 

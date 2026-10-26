@@ -38,6 +38,7 @@ impl fmt::Display for AgentSetupStep {
 /// A step of the `awman ready` phase machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadyStep {
+    AgentDefinition,
     /// A kit-declarative runtime prepared the agent in one operation.
     ApplyAgentKit,
     /// Confirming the project Dockerfile exists at this path.
@@ -73,6 +74,7 @@ pub enum ReadyStep {
 impl fmt::Display for ReadyStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AgentDefinition => f.write_str("Agent definition"),
             Self::ApplyAgentKit => f.write_str("Apply agent kit"),
             Self::CheckDockerfile(path) => write!(f, "Check {}", path.display()),
             Self::CreateDockerfile(path) => write!(f, "Create {}", path.display()),

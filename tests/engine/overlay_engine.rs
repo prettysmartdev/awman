@@ -151,23 +151,26 @@ fn skill_overlays_empty_when_global_skills_dir_absent() {
 }
 
 #[test]
-fn skill_overlays_empty_for_maki_agent_no_error() {
+fn skill_overlays_empty_for_an_undefined_agent_no_error() {
     let tmp = tempfile::tempdir().unwrap();
     let skills = tmp.path().join("skills");
     std::fs::create_dir_all(&skills).unwrap();
     let engine = make_engine(tmp.path());
-    let agent = AgentName::new("maki").unwrap();
+    let agent = AgentName::new("not-defined").unwrap();
 
-    // Must return Ok(vec![]) — not an error — even though maki has no known skills dir.
+    // Must return Ok(vec![]) — not an error — even though the agent has no definition (and so no skills dir).
     let result = with_amux_config_home(tmp.path(), || {
         engine.skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
     });
 
     assert!(
         result.is_ok(),
-        "maki must not produce an error; got {result:?}"
+        "an undefined agent must not produce an error; got {result:?}"
     );
-    assert!(result.unwrap().is_empty(), "maki must produce no mount");
+    assert!(
+        result.unwrap().is_empty(),
+        "an undefined agent must produce no mount"
+    );
 }
 
 #[test]
@@ -185,7 +188,13 @@ fn build_overlays_includes_skills_mount_when_include_skills_true() {
         Session::open(
             session_tmp.path().to_path_buf(),
             &resolver,
-            SessionOpenOptions::default(),
+            SessionOpenOptions {
+                env: Some(awman::data::config::env::EnvSnapshot::with_overrides([(
+                    "AWMAN_CONFIG_HOME",
+                    tmp.path().to_str().unwrap(),
+                )])),
+                ..Default::default()
+            },
         )
         .unwrap()
     };
@@ -195,9 +204,7 @@ fn build_overlays_includes_skills_mount_when_include_skills_true() {
         ..Default::default()
     };
 
-    let overlays = with_amux_config_home(tmp.path(), || {
-        engine.build_overlays(&session, &request).unwrap()
-    });
+    let overlays = engine.build_overlays(&session, &request).unwrap();
 
     let skills_mount = overlays.iter().find(|o| o.host_path == skills_canon);
     assert!(
@@ -230,7 +237,13 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
         Session::open(
             session_tmp.path().to_path_buf(),
             &resolver,
-            SessionOpenOptions::default(),
+            SessionOpenOptions {
+                env: Some(awman::data::config::env::EnvSnapshot::with_overrides([(
+                    "AWMAN_CONFIG_HOME",
+                    tmp.path().to_str().unwrap(),
+                )])),
+                ..Default::default()
+            },
         )
         .unwrap()
     };
@@ -245,9 +258,7 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
         ..Default::default()
     };
 
-    let overlays = with_amux_config_home(tmp.path(), || {
-        engine.build_overlays(&session, &request).unwrap()
-    });
+    let overlays = engine.build_overlays(&session, &request).unwrap();
 
     assert!(
         overlays.iter().any(|o| o.host_path == skills_canon),

@@ -54,6 +54,18 @@ Credential values never appear in a printed command. Env-delivered agent credent
 
 ---
 
+## Custom agent definitions
+
+[Custom agents](15-custom-agents.md) are defined by TOML files, so awman treats them as untrusted input until you approve them:
+
+- **Approval per content hash.** Definitions in a repo's `.awman/agents/` must be approved before awman builds or launches them. The approval covers the TOML and any Dockerfile it references, and is stored in `~/.awman/trusted-agents.json`; changing either file asks again. Global definitions in `~/.awman/agents/` are your own and need no approval unless they declare `[ping]`. Unattended callers (`-n`, `--json`, the API, the squad daemon) never prompt and fail instead — see [The approval prompt](15-custom-agents.md#the-approval-prompt).
+- **Containers only.** Agents run in the same containers and microVMs as built-in agents. The one host-side command a definition can request is the optional `[ping]` check during `awman ready`; it is shown in the approval prompt, runs only after you approve, from an empty temporary directory, with an awman-chosen greeting as the last argument. Without `[ping]`, `ready` skips the host check. See [The optional host check](15-custom-agents.md#the-optional-host-check-ping).
+- **No shell.** Commands are argv arrays and install steps are written into the image build in a form that cannot run outside their own `RUN` step.
+- **Host-path deny-list.** A definition cannot mount `.ssh`, `.gnupg`, `.aws`, `.azure`, `.config/gcloud`, `.kube`, `.docker`, `.awman`, `.netrc`, `.git-credentials`, `.config/gh`, `.password-store`, `.local/share/keyrings` or `Library/Keychains` — or any directory above, inside, or symlinked onto them — as its settings directory. The same holds for awman's actual data directory and the real targets of these directories when they are themselves relocated by a symlink.
+- **Your Dockerfile, your responsibility.** If you [take ownership](15-custom-agents.md#taking-ownership-of-a-rendered-dockerfile) of a rendered Dockerfile by removing its header line, awman builds it as written and no longer checks it against the approved definition.
+
+---
+
 ## Worktree isolation
 
 The `--worktree` flag runs agent sessions in an isolated Git worktree rather than your main working directory. The agent's changes land on a separate branch, completely isolated from your current work until you decide what to do with them.

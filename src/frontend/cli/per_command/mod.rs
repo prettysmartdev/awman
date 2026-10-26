@@ -29,6 +29,7 @@ mod ready;
 mod acp_frontend;
 mod agent_auth;
 mod agent_setup;
+mod agent_trust;
 mod container_frontend_marker;
 mod mount_scope;
 mod workflow_frontend_marker;

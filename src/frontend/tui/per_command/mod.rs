@@ -7,6 +7,7 @@
 mod acp_frontend;
 mod agent_auth;
 mod agent_setup;
+mod agent_trust;
 mod agents;
 mod api_server;
 mod chat;

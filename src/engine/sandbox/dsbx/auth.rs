@@ -13,7 +13,7 @@
 //! via `sbx create`) before any secret is set.
 
 use crate::data::message::UserMessageSink;
-use crate::engine::agent::agent_matrix::matrix_for;
+use crate::engine::agent::first_party::first_party;
 use crate::engine::container::options::{EnvLiteral, EnvVar};
 use crate::engine::error::EngineError;
 use crate::engine::sandbox::dsbx::spawn::SbxCommand;
@@ -24,17 +24,17 @@ use crate::engine::sandbox::dsbx::spawn::SbxCommand;
 pub(super) use crate::engine::auth::service_for_credential;
 
 /// Allowlist of provider auth env vars accepted via `env(VAR)` overlays for
-/// launch-time auto-auth, read from the one per-agent table
-/// ([`AgentMatrix::sandbox_auth_env_vars`], F-32). An unknown agent name has
-/// no entry and therefore no allowlist.
+/// launch-time auto-auth, read from the first-party table
+/// (`AgentDefinition::sandbox_auth_env_vars`, F-32). Any other name (custom
+/// agents never reach sbx) has no entry and therefore no allowlist.
 ///
 /// This used to be a second `match agent` here — a per-agent table outside
-/// `AgentMatrix`, and one the F-32 acceptance grep could not see because it
+/// the agent table, and one the F-32 acceptance grep could not see because it
 /// matched a `&str` parameter rather than `agent.as_str()`.
-pub(super) fn supported_auth_env_vars(agent: &str) -> &'static [&'static str] {
-    matrix_for(agent)
-        .map(|m| m.sandbox_auth_env_vars)
-        .unwrap_or(&[])
+pub(super) fn supported_auth_env_vars(agent: &str) -> Vec<String> {
+    first_party(agent)
+        .map(|d| d.sandbox_auth_env_vars)
+        .unwrap_or_default()
 }
 
 /// Heuristic: does this env-var name look like it carries a secret? Used to
@@ -102,11 +102,11 @@ pub(super) fn auto_auth_env_overlays(
 
     for var in env_passthrough {
         let key = var.0.as_str();
-        if supported.contains(&key) {
+        if supported.iter().any(|s| s == key) {
             let Some(service) = service_for_credential(key) else {
                 // Unreachable while the allowlist test below holds; degrade to
                 // the unsupported-var warning rather than panicking.
-                warn_unsupported_dropped(agent, key, supported, sink);
+                warn_unsupported_dropped(agent, key, &supported, sink);
                 continue;
             };
             if configured_services.contains(&service) {
@@ -125,7 +125,7 @@ pub(super) fn auto_auth_env_overlays(
                 }
             }
         } else if is_credential_like(key) {
-            warn_unsupported_dropped(agent, key, supported, sink);
+            warn_unsupported_dropped(agent, key, &supported, sink);
         }
         // Non-credential vars flow to the agent via session.json as before.
     }
@@ -149,7 +149,7 @@ pub(super) fn auto_auth_env_overlays(
         // count. Deduplicate services so e.g. copilot's GH_TOKEN/GITHUB_TOKEN
         // pair probes `github` once.
         let mut services: Vec<&'static str> = Vec::new();
-        for var in supported {
+        for var in &supported {
             if let Some(service) = service_for_credential(var) {
                 if !services.contains(&service) {
                     services.push(service);
@@ -191,7 +191,7 @@ pub(super) fn auto_auth_env_overlays(
 fn warn_unsupported_dropped(
     agent: &str,
     key: &str,
-    supported: &[&str],
+    supported: &[String],
     sink: &mut dyn UserMessageSink,
 ) {
     let hint = if supported.is_empty() {
@@ -594,7 +594,7 @@ mod tests {
         );
         assert_eq!(supported_auth_env_vars("opencode"), &["ANTHROPIC_API_KEY"]);
         // Agent-kit agents are out of scope for now.
-        for agent in ["antigravity", "crush", "maki", "cline", "unknown"] {
+        for agent in ["antigravity", "cline", "unknown"] {
             assert!(
                 supported_auth_env_vars(agent).is_empty(),
                 "agent-kit agent {agent} must have no auto-auth allowlist"
@@ -609,7 +609,7 @@ mod tests {
         for agent in ["claude", "codex", "gemini", "copilot", "opencode"] {
             for var in supported_auth_env_vars(agent) {
                 assert!(
-                    service_for_credential(var).is_some(),
+                    service_for_credential(&var).is_some(),
                     "allowlisted var {var} (agent {agent}) must map to an sbx service"
                 );
             }
@@ -700,8 +700,8 @@ mod tests {
     fn agent_kit_agent_gets_drop_warning_but_no_manual_auth_warning() {
         let mut sink = VecSink::default();
         auto_auth_env_overlays(
-            "crush",
-            "awman-h-crush",
+            "cline",
+            "awman-h-cline",
             &passthrough(&["ANTHROPIC_API_KEY"]),
             &[],
             &|_| Some("sk-value".into()),
@@ -712,7 +712,7 @@ mod tests {
         assert!(
             sink.messages
                 .iter()
-                .any(|m| { m.text.contains("not yet supported for agent 'crush'") }),
+                .any(|m| { m.text.contains("not yet supported for agent 'cline'") }),
             "agent-kit agents must explain auto-auth is out of scope: {:?}",
             sink.messages
         );

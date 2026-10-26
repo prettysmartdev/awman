@@ -289,6 +289,7 @@ fn render_new(o: &NewOutcome) -> Option<String> {
         NewOutcome::Spec(s) => Some(render_new_spec(s)),
         NewOutcome::Workflow(w) => Some(render_new_workflow(w)),
         NewOutcome::Skill(s) => render_new_skill(s),
+        NewOutcome::Agent(a) => Some(a.render()),
     }
 }
 
@@ -397,6 +398,7 @@ mod tests {
             base_image: StepStatus::Done,
             agent_image: StepStatus::Done,
             image_source: None,
+            agent_definition: None,
             local_agent: StepStatus::Done,
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
@@ -490,6 +492,7 @@ mod tests {
             base_image: StepStatus::Done,
             agent_image: StepStatus::Done,
             image_source: None,
+            agent_definition: None,
             local_agent: StepStatus::Done,
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
@@ -541,6 +544,7 @@ mod tests {
             base_image: StepStatus::Failed("boom".into()),
             agent_image: StepStatus::Pending,
             image_source: None,
+            agent_definition: None,
             local_agent: StepStatus::Pending,
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,

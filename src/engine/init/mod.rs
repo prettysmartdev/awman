@@ -64,6 +64,7 @@ pub struct InitEngine {
     /// `Preflight`, mutates this copy, and saves it — the saved file and the
     /// engine's view can no longer diverge.
     repo_config: RepoConfig,
+    definition: Option<crate::engine::agent::ResolvedAgent>,
 }
 
 impl InitEngine {
@@ -87,6 +88,7 @@ impl InitEngine {
             pending_dockerfile_path: None,
             config_existed_at_start: false,
             repo_config: RepoConfig::default(),
+            definition: None,
         }
     }
 
@@ -111,6 +113,10 @@ impl InitEngine {
 
         let next = match &self.phase {
             InitPhase::Preflight => {
+                self.definition = Some(
+                    self.agent_engine
+                        .resolve_definition(&self.session, &self.options.agent)?,
+                );
                 let _ = self.git_engine;
                 let _ = self.overlay_engine;
                 // Snapshot before creating .awman/ so we can tell whether
@@ -246,22 +252,34 @@ impl InitEngine {
             // Issue 10: Ensure .awman/Dockerfile.<agent> exists.
             InitPhase::SettingUpAgentDockerfile => {
                 let paths = RepoDockerfilePaths::new(&git_root);
-                let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 let project_tag = crate::data::image_tags::project_image_tag(&git_root);
-                if !agent_dockerfile.exists() {
-                    let dl = crate::engine::agent::download::download_agent_dockerfile(
-                        self.options.agent.as_str(),
-                        &agent_dockerfile,
-                        &project_tag,
-                    )
-                    .await;
+                let def = self
+                    .definition
+                    .as_ref()
+                    .expect("init preflight resolved the definition");
+                {
+                    let dl =
+                        crate::engine::agent::provision_agent_dockerfile(def, &paths, &project_tag)
+                            .await;
                     if let Err(e) = dl {
+                        if def.is_custom() {
+                            return Err(EngineError::Other(format!(
+                                "agent Dockerfile render failed: {e}"
+                            )));
+                        }
                         frontend.write_message(crate::data::message::UserMessage {
                             level: crate::data::message::MessageLevel::Warning,
                             text: format!(
                                 "agent Dockerfile download failed: {e}; continuing without it"
                             ),
                         });
+                    } else if let Ok(sync) = dl {
+                        for warning in sync.warnings {
+                            frontend.write_message(crate::data::message::UserMessage {
+                                level: crate::data::message::MessageLevel::Warning,
+                                text: warning,
+                            });
+                        }
                     }
                 }
                 InitPhase::WritingConfig
@@ -379,7 +397,11 @@ impl InitEngine {
                             );
                         }
                         Err(e) => {
-                            let msg = e.to_string();
+                            let msg = self
+                                .definition
+                                .as_ref()
+                                .map(|def| crate::engine::agent::custom_build_failure(def, &e))
+                                .unwrap_or_else(|| e.to_string());
                             self.summary.agent_image_build = StepStatus::Failed(msg.clone());
                             frontend.report_step_status(
                                 &InitStep::BuildAgentImage.into(),
@@ -521,6 +543,20 @@ impl InitEngine {
                         use crate::data::image_tags::agent_image_tag;
                         let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                         if agent_dockerfile.exists() {
+                            let definition = self
+                                .definition
+                                .as_ref()
+                                .expect("init preflight resolved the definition");
+                            let sync = crate::engine::agent::provision_agent_dockerfile(
+                                definition, &paths, &tag,
+                            )
+                            .await?;
+                            for warning in sync.warnings {
+                                frontend.write_message(crate::data::message::UserMessage {
+                                    level: crate::data::message::MessageLevel::Warning,
+                                    text: warning,
+                                });
+                            }
                             let agent_tag = agent_image_tag(&git_root, self.options.agent.as_str());
                             let mut agent_sink = |line: &str| {
                                 frontend.report_step_status(
@@ -528,7 +564,7 @@ impl InitEngine {
                                     StepStatus::Running,
                                 );
                             };
-                            let _ = self.runtime.build_image(
+                            let result = self.runtime.build_image(
                                 &crate::engine::container::BuildRequest::runtime(
                                     &agent_tag,
                                     &agent_dockerfile,
@@ -537,6 +573,14 @@ impl InitEngine {
                                 ),
                                 &mut agent_sink,
                             );
+                            if let Err(error) = result {
+                                let status = StepStatus::Failed(
+                                    crate::engine::agent::custom_build_failure(definition, error),
+                                );
+                                self.summary.agent_image_build = status.clone();
+                                frontend
+                                    .report_step_status(&InitStep::BuildAgentImage.into(), status);
+                            }
                         }
                     }
                 } else {
@@ -751,6 +795,64 @@ mod tests {
     }
 
     // -- Tests ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn custom_init_checks_trust_and_runtime_before_writing() {
+        for approve in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("global");
+            let mut engine = make_engine(temp.path());
+            engine.session = Arc::new(Session::for_tests_isolated(temp.path(), &home));
+            engine.options.agent = AgentName::new("pi").unwrap();
+            let dir = temp.path().join(".awman/agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pi.toml"), "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['install pi']\n").unwrap();
+            if approve {
+                let data = crate::engine::agent::AgentRegistry::load_untrusted(
+                    engine.session.env(),
+                    &engine.options.agent,
+                    Some(temp.path()),
+                )
+                .unwrap();
+                crate::engine::agent::AgentRegistry::record_approval(
+                    engine.session.env(),
+                    data.definition(),
+                    Some(temp.path()),
+                )
+                .unwrap();
+            }
+            let mut runtime = crate::engine::ready::tests::fakes::FakeImportRuntime::new(false);
+            runtime.caps.kit_declarative = true;
+            engine.runtime = Arc::new(runtime);
+            engine.agent_engine = Arc::new(AgentEngine::new(
+                engine.overlay_engine.clone(),
+                engine.runtime.clone(),
+            ));
+            let error = engine
+                .step(&mut FakeInitFrontend::all_yes())
+                .await
+                .unwrap_err();
+            if approve {
+                assert!(matches!(
+                    error,
+                    EngineError::CustomAgentRuntimeUnsupported { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    EngineError::AgentDefinitionUntrusted { .. }
+                ));
+            }
+            for path in [
+                "Dockerfile.dev",
+                ".awman/config.json",
+                ".awman/Dockerfile.pi",
+                "aspec",
+            ] {
+                assert!(!temp.path().join(path).exists(), "init wrote {path}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn each_phase_independently_reachable_via_step() {

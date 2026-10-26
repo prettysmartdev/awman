@@ -388,15 +388,34 @@ impl LocalTaskEvaluator {
     /// `image_exists` → `build_image` pattern
     /// [`ensure_agent_image`] uses one layer up; agent images themselves are
     /// still built by `ensure_agent_image`, not here.
-    fn prepare_directory_workspace_images(
+    async fn prepare_directory_workspace_images(
         &self,
+        session: &Session,
         root: &Path,
         agents: &[String],
         sink: &mut dyn UserMessageSink,
         build_logs: &mut SquadBuildLogs,
     ) -> Result<(), CommandError> {
-        crate::engine::squad::SquadAgentLauncher::ensure_directory_workspace_project(root, agents)
+        for name in agents {
+            let agent = AgentName::new(name.clone()).map_err(CommandError::Data)?;
+            self.engines
+                .agent_engine
+                .resolve_definition(session, &agent)?;
+        }
+        let warnings =
+            crate::engine::squad::SquadAgentLauncher::ensure_directory_workspace_project_with_env(
+                session.env(),
+                root,
+                agents,
+            )
+            .await
             .map_err(CommandError::from)?;
+        for warning in warnings {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: warning,
+            });
+        }
 
         let runtime = self
             .engines
@@ -474,6 +493,7 @@ impl LocalTaskEvaluator {
         // creation path — fails on every run before its leader launches.
         if !task.mount_scope.is_git_repo() {
             self.prepare_directory_workspace_images(
+                &session,
                 &git_root,
                 &directory_workspace_agents(
                     task,
@@ -483,11 +503,21 @@ impl LocalTaskEvaluator {
                 ),
                 &mut sink,
                 &mut build_logs,
-            )?;
+            )
+            .await?;
         }
 
         let dockerfiles = crate::data::RepoDockerfilePaths::new(&git_root);
-        let available_agents = dockerfiles.discover_agent_dockerfiles();
+        let (available_agents, warnings) = self
+            .engines
+            .agent_engine
+            .filter_available_agents(&session, dockerfiles.discover_agent_dockerfiles());
+        for warning in warnings {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: warning,
+            });
+        }
 
         // The agent listing the leader sees: the configured pool where one is
         // set (validated against the repo's Dockerfiles), else discovery.
@@ -1793,8 +1823,8 @@ mod tests {
         let mut pool = HashMap::new();
         pool.insert("codex".to_string(), vec!["gpt-5".to_string()]);
         let agents =
-            directory_workspace_agents(&task, Some("opencode::sonnet"), Some(&pool), Some("crush"));
-        assert_eq!(agents, vec!["claude", "opencode", "crush", "codex"]);
+            directory_workspace_agents(&task, Some("opencode::sonnet"), Some(&pool), Some("cline"));
+        assert_eq!(agents, vec!["claude", "opencode", "cline", "codex"]);
     }
 
     #[test]

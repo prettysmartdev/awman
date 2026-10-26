@@ -135,11 +135,21 @@ impl ResolvedSandboxOptions {
     pub(crate) fn validate_tool_restrictions(
         &self,
     ) -> Result<(), crate::engine::error::EngineError> {
-        let matrix = crate::engine::agent::agent_matrix::matrix_for(&self.agent_id)?;
-        matrix.validate_tool_restrictions(
+        let def = crate::engine::agent::first_party::first_party(&self.agent_id);
+        // Custom agents are refused before any sbx code runs, so one reaching
+        // here is a dispatch bug; refuse it the same way.
+        let Some(def) = def else {
+            return Err(
+                crate::engine::error::EngineError::CustomAgentRuntimeUnsupported {
+                    name: self.agent_id.clone(),
+                    runtime: "docker-sbx-experimental".to_string(),
+                },
+            );
+        };
+        def.validate_tool_restrictions(
             &self.allowed_tools,
             &self.disallowed_tools,
-            crate::engine::agent::agent_matrix::RunParadigm::Sandbox,
+            crate::engine::agent::definition::RunParadigm::Sandbox,
         )
     }
 
@@ -208,7 +218,7 @@ mod restriction_tests {
 
     #[test]
     fn direct_sandbox_options_cannot_bypass_tool_validation() {
-        for agent in crate::engine::agent::agent_matrix::SUPPORTED_AGENTS {
+        for agent in crate::engine::agent::first_party::FIRST_PARTY_AGENTS {
             for allowed in [true, false] {
                 let options = ResolvedSandboxOptions::resolve([
                     SandboxOption::AgentId((*agent).into()),

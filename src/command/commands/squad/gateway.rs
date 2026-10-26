@@ -392,6 +392,10 @@ pub struct LocalTaskGateway {
     /// The daemon's payload-environment metadata (WI 0116 §4). Shared with the
     /// scheduler, which reads the same coverage when it opens a run row.
     env_state: Arc<DaemonEnvState>,
+    /// The daemon's environment, captured when the gateway is built (at
+    /// bootstrap), so agent definitions and trust resolve against the same
+    /// data home the scheduler uses for every later request.
+    env: crate::data::config::env::EnvSnapshot,
 }
 
 impl LocalTaskGateway {
@@ -408,6 +412,7 @@ impl LocalTaskGateway {
             status,
             paths,
             env_state,
+            env: crate::data::config::env::Env::from_process(),
         }
     }
 
@@ -471,11 +476,30 @@ impl LocalTaskGateway {
             for name in env_overlay_names(&task.overlays) {
                 required.entry(name).or_default().push(task.name.clone());
             }
+            for name in self.custom_auth_env_names(task) {
+                required.entry(name).or_default().push(task.name.clone());
+            }
         }
         for name in self.daemon_wide_env_names() {
             required.insert(name, task_names.clone());
         }
         required
+    }
+
+    /// `auth.env` names of the approved custom agents `task` may launch: its
+    /// own agent and every agent in its effective pool (task file over global).
+    /// Forwarding reads them from the same daemon overlay as an `env(NAME)`
+    /// overlay, so they are required on the same terms. Resolution enforces
+    /// trust: an unapproved, invalid or deleted definition contributes no
+    /// name, so the daemon never solicits a secret on its behalf. First-party
+    /// agents keep their own credential paths and add nothing here.
+    fn custom_auth_env_names(&self, task: &Task) -> Vec<String> {
+        task_custom_auth_env_names(
+            &self.env,
+            &self.paths,
+            self.engines.global_config.squad.clone().unwrap_or_default(),
+            task,
+        )
     }
 
     /// `env(NAME)` from the daemon's own overlay sources — its global config
@@ -588,7 +612,7 @@ impl LocalTaskGateway {
         // to validate against — a missing agent image surfaces at launch, the
         // same way it does for any other non-repo-rooted run.
         if let Some(git_root) = &resolved.git_root {
-            validate_agent_dockerfiles(git_root, &agents)?;
+            validate_task_agents(&self.env, git_root, &agents)?;
         }
         Ok(resolved)
     }
@@ -843,7 +867,7 @@ impl TaskGateway for LocalTaskGateway {
             if let Some(pool) = &req.agents_to_models {
                 agents.extend(pool.keys().cloned());
             }
-            validate_agent_dockerfiles(&existing.repo_scope, &agents)?;
+            validate_task_agents(&self.env, &existing.repo_scope, &agents)?;
         }
 
         // The task config is written before the row, so a failed config write
@@ -1263,10 +1287,59 @@ impl TaskGateway for RemoteTaskGateway {
     }
 }
 
-fn validate_agent_dockerfiles(
+fn task_custom_auth_env_names(
+    env: &crate::data::config::env::EnvSnapshot,
+    paths: &SquadPaths,
+    global_squad: SquadConfig,
+    task: &Task,
+) -> Vec<String> {
+    let pool = crate::data::config::global::task_squad_config(paths, &task.name, &global_squad)
+        .unwrap_or(global_squad);
+    let mut agents: BTreeSet<String> = task.agent.iter().cloned().collect();
+    agents.extend(pool.agents_to_models.unwrap_or_default().into_keys());
+    let git_root = task.uses_worktree().then_some(task.repo_scope.as_path());
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for agent in agents {
+        let Ok(agent) = crate::data::session::AgentName::new(&agent) else {
+            continue;
+        };
+        if let Ok(resolved) = crate::engine::agent::AgentRegistry::resolve(env, &agent, git_root) {
+            let def = resolved.definition();
+            if def.is_custom() {
+                names.extend(def.auth_env.iter().cloned());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Every agent a repository-backed task may launch must resolve the way the
+/// scheduler will resolve it (first-party, or an approved custom definition
+/// in the repo or the daemon's global home) *and* have a Dockerfile, so a
+/// deleted, invalid or unapproved definition is refused at create/update
+/// rather than accepted and failed later. Never prompts: the daemon cannot.
+fn validate_task_agents(
+    env: &crate::data::config::env::EnvSnapshot,
     git_root: &std::path::Path,
     agents: &BTreeSet<String>,
 ) -> Result<(), CommandError> {
+    let resolves = |agent: &str| -> Result<(), String> {
+        let name = crate::data::session::AgentName::new(agent).map_err(|e| e.to_string())?;
+        crate::engine::agent::AgentRegistry::resolve(env, &name, Some(git_root))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    let unusable: Vec<(&String, String)> = agents
+        .iter()
+        .filter_map(|agent| resolves(agent).err().map(|e| (agent, e)))
+        .collect();
+    if !unusable.is_empty() {
+        let mut message = String::from("squad task references agents that cannot be used:\n");
+        for (agent, error) in unusable {
+            message.push_str(&format!("  - \"{agent}\": {error}\n"));
+        }
+        return Err(CommandError::Other(message.trim_end().to_string()));
+    }
     let paths = RepoDockerfilePaths::new(git_root);
     let unknown: Vec<_> = agents
         .iter()
@@ -1275,10 +1348,13 @@ fn validate_agent_dockerfiles(
     if unknown.is_empty() {
         return Ok(());
     }
+    // A leftover Dockerfile whose definition is gone (or unapproved) is not
+    // an available agent.
     let available = paths
         .discover_agent_dockerfiles()
         .into_iter()
         .map(|(name, _)| name)
+        .filter(|name| resolves(name).is_ok())
         .collect::<Vec<_>>();
     let mut message =
         String::from("squad task references agents with no Dockerfile in the project:\n");
@@ -1301,6 +1377,54 @@ fn validate_agent_dockerfiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create/update validation resolves each agent like the scheduler will:
+    /// first-party and approved custom agents pass; an unapproved definition,
+    /// or a deleted one with a leftover Dockerfile, is refused per agent and
+    /// is never advertised as available.
+    #[test]
+    fn task_agents_must_resolve_and_leftover_dockerfiles_are_not_available() {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::session::AgentName;
+        use crate::engine::agent::AgentRegistry;
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home.path().to_str().unwrap())]);
+        let awman = repo.path().join(".awman");
+        std::fs::create_dir_all(awman.join("agents")).unwrap();
+        let def = "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['true']\n";
+        for agent in ["claude", "pi", "untrusted", "deleted"] {
+            std::fs::write(awman.join(format!("Dockerfile.{agent}")), "FROM scratch\n").unwrap();
+        }
+        for agent in ["pi", "untrusted"] {
+            std::fs::write(awman.join(format!("agents/{agent}.toml")), def).unwrap();
+        }
+        let pi =
+            AgentRegistry::load_untrusted(&env, &AgentName::new("pi").unwrap(), Some(repo.path()))
+                .unwrap();
+        AgentRegistry::record_approval(&env, pi.definition(), Some(repo.path())).unwrap();
+        let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+
+        validate_task_agents(&env, repo.path(), &set(&["claude", "pi"])).unwrap();
+        for refused in ["untrusted", "deleted"] {
+            let error = validate_task_agents(&env, repo.path(), &set(&["claude", refused]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("\"{refused}\"")), "{error}");
+            assert!(!error.contains("\"claude\""), "{error}");
+        }
+        let error = validate_task_agents(&env, repo.path(), &set(&["deleted"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown agent 'deleted'"), "{error}");
+        // A first-party agent missing its Dockerfile lists only usable agents.
+        std::fs::remove_file(awman.join("Dockerfile.claude")).unwrap();
+        let error = validate_task_agents(&env, repo.path(), &set(&["claude"]))
+            .unwrap_err()
+            .to_string();
+        let available = error.lines().last().unwrap();
+        assert_eq!(available, "Available agents: pi", "{error}");
+    }
 
     /// `--agent-models` is the scripted equivalent of the interview's
     /// agent/model questions, so it has to accept the shapes a user will

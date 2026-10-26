@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::launch_policy::{LaunchModeDecision, LaunchPolicy};
+use crate::command::commands::launch_policy::{
+    ensure_agent_trusted, LaunchModeDecision, LaunchPolicy,
+};
 use crate::command::commands::mount_scope::MountScope;
 use crate::command::commands::parse_overlay_list;
 use crate::command::commands::Command;
@@ -111,6 +113,14 @@ impl Command for ChatCommand {
                 return Err(e);
             }
         };
+        // Review/approve a custom definition before anything resolves it.
+        if let Err(e) = ensure_agent_trusted(&session, &agent, frontend.as_mut()) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("chat: {e}"),
+            });
+            return Err(e);
+        }
 
         // Launch mode is independent of agent resolution.  Resolve it before
         // mount/overlay/setup work so an unsupported ACP request cannot touch
@@ -122,11 +132,11 @@ impl Command for ChatCommand {
                 && session.repo_config().agent.is_some()
                 && session.repo_config().launch_mode
                     == Some(crate::data::config::repo::LaunchMode::Acp));
-        let launch_decision = match LaunchPolicy::resolve_launch_mode(&config, &agent, explicit_acp)
-        {
-            Ok(decision) => decision,
-            Err(e) => return Err(CommandError::from(e)),
-        };
+        let launch_decision =
+            match LaunchPolicy::resolve_launch_mode(&session, &config, &agent, explicit_acp) {
+                Ok(decision) => decision,
+                Err(e) => return Err(CommandError::from(e)),
+            };
         if launch_decision == LaunchModeDecision::StdioWithFallbackWarning {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,

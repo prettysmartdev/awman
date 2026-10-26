@@ -432,6 +432,7 @@ impl HasAgentFrontend for FakeFrontend {
     }
 }
 
+impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeFrontend {}
 impl AgentLaunchFrontend for FakeFrontend {
     fn set_pty_active(&mut self, active: bool) {
         self.log.lock().unwrap().pty_active.push(active);

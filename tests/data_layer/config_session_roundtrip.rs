@@ -296,15 +296,13 @@ fn session_touch_advances_last_active_at() {
 // ─── AgentName validation ─────────────────────────────────────────────────────
 
 #[test]
-fn agent_name_all_valid_agent_matrix() {
+fn agent_name_all_valid_first_party() {
     for name in &[
         "claude",
         "codex",
         "opencode",
-        "maki",
         "gemini",
         "copilot",
-        "crush",
         "cline",
         "antigravity",
     ] {

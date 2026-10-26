@@ -20,7 +20,55 @@ impl OverlayEngine {
         if !include_all && names.is_empty() {
             return Ok(vec![]);
         }
-        let skill_dirs = crate::data::fs::skill_dirs::SkillDirs::from_process_env(None)
+        let definition = resolve_definition(agent, git_root);
+        self.skill_overlays_for(
+            definition.as_deref(),
+            agent,
+            include_all,
+            names,
+            container_home_override,
+            git_root,
+        )
+    }
+
+    /// [`Self::skill_overlays`] for an already-resolved definition. `None`
+    /// means `agent` did not resolve: the overlay is skipped with a warning.
+    pub(crate) fn skill_overlays_for(
+        &self,
+        definition: Option<&AgentDefinition>,
+        agent: &AgentName,
+        include_all: bool,
+        names: &[String],
+        container_home_override: &Option<String>,
+        git_root: &Path,
+    ) -> Result<Vec<OverlaySpec>, EngineError> {
+        self.skill_overlays_for_with_env(
+            &crate::data::config::env::Env::from_process(),
+            definition,
+            agent,
+            include_all,
+            names,
+            container_home_override,
+            git_root,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn skill_overlays_for_with_env(
+        &self,
+        env: &crate::data::config::env::EnvSnapshot,
+        definition: Option<&AgentDefinition>,
+        agent: &AgentName,
+        include_all: bool,
+        names: &[String],
+        container_home_override: &Option<String>,
+        git_root: &Path,
+    ) -> Result<Vec<OverlaySpec>, EngineError> {
+        // Early return when no skills requested.
+        if !include_all && names.is_empty() {
+            return Ok(vec![]);
+        }
+        let skill_dirs = crate::data::fs::skill_dirs::SkillDirs::from_env(env, None)
             .map_err(EngineError::Data)?;
         let host_skills_dir = skill_dirs.global_dir();
         if !host_skills_dir.exists() {
@@ -37,9 +85,9 @@ impl OverlayEngine {
                 .unwrap_or_else(|| "/root".to_string())
         });
 
-        // Where this agent reads skills from, per the one per-agent table.
-        let container_path = match matrix_for(agent.as_str()) {
-            Ok(matrix) => match matrix.skills_mount {
+        // Where this agent reads skills from, per its definition.
+        let container_path = match definition {
+            Some(def) => match &def.skills_mount {
                 Some(rel) => format!("{container_home}/{rel}"),
                 None => {
                     tracing::warn!(
@@ -49,7 +97,7 @@ impl OverlayEngine {
                     return Ok(vec![]);
                 }
             },
-            Err(_) => {
+            None => {
                 tracing::warn!(
                     agent = agent.as_str(),
                     "skills overlay: unknown agent, skipping"

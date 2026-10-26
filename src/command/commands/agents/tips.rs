@@ -19,7 +19,7 @@ pub const TIPS: &[&str] = &[
     "`awman ready --json` prints a machine-readable readiness report for scripts and CI.",
     "Run `awman` from any subdirectory of a Git repo — it locates the root automatically.",
     "Run `awman` with no arguments to open the TUI; add a subcommand to run it once and exit.",
-    "Supported agents: Claude, Codex, Opencode, Maki, Gemini, Copilot, Crush, Cline and Antigravity.",
+    "Built-in agents: Claude, Codex, Opencode, Gemini, Copilot, Cline and Antigravity.",
     // ── Agent sessions ───────────────────────────────────────────────────────
     "`awman chat` opens an interactive chat session with your configured agent.",
     "`awman chat --plan` starts the agent in read-only plan mode.",
@@ -51,6 +51,8 @@ pub const TIPS: &[&str] = &[
     "`awman new skill` creates a skill; add `--global` to share it with every repo.",
     "`awman new skill --pull github.com/obra/superpowers` pulls a published skills library.",
     "`awman new skill --pull-all` refreshes every skills library you've pulled.",
+    "`awman new skill --pull builtin` pulls awman's own skills, like `create-custom-agent`.",
+    "`awman new agent <name>` scaffolds a custom agent definition in `.awman/agents/`.",
     // ── Overlays ─────────────────────────────────────────────────────────────
     "`--overlay \"dir(~/notes:/mnt/notes:ro)\"` mounts a host directory into the agent read-only.",
     "The `ssh()` overlay gives the agent your SSH keys so it can push to remotes.",

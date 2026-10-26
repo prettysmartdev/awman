@@ -727,6 +727,23 @@ mod tests {
         AuthEngine::with_paths(AuthPathResolver::at_home(home), ApiPaths::at_root(api_root))
     }
 
+    /// A custom agent name (no first-party entry) takes every `_ =>` path:
+    /// no host artefacts, no keychain credentials, nothing refreshable.
+    #[test]
+    fn a_custom_agent_name_has_no_host_credentials() {
+        let tmp = tempfile::tempdir().expect("scratch");
+        let engine = engine_with(tmp.path(), tmp.path());
+        let agent = AgentName::new("pi").unwrap();
+        let status = engine.list_agent_credentials(&agent).unwrap();
+        assert!(!status.config_file_present);
+        assert!(!status.settings_dir_present);
+        assert!(status.keychain_env_vars.is_empty());
+        assert!(!status.refreshable);
+        assert!(keychain::refreshable_spec_for(&agent).is_none());
+        let creds = engine.agent_env_credentials(&agent).unwrap();
+        assert!(creds.env_vars.is_empty());
+    }
+
     // ── verify_bearer / request_auth_mode ────────────────────────────────────
 
     fn enabled_for(key: &str) -> (AuthEngine, AuthMode) {

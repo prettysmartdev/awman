@@ -649,6 +649,10 @@ impl WorkflowFrontend for CliParallelFrontend {
     }
 }
 
+/// Parallel workflow steps run after preflight has already reviewed every
+/// agent, so this frontend never asks: it keeps the default refusal.
+impl crate::command::commands::agent_trust::AgentTrustFrontend for CliParallelFrontend {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

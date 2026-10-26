@@ -64,6 +64,10 @@ pub struct ReadyEngine {
     /// (F-38). `awman ready`'s local-agent check is authorized trigger (a)
     /// in `security.md`.
     host_agent: Arc<dyn ReadyHostPing>,
+    /// `options.agent` resolved once, on the first step, and read by every
+    /// later phase (the host ping included) so one `ready` run never mixes
+    /// two versions of a definition.
+    definition: Option<crate::engine::agent::ResolvedAgent>,
     preparer: crate::engine::image_prep::AgentImagePreparer,
     image_policy: crate::engine::image_prep::BuildPolicy,
     cancel: crate::engine::oci::CancelToken,
@@ -120,7 +124,8 @@ impl ReadyEngine {
                 data_home,
                 context,
             ),
-        };
+        }
+        .with_definition_env(session.env().clone());
         let image_policy = crate::engine::image_prep::BuildPolicy::Ready {
             build: options.build,
             no_cache: options.no_cache,
@@ -145,6 +150,7 @@ impl ReadyEngine {
             summary,
             pre_audit_dockerfile_hash: None,
             host_agent: Arc::new(HostAgentPinger::new()),
+            definition: None,
             preparer,
             image_policy,
             cancel,

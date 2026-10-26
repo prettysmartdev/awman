@@ -144,20 +144,38 @@ impl SquadAgentLauncher {
     /// the very first evaluation of a default-workspace task fails before the
     /// leader is ever launched.
     ///
-    /// Every write is **create-if-missing**. The durable workspace belongs to the
-    /// task for its whole lifetime (WI 0106 §6a), so a Dockerfile the user (or the
-    /// leader) has since edited is never overwritten — this only fills in what is
-    /// absent, from the same bundled templates `awman init` writes into a fresh
-    /// repository.
-    ///
-    /// Agents with no bundled template are skipped: `ensure_agent_image`'s existing
-    /// "agent has no Dockerfile" error is the right report for those.
-    pub fn ensure_directory_workspace_project(
+    /// The project Dockerfile is create-if-missing. Agent Dockerfiles use the
+    /// shared sync rule: custom generated files track approved definitions;
+    /// hand-maintained files survive. Unknown or unapproved agents fail here.
+    pub async fn ensure_directory_workspace_project(
         root: &Path,
         agents: &[String],
     ) -> Result<(), EngineError> {
+        Self::ensure_directory_workspace_project_with_env(
+            &crate::data::config::env::Env::from_process(),
+            root,
+            agents,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn ensure_directory_workspace_project_with_env(
+        env: &crate::data::config::env::EnvSnapshot,
+        root: &Path,
+        agents: &[String],
+    ) -> Result<Vec<String>, EngineError> {
         std::fs::create_dir_all(root).map_err(|e| EngineError::io(root, e))?;
         let paths = RepoDockerfilePaths::new(root);
+        let mut definitions = Vec::new();
+        for agent in agents {
+            let name = AgentName::new(agent)?;
+            definitions.push(crate::engine::agent::AgentRegistry::resolve(
+                env,
+                &name,
+                Some(root),
+            )?);
+        }
 
         let project = paths.project_dockerfile();
         if !project.exists() {
@@ -166,20 +184,13 @@ impl SquadAgentLauncher {
         }
 
         let base_tag = crate::data::image_tags::project_image_tag(root);
-        let awman_dir = paths.awman_dir();
-        for agent in agents {
-            let Some(template) = crate::data::templates::agent_dockerfile_for(agent) else {
-                continue;
-            };
-            let dest = paths.agent_dockerfile(agent);
-            if dest.exists() {
-                continue;
-            }
-            std::fs::create_dir_all(&awman_dir).map_err(|e| EngineError::io(&awman_dir, e))?;
-            std::fs::write(&dest, template.replace("{{AWMAN_BASE_IMAGE}}", &base_tag))
-                .map_err(|e| EngineError::io(&dest, e))?;
+        let mut warnings = Vec::new();
+        for def in definitions {
+            let sync =
+                crate::engine::agent::provision_agent_dockerfile(&def, &paths, &base_tag).await?;
+            warnings.extend(sync.warnings);
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Drive a launched unattended agent to completion with the same stuck →
@@ -627,12 +638,13 @@ mod tests {
     /// `.awman/Dockerfile.<agent>`, so `ensure_agent_image` has nothing to
     /// build from and a default-workspace task cannot launch its leader at
     /// all. Scaffolding fills both in from the bundled templates.
-    #[test]
-    fn a_plain_directory_workspace_gains_the_image_sources_it_needs() {
+    #[tokio::test]
+    async fn a_plain_directory_workspace_gains_the_image_sources_it_needs() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");
 
         SquadAgentLauncher::ensure_directory_workspace_project(&root, &["claude".to_string()])
+            .await
             .unwrap();
 
         let paths = RepoDockerfilePaths::new(&root);
@@ -667,8 +679,8 @@ mod tests {
     /// The durable workspace belongs to the task for its whole lifetime, so
     /// scaffolding is create-if-missing: an edited Dockerfile survives every
     /// later run untouched.
-    #[test]
-    fn scaffolding_never_overwrites_an_existing_dockerfile() {
+    #[tokio::test]
+    async fn scaffolding_never_overwrites_an_existing_dockerfile() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let paths = RepoDockerfilePaths::new(&root);
@@ -677,8 +689,10 @@ mod tests {
         std::fs::write(paths.agent_dockerfile("claude"), "FROM my-own-agent\n").unwrap();
 
         SquadAgentLauncher::ensure_directory_workspace_project(&root, &["claude".to_string()])
+            .await
             .unwrap();
         SquadAgentLauncher::ensure_directory_workspace_project(&root, &["claude".to_string()])
+            .await
             .unwrap();
 
         assert_eq!(
@@ -693,16 +707,67 @@ mod tests {
 
     /// An agent with no bundled template is left to `ensure_agent_image`'s
     /// existing "agent has no Dockerfile" error rather than being invented.
-    #[test]
-    fn an_unknown_agent_is_left_for_the_existing_missing_dockerfile_error() {
+    #[tokio::test]
+    async fn directory_workspace_renders_approved_custom_agents_with_the_session_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("global");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([(
+            "AWMAN_CONFIG_HOME",
+            home.to_str().unwrap(),
+        )]);
+        crate::engine::agent::custom::install_crush_fixture(&root, &env);
+        SquadAgentLauncher::ensure_directory_workspace_project_with_env(
+            &env,
+            &root,
+            &["crush".into()],
+        )
+        .await
+        .unwrap();
+        let paths = RepoDockerfilePaths::new(&root);
+        let rendered = std::fs::read_to_string(paths.agent_dockerfile("crush")).unwrap();
+        assert!(rendered.starts_with(crate::engine::agent::custom::DOCKERFILE_HEADER_PREFIX));
+        assert!(rendered.contains(&format!(
+            "FROM {}",
+            crate::data::image_tags::project_image_tag(&root)
+        )));
+        std::fs::remove_file(home.join("trusted-agents.json")).unwrap();
+        let error = SquadAgentLauncher::ensure_directory_workspace_project_with_env(
+            &env,
+            &root,
+            &["crush".into()],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::AgentDefinitionUntrusted { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_dockerfile("crush")).unwrap(),
+            rendered
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_agent_surfaces_unknown_agent() {
         let tmp = tempfile::tempdir().unwrap();
-        SquadAgentLauncher::ensure_directory_workspace_project(
+        let paths = RepoDockerfilePaths::new(tmp.path());
+        std::fs::create_dir_all(paths.awman_dir()).unwrap();
+        std::fs::write(
+            paths.agent_dockerfile("not-a-real-agent"),
+            "# awman-generated from repo:deleted\nFROM project\n",
+        )
+        .unwrap();
+        let error = SquadAgentLauncher::ensure_directory_workspace_project(
             tmp.path(),
             &["not-a-real-agent".to_string()],
         )
-        .unwrap();
-        assert!(!RepoDockerfilePaths::new(tmp.path())
-            .agent_dockerfile("not-a-real-agent")
-            .exists());
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, EngineError::UnknownAgent { name, .. } if name == "not-a-real-agent")
+        );
     }
 }

@@ -32,6 +32,12 @@ pub(super) async fn run(
             for (slug, result) in slugs.into_iter().zip(results) {
                 match result {
                     Ok(outcome) => {
+                        if let Some(warning) = &outcome.sparse_fallback_warning {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Warning,
+                                text: warning.clone(),
+                            });
+                        }
                         frontend.write_message(pull_success_message(&outcome));
                         successes += 1;
                         libraries.push(pull_library_outcome(outcome));
@@ -109,6 +115,12 @@ pub(super) async fn run(
                     return Err(error);
                 }
             };
+            if let Some(warning) = &outcome.sparse_fallback_warning {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: warning.clone(),
+                });
+            }
             frontend.write_message(pull_success_message(&outcome));
             let path = outcome.dir.display().to_string();
             NewOutcome::Skill(NewSkillOutcome {

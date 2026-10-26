@@ -45,6 +45,11 @@
 //! | [`delete_task_dir`](HeadlessDefaults::delete_task_dir) | `false` | `false` | `false` |
 //! | [`spec_kind`](HeadlessDefaults::spec_kind) | `Task` | `Task` | `Task` |
 //!
+//! Approving a custom agent definition (`agent_trust::ensure_agent_trusted`)
+//! deliberately has **no row**: no profile, and no `--yes`, ever answers it.
+//! A host with nobody to ask refuses with `AgentDefinitionUntrusted`, which
+//! tells the user to run `awman ready --agent <name>` interactively.
+//!
 //! Every row reproduces what the three frontends answered before F-13. The
 //! table-driven test at the bottom of this file is the contract: it asserts
 //! each cell, so changing a policy means changing the test, which means the

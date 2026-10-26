@@ -19,6 +19,8 @@ pub struct AgentCredentialHealth {
 pub struct ReadySummary {
     pub runtime_name: String,
     pub dockerfile: StepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition: Option<StepStatus>,
     pub base_image: StepStatus,
     pub agent_image: StepStatus,
     pub local_agent: StepStatus,
@@ -56,6 +58,7 @@ impl ReadySummary {
         Self {
             runtime_name: runtime_name.into(),
             dockerfile: StepStatus::Pending,
+            agent_definition: None,
             base_image: StepStatus::Pending,
             agent_image: StepStatus::Pending,
             local_agent: StepStatus::Pending,
@@ -104,6 +107,9 @@ impl ReadySummary {
         if let Some(status) = &self.image_source {
             rows.insert(3, ("Image source".to_string(), status.clone()));
         }
+        if let Some(status) = &self.agent_definition {
+            rows.insert(1, ("Agent definition".to_string(), status.clone()));
+        }
         // The ready engine reports a single consolidated entry — either
         // "Other agents" (all OK) or "Missing images" (warn) — and its label
         // is rendered verbatim.
@@ -141,6 +147,7 @@ impl ReadySummary {
         [&self.dockerfile, &self.local_agent, &self.image_rebuild]
             .into_iter()
             .any(failed)
+            || self.agent_definition.as_ref().is_some_and(failed)
             || self.non_default_agent_images.iter().any(|(_, s)| failed(s))
             || self.has_image_failures()
     }
@@ -172,6 +179,10 @@ impl ReadySummary {
     /// session setup.
     pub fn is_ready(&self) -> bool {
         !self.has_image_failures()
+            && self
+                .agent_definition
+                .as_ref()
+                .is_none_or(|s| *s == StepStatus::Done)
             && self.base_image.is_terminal()
             && self.agent_image.is_terminal()
             && self
@@ -197,6 +208,9 @@ impl ReadySummary {
             ("Base image".into(), &self.base_image),
             ("Agent image".into(), &self.agent_image),
         ];
+        if let Some(status) = &self.agent_definition {
+            stages.insert(0, ("Agent definition".into(), status));
+        }
         if let Some(status) = &self.image_source {
             stages.push(("Image source".into(), status));
         }

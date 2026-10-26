@@ -7,9 +7,8 @@ use crate::data::config::overlays::{ContextScope, DirectorySpec};
 use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::image_tags::agent_image_tag;
 use crate::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
-use crate::engine::agent::agent_matrix::{
-    matrix_for, SettingsMount, SystemPromptMode, SUPPORTED_AGENTS,
-};
+use crate::engine::agent::definition::{SettingsMount, SystemPromptMode};
+use crate::engine::agent::first_party::{first_party, FIRST_PARTY_AGENTS};
 use crate::engine::agent::{AgentEngine, AgentRunOptions};
 use crate::engine::agent_runtime::{
     AgentRuntimeEngine, Capabilities, ReadyAgentOptions, ResolvedAgentOptions,
@@ -132,8 +131,8 @@ fn world(image_home: Option<&str>) -> World {
     }
     // Every agent gets host settings, so every settings family is exercised.
     let resolver = AuthPathResolver::at_home(&home);
-    for agent in SUPPORTED_AGENTS {
-        if let SettingsMount::Direct(relative) = matrix_for(agent).unwrap().settings_mount {
+    for agent in FIRST_PARTY_AGENTS {
+        if let SettingsMount::Direct(relative) = first_party(agent).unwrap().settings_mount {
             let dir = home.join(relative);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("settings.json"), b"{\"host\":true}").unwrap();
@@ -161,7 +160,7 @@ fn world(image_home: Option<&str>) -> World {
         }),
     );
     let rig = Rig::new("session-a");
-    for agent in SUPPORTED_AGENTS {
+    for agent in FIRST_PARTY_AGENTS {
         rig.driver
             .state
             .lock()
@@ -256,27 +255,47 @@ fn window(argv: &[String], first: &str, second: &str) -> bool {
 #[test]
 fn every_settings_family_and_prompt_mode_belongs_to_some_agent() {
     let mut settings = [false; 4];
-    let mut prompts = [false; 7];
-    for agent in SUPPORTED_AGENTS {
-        let matrix = matrix_for(agent).unwrap();
+    // `Unsupported` delivery has no first-party agent since crush and maki
+    // became custom definitions; it is covered through a custom fixture.
+    let mut prompts = [false; 6];
+    for agent in FIRST_PARTY_AGENTS {
+        let matrix = first_party(agent).unwrap();
         settings[match matrix.settings_mount {
             SettingsMount::None => 0,
             SettingsMount::Direct(_) => 1,
             SettingsMount::Claude => 2,
             SettingsMount::Antigravity => 3,
         }] = true;
-        prompts[match matrix.system_prompt_delivery {
-            SystemPromptMode::Append => 0,
-            SystemPromptMode::AppendInline { .. } => 1,
-            SystemPromptMode::Replace => 2,
-            SystemPromptMode::AgentsMd => 3,
-            SystemPromptMode::EnvFile { .. } => 4,
-            SystemPromptMode::AddDir { .. } => 5,
-            SystemPromptMode::Unsupported => 6,
-        }] = true;
+        match matrix.system_prompt_delivery {
+            SystemPromptMode::Append => prompts[0] = true,
+            SystemPromptMode::AppendInline { .. } => prompts[1] = true,
+            SystemPromptMode::Replace => prompts[2] = true,
+            SystemPromptMode::AgentsMd => prompts[3] = true,
+            SystemPromptMode::EnvFile { .. } => prompts[4] = true,
+            SystemPromptMode::AddDir { .. } => prompts[5] = true,
+            SystemPromptMode::Unsupported => panic!("{agent}: unexpected Unsupported delivery"),
+        }
     }
     assert_eq!(settings, [true; 4], "a SettingsMount family has no agent");
-    assert_eq!(prompts, [true; 7], "a SystemPromptMode has no agent");
+    assert_eq!(prompts, [true; 6], "a SystemPromptMode has no agent");
+}
+
+#[test]
+fn unsupported_prompt_delivery_is_planned_for_a_custom_agent() {
+    let mut world = world(Some(HOME));
+    world.session = Session::for_tests_isolated(&world.git_root, &world.home.join(".awman"));
+    crate::engine::agent::custom::install_crush_fixture(&world.git_root, world.session.env());
+    world
+        .rig
+        .driver
+        .state
+        .lock()
+        .unwrap()
+        .images
+        .insert(agent_image_tag(&world.git_root, "crush"), fixture_image());
+    let plan = world.plan("crush", &world.run_options(false)).unwrap();
+    assert!(!plan.command.argv.iter().any(|arg| arg.contains(PROMPT)));
+    assert!(plan.command.argv.iter().any(|arg| arg == "crush"));
 }
 
 #[test]
@@ -284,8 +303,8 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
     let world = world(Some(HOME));
     for non_interactive in [false, true] {
         let run = world.run_options(non_interactive);
-        for agent in SUPPORTED_AGENTS {
-            let matrix = matrix_for(agent).unwrap();
+        for agent in FIRST_PARTY_AGENTS {
+            let matrix = first_party(agent).unwrap();
             let plan = world
                 .plan(agent, &run)
                 .unwrap_or_else(|e| panic!("{agent} (non_interactive={non_interactive}): {e}"));
@@ -322,7 +341,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
             // Settings family, rooted at the imported image's HOME.
             let resolver = AuthPathResolver::at_home(&world.home);
             let host_settings = resolver.resolve(agent).settings_dir;
-            match matrix.settings_mount {
+            match &matrix.settings_mount {
                 SettingsMount::None => {
                     assert!(
                         mounts.iter().all(|m| !m.guest.starts_with("/home/probe/.")),
@@ -356,6 +375,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                 SystemPromptMode::Append => {
                     let flag = matrix
                         .system_prompt_flag
+                        .as_deref()
                         .unwrap_or("--append-system-prompt-file");
                     let guest = argv
                         .windows(2)
@@ -367,14 +387,14 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                     assert_eq!(std::fs::read_to_string(&m.host).unwrap(), PROMPT);
                 }
                 SystemPromptMode::AppendInline { key } => {
-                    let flag = matrix.system_prompt_flag.unwrap_or("--config");
+                    let flag = matrix.system_prompt_flag.as_deref().unwrap_or("--config");
                     assert!(
                         window(argv, flag, &format!("{key}={PROMPT}")),
                         "{context}: {argv:?}"
                     );
                 }
                 SystemPromptMode::Replace => {
-                    let flag = matrix.system_prompt_flag.unwrap_or("--system");
+                    let flag = matrix.system_prompt_flag.as_deref().unwrap_or("--system");
                     let text = argv
                         .windows(2)
                         .find(|w| w[0] == flag)
@@ -412,7 +432,7 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
             }
 
             // The non-interactive subcommand or flag appears exactly once.
-            if let Some(flag) = matrix.non_interactive_flag {
+            if let Some(flag) = matrix.non_interactive_flag.as_deref() {
                 let count = argv.iter().filter(|a| a.as_str() == flag).count();
                 assert_eq!(
                     count,
@@ -433,9 +453,9 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
                 assert_eq!(plan.seeded_prompt, None, "{context}");
                 assert_eq!(argv.last().unwrap(), "task: fix it", "{context}");
             }
-            for (key, value) in matrix.static_env {
+            for (key, value) in &matrix.static_env {
                 assert!(
-                    plan.command.env.contains(&((*key).into(), (*value).into())),
+                    plan.command.env.contains(&(key.clone(), value.clone())),
                     "{context}: static env {key}"
                 );
             }
@@ -451,14 +471,14 @@ fn every_agent_plans_every_overlay_settings_and_prompt_variant() {
 #[test]
 fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
     use crate::data::config::repo::LaunchMode;
-    use crate::engine::agent::agent_matrix::ModelFlagDelivery;
+    use crate::engine::agent::definition::ModelFlagDelivery;
     use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
     use crate::engine::error::ToolRestriction;
 
     let world = world(Some(HOME));
     let mut checked = 0;
-    for agent in SUPPORTED_AGENTS {
-        let matrix = matrix_for(agent).unwrap();
+    for agent in FIRST_PARTY_AGENTS {
+        let matrix = first_party(agent).unwrap();
         let model = (!matches!(matrix.model_flag, ModelFlagDelivery::Unsupported))
             .then(|| "some-model".to_string());
         let mut table: Vec<(&str, AgentRunOptions)> = vec![
@@ -514,7 +534,7 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
                 ..world.run_options(true)
             },
         ));
-        if matrix.plan_flag.is_some() {
+        if !matrix.plan_flags.is_empty() {
             table.push((
                 "plan",
                 AgentRunOptions {
@@ -633,14 +653,14 @@ fn docker_apple_and_builtin_render_the_same_agent_argv_for_every_agent() {
             checked += 1;
         }
     }
-    assert!(checked >= SUPPORTED_AGENTS.len() * 6);
+    assert!(checked >= FIRST_PARTY_AGENTS.len() * 6);
 }
 
 #[test]
 fn a_missing_image_home_is_refused_instead_of_guessing_root() {
     let world = world(None);
     let run = world.run_options(false);
-    for agent in SUPPORTED_AGENTS {
+    for agent in FIRST_PARTY_AGENTS {
         match world.plan(agent, &run) {
             Err(EngineError::Config(message)) => {
                 assert!(message.contains("HOME"), "{agent}: {message}")
@@ -693,11 +713,11 @@ fn acp_launch_keeps_the_agent_entrypoint_and_is_persistent() {
 #[test]
 fn named_and_all_skill_overlays_reach_the_builtin_plan() {
     let config = tempfile::tempdir().unwrap();
-    let _home = crate::data::config::env::ConfigHomeGuard::set(config.path());
     let skill = config.path().join("skills/review");
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(skill.join("SKILL.md"), "synthetic review skill").unwrap();
-    let world = world(Some(HOME));
+    let mut world = world(Some(HOME));
+    world.session = Session::for_tests_isolated(&world.git_root, config.path());
     for all in [false, true] {
         let mut run = world.run_options(false);
         run.include_all_skills = all;
@@ -705,7 +725,7 @@ fn named_and_all_skill_overlays_reach_the_builtin_plan() {
         let plan = world.plan("codex", &run).unwrap();
         let base = format!(
             "{HOME}/{}",
-            matrix_for("codex").unwrap().skills_mount.unwrap()
+            first_party("codex").unwrap().skills_mount.unwrap()
         );
         let destination = if all { base } else { format!("{base}/review") };
         let mounted = mount(&plan, &destination).expect("resolved skill reaches builtin");

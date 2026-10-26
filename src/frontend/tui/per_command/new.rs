@@ -1,11 +1,22 @@
 //! `NewCommandFrontend` impl for the TUI.
 
-use crate::command::commands::new::NewCommandFrontend;
+use crate::command::commands::new::{NewAgentOutcome, NewCommandFrontend};
 use crate::command::error::CommandError;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
 impl NewCommandFrontend for TuiCommandFrontend {
+    /// One status-log entry per line: the log draws each entry as one line.
+    fn show_new_agent(&mut self, outcome: &NewAgentOutcome) {
+        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+        for line in outcome.render().lines() {
+            self.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: line.to_string(),
+            });
+        }
+    }
+
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
         let response = self.ask_dialog(DialogRequest::TextInput {
             title: "Workflow name".into(),

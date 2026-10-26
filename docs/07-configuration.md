@@ -227,7 +227,18 @@ awman config set --global default_agent gemini   # for all projects
 awman config set agent codex                     # for this repo only
 ```
 
-Valid agents: `claude`, `codex`, `gemini`, `opencode`, `crush`, `cline`, `copilot`, `maki`, `antigravity`. Anything else is rejected at write time.
+Valid agents: `claude`, `codex`, `gemini`, `opencode`, `cline`, `copilot`, `antigravity`, or the name of a [custom agent](15-custom-agents.md). A repo-scope write accepts custom agents defined in the repo or globally; a `--global` write accepts only globally defined ones. Anything else is rejected at write time with the list of valid agents.
+
+### Custom agent definitions and approvals
+
+`agent` and `default_agent` accept the names of [custom agents](15-custom-agents.md). Definitions are TOML files:
+
+| Path | Scope |
+|------|-------|
+| `<git_root>/.awman/agents/<name>.toml` | This repo (wins over a global definition of the same name) |
+| `~/.awman/agents/<name>.toml` | Every repo |
+
+Your approvals of custom definitions are recorded in `~/.awman/trusted-agents.json`. Each entry is tied to the repo and the content hash of the definition, so editing a definition asks you to approve it again. The global paths follow your global files if you [relocate them](#where-global-files-live).
 
 ### Adjust terminal scrollback
 
@@ -615,7 +626,7 @@ Value handling:
 
 - `yoloDisallowedTools`, `overlays`, `api.workDirs` — comma-separated values are stored as arrays; an empty string stores an empty array.
 - `terminal_scrollback_lines`, `agentStuckTimeout`, `api.port`, `maxConcurrentAgents`, `dynamicWorkflows.maxConcurrentSteps` — must be positive integers; `0` is rejected.
-- `agent`, `default_agent` — validated against the supported agent list.
+- `agent`, `default_agent` — validated against the built-in agents and the custom agents defined in the scope being written.
 - `dynamicWorkflows.defaultLeader` — must be in `agent::model` format (exactly two non-empty, non-whitespace components).
 - `dynamicWorkflows.guidance.<index>` — a single free-form instruction string, capped at 1,000 characters and 50 entries total; empty or whitespace-only values are rejected on load and coerced to a removal when set via `config set`.
 - `envPassthrough` — removed; the error message points you to `env(VAR)` overlay entries.

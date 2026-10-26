@@ -1239,7 +1239,7 @@ per-repo build artifacts, not per-agent CLI behavior, and never lived here.)
 tables in the tree — a new agent or a new container backend is
 a single-file edit to one of the two.
 
-Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline`.
+Supported built-in agents: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`. Other agents are added through [custom agent definitions](15-custom-agents.md).
 
 Key per-agent distinctions:
 
@@ -1251,8 +1251,6 @@ Key per-agent distinctions:
 | `gemini` | `gemini` | varies | `--approval-mode=plan` |
 | `copilot` | `copilot -i` | varies | `--plan` |
 | `cline` | `cline` | `task` subcommand | `--plan` |
-| `crush` | `crush` | `run` subcommand | (unsupported — error) |
-| `maki` | `maki` | varies | (unsupported — error) |
 | `antigravity` | `agy` | `--print` | (unsupported — error) |
 
 `antigravity`'s `ping_argv` is `["antigravity", "--print"]` — a different

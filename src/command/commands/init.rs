@@ -9,6 +9,7 @@ use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::session::AgentName;
 use crate::data::step_status::StepStatus;
+use crate::engine::agent::registry::AgentRegistry;
 use crate::engine::init::{InitEngine, InitEngineOptions, InitFrontend, InitSummary};
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,23 @@ impl Command for InitCommand {
             }
         };
         let session = self.session;
+        // `--agent` is free-form: any first-party name or a custom definition
+        // discovered for this repo. Anything else is the same `unknown agent`
+        // error a launch would give, before init writes anything.
+        let root = Some(session.definition_root());
+        if !AgentRegistry::list(session.env(), root).contains(agent_name.as_str()) {
+            let cmd_err = CommandError::Engine(AgentRegistry::unknown(
+                session.env(),
+                agent_name.as_str(),
+                root,
+                false,
+            ));
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("init: {cmd_err}"),
+            });
+            return Err(cmd_err);
+        }
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
             text: format!("init: resolved git root at {:?}", session.git_root()),

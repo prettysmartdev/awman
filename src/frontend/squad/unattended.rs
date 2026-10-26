@@ -760,6 +760,10 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
     }
 }
 
+/// Nobody is attached to an unattended squad run, so a custom definition that
+/// needs approval is refused, never approved.
+impl crate::command::commands::agent_trust::AgentTrustFrontend for UnattendedFrontend {}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

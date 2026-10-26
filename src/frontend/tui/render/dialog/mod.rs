@@ -101,6 +101,7 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         dialogs::Dialog::Custom { title, body, keys } => {
             misc::render_custom(title, body, keys, area, frame)
         }
+        dialogs::Dialog::Review(state) => misc::render_review(state, area, frame),
         dialogs::Dialog::FatalError { title, body } => {
             misc::render_fatal_error(title, body, area, frame)
         }

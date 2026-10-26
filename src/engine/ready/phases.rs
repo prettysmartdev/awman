@@ -47,6 +47,78 @@ impl ReadyEngine {
         let _ = &self.git_engine;
         let _ = &self.overlay_engine;
 
+        // Resolve the agent once, before any phase (the kit branch included)
+        // reads it. An unknown agent fails here, before anything is built or
+        // run on the host.
+        if self.definition.is_none() {
+            let resolved = self
+                .agent_engine
+                .resolve_definition(&self.session, &self.options.agent);
+            let resolved = match resolved {
+                Ok(def) => def,
+                Err(e @ EngineError::CustomAgentRuntimeUnsupported { .. }) => {
+                    self.summary.dockerfile = StepStatus::Skipped;
+                    self.summary.base_image = StepStatus::Skipped;
+                    self.summary.local_agent = StepStatus::Skipped;
+                    self.summary.audit = StepStatus::Skipped;
+                    self.summary.agent_image = StepStatus::Failed(e.to_string());
+                    frontend.report_step_status(
+                        &ReadyStep::ApplyAgentKit.into(),
+                        self.summary.agent_image.clone(),
+                    );
+                    self.phase = ReadyPhase::Complete;
+                    frontend.report_summary(&self.summary);
+                    return Err(e);
+                }
+                Err(e) => {
+                    if matches!(
+                        e,
+                        EngineError::AgentDefinitionUntrusted { .. }
+                            | EngineError::AgentDefinitionInvalid { .. }
+                    ) {
+                        self.summary.agent_definition = Some(StepStatus::Failed(e.to_string()));
+                        frontend.report_step_status(
+                            &ReadyStep::AgentDefinition.into(),
+                            StepStatus::Failed(e.to_string()),
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            for skipped in crate::engine::agent::AgentRegistry::list(
+                self.session.env(),
+                Some(self.session.definition_root()),
+            )
+            .skipped
+            {
+                frontend.write_message(crate::data::message::UserMessage {
+                    level: crate::data::message::MessageLevel::Warning,
+                    text: format!("{}: {}", skipped.path.display(), skipped.reason),
+                });
+            }
+            if let crate::engine::agent::AgentOrigin::Custom { scope, path, .. } = &resolved.origin
+            {
+                self.summary.agent_definition = Some(StepStatus::Done);
+                frontend.report_step_status(&ReadyStep::AgentDefinition.into(), StepStatus::Done);
+                // Resolve succeeded, so a definition that needs approval has it.
+                let trust = if crate::engine::agent::AgentRegistry::needs_approval(&resolved) {
+                    "trusted ✓"
+                } else {
+                    "approval not needed"
+                };
+                frontend.write_message(crate::data::message::UserMessage {
+                    level: crate::data::message::MessageLevel::Info,
+                    text: format!(
+                        "agent definition: loaded from {}:{} — {trust}",
+                        scope.as_str(),
+                        path.display()
+                    ),
+                });
+            }
+            self.preparer.set_definition(resolved.clone());
+            self.definition = Some(resolved);
+        }
+
         // A kit-declarative runtime prepares an agent by emitting and
         // validating a kit, not by building Docker images. The whole
         // container phase machine is skipped in one step. F-40b moved this
@@ -234,8 +306,22 @@ impl ReadyEngine {
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 let tag = agent_image_tag(&git_root, self.options.agent.as_str());
-                let needs_build =
-                    self.options.build || !self.runtime.image_exists(&tag).unwrap_or(false);
+                let sync = crate::engine::agent::provision_agent_dockerfile(
+                    self.definition.as_ref().unwrap(),
+                    &paths,
+                    &project_image_tag(&git_root),
+                )
+                .await?;
+                for warning in &sync.warnings {
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Warning,
+                        text: warning.clone(),
+                    });
+                }
+                let needs_build = self.options.build
+                    || (self.definition.as_ref().unwrap().is_custom()
+                        && sync == crate::engine::agent::DockerfileSync::Written)
+                    || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.agent_image = StepStatus::Done;
                     frontend
@@ -247,29 +333,6 @@ impl ReadyEngine {
                 }
                 frontend
                     .report_step_status(&ReadyStep::BuildAgentImage.into(), StepStatus::Running);
-                if !agent_dockerfile.exists() {
-                    // Try downloading the per-agent Dockerfile (best-effort).
-                    let project_tag = project_image_tag(&git_root);
-                    let dl = crate::engine::agent::download::download_agent_dockerfile(
-                        self.options.agent.as_str(),
-                        &agent_dockerfile,
-                        &project_tag,
-                    )
-                    .await;
-                    if let Err(e) = dl {
-                        let msg = e.to_string();
-                        self.summary.agent_image = StepStatus::Failed(msg.clone());
-                        frontend.report_step_status(
-                            &ReadyStep::DownloadAgentDockerfile.into(),
-                            StepStatus::Failed(msg),
-                        );
-                        // Continue but mark agent image not built.
-                        return Ok({
-                            self.phase = ReadyPhase::CheckingNonDefaultAgents;
-                            self.phase.clone()
-                        });
-                    }
-                }
                 let mut sink = |line: &str| {
                     frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
                 };
@@ -291,10 +354,14 @@ impl ReadyEngine {
                         );
                     }
                     Err(e) => {
-                        self.summary.agent_image = StepStatus::Failed(e.to_string());
+                        let message = crate::engine::agent::custom_build_failure(
+                            self.definition.as_ref().unwrap(),
+                            &e,
+                        );
+                        self.summary.agent_image = StepStatus::Failed(message.clone());
                         frontend.report_step_status(
                             &ReadyStep::BuildAgentImage.into(),
-                            StepStatus::Failed(e.to_string()),
+                            StepStatus::Failed(message),
                         );
                     }
                 }
@@ -306,6 +373,34 @@ impl ReadyEngine {
                     for (agent_name, agent_path) in &all_agents {
                         if agent_name == default_agent {
                             continue;
+                        }
+                        let provision = async {
+                            let name = AgentName::new(agent_name)?;
+                            let def = self.agent_engine.resolve_definition(&self.session, &name)?;
+                            let sync = crate::engine::agent::provision_agent_dockerfile(
+                                &def,
+                                &paths,
+                                &project_image_tag(&git_root),
+                            )
+                            .await?;
+                            Ok::<_, EngineError>((def, sync))
+                        }
+                        .await;
+                        let (definition, sync) = match provision {
+                            Ok(result) => result,
+                            Err(error) => {
+                                frontend.report_step_status(
+                                    &ReadyStep::BuildAgentImageFor(agent_name.clone()).into(),
+                                    StepStatus::Failed(error.to_string()),
+                                );
+                                continue;
+                            }
+                        };
+                        for warning in sync.warnings {
+                            frontend.write_message(crate::data::message::UserMessage {
+                                level: crate::data::message::MessageLevel::Warning,
+                                text: warning,
+                            });
                         }
                         let other_tag = agent_image_tag(&git_root, agent_name);
                         frontend.report_step_status(
@@ -335,7 +430,10 @@ impl ReadyEngine {
                             Err(e) => {
                                 frontend.report_step_status(
                                     &ReadyStep::BuildAgentImageFor(agent_name.to_string()).into(),
-                                    StepStatus::Failed(e.to_string()),
+                                    StepStatus::Failed(crate::engine::agent::custom_build_failure(
+                                        &definition,
+                                        e,
+                                    )),
                                 );
                             }
                         }
@@ -359,6 +457,18 @@ impl ReadyEngine {
                         continue;
                     }
                     count += 1;
+                    let name = AgentName::new(agent_name)?;
+                    if let Err(error) = self.agent_engine.resolve_definition(&self.session, &name) {
+                        let status = StepStatus::Failed(error.to_string());
+                        frontend.report_step_status(
+                            &ReadyStep::BuildAgentImageFor(agent_name.clone()).into(),
+                            status.clone(),
+                        );
+                        self.summary
+                            .non_default_agent_images
+                            .push((agent_name.clone(), status));
+                        continue;
+                    }
                     let other_tag = agent_image_tag(&git_root, agent_name);
                     // An image whose build or import failed in this run is
                     // not "done" just because an older one is installed.
@@ -428,16 +538,44 @@ impl ReadyEngine {
             }
             // SECURITY EXCEPTION: this is the ONE sanctioned host-side agent
             // execution in awman (see `aspec/architecture/security.md`). The
-            // agent binary runs on the host with a hardcoded greeting — never
+            // first-party ping or the [ping] of an approved custom definition
+            // runs on the host with one hardcoded greeting — never
             // user input, repo content, or a working directory — to verify it
             // is installed and authenticated, and to force it to refresh its
             // auth token before credentials are mounted into containerized
             // agents. Do not add other host-side agent invocations.
             ReadyPhase::CheckingLocalAgent => {
+                if let Some(def) = self.definition.as_ref().filter(|d| d.ping_argv.is_none()) {
+                    let path = match &def.origin {
+                        crate::engine::agent::AgentOrigin::Custom { path, .. } => {
+                            path.display().to_string()
+                        }
+                        _ => def.name.clone(),
+                    };
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Info,
+                        text: format!("no [ping] command in {path}; host check skipped"),
+                    });
+                    self.summary.local_agent = StepStatus::Skipped;
+                    frontend.report_step_status(
+                        &ReadyStep::CheckLocalAgent.into(),
+                        StepStatus::Skipped,
+                    );
+                    self.pre_audit_dockerfile_hash =
+                        dockerfile_hash(self.preparer.project_dockerfile());
+                    self.phase = ReadyPhase::RunningAudit;
+                    return Ok(self.phase.clone());
+                }
                 frontend
                     .report_step_status(&ReadyStep::CheckLocalAgent.into(), StepStatus::Running);
                 let agent_name = self.options.agent.as_str();
-                let ping = self.host_agent.ping(&self.options.agent).await;
+                // `definition` is always set by the time this phase runs (it
+                // is resolved on the first step); `CouldNotRun` keeps the
+                // impossible case from spawning anything.
+                let ping = match self.definition.clone() {
+                    Some(def) => self.host_agent.ping(&def).await,
+                    None => LocalAgentPingResult::CouldNotRun,
+                };
                 // The engine reports the result; the frontend draws the
                 // transcript. The default impl writes the same two `>`/`<`
                 // lines this arm used to compose (F-45).
@@ -473,6 +611,13 @@ impl ReadyEngine {
                             &ReadyStep::CheckLocalAgent.into(),
                             StepStatus::Failed(format!("{agent_name}: could not run")),
                         );
+                    }
+                    LocalAgentPingResult::TimedOut => {
+                        let status = StepStatus::Failed(format!(
+                            "{agent_name}: host ping timed out after 60 seconds"
+                        ));
+                        self.summary.local_agent = status.clone();
+                        frontend.report_step_status(&ReadyStep::CheckLocalAgent.into(), status);
                     }
                 }
                 let dockerfile_path = self.preparer.project_dockerfile().to_path_buf();
@@ -664,6 +809,36 @@ impl ReadyEngine {
                                         let agent =
                                             name_str.strip_prefix("Dockerfile.").unwrap_or("");
                                         if !agent.is_empty() {
+                                            let prepared = async {
+                                                let name = AgentName::new(agent)?;
+                                                let def = if agent == self.options.agent.as_str() {
+                                                    self.definition.clone().expect("ready resolved the selected definition")
+                                                } else {
+                                                    self.agent_engine.resolve_definition(&self.session, &name)?
+                                                };
+                                                let sync = crate::engine::agent::provision_agent_dockerfile(
+                                                    &def, &crate::data::RepoDockerfilePaths::new(&git_root), &tag,
+                                                ).await?;
+                                                Ok::<_, EngineError>((def, sync))
+                                            }.await;
+                                            let (definition, sync) = match prepared {
+                                                Ok(prepared) => prepared,
+                                                Err(error) => {
+                                                    frontend.report_step_status(
+                                                        &ReadyStep::BuildAgentImageFor(
+                                                            agent.into(),
+                                                        )
+                                                        .into(),
+                                                        StepStatus::Failed(error.to_string()),
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                            for warning in sync.warnings {
+                                                frontend.write_message(crate::data::message::UserMessage {
+                                                    level: crate::data::message::MessageLevel::Warning, text: warning,
+                                                });
+                                            }
                                             let agent_tag =
                                                 crate::data::image_tags::agent_image_tag(
                                                     &git_root, agent,
@@ -674,7 +849,7 @@ impl ReadyEngine {
                                                     StepStatus::Running,
                                                 );
                                             };
-                                            let _ = self.runtime.build_image(
+                                            let result = self.runtime.build_image(
                                                 &crate::engine::container::BuildRequest::runtime(
                                                     &agent_tag,
                                                     &entry.path(),
@@ -683,6 +858,18 @@ impl ReadyEngine {
                                                 ),
                                                 &mut agent_sink,
                                             );
+                                            if let Err(error) = result {
+                                                frontend.report_step_status(
+                                                    &ReadyStep::BuildAgentImageFor(agent.into())
+                                                        .into(),
+                                                    StepStatus::Failed(
+                                                        crate::engine::agent::custom_build_failure(
+                                                            &definition,
+                                                            error,
+                                                        ),
+                                                    ),
+                                                );
+                                            }
                                         }
                                     }
                                 }

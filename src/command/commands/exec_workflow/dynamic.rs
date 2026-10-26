@@ -437,6 +437,14 @@ impl ExecWorkflowCommand {
         //    the resume branch: a resumed run never launches a leader, and must
         //    not be blocked by leader config that has drifted since.
         let (leader_agent, leader_model) = resolve_leader_model(&self.flags, &self.session)?;
+        // A custom leader definition is reviewed before the leader resolves.
+        frontend.with(|frontend| {
+            crate::command::commands::agent_trust::ensure_agent_trusted(
+                &base_session,
+                &leader_agent,
+                frontend,
+            )
+        })?;
 
         // The work item path the leader sees is inside the mounted worktree.
         let wi_relative = wi_file
@@ -484,7 +492,16 @@ impl ExecWorkflowCommand {
 
         // ── Discover available agents. ──────────────────────────────────────
         // (`paths` was resolved above, before the resume branch.)
-        let available_agents = paths.discover_agent_dockerfiles();
+        let (available_agents, warnings) = self
+            .engines
+            .agent_engine
+            .filter_available_agents(&base_session, paths.discover_agent_dockerfiles());
+        for warning in warnings {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: warning,
+            });
+        }
 
         // ── Resolve the dynamicWorkflows config (WI-0095): the configured
         //    agent/model listing (validated against discovered Dockerfiles) and
@@ -838,6 +855,11 @@ impl ExecWorkflowCommand {
             skip_state_resume_prompt,
             frontend,
         } = exec;
+
+        // ── Review custom definitions once per agent, before resolving. ─────
+        frontend.with(|frontend| {
+            ensure_workflow_agents_approved(&workflow, &base_session, &effective_flags, frontend)
+        })?;
 
         // ── Build any missing agent images before execution (WI-0092 §9b). ──
         let resolved_agents =

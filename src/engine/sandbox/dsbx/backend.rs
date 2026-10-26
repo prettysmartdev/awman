@@ -14,7 +14,8 @@ use chrono::Utc;
 
 use crate::data::fs::SandboxKitPaths;
 use crate::data::session::AgentHandle;
-use crate::engine::agent::agent_matrix::{matrix_for, SbxKitKind};
+use crate::engine::agent::definition::SbxKitKind;
+use crate::engine::agent::first_party::first_party;
 use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, AgentStats, ExecutionBackend,
 };
@@ -106,9 +107,12 @@ fn kit_dir_for(agent: &str) -> Result<PathBuf, EngineError> {
     Ok(SandboxKitPaths::from_process_env()?.kit_dir(agent))
 }
 
+/// The sbx kit kind for `agent`. Sandbox-class runtimes run first-party
+/// agents only (custom agents are refused before any sbx code runs), so this
+/// reads the first-party table directly; any other name is a mixin.
 fn kit_kind_for(agent: &str) -> SbxKitKind {
-    matrix_for(agent)
-        .map(|m| m.sbx_kit_kind)
+    first_party(agent)
+        .map(|d| d.sbx_kit_kind)
         .unwrap_or(SbxKitKind::Mixin)
 }
 
@@ -418,17 +422,25 @@ fn push_workspace_positional(argv: &mut Vec<String>, options: &ResolvedSandboxOp
 /// config flows through `session.json` and their prompt via stdin
 /// ([`stdin_seed`]), so they get no args here.
 fn agent_args(agent: &str, options: &ResolvedSandboxOptions) -> Vec<String> {
+    let Some(def) = first_party(agent) else {
+        return Vec::new();
+    };
+    agent_args_for(&def, options)
+}
+
+fn agent_args_for(
+    def: &crate::engine::agent::AgentDefinition,
+    options: &ResolvedSandboxOptions,
+) -> Vec<String> {
     use crate::engine::container::options::ModelFlagForm;
 
-    if !matches!(kit_kind_for(agent), SbxKitKind::Agent) {
+    if !matches!(def.sbx_kit_kind, SbxKitKind::Agent) {
         return Vec::new();
     }
     let mut args = Vec::new();
     if !options.interactive {
-        if let Ok(matrix) = matrix_for(agent) {
-            if let Some(flag) = matrix.non_interactive_flag {
-                args.push(flag.to_string());
-            }
+        if let Some(flag) = &def.non_interactive_flag {
+            args.push(flag.clone());
         }
     }
     args.extend(options.mode_flags.iter().cloned());
@@ -1016,14 +1028,14 @@ mod tests {
 
     #[test]
     fn seeded_prompt_appended_after_delimiter_only_for_agent_kind() {
-        // crush is a `kind: agent` kit → prompt appended after `--` (a bare
+        // cline is a `kind: agent` kit → prompt appended after `--` (a bare
         // positional would be parsed by sbx as a workspace PATH).
-        let crush = opts(vec![
-            SandboxOption::AgentId("crush".into()),
+        let cline = opts(vec![
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(true),
             SandboxOption::SeededPrompt("do the thing".into()),
         ]);
-        let argv = run_argv("awman-h-crush", "crush", &crush);
+        let argv = run_argv("awman-h-cline", "cline", &cline);
         assert_eq!(argv.last().unwrap(), "do the thing");
         assert_eq!(
             argv[argv.len() - 2],
@@ -1234,18 +1246,18 @@ mod tests {
     fn model_flag_appended_after_delimiter_for_agent_kits() {
         use crate::engine::container::options::ModelFlagForm;
         let o = opts(vec![
-            SandboxOption::AgentId("crush".into()),
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(true),
             SandboxOption::Model {
                 flag: ModelFlagForm::Argument("anthropic/claude-opus-4-6".into()),
             },
         ]);
-        let argv = run_argv("awman-h-crush", "crush", &o);
+        let argv = run_argv("awman-h-cline", "cline", &o);
         assert_eq!(
             argv,
             vec![
                 "run",
-                "awman-h-crush",
+                "awman-h-cline",
                 "--",
                 "--model",
                 "anthropic/claude-opus-4-6"
@@ -1258,14 +1270,14 @@ mod tests {
     fn model_shorthand_appended_as_single_token() {
         use crate::engine::container::options::ModelFlagForm;
         let o = opts(vec![
-            SandboxOption::AgentId("maki".into()),
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(true),
             SandboxOption::Model {
                 flag: ModelFlagForm::Shorthand("--model=sonnet".into()),
             },
         ]);
-        let argv = run_argv("awman-h-maki", "maki", &o);
-        assert_eq!(argv, vec!["run", "awman-h-maki", "--", "--model=sonnet"]);
+        let argv = run_argv("awman-h-cline", "cline", &o);
+        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "--model=sonnet"]);
     }
 
     #[test]
@@ -1288,7 +1300,7 @@ mod tests {
     fn mode_flags_appended_before_model_and_prompt_for_agent_kits() {
         use crate::engine::container::options::ModelFlagForm;
         let o = opts(vec![
-            SandboxOption::AgentId("crush".into()),
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(true),
             SandboxOption::AgentModeFlags(vec!["--yolo".into()]),
             SandboxOption::Model {
@@ -1296,12 +1308,12 @@ mod tests {
             },
             SandboxOption::SeededPrompt("fix it".into()),
         ]);
-        let argv = run_argv("awman-h-crush", "crush", &o);
+        let argv = run_argv("awman-h-cline", "cline", &o);
         assert_eq!(
             argv,
             vec![
                 "run",
-                "awman-h-crush",
+                "awman-h-cline",
                 "--",
                 "--yolo",
                 "--model",
@@ -1315,7 +1327,7 @@ mod tests {
     fn agent_flags_appended_after_model_and_before_prompt_for_agent_kits() {
         use crate::engine::container::options::ModelFlagForm;
         let o = opts(vec![
-            SandboxOption::AgentId("crush".into()),
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(true),
             SandboxOption::Model {
                 flag: ModelFlagForm::Argument("gpt-5".into()),
@@ -1323,12 +1335,12 @@ mod tests {
             SandboxOption::AgentFlags(vec!["--debug".into()]),
             SandboxOption::SeededPrompt("fix it".into()),
         ]);
-        let argv = run_argv("awman-h-crush", "crush", &o);
+        let argv = run_argv("awman-h-cline", "cline", &o);
         assert_eq!(
             argv,
             vec![
                 "run",
-                "awman-h-crush",
+                "awman-h-cline",
                 "--",
                 "--model",
                 "gpt-5",
@@ -1339,26 +1351,32 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_prepends_matrix_flag_for_agent_kits() {
-        // crush's non-interactive shape is the `run` subcommand — it must be
+    fn non_interactive_prepends_definition_flag_for_agent_kits() {
+        // cline's non-interactive shape is the `task` subcommand — it must be
         // the first agent arg, before flags and the prompt, mirroring the
         // container path's `entrypoint_for`.
         let o = opts(vec![
-            SandboxOption::AgentId("crush".into()),
+            SandboxOption::AgentId("cline".into()),
             SandboxOption::Interactive(false),
             SandboxOption::SeededPrompt("do it".into()),
         ]);
-        let argv = run_argv("awman-h-crush", "crush", &o);
-        assert_eq!(argv, vec!["run", "awman-h-crush", "--", "run", "do it"]);
+        let argv = run_argv("awman-h-cline", "cline", &o);
+        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "task", "do it"]);
+    }
 
+    #[test]
+    fn non_interactive_adds_no_token_for_an_agent_kit_without_one() {
+        // Every first-party `kind: agent` kit declares a non-interactive
+        // token; this needs a test-only definition (the former maki shape).
         // maki has no non-interactive flag → no extra token.
         let o = opts(vec![
             SandboxOption::AgentId("maki".into()),
             SandboxOption::Interactive(false),
             SandboxOption::SeededPrompt("do it".into()),
         ]);
-        let argv = run_argv("awman-h-maki", "maki", &o);
-        assert_eq!(argv, vec!["run", "awman-h-maki", "--", "do it"]);
+        let mut def = crate::engine::agent::custom::crush_fixture();
+        def.non_interactive_flag = None;
+        assert_eq!(agent_args_for(&def, &o), vec!["do it"]);
     }
 
     // Seeded prompts for mixin vs agent kit agents (full table check)
@@ -1380,7 +1398,7 @@ mod tests {
 
     #[test]
     fn all_agent_kit_agents_append_prompt_after_delimiter() {
-        let agent_kits = ["antigravity", "crush", "maki", "cline"];
+        let agent_kits = ["antigravity", "cline"];
         for agent in &agent_kits {
             let o = opts(vec![
                 SandboxOption::AgentId((*agent).into()),
@@ -1586,7 +1604,7 @@ mod tests {
                 "mixin {agent}: stdin is the only delivery path, seed must be present"
             );
         }
-        for agent in ["antigravity", "crush", "maki", "cline"] {
+        for agent in ["antigravity", "cline"] {
             let o = opts(vec![
                 SandboxOption::AgentId(agent.into()),
                 SandboxOption::SeededPrompt(prompt.into()),

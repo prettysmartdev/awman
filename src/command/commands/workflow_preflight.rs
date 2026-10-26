@@ -25,6 +25,43 @@ use crate::data::session::Session;
 use crate::data::workflow_definition::Workflow;
 use crate::engine::error::EngineError;
 
+/// Review and approve, once per distinct agent, every custom definition the
+/// workflow's steps will launch — before any of them is resolved, so a
+/// workflow never fails halfway on an unapproved definition.
+///
+/// Agents resolve with the ACP preflight's precedence: step → workflow →
+/// effective default (`--agent`, then config). A step that resolves to no
+/// agent is left for the preflight below to report.
+pub(crate) fn ensure_workflow_agents_approved(
+    workflow: &Workflow,
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+    frontend: &mut dyn crate::command::commands::agent_trust::AgentTrustFrontend,
+) -> Result<(), CommandError> {
+    let current = session.effective_config();
+    let config = crate::data::config::effective::EffectiveConfig::new(
+        workflow_flag_config(flags),
+        current.env().clone(),
+        current.repo().clone(),
+        current.global().clone(),
+    );
+    let default_agent = config.agent();
+    let mut agents = Vec::new();
+    for step in &workflow.steps {
+        let name = step
+            .agent
+            .as_deref()
+            .or(workflow.agent.as_deref())
+            .or(default_agent.as_deref());
+        if let Some(name) = name {
+            agents.push(crate::data::session::AgentName::new(name)?);
+        }
+    }
+    crate::command::commands::agent_trust::ensure_workflow_agents_trusted(
+        session, &agents, frontend,
+    )
+}
+
 pub(crate) fn validate_workflow_acp_preflight(
     workflow: &Workflow,
     session: &Session,
@@ -57,9 +94,8 @@ pub(crate) fn validate_workflow_acp_preflight(
                 ))
             })?;
         let agent = crate::data::session::AgentName::new(agent_name).map_err(EngineError::Data)?;
-        let mode = if requested == LaunchMode::Acp
-            && !crate::engine::agent::agent_matrix::matrix_for(agent.as_str())?.supports_acp
-        {
+        let definition = crate::engine::agent::AgentRegistry::resolve_for_session(session, &agent)?;
+        let mode = if requested == LaunchMode::Acp && !definition.supports_acp {
             if config.launch_mode_fallback() == LaunchModeFallback::Error {
                 return Err(EngineError::Other(format!(
                     "workflow ACP pre-flight failed: step '{}' uses agent '{}', which does not support ACP",
@@ -367,6 +403,11 @@ pub(crate) fn resolve_and_validate_workflow_agents(
 
     let available = paths.discover_agent_dockerfiles();
     let available_names: Vec<String> = available.iter().map(|(n, _)| n.clone()).collect();
+    for name in &resolved {
+        let agent = crate::data::session::AgentName::new(name).map_err(|e| e.to_string())?;
+        crate::engine::agent::AgentRegistry::resolve_for_session(session, &agent)
+            .map_err(|e| e.to_string())?;
+    }
     let unknown: Vec<&String> = resolved
         .iter()
         .filter(|a| !paths.agent_dockerfile(a).exists())
@@ -422,6 +463,7 @@ async fn import_agent_image_for_step(
     git_root: &std::path::Path,
     agent: &str,
     session: &crate::data::session::Session,
+    definition: crate::engine::agent::ResolvedAgent,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), CommandError> {
     use crate::engine::image_prep::{
@@ -441,7 +483,9 @@ async fn import_agent_image_for_step(
             session.repo_config(),
             session.configured_agent().as_str(),
         ),
-    );
+    )
+    .with_definition_env(session.env().clone())
+    .with_definition(definition);
     let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
     let result = preparer
         .prepare(
@@ -483,6 +527,8 @@ pub(crate) async fn ensure_agent_image_with_build_output(
     sink: &mut dyn UserMessageSink,
     mut build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<(), CommandError> {
+    let name = crate::data::session::AgentName::new(agent).map_err(EngineError::Data)?;
+    let definition = engines.agent_engine.resolve_definition(session, &name)?;
     let runtime = engines
         .require_container_runtime()
         .map_err(CommandError::from)?;
@@ -491,9 +537,22 @@ pub(crate) async fn ensure_agent_image_with_build_output(
     {
         let runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
             runtime.clone();
-        return import_agent_image_for_step(runtime, git_root, agent, session, sink).await;
+        return import_agent_image_for_step(runtime, git_root, agent, session, definition, sink)
+            .await;
     }
     let dockerfile = paths.agent_dockerfile(agent);
+    let sync = crate::engine::agent::provision_agent_dockerfile(
+        &definition,
+        paths,
+        &crate::data::image_tags::project_image_tag(git_root),
+    )
+    .await?;
+    for warning in &sync.warnings {
+        sink.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text: warning.clone(),
+        });
+    }
     if !dockerfile.exists() {
         return Err(CommandError::Other(format!(
             "agent '{agent}' has no Dockerfile (expected {})",
@@ -502,6 +561,9 @@ pub(crate) async fn ensure_agent_image_with_build_output(
     }
     let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
     if runtime.image_exists(&tag) {
+        if sync.definition_changed() && definition.is_custom() {
+            sink.write_message(UserMessage { level: MessageLevel::Warning, text: format!("agent definition '{agent}' changed since its image was built; run 'awman ready --agent {agent} --build'") });
+        }
         return Ok(());
     }
     sink.write_message(UserMessage {
@@ -523,8 +585,9 @@ pub(crate) async fn ensure_agent_image_with_build_output(
             },
         )
         .map_err(|e| {
+            let reason = crate::engine::agent::custom_build_failure(&definition, e);
             CommandError::Other(format!(
-                "failed to build image for agent '{agent}' from {}: {e}",
+                "failed to build image for agent '{agent}' from {}: {reason}",
                 dockerfile.display()
             ))
         });
@@ -887,6 +950,11 @@ mod import_tests {
             root.path(),
             "codex",
             &session,
+            crate::engine::agent::AgentRegistry::resolve_for_session(
+                &session,
+                &crate::data::session::AgentName::new("codex").unwrap(),
+            )
+            .unwrap(),
             &mut Quiet,
         )
         .await
@@ -903,9 +971,38 @@ mod import_tests {
             root.path(),
             "claude",
             &session,
+            crate::engine::agent::AgentRegistry::resolve_for_session(
+                &session,
+                &crate::data::session::AgentName::new("claude").unwrap(),
+            )
+            .unwrap(),
             &mut Quiet,
         )
         .await;
         assert_eq!(runtime.imports.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod custom_definition_tests {
+    use super::*;
+    #[test]
+    fn deleted_custom_definition_is_unknown_even_with_a_rendered_dockerfile() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session::for_tests_isolated(temp.path(), &temp.path().join("global"));
+        let paths = crate::data::RepoDockerfilePaths::new(temp.path());
+        std::fs::create_dir_all(paths.awman_dir()).unwrap();
+        std::fs::write(
+            paths.agent_dockerfile("pi"),
+            "# awman-generated from repo:deleted\nFROM project\n",
+        )
+        .unwrap();
+        let workflow = Workflow::parse(
+            "agent = 'pi'\n[[steps]]\nname = 'test'\nprompt = 'do it'\n",
+            crate::data::workflow_definition::WorkflowFormat::Toml,
+        )
+        .unwrap();
+        let error = resolve_and_validate_workflow_agents(&workflow, &session, &paths).unwrap_err();
+        assert!(error.contains("unknown agent 'pi'"), "{error}");
     }
 }
