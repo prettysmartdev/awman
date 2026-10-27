@@ -841,7 +841,7 @@ pub(crate) async fn execute_prepared(
     Ok(ExecWorkflowOutcome {
         workflow: workflow_path.display().to_string(),
         exit_code,
-        worktree_used: flags.worktree,
+        worktree_used: worktree_path.is_some(),
     })
 }
 

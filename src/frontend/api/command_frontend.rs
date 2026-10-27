@@ -99,6 +99,8 @@ pub struct ApiDispatchFrontend {
     /// Latched once `Done` has been emitted, so both `emit_done` and `Drop`
     /// stay idempotent.
     done_emitted: std::sync::atomic::AtomicBool,
+    /// The queue worker owns completion when post-command stages are enabled.
+    emit_done_on_drop: bool,
     /// Throttle: last time a yolo countdown status message was emitted.
     last_sink_message_time: Option<std::time::Instant>,
     /// What the countdown currently being ticked will do when it expires
@@ -178,6 +180,7 @@ impl ApiDispatchFrontend {
             step_indices: std::sync::Mutex::new(HashMap::new()),
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
+            emit_done_on_drop: true,
             last_sink_message_time: None,
             countdown_kind: CountdownKind::StuckStep,
             // The *catalogue's* spelling of the path, not the request's. This
@@ -195,6 +198,12 @@ impl ApiDispatchFrontend {
     /// Mirror workflow snapshots into the command directory for API polling.
     pub fn with_state_writer(mut self, writer: CommandStateWriter) -> Self {
         self.state_writer = Some(writer);
+        self
+    }
+
+    /// Let the queue worker emit `Done` after post-command stages finish.
+    pub fn deferring_done(mut self) -> Self {
+        self.emit_done_on_drop = false;
         self
     }
 
@@ -258,9 +267,10 @@ impl Drop for ApiDispatchFrontend {
             let line = std::mem::take(&mut self.line_buffer_stderr);
             self.event_bus.emit(EventPayload::StderrLine(line));
         }
-        if !self
-            .done_emitted
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        if self.emit_done_on_drop
+            && !self
+                .done_emitted
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             self.event_bus.emit(EventPayload::Done);
         }
@@ -1479,6 +1489,25 @@ mod tests {
     }
 
     // ─── Drop emits Done and flushes partial lines ─────────────────────────────
+
+    #[test]
+    fn deferred_drop_flushes_output_and_leaves_done_to_worker() {
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut frontend =
+            ApiDispatchFrontend::new("exec prompt", &[], bus.sender()).deferring_done();
+        frontend.line_buffer_stdout = "trailing output".into();
+        drop(frontend);
+        assert!(matches!(rx.try_recv().unwrap().payload,
+            EventPayload::StdoutLine(ref line) if line == "trailing output"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        bus.sender().emit(EventPayload::Done);
+        assert!(matches!(rx.try_recv().unwrap().payload, EventPayload::Done));
+    }
 
     #[tokio::test]
     async fn drop_emits_done_sentinel_when_emit_done_was_not_called() {

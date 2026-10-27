@@ -48,6 +48,14 @@ pub enum EngineError {
     #[error("{0}")]
     MergeFailed(Box<MergeFailedDetail>),
 
+    /// A setup merge of `origin/<merge_ref>` hit conflicts; the merge was aborted and the
+    /// clone is back at the pre-merge HEAD.
+    #[error("merge of origin/{merge_ref} conflicts in: {}", conflicting_paths.join(", "))]
+    MergeRefConflict {
+        merge_ref: String,
+        conflicting_paths: Vec<String>,
+    },
+
     /// A Docker or Apple Containers CLI backend failure. Builtin-runtime and
     /// image-builder failures have their own variants: this one exits 3
     /// ("container runtime unavailable"), which is wrong for them.
@@ -634,7 +642,8 @@ impl EngineError {
             // engine failure, never "Docker is missing" (3).
             EngineError::BuiltinCatalogMismatch { .. }
             | EngineError::BuiltinCatalogUpgradeBlocked { .. }
-            | EngineError::BuiltinCatalogBackupExists { .. } => 1,
+            | EngineError::BuiltinCatalogBackupExists { .. }
+            | EngineError::MergeRefConflict { .. } => 1,
             _ => 1,
         }
     }

@@ -150,11 +150,11 @@ impl ApiServerRuntime {
                     Ok(mut session) => {
                         if rec.session_type == "remote" {
                             if let Some(cloned) = rec.cloned_path.as_deref() {
-                                // Known gap: SQLite does not persist repo_url or branch yet.
-                                // Follow-up: persist both fields without changing this schema here.
+                                // Rows written before WI 0133 have no repo_url/branch
+                                // and restore with empty strings, as they always did.
                                 session.set_session_type(SessionType::Remote {
-                                    repo_url: String::new(),
-                                    branch: String::new(),
+                                    repo_url: rec.repo_url.clone().unwrap_or_default(),
+                                    branch: rec.branch.clone().unwrap_or_default(),
                                     cloned_path: std::path::PathBuf::from(cloned),
                                 });
                             }

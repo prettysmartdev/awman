@@ -152,10 +152,15 @@ pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<St
             (cmd, None)
         }
         TeardownStep::PushBranch { remote, branch } => {
-            let cmd = match (remote, branch) {
-                (Some(r), Some(b)) => format!("git push {} {}", sh_quote(r), sh_quote(b)),
-                _ => "git push".to_string(),
-            };
+            let remote = remote.as_deref().unwrap_or("origin");
+            let branch = branch.as_deref().unwrap_or("HEAD");
+            if branch.starts_with(['-', '+']) || branch.contains(':') {
+                return (
+                    "printf '%s\\n' 'push_branch requires a branch name, not options or a refspec' >&2; exit 2".into(),
+                    None,
+                );
+            }
+            let cmd = format!("git push -u -- {} {}", sh_quote(remote), sh_quote(branch));
             let mut env = HashMap::new();
             env.insert(
                 "GIT_SSH_COMMAND".to_string(),
@@ -625,7 +630,7 @@ mod tests {
             branch: Some("feature/x".to_string()),
         };
         let (cmd, env) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "git push 'origin' 'feature/x'");
+        assert_eq!(cmd, "git push -u -- 'origin' 'feature/x'");
         let env = env.expect("push_branch must set GIT_SSH_COMMAND env");
         assert_eq!(
             env.get("GIT_SSH_COMMAND").unwrap(),
@@ -640,7 +645,37 @@ mod tests {
             branch: None,
         };
         let (cmd, env) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "git push");
+        assert_eq!(cmd, "git push -u -- 'origin' 'HEAD'");
+        let env = env.expect("push_branch must set GIT_SSH_COMMAND env");
+        assert_eq!(
+            env.get("GIT_SSH_COMMAND").unwrap(),
+            "ssh -o StrictHostKeyChecking=accept-new",
+        );
+    }
+
+    #[test]
+    fn push_branch_remote_without_branch_defaults_to_head() {
+        let step = TeardownStep::PushBranch {
+            remote: Some("upstream".to_string()),
+            branch: None,
+        };
+        let (cmd, env) = teardown_step_to_shell(&step);
+        assert_eq!(cmd, "git push -u -- 'upstream' 'HEAD'");
+        let env = env.expect("push_branch must set GIT_SSH_COMMAND env");
+        assert_eq!(
+            env.get("GIT_SSH_COMMAND").unwrap(),
+            "ssh -o StrictHostKeyChecking=accept-new",
+        );
+    }
+
+    #[test]
+    fn push_branch_branch_without_remote_defaults_to_origin() {
+        let step = TeardownStep::PushBranch {
+            remote: None,
+            branch: Some("feature/y".to_string()),
+        };
+        let (cmd, env) = teardown_step_to_shell(&step);
+        assert_eq!(cmd, "git push -u -- 'origin' 'feature/y'");
         let env = env.expect("push_branch must set GIT_SSH_COMMAND env");
         assert_eq!(
             env.get("GIT_SSH_COMMAND").unwrap(),

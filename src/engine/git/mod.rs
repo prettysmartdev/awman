@@ -17,6 +17,7 @@ use crate::data::worktree_paths::{
 use crate::engine::error::{EngineError, MergeFailedDetail};
 
 pub mod frontend;
+pub mod remote_push;
 
 pub use frontend::{GitCommand, GitFrontend};
 
@@ -24,6 +25,16 @@ pub use frontend::{GitCommand, GitFrontend};
 fn run_git_logged(
     args: &[&str],
     cwd: &Path,
+    sink: &mut dyn GitFrontend,
+) -> Result<std::process::Output, EngineError> {
+    run_git_logged_env(args, cwd, &[], sink)
+}
+
+/// [`run_git_logged`] with extra environment variables for the child.
+fn run_git_logged_env(
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
     sink: &mut dyn GitFrontend,
 ) -> Result<std::process::Output, EngineError> {
     let command = GitCommand::new(args);
@@ -34,6 +45,7 @@ fn run_git_logged(
     sink.command_started(&command);
     let output = Command::new("git")
         .args(args)
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .output()
         .map_err(|e| EngineError::Git(format!("invoke `{cmd_str}`: {e}")))?;
@@ -52,6 +64,67 @@ fn run_git_logged(
         }
     }
     Ok(output)
+}
+
+/// Host-side committer identity awman uses in a clone it owns (WI 0133).
+pub const FALLBACK_COMMIT_NAME: &str = "awman";
+pub const FALLBACK_COMMIT_EMAIL: &str = "awman@localhost";
+
+/// Pathspecs that keep awman's own bookkeeping out of a leftover-changes commit:
+/// the engine's `WorkflowState` JSON and the saved dynamic workflow copy, both of
+/// which live under `<root>/.awman/workflows/` and are never gitignored.
+pub const AWMAN_BOOKKEEPING_EXCLUDES: &[&str] = &[
+    ":(exclude).awman/workflows/*.json",
+    ":(exclude).awman/workflows/dynamic-*.toml",
+];
+
+/// The identity a host-side commit in a clone will be recorded with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+    /// `true` when at least one of the two came from awman's fallback rather than
+    /// git's own config resolution for the clone.
+    pub fallback: bool,
+    /// Extra `git` arguments to put *before* the subcommand: `-c user.name=…` and/or
+    /// `-c user.email=…` for exactly the keys the clone could not resolve. Empty when
+    /// both resolve.
+    pub overrides: Vec<String>,
+}
+
+impl CommitIdentity {
+    /// One line for the setup log / status stream.
+    pub fn describe(&self) -> String {
+        if self.fallback {
+            format!(
+                "committing as {} <{}> (no git identity in the clone)",
+                self.name, self.email
+            )
+        } else {
+            format!("committing as {} <{}> (git config)", self.name, self.email)
+        }
+    }
+}
+
+/// Result of [`GitEngine::merge_ref_logged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeRefOutcome {
+    Merged { sha: String },
+    AlreadyUpToDate,
+}
+
+/// Result of [`GitEngine::commit_all_with_identity_logged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitAllOutcome {
+    Committed { sha: String },
+    NothingToCommit,
+}
+
+/// The identity overrides followed by `rest`: the full argument list after `git`.
+fn with_overrides<'a>(identity: &'a CommitIdentity, rest: &[&'a str]) -> Vec<&'a str> {
+    let mut args: Vec<&str> = identity.overrides.iter().map(String::as_str).collect();
+    args.extend_from_slice(rest);
+    args
 }
 
 /// The commit message a squash merge of `branch` is recorded with.
@@ -250,6 +323,94 @@ impl GitEngine {
     /// Returns whether the worktree at `path` has zero uncommitted changes.
     pub fn is_clean(&self, path: &Path) -> Result<bool, EngineError> {
         Ok(self.uncommitted_files(path)?.is_empty())
+    }
+
+    /// Fingerprint HEAD and file bytes, including dirty/untracked paths. Status
+    /// letters alone miss rewrites of already-dirty files and clean commits.
+    pub fn checkout_fingerprint(&self, root: &Path) -> Result<Vec<u8>, EngineError> {
+        use sha2::{Digest, Sha256};
+        fn hash_path(hash: &mut Sha256, path: &Path) -> Result<(), EngineError> {
+            let io = |e: std::io::Error| EngineError::Git(e.to_string());
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    hash.update(b"symlink");
+                    hash.update(
+                        std::fs::read_link(path)
+                            .map_err(io)?
+                            .as_os_str()
+                            .as_encoded_bytes(),
+                    );
+                }
+                Ok(meta) if meta.is_file() => {
+                    hash.update(b"file");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        hash.update((meta.permissions().mode() & 0o111).to_le_bytes());
+                    }
+                    hash.update(meta.len().to_le_bytes());
+                    hash.update(std::fs::read(path).map_err(io)?);
+                }
+                Ok(meta) if meta.is_dir() => {
+                    // A tracked directory is a submodule. Its dirty contents
+                    // must remain guarded, including an already-dirty submodule.
+                    hash.update(b"directory");
+                    let mut entries = std::fs::read_dir(path)
+                        .map_err(io)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(io)?;
+                    entries.sort_by_key(|entry| entry.file_name());
+                    for entry in entries {
+                        if entry.file_name() != ".git" {
+                            hash.update(entry.file_name().as_encoded_bytes());
+                            hash_path(hash, &entry.path())?;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    return Err(EngineError::Git(
+                        "unsupported file in leader mutation guard".into(),
+                    ))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => hash.update(b"missing"),
+                Err(e) => return Err(io(e)),
+            }
+            Ok(())
+        }
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])
+            .current_dir(root)
+            .output()
+            .map_err(|e| EngineError::Git(e.to_string()))?;
+        if !output.status.success() {
+            return Err(EngineError::Git(
+                String::from_utf8_lossy(&output.stderr).into(),
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(self.head_sha(root)?);
+        let mut paths: Vec<&[u8]> = output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        for path in paths {
+            let name = std::str::from_utf8(path).map_err(|e| EngineError::Git(e.to_string()))?;
+            hash.update(path.len().to_le_bytes());
+            hash.update(path);
+            hash_path(&mut hash, &root.join(name))?;
+        }
+        Ok(hash.finalize().to_vec())
     }
 
     /// `git status --porcelain` lines (one per uncommitted file).
@@ -1400,6 +1561,266 @@ impl GitEngine {
         }
         Ok("created")
     }
+
+    /// Resolve the identity to commit with in `repo`. Each key git cannot resolve
+    /// is supplied through `-c`; a key it can resolve is left alone. Never errors on
+    /// a missing key, only on a failed `git` spawn.
+    pub fn commit_identity(&self, repo: &Path) -> Result<CommitIdentity, EngineError> {
+        let configured = self.identity_configured(repo)?;
+        let mut overrides = Vec::new();
+        let mut fallback = false;
+        let name = match configured.name {
+            Some(n) => n,
+            None => {
+                fallback = true;
+                overrides.push("-c".to_string());
+                overrides.push(format!("user.name={FALLBACK_COMMIT_NAME}"));
+                FALLBACK_COMMIT_NAME.to_string()
+            }
+        };
+        let email = match configured.email {
+            Some(e) => e,
+            None => {
+                fallback = true;
+                overrides.push("-c".to_string());
+                overrides.push(format!("user.email={FALLBACK_COMMIT_EMAIL}"));
+                FALLBACK_COMMIT_EMAIL.to_string()
+            }
+        };
+        Ok(CommitIdentity {
+            name,
+            email,
+            fallback,
+            overrides,
+        })
+    }
+
+    /// Check out the named origin branch without allowing a tag to shadow it.
+    pub fn checkout_remote_branch_logged(
+        &self,
+        repo: &Path,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<&'static str, EngineError> {
+        let target = format!("refs/remotes/origin/{branch}");
+        let output = run_git_logged(&["checkout", "-B", branch, &target], repo, sink)?;
+        if !output.status.success() {
+            return Err(EngineError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().into(),
+            ));
+        }
+        Ok("checked-out")
+    }
+
+    /// `git rev-parse --verify --quiet refs/remotes/<remote>/<branch>` → sha, or `None`.
+    pub fn remote_ref_sha(&self, repo: &Path, remote: &str, branch: &str) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/remotes/{remote}/{branch}^{{commit}}"))
+            .current_dir(repo)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!sha.is_empty()).then_some(sha)
+    }
+
+    /// Return the first tag-only merge target. A failed advertisement lookup
+    /// cannot establish branch-only validation, so it fails before acceptance.
+    pub fn tag_only_merge_ref(
+        &self,
+        url: &str,
+        names: &[String],
+    ) -> Result<Option<String>, EngineError> {
+        let scratch = tempfile::tempdir().map_err(|e| EngineError::Git(e.to_string()))?;
+        let mut command = Command::new("git");
+        command
+            .args(["ls-remote", "--heads", "--tags", url])
+            .current_dir(scratch.path())
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let output = crate::engine::host_cli::checked_output(&mut command, "git ls-remote")
+            .map_err(|e| EngineError::Git(format!("cannot validate merge_refs: {e}")))?;
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let advertised: std::collections::HashSet<&str> = listing
+            .lines()
+            .filter_map(|line| line.split_once('\t').map(|(_, r)| r))
+            .collect();
+        Ok(names
+            .iter()
+            .find(|name| {
+                advertised.contains(format!("refs/tags/{name}").as_str())
+                    && !advertised.contains(format!("refs/heads/{name}").as_str())
+            })
+            .cloned())
+    }
+
+    /// Resolve a caller-supplied base ref to a spelling git accepts as a start point.
+    /// Tries `<base_ref>` first (sha, tag, local branch, `origin/x`), then
+    /// `origin/<base_ref>`. Returns the spelling that resolved.
+    pub fn resolve_base_ref_logged(
+        &self,
+        repo: &Path,
+        base_ref: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<String, EngineError> {
+        for candidate in [base_ref.to_string(), format!("origin/{base_ref}")] {
+            let spec = format!("{candidate}^{{commit}}");
+            let output = run_git_logged(&["rev-parse", "--verify", "--quiet", &spec], repo, sink)?;
+            if output.status.success() {
+                return Ok(candidate);
+            }
+        }
+        Err(EngineError::Git(format!(
+            "base_ref '{base_ref}' does not resolve to a commit in the clone \
+             (tried '{base_ref}' and 'origin/{base_ref}')"
+        )))
+    }
+
+    /// `git checkout --no-track -b <branch> <start_point>`. `--no-track` so a branch
+    /// cut from `origin/main` does not get `origin/main` as its upstream.
+    pub fn create_branch_from_logged(
+        &self,
+        repo: &Path,
+        branch: &str,
+        start_point: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<(), EngineError> {
+        let output = run_git_logged(
+            &["checkout", "--no-track", "-b", branch, start_point],
+            repo,
+            sink,
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git checkout -b {branch} {start_point} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// `git merge --no-ff --no-edit origin/<merge_ref>` in `repo`, committing as
+    /// `identity`. A missing `origin/<merge_ref>` is an error; a conflict is aborted
+    /// (`git merge --abort`) and reported with the conflicting paths.
+    pub fn merge_ref_logged(
+        &self,
+        repo: &Path,
+        merge_ref: &str,
+        identity: &CommitIdentity,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<MergeRefOutcome, EngineError> {
+        if self.remote_ref_sha(repo, "origin", merge_ref).is_none() {
+            return Err(EngineError::Git(format!(
+                "merge ref '{merge_ref}' does not exist on origin"
+            )));
+        }
+        let target = format!("refs/remotes/origin/{merge_ref}");
+        let args = with_overrides(identity, &["merge", "--no-ff", "--no-edit", &target]);
+        let output = run_git_logged(&args, repo, sink)?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("Already up to date") {
+                return Ok(MergeRefOutcome::AlreadyUpToDate);
+            }
+            return Ok(MergeRefOutcome::Merged {
+                sha: self.head_sha(repo)?,
+            });
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let conflicting_paths = self.unmerged_paths_logged(repo, sink).unwrap_or_default();
+        // Leave the clone at the pre-merge HEAD. A failed abort is logged and ignored.
+        let _ = run_git_logged(&["merge", "--abort"], repo, sink);
+        if conflicting_paths.is_empty() {
+            Err(EngineError::Git(format!(
+                "git merge {target} failed: {stderr}"
+            )))
+        } else {
+            Err(EngineError::MergeRefConflict {
+                merge_ref: merge_ref.to_string(),
+                conflicting_paths,
+            })
+        }
+    }
+
+    /// `git add -A -- . <AWMAN_BOOKKEEPING_EXCLUDES>`, then commit with `message` as
+    /// `identity` if anything is staged. No changes is `NothingToCommit`, not an error.
+    pub fn commit_all_with_identity_logged(
+        &self,
+        repo: &Path,
+        message: &str,
+        identity: &CommitIdentity,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<CommitAllOutcome, EngineError> {
+        // Exclusions must apply to entries already staged by an agent as well.
+        let output = run_git_logged(
+            &[
+                "reset",
+                "-q",
+                "HEAD",
+                "--",
+                ".awman/workflows/*.json",
+                ".awman/workflows/dynamic-*.toml",
+            ],
+            repo,
+            sink,
+        )?;
+        if !output.status.success() {
+            return Err(EngineError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().into(),
+            ));
+        }
+        let mut add: Vec<&str> = vec!["add", "-A", "--", "."];
+        add.extend_from_slice(AWMAN_BOOKKEEPING_EXCLUDES);
+        let output = run_git_logged(&add, repo, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git add -A failed: {}",
+                stderr.trim()
+            )));
+        }
+        if !self.has_staged_changes_logged(repo, sink)? {
+            return Ok(CommitAllOutcome::NothingToCommit);
+        }
+        let args = with_overrides(identity, &["commit", "-m", message]);
+        let output = run_git_logged(&args, repo, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git commit failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(CommitAllOutcome::Committed {
+            sha: self.head_sha(repo)?,
+        })
+    }
+
+    /// `git push -u <remote> HEAD:<branch>` in `repo` with `GIT_TERMINAL_PROMPT=0`,
+    /// so a missing credential fails fast with git's stderr. Never `--force`.
+    /// Returns the sha that was pushed.
+    pub fn push_upstream_logged(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<String, EngineError> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        let args = ["push", "-u", remote, refspec.as_str()];
+        let output = run_git_logged_env(&args, repo, &[("GIT_TERMINAL_PROMPT", "0")], sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git push -u {remote} HEAD:refs/heads/{branch} failed: {}",
+                stderr.trim()
+            )));
+        }
+        self.head_sha(repo)
+    }
 }
 
 /// Parse `git status --porcelain` output into `(path, change)` pairs.
@@ -2152,5 +2573,500 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, SparseCloneOutcome::FellBackToShallow);
         assert_eq!(calls, 3);
+    }
+
+    // ---- WI 0133: merge refs, leftover commit, push ----
+
+    type UpstreamClone = (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+    );
+
+    /// `(source, bare, work, clone)`: a clone of the local upstream. The clone has no
+    /// `user.*` of its own; tests set or rely on explicit identities.
+    fn clone_of_upstream() -> UpstreamClone {
+        let (source, bare) = setup_upstream();
+        let work = tempfile::tempdir().unwrap();
+        let clone = work.path().join("clone");
+        GitEngine::new()
+            .clone_repo(&bare_url(&bare), None, &clone)
+            .unwrap();
+        (source, bare, work, clone)
+    }
+
+    /// Commit `file` = `content` on a new upstream branch `name` cut from main.
+    fn push_upstream_branch(source: &Path, name: &str, file: &str, content: &str) {
+        run_git(source, &["checkout", "-q", "-b", name, "main"]);
+        std::fs::write(source.join(file), content).unwrap();
+        run_git(source, &["add", "."]);
+        run_git(
+            source,
+            &["commit", "-q", "-m", &format!("edit {file} on {name}")],
+        );
+        run_git(source, &["push", "-q", "origin", name]);
+        run_git(source, &["checkout", "-q", "main"]);
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The fallback assertions only hold when no global identity leaks in.
+    fn global_email_unset() -> bool {
+        !Command::new("git")
+            .args(["config", "--global", "user.email"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn test_identity() -> CommitIdentity {
+        CommitIdentity {
+            name: "a".into(),
+            email: "a@a".into(),
+            fallback: true,
+            overrides: ["-c", "user.name=a", "-c", "user.email=a@a"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn commit_identity_uses_clone_config_when_present() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        run_git(&clone, &["config", "user.name", "Jane"]);
+        run_git(&clone, &["config", "user.email", "jane@x"]);
+        let id = GitEngine::new().commit_identity(&clone).unwrap();
+        assert_eq!(id.name, "Jane");
+        assert_eq!(id.email, "jane@x");
+        assert!(!id.fallback);
+        assert!(id.overrides.is_empty());
+        assert!(id.describe().contains("Jane <jane@x> (git config)"));
+    }
+
+    #[test]
+    fn commit_identity_falls_back_when_clone_has_none() {
+        if !global_email_unset() {
+            return;
+        }
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let id = GitEngine::new().commit_identity(&clone).unwrap();
+        assert!(id.fallback);
+        assert_eq!(id.email, FALLBACK_COMMIT_EMAIL);
+        assert!(id
+            .overrides
+            .contains(&"user.email=awman@localhost".to_string()));
+        assert!(id.overrides.contains(&"user.name=awman".to_string()));
+        assert!(id.describe().contains("awman <awman@localhost>"));
+    }
+
+    #[test]
+    fn commit_identity_overrides_only_the_missing_key() {
+        if !global_email_unset() {
+            return;
+        }
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        run_git(&clone, &["config", "user.name", "Jane"]);
+        let id = GitEngine::new().commit_identity(&clone).unwrap();
+        assert_eq!(id.name, "Jane");
+        assert_eq!(id.email, FALLBACK_COMMIT_EMAIL);
+        assert_eq!(id.overrides, vec!["-c", "user.email=awman@localhost"]);
+    }
+
+    #[test]
+    fn remote_ref_sha_finds_existing_and_not_missing() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let g = GitEngine::new();
+        assert!(g.remote_ref_sha(&clone, "origin", "main").is_some());
+        assert!(g.remote_ref_sha(&clone, "origin", "nope").is_none());
+    }
+
+    #[test]
+    fn resolve_base_ref_handles_sha_tag_branch_and_missing() {
+        let (source, _b, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "feature", "f.txt", "f");
+        run_git(&clone, &["fetch", "-q", "origin"]);
+        run_git(&clone, &["tag", "v1", "origin/main"]);
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let sha = g.head_sha(&clone).unwrap();
+        assert_eq!(
+            g.resolve_base_ref_logged(&clone, &sha, &mut sink).unwrap(),
+            sha
+        );
+        assert_eq!(
+            g.resolve_base_ref_logged(&clone, "v1", &mut sink).unwrap(),
+            "v1"
+        );
+        assert_eq!(
+            g.resolve_base_ref_logged(&clone, "feature", &mut sink)
+                .unwrap(),
+            "origin/feature"
+        );
+        let err = g
+            .resolve_base_ref_logged(&clone, "missing", &mut sink)
+            .unwrap_err();
+        assert!(err.to_string().contains("does not resolve"), "{err}");
+    }
+
+    #[test]
+    fn create_branch_from_cuts_branch_without_upstream() {
+        let (source, _b, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "base", "base.txt", "b");
+        run_git(&clone, &["fetch", "-q", "origin"]);
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        g.create_branch_from_logged(&clone, "work", "origin/base", &mut sink)
+            .unwrap();
+        assert!(clone.join("base.txt").exists());
+        assert_eq!(git_out(&clone, &["config", "branch.work.remote"]), "");
+        assert!(g
+            .create_branch_from_logged(&clone, "x", "origin/nope", &mut sink)
+            .is_err());
+    }
+
+    #[test]
+    fn merge_ref_merges_with_a_merge_commit() {
+        let (source, _b, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "other", "other.txt", "o");
+        run_git(&clone, &["fetch", "-q", "origin"]);
+        run_git(&clone, &["checkout", "-q", "-b", "work"]);
+        // Diverge so --no-ff has something to record beyond a fast-forward.
+        std::fs::write(clone.join("mine.txt"), "m").unwrap();
+        run_git(&clone, &["add", "."]);
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@a",
+                "commit",
+                "-q",
+                "-m",
+                "mine",
+            ],
+        );
+        let g = GitEngine::new();
+        let id = test_identity();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let out = g.merge_ref_logged(&clone, "other", &id, &mut sink).unwrap();
+        let MergeRefOutcome::Merged { sha } = out else {
+            panic!("expected Merged, got {out:?}");
+        };
+        assert_eq!(sha, g.head_sha(&clone).unwrap());
+        assert!(clone.join("other.txt").exists());
+        let parents = git_out(&clone, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(
+            parents.split_whitespace().count(),
+            3,
+            "merge commit has 2 parents"
+        );
+        let again = g.merge_ref_logged(&clone, "other", &id, &mut sink).unwrap();
+        assert_eq!(again, MergeRefOutcome::AlreadyUpToDate);
+    }
+
+    #[test]
+    fn merge_ref_forces_a_merge_commit_even_when_fast_forward_is_possible() {
+        let (source, _b, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "other", "other.txt", "o");
+        run_git(&clone, &["fetch", "-q", "origin"]);
+        run_git(&clone, &["checkout", "-q", "-b", "work"]);
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        g.merge_ref_logged(&clone, "other", &test_identity(), &mut sink)
+            .unwrap();
+        let parents = git_out(&clone, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(parents.split_whitespace().count(), 3);
+    }
+
+    #[test]
+    fn merge_ref_commits_as_fallback_identity_when_clone_has_none() {
+        if !global_email_unset() {
+            return;
+        }
+        let (source, _b, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "other", "other.txt", "o");
+        run_git(&clone, &["fetch", "-q", "origin"]);
+        run_git(&clone, &["checkout", "-q", "-b", "work"]);
+        let g = GitEngine::new();
+        let id = g.commit_identity(&clone).unwrap();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        g.merge_ref_logged(&clone, "other", &id, &mut sink).unwrap();
+        assert_eq!(
+            git_out(&clone, &["log", "-1", "--format=%ae"]),
+            "awman@localhost"
+        );
+    }
+
+    #[test]
+    fn merge_ref_missing_ref_is_an_error() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let err = g
+            .merge_ref_logged(&clone, "ghost", &test_identity(), &mut sink)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist on origin"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_ref_conflict_aborts_and_lists_paths() {
+        let (source, _b, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "other", "README.md", "theirs");
+        run_git(&clone, &["fetch", "-q", "origin"]);
+        run_git(&clone, &["checkout", "-q", "-b", "work"]);
+        std::fs::write(clone.join("README.md"), "ours").unwrap();
+        run_git(&clone, &["add", "."]);
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=a",
+                "-c",
+                "user.email=a@a",
+                "commit",
+                "-q",
+                "-m",
+                "ours",
+            ],
+        );
+        let g = GitEngine::new();
+        let before = g.head_sha(&clone).unwrap();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let err = g
+            .merge_ref_logged(&clone, "other", &test_identity(), &mut sink)
+            .unwrap_err();
+        match &err {
+            EngineError::MergeRefConflict {
+                merge_ref,
+                conflicting_paths,
+            } => {
+                assert_eq!(merge_ref, "other");
+                assert_eq!(conflicting_paths, &vec!["README.md".to_string()]);
+            }
+            other => panic!("expected MergeRefConflict, got {other:?}"),
+        }
+        assert!(err.to_string().contains("README.md"));
+        assert!(!clone.join(".git/MERGE_HEAD").exists());
+        assert_eq!(g.head_sha(&clone).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(clone.join("README.md")).unwrap(),
+            "ours"
+        );
+    }
+
+    #[test]
+    fn commit_all_commits_changes_and_reports_sha() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        std::fs::write(clone.join("new.txt"), "n").unwrap();
+        let out = g
+            .commit_all_with_identity_logged(
+                &clone,
+                "Implement work item 0001",
+                &test_identity(),
+                &mut sink,
+            )
+            .unwrap();
+        let CommitAllOutcome::Committed { sha } = out else {
+            panic!("expected Committed, got {out:?}");
+        };
+        assert_eq!(sha, g.head_sha(&clone).unwrap());
+        assert_eq!(
+            git_out(&clone, &["log", "-1", "--format=%s"]),
+            "Implement work item 0001"
+        );
+    }
+
+    #[test]
+    fn commit_all_with_no_changes_is_not_an_error() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let before = g.head_sha(&clone).unwrap();
+        let out = g
+            .commit_all_with_identity_logged(&clone, "msg", &test_identity(), &mut sink)
+            .unwrap();
+        assert_eq!(out, CommitAllOutcome::NothingToCommit);
+        assert_eq!(g.head_sha(&clone).unwrap(), before);
+    }
+
+    #[test]
+    fn commit_all_ignores_awman_workflow_bookkeeping() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let dir = clone.join(".awman/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abc-0001-wf.json"), "{}").unwrap();
+        std::fs::write(dir.join("dynamic-0001.toml"), "x = 1").unwrap();
+        let out = g
+            .commit_all_with_identity_logged(&clone, "msg", &test_identity(), &mut sink)
+            .unwrap();
+        assert_eq!(out, CommitAllOutcome::NothingToCommit);
+    }
+
+    #[test]
+    fn commit_all_excludes_pre_staged_bookkeeping_additions_modifications_and_deletions() {
+        for source_edit in [false, true] {
+            let (_s, _b, _w, clone) = clone_of_upstream();
+            let dir = clone.join(".awman/workflows");
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["modified.json", "deleted.json"] {
+                std::fs::write(dir.join(name), "original").unwrap();
+            }
+            run_git(&clone, &["add", "-A"]);
+            run_git(
+                &clone,
+                &[
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    "baseline",
+                ],
+            );
+            std::fs::write(dir.join("modified.json"), "modified").unwrap();
+            std::fs::remove_file(dir.join("deleted.json")).unwrap();
+            std::fs::write(dir.join("new.json"), "new").unwrap();
+            std::fs::write(dir.join("dynamic-0042.toml"), "new").unwrap();
+            if source_edit {
+                std::fs::write(clone.join("work.txt"), "work").unwrap();
+            }
+            run_git(&clone, &["add", "-A"]);
+            let before = GitEngine::new().head_sha(&clone).unwrap();
+            let result = GitEngine::new()
+                .commit_all_with_identity_logged(
+                    &clone,
+                    "leftovers",
+                    &test_identity(),
+                    &mut crate::data::message::RecordingMessageSink::new(),
+                )
+                .unwrap();
+            if source_edit {
+                assert!(matches!(result, CommitAllOutcome::Committed { .. }));
+                assert_eq!(
+                    git_out(&clone, &["diff", "--name-only", &before, "HEAD"]),
+                    "work.txt"
+                );
+            } else {
+                assert_eq!(result, CommitAllOutcome::NothingToCommit);
+                assert_eq!(GitEngine::new().head_sha(&clone).unwrap(), before);
+            }
+            assert_eq!(
+                git_out(&clone, &["show", "HEAD:.awman/workflows/modified.json"]),
+                "original"
+            );
+            assert_eq!(
+                git_out(&clone, &["show", "HEAD:.awman/workflows/deleted.json"]),
+                "original"
+            );
+            assert!(dir.join("new.json").exists());
+            assert!(!dir.join("deleted.json").exists());
+        }
+    }
+
+    #[test]
+    fn checkout_fingerprint_detects_dirty_rewrites_untracked_rewrites_and_commits() {
+        let (_s, _b, _w, clone) = clone_of_upstream();
+        let git = GitEngine::new();
+        std::fs::write(clone.join("README.md"), "dirty").unwrap();
+        let before = git.checkout_fingerprint(&clone).unwrap();
+        std::fs::write(clone.join("README.md"), "other").unwrap();
+        assert_ne!(before, git.checkout_fingerprint(&clone).unwrap());
+        std::fs::write(clone.join("untracked"), "one").unwrap();
+        let before = git.checkout_fingerprint(&clone).unwrap();
+        std::fs::write(clone.join("untracked"), "two").unwrap();
+        assert_ne!(before, git.checkout_fingerprint(&clone).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let before = git.checkout_fingerprint(&clone).unwrap();
+            std::fs::set_permissions(
+                clone.join("README.md"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            assert_ne!(before, git.checkout_fingerprint(&clone).unwrap());
+        }
+        let before = git.checkout_fingerprint(&clone).unwrap();
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "forbidden",
+            ],
+        );
+        assert_ne!(before, git.checkout_fingerprint(&clone).unwrap());
+    }
+
+    #[test]
+    fn push_upstream_creates_branch_on_origin_and_sets_upstream() {
+        let (_s, bare, _w, clone) = clone_of_upstream();
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        g.create_branch_from_logged(&clone, "local-name", "origin/HEAD", &mut sink)
+            .unwrap();
+        std::fs::write(clone.join("work.txt"), "w").unwrap();
+        g.commit_all_with_identity_logged(&clone, "work", &test_identity(), &mut sink)
+            .unwrap();
+        let pushed = g
+            .push_upstream_logged(&clone, "origin", "job/1", &mut sink)
+            .unwrap();
+        assert_eq!(pushed, g.head_sha(&clone).unwrap());
+        assert_eq!(
+            git_out(bare.path(), &["rev-parse", "refs/heads/job/1"]),
+            pushed
+        );
+        assert_eq!(
+            git_out(&clone, &["config", "branch.local-name.remote"]),
+            "origin"
+        );
+    }
+
+    #[test]
+    fn push_upstream_rejection_returns_stderr_and_never_forces() {
+        let (source, bare, _w, clone) = clone_of_upstream();
+        push_upstream_branch(source.path(), "job", "theirs.txt", "t");
+        let g = GitEngine::new();
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        std::fs::write(clone.join("mine.txt"), "m").unwrap();
+        g.commit_all_with_identity_logged(&clone, "mine", &test_identity(), &mut sink)
+            .unwrap();
+        let before = git_out(bare.path(), &["rev-parse", "refs/heads/job"]);
+        let err = g
+            .push_upstream_logged(&clone, "origin", "job", &mut sink)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("git push -u origin HEAD:refs/heads/job failed"),
+            "{err}"
+        );
+        assert_eq!(
+            before,
+            git_out(bare.path(), &["rev-parse", "refs/heads/job"]),
+            "a non-fast-forward push must not overwrite the remote branch"
+        );
     }
 }

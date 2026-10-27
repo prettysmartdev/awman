@@ -27,6 +27,7 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
         let args: Vec<String> = serde_json::from_str(&command.args).unwrap_or_default();
         command_frontend::ApiDispatchFrontend::new(&command.subcommand, &args, event_bus)
             .with_state_writer(state_writer)
+            .deferring_done()
     }
 }
 

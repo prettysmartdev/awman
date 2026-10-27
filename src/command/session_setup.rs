@@ -40,7 +40,7 @@ use crate::data::session::{SessionOpenOptions, SessionType};
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus, SetupEventPayload};
 use crate::engine::error::EngineError;
-use crate::engine::git::GitFrontend;
+use crate::engine::git::{GitFrontend, MergeRefOutcome};
 use crate::engine::ready::frontend::ReadyFrontend;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions};
 
@@ -192,6 +192,236 @@ impl SessionSetup {
         }
     }
 
+    /// Record a remote-stage failure and retire the run: broadcast it, delete
+    /// the partial clone, persist `"failed"`, then finish. Every failure in
+    /// [`Self::prepare_clone`] ends here so none can leave a clone behind.
+    async fn fail_remote(
+        &self,
+        presenter: &mut dyn SessionSetupPresenter,
+        stage: &str,
+        error: &str,
+    ) {
+        self.mark_failed(presenter, stage, error);
+        self.delete_clone().await;
+        self.persist_status("failed");
+        self.finish(presenter).await;
+    }
+
+    /// Run one blocking git operation off the async runtime, turning a panic
+    /// in the task into an [`EngineError::Git`] naming `what`.
+    async fn blocking_git<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        op: impl FnOnce(&crate::engine::git::GitEngine) -> Result<T, EngineError> + Send + 'static,
+    ) -> Result<T, EngineError> {
+        let git = Arc::clone(&self.engines.git_engine);
+        tokio::task::spawn_blocking(move || op(&git))
+            .await
+            .unwrap_or_else(|join_err| {
+                Err(EngineError::Git(format!(
+                    "{what} task panicked: {join_err}"
+                )))
+            })
+    }
+
+    /// The remote-only stages: clone the default branch, set up the session
+    /// branch, then merge `merge_refs` into it. `Err(())` means a stage failed
+    /// and the failure has already been recorded, the clone deleted and the
+    /// run finished; the caller just stops.
+    pub(crate) async fn prepare_clone(
+        &self,
+        presenter: &mut dyn SessionSetupPresenter,
+    ) -> Result<(), ()> {
+        let session_id = &self.session_id;
+
+        // ── Stage 1: clone repository ────────────────────────────────────────
+        self.enter_status(SessionSetupStatus::CloningRepository);
+        let msg = format!(
+            "Cloning {}...",
+            self.plan.repo_url.as_deref().unwrap_or("repository")
+        );
+        self.stage(presenter, "cloning_repository", &msg);
+        presenter.log(&format!(
+            "state → {:?}: clone stage",
+            SessionSetupStatus::CloningRepository
+        ));
+
+        let url = self.plan.repo_url.clone().unwrap_or_default();
+        let dest = self
+            .plan
+            .cloned_path
+            .clone()
+            .expect("remote sessions have cloned_path");
+        tracing::info!(
+            session_id = %session_id,
+            repo_url = %url,
+            dest = %dest.display(),
+            "Cloning remote repository (default branch)"
+        );
+        let dest_for_clone = dest.clone();
+        let mut clone_sink = presenter.git_log_sink();
+        // Clone the repository's default branch regardless of `plan.branch`.
+        // A full clone, so every remote branch is available as
+        // `origin/<name>` to the branch and merge stages below.
+        let clone_result = self
+            .blocking_git("clone", move |git| {
+                git.clone_repo_logged(&url, None, &dest_for_clone, &mut *clone_sink)
+            })
+            .await;
+        if let Err(e) = clone_result {
+            tracing::error!(session_id = %session_id, error = %e, "Clone failed");
+            self.fail_remote(presenter, "clone", &e.to_string()).await;
+            return Err(());
+        }
+        tracing::info!(session_id = %session_id, "Repository cloned");
+        presenter.emit(SetupEventPayload::StageChanged {
+            stage: "cloning_repository_done".to_string(),
+            message: "Repository cloned".to_string(),
+        });
+
+        // ── Stage 2: set up branch ───────────────────────────────────────────
+        let Some(branch) = self.plan.branch.clone() else {
+            return Ok(());
+        };
+        self.enter_status(SessionSetupStatus::SettingUpBranch);
+        let msg = format!("Checking out branch '{branch}'...");
+        self.stage(presenter, "setting_up_branch", &msg);
+        presenter.log(&format!(
+            "state → {:?}: branch={branch}",
+            SessionSetupStatus::SettingUpBranch
+        ));
+        tracing::info!(session_id = %session_id, branch = %branch, "Setting up branch");
+
+        match self.setup_branch(presenter, &dest, &branch).await {
+            Ok(disposition) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    branch = %branch,
+                    disposition = %disposition,
+                    "Branch ready"
+                );
+                presenter.emit(SetupEventPayload::StageChanged {
+                    stage: "branch_ready".to_string(),
+                    message: format!("Branch '{branch}' {disposition}"),
+                });
+            }
+            Err(e) => {
+                tracing::error!(session_id = %session_id, error = %e, "Branch setup failed");
+                self.fail_remote(presenter, "branch", &e).await;
+                return Err(());
+            }
+        }
+
+        // ── Stage 2b: merge refs ─────────────────────────────────────────────
+        if self.plan.merge_refs.is_empty() {
+            return Ok(());
+        }
+        self.enter_status(SessionSetupStatus::MergingRefs);
+        presenter.log(&format!(
+            "state → {:?}: merge_refs={:?}",
+            SessionSetupStatus::MergingRefs,
+            self.plan.merge_refs
+        ));
+        if let Err(e) = self.merge_refs(presenter, &dest).await {
+            tracing::error!(session_id = %session_id, error = %e, "Merging refs failed");
+            self.fail_remote(presenter, "merging_refs", &e).await;
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Put the clone on `branch`. A branch already on origin is checked out
+    /// (and refuses a `base_ref`, which would otherwise be silently ignored);
+    /// a new one is cut from `base_ref` or `origin/HEAD`. Returns how the
+    /// branch was obtained, for the `branch_ready` message.
+    async fn setup_branch(
+        &self,
+        presenter: &mut dyn SessionSetupPresenter,
+        dest: &std::path::Path,
+        branch: &str,
+    ) -> Result<String, String> {
+        let exists_on_origin = {
+            let (dest, branch) = (dest.to_path_buf(), branch.to_string());
+            self.blocking_git("branch", move |git| {
+                Ok(git.remote_ref_sha(&dest, "origin", &branch).is_some())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        };
+        let base_ref = self.plan.base_ref.clone();
+        let (dest, branch) = (dest.to_path_buf(), branch.to_string());
+        let mut sink = presenter.git_log_sink();
+        match (exists_on_origin, base_ref) {
+            (true, Some(_)) => Err(format!(
+                "branch '{branch}' already exists on origin; omit base_ref to continue it"
+            )),
+            (true, None) => self
+                .blocking_git("branch", move |git| {
+                    git.checkout_remote_branch_logged(&dest, &branch, &mut *sink)
+                })
+                .await
+                .map(str::to_string)
+                .map_err(|e| e.to_string()),
+            (false, base_ref) => self
+                .blocking_git("branch", move |git| {
+                    let start = match base_ref {
+                        Some(base) => git.resolve_base_ref_logged(&dest, &base, &mut *sink)?,
+                        None => "refs/remotes/origin/HEAD".to_string(),
+                    };
+                    git.create_branch_from_logged(&dest, &branch, &start, &mut *sink)?;
+                    Ok(format!("created from {start}"))
+                })
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Merge each `merge_refs` entry, in order, as
+    /// `git merge --no-ff --no-edit origin/<ref>`. The first missing ref or
+    /// conflict stops the stage; the engine has already aborted a conflicting
+    /// merge, and its error names the conflicting paths.
+    async fn merge_refs(
+        &self,
+        presenter: &mut dyn SessionSetupPresenter,
+        dest: &std::path::Path,
+    ) -> Result<(), String> {
+        // The clone may have no `user.name` / `user.email` (a fresh server);
+        // the engine supplies awman's fallback for exactly the missing keys.
+        let identity = {
+            let dest = dest.to_path_buf();
+            self.blocking_git("merge", move |git| git.commit_identity(&dest))
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        presenter.log(&identity.describe());
+
+        let total = self.plan.merge_refs.len();
+        for (i, merge_ref) in self.plan.merge_refs.iter().enumerate() {
+            let msg = format!("Merging origin/{merge_ref} ({}/{total})...", i + 1);
+            self.stage(presenter, "merging_refs", &msg);
+            let (dest, r, id) = (dest.to_path_buf(), merge_ref.clone(), identity.clone());
+            let mut sink = presenter.git_log_sink();
+            let outcome = self
+                .blocking_git("merge", move |git| {
+                    git.merge_ref_logged(&dest, &r, &id, &mut *sink)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let message = match outcome {
+                MergeRefOutcome::Merged { sha } => {
+                    format!("Merged origin/{merge_ref} ({})", &sha[..sha.len().min(8)])
+                }
+                MergeRefOutcome::AlreadyUpToDate => format!("origin/{merge_ref} already merged"),
+            };
+            tracing::info!(session_id = %self.session_id, merge_ref = %merge_ref, "{message}");
+            presenter.emit(SetupEventPayload::StageChanged {
+                stage: "merge_ref_done".to_string(),
+                message,
+            });
+        }
+        Ok(())
+    }
+
     /// Run the full setup sequence, reporting progress and terminal state via
     /// `presenter`. Returns when setup reaches a terminal state (ready or
     /// failed), the snapshot is on disk, and the frontend has been told to
@@ -220,114 +450,9 @@ impl SessionSetup {
             self.plan.resolved_workdir.display()
         ));
 
-        // ── [remote only] Stage 1: clone repository ──────────────────────────
-        if self.plan.kind == SessionKind::Remote {
-            self.enter_status(SessionSetupStatus::CloningRepository);
-            let msg = format!(
-                "Cloning {}...",
-                self.plan.repo_url.as_deref().unwrap_or("repository")
-            );
-            self.stage(presenter, "cloning_repository", &msg);
-            presenter.log(&format!(
-                "state → {:?}: clone stage",
-                SessionSetupStatus::CloningRepository
-            ));
-
-            let url = self.plan.repo_url.clone().unwrap_or_default();
-            let dest = self
-                .plan
-                .cloned_path
-                .clone()
-                .expect("remote sessions have cloned_path");
-            tracing::info!(
-                session_id = %session_id,
-                repo_url = %url,
-                dest = %dest.display(),
-                "Cloning remote repository (default branch)"
-            );
-            let git = Arc::clone(&self.engines.git_engine);
-            let dest_for_clone = dest.clone();
-            let mut clone_sink = presenter.git_log_sink();
-            // Clone the repository's default branch regardless of `plan.branch`.
-            // The requested branch (which may not exist on the remote) is created
-            // or checked out in the dedicated branch-setup stage below.
-            let clone_result = tokio::task::spawn_blocking(move || {
-                git.clone_repo_logged(&url, None, &dest_for_clone, &mut *clone_sink)
-            })
-            .await
-            .unwrap_or_else(|join_err| {
-                Err(EngineError::Git(format!("clone task panicked: {join_err}")))
-            });
-            if let Err(e) = clone_result {
-                tracing::error!(session_id = %session_id, error = %e, "Clone failed");
-                self.mark_failed(presenter, "clone", &e.to_string());
-                // Cleanup any partial clone.
-                self.delete_clone().await;
-                self.persist_status("failed");
-                self.finish(presenter).await;
-                return;
-            }
-            tracing::info!(session_id = %session_id, "Repository cloned");
-            presenter.emit(SetupEventPayload::StageChanged {
-                stage: "cloning_repository_done".to_string(),
-                message: "Repository cloned".to_string(),
-            });
-
-            // ── [remote only] Stage 2: set up branch ─────────────────────────
-            if let Some(branch) = self.plan.branch.as_deref() {
-                self.enter_status(SessionSetupStatus::SettingUpBranch);
-                let msg = format!("Checking out branch '{branch}'...");
-                self.stage(presenter, "setting_up_branch", &msg);
-                presenter.log(&format!(
-                    "state → {:?}: branch={branch}",
-                    SessionSetupStatus::SettingUpBranch
-                ));
-                tracing::info!(
-                    session_id = %session_id,
-                    branch = %branch,
-                    "Setting up branch"
-                );
-
-                let git = Arc::clone(&self.engines.git_engine);
-                let dest_for_branch = dest.clone();
-                let branch_owned = branch.to_string();
-                let mut branch_sink = presenter.git_log_sink();
-                let branch_result = tokio::task::spawn_blocking(move || {
-                    git.checkout_or_create_branch_logged(
-                        &dest_for_branch,
-                        &branch_owned,
-                        &mut *branch_sink,
-                    )
-                })
-                .await
-                .unwrap_or_else(|join_err| {
-                    Err(EngineError::Git(format!(
-                        "branch task panicked: {join_err}"
-                    )))
-                });
-                match branch_result {
-                    Ok(disposition) => {
-                        tracing::info!(
-                            session_id = %session_id,
-                            branch = %branch,
-                            disposition = disposition,
-                            "Branch ready"
-                        );
-                        presenter.emit(SetupEventPayload::StageChanged {
-                            stage: "branch_ready".to_string(),
-                            message: format!("Branch '{branch}' {disposition}"),
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(session_id = %session_id, error = %e, "Branch setup failed");
-                        self.mark_failed(presenter, "branch", &e.to_string());
-                        self.delete_clone().await;
-                        self.persist_status("failed");
-                        self.finish(presenter).await;
-                        return;
-                    }
-                }
-            }
+        // ── [remote only] Stages 1-2b: clone, branch, merges ─────────────────
+        if self.plan.kind == SessionKind::Remote && self.prepare_clone(presenter).await.is_err() {
+            return;
         }
 
         // ── Stage 3 (all): open Session ──────────────────────────────────────
@@ -652,6 +777,9 @@ mod tests {
             // A path that does not exist → `git clone` fails immediately.
             repo_url: Some(root.path().join("no-such-repo.git").display().to_string()),
             branch: None,
+            base_ref: None,
+            merge_refs: Vec::new(),
+            push: false,
         };
 
         // The orchestrator now owns persistence, so the test gives it a real
@@ -850,6 +978,9 @@ mod tests {
             cloned_path: None,
             repo_url: None,
             branch: None,
+            base_ref: None,
+            merge_refs: Vec::new(),
+            push: false,
         };
 
         let api_root = tempfile::tempdir().unwrap();

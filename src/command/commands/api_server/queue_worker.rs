@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::event_bus::EventBus;
+use super::push_back::{
+    push_after_success, push_baseline, PushBackError, PushBackOutcome, PushEventSink,
+};
 use super::runtime::ApiSessionLifecycle;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::execution_event::{
     CommandStatusKind, EventPayload, PhaseStatusKind, StepStatusKind,
 };
 use crate::data::fs::api_command_log::{CommandLogWriter, CommandStateWriter};
-use crate::data::fs::api_db::{CommandRecord, SqliteSessionStore};
+use crate::data::fs::api_db::{CommandRecord, CommandResult, SqliteSessionStore};
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session_manager::SessionManager;
 
@@ -22,25 +25,43 @@ struct QueuedCommandResult {
     result_json: String,
 }
 impl QueuedCommandResult {
-    fn new(result: &Result<CommandOutcome, crate::command::error::CommandError>) -> Self {
-        let exit_code = result.as_ref().map_or_else(
+    fn new(
+        result: &Result<CommandOutcome, crate::command::error::CommandError>,
+        push_outcome: &Result<PushBackOutcome, PushBackError>,
+    ) -> Self {
+        let mut exit_code = result.as_ref().map_or_else(
             |error| i32::from(error.exit_code()),
             CommandOutcome::exit_code,
         );
+        let mut json = CommandResult {
+            exit_code: Some(exit_code),
+            error: result.as_ref().err().map(ToString::to_string),
+            error_status: result.as_ref().err().map(|error| error.http_status()),
+            stage: None,
+            pushed: None,
+        };
+        match push_outcome {
+            Ok(PushBackOutcome::NotConfigured) => {}
+            Ok(PushBackOutcome::NothingToPush) => json.pushed = Some(None),
+            Ok(PushBackOutcome::Pushed(pushed)) => json.pushed = Some(Some(pushed.clone())),
+            Err(error) => {
+                exit_code = 1;
+                json.exit_code = Some(exit_code);
+                json.error = Some(error.message.clone());
+                json.error_status = Some(500);
+                json.stage = Some(error.stage.into());
+                json.pushed = Some(None);
+            }
+        }
         let status = if result.is_ok() && exit_code == 0 {
             "done"
         } else {
             "error"
         };
-        let mut json = serde_json::json!({ "exit_code": exit_code });
-        if let Err(error) = result {
-            json["error"] = serde_json::Value::String(error.to_string());
-            json["error_status"] = serde_json::Value::from(error.http_status());
-        }
         Self {
             exit_code,
             status,
-            result_json: json.to_string(),
+            result_json: serde_json::to_string(&json).expect("command result is serializable"),
         }
     }
 
@@ -63,6 +84,8 @@ impl QueuedCommandResult {
 pub trait ApiCommandFrontendFactory: Send + Sync {
     type Frontend: crate::command::dispatch::DispatchFrontend;
 
+    /// The worker emits `Done` after post-command stages. The returned frontend
+    /// must leave that sentinel to the worker, including when dropped on error.
     fn frontend_for(
         &self,
         cmd: &CommandRecord,
@@ -191,7 +214,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
 
         // Spawn logfile writer task. The two log files are owned by a Layer 0
         // writer so this frontend performs no filesystem calls of its own.
-        {
+        let log_writer = {
             let mut log_rx = event_bus.subscribe();
             let paths = self.paths.clone();
             let session_id_for_log = session_id.clone();
@@ -225,8 +248,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            });
-        }
+            })
+        };
 
         // Spawn server-side tracing task — emits structured tracing records
         // for workflow step + phase transitions and the engine-reported
@@ -267,6 +290,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                     "error": "Session not found in memory",
                 }))
                 .ok();
+                event_bus.sender().emit(EventPayload::Done);
+                let _ = log_writer.await;
                 let _ =
                     self.store
                         .complete_command(&command_id, "error", None, result_json.as_deref());
@@ -274,6 +299,26 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 self.post_execution_check(&session_id).await;
                 return;
             }
+        };
+
+        // Capture before dispatch: explicit workflow teardown may publish itself.
+        let baseline = match self.store.get_session(&session_id) {
+            Ok(Some(record)) => {
+                let git = Arc::clone(&self.engines.git_engine);
+                tokio::task::spawn_blocking(move || push_baseline(&git, &record))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(PushBackError {
+                            stage: "push",
+                            message: e.to_string(),
+                        })
+                    })
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(PushBackError {
+                stage: "push",
+                message: e.to_string(),
+            }),
         };
 
         // Dispatch through Layer 2.
@@ -317,7 +362,51 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }
         };
 
-        let completion = QueuedCommandResult::new(&result);
+        let push_outcome = if command_succeeded_for_push(&result) {
+            match self.store.get_session(&session_id) {
+                Ok(Some(record)) => {
+                    let git = Arc::clone(&self.engines.git_engine);
+                    let subcommand = subcommand.clone();
+                    let args = args.clone();
+                    let sender = event_bus.sender();
+                    tokio::task::spawn_blocking(move || {
+                        let baseline = baseline?;
+                        push_after_success(
+                            &git,
+                            &record,
+                            &subcommand,
+                            &args,
+                            baseline,
+                            &mut PushEventSink(sender),
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(PushBackError {
+                            stage: "push",
+                            message: format!("push task failed: {error}"),
+                        })
+                    })
+                }
+                Ok(None) => Ok(PushBackOutcome::NotConfigured),
+                Err(error) => Err(PushBackError {
+                    stage: "push",
+                    message: format!("failed to read session push configuration: {error}"),
+                }),
+            }
+        } else {
+            Ok(PushBackOutcome::NotConfigured)
+        };
+        if let Err(error) = &push_outcome {
+            tracing::error!(command_id = %command_id, error = %error.message, "Push-back failed");
+            event_bus.sender().emit(EventPayload::CommandStatus {
+                status: CommandStatusKind::Error,
+                exit_code: Some(1),
+                error: Some(format!("{}: {}", error.stage, error.message)),
+            });
+        }
+
+        let completion = QueuedCommandResult::new(&result, &push_outcome);
         let exit_code = completion.exit_code;
         let status = completion.status;
         let success = status == "done";
@@ -340,7 +429,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 status = status,
                 exit_code = ?exit_code,
                 success = false,
-                error = result.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+                error = push_outcome.as_ref().err().map(|e| e.message.clone())
+                    .or_else(|| result.as_ref().err().map(ToString::to_string)).unwrap_or_default(),
                 "Command execution finished with failure"
             );
         }
@@ -348,8 +438,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         if let Err(ref e) = result {
             tracing::error!(command_id = %command_id, error = %e, "Command failed");
         }
-
-        let _ = completion.persist(&self.store, &command_id);
 
         // Write final metadata.
         {
@@ -370,6 +458,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 .write_command_metadata(&session_id, &command_id, &metadata);
         }
 
+        event_bus.sender().emit(EventPayload::Done);
+        let _ = log_writer.await;
+        let _ = completion.persist(&self.store, &command_id);
         self.cleanup_event_bus(&command_id).await;
         self.post_execution_check(&session_id).await;
     }
@@ -390,6 +481,18 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 tracing::error!(worker_id = %self.worker_id, %error, session_id, "Failed to finish closing session");
             }
         }
+    }
+}
+
+/// A paused/interrupted execution has no process exit code, even though the
+/// general command projection maps it to zero. Only a real exit 0 may push.
+fn command_succeeded_for_push(
+    result: &Result<CommandOutcome, crate::command::error::CommandError>,
+) -> bool {
+    match result {
+        Ok(CommandOutcome::ExecWorkflow(outcome)) => outcome.exit_code == Some(0),
+        Ok(CommandOutcome::ExecPrompt(outcome)) => outcome.exit_code == Some(0),
+        _ => false,
     }
 }
 
@@ -555,6 +658,70 @@ mod completion_tests {
     use crate::engine::error::EngineError;
 
     #[test]
+    fn push_requires_an_explicit_successful_execution_exit() {
+        for exit_code in [None, Some(0), Some(1), Some(130)] {
+            let workflow = Ok(CommandOutcome::ExecWorkflow(
+                crate::command::commands::exec_workflow::ExecWorkflowOutcome {
+                    workflow: "workflow.toml".into(),
+                    exit_code,
+                    worktree_used: false,
+                },
+            ));
+            let prompt = Ok(CommandOutcome::ExecPrompt(
+                crate::command::commands::exec_prompt::ExecPromptOutcome {
+                    agent: None,
+                    exit_code,
+                },
+            ));
+            assert_eq!(command_succeeded_for_push(&workflow), exit_code == Some(0));
+            assert_eq!(command_succeeded_for_push(&prompt), exit_code == Some(0));
+        }
+        assert!(!command_succeeded_for_push(&Err(CommandError::Aborted)));
+        assert!(!command_succeeded_for_push(&Ok(CommandOutcome::Empty)));
+    }
+
+    #[test]
+    fn push_completion_records_absent_null_and_pushed_ref() {
+        use crate::data::fs::api_db::PushedRef;
+
+        let result = Ok(CommandOutcome::Empty);
+        let unconfigured = QueuedCommandResult::new(&result, &Ok(PushBackOutcome::NotConfigured));
+        assert_eq!(unconfigured.result_json, r#"{"exit_code":0}"#);
+
+        let nothing = QueuedCommandResult::new(&result, &Ok(PushBackOutcome::NothingToPush));
+        let json: serde_json::Value = serde_json::from_str(&nothing.result_json).unwrap();
+        assert!(json["pushed"].is_null());
+        assert!(json.as_object().unwrap().contains_key("pushed"));
+
+        let pushed = PushedRef {
+            remote: "origin".into(),
+            branch: "feature".into(),
+            sha: "1234567890".into(),
+        };
+        let completion =
+            QueuedCommandResult::new(&result, &Ok(PushBackOutcome::Pushed(pushed.clone())));
+        let json: CommandResult = serde_json::from_str(&completion.result_json).unwrap();
+        assert_eq!(completion.status, "done");
+        assert_eq!(json.pushed, Some(Some(pushed)));
+    }
+
+    #[test]
+    fn push_failure_overrides_success_and_persists_stderr() {
+        let failure = PushBackError::from(EngineError::Git(
+            "git push failed: rejected (non-fast-forward)".into(),
+        ));
+        let completion = QueuedCommandResult::new(&Ok(CommandOutcome::Empty), &Err(failure));
+        let json: CommandResult = serde_json::from_str(&completion.result_json).unwrap();
+        assert_eq!(completion.status, "error");
+        assert_eq!(completion.exit_code, 1);
+        assert_eq!(json.exit_code, Some(1));
+        assert_eq!(json.stage.as_deref(), Some("push"));
+        assert!(json.error.unwrap().contains("rejected (non-fast-forward)"));
+        assert_eq!(json.error_status, Some(500));
+        assert_eq!(json.pushed, Some(None));
+    }
+
+    #[test]
     fn queued_failures_persist_the_shared_code_in_row_and_json() {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteSessionStore::open(temp.path()).unwrap();
@@ -593,7 +760,8 @@ mod completion_tests {
                 .unwrap();
             let command = store.claim_next_command("worker").unwrap().unwrap();
             assert_eq!(command.id, id);
-            let completion = QueuedCommandResult::new(&Err(error));
+            let completion =
+                QueuedCommandResult::new(&Err(error), &Ok(PushBackOutcome::NotConfigured));
             completion.persist(&store, &id).unwrap();
             let saved = store.get_command(&id).unwrap().unwrap();
             assert_eq!(saved.status, "error");

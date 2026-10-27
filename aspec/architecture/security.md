@@ -92,3 +92,12 @@ not passed to the SDK. Config and layer blobs remain byte-identical; rewriting
 outer selection metadata does not flatten the root filesystem. Acquisition
 cache references retain their own identity and source metadata even when their
 archive bytes are shared.
+
+## Remote session push-back
+
+When a remote API session is created with `push: true`, awman pushes the session branch to `origin` after a successful `exec` command. This is a host-side Git operation; all agent work still happens in containers. The clone lives under `<API root>/sessions/<id>/<repository-folder>`. The API root is selected in order from `AWMAN_API_ROOT`, `AWMAN_CONFIG_HOME/api`, `XDG_DATA_HOME/awman/api`, or `~/.awman/api`.
+
+- **Credentials:** transport uses the trusted host Git configuration and credentials of the user running `awman api` (their SSH keys and credential helpers), with prompting disabled (`GIT_TERMINAL_PROMPT=0`; default SSH uses `BatchMode=yes`). Per-session credentials will replace these when available. Each push-back Git operation has a two-minute timeout.
+- **No force:** awman never force-pushes. A rejected push fails the command with a `push` stage error and leaves local commits in the clone.
+- **Untrusted metadata:** agents can write the clone's `.git`, so absence of hooks immediately after clone provides no protection. Push-back imports only inert objects and refs into a private Git directory outside the mount, rejects symlinks/special files in imported metadata, disables hooks and fsmonitor explicitly, and never imports the clone's config, index, alternates, attributes, or signing/transport helpers. Work-tree staging/committing uses no system/global config, preventing configured filters from executing on agent files. Only identity values and the inert object format are preserved; transport uses a newly authored `origin` pinned to the session's persisted `repo_url`, with trusted host credentials. No agent-authored configuration is evaluated as host commands. Commit objects and the resulting index/ref are copied back without executing Git in the writable clone.
+- **Scope:** only `refs/heads/<session branch>` on `origin` is pushed, and only when the session was explicitly created with `push: true`. Explicit workflow `push_branch` steps execute in the container, accept branch names rather than force options/refspecs, and delimit positional arguments with `--`.

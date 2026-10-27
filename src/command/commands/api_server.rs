@@ -17,6 +17,7 @@ use crate::engine::daemon::{AcquireError, DaemonGuard, DaemonKind, DaemonSupervi
 use crate::engine::remote::{HttpClientOptions, HttpCore};
 
 pub mod event_bus;
+pub mod push_back;
 pub mod queue_worker;
 pub mod runtime;
 pub mod session_setup;

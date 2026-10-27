@@ -36,6 +36,10 @@ pub const AWMAN_SQUAD_KEY: &str = "AWMAN_SQUAD_KEY";
 /// `GITHUB_TOKEN` — optional token used by the GitHub issue provider.
 pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
+/// Trusted host Git transport overrides, preserved by remote-session push-back.
+pub const GIT_SSH_COMMAND: &str = "GIT_SSH_COMMAND";
+pub const GIT_SSH: &str = "GIT_SSH";
+
 /// `AWMAN_MAX_CONCURRENT_AGENTS` — overrides the max-concurrent-agents cap
 /// for workflow execution.
 pub const AWMAN_MAX_CONCURRENT_AGENTS: &str = "AWMAN_MAX_CONCURRENT_AGENTS";
