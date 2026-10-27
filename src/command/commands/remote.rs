@@ -375,6 +375,7 @@ async fn run_remote_exec(
                             text: format!("[step {step_index}] {step_name} → {to_status}"),
                         });
                     }
+                    EventPayload::WorkflowPhaseTransition { ref phase, .. } if phase != "main" => {}
                     EventPayload::WorkflowPhaseTransition {
                         phase,
                         step_desc,

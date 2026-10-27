@@ -10,6 +10,7 @@ use crate::data::error::DataError;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::fs::data_paths::DataPaths;
 use crate::data::session_setup_event::SessionSetupState;
+use crate::data::workflow_state::WorkflowState;
 
 /// Filename of the API sqlite database.
 pub const API_DB_FILENAME: &str = "awman.db";
@@ -262,7 +263,7 @@ impl ApiPaths {
         std::fs::create_dir_all(&session_dir).map_err(|e| DataError::io(&session_dir, e))?;
         let path = self.session_setup_state_path(session_id);
         let json = serde_json::to_string_pretty(state)
-            .map_err(|source| DataError::ConfigSerialize { source })?;
+            .map_err(|source| DataError::Other(format!("serializing workflow state: {source}")))?;
         std::fs::write(&path, json).map_err(|e| DataError::io(&path, e))
     }
 
@@ -292,6 +293,23 @@ impl ApiPaths {
         let json = serde_json::to_string_pretty(metadata)
             .map_err(|source| DataError::ConfigSerialize { source })?;
         std::fs::write(&path, json).map_err(|e| DataError::io(&path, e))
+    }
+
+    /// Atomically persist a command's workflow state: write
+    /// `workflow.state.json.tmp`, then rename it over `workflow.state.json`
+    /// so a poll never reads a half-written file.
+    pub fn write_command_workflow_state(
+        &self,
+        session_id: &str,
+        command_id: &str,
+        state: &WorkflowState,
+    ) -> Result<(), DataError> {
+        let path = self.command_workflow_state_path(session_id, command_id);
+        let tmp_path = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|source| DataError::ConfigSerialize { source })?;
+        std::fs::write(&tmp_path, json).map_err(|e| DataError::io(&tmp_path, e))?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| DataError::io(&path, e))
     }
 
     /// Read a command's persisted workflow state as raw JSON text. Returns

@@ -989,6 +989,54 @@ Press [r] to retry, or any other key to abort:
 | `--dynamic` | Let a leader agent design the workflow file from your work item; see [Dynamic Workflows](06-dynamic-workflows.md) |
 | `--leader=<agent::model>` | Override the agent and model used as the leader when `--dynamic` is set; format: `agent::model` |
 | `--max-concurrent=<N>` | Cap on concurrently-running steps for this invocation (must be ≥ 1); overrides `maxConcurrentAgents` in config — see [Parallel workflows](05-workflows.md#parallel-workflows) |
+| `--on-dirty-merge-target=<POLICY>` | Action for uncommitted changes in the merge target: `ask`, `commit`, `stash`, or `fail` |
+| `--on-merge-failure=<POLICY>` | Action after a failed merge: `ask`, `agent`, or `keep` |
+
+### Worktree merge-back
+
+When `--worktree` is active (including the worktree implied by `--yolo` or
+`--dynamic`), the workflow runs on its own branch. After the workflow finishes,
+awman checks the merge target (the checkout you started from) for staged,
+unstaged, and untracked changes before merging the worktree branch back. Choose
+what to do with a dirty target using `--on-dirty-merge-target` or
+`worktree.onDirtyMergeTarget`:
+
+- `ask` prompts you; a headless host uses its own default (API: `fail`).
+- `commit` commits all target changes before the merge.
+- `stash` stashes tracked and untracked changes, then merges. awman reports the
+  created `stash@{0}`; it does not automatically pop the stash.
+- `fail` keeps the worktree and aborts the merge-back with a dirty-target
+  error.
+
+If Git reports that the merge failed, awman keeps the worktree and can ask
+whether to launch a merge-fix agent. `--on-merge-failure` or
+`worktree.mergeFix.onFailure` accepts `ask`, `agent`, or `keep`. The agent works
+in the merge target, receives the failed command, output, and unmerged paths,
+and is asked to resolve and stage the conflicts without committing. awman then
+checks for conflict markers and unmerged paths, stages the affected paths, and
+completes the merge (including the required commit for squash mode). If
+verification fails or the agent cannot start, the worktree is kept. Git paths
+are handled literally; non-UTF-8 names require manual resolution and preserve
+the worktree. A
+successful merge uses the normal cleanup path. For a failed squash, awman
+requires a staged result and retains the non-conflicting staged changes.
+An empty result, discarded index, or agent-authored squash commit cannot
+establish completion safely, so awman keeps the worktree for manual review.
+
+For `exec workflow` on the API, headless defaults are `fail` for a dirty merge
+target and `keep` after a merge failure; explicitly pass `ask`, `commit`,
+`stash`, `agent`, or `keep` as appropriate to select another policy.
+
+These policies govern final merge-back only. Before creating a worktree, the
+API's existing headless preparation policy automatically commits a checkout
+that is already dirty, even with `--on-dirty-merge-target fail`. Changes made
+during the run are subject to the final dirty-target policy. Start with a clean
+server checkout if you need to avoid the initial automatic commit.
+
+Repair uses the last successfully launched step's agent and model, with
+`--agent` and `--model` taking precedence. For a parallel group, the last member
+launched in source order supplies these defaults; changing UI focus does not
+change them.
 
 ---
 

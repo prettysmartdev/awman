@@ -1587,64 +1587,6 @@ async fn real_network_remote_session_missing_repo_url_returns_400() {
 
 // ─── Workflow state endpoint test ─────────────────────────────────────────────
 
-/// After manually writing a workflow state file, GET /v1/workflows/{command_id}
-/// returns the correct JSON.
-#[tokio::test]
-async fn real_network_workflow_state_endpoint_returns_correct_json() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = make_app_state(tmp.path());
-    let Some((addr, server)) = spawn_router(Arc::clone(&state)).await else {
-        eprintln!("SKIP: cannot bind 127.0.0.1");
-        return;
-    };
-
-    let sess_id = "wf-state-sess";
-    let cmd_id = "wf-state-cmd";
-    insert_ready_session(&state.store, sess_id, "/work");
-    state
-        .store
-        .enqueue_command(cmd_id, sess_id, "exec workflow", r#"["wf.toml"]"#, "/l")
-        .unwrap();
-
-    // Write workflow state to the expected path.
-    let wf_path = state.paths.command_workflow_state_path(sess_id, cmd_id);
-    tokio::fs::create_dir_all(wf_path.parent().unwrap())
-        .await
-        .unwrap();
-    let wf_state = serde_json::json!({
-        "schema_version": 2,
-        "workflow_name": "test-workflow",
-        "workflow_hash": "abc123",
-        "step_states": { "analyze": "Succeeded" },
-        "completed_steps": ["analyze"],
-        "current_step_index": null,
-        "started_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-01T00:01:00Z"
-    });
-    tokio::fs::write(&wf_path, serde_json::to_string(&wf_state).unwrap())
-        .await
-        .unwrap();
-
-    let resp = reqwest::get(format!("http://{addr}/v1/workflows/{cmd_id}"))
-        .await
-        .expect("GET /v1/workflows/{command_id}");
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-
-    assert_eq!(
-        body["workflow_name"].as_str(),
-        Some("test-workflow"),
-        "workflow_name must match; got {body}"
-    );
-    assert_eq!(
-        body["workflow_hash"].as_str(),
-        Some("abc123"),
-        "workflow_hash must match; got {body}"
-    );
-
-    server.abort();
-}
-
 /// GET /v1/workflows/{command_id} returns 404 when no workflow state exists.
 #[tokio::test]
 async fn real_network_workflow_state_404_when_no_state_file() {

@@ -45,8 +45,8 @@ use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
 use crate::command::commands::specs::SpecsCommandFrontend;
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
-    WorktreeLifecycleFrontend, WorktreeMergeMode,
+    DirtyMergeTargetDecision, ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction,
+    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::command::dispatch::projections::raw_args::ParsedArgs;
@@ -54,13 +54,14 @@ use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
 use crate::data::config::repo::WorkItemsConfig;
+use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::ready_phase::ReadyPhase;
 use crate::data::ready_summary::ReadySummary;
 use crate::data::session::AgentName;
 use crate::data::step_status::StepStatus;
 use crate::data::workflow_definition::WorkflowStep;
-use crate::data::workflow_state::PhaseKind;
+use crate::data::workflow_state::{PhaseKind, WorkflowState};
 use crate::engine::acp::{AcpFrontend, PermissionDecision, PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
@@ -85,14 +86,15 @@ pub struct ApiDispatchFrontend {
     /// rather than running with silently-dropped flags. `None` on success.
     parse_error: Option<CommandError>,
     event_bus: EventBusSender,
+    state_writer: Option<CommandStateWriter>,
     line_buffer_stdout: String,
     line_buffer_stderr: String,
     /// Map of step name → 0-based index, populated lazily on the first
     /// `report_step_status` call for each unique step. Used to emit
     /// `WorkflowStepTransition.step_index` accurately.
     step_indices: std::sync::Mutex<HashMap<String, usize>>,
-    /// Set to `true` after the first `WorkflowPhaseTransition` event is
-    /// emitted. Prevents duplicate phase events for the same workflow run.
+    /// Set after the first main-phase `WorkflowPhaseTransition` event.
+    /// Prevents duplicate main-phase start events for the same workflow run.
     phase_emitted: std::sync::Mutex<bool>,
     /// Latched once `Done` has been emitted, so both `emit_done` and `Drop`
     /// stay idempotent.
@@ -170,6 +172,7 @@ impl ApiDispatchFrontend {
             parsed,
             parse_error,
             event_bus,
+            state_writer: None,
             line_buffer_stdout: String::new(),
             line_buffer_stderr: String::new(),
             step_indices: std::sync::Mutex::new(HashMap::new()),
@@ -187,6 +190,12 @@ impl ApiDispatchFrontend {
             command_path: CommandCatalogue::get().canonical_path(&path).join(" "),
             headless: HeadlessDefaults::api(),
         }
+    }
+
+    /// Mirror workflow snapshots into the command directory for API polling.
+    pub fn with_state_writer(mut self, writer: CommandStateWriter) -> Self {
+        self.state_writer = Some(writer);
+        self
     }
 
     /// Look up (or assign on first sight) the 0-based step index for a step
@@ -700,6 +709,14 @@ impl AgentAuthFrontend for ApiDispatchFrontend {
 // ─── WorkflowFrontend ───────────────────────────────────────────────────────
 
 impl WorkflowFrontend for ApiDispatchFrontend {
+    fn report_workflow_state(&mut self, state: &WorkflowState) {
+        if let Some(writer) = &self.state_writer {
+            if let Err(error) = writer.write(state) {
+                tracing::warn!(%error, "failed to write command workflow state");
+            }
+        }
+    }
+
     fn show_workflow_control_board(
         &mut self,
         _state: &crate::data::workflow_state::WorkflowState,
@@ -823,7 +840,6 @@ impl WorkflowFrontend for ApiDispatchFrontend {
 
     // `supports_interactive_recovery` keeps its `false` default: an API run has
     // no user to ask, so a failed step takes the engine's countdown-and-retry
-
     // path (WI-0115 §3).
     // One set of four for both phases (F-34). `PhaseKind::label()` is the
     // `phase` string, so the event stream is unchanged: `"setup"` and
@@ -833,6 +849,11 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: kind.label().to_string(),
             message: format!("started: {description}"),
+        });
+        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+            phase: kind.label().to_string(),
+            step_desc: description.to_string(),
+            status: PhaseStatusKind::Running,
         });
     }
 
@@ -848,6 +869,11 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             phase: kind.label().to_string(),
             message: format!("completed: {description}"),
         });
+        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+            phase: kind.label().to_string(),
+            step_desc: description.to_string(),
+            status: PhaseStatusKind::Succeeded,
+        });
     }
 
     fn on_phase_step_failed(
@@ -860,6 +886,11 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: kind.label().to_string(),
             message: format!("failed: {description} (exit {exit_code}): {stderr}"),
+        });
+        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+            phase: kind.label().to_string(),
+            step_desc: description.to_string(),
+            status: PhaseStatusKind::Failed,
         });
     }
 
@@ -965,6 +996,22 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
 
     fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
         Ok(self.headless.merge_mode())
+    }
+
+    fn ask_dirty_merge_target(
+        &mut self,
+        _target_branch: &str,
+        _files: &[String],
+        _suggested_message: &str,
+    ) -> Result<DirtyMergeTargetDecision, CommandError> {
+        Ok(self.headless.dirty_merge_target())
+    }
+
+    fn ask_launch_merge_fix_agent(
+        &mut self,
+        _failure: &MergeFailure,
+    ) -> Result<bool, CommandError> {
+        Ok(self.headless.launch_merge_fix_agent())
     }
 
     fn confirm_worktree_cleanup(
@@ -1227,6 +1274,11 @@ impl crate::command::commands::agent_trust::AgentTrustFrontend for ApiDispatchFr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "wi0132_e2e.rs"]
+    mod wi0132_e2e;
+    #[path = "wi0132_engine.rs"]
+    mod wi0132_engine;
 
     fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
         let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);

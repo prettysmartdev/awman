@@ -14,7 +14,7 @@ use crate::data::session::GitRootResolver;
 use crate::data::worktree_paths::{
     worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
 };
-use crate::engine::error::EngineError;
+use crate::engine::error::{EngineError, MergeFailedDetail};
 
 pub mod frontend;
 
@@ -52,6 +52,49 @@ fn run_git_logged(
         }
     }
     Ok(output)
+}
+
+/// The commit message a squash merge of `branch` is recorded with.
+pub fn squash_commit_message(branch: &str) -> String {
+    format!("Implement {branch}")
+}
+
+/// `EngineError::MergeFailed` for a merge command (`args`, after `git`) that
+/// exited non-zero with `output`.
+fn merge_failed(
+    branch: &str,
+    worktree_path: &Path,
+    git_root: &Path,
+    args: &[&str],
+    output: &std::process::Output,
+) -> EngineError {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    EngineError::MergeFailed(Box::new(MergeFailedDetail {
+        branch: branch.to_string(),
+        worktree_path: worktree_path.to_path_buf(),
+        git_root: git_root.to_path_buf(),
+        // Quoted where needed so it can be pasted into a shell: the plain
+        // merge's `-m "Merge <branch>"` contains a space.
+        command: std::iter::once("git".to_string())
+            .chain(args.iter().map(|a| {
+                if a.contains(char::is_whitespace) {
+                    format!("\"{a}\"")
+                } else {
+                    a.to_string()
+                }
+            }))
+            .collect::<Vec<_>>()
+            .join(" "),
+        // A signal-terminated git has no exit code; report it as a failure.
+        exit_code: output.status.code().unwrap_or(1),
+        output: combined,
+    }))
 }
 
 /// How a sparse clone ended.
@@ -367,36 +410,43 @@ impl GitEngine {
     }
 
     /// Squash-merge `branch` into the current branch and commit `Implement <branch>`.
-    /// Returns `EngineError::MergeConflict` when the merge produces conflicts.
+    /// Returns `EngineError::MergeFailed` when either command fails.
     pub fn merge_branch(
         &self,
         git_root: &Path,
         branch: &str,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
+        let args = ["merge", "--squash", branch];
         let output = Command::new("git")
-            .args(["merge", "--squash", branch])
+            .args(args)
             .current_dir(git_root)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git merge --squash`: {e}")))?;
         if !output.status.success() {
-            return Err(EngineError::MergeConflict {
-                branch: branch.to_string(),
-                worktree_path: worktree_path.to_path_buf(),
-            });
+            return Err(merge_failed(
+                branch,
+                worktree_path,
+                git_root,
+                &args,
+                &output,
+            ));
         }
-        let message = format!("Implement {branch}");
+        let message = squash_commit_message(branch);
+        let args = ["commit", "-m", &message];
         let output = Command::new("git")
-            .args(["commit", "-m", &message])
+            .args(args)
             .current_dir(git_root)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git commit`: {e}")))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(EngineError::Git(format!(
-                "git commit failed: {}",
-                stderr.trim()
-            )));
+            return Err(merge_failed(
+                branch,
+                worktree_path,
+                git_root,
+                &args,
+                &output,
+            ));
         }
         Ok(())
     }
@@ -927,6 +977,31 @@ impl GitEngine {
         Ok(())
     }
 
+    /// `git stash push --include-untracked -m <message>` at `git_root`.
+    ///
+    /// A non-zero exit is `EngineError::Git` with git's stderr; the caller
+    /// treats it as an abort of the merge.
+    pub fn stash_push_logged(
+        &self,
+        git_root: &Path,
+        message: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<(), EngineError> {
+        let output = run_git_logged(
+            &["stash", "push", "--include-untracked", "-m", message],
+            git_root,
+            sink,
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git stash failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn create_worktree_logged(
         &self,
         git_root: &Path,
@@ -979,7 +1054,8 @@ impl GitEngine {
     /// the changes via `git merge --squash` and commits `Implement <branch>`;
     /// with `squash: false` it runs a plain `git merge`, preserving the
     /// branch's individual commits (fast-forwarding when possible).
-    /// Returns `EngineError::MergeConflict` when the merge fails.
+    /// Returns `EngineError::MergeFailed` (with the failing command, its exit
+    /// code and output) when `git merge` or the squash commit fails.
     pub fn merge_branch_logged(
         &self,
         git_root: &Path,
@@ -990,35 +1066,221 @@ impl GitEngine {
     ) -> Result<(), EngineError> {
         if !squash {
             let message = format!("Merge {branch}");
-            let output = run_git_logged(&["merge", "-m", &message, branch], git_root, sink)?;
+            let args = ["merge", "-m", &message, branch];
+            let output = run_git_logged(&args, git_root, sink)?;
             if !output.status.success() {
-                return Err(EngineError::MergeConflict {
-                    branch: branch.to_string(),
-                    worktree_path: worktree_path.to_path_buf(),
-                });
+                return Err(merge_failed(
+                    branch,
+                    worktree_path,
+                    git_root,
+                    &args,
+                    &output,
+                ));
             }
             return Ok(());
         }
-        let output = run_git_logged(&["merge", "--squash", branch], git_root, sink)?;
+        let args = ["merge", "--squash", branch];
+        let output = run_git_logged(&args, git_root, sink)?;
         if !output.status.success() {
-            return Err(EngineError::MergeConflict {
-                branch: branch.to_string(),
-                worktree_path: worktree_path.to_path_buf(),
-            });
+            return Err(merge_failed(
+                branch,
+                worktree_path,
+                git_root,
+                &args,
+                &output,
+            ));
         }
-        let has_staged = {
-            let check = run_git_logged(&["diff", "--cached", "--quiet"], git_root, sink)?;
-            !check.status.success()
-        };
-        if !has_staged {
+        if !self.has_staged_changes_logged(git_root, sink)? {
             sink.write_message(UserMessage {
                 level: MessageLevel::Info,
                 text: "squash merge staged no changes (branch already up to date)".to_string(),
             });
             return Ok(());
         }
-        let message = format!("Implement {branch}");
-        let output = run_git_logged(&["commit", "-m", &message], git_root, sink)?;
+        let message = squash_commit_message(branch);
+        let args = ["commit", "-m", &message];
+        let output = run_git_logged(&args, git_root, sink)?;
+        if !output.status.success() {
+            return Err(merge_failed(
+                branch,
+                worktree_path,
+                git_root,
+                &args,
+                &output,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Current commit identity, used to detect an agent replacing a pending squash.
+    pub fn head_commit_logged(
+        &self,
+        git_root: &Path,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<String, EngineError> {
+        let output = run_git_logged(&["rev-parse", "--verify", "HEAD"], git_root, sink)?;
+        if !output.status.success() {
+            return Err(EngineError::Git("reading HEAD failed".into()));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    }
+
+    /// Whether the index differs from HEAD (`git diff --cached --quiet`).
+    pub fn has_staged_changes_logged(
+        &self,
+        git_root: &Path,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<bool, EngineError> {
+        let check = run_git_logged(&["diff", "--cached", "--quiet"], git_root, sink)?;
+        Ok(!check.status.success())
+    }
+
+    /// Paths whose staged contents differ from HEAD, including unmerged paths.
+    pub fn staged_paths_logged(
+        &self,
+        git_root: &Path,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<Vec<String>, EngineError> {
+        let output = run_git_logged(&["diff", "--cached", "--name-only", "-z"], git_root, sink)?;
+        if !output.status.success() {
+            return Err(EngineError::Git("reading staged paths failed".into()));
+        }
+        output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                String::from_utf8(p.to_vec()).map_err(|_| {
+                    EngineError::Git(
+                        "staged filename is not UTF-8; resolve the merge manually".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Unmerged paths in the index: `git diff --name-only --diff-filter=U`.
+    pub fn unmerged_paths_logged(
+        &self,
+        git_root: &Path,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<Vec<String>, EngineError> {
+        let output = run_git_logged(
+            &["diff", "--name-only", "--diff-filter=U", "-z"],
+            git_root,
+            sink,
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git diff --diff-filter=U failed: {}",
+                stderr.trim()
+            )));
+        }
+        let mut paths: Vec<String> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                String::from_utf8(path.to_vec()).map_err(|_| {
+                    EngineError::Git(
+                        "unmerged filename is not UTF-8; resolve the merge manually".into(),
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        // git lists a path once per conflicting stage on some versions.
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Whether a plain merge is in progress (`MERGE_HEAD` exists). A
+    /// conflicted squash merge leaves no `MERGE_HEAD`; check
+    /// [`Self::unmerged_paths_logged`] too.
+    pub fn merge_in_progress(&self, git_root: &Path) -> bool {
+        Command::new("git")
+            .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+            .current_dir(git_root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// [`Self::merge_in_progress`], with the probe reported to `sink`.
+    pub fn merge_in_progress_logged(&self, git_root: &Path, sink: &mut dyn GitFrontend) -> bool {
+        run_git_logged(
+            &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            git_root,
+            sink,
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    }
+
+    /// Whether `commit` is an ancestor of (already merged into) `HEAD`.
+    pub fn is_merged_into_head(&self, git_root: &Path, commit: &str) -> bool {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .current_dir(git_root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// An ancestry check reported through the ordinary git command stream.
+    pub fn is_merged_into_head_logged(
+        &self,
+        git_root: &Path,
+        commit: &str,
+        sink: &mut dyn GitFrontend,
+    ) -> bool {
+        run_git_logged(
+            &["merge-base", "--is-ancestor", commit, "HEAD"],
+            git_root,
+            sink,
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    }
+
+    /// `git --literal-pathspecs add -- <paths>`. A path one side of the merge deleted is staged
+    /// as a deletion, as `git add` does for any removed tracked file.
+    pub fn stage_paths_logged(
+        &self,
+        git_root: &Path,
+        paths: &[String],
+        sink: &mut dyn GitFrontend,
+    ) -> Result<(), EngineError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["--literal-pathspecs", "add", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        let output = run_git_logged(&args, git_root, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git add failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Complete a resolved merge: `git commit --no-edit` when `message` is
+    /// `None` (a plain merge, `MERGE_MSG` exists), else `git commit -m
+    /// <message>` (the squash commit, [`squash_commit_message`]).
+    pub fn commit_merge_logged(
+        &self,
+        git_root: &Path,
+        message: Option<&str>,
+        sink: &mut dyn GitFrontend,
+    ) -> Result<(), EngineError> {
+        let args: Vec<&str> = match message {
+            None => vec!["commit", "--no-edit"],
+            Some(m) => vec!["commit", "-m", m],
+        };
+        let output = run_git_logged(&args, git_root, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(

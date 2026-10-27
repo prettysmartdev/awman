@@ -183,8 +183,18 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::MergeConflict {
             branch,
             worktree_path,
+            git_root,
         } => format!(
-            "merge conflict on branch {branch}; resolve in worktree at {}",
+            "merge of branch {branch} is still unresolved in {}; resolve it there (worktree kept at {})",
+            git_root.display(),
+            worktree_path.display()
+        ),
+        CommandError::MergeTargetDirty {
+            target_branch,
+            branch,
+            worktree_path,
+        } => format!(
+            "merge target '{target_branch}' has uncommitted changes; commit or stash them, then merge '{branch}' from the worktree at {}",
             worktree_path.display()
         ),
         CommandError::MissingRemoteAddress => {

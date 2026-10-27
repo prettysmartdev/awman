@@ -209,6 +209,7 @@ impl WorkflowEngine {
         );
         self.persist()?;
 
+        self.last_launched_identity = Some((resolved_agent.clone(), resolved_model.clone()));
         let stuck_sender = execution.stuck_sender();
         let cancel_handle = execution.cancel_handle();
         let container_name = execution.handle().name.clone();

@@ -13,7 +13,9 @@ use crate::data::config::builtin_runtime::{BuiltinRuntimeConfig, DEFAULT_STATE_S
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
 use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
-use crate::data::config::repo::{AgentAuthMode, LaunchMode, RepoConfig};
+use crate::data::config::repo::{
+    AgentAuthMode, LaunchMode, OnDirtyMergeTarget, OnMergeFailure, RepoConfig, WorktreeConfig,
+};
 use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
 use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::config::{DEFAULT_AGENT_STUCK_TIMEOUT_SECS, DEFAULT_SCROLLBACK_LINES};
@@ -460,6 +462,38 @@ impl EffectiveConfig {
                     .unwrap_or(60),
             ),
         }
+    }
+
+    /// `worktree.onDirtyMergeTarget`: repo over global. `None` when neither
+    /// sets it, so the host's headless default applies.
+    pub fn worktree_on_dirty_merge_target(&self) -> Option<OnDirtyMergeTarget> {
+        self.repo
+            .worktree
+            .as_ref()
+            .and_then(|w| w.on_dirty_merge_target)
+            .or_else(|| {
+                self.global
+                    .worktree
+                    .as_ref()
+                    .and_then(|w| w.on_dirty_merge_target)
+            })
+    }
+
+    /// `worktree.mergeFix.onFailure`: repo over global.
+    pub fn worktree_merge_fix_on_failure(&self) -> Option<OnMergeFailure> {
+        let merge_fix = |w: &Option<WorktreeConfig>| w.as_ref().and_then(|w| w.merge_fix.clone());
+        merge_fix(&self.repo.worktree)
+            .and_then(|m| m.on_failure)
+            .or_else(|| merge_fix(&self.global.worktree).and_then(|m| m.on_failure))
+    }
+
+    /// `worktree.mergeFix.promptTemplate`: repo over global. A path relative
+    /// to the git root.
+    pub fn worktree_merge_fix_prompt_template(&self) -> Option<String> {
+        let merge_fix = |w: &Option<WorktreeConfig>| w.as_ref().and_then(|w| w.merge_fix.clone());
+        merge_fix(&self.repo.worktree)
+            .and_then(|m| m.prompt_template)
+            .or_else(|| merge_fix(&self.global.worktree).and_then(|m| m.prompt_template))
     }
 }
 
@@ -1405,6 +1439,57 @@ mod tests {
             global,
         );
         assert_eq!(ec.launch_mode_fallback(), LaunchModeFallback::Stdio);
+    }
+
+    // ── worktree merge-back settings (WI-0132 Part B) ────────────────────────
+
+    #[test]
+    fn worktree_on_dirty_merge_target_repo_overrides_global() {
+        use crate::data::config::repo::{OnDirtyMergeTarget, WorktreeConfig};
+        let worktree = |v| {
+            Some(WorktreeConfig {
+                on_dirty_merge_target: Some(v),
+                merge_fix: None,
+            })
+        };
+        let unset = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(unset.worktree_on_dirty_merge_target(), None);
+
+        let global_only = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig {
+                worktree: worktree(OnDirtyMergeTarget::Stash),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            global_only.worktree_on_dirty_merge_target(),
+            Some(OnDirtyMergeTarget::Stash)
+        );
+
+        let both = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig {
+                worktree: worktree(OnDirtyMergeTarget::Commit),
+                ..Default::default()
+            },
+            GlobalConfig {
+                worktree: worktree(OnDirtyMergeTarget::Stash),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            both.worktree_on_dirty_merge_target(),
+            Some(OnDirtyMergeTarget::Commit)
+        );
     }
 
     // ── auth_refresh (WI-0107 §6) ────────────────────────────────────────────

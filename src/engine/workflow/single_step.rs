@@ -205,6 +205,7 @@ impl WorkflowEngine {
             launch_id: 0,
         }];
         self.current_step_name = Some(step.name.clone());
+        self.last_launched_identity = Some((resolved_agent.clone(), resolved_model.clone()));
         self.current_step_agent = Some(resolved_agent);
         self.current_step_model = resolved_model;
         Ok(step.name)

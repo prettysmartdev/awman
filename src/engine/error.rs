@@ -12,6 +12,20 @@ use crate::data::config::image_source::ImageSourceKind;
 use crate::data::error::DataError;
 use crate::engine::oci::resolve::ImageBuildGuidance;
 
+/// The failed merge behind [`EngineError::MergeFailed`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("merge of '{branch}' into the checkout at {git_root} failed: `{command}` exited {exit_code}; worktree kept at {worktree_path}")]
+pub struct MergeFailedDetail {
+    pub branch: String,
+    pub worktree_path: PathBuf,
+    pub git_root: PathBuf,
+    /// The exact command that failed, as a user would type it.
+    pub command: String,
+    pub exit_code: i32,
+    /// stdout then stderr of that command, trimmed.
+    pub output: String,
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -27,13 +41,12 @@ pub enum EngineError {
     #[error("git operation failed: {0}")]
     Git(String),
 
-    #[error(
-        "merge conflict on branch '{branch}'; resolve manually in worktree at {worktree_path}"
-    )]
-    MergeConflict {
-        branch: String,
-        worktree_path: PathBuf,
-    },
+    /// A `git merge` (or the squash merge's commit) exited non-zero. Carries
+    /// the exact command and its output so the merge-fix agent's prompt and
+    /// the frontend can show what failed. Conflicts and failures that never
+    /// touched the index both land here. Boxed to keep `EngineError` small.
+    #[error("{0}")]
+    MergeFailed(Box<MergeFailedDetail>),
 
     /// A Docker or Apple Containers CLI backend failure. Builtin-runtime and
     /// image-builder failures have their own variants: this one exits 3

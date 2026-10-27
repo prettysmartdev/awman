@@ -3,8 +3,11 @@
 use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
+    dirty_merge_target_body, dirty_target_commit_message, DirtyMergeTargetDecision,
+    ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
+    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode, DIRTY_COMMIT_PROMPT,
+    DIRTY_COMMIT_TITLE, DIRTY_MERGE_TARGET_KEYS, DIRTY_MERGE_TARGET_TITLE,
+    MERGE_FIX_PROMPT_OUTPUT_LINES,
 };
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
@@ -167,6 +170,45 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         })
     }
 
+    fn ask_dirty_merge_target(
+        &mut self,
+        target_branch: &str,
+        files: &[String],
+        suggested_message: &str,
+    ) -> Result<DirtyMergeTargetDecision, CommandError> {
+        let response = self.ask_dialog(DialogRequest::Custom {
+            title: DIRTY_MERGE_TARGET_TITLE.into(),
+            body: dirty_merge_target_body(target_branch, files),
+            keys: DIRTY_MERGE_TARGET_KEYS
+                .iter()
+                .map(|(key, label)| (*key, (*label).into()))
+                .collect(),
+        })?;
+        Ok(match response {
+            DialogResponse::Char('c') => {
+                let msg_response = self.ask_dialog(DialogRequest::TextInput {
+                    title: DIRTY_COMMIT_TITLE.into(),
+                    prompt: DIRTY_COMMIT_PROMPT.into(),
+                    default_text: Some(suggested_message.to_string()),
+                })?;
+                dirty_target_commit_response(msg_response, suggested_message)
+            }
+            DialogResponse::Char('s') => DirtyMergeTargetDecision::Stash,
+            _ => DirtyMergeTargetDecision::Abort,
+        })
+    }
+
+    fn ask_launch_merge_fix_agent(&mut self, failure: &MergeFailure) -> Result<bool, CommandError> {
+        let response = self.ask_dialog(DialogRequest::YesNo {
+            title: failure.prompt_title(),
+            body: failure.prompt_body(MERGE_FIX_PROMPT_OUTPUT_LINES),
+        })?;
+        Ok(matches!(
+            response,
+            DialogResponse::Yes | DialogResponse::Char('y')
+        ))
+    }
+
     fn confirm_worktree_cleanup(
         &mut self,
         branch: &str,
@@ -209,5 +251,33 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
             "Worktree kept at {} (branch: {branch})",
             path.display()
         ));
+    }
+}
+
+fn dirty_target_commit_response(
+    response: DialogResponse,
+    suggested: &str,
+) -> DirtyMergeTargetDecision {
+    match response {
+        DialogResponse::Text(text) => dirty_target_commit_message(Some(&text), suggested),
+        _ => dirty_target_commit_message(None, suggested),
+    }
+}
+
+#[cfg(test)]
+mod dirty_target_tests {
+    use super::*;
+    #[test]
+    fn escape_aborts_but_submitted_empty_text_accepts_default() {
+        assert_eq!(
+            dirty_target_commit_response(DialogResponse::Dismissed, "WIP"),
+            DirtyMergeTargetDecision::Abort
+        );
+        assert_eq!(
+            dirty_target_commit_response(DialogResponse::Text(String::new()), "WIP"),
+            DirtyMergeTargetDecision::Commit {
+                message: "WIP".into()
+            }
+        );
     }
 }

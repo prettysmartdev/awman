@@ -36,9 +36,45 @@ Created by `awman init`; commit it so the whole team shares the same setup.
     "maxConcurrentSteps": 3,
     "defaultLeader": "claude::claude-opus-4-8",
     "guidance": ["Never spawn more than two agents in parallel."]
+  },
+  "worktree": {
+    "onDirtyMergeTarget": "ask",
+    "mergeFix": {
+      "onFailure": "agent",
+      "promptTemplate": "prompts/merge-fix.md"
+    }
   }
 }
 ```
+
+`worktree` controls the merge-back of an isolated workflow worktree. It can be
+set in repo config and global config; repo values take precedence. Command-line
+flags override both. With no configured value, the frontend's headless policy
+applies (for example, API workflows use `fail` for a dirty merge target and
+`keep` after a merge failure). These policies apply only at final merge-back.
+The API's existing preparation policy still automatically commits a checkout
+that is dirty before worktree creation; `fail` does not change that initial
+decision.
+
+| JSON key | Type | Values / default | Meaning |
+|----------|------|------------------|---------|
+| `worktree.onDirtyMergeTarget` | string | `ask`, `commit`, `stash`, `fail`; unset | Action when the merge target has tracked or untracked changes before merge-back. |
+| `worktree.mergeFix.onFailure` | string | `ask`, `agent`, `keep`; unset | Action when Git cannot merge the worktree branch. |
+| `worktree.mergeFix.promptTemplate` | string | Path; unset | Prompt template path relative to the Git root. Replaces the built-in merge-fix prompt. |
+
+The prompt template supports `{{merge_command}}`, `{{merge_exit_code}}`,
+`{{merge_output}}`, `{{branch}}`, `{{target_branch}}`, and
+`{{unmerged_paths}}`. The last placeholder contains one path per line, or
+`(none)` when Git reports no unmerged paths. Work-item placeholders such as
+`{{work_item_number}}` and `{{work_item_content}}` are also substituted when
+the workflow has work-item context.
+
+Custom templates must be regular files within the Git root. Absolute paths,
+parent traversal, and symlink components are refused. Secure custom-template
+reads currently require Unix; on other platforms the built-in prompt is available, while
+configured custom templates are refused. Inserted diagnostic values are substituted
+once; custom templates should clearly label them as untrusted data. The built-in
+prompt uses fences that cannot be closed by the diagnostic contents.
 
 ### Global config
 
@@ -539,6 +575,9 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `agentStuckTimeout` | integer (seconds) | 30 | Inactivity period before an agent is flagged as stuck | yes |
 | `maxConcurrentAgents` | integer | (unset → unlimited) | Cap on concurrently-running workflow steps; overridden by `--max-concurrent` / `AWMAN_MAX_CONCURRENT_AGENTS` — see [Parallel workflows](05-workflows.md#parallel-workflows) | yes |
 | `baseImage` | string | (unset → global) | Image tag for workflow setup/teardown containers — see [Workflows](05-workflows.md) | no (edit file) |
+| `worktree.onDirtyMergeTarget` | string | (unset → frontend default) | `ask`, `commit`, `stash`, or `fail` when the merge target has changes — see [Worktree merge-back](05-workflows.md#worktree-merge-back) | yes |
+| `worktree.mergeFix.onFailure` | string | (unset → frontend default) | `ask`, `agent`, or `keep` after a worktree merge fails — see [Worktree merge-back](05-workflows.md#worktree-merge-back) | yes |
+| `worktree.mergeFix.promptTemplate` | string | (unset → built-in prompt) | Merge-fix agent prompt template path relative to the Git root | yes |
 | `dockerfile` | string | `Dockerfile.dev` | Path to the project base Dockerfile, relative to repo root or absolute | no (edit file) |
 | `dynamicWorkflows.agentsToModels` | object (agent → string array) | (unset → Dockerfile discovery) | Restricts a dynamic workflow's leader to this agent/model set — see [Dynamic Workflows](06-dynamic-workflows.md#configuring-dynamic-workflows) | yes, per agent as `dynamicWorkflows.agentsToModels.<agentName>` (comma-separated; empty value removes) |
 | `dynamicWorkflows.maxConcurrentSteps` | integer | (unset → unlimited) | Advisory cap on concurrent workflow steps passed to the leader prompt | yes, as `dynamicWorkflows.maxConcurrentSteps` |
@@ -563,6 +602,9 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `maxConcurrentAgents` | integer | (unset → unlimited) | Machine-wide default cap on concurrently-running workflow steps (unless a repo overrides it) — see [Parallel workflows](05-workflows.md#parallel-workflows) | yes |
 | `workers` | integer | 2 | API server worker tasks processing the command queue in parallel — see [API mode](09-api-and-remote-mode.md) | no (edit file) |
 | `baseImage` | string | (unset) | Default image tag for workflow setup/teardown containers | no (edit file) |
+| `worktree.onDirtyMergeTarget` | string | (unset → frontend default) | Default dirty merge-target action: `ask`, `commit`, `stash`, or `fail` | yes |
+| `worktree.mergeFix.onFailure` | string | (unset → frontend default) | Default merge-failure action: `ask`, `agent`, or `keep` | yes |
+| `worktree.mergeFix.promptTemplate` | string | (unset → built-in prompt) | Default merge-fix prompt template path relative to the Git root | yes |
 | `api.workDirs` | string array | `[]` | Directories pre-approved for API session creation; merged with `--workdirs` at server start | yes |
 | `api.alwaysNonInteractive` | bool | `false` | Force non-interactive mode for all dispatched commands (useful on API servers with no TTY) | no (edit file) |
 | `remote.defaultAddr` | string | (unset) | Default remote awman API server address | yes |

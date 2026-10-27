@@ -8,6 +8,8 @@
 mod parallel;
 mod phases;
 mod single;
+mod wi0132_a;
+mod wi0132_d;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -92,7 +94,7 @@ impl WorkflowFrontend for FakeWorkflowFrontend {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(NextAction::LaunchNext);
+            .unwrap_or_else(|| api_headless_next_action(available));
         Ok(action)
     }
 
@@ -122,6 +124,19 @@ impl WorkflowFrontend for FakeWorkflowFrontend {
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         *self.completed.lock().unwrap() = Some(outcome.clone());
+    }
+}
+
+/// The API profile's answer (`HeadlessDefaults::api().workflow_next_action`,
+/// src/command/headless.rs), restated here because Layer 1 tests cannot
+/// import Layer 2. Keep the two in step.
+fn api_headless_next_action(available: &AvailableActions) -> NextAction {
+    if available.can_launch_next {
+        NextAction::LaunchNext
+    } else if available.can_finish_workflow {
+        NextAction::FinishWorkflow
+    } else {
+        NextAction::Abort
     }
 }
 

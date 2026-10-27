@@ -291,6 +291,7 @@ pub struct WorkflowEngine {
     /// `None` means unlimited.
     max_concurrent: Option<usize>,
     current_step_name: Option<String>,
+    last_launched_identity: Option<(AgentName, Option<String>)>,
     current_step_agent: Option<AgentName>,
     current_step_model: Option<String>,
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
@@ -674,6 +675,7 @@ impl WorkflowEngine {
             active_steps: Vec::new(),
             max_concurrent,
             current_step_name: None,
+            last_launched_identity: None,
             current_step_agent: None,
             current_step_model: None,
             work_item_context,
@@ -806,6 +808,32 @@ pub struct PhaseStepRef {
     /// The step's description, with work-item variables substituted — the
     /// same string `on_phase_step_started` carried.
     pub description: String,
+}
+
+/// One agent run outside the step DAG: an `on_failure` remediation, or the
+/// merge-fix agent after a failed worktree merge-back. The prompt is final
+/// (already rendered).
+#[derive(Debug, Clone)]
+pub struct RemediationAgentSpec {
+    /// Shown in countdown and log lines, e.g. `on_failure: <step>` or
+    /// `merge-fix: <branch>`.
+    pub label: String,
+    pub prompt: String,
+    pub agent: AgentName,
+    pub model: Option<String>,
+    /// Extra `host:container[:ro]` overlays for this run only.
+    pub extra_overlays: Option<Vec<String>>,
+}
+
+/// Why [`WorkflowEngine::run_remediation_agent`] produced no exit code.
+#[derive(Debug, thiserror::Error)]
+pub enum RemediationAgentError {
+    /// The agent factory could not build or start the container.
+    #[error("failed to launch agent: {0}")]
+    Launch(EngineError),
+    /// The container started but waiting on it failed.
+    #[error("agent execution error: {0}")]
+    Execution(EngineError),
 }
 
 /// Outcome of one phase shell step: whether it failed, the command's exit

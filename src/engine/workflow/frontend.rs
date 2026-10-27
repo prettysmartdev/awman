@@ -64,6 +64,12 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
 
     // === Status reporting (fire-and-forget) ===
 
+    /// Every state the engine persists, after saving its own state file and
+    /// mirroring the session summary. Covers transitions, phases, completion
+    /// and remediation. The API frontend mirrors it into the command's
+    /// `workflow.state.json`; other frontends may keep this no-op default.
+    fn report_workflow_state(&mut self, _state: &WorkflowState) {}
+
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus);
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
@@ -356,6 +362,10 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
         self.lock().unwrap().report_step_status(step, status);
+    }
+
+    fn report_workflow_state(&mut self, state: &WorkflowState) {
+        self.lock().unwrap().report_workflow_state(state);
     }
 
     fn report_step_output(&mut self, step: &WorkflowStep, output: StepOutput) {

@@ -36,8 +36,8 @@ use crate::command::commands::exec_workflow::{
 };
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
+    DirtyMergeTargetDecision, ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction,
+    PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
@@ -379,6 +379,20 @@ impl WorktreeLifecycleFrontend for CliParallelFrontend {
         self.inner.ask_merge_mode(branch)
     }
 
+    fn ask_dirty_merge_target(
+        &mut self,
+        target_branch: &str,
+        files: &[String],
+        suggested_message: &str,
+    ) -> Result<DirtyMergeTargetDecision, CommandError> {
+        self.inner
+            .ask_dirty_merge_target(target_branch, files, suggested_message)
+    }
+
+    fn ask_launch_merge_fix_agent(&mut self, failure: &MergeFailure) -> Result<bool, CommandError> {
+        self.inner.ask_launch_merge_fix_agent(failure)
+    }
+
     fn confirm_worktree_cleanup(
         &mut self,
         branch: &str,
@@ -482,6 +496,10 @@ impl WorkflowFrontend for CliParallelFrontend {
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
         self.inner.report_step_status(step, status);
+    }
+
+    fn report_workflow_state(&mut self, state: &WorkflowState) {
+        self.inner.report_workflow_state(state);
     }
 
     fn report_step_output(&mut self, step: &WorkflowStep, output: StepOutput) {

@@ -667,7 +667,7 @@ Every `curl` example in the rest of this document elides `-k`/`--cacert` for bre
 | `GET` | `/v1/commands/:id/status` | Get command status and metadata |
 | `GET` | `/v1/commands/:id/logs` | Stream live command output via Server-Sent Events (ends with `data: [awman:done]`); `?format=json` returns the captured events instead |
 | `GET` | `/v1/workflows/:id` | Get the workflow state for a command |
-| `GET` | `/v1/status` | Server health (uptime, active sessions, running commands) |
+| `GET` | `/v1/status` | Server health (uptime, active sessions, running commands, and supported `features`) |
 
 ### Agent commands
 
@@ -1157,6 +1157,12 @@ strings, so a client can match on a fixed set of values:
 | `workflow_phase_transition.status` | `running`, `succeeded`, `failed`, `paused`, `teardown_failed` |
 | `command_status.status` | `done`, `paused`, `aborted`, `error` |
 
+`workflow_phase_transition` is emitted for the main workflow and for each
+setup or teardown phase step. Its `phase` is `setup`, `main`, or `teardown`,
+`step_desc` identifies the phase step, and `status` reports its transition.
+Setup and teardown transitions let clients track those phases independently of
+the main `workflow_step_transition` events.
+
 #### Get session queue status
 
 ```sh
@@ -1229,17 +1235,45 @@ curl -s http://localhost:9876/v1/status \
 
 ```json
 {
+  "status": "ok",
+  "pid": 12345,
   "uptime_seconds": 11640,
   "active_sessions": 2,
-  "running_commands": 1
+  "running_commands": 1,
+  "features": ["workflow_state"]
 }
 ```
+
+The `features` array lists capabilities clients can detect without relying on
+the server version. `workflow_state` means the server exposes live workflow
+snapshots through `GET /v1/workflows/:command_id`.
 
 ---
 
 ### Workflow state
 
-When a command runs a workflow (`exec workflow`), the API server writes a `workflow.state.json` file to the per-command directory. This file is updated atomically on every step transition. The `GET /v1/workflows/:command_id` endpoint exposes that state over HTTP.
+API-mode `exec workflow` commands launch available steps automatically, finish
+when the last step completes. A failed step is retried once, then fails the
+command (`error`); a step with `abort_on_failure` aborts it. No interactive
+confirmation is required.
+
+When a workflow starts, the API server snapshots its `WorkflowState` to
+`workflow.state.json` in that command's API directory. The snapshot is updated
+atomically as the state changes. For an ordinary workflow, the first snapshot
+exists before setup runs. With `--dynamic`, it exists after the leader's
+workflow design validates and before setup runs. The local engine state is
+also stored under `$GITROOT/.awman/workflows/`. Snapshot write errors are logged
+without failing the command; the last successfully written snapshot remains.
+On Windows, readers should close their file handles between reads so sharing
+locks do not prevent replacement. Command status remains authoritative.
+
+For worktree merge-back, `--on-dirty-merge-target` accepts `ask`, `commit`,
+`stash`, or `fail`; `--on-merge-failure` accepts `ask`, `agent`, or `keep`.
+API headless defaults are `fail` for a dirty merge target and `keep` after a
+merge failure. See [Worktree merge-back](05-workflows.md#worktree-merge-back)
+for what each choice does. These policies apply at final merge-back. The API
+still automatically commits changes already present before creating a worktree;
+start from a clean checkout to avoid that existing preparation behavior.
 
 #### Get workflow state
 
@@ -1248,28 +1282,63 @@ curl -s http://localhost:9876/v1/workflows/<command-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Returns the current `WorkflowState` for the given command. The structure is identical to the local workflow state format produced by `awman exec workflow` when it writes state to `$GITROOT/.awman/workflows/`.
+Returns the current `WorkflowState` for the given command. It uses the same
+serialized state structure as the local workflow state file.
 
 ```json
 {
+  "schema_version": 4,
+  "invocation_id": "d2b50c8e-5bd0-4da6-9e19-0ed469d33f6d",
+  "workflow_name": "implement-feature",
+  "workflow_hash": "a41f…",
+  "work_item": 132,
   "steps": [
-    { "name": "plan",      "status": "done"    },
-    { "name": "implement", "status": "running" },
-    { "name": "docs",      "status": "pending" },
-    { "name": "review",    "status": "pending" }
+    { "name": "plan", "depends_on": [], "agent": "codex", "model": "gpt-6" },
+    { "name": "docs", "depends_on": ["plan"] }
   ],
-  "status": "running"
+  "step_states": {
+    "plan": "Succeeded",
+    "docs": { "Running": { "container_id": null } }
+  },
+  "completed_steps": ["plan"],
+  "current_step_index": 1,
+  "started_at": "2026-10-27T12:00:00Z",
+  "updated_at": "2026-10-27T12:05:00Z",
+  "current_phase": "Main",
+  "setup_completed": true,
+  "teardown_completed": false,
+  "setup_step_states": [
+    { "description": "run_shell: prepare", "status": "Succeeded" }
+  ],
+  "teardown_step_states": [
+    { "description": "run_shell: verify", "status": "Pending" }
+  ]
 }
 ```
 
-Use the `status` field in the response body to determine completion — do not rely solely on the HTTP status code.
+`WorkflowState` has no top-level `status` property. `step_states` maps each step
+name to a `StepState`; `steps` contains step metadata (`name`, `depends_on`,
+and optional `agent` and `model`). Setup and teardown progress is in the
+`setup_step_states` and `teardown_step_states` arrays. Workflow phase values
+use their Rust variant names (`"Setup"`, `"Main"`, `"Teardown"`, `"Done"`).
+The enum values use Serde's externally tagged representation: unit variants
+are strings such as `"Succeeded"`, and data variants are one-key objects, as
+in `{"Running":{"container_id":null}}` or
+`{"Failed":{"exit_code":1,"error_message":"step failed"}}`.
+Poll `step_states` and `current_phase` to track progress; there is no derived
+workflow-level status field. Phase entries have `description` and `status`.
+Phase statuses are `"Pending"`, `"Running"` (without a container ID),
+`"Succeeded"`, `{"Failed":{"error":"reason"}}`, or
+`{"Remediating":{"attempt":1,"of":2}}`. Agent steps additionally use
+`"Cancelled"` and `"Skipped"`.
 
-| `status` value | Meaning |
-|----------------|---------|
-| `running` | At least one step is actively executing |
-| `paused` | A step is waiting for user confirmation to advance |
-| `complete` | All steps finished successfully |
-| `error` | At least one step failed |
+Always also watch `GET /v1/commands/{command_id}` or `command_status` events.
+A command can end before its workflow starts, or fail while the most recent
+snapshot still shows a phase short of Done. A Done workflow snapshot also
+precedes worktree merge-back, whose failure can still fail the command.
+On restart, completed work is retained, but interrupted steps can reset to
+Pending and phase steps can rerun; status progression is not strictly monotonic
+across retries or resumes.
 
 **Response codes:**
 
@@ -1278,6 +1347,8 @@ Use the `status` field in the response body to determine completion — do not r
 | 200 | Workflow state found; body contains the full `WorkflowState` JSON |
 | 404 `{"error": "command not found"}` | No command with that ID exists |
 | 404 `{"error": "no workflow for this command"}` | The command exists but did not run a workflow (e.g. `exec prompt` or `chat`) |
+| 404 `{"error": "workflow not started"}` | An `exec workflow` command is pending or running, but no workflow snapshot exists yet |
+| 404 `{"error": "workflow never started"}` | The workflow command ended before producing any snapshot; stop polling |
 | 401 | Missing or invalid API key (same auth middleware as all other endpoints) |
 
 **Polling for live workflow progress:**
@@ -1288,18 +1359,29 @@ Poll this endpoint at your preferred interval to track a running workflow. The s
 SERVER=http://localhost:9876
 KEY=<your-api-key>
 
-# Poll until the workflow reaches a terminal state
+# Poll workflow progress until this command execution stops
 while true; do
   RESP=$(curl -s "$SERVER/v1/workflows/$CMD" \
     -H "Authorization: Bearer $KEY")
-  STATUS=$(echo "$RESP" | jq -r '.status')
-  echo "Workflow status: $STATUS"
-  [ "$STATUS" = "complete" ] || [ "$STATUS" = "error" ] && break
+  PHASE=$(echo "$RESP" | jq -r '.current_phase')
+  echo "Workflow phase: $PHASE"
+  COMMAND=$(curl -fsS "$SERVER/v1/commands/$CMD" \
+    -H "Authorization: Bearer $KEY") || break
+  STATUS=$(echo "$COMMAND" | jq -r '.status')
+  case "$STATUS" in
+    done|error|aborted|cancelled|paused) break ;;
+  esac
   sleep 5
 done
 ```
 
-If the endpoint returns HTTP 404 on the first poll, the command either has not started yet or is not a workflow command — treat 404 as "no workflow" and skip the Workflow Overview. If 404 is returned after a non-404 response, the workflow was removed; stop polling.
+If the endpoint returns HTTP 404 `{"error":"workflow not started"}`, the
+workflow state has not been created yet; retry while the command remains pending
+or running. `{"error":"workflow never started"}` means that execution has ended
+without a workflow snapshot. The exact
+`{"error":"no workflow for this command"}` response means the command did not
+run a workflow. If a workflow state was previously returned and later becomes
+404, the state was removed; stop polling.
 
 The [Remote-bound TUI tabs](#remote-bound-tui-tabs) feature uses this endpoint internally to render the Workflow Overview for commands running on a remote API server.
 
@@ -1406,7 +1488,13 @@ the database from its former API storage location automatically. It retains an
 `awman.db.pre-migration` backup of the old database; `awman clean` removes that
 backup, but never removes the live database.
 
-`workflow.state.json` is written and updated atomically (write to a temp file, then rename) each time the workflow advances to a new step. The file uses the identical JSON structure as the local workflow state in `$GITROOT/.awman/workflows/`. It is created only when the command runs a workflow; it is never present for `exec prompt`, `chat`, or other non-workflow commands.
+`workflow.state.json` is written and updated atomically (write to a temp file,
+then rename) as workflow state changes. For an ordinary workflow its first
+snapshot is written before setup runs; with `--dynamic`, the first snapshot is
+written after the leader's design validates and before setup runs. The file
+uses the same JSON structure as the local workflow state in
+`$GITROOT/.awman/workflows/`. It is never present for `exec prompt`, `chat`, or
+other non-workflow commands.
 
 `awman.db` contains the API session and command records (and the squad task
 and run records when squad is in use):
@@ -1489,7 +1577,7 @@ For additional defense in depth, bind the server to `localhost` (the default) an
 
 ## Session cleanup
 
-At server startup, awman automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `~/.awman/data/awman.db` along with all associated command records. The on-disk output logs in `~/.awman/api/sessions/<uuid>/` are **not** deleted — they remain for audit purposes.
+At server startup, awman automatically purges sessions that were closed more than 24 hours ago. Their rows are removed from `~/.awman/data/awman.db` along with all associated command records. The on-disk output logs and workflow snapshots in `~/.awman/api/sessions/<uuid>/` are **not** deleted — they remain for audit purposes, but the API no longer serves a snapshot after its command row is purged. Remove these directories separately when disk retention is no longer needed.
 
 The cleanup runs once, before the server begins accepting connections. Each purged session is logged at `INFO` level:
 
@@ -1542,9 +1630,9 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | Startup cleanup: on-disk log files for cleaned sessions | Not deleted; they remain in `~/.awman/api/sessions/<uuid>/` for audit purposes |
 | `GET /v1/workflows/:command_id` — unknown command ID | HTTP 404 `{"error": "command not found"}` |
 | `GET /v1/workflows/:command_id` — command is not a workflow command | HTTP 404 `{"error": "no workflow for this command"}`; `workflow.state.json` is never created |
-| `GET /v1/workflows/:command_id` — command is `pending` (not yet started) | HTTP 404 `{"error": "no workflow for this command"}`; file does not exist yet |
-| `GET /v1/workflows/:command_id` — workflow is paused | HTTP 200; `WorkflowState.status` is `"paused"`; the paused step is identified in the body; polling may continue since the workflow can resume |
-| `GET /v1/workflows/:command_id` — workflow is complete | HTTP 200; `WorkflowState.status` is `"complete"`; all steps present with terminal statuses; clients should stop polling |
+| `GET /v1/workflows/:command_id` — command is `pending` (not yet started) | HTTP 404 `{"error": "workflow not started"}`; state is created when workflow execution starts |
+| `GET /v1/workflows/:command_id` — workflow is paused | HTTP 200; inspect the tagged step states and `current_phase`; polling may continue since the workflow can resume |
+| `GET /v1/workflows/:command_id` — workflow is complete | HTTP 200; inspect the tagged step states and `current_phase`; stop polling when the command status is terminal, including any merge-back outcome |
 | Concurrent reads of `workflow.state.json` during a write | File is written atomically via rename; clients never observe a partial JSON document |
 | `DELETE /v1/sessions/:id` — no queued commands, no running command | HTTP 200; session immediately transitions to `closed` status |
 | `DELETE /v1/sessions/:id` — queued commands present, no running command | HTTP 200; all queued commands are cancelled; session immediately transitions to `closed` status |

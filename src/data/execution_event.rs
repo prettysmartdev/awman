@@ -177,6 +177,7 @@ impl EventPayload {
                 to_status,
                 ..
             } => Some(format!("[step {step_index}] {step_name} → {to_status}")),
+            EventPayload::WorkflowPhaseTransition { phase, .. } if phase != "main" => None,
             EventPayload::WorkflowPhaseTransition {
                 phase,
                 step_desc,
@@ -213,5 +214,28 @@ impl EventPayload {
             }
             EventPayload::Done => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod phase_log_tests {
+    use super::*;
+    #[test]
+    fn additive_phase_events_remain_structured_without_duplicate_text() {
+        let phase = EventPayload::WorkflowPhaseTransition {
+            phase: "setup".into(),
+            step_desc: "prepare".into(),
+            status: PhaseStatusKind::Running,
+        };
+        assert_eq!(phase.to_plain_text(), None);
+        assert_eq!(phase.sse_event_type(), "workflow_phase_transition");
+        assert_eq!(
+            EventPayload::StatusMessage {
+                phase: "setup".into(),
+                message: "started: prepare".into()
+            }
+            .to_plain_text(),
+            Some("[setup] started: prepare".into())
+        );
     }
 }

@@ -185,6 +185,12 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
         return Ok(serde_json::Value::String(trimmed.to_string()));
     }
     match field {
+        "worktree.onDirtyMergeTarget" => value
+            .parse::<crate::data::config::OnDirtyMergeTarget>()
+            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
+        "worktree.mergeFix.onFailure" => value
+            .parse::<crate::data::config::OnMergeFailure>()
+            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
         "agent" | "default_agent" => {
             // Shape only here; whether the name is defined depends on the
             // scope being written (`check_agent_known`).

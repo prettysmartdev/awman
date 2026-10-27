@@ -373,9 +373,10 @@ impl WorkflowEngine {
                 Ok(MidStepOutcome::WorkflowEnded(outcome))
             }
             NextAction::FinishWorkflow => {
-                if !self.is_last_step() {
+                if !self.workflow_can_finish() {
                     return Err(EngineError::InvalidAdvanceAction(
-                        "FinishWorkflow only valid on the last step".into(),
+                        "FinishWorkflow only valid on the last step or once every step is terminal"
+                            .into(),
                     ));
                 }
                 if already_finished.is_none() {
@@ -464,9 +465,9 @@ impl WorkflowEngine {
     }
 
     pub(super) fn handle_finish_workflow(&mut self) -> Result<WorkflowOutcome, EngineError> {
-        if !self.is_last_step() {
+        if !self.workflow_can_finish() {
             return Err(EngineError::InvalidAdvanceAction(
-                "FinishWorkflow only valid on the last step".into(),
+                "FinishWorkflow only valid on the last step or once every step is terminal".into(),
             ));
         }
         let skipped: Vec<String> = self
@@ -607,7 +608,7 @@ impl WorkflowEngine {
             can_restart_current_step: self.current_step_name.is_some(),
             can_pause: true,
             can_abort: true,
-            can_finish_workflow: self.is_last_step(),
+            can_finish_workflow: self.workflow_can_finish(),
             can_dismiss: has_execution || self.current_step_name.is_some(),
             ..Default::default()
         };
@@ -635,8 +636,10 @@ impl WorkflowEngine {
             a.cancel_to_previous_unavailable_reason = Some("this is the first step".into());
         }
         if !a.can_finish_workflow {
-            a.finish_workflow_unavailable_reason =
-                Some("FinishWorkflow is only valid on the last step".into());
+            a.finish_workflow_unavailable_reason = Some(
+                "FinishWorkflow is only valid on the last step or once every step is terminal"
+                    .into(),
+            );
         }
 
         // Workflow Control Board scoping for parallel groups (WI-0096 §10).
@@ -663,6 +666,14 @@ impl WorkflowEngine {
         a.focused_step = self.running_step_name();
         a.simple_advance = self.simple_advance(&a);
         Ok(a)
+    }
+
+    /// `FinishWorkflow` is valid on the topologically last step (as before)
+    /// and once every step is terminal. In a DAG with more than one sink the
+    /// step that finishes last is often not topologically last, and the final
+    /// yolo board must still be able to finish the run.
+    pub(super) fn workflow_can_finish(&self) -> bool {
+        self.is_last_step() || self.state.is_complete()
     }
 
     /// The step currently in `Running` state, if exactly one is.

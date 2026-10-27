@@ -991,6 +991,8 @@ fn exec_workflow_flags_keep_their_documented_order() {
             "dynamic",
             "leader",
             "max-concurrent",
+            "on-dirty-merge-target",
+            "on-merge-failure",
         ]
     );
 }

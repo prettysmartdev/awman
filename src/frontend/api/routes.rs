@@ -158,6 +158,9 @@ struct CommandResponse {
     result: Option<serde_json::Value>,
 }
 
+/// Capabilities a client can detect without parsing the version. Append only.
+pub const API_FEATURES: &[&str] = &["workflow_state"];
+
 #[derive(Serialize)]
 struct StatusResponse {
     status: String,
@@ -165,6 +168,7 @@ struct StatusResponse {
     uptime_seconds: u64,
     active_sessions: i64,
     running_commands: i64,
+    features: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -251,6 +255,10 @@ async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         uptime_seconds: uptime,
         active_sessions,
         running_commands,
+        features: API_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect(),
     })
 }
 
@@ -1233,8 +1241,8 @@ async fn handle_get_workflow(
     State(state): State<Arc<AppState>>,
     AxumPath(command_id): AxumPath<String>,
 ) -> Response {
-    let session_id = match state.store.get_command(&command_id) {
-        Ok(Some(c)) => c.session_id,
+    let cmd = match state.store.get_command(&command_id) {
+        Ok(Some(c)) => c,
         Ok(None) => {
             return (StatusCode::NOT_FOUND, error_json("command not found")).into_response();
         }
@@ -1250,7 +1258,7 @@ async fn handle_get_workflow(
 
     match state
         .paths
-        .read_command_workflow_state_raw(&session_id, &command_id)
+        .read_command_workflow_state_raw(&cmd.session_id, &command_id)
     {
         Ok(Some(content)) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(val) => Json(val).into_response(),
@@ -1263,11 +1271,19 @@ async fn handle_get_workflow(
                     .into_response()
             }
         },
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            error_json("no workflow for this command"),
-        )
-            .into_response(),
+        Ok(None) => {
+            let path: Vec<&str> = cmd.subcommand.split_whitespace().collect();
+            let error = if CommandCatalogue::get().canonical_path(&path) == ["exec", "workflow"] {
+                if matches!(cmd.status.as_str(), "queued" | "pending" | "running") {
+                    "workflow not started"
+                } else {
+                    "workflow never started"
+                }
+            } else {
+                "no workflow for this command"
+            };
+            (StatusCode::NOT_FOUND, error_json(error)).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to read workflow state");
             (

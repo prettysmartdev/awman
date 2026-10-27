@@ -193,17 +193,14 @@ pub(crate) fn refresh_warning(outcome: &RefreshOutcome) -> Option<String> {
     }
 }
 
-impl AgentExecutionFactory for CommandLayerFactory {
-    fn execution_for_step(
+impl CommandLayerFactory {
+    fn execution_with_prompt(
         &self,
         step: &WorkflowStep,
         session: &Session,
         runtime: &WorkflowRuntimeContext,
+        substitution: crate::data::workflow_prompt_template::Substitution,
     ) -> Result<crate::engine::agent_runtime::execution::AgentExecution, EngineError> {
-        // Substitute work item template tokens in the step prompt.
-        let substitution =
-            substitute_prompt(&step.prompt_template, self.work_item_context.as_ref());
-
         // Compute per-step overlays by merging config/env/CLI with step-level overlays.
         let collected = session
             .effective_config()
@@ -385,6 +382,39 @@ impl AgentExecutionFactory for CommandLayerFactory {
             run_opts.launch_mode == crate::data::config::repo::LaunchMode::Acp,
         );
         instance.run_with_frontend(Box::new(proxy))
+    }
+}
+
+impl AgentExecutionFactory for CommandLayerFactory {
+    fn execution_for_step(
+        &self,
+        step: &WorkflowStep,
+        session: &Session,
+        runtime: &WorkflowRuntimeContext,
+    ) -> Result<crate::engine::agent_runtime::execution::AgentExecution, EngineError> {
+        self.execution_with_prompt(
+            step,
+            session,
+            runtime,
+            substitute_prompt(&step.prompt_template, self.work_item_context.as_ref()),
+        )
+    }
+
+    fn execution_for_rendered_step(
+        &self,
+        step: &WorkflowStep,
+        session: &Session,
+        runtime: &WorkflowRuntimeContext,
+    ) -> Result<crate::engine::agent_runtime::execution::AgentExecution, EngineError> {
+        self.execution_with_prompt(
+            step,
+            session,
+            runtime,
+            crate::data::workflow_prompt_template::Substitution {
+                rendered: step.prompt_template.clone(),
+                warnings: vec![],
+            },
+        )
     }
 
     fn inject_prompt(

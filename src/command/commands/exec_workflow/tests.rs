@@ -223,6 +223,21 @@ impl WorktreeLifecycleFrontend for FakeExecWorkflowFrontend {
     ) -> Result<Option<String>, CommandError> {
         Ok(None)
     }
+    fn ask_dirty_merge_target(
+        &mut self,
+        _target_branch: &str,
+        _files: &[String],
+        _suggested_message: &str,
+    ) -> Result<crate::command::commands::worktree_lifecycle::DirtyMergeTargetDecision, CommandError>
+    {
+        Ok(crate::command::commands::worktree_lifecycle::DirtyMergeTargetDecision::Abort)
+    }
+    fn ask_launch_merge_fix_agent(
+        &mut self,
+        _failure: &crate::command::commands::worktree_lifecycle::MergeFailure,
+    ) -> Result<bool, CommandError> {
+        Ok(false)
+    }
     fn ask_merge_mode(
         &mut self,
         _branch: &str,
@@ -399,6 +414,8 @@ async fn set_pty_active_called_true_then_false_around_engine() {
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
         leader: None,
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
     };
     let session = {
         let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
@@ -634,6 +651,8 @@ async fn workflow_command_survives_runtime_holding_frontend_after_wait() {
             issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
             dynamic: false,
             leader: None,
+            on_dirty_merge_target: None,
+            on_merge_failure: None,
         };
         let frontend = FakeExecWorkflowFrontend::new();
         let messages = frontend.shared_messages.clone();
@@ -911,6 +930,8 @@ fn exec_workflow_flags_worktree_defaults_to_false() {
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
         leader: None,
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
     };
     assert!(!flags.worktree);
     assert!(!flags.yolo);
@@ -1013,6 +1034,8 @@ fn exec_workflow_flags_yolo_implies_worktree_in_dispatch() {
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
         leader: None,
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
     };
     assert!(flags.yolo);
     assert!(flags.worktree, "yolo must imply worktree");
@@ -1530,6 +1553,8 @@ fn make_dynamic_flags(
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic,
         leader: leader.map(|s| s.to_string()),
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
     }
 }
 
@@ -3560,6 +3585,8 @@ async fn run_recorded_workflow(
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: false,
         leader: None,
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
     };
     let session = Session::for_tests_isolated(&repo, &tmp.join("config-home"));
     let cmd = ExecWorkflowCommand::new(flags, engines, session);
@@ -3680,6 +3707,8 @@ async fn record_leader_launch(
         issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
         dynamic: true,
         leader: Some("codex::gpt-5".into()),
+        on_dirty_merge_target: None,
+        on_merge_failure: None,
     };
     let cmd = ExecWorkflowCommand::new(flags, engines, invoking);
     let shared = SharedWorkflowFrontend::new(Box::new(FakeExecWorkflowFrontend::new()));
@@ -3839,4 +3868,196 @@ async fn interactive_setup_and_teardown_factories_use_each_sessions_policy() {
             }
         }
     }
+}
+
+// ─── WI 0132 Parts B and C: merge-back policy and merge-fix prompt ───────────
+
+fn merge_policy_flags(
+    dirty: Option<crate::data::config::repo::OnDirtyMergeTarget>,
+    failure: Option<crate::data::config::repo::OnMergeFailure>,
+) -> ExecWorkflowCommandFlags {
+    ExecWorkflowCommandFlags {
+        workflow: None,
+        work_item: None,
+        non_interactive: true,
+        plan: false,
+        allow_docker: false,
+        worktree: true,
+        yolo: false,
+        auto: false,
+        agent: None,
+        model: None,
+        launch_mode: None,
+        overlay: vec![],
+        agent_flags: None,
+        max_concurrent: None,
+        issue_source: crate::engine::issue::IssueSourceFlags { issue: None },
+        dynamic: false,
+        leader: None,
+        on_dirty_merge_target: dirty,
+        on_merge_failure: failure,
+    }
+}
+
+/// A session whose repo and global configs carry the given `worktree` JSON.
+fn merge_policy_session(tmp: &Path, repo: Option<&str>, global: Option<&str>) -> Session {
+    let config_home = tmp.join("config-home");
+    std::fs::create_dir_all(&config_home).unwrap();
+    if let Some(json) = global {
+        std::fs::write(config_home.join("config.json"), json).unwrap();
+    }
+    agent_flags_session(tmp, "repo", repo)
+}
+
+#[test]
+fn merge_policy_is_unset_without_flags_or_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(tmp.path(), None, None);
+    let policy = super::prepare::finalize_policy(&merge_policy_flags(None, None), &session);
+    assert_eq!(policy.on_dirty_merge_target, None);
+    assert_eq!(policy.on_merge_failure, None);
+}
+
+#[test]
+fn merge_policy_global_config_applies() {
+    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(
+        tmp.path(),
+        None,
+        Some(r#"{"worktree": {"onDirtyMergeTarget": "stash", "mergeFix": {"onFailure": "keep"}}}"#),
+    );
+    let policy = super::prepare::finalize_policy(&merge_policy_flags(None, None), &session);
+    assert_eq!(policy.on_dirty_merge_target, Some(D::Stash));
+    assert_eq!(policy.on_merge_failure, Some(F::Keep));
+}
+
+#[test]
+fn merge_policy_repo_config_beats_global() {
+    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(
+        tmp.path(),
+        Some(
+            r#"{"worktree": {"onDirtyMergeTarget": "commit", "mergeFix": {"onFailure": "agent"}}}"#,
+        ),
+        Some(r#"{"worktree": {"onDirtyMergeTarget": "stash", "mergeFix": {"onFailure": "keep"}}}"#),
+    );
+    let policy = super::prepare::finalize_policy(&merge_policy_flags(None, None), &session);
+    assert_eq!(policy.on_dirty_merge_target, Some(D::Commit));
+    assert_eq!(policy.on_merge_failure, Some(F::Agent));
+}
+
+#[test]
+fn merge_policy_flag_beats_repo_and_global() {
+    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(
+        tmp.path(),
+        Some(
+            r#"{"worktree": {"onDirtyMergeTarget": "commit", "mergeFix": {"onFailure": "agent"}}}"#,
+        ),
+        Some(r#"{"worktree": {"onDirtyMergeTarget": "stash", "mergeFix": {"onFailure": "keep"}}}"#),
+    );
+    let flags = merge_policy_flags(Some(D::Fail), Some(F::Ask));
+    let policy = super::prepare::finalize_policy(&flags, &session);
+    assert_eq!(policy.on_dirty_merge_target, Some(D::Fail));
+    assert_eq!(policy.on_merge_failure, Some(F::Ask));
+}
+
+#[test]
+fn merge_policy_settings_resolve_independently() {
+    use crate::data::config::repo::{OnDirtyMergeTarget as D, OnMergeFailure as F};
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(
+        tmp.path(),
+        Some(r#"{"worktree": {"mergeFix": {"onFailure": "agent"}}}"#),
+        Some(r#"{"worktree": {"onDirtyMergeTarget": "stash"}}"#),
+    );
+    let policy =
+        super::prepare::finalize_policy(&merge_policy_flags(Some(D::Commit), None), &session);
+    assert_eq!(policy.on_dirty_merge_target, Some(D::Commit));
+    assert_eq!(policy.on_merge_failure, Some(F::Agent));
+}
+
+fn failure_for_prompt(
+    git_root: &Path,
+) -> crate::command::commands::worktree_lifecycle::MergeFailure {
+    crate::command::commands::worktree_lifecycle::MergeFailure {
+        branch: "awman/feat".into(),
+        target_branch: "main".into(),
+        worktree_path: git_root.join("wt"),
+        git_root: git_root.to_path_buf(),
+        squash: true,
+        command: "git merge --squash awman/feat".into(),
+        exit_code: 1,
+        output: "CONFLICT (content): Merge conflict in README.md".into(),
+        unmerged_paths: vec!["README.md".into(), "src/a.rs".into()],
+        staged_paths: vec![],
+        head_before_fix: "head".into(),
+        merge_in_progress: false,
+    }
+}
+
+#[test]
+fn merge_fix_prompt_built_in_substitutes_every_placeholder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(tmp.path(), None, None);
+    let failure = failure_for_prompt(&tmp.path().join("repo"));
+    let out =
+        super::prepare::merge_fix_prompt(&session.effective_config(), &failure, None).unwrap();
+    assert!(!out.rendered.contains("{{"), "{}", out.rendered);
+    for needle in [
+        "git merge --squash awman/feat",
+        "awman/feat",
+        "main",
+        "README.md\nsrc/a.rs",
+        "Merge conflict in README.md",
+    ] {
+        assert!(out.rendered.contains(needle), "missing {needle}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_fix_prompt_uses_the_configured_template() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(
+        tmp.path(),
+        Some(r#"{"worktree": {"mergeFix": {"promptTemplate": "merge-prompt.md"}}}"#),
+        None,
+    );
+    let root = tmp.path().join("repo");
+    std::fs::write(
+        root.join("merge-prompt.md"),
+        "CUSTOM {{branch}} into {{target_branch}} exit={{merge_exit_code}} [{{unmerged_paths}}] {{merge_command}} <{{merge_output}}>",
+    )
+    .unwrap();
+    let out = super::prepare::merge_fix_prompt(
+        &session.effective_config(),
+        &failure_for_prompt(&root),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        out.rendered,
+        "CUSTOM awman/feat into main exit=1 [README.md\nsrc/a.rs] git merge --squash awman/feat <CONFLICT (content): Merge conflict in README.md>"
+    );
+}
+
+#[test]
+fn merge_fix_prompt_unreadable_template_is_an_error_not_a_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session = merge_policy_session(
+        tmp.path(),
+        Some(r#"{"worktree": {"mergeFix": {"promptTemplate": "missing.md"}}}"#),
+        None,
+    );
+    let err = super::prepare::merge_fix_prompt(
+        &session.effective_config(),
+        &failure_for_prompt(&tmp.path().join("repo")),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("promptTemplate"), "{err}");
 }

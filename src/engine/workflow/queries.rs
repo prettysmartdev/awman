@@ -215,11 +215,12 @@ impl WorkflowEngine {
         })
     }
 
-    pub(super) fn persist(&self) -> Result<(), EngineError> {
+    pub(super) fn persist(&mut self) -> Result<(), EngineError> {
         self.state_store
             .save(&self.state)
             .map_err(EngineError::Data)?;
         self.mirror_summary();
+        self.frontend.report_workflow_state(&self.state);
         Ok(())
     }
 

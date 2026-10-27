@@ -81,8 +81,20 @@ pub enum CommandError {
     #[error("command aborted by user")]
     Aborted,
 
-    #[error("merge conflict on branch {branch} (worktree at {worktree_path})")]
+    /// A failed worktree merge-back that is still unresolved after the
+    /// merge-fix agent ran. The merge state is left in `git_root`.
+    #[error(
+        "merge of branch {branch} is still unresolved in {git_root} (worktree at {worktree_path})"
+    )]
     MergeConflict {
+        branch: String,
+        worktree_path: PathBuf,
+        git_root: PathBuf,
+    },
+
+    #[error("merge target '{target_branch}' has uncommitted changes; worktree for '{branch}' kept at {worktree_path}")]
+    MergeTargetDirty {
+        target_branch: String,
         branch: String,
         worktree_path: PathBuf,
     },
@@ -368,6 +380,7 @@ impl CommandError {
         CommandError::Engine(e) => e.exit_code(),
         CommandError::Data(_) => 1,
         CommandError::MergeConflict { .. } => 1,
+        CommandError::MergeTargetDirty { .. } => 1,
         CommandError::MissingRemoteAddress
         | CommandError::MissingApiKey
         | CommandError::RemoteTimeout
@@ -401,6 +414,7 @@ impl CommandError {
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => 403,
             CommandError::Engine(EngineError::UnknownAgent { .. }) => 404,
             CommandError::SessionWorkdirNotAllowed { .. } => 403,
+            CommandError::MergeTargetDirty { .. } | CommandError::MergeConflict { .. } => 409,
             _ => match self.exit_code() {
                 2 => 400,
                 4 => 404,

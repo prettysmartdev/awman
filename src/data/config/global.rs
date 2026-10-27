@@ -10,7 +10,7 @@ use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::config::repo::{
     validate_agent_flags, validate_auth_refresh, AgentFlagsConfig, ApiConfig, AuthRefreshConfig,
-    RemoteConfig, SquadConfig,
+    RemoteConfig, SquadConfig, WorktreeConfig,
 };
 use crate::data::config::runtime_selection::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::error::DataError;
@@ -77,6 +77,9 @@ pub struct GlobalConfig {
     /// Settings for the builtin microVM runtime (`runtime: "builtin"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<BuiltinRuntimeConfig>,
+    /// Merge-back behaviour for worktree branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeConfig>,
 }
 
 impl GlobalConfig {
@@ -256,6 +259,7 @@ mod tests {
             yolo_disallowed_tools: Some(vec!["rm".to_string()]),
             legacy_env_passthrough: None,
             builtin: None,
+            worktree: None,
             api: Some(ApiConfig {
                 work_dirs: Some(vec!["/work".to_string()]),
                 always_non_interactive: Some(true),

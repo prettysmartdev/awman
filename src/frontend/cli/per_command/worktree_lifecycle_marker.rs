@@ -7,8 +7,11 @@
 use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
-    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
+    dirty_merge_target_body, dirty_target_commit_message, DirtyMergeTargetDecision,
+    ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
+    PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode, DIRTY_COMMIT_PROMPT,
+    DIRTY_COMMIT_TITLE, DIRTY_MERGE_TARGET_KEYS, DIRTY_MERGE_TARGET_TITLE,
+    MERGE_FIX_PROMPT_OUTPUT_LINES,
 };
 use crate::command::error::CommandError;
 use crate::data::message::UserMessageSink;
@@ -157,6 +160,45 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         })
     }
 
+    fn ask_dirty_merge_target(
+        &mut self,
+        target_branch: &str,
+        files: &[String],
+        suggested_message: &str,
+    ) -> Result<DirtyMergeTargetDecision, CommandError> {
+        if self.non_interactive {
+            return Ok(self.headless.dirty_merge_target());
+        }
+        eprintln!("awman: {DIRTY_MERGE_TARGET_TITLE}");
+        eprintln!("{}", dirty_merge_target_body(target_branch, files));
+        for (key, label) in DIRTY_MERGE_TARGET_KEYS {
+            eprintln!("  [{key}] {label}");
+        }
+        match read_line_or_default('a') {
+            'c' | 'C' => {
+                eprintln!(
+                    "awman: {DIRTY_COMMIT_TITLE}: {DIRTY_COMMIT_PROMPT} [{suggested_message}]"
+                );
+                Ok(read_dirty_commit_message(
+                    &mut std::io::stdin().lock(),
+                    suggested_message,
+                ))
+            }
+            's' | 'S' => Ok(DirtyMergeTargetDecision::Stash),
+            _ => Ok(DirtyMergeTargetDecision::Abort),
+        }
+    }
+
+    fn ask_launch_merge_fix_agent(&mut self, failure: &MergeFailure) -> Result<bool, CommandError> {
+        if self.non_interactive {
+            return Ok(self.headless.launch_merge_fix_agent());
+        }
+        eprintln!("{}", failure.prompt_body(MERGE_FIX_PROMPT_OUTPUT_LINES));
+        eprintln!("awman: {}", failure.prompt_title());
+        let ch = read_line_or_default('n');
+        Ok(matches!(ch, 'y' | 'Y'))
+    }
+
     fn confirm_worktree_cleanup(
         &mut self,
         branch: &str,
@@ -199,5 +241,50 @@ impl WorktreeLifecycleFrontend for CliFrontend {
                 level: crate::data::message::MessageLevel::Info,
                 text: format!("worktree for {branch} kept at {}", path.display()),
             });
+    }
+}
+
+fn read_dirty_commit_message(
+    reader: &mut dyn std::io::BufRead,
+    suggested: &str,
+) -> DirtyMergeTargetDecision {
+    let mut text = String::new();
+    match reader.read_line(&mut text) {
+        Ok(n) if n > 0 => dirty_target_commit_message(Some(&text), suggested),
+        _ => dirty_target_commit_message(None, suggested),
+    }
+}
+
+#[cfg(test)]
+mod dirty_target_tests {
+    use super::*;
+    #[test]
+    fn eof_and_read_error_abort_and_enter_accepts_default() {
+        assert_eq!(
+            read_dirty_commit_message(&mut std::io::Cursor::new(b""), "WIP"),
+            DirtyMergeTargetDecision::Abort
+        );
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+        }
+        impl std::io::BufRead for Broken {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        assert_eq!(
+            read_dirty_commit_message(&mut Broken, "WIP"),
+            DirtyMergeTargetDecision::Abort
+        );
+        assert_eq!(
+            read_dirty_commit_message(&mut std::io::Cursor::new(b"\n"), "WIP"),
+            DirtyMergeTargetDecision::Commit {
+                message: "WIP".into()
+            }
+        );
     }
 }
