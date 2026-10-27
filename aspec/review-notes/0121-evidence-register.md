@@ -402,13 +402,15 @@ no new native execution or full-diff approval is inferred.
 vendored `msb_krun` patch with upstream `static-krunfw` and moved Microsandbox
 from 0.7.2 to 0.7.8. **The WI 0123 PASS rows above are evidence for the previous
 0.7.2 / `msb_krun 0.1.39` build. They are not re-earned by this change.** The
-adopted build has only the Linux aarch64 evidence listed here; every native gate
-below is BLOCKED or deferred.
+adopted build earned its own Apple Silicon passes afterwards; see
+[Native Apple Silicon verification](#native-apple-silicon-verification-recorded-2026-10-26).
+Linux KVM gates stay deferred to WI 0124.
 
-**Awman revision and diff: BLOCKED.** This workspace's `.git` points to an
-unavailable host worktree, so no `git diff`, `status` or clean-checkout run was
-possible. Hashes below were taken from files with `sha256sum` and versions from
-`Cargo.toml`.
+**Awman revision and diff:** blocked when this record was first written (2026-10-21):
+the workspace's `.git` pointed at an unavailable host worktree, so hashes below were
+taken from files with `sha256sum` and versions from `Cargo.toml`. Superseded by the
+clean-checkout gate of the later native run, which builds and boots from a fresh
+`git worktree` of HEAD.
 
 ### Upstream references and route decision
 
@@ -451,24 +453,43 @@ rebased. The 0.7.2 trees were deleted.
   `msb_version 0.7.8` and libkrun `b35c7e1…`.
 - Linux aarch64 payload re-pinned and verified by the native extractor: kernel
   24,576,000 bytes, load/entry `0x80000000`, byte-identical to the independent route-spike
-  extraction. Darwin aarch64 and Linux x86_64 are **unverified** (cannot be extracted on
-  this host); the older Darwin provenance file is historical only.
+  extraction. Darwin aarch64 was verified later on a native host (see below); Linux
+  x86_64 is still **unverified**.
 - Executed here (aarch64 Linux, no `/dev/kvm`): `cargo build --locked --workspace` with
   and without `builtin-runtime`; `make test` (exit 0; 40 `test result` lines, 0 failed,
   4 ignored); `cargo test -p awman-host-shims --features builtin-runtime --lib` 9/9;
   clippy `-D warnings` for the shim crate; `cargo fmt --all --check`.
 
-### Gates not run (not passes)
+### Native Apple Silicon verification (recorded 2026-10-26)
+
+The maintainer ran `make payloads-verify` (`tools/msb-payloads/payloads-verify.sh`)
+on an Apple Silicon Mac against the final adopted code, after several fix
+iterations that were squashed into `fe1b18b5`. Every gate passed, and the script
+promoted the Darwin record to `status = "verified"`. It does that only when all of
+its gates pass. The candidate record is committed in `fe1b18b5`
+(`third_party/msb-payloads/manifest.toml`,
+`third_party/msb-payloads/aarch64-apple-darwin/provenance.txt`): kernel SHA-256
+`cf6cb036c7b40923588950cc8f80750617114243730668d6859216de4d52ee39` (identical to the
+Linux aarch64 pin), 24,576,000 bytes, load/entry `0x80000000`, archive SHA-256
+`5dbe0d921c6b6f807d2c59f87e0a3c3a648424871b6bee513b837a8c600a2493`, extractor SHA-256
+`cf5d370345acf47d6c96867ab28327d871e6dab9d8ddeb5344ec7728278ee2f6`, Apple clang 21.0.0.
+
+**Evidence limit:** the run's evidence directory was not kept, so no raw logs are in
+this repository. These PASS rows rest on the maintainer's attestation and the
+committed `verified` record. An earlier, pre-fix run of the same gates that failed
+(3 passed, 28 failed) was superseded and deleted.
 
 | Gate | Status |
 |---|---|
-| Apple Silicon hardware boot of the adopted build (WI 0123 hermetic/feature/hardware tiers, `make test-builtin`) | **BLOCKED**: no Apple Silicon host |
-| Ad-hoc-signed optimized artifact boot and scans (`tools/release-artifact-check.sh`, `tools/measure-release-artifact.sh`), including Mach-O export-trie / `strip -x` behavior of `krunfw_get_kernel` and `current_exe()` matching | **BLOCKED / pending** (needs macOS) |
-| Strict fixture (image/mount/config assertions, exit status, same-executable worker identity, minimal-PATH/offline run) | **BLOCKED / pending** |
-| Darwin and Linux x86_64 payload verification | **Pending**: needs native hosts |
-| Linux ARM64 and x86_64 KVM boots | **Deferred to WI 0124** (`/dev/kvm` absent) |
-| Native guest network, hostile-config and installed-runtime coexistence for the rebased patches | **BLOCKED** (needs native hosts; host-side tests only) |
-| `make test-builtin`, `tools/test-builtin-network.sh` | Host-side tier passed in the tests step (90 network tests, including three strict_sni tests); hardware functions skipped/blocked, no guest PASS |
+| Payload fetch and verify (pinned archive and agent hashes, kernel layout) | **PASS** (Apple Silicon) |
+| Apple Silicon hardware boot of the adopted build (`make test-builtin` with real guests required, so a skip fails the gate; this covers 16 KiB-page host execution) | **PASS** |
+| Clean-checkout native build and guest boots (`tools/native-builtin-ci.sh` from a fresh worktree of HEAD) | **PASS** |
+| Ad-hoc-signed optimized artifact boot and scans (`--release`, `tools/macos-sign.sh`, `tools/release-artifact-check.sh`), including `krunfw_get_kernel` binding and `current_exe()` matching in the signed binary | **PASS** |
+| Strict fixture (`tools/release-offline-session.sh`: private project and HOME, offline fixture import, network `none`, synthetic agent, and stubbed host container helpers that fail the run if awman executes them) | **PASS** |
+| Native guest network enforcement for the rebased network/types patches (the `builtin_hw` network tests, run with `AWMAN_TEST_BUILTIN_NETWORK=1`) | **PASS** (Apple Silicon); Linux in WI 0124 |
+| Hostile installed-config refusal and installed-runtime coexistence | Host-side refusal tests only (`runtime_refusal`, `sqlite`); no dedicated native coexistence test exists. Not claimed as a native PASS |
+| Linux x86_64 payload verification | **Pending**: needs a native host (WI 0124) |
+| Linux ARM64 and x86_64 KVM boots | **Deferred to WI 0124** |
 
 ### SQLite gate repair
 
@@ -491,10 +512,11 @@ The tests step ran `make test-builtin` (exit 0, host-only tests; hardware skippe
 feature/target graph checks, static-link checks, release/fat-LTO/stripped metadata
 checks and published 0.7.2/0.7.8 protocol compatibility tests. Raw logs are in the
 shared workflow context (`tests-make-test-builtin.log`, `tests-static-release.log`,
-`tests-protocol-compat.log`). These results do not re-earn previous hardware PASS rows.
+`tests-protocol-compat.log`). Those Linux host-side results were not hardware passes.
+The Apple Silicon hardware passes come from the native run recorded above.
 
-**Release blocker:** the adopted Darwin payload is unverified. No Apple Silicon
-build/sign/strip/re-sign/boot or strict-fixture pass exists; the release job remains
-blocked. The x86_64 provider additionally refuses its direct-mapping consumer until
-WI 0124 integrates private-memory boot and isolation coverage. Linux KVM gates are
-still deferred. The fix log records new checks separately; none are hardware passes.
+**Release status:** the Darwin release blocker is cleared. The adopted payload is
+verified, and the Apple Silicon boot, signed-artifact and strict-fixture gates
+passed. The x86_64 provider still refuses its direct-mapping consumer until WI 0124
+integrates private-memory boot and isolation coverage. Linux KVM gates remain
+deferred to WI 0124.

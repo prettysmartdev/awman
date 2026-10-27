@@ -14,7 +14,8 @@ including upstream test and example binaries, needs the same ad-hoc
 entitlement signature. Native boot and final-artifact checks still apply,
 and failures must be reported honestly.
 
-Last reconciled: 2026-10-21, against completed WIs 0119 and 0121–0127,
+Last reconciled: 2026-10-26 (Apple Silicon gates); upstream state as of
+2026-10-21, against completed WIs 0119 and 0121–0127,
 open WI 0124, and upstream as listed in "Upstream state" below.
 
 ## Summary:
@@ -166,15 +167,18 @@ Result of this work item (2026-10-21, aarch64 Linux build host without `/dev/kvm
   `21f169f7e94798c8916315f8ac6f5999d5b88566` (Linux 6.12.111; 0.7.2 was `cf4c22b…`),
   so the kernel and guest agent changed. Linux aarch64 is re-pinned and verified:
   kernel SHA-256 `cf6cb036c7b40923588950cc8f80750617114243730668d6859216de4d52ee39`,
-  24,576,000 bytes, load/entry `0x80000000`. Darwin aarch64 and Linux x86_64 are
-  **unverified** until extracted on native hosts, so an Apple Silicon `make build`
-  selects the non-builtin build until the Darwin payload is verified.
+  24,576,000 bytes, load/entry `0x80000000`. Darwin aarch64 was later verified
+  natively with the same kernel (below). Linux x86_64 stays unverified (WI 0124).
 - Evidence and commands are in the
   [evidence register](../review-notes/0121-evidence-register.md#wi-0120-adoption-record-2026-10-21).
-  Not run here, and therefore **not passes**: Apple Silicon hardware boots, the
-  ad-hoc-signed optimized artifact boot and scans, and the strict fixture (BLOCKED:
-  no Apple Silicon host); Linux ARM64/x86_64 KVM boots (WI 0124 gates; `/dev/kvm`
-  absent).
+- **Native Apple Silicon (recorded 2026-10-26):** the maintainer ran
+  `make payloads-verify` against the final code. Its hardware (`make test-builtin`,
+  real guests required), clean-checkout, signed optimized artifact and strict
+  offline fixture gates all passed, and the Darwin record was promoted to `verified`
+  (committed in `fe1b18b5`). The evidence directory was not kept, so these passes
+  rest on the maintainer's attestation and the committed record; see the
+  [register](../review-notes/0121-evidence-register.md#native-apple-silicon-verification-recorded-2026-10-26).
+  Linux ARM64/x86_64 KVM boots remain WI 0124 gates.
 
 ### Phase 1: decide the upstream route
 
@@ -276,7 +280,7 @@ were checked against the tree with `sha256sum` on 2026-10-21 after the 0.7.8 reb
 | Carried change | Exact current scope | Replacement | Removal gate |
 |---|---|---|---|
 | SQLx SQLite bound backport | `third_party/sqlx-sqlite-0.9.0/` (patch SHA-256 `22a7e9a2e4f9dbf588a514e5305dfd6f21377107bb7600c348660606d664031f`, 2 files). Raises the `libsqlite3-sys` upper bound from `<0.38.0` to `<0.39.0`, matching upstream SQLx commit `94aafe3a68884d923b0798a767c8d7f6cfda89d2`, which resolves the `rusqlite 0.40.2` / `libsqlite3-sys 0.38.2` native-links conflict. Also adds one `#[allow(deprecated)]` for `time >= 0.3.55` format components. Independent of embedded-kernel work. | A published compatible `sqlx-sqlite` release (latest is still 0.9.0). | Update the dependency and lockfile, remove the patch path and vendor tree, then pass the combined awman/msb link, exactly-one-bundled-SQLite check, awman store tests, msb migrations, cross-driver checks, and old/new catalog round trips on supported targets. Do not couple this to libkrun work. |
-| ~~libkrun kernel-provider loader~~ (**removed by WI 0120**) | Was `third_party/msb_krun-0.1.39/` (patch SHA-256 `cf6d58d0574d8bfefad6137b3f6435ec5524dbf11e8f6b24ff2133c8610dcfba`). The tree is deleted and no `[patch.crates-io]` entry remains. | Published `msb_krun =0.1.41` with `static-krunfw` and the awman-owned `krunfw_get_kernel` callback (Track A). | Done for the build/link gates (see the register). Still open: Apple Silicon boot, signed-artifact and strict-fixture gates (BLOCKED, not run here) and Linux KVM boots (WI 0124). A future `msb_krun` bump must re-read `load_krunfw_library`, because Rust cannot type-check the `no_mangle` signature against the C declaration. |
+| ~~libkrun kernel-provider loader~~ (**removed by WI 0120**) | Was `third_party/msb_krun-0.1.39/` (patch SHA-256 `cf6d58d0574d8bfefad6137b3f6435ec5524dbf11e8f6b24ff2133c8610dcfba`). The tree is deleted and no `[patch.crates-io]` entry remains. | Published `msb_krun =0.1.41` with `static-krunfw` and the awman-owned `krunfw_get_kernel` callback (Track A). | Done: build/link gates, plus the Apple Silicon boot, signed-artifact and strict-fixture gates (see the register). Still open: Linux KVM boots (WI 0124). A future `msb_krun` bump must re-read `load_krunfw_library`, because Rust cannot type-check the `no_mangle` signature against the C declaration. |
 | Microsandbox guest-agent artifact-root glue | `third_party/microsandbox-filesystem-0.7.8/` (published crate SHA-256 `e890749fd6c87b7966865a4f7a0add888926adce222fdd4525eb64e047fee30b`; patch SHA-256 `b87c1e5f67fe0b9b3044bc43ff332601233280012bd35ea4145b6b75b9feab61`). Only `build.rs` changes: it adds target-aware lookup at `MSB_EMBED_ARTIFACTS_ROOT/<target-arch>/agentd`, and existing inputs remain. Published 0.7.8 still has only `MSB_EMBED_ARTIFACTS_DIR`. | An equivalent upstream target-aware build input, or awman setting `MSB_EMBED_ARTIFACTS_DIR` per target in its own build. | Pin the release/commit, remove the vendor patch and path override, and verify clean builds for all required targets plus guest-agent hash/architecture checks. |
 | Awman-side worker and provider integration (not a vendored dependency patch) | `crates/awman-host-shims/src/{worker.rs,kernel.rs,version.rs}` (built behind `cfg(awman_builtin)`), `src/engine/container/builtin/embedded/mod.rs` (`set_libkrunfw_path`), `src/engine/container/builtin/msb_driver.rs` (firmware-path check), constants in `src/data/builtin_runtime.rs`, and the single early call `awman_host_shims::dispatch_worker(...)` in `src/main.rs`. `kernel::prepare()` arms the process (validation plus the aligned copy) before the worker runs; `krunfw_get_kernel` is the one documented exported symbol. | Remove the firmware-path transport only when the SDK can represent an embedded origin directly. Keep the worker protocol and early dispatch while the SDK still launches the same executable. Scope any needed Microsandbox runtime patch as its own upstream change and record it here before carrying it. | Test worker launch/version compatibility first, then remove only the glue the upstream API makes redundant. Verify same-executable boot, installed-runtime refusal, protocol compatibility, and no symbol/path workaround beyond the one documented callback. |
 | Awman-side macOS builtin fixes (WI 0122; awman code, not dependency patches) | `crates/awman-host-shims/src/kernel.rs` uses the aligned process-lifetime copy on every serving target (Mach-O caps section alignment below 64 KiB). x86_64 serving is refused until its runner uses private-memory boot. `crates/awman-host-shims/src/worker.rs` accepts the SDK's umask-mode lifecycle lock (no group/other write). `src/engine/container/builtin/msb_driver.rs` canonicalizes bind-source ancestors, because the SDK's no-follow root open refuses macOS `/tmp` and `/var` symlinks; a symlinked leaf is still refused. The fourth WI 0122 fix (`only_lo` probe tolerates the kernel's inert `dummy0`) is test-only and has no upstream counterpart. | Upstream: a kernel provider that owns alignment (Track A keeps the copy in awman), an SDK lock created `0600`, and SDK root resolution that tolerates system symlink ancestors while refusing a symlinked leaf. | Remove each only after the matching upstream change is pinned and the macOS actual-awman guest tests pass again. All three are platform-neutral and must be revalidated on Linux in WI 0124. |
@@ -305,23 +309,23 @@ production runtime dependency.
   only with a recorded, concrete gap), with the upstream bases used. Recorded in the register: Track A, `msb_krun 0.1.41` / libkrun `b35c7e1…`, Microsandbox `v0.7.8`.
 - [x] The Microsandbox/msb_krun dependency is bumped to a release containing
   the chosen API, and every carried Microsandbox patch is rebased (or dropped
-  because it landed upstream) with new provenance and hashes. All four Microsandbox patches were rebased onto 0.7.8 (none landed upstream); hashes are in the inventory and `third_party/README.md`. Payload re-pinned for Linux aarch64 only (see "Proven starting point").
+  because it landed upstream) with new provenance and hashes. All four Microsandbox patches were rebased onto 0.7.8 (none landed upstream); hashes are in the inventory and `third_party/README.md`. Payload re-pinned for Linux aarch64, and later verified natively for Darwin aarch64 (see "Proven starting point"); Linux x86_64 is WI 0124.
 - [x] The vendored `msb_krun` patch is removed. Kernel provision uses the
   published API with explicit validation, a writable aligned buffer kept for
   the process lifetime, and no hidden fallback to a dynamic library.
 - [x] Any remaining unsafe code is confined to `awman-host-shims` with exact
   `// SAFETY:` contracts. The `awman` library keeps `forbid(unsafe_code)`.
-- [ ] Apple Silicon gates (WI 0123 tiers, signed optimized artifact,
+- [x] Apple Silicon gates (WI 0123 tiers, signed optimized artifact,
   strict fixture) pass on the adopted API. Linux ARM64/x86_64 KVM boots are
   recorded as WI 0124 gates, never as passes without hardware evidence.
-  **Not done:** no Apple Silicon host was available. These gates are BLOCKED/pending, and the Darwin payload is unverified. Linux ARM64/x86_64 KVM boots remain WI 0124 gates.
+  **Done (recorded 2026-10-26):** `make payloads-verify` passed every gate on Apple Silicon against the final code, and the Darwin payload is `verified`. Raw logs were not retained; the passes are maintainer-attested (see the register). Linux ARM64/x86_64 KVM boots remain WI 0124 gates.
 - [ ] Any upstream PR (libkrun docs fix, Track B API, Microsandbox isolated
   builder/filesystem/network changes) is separately scoped and tested, and is
   submitted only with explicit authorization. Acceptance is tracked here, not
   assumed.
   **Not done:** nothing was submitted. A libkrun documentation fix is drafted locally only, in [`upstream-libkrun-docs.md`](../review-notes/0120-evidence/upstream-libkrun-docs.md); no fork, branch or PR exists.
 - [x] `third_party/README.md`, the evidence register and this inventory agree
-  with the tree after adoption. Hashes and versions were compared with `sha256sum` and `Cargo.toml` on 2026-10-21. Final verification re-checked every `upstream.diff` and published-crate SHA-256 against the README, register, inventory, `PATCH.md` files, `Cargo.lock` and the fetched crates. A Git-tracked-checkout audit remains blocked because this workspace's `.git` points to an unavailable host worktree; repeat it on a real checkout.
+  with the tree after adoption. Hashes and versions were compared with `sha256sum` and `Cargo.toml` on 2026-10-21. Final verification re-checked every `upstream.diff` and published-crate SHA-256 against the README, register, inventory, `PATCH.md` files, `Cargo.lock` and the fetched crates. The Git-tracked-checkout audit was blocked on 2026-10-21 (unavailable worktree). It was covered later by `payloads-verify`'s clean-checkout gate, which builds and boots from a fresh worktree of HEAD.
 
 ## Edge Case Considerations:
 - Empty, truncated, oversized, wrong-architecture or improperly aligned kernel
@@ -388,14 +392,15 @@ production runtime dependency.
   prerequisite or behavior. Upstream patch mechanics alone do not warrant a
   new end-user guide.
 
-### Adversarial review fixes and release blocker (2026-10-21)
+### Adversarial review fixes and release blocker (2026-10-21; blocker cleared 2026-10-26)
 
-WI 0120 remains **unreleased / incomplete**: Darwin 0.7.8 extraction, hash/layout
-verification, 16 KiB-host execution, signing/strip/re-sign, final-artifact boot and
-strict-fixture gates require Apple Silicon and have not passed. The release workflow
-intentionally depends on its failing native payload gate; do not bypass it to publish
-other assets. `make payloads` currently exits nonzero on Darwin; `make build` omits
-builtin there. User docs now disclose this temporary source-build limitation.
+On 2026-10-21 the Darwin 0.7.8 extraction, hash/layout verification, 16 KiB-host
+execution, signing/strip/re-sign, final-artifact boot and strict-fixture gates were
+outstanding, and the release workflow was deliberately blocked on its native payload
+gate. **Cleared:** all of these passed on Apple Silicon (see "Native Apple Silicon"
+above), and the Darwin payload is `verified`. `make payloads` succeeds on Apple
+Silicon and `make build` includes the builtin runtime again. The temporary
+source-build notice was removed from the user docs.
 
 The pinned x86_64 runner maps the shared callback allocation directly into kernel
 RAM. `kernel::prepare` now refuses that consumer, even if its payload is later

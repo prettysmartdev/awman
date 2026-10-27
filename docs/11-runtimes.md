@@ -65,19 +65,17 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 
 ## Builtin microVM (experimental)
 
-> **Current source build availability:** the runtime dependency upgrade is awaiting native Apple Silicon verification. `make payloads` on Apple Silicon currently records extraction evidence and exits nonzero because the new Darwin payload is unverified, so `make build` and `make install` build without the builtin runtime. To verify it yourself on an Apple Silicon Mac, commit or stash local changes, install Apple Containers (Docker is optional), and run `make payloads-verify` as your own user (not with `sudo`). It boots real guest VMs, runs the required hardware and signed-artifact checks, and marks the payload verified in `third_party/msb-payloads/manifest.toml` only if all of them pass. After that, `make install` includes the builtin runtime. Use another runtime or a previously verified release until the new payload, signed/stripped artifact and guest checks pass. Publishing the next release is blocked on those checks.
-
 `builtin-experimental` runs each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable**. Each VM starts another process of that same executable. There is no separate runtime to install, and no Docker, `container` or `sbx` is needed to *run* agents.
 
 **Isolation model:** a hardware-virtualized VM with its own kernel per session. The hypervisor, device emulation, and shared-filesystem implementations form part of the security boundary. The configured project, settings, and overlay mounts grant access to host files. There is no host Docker socket bridge.
 
-> **Experimental, macOS on Apple Silicon only.** This runtime is released as an experimental preview, like `docker-sbx-experimental`: behaviour and configuration may still change. In this release it runs only on Macs with Apple Silicon. The previous dependency version's guest behaviour (sessions, PTY and ACP, workflows, squad, the API, resource limits, networking, image import) was tested on real Apple Silicon hardware; the current dependency upgrade has not re-earned those results; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
+> **Experimental, macOS on Apple Silicon only.** This runtime is released as an experimental preview, like `docker-sbx-experimental`: behaviour and configuration may still change. In this release it runs only on Macs with Apple Silicon. Its guest behaviour (sessions, PTY and ACP, workflows, squad, the API, resource limits, networking, image import) is tested on real Apple Silicon hardware; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
 
 ### Where it is available
 
 | Host | Status |
 |---|---|
-| macOS on Apple Silicon | Previous release supported (experimental); current source build awaits payload and guest re-verification (see above). |
+| macOS on Apple Silicon | Supported (experimental). Included in the `awman-macos-arm64` release and in source builds (`make build`). |
 | Linux (x86_64 or arm64), Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
 
 The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
@@ -120,7 +118,7 @@ macOS only lets a program start a virtual machine when its code signature carrie
 
 ### Building from source
 
-After the native verification blocker above is resolved, run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` include the builtin runtime when the payload verifies and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). On other hosts they build the existing runtimes only.
+Run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` include the builtin runtime when the payload verifies and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). On other hosts they build the existing runtimes only.
 
 If you copy, strip or otherwise change the binary afterwards, sign it again:
 
@@ -320,7 +318,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 
 **CAs.** By default the guest trusts only the image's own CA bundle. Set `trustHostCas: true` (global only) to also install the host's trusted root CAs in the guest at boot — useful behind a corporate TLS-inspecting proxy. awman never installs an interception CA of its own.
 
-> The previous dependency version tested these rules in real guests on Apple Silicon; the current upgrade still requires native re-verification: allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and isolation between VMs running at the same time with different policies. IPv6 denial is verified only on hosts that have IPv6 connectivity.
+> These rules are tested in real guests on Apple Silicon: allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and isolation between VMs running at the same time with different policies. IPv6 denial is verified only on hosts that have IPv6 connectivity.
 
 ### Session lifecycle
 
